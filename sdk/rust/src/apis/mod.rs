@@ -24,8 +24,10 @@ use bytes::Bytes;
 use prost::Enumeration;
 use serde_derive::{Deserialize, Serialize};
 use thiserror::Error;
+use time::macros::format_description;
 use tonic::Status;
 use tracing_subscriber::filter::{FromEnvError, ParseError};
+use tracing_subscriber::fmt::time::LocalTime;
 
 pub type TaskID = String;
 pub type SessionID = String;
@@ -193,12 +195,18 @@ pub fn init_logger() -> Result<(), FlameError> {
         .add_directive("h2=error".parse()?)
         .add_directive("hyper_util=error".parse()?)
         .add_directive("tower=error".parse()?);
+
+    let time_format = LocalTime::new(format_description!(
+        "[hour repr:24]:[minute]:[second]::[subsecond digits:3]"
+    ));
+
     // Initialize tracing with a custom format
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
+        .with_timer(time_format)
         .with_target(true)
-        .with_thread_ids(true)
+        .with_ansi(false)
+        // .with_thread_ids(true)
         // .with_process_ids(true)
         .init();
 
