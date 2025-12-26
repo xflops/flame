@@ -122,9 +122,17 @@ async fn main() -> Result<(), FlameError> {
 
     tracing::info!("flame-session-manager started.");
 
-    // Register default applications.
-    for (name, attr) in common::default_applications() {
-        controller.register_application(name, attr).await?;
+    {
+        // Register default applications.
+        let handler = tokio::spawn(async move {
+            for (name, attr) in common::default_applications() {
+                controller.register_application(name, attr).await?;
+            }
+
+            Ok(())
+        });
+
+        handlers.push(handler);
     }
 
     // Waiting for all thread to exit.

@@ -70,6 +70,17 @@ async fn main() -> Result<(), FlameError> {
         handlers.push(handler);
     }
 
+    // // Start object cache thread.
+    // {
+    //     let cache_config = ctx.clone().cache;
+    //     if let Some(cache_config) = cache_config {
+    //         let objcache = cache::new_ptr(&cache_config)?;
+    //         objcache.run().await?;
+    //     } else {
+    //         tracing::warn!("No object cache configuration found, skipping object cache thread.");
+    //     }
+    // }
+
     // Waiting for all thread to exit.
     let _ = join_all(handlers).await;
 
