@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from enum import IntEnum
 from typing import Optional, List, Dict, Any, Union
 from datetime import datetime
@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from pathlib import Path
 import yaml
 import os
+import bson
 
 
 # Type aliases
@@ -34,7 +35,7 @@ CommonData = Message
 # Constants
 DEFAULT_FLAME_CONF = "flame.yaml"
 DEFAULT_FLAME_ENDPOINT = "http://127.0.0.1:8080"
-
+DEFAULT_FLAME_CACHE_ENDPOINT = "http://127.0.0.1:9090"
 
 class SessionState(IntEnum):
     """Session state enumeration."""
@@ -205,29 +206,62 @@ class FlameContext:
     """Flame configuration."""
 
     _endpoint = None
+    _cache_endpoint = None
 
     def __init__(self):
         self._endpoint = DEFAULT_FLAME_ENDPOINT
+        self._cache_endpoint = DEFAULT_FLAME_CACHE_ENDPOINT
+
+        home = Path.home()
+        config_file = home / ".flame" / DEFAULT_FLAME_CONF
+        if config_file.exists():
+            with open(config_file, "r") as f:
+                config = yaml.safe_load(f)
+                cc = config.get("current-cluster")
+                if cc is None:
+                    raise FlameError(FlameErrorCode.INVALID_CONFIG,
+                                     "current-cluster is not set")
+                for cluster in config.get("clusters", []):
+                    if cc == cluster["name"]:
+                        self._endpoint = cluster.get("endpoint", self._endpoint)
+                        self._cache_endpoint = cluster.get("cache", self._cache_endpoint)
+                        break
+                else:
+                    raise FlameError(FlameErrorCode.INVALID_CONFIG,
+                                     f"cluster <{cc}> not found")
 
         endpoint = os.getenv("FLAME_ENDPOINT")
         if endpoint is not None:
             self._endpoint = endpoint
-        else:
-            home = Path.home()
-            config_file = home / ".flame" / DEFAULT_FLAME_CONF
-            if config_file.exists():
-                with open(config_file, "r") as f:
-                    config = yaml.safe_load(f)
-                    cc = config.get("current-cluster")
-                    if cc is None:
-                        raise FlameError(
-                            FlameErrorCode.INVALID_CONFIG, "current-cluster is not set"
-                        )
-                    for cluster in config.get("clusters", []):
-                        if cc == cluster["name"]:
-                            self._endpoint = cluster.get("endpoint", self._endpoint)
-                            break
-                    else:
-                        raise FlameError(
-                            FlameErrorCode.INVALID_CONFIG, f"cluster <{cc}> not found"
-                        )
+        cache_endpoint = os.getenv("FLAME_CACHE_ENDPOINT")
+        if cache_endpoint is not None:
+            self._cache_endpoint = cache_endpoint
+
+
+class DataLocation(IntEnum):
+    """Data location enumeration."""
+
+    LOCAL = 0
+    REMOTE = 1
+
+
+@dataclass
+class DataExpr:
+    """Data expression."""
+
+    location: DataLocation
+    url: Optional[str] = None
+    data: Optional[bytes] = None
+
+    def to_json(self) -> bytes:
+        data = asdict(self)
+        # For remote data, the data is not included in the JSON
+        if self.location == DataLocation.REMOTE:
+            data["data"] = None
+
+        return bson.dumps(data)
+
+    @classmethod
+    def from_json(cls, json_data: bytes) -> "DataExpr":
+        data = bson.loads(json_data)
+        return cls(**data)

@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-import flamepy.shim_pb2 as shim__pb2
+import flamepy.cache_pb2 as cache__pb2
 import flamepy.types_pb2 as types__pb2
 
 GRPC_GENERATED_VERSION = '1.76.0'
@@ -19,14 +19,14 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in shim_pb2_grpc.py depends on'
+        + ' but the generated code in cache_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
     )
 
 
-class InstanceStub(object):
+class ObjectCacheStub(object):
     """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
@@ -35,91 +35,91 @@ class InstanceStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.OnSessionEnter = channel.unary_unary(
-                '/flame.Instance/OnSessionEnter',
-                request_serializer=shim__pb2.SessionContext.SerializeToString,
+        self.Put = channel.unary_unary(
+                '/flame.ObjectCache/Put',
+                request_serializer=cache__pb2.PutObjectRequest.SerializeToString,
+                response_deserializer=cache__pb2.ObjectMetadata.FromString,
+                _registered_method=True)
+        self.Get = channel.unary_unary(
+                '/flame.ObjectCache/Get',
+                request_serializer=cache__pb2.GetObjectRequest.SerializeToString,
+                response_deserializer=cache__pb2.Object.FromString,
+                _registered_method=True)
+        self.Update = channel.unary_unary(
+                '/flame.ObjectCache/Update',
+                request_serializer=cache__pb2.Object.SerializeToString,
+                response_deserializer=cache__pb2.ObjectMetadata.FromString,
+                _registered_method=True)
+        self.Delete = channel.unary_unary(
+                '/flame.ObjectCache/Delete',
+                request_serializer=cache__pb2.DeleteObjectRequest.SerializeToString,
                 response_deserializer=types__pb2.Result.FromString,
-                _registered_method=True)
-        self.OnTaskInvoke = channel.unary_unary(
-                '/flame.Instance/OnTaskInvoke',
-                request_serializer=shim__pb2.TaskContext.SerializeToString,
-                response_deserializer=types__pb2.TaskResult.FromString,
-                _registered_method=True)
-        self.OnSessionLeave = channel.unary_unary(
-                '/flame.Instance/OnSessionLeave',
-                request_serializer=types__pb2.EmptyRequest.SerializeToString,
-                response_deserializer=types__pb2.Result.FromString,
-                _registered_method=True)
-        self.WatchEvent = channel.unary_stream(
-                '/flame.Instance/WatchEvent',
-                request_serializer=types__pb2.EmptyRequest.SerializeToString,
-                response_deserializer=shim__pb2.WatchEventResponse.FromString,
                 _registered_method=True)
 
 
-class InstanceServicer(object):
+class ObjectCacheServicer(object):
     """Missing associated documentation comment in .proto file."""
 
-    def OnSessionEnter(self, request, context):
+    def Put(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def OnTaskInvoke(self, request, context):
+    def Get(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def OnSessionLeave(self, request, context):
+    def Update(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def WatchEvent(self, request, context):
+    def Delete(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
 
-def add_InstanceServicer_to_server(servicer, server):
+def add_ObjectCacheServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'OnSessionEnter': grpc.unary_unary_rpc_method_handler(
-                    servicer.OnSessionEnter,
-                    request_deserializer=shim__pb2.SessionContext.FromString,
+            'Put': grpc.unary_unary_rpc_method_handler(
+                    servicer.Put,
+                    request_deserializer=cache__pb2.PutObjectRequest.FromString,
+                    response_serializer=cache__pb2.ObjectMetadata.SerializeToString,
+            ),
+            'Get': grpc.unary_unary_rpc_method_handler(
+                    servicer.Get,
+                    request_deserializer=cache__pb2.GetObjectRequest.FromString,
+                    response_serializer=cache__pb2.Object.SerializeToString,
+            ),
+            'Update': grpc.unary_unary_rpc_method_handler(
+                    servicer.Update,
+                    request_deserializer=cache__pb2.Object.FromString,
+                    response_serializer=cache__pb2.ObjectMetadata.SerializeToString,
+            ),
+            'Delete': grpc.unary_unary_rpc_method_handler(
+                    servicer.Delete,
+                    request_deserializer=cache__pb2.DeleteObjectRequest.FromString,
                     response_serializer=types__pb2.Result.SerializeToString,
-            ),
-            'OnTaskInvoke': grpc.unary_unary_rpc_method_handler(
-                    servicer.OnTaskInvoke,
-                    request_deserializer=shim__pb2.TaskContext.FromString,
-                    response_serializer=types__pb2.TaskResult.SerializeToString,
-            ),
-            'OnSessionLeave': grpc.unary_unary_rpc_method_handler(
-                    servicer.OnSessionLeave,
-                    request_deserializer=types__pb2.EmptyRequest.FromString,
-                    response_serializer=types__pb2.Result.SerializeToString,
-            ),
-            'WatchEvent': grpc.unary_stream_rpc_method_handler(
-                    servicer.WatchEvent,
-                    request_deserializer=types__pb2.EmptyRequest.FromString,
-                    response_serializer=shim__pb2.WatchEventResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'flame.Instance', rpc_method_handlers)
+            'flame.ObjectCache', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('flame.Instance', rpc_method_handlers)
+    server.add_registered_method_handlers('flame.ObjectCache', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
-class Instance(object):
+class ObjectCache(object):
     """Missing associated documentation comment in .proto file."""
 
     @staticmethod
-    def OnSessionEnter(request,
+    def Put(request,
             target,
             options=(),
             channel_credentials=None,
@@ -132,90 +132,90 @@ class Instance(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/flame.Instance/OnSessionEnter',
-            shim__pb2.SessionContext.SerializeToString,
+            '/flame.ObjectCache/Put',
+            cache__pb2.PutObjectRequest.SerializeToString,
+            cache__pb2.ObjectMetadata.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Get(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/flame.ObjectCache/Get',
+            cache__pb2.GetObjectRequest.SerializeToString,
+            cache__pb2.Object.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Update(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/flame.ObjectCache/Update',
+            cache__pb2.Object.SerializeToString,
+            cache__pb2.ObjectMetadata.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Delete(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/flame.ObjectCache/Delete',
+            cache__pb2.DeleteObjectRequest.SerializeToString,
             types__pb2.Result.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def OnTaskInvoke(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/flame.Instance/OnTaskInvoke',
-            shim__pb2.TaskContext.SerializeToString,
-            types__pb2.TaskResult.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def OnSessionLeave(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/flame.Instance/OnSessionLeave',
-            types__pb2.EmptyRequest.SerializeToString,
-            types__pb2.Result.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def WatchEvent(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_stream(
-            request,
-            target,
-            '/flame.Instance/WatchEvent',
-            types__pb2.EmptyRequest.SerializeToString,
-            shim__pb2.WatchEventResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -16,8 +16,8 @@ from typing import Optional, List, Dict, Any, Union
 from urllib.parse import urlparse
 import grpc
 import grpc.aio
-
 from datetime import datetime, timezone
+
 from .types import (
     Task,
     Application,
@@ -59,6 +59,8 @@ from .frontend_pb2 import (
     OpenSessionRequest,
 )
 from .frontend_pb2_grpc import FrontendStub
+from .cache_client import ObjectCacheClient
+from .types import DataExpr, DataLocation
 
 
 async def connect(addr: str) -> "Connection":
@@ -66,20 +68,38 @@ async def connect(addr: str) -> "Connection":
     return await Connection.connect(addr)
 
 
-async def create_session(
-    application: str, common_data: Dict[str, Any] = None, slots: int = 1
-) -> "Session":
-    conn = await ConnectionInstance().instance()
+async def create_session(application: str,
+                         common_data: Dict[str, Any] = None,
+                         slots: int = 1) -> "Session":
+
+    connection_instance = ConnectionInstance()
+
+    conn = await connection_instance.instance()
     if common_data is None:
         pass
     elif isinstance(common_data, FlameRequest):
         common_data = common_data.to_json()
     elif not isinstance(common_data, CommonData):
-        raise ValueError("Invalid common data type, must be a Request or CommonData")
+        raise ValueError(
+            "Invalid common data type, must be a Request or CommonData")
+
+    cache_endpoint = connection_instance._context._cache_endpoint
+
+    if cache_endpoint is not None:
+        cache_client = ObjectCacheClient(cache_endpoint)
+        metadata = await cache_client.put_object(application, common_data)
+        data_expr = DataExpr(location=DataLocation.REMOTE,
+                             url=metadata.endpoint,
+                             data=common_data)
+        common_data = CommonData(data_expr.to_json())
+    else:
+        data_expr = DataExpr(location=DataLocation.LOCAL, data=common_data)
+        common_data = CommonData(data_expr.to_json())
 
     session = await conn.create_session(
-        SessionAttributes(application=application, common_data=common_data, slots=slots)
-    )
+        SessionAttributes(application=application,
+                          common_data=common_data,
+                          slots=slots))
     return session
 
 
@@ -132,11 +152,22 @@ class ConnectionInstance:
     _context = None
     _lock = threading.Lock()
 
+    # Singleton instance
+    _instance_lock = threading.Lock()
+    _instance = None
+
+    def __new__(cls):
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = super(ConnectionInstance, cls).__new__(cls)
+                cls._instance._context = FlameContext()
+                return cls._instance
+            return cls._instance
+
     async def instance(self) -> "Connection":
         """Get the connection instance."""
         with self._lock:
             if not self._connection:
-                self._context = FlameContext()
                 self._connection = await connect(self._context._endpoint)
             return self._connection
 

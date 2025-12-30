@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+import "types.proto";
+
+package flame;
+
+message Object {
+    string uuid = 1;
+    string name = 2;
+    uint64 version = 3;
+    bytes data = 4;
+}
+
+message ObjectMetadata {
+    string endpoint = 1;
+    uint64 version = 2;
+    uint64 size = 3;
+}
+
+service ObjectCache {
+    rpc Put(PutObjectRequest) returns (ObjectMetadata) {}
+    rpc Get(GetObjectRequest) returns (Object) {}
+    rpc Update(Object) returns (ObjectMetadata) {}
+
+    rpc Delete(DeleteObjectRequest) returns (Result) {}
+}
+
+message PutObjectRequest {
+    string name = 1;
+    bytes data = 2;
+}
+
+message GetObjectRequest {
+    string uuid = 1;
+}
+
+message DeleteObjectRequest {
+    string uuid = 1;
+}

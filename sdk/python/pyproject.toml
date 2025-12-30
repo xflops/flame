@@ -23,6 +23,7 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
 ]
+
 dependencies = [
   "grpcio>=1.50.0",
   "grpcio-tools>=1.50.0",
@@ -31,6 +32,7 @@ dependencies = [
   "fastapi>=0.115.0",
   "uvicorn>=0.35.0",
   "pyyaml>=6.0.0",
+  "bson>=0.5",
 ]
 
 [project.optional-dependencies]
@@ -53,7 +55,7 @@ Repository = "https://github.com/xflops/flame"
 Issues = "https://github.com/xflops/flame/issues"
 
 [tool.black]
-line-length = 88
+line-length = 1024
 target-version = ['py38']
 include = '\.pyi?$'
 extend-exclude = '''

@@ -19,7 +19,7 @@ def main():
     protos_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate Python files from protobuf definitions
-    proto_files = ["frontend.proto", "shim.proto", "types.proto"]
+    proto_files = ["frontend.proto", "shim.proto", "types.proto", "cache.proto"]
 
     for proto_file in proto_files:
         proto_path = protos_dir / proto_file

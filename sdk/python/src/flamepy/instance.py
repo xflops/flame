@@ -16,6 +16,7 @@ import inspect
 import uvicorn
 import os
 import time
+import logging
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, Union
 from fastapi import FastAPI, Request as FastAPIRequest, Response as FastAPIResponse
@@ -31,13 +32,12 @@ from .service import (
     ApplicationContext,
     FLAME_INSTANCE_ENDPOINT,
 )
-from .types import Shim
-import logging
 
 debug_service = None
 
 
 class FlameInstance(FlameService):
+
     def __init__(self):
         self.session_id = None
         self.task_id = None
@@ -60,13 +60,9 @@ class FlameInstance(FlameService):
 
         sig = inspect.signature(func)
         self._context = func
-        assert (
-            len(sig.parameters) == 1 or len(sig.parameters) == 0
-        ), "Context must have exactly zero or one parameter"
+        assert len(sig.parameters) == 1 or len(sig.parameters) == 0, "Context must have exactly zero or one parameter"
         for param in sig.parameters.values():
-            assert (
-                param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
-            ), "Parameter must be positional or keyword"
+            assert param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD, "Parameter must be positional or keyword"
             if param.annotation is not inspect._empty:
                 self._context_schema = param.annotation.model_json_schema()
             self._context_parameter = param
@@ -77,13 +73,9 @@ class FlameInstance(FlameService):
 
         sig = inspect.signature(func)
         self._entrypoint = func
-        assert (
-            len(sig.parameters) == 1 or len(sig.parameters) == 0
-        ), "Entrypoint must have exactly zero or one parameter"
+        assert len(sig.parameters) == 1 or len(sig.parameters) == 0, "Entrypoint must have exactly zero or one parameter"
         for param in sig.parameters.values():
-            assert (
-                param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
-            ), "Parameter must be positional or keyword"
+            assert param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD, "Parameter must be positional or keyword"
             if param.annotation is not inspect._empty:
                 self._input_schema = param.annotation.model_json_schema()
             self._parameter = param
@@ -133,11 +125,7 @@ class FlameInstance(FlameService):
             self._queue = context._queue
 
         if self._parameter is not None:
-            obj = (
-                self._parameter.annotation.model_validate_json(context.input)
-                if context.input is not None
-                else None
-            )
+            obj = self._parameter.annotation.model_validate_json(context.input) if context.input is not None else None
             if inspect.iscoroutinefunction(self._entrypoint):
                 res = await self._entrypoint(obj)
             else:
@@ -166,9 +154,7 @@ class FlameInstance(FlameService):
         if self._queue is not None:
             await self._queue.put(
                 WatchEventResponseProto(
-                    owner=EventOwnerProto(
-                        session_id=self.session_id, task_id=self.task_id
-                    ),
+                    owner=EventOwnerProto(session_id=self.session_id, task_id=self.task_id),
                     event=EventProto(
                         code=code,
                         message=message,
@@ -208,15 +194,11 @@ def run_debug_service(instance: FlameInstance):
 
     if instance._context is not None:
         context_name = instance._context.__name__
-        debug_service.add_api_route(
-            f"/{context_name}", context_local_api, methods=["POST"]
-        )
+        debug_service.add_api_route(f"/{context_name}", context_local_api, methods=["POST"])
 
     if instance._entrypoint is not None:
         entrypoint_name = instance._entrypoint.__name__
-        debug_service.add_api_route(
-            f"/{entrypoint_name}", entrypoint_local_api, methods=["POST"]
-        )
+        debug_service.add_api_route(f"/{entrypoint_name}", entrypoint_local_api, methods=["POST"])
 
     uvicorn.run(debug_service, host="0.0.0.0", port=5050)
 

@@ -21,7 +21,8 @@ from dataclasses import dataclass
 import logging
 from concurrent import futures
 
-from .types import Shim, FlameError, FlameErrorCode
+from .types import Shim, FlameError, FlameErrorCode, DataExpr, DataLocation
+from .cache_client import ObjectCacheClient, ObjectEndpoint, load_data, update_data
 from .shim_pb2_grpc import InstanceServicer, add_InstanceServicer_to_server
 from .shim_pb2 import WatchEventResponse as WatchEventResponseProto
 from .types_pb2 import (
@@ -37,7 +38,7 @@ logger = logging.getLogger(__name__)
 FLAME_INSTANCE_ENDPOINT = "FLAME_INSTANCE_ENDPOINT"
 
 class TraceFn:
-    def __init__(self, name:str):
+    def __init__(self, name: str):
         self.name = name
         logger.debug(f"{name} Enter")
 
@@ -60,17 +61,28 @@ class SessionContext:
     """Context for a session."""
 
     _queue: asyncio.Queue
+    _common_data_expr: DataExpr
+
     session_id: str
     application: ApplicationContext
     common_data: Optional[bytes] = None
+
+    async def update_common_data(self, data: Optional[bytes] = None):
+        """Update the common data expression."""
+        if self._common_data_expr.location == DataLocation.LOCAL:
+            raise FlameError(FlameErrorCode.INVALID_STATE,
+                             "can not update local common data")
+
+        await update_data(self._common_data_expr, data)
+        self.common_data = data
 
     async def record_event(self, code: int, message: Optional[str] = None):
         """Record an event."""
         event = WatchEventResponseProto(
             owner=EventOwnerProto(session_id=self.session_id, task_id=None),
-            event=EventProto(
-                code=code, message=message, creation_time=int(time.time() * 1000)
-            ),
+            event=EventProto(code=code,
+                             message=message,
+                             creation_time=int(time.time() * 1000)),
         )
         await self._queue.put(event)
 
@@ -80,17 +92,30 @@ class TaskContext:
     """Context for a task."""
 
     _queue: asyncio.Queue
+    _common_data_expr: DataExpr
+
     task_id: str
     session_id: str
     input: Optional[bytes] = None
 
+
+    async def update_common_data(self, data: Optional[bytes] = None):
+        """Update the common data expression."""
+        if self._common_data_expr.location == DataLocation.LOCAL:
+            raise FlameError(FlameErrorCode.INVALID_STATE,
+                             "can not update local common data")
+
+        await update_data(self._common_data_expr, data)
+
+
     async def record_event(self, code: int, message: Optional[str] = None):
         """Record an event."""
         event = WatchEventResponseProto(
-            owner=EventOwnerProto(session_id=self.session_id, task_id=self.task_id),
-            event=EventProto(
-                code=code, message=message, creation_time=int(time.time() * 1000)
-            ),
+            owner=EventOwnerProto(session_id=self.session_id,
+                                  task_id=self.task_id),
+            event=EventProto(code=code,
+                             message=message,
+                             creation_time=int(time.time() * 1000)),
         )
         await self._queue.put(event)
 
@@ -142,12 +167,13 @@ class FlameService:
         pass
 
 
-class FlmInstanceServicer(InstanceServicer):
+class FlameInstanceServicer(InstanceServicer):
     """gRPC servicer implementation for GrpcShim service."""
 
     def __init__(self, service: FlameService):
         self._service = service
         self._queue = asyncio.Queue()
+        self._common_data_expr = None
 
     async def OnSessionEnter(self, request, context):
         """Handle OnSessionEnter RPC call."""
@@ -161,27 +187,23 @@ class FlmInstanceServicer(InstanceServicer):
             app_context = ApplicationContext(
                 name=request.application.name,
                 shim=Shim(request.application.shim),
-                image=(
-                    request.application.image
-                    if request.application.HasField("image")
-                    else None
-                ),
-                command=(
-                    request.application.command
-                    if request.application.HasField("command")
-                    else None
-                ),
+                image=(request.application.image if request.application.HasField("image") else None),
+                command=(request.application.command if request.application.HasField("command") else None),
             )
 
             logger.debug(f"app_context: {app_context}")
 
+            self._common_data_expr = DataExpr.from_json(request.common_data) if request.HasField("common_data") else None
+
+            common_data = await load_data(self._common_data_expr) if self._common_data_expr is not None else None
+
             session_context = SessionContext(
                 _queue=self._queue,
+                _common_data_expr=self._common_data_expr,
+
                 session_id=request.session_id,
                 application=app_context,
-                common_data=(
-                    request.common_data if request.HasField("common_data") else None
-                ),
+                common_data=common_data,
             )
 
             logger.debug(f"session_context: {session_context}")
@@ -207,6 +229,8 @@ class FlmInstanceServicer(InstanceServicer):
             # Convert protobuf request to TaskContext
             task_context = TaskContext(
                 _queue=self._queue,
+                _common_data_expr=self._common_data_expr,
+
                 task_id=request.task_id,
                 session_id=request.session_id,
                 input=request.input if request.HasField("input") else None,
@@ -271,7 +295,7 @@ class FlmInstanceServicer(InstanceServicer):
             raise
 
 
-class FlmInstanceServer:
+class FlameInstanceServer:
     """Server for gRPC shim services."""
 
     def __init__(self, service: FlameService):
@@ -285,20 +309,16 @@ class FlmInstanceServer:
             self._server = grpc.aio.server()
 
             # Add servicer to server
-            shim_servicer = FlmInstanceServicer(self._service)
+            shim_servicer = FlameInstanceServicer(self._service)
             add_InstanceServicer_to_server(shim_servicer, self._server)
 
             # Listen on Unix socket
             endpoint = os.getenv(FLAME_INSTANCE_ENDPOINT)
             if endpoint is not None:
                 self._server.add_insecure_port(f"unix://{endpoint}")
-                logger.debug(
-                    f"Flame Python instance service started on Unix socket: {endpoint}"
-                )
+                logger.debug(f"Flame Python instance service started on Unix socket: {endpoint}")
             else:
-                raise FlameError(
-                    FlameErrorCode.INVALID_CONFIG, "FLAME_INSTANCE_ENDPOINT not found"
-                )
+                raise FlameError(FlameErrorCode.INVALID_CONFIG, "FLAME_INSTANCE_ENDPOINT not found")
 
             # Start server
             await self._server.start()
@@ -326,5 +346,5 @@ def run(service: FlameService):
         service: The shim service implementation
     """
 
-    server = FlmInstanceServer(service)
+    server = FlameInstanceServer(service)
     asyncio.run(server.start())
