@@ -162,12 +162,13 @@ class ConnectionInstance:
     async def instance(cls) -> "Connection":
         """Get the connection instance."""
         instance = await cls._get_instance()
-        return await connect(instance._context._endpoint)
+        return await instance._get_connection(instance._context._endpoint)
 
-        # async with instance._lock:
-        #     if instance._connection is None:
-        #         instance._connection = await connect(instance._context._endpoint)
-        #     return instance._connection
+    async def _get_connection(self, endpoint: str) -> "Connection":
+        async with self._lock:
+            if self._connection is None:
+                self._connection = await connect(endpoint)
+            return self._connection
 
 
 class Connection:
