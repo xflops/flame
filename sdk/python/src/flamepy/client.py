@@ -141,33 +141,19 @@ async def close_session(session_id: SessionID) -> "Session":
 class ConnectionInstance:
     """Connection instance."""
 
-    _lock = asyncio.Lock()
+    _lock = threading.Lock()
     _connection = None
     _context = None
-
-    # Singleton instance
-    _instance_lock = asyncio.Lock()
-    _instance = None
-
-    @classmethod
-    async def _get_instance(cls) -> "ConnectionInstance":
-        async with cls._instance_lock:
-            if cls._instance is None:
-                cls._instance = super().__new__(cls)
-                cls._instance._context = FlameContext()
-                return cls._instance
-            return cls._instance
 
     @classmethod
     async def instance(cls) -> "Connection":
         """Get the connection instance."""
-        instance = await cls._get_instance()
-        return await connect(instance._context._endpoint)
 
-        # async with instance._lock:
-        #     if instance._connection is None:
-        #         instance._connection = await connect(instance._context._endpoint)
-        #     return instance._connection
+        with cls._lock:
+            if cls._connection is None:
+                cls._context = FlameContext()
+                cls._connection = await connect(cls._context._endpoint)
+            return cls._connection
 
 
 class Connection:
