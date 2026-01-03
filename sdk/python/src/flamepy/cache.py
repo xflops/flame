@@ -45,6 +45,7 @@ async def put_object(session_id: str, data: bytes) -> "DataExpr":
 
     return DataExpr(source=DataSource.REMOTE, url=metadata.endpoint, data=data, version=metadata.version)
 
+
 async def get_object(de: DataExpr) -> "DataExpr":
     """Get an object from the cache."""
     if de.source != DataSource.REMOTE:
@@ -60,6 +61,7 @@ async def get_object(de: DataExpr) -> "DataExpr":
     de.version = obj.version
 
     return de
+
 
 async def update_object(de: DataExpr) -> "DataExpr":
     """Update an object in the cache."""

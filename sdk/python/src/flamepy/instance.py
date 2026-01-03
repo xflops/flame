@@ -45,11 +45,8 @@ class FlameInstance(FlameService):
         self._entrypoint = None
         self._parameter = None
         self._return_type = None
-        self._input_schema = None
-        self._output_schema = None
 
         self._context = None
-        self._context_schema = None
         self._context_parameter = None
 
         self._queue = None
@@ -60,15 +57,9 @@ class FlameInstance(FlameService):
 
         sig = inspect.signature(func)
         self._context = func
-        assert (
-            len(sig.parameters) == 1 or len(sig.parameters) == 0
-        ), "Context must have exactly zero or one parameter"
+        assert len(sig.parameters) == 1 or len(sig.parameters) == 0, "Context must have exactly zero or one parameter"
         for param in sig.parameters.values():
-            assert (
-                param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
-            ), "Parameter must be positional or keyword"
-            if param.annotation is not inspect._empty:
-                self._context_schema = param.annotation.model_json_schema()
+            assert param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD, "Parameter must be positional or keyword"
             self._context_parameter = param
 
     def entrypoint(self, func):
@@ -77,20 +68,13 @@ class FlameInstance(FlameService):
 
         sig = inspect.signature(func)
         self._entrypoint = func
-        assert (
-            len(sig.parameters) == 1 or len(sig.parameters) == 0
-        ), "Entrypoint must have exactly zero or one parameter"
+        assert len(sig.parameters) == 1 or len(sig.parameters) == 0, "Entrypoint must have exactly zero or one parameter"
         for param in sig.parameters.values():
-            assert (
-                param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
-            ), "Parameter must be positional or keyword"
-            if param.annotation is not inspect._empty:
-                self._input_schema = param.annotation.model_json_schema()
+            assert param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD, "Parameter must be positional or keyword"
             self._parameter = param
 
         if sig.return_annotation is not inspect._empty:
             self._return_type = sig.return_annotation
-            self._output_schema = self._return_type.model_json_schema()
 
     async def on_session_enter(self, context: SessionContext):
         logger = logging.getLogger(__name__)
@@ -109,13 +93,7 @@ class FlameInstance(FlameService):
             else:
                 self._context()
         else:
-            obj = (
-                self._context_parameter.annotation.model_validate_json(
-                    context.common_data
-                )
-                if context.common_data is not None
-                else None
-            )
+            obj = self._context_parameter.annotation.model_validate(context.common_data) if context.common_data is not None else None
             if inspect.iscoroutinefunction(self._context):
                 await self._context(obj)
             else:
@@ -133,11 +111,7 @@ class FlameInstance(FlameService):
             self._queue = context._queue
 
         if self._parameter is not None:
-            obj = (
-                self._parameter.annotation.model_validate_json(context.input)
-                if context.input is not None
-                else None
-            )
+            obj = self._parameter.annotation.model_validate(context.input) if context.input is not None else None
             if inspect.iscoroutinefunction(self._entrypoint):
                 res = await self._entrypoint(obj)
             else:
@@ -148,7 +122,7 @@ class FlameInstance(FlameService):
             else:
                 res = self._entrypoint()
 
-        res = self._return_type.model_validate(res).model_dump_json()
+        res = self._return_type.model_dump(res)
         logger.debug(f"on_task_invoke: {res}")
 
         self.task_id = None
@@ -166,9 +140,7 @@ class FlameInstance(FlameService):
         if self._queue is not None:
             await self._queue.put(
                 WatchEventResponseProto(
-                    owner=EventOwnerProto(
-                        session_id=self.session_id, task_id=self.task_id
-                    ),
+                    owner=EventOwnerProto(session_id=self.session_id, task_id=self.task_id),
                     event=EventProto(
                         code=code,
                         message=message,
@@ -208,15 +180,11 @@ def run_debug_service(instance: FlameInstance):
 
     if instance._context is not None:
         context_name = instance._context.__name__
-        debug_service.add_api_route(
-            f"/{context_name}", context_local_api, methods=["POST"]
-        )
+        debug_service.add_api_route(f"/{context_name}", context_local_api, methods=["POST"])
 
     if instance._entrypoint is not None:
         entrypoint_name = instance._entrypoint.__name__
-        debug_service.add_api_route(
-            f"/{entrypoint_name}", entrypoint_local_api, methods=["POST"]
-        )
+        debug_service.add_api_route(f"/{entrypoint_name}", entrypoint_local_api, methods=["POST"])
 
     uvicorn.run(debug_service, host="0.0.0.0", port=5050)
 

@@ -37,8 +37,9 @@ logger = logging.getLogger(__name__)
 
 FLAME_INSTANCE_ENDPOINT = "FLAME_INSTANCE_ENDPOINT"
 
+
 class TraceFn:
-    def __init__(self, name:str):
+    def __init__(self, name: str):
         self.name = name
         logger.debug(f"{name} Enter")
 
@@ -69,9 +70,7 @@ class SessionContext:
         """Record an event."""
         event = WatchEventResponseProto(
             owner=EventOwnerProto(session_id=self.session_id, task_id=None),
-            event=EventProto(
-                code=code, message=message, creation_time=int(time.time() * 1000)
-            ),
+            event=EventProto(code=code, message=message, creation_time=int(time.time() * 1000)),
         )
         await self._queue.put(event)
 
@@ -89,9 +88,7 @@ class TaskContext:
         """Record an event."""
         event = WatchEventResponseProto(
             owner=EventOwnerProto(session_id=self.session_id, task_id=self.task_id),
-            event=EventProto(
-                code=code, message=message, creation_time=int(time.time() * 1000)
-            ),
+            event=EventProto(code=code, message=message, creation_time=int(time.time() * 1000)),
         )
         await self._queue.put(event)
 
@@ -163,16 +160,8 @@ class FlameInstanceServicer(InstanceServicer):
             app_context = ApplicationContext(
                 name=request.application.name,
                 shim=Shim(request.application.shim),
-                image=(
-                    request.application.image
-                    if request.application.HasField("image")
-                    else None
-                ),
-                command=(
-                    request.application.command
-                    if request.application.HasField("command")
-                    else None
-                ),
+                image=(request.application.image if request.application.HasField("image") else None),
+                command=(request.application.command if request.application.HasField("command") else None),
             )
 
             logger.debug(f"app_context: {app_context}")
@@ -297,13 +286,9 @@ class FlameInstanceServer:
             endpoint = os.getenv(FLAME_INSTANCE_ENDPOINT)
             if endpoint is not None:
                 self._server.add_insecure_port(f"unix://{endpoint}")
-                logger.debug(
-                    f"Flame Python instance service started on Unix socket: {endpoint}"
-                )
+                logger.debug(f"Flame Python instance service started on Unix socket: {endpoint}")
             else:
-                raise FlameError(
-                    FlameErrorCode.INVALID_CONFIG, "FLAME_INSTANCE_ENDPOINT not found"
-                )
+                raise FlameError(FlameErrorCode.INVALID_CONFIG, "FLAME_INSTANCE_ENDPOINT not found")
 
             # Start server
             await self._server.start()

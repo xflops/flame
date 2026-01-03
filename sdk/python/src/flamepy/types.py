@@ -191,25 +191,25 @@ class TaskInformer:
 class Request(BaseModel):
     @classmethod
     def from_json(cls, json_data):
-        return cls.model_validate_json(json_data.decode("utf-8"))
+        return cls.model_validate(json_data)
 
     def to_json(self) -> bytes:
-        return self.model_dump_json().encode("utf-8")
+        return self.model_dump()
 
 
 class Response(BaseModel):
     @classmethod
     def from_json(cls, json_data):
-        return cls.model_validate_json(json_data.decode("utf-8"))
+        return cls.model_validate(json_data)
 
     def to_json(self) -> bytes:
-        return self.model_dump_json().encode("utf-8")
+        return self.model_dump()
 
 
 def short_name(prefix: str, length: int = 6) -> str:
     """Generate a short name with a prefix."""
     alphabet = string.ascii_letters + string.digits
-    sn = ''.join(random.SystemRandom().choice(alphabet) for _ in range(length))
+    sn = "".join(random.SystemRandom().choice(alphabet) for _ in range(length))
     return f"{prefix}-{sn}"
 
 
@@ -227,16 +227,14 @@ class FlameContext:
                 config = yaml.safe_load(f)
                 cc = config.get("current-cluster")
                 if cc is None:
-                    raise FlameError(FlameErrorCode.INVALID_CONFIG,
-                                     "current-cluster is not set")
+                    raise FlameError(FlameErrorCode.INVALID_CONFIG, "current-cluster is not set")
                 for cluster in config.get("clusters", []):
                     if cc == cluster["name"]:
                         self._endpoint = cluster.get("endpoint")
                         self._cache_endpoint = cluster.get("cache")
                         break
                 else:
-                    raise FlameError(FlameErrorCode.INVALID_CONFIG,
-                                     f"cluster <{cc}> not found")
+                    raise FlameError(FlameErrorCode.INVALID_CONFIG, f"cluster <{cc}> not found")
 
         endpoint = os.getenv("FLAME_ENDPOINT")
         if endpoint is not None:
