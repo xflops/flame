@@ -176,10 +176,10 @@ impl Plugin for FairShare {
             } else {
                 tracing::warn!("Node <{}> not found for executor <{}>.", exe.node, exe.id);
             }
-            // If the executor is not bound, it means it is not allocated to any session.
-            if exe.state != ExecutorState::Bound {
-                continue;
-            }
+
+            // Go through all the executors here (VOID, IDLE, BOUND, BINDING, UNBINDING, RELEASING, RELEASED)
+            // If the executor is related to a session, add the slots to the session.
+
             if let Some(ssn_id) = exe.ssn_id.clone() {
                 if let Some(ssn) = self.ssn_map.get_mut(&ssn_id) {
                     ssn.allocated += ssn.slots as f64;
