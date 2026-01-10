@@ -517,7 +517,7 @@ impl Storage {
             resreq,
             slots,
             task_id: None,
-            ssn_id: None,
+            ssn_id: Some(ssn_id.clone()),
             creation_time: Utc::now(),
             state: ExecutorState::Void,
         };
