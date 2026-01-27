@@ -66,7 +66,7 @@ To support the introduction of the new `url` field in the application configurat
 
 ### APIs
 
-The `RunnerContext` and `RunnerRequest` classes are integral parts of the `flamepy.core` module, and are made available to users developing custom applications via `from flamepy import RunnerContext, RunnerRequest`.
+The `RunnerContext` and `RunnerRequest` classes are integral parts of the `flamepy` module, and are made available to users developing custom applications via `from flamepy import RunnerContext, RunnerRequest`.
 
 - **RunnerContext** encapsulates the session-wide shared execution object. Its `execution_object` field holds a Python object directly. This allows flexible sharing of state or functions for all tasks within a session, leveraging `ObjectRef` to optimize data transfer.
   
