@@ -101,8 +101,7 @@ if os.path.isfile(package_path) and self._is_archive(package_path):
 ### Using Cache-based Output
 
 ```python
-from flamepy.rl import Runner
-from flamepy.cache import get_object
+from flamepy import Runner, get_object
 
 class DataProcessor:
     def process_large_data(self, data):
@@ -204,8 +203,7 @@ result = ssn.invoke(request)
 
 **After**:
 ```python
-from flamepy.rl import RunnerContext, RunnerServiceKind
-from flamepy.cache import get_object
+from flamepy import RunnerContext, RunnerServiceKind, get_object
 
 ctx = RunnerContext(execution_object=my_func, kind=RunnerServiceKind.Stateless)
 ssn = create_session("flmrun", ctx)

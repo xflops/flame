@@ -10,6 +10,8 @@ The Runner API provides a simplified way to package, deploy, and run Python appl
 2. **RunnerService**: A service wrapper that exposes execution objects as remote Flame services
 3. **ObjectFuture**: A future that resolves to cached objects for efficient data handling
 
+**Note**: The Runner API modules (`Runner`, `RunnerService`, `FlameRunpyService`, etc.) are exported at the top-level `flamepy` module. They can be imported directly via `from flamepy import Runner`, or from `flamepy.core` or `flamepy.rl` (for backward compatibility).
+
 ## Prerequisites
 
 ### 1. Configure Package Storage
@@ -53,7 +55,7 @@ print([app.name for app in apps])
 ### Example 1: Simple Function
 
 ```python
-from flamepy.rl import Runner
+from flamepy import Runner
 
 def sum_fn(a: int, b: int) -> int:
     return a + b
@@ -73,7 +75,7 @@ with Runner("my-app") as rr:
 ### Example 2: Class with State
 
 ```python
-from flamepy.rl import Runner
+from flamepy import Runner
 
 class Counter:
     def __init__(self, initial: int = 0):
@@ -107,7 +109,7 @@ with Runner("counter-app") as rr:
 For large objects, you can pass `ObjectFuture` instances as arguments to avoid unnecessary data transfer:
 
 ```python
-from flamepy.rl import Runner
+from flamepy import Runner
 
 class Counter:
     def __init__(self, initial: int = 0):

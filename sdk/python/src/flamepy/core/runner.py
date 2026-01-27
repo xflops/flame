@@ -29,11 +29,9 @@ from flamepy.core.types import (
     FlameContext,
     FlameError,
     FlameErrorCode,
-    short_name,
-)
-from flamepy.rl.types import (
     RunnerContext,
     RunnerRequest,
+    short_name,
 )
 
 logger = logging.getLogger(__name__)

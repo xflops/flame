@@ -28,8 +28,7 @@ import cloudpickle
 
 from flamepy.core import ObjectRef, get_object, put_object, update_object
 from flamepy.core.service import FlameService, SessionContext, TaskContext
-from flamepy.core.types import TaskOutput, short_name
-from flamepy.rl.types import RunnerContext, RunnerRequest
+from flamepy.core.types import RunnerContext, RunnerRequest, TaskOutput, short_name
 
 logger = logging.getLogger(__name__)
 

@@ -38,6 +38,15 @@ from .client import (
     unregister_application,
 )
 
+# Instance service
+from .instance import FlameInstance
+
+# Runner classes
+from .runner import ObjectFuture, ObjectFutureIterator, Runner, RunnerService
+
+# Runpy service
+from .runpy import FlameRunpyService
+
 # Service functions
 # Service implementation classes
 # Service base classes
@@ -78,6 +87,8 @@ from .types import (
     FlameErrorCode,
     FlamePackage,
     Message,
+    RunnerContext,
+    RunnerRequest,
     SessionAttributes,
     SessionID,
     SessionState,
@@ -121,6 +132,8 @@ __all__ = [
     "Application",
     "FlamePackage",
     "FlameContextRunner",
+    "RunnerContext",
+    "RunnerRequest",
     # Context and utility classes
     "TaskInformer",
     "FlameContext",
@@ -161,4 +174,13 @@ __all__ = [
     "get_object",
     "put_object",
     "update_object",
+    # Runner classes
+    "ObjectFuture",
+    "ObjectFutureIterator",
+    "Runner",
+    "RunnerService",
+    # Runpy service
+    "FlameRunpyService",
+    # Instance service
+    "FlameInstance",
 ]

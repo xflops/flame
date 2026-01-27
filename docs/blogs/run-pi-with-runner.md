@@ -66,7 +66,7 @@ def estimate_batch(num_samples: int) -> int:
 Runner turns that function into a remote service and manages everything else:
 
 ```python
-from flamepy.rl import Runner
+from flamepy import Runner
 from pi import estimate_batch
 import math
 

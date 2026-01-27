@@ -1,5 +1,5 @@
 from ps import ConvNet, get_data_loader, ParameterServer, DataWorker, evaluate
-from flamepy.rl import Runner
+from flamepy import Runner
 
 
 if __name__ == "__main__":

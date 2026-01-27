@@ -15,7 +15,7 @@ limitations under the License.
 from . import agent, rl
 
 # Export all core classes/types at top level
-from .core import (  # Type aliases; Constants; Enums; Exception classes; Data classes; Context and utility classes; Client functions; Client classes; Service constants; Service context classes; Service base classes; Service functions
+from .core import (  # Type aliases; Constants; Enums; Exception classes; Data classes; Context and utility classes; Client functions; Client classes; Service constants; Service context classes; Service base classes; Service functions; Runner classes; Cache classes
     DEFAULT_FLAME_CACHE_ENDPOINT,
     DEFAULT_FLAME_CONF,
     DEFAULT_FLAME_ENDPOINT,
@@ -33,9 +33,18 @@ from .core import (  # Type aliases; Constants; Enums; Exception classes; Data c
     FlameContextRunner,
     FlameError,
     FlameErrorCode,
+    FlameInstance,
     FlamePackage,
+    FlameRunpyService,
     FlameService,
     Message,
+    ObjectFuture,
+    ObjectFutureIterator,
+    ObjectRef,
+    Runner,
+    RunnerContext,
+    RunnerRequest,
+    RunnerService,
     Session,
     SessionAttributes,
     SessionContext,
@@ -54,13 +63,16 @@ from .core import (  # Type aliases; Constants; Enums; Exception classes; Data c
     connect,
     create_session,
     get_application,
+    get_object,
     get_session,
     list_applications,
     list_sessions,
     open_session,
+    put_object,
     register_application,
     run,
     unregister_application,
+    update_object,
 )
 
 __version__ = "0.3.0"
@@ -95,6 +107,8 @@ __all__ = [
     "Application",
     "FlamePackage",
     "FlameContextRunner",
+    "RunnerContext",
+    "RunnerRequest",
     # Context and utility classes
     "TaskInformer",
     "FlameContext",
@@ -125,13 +139,18 @@ __all__ = [
     "run",
     # Cache classes
     "ObjectRef",
-    "Object",
-    "ObjectMetadata",
     # Cache functions
     "get_object",
     "put_object",
     "update_object",
-    "suppress_dependency_logs",
+    # Runner classes
+    "Runner",
+    "RunnerService",
+    "ObjectFuture",
+    "ObjectFutureIterator",
+    "FlameRunpyService",
+    # Instance service
+    "FlameInstance",
     # Submodules (rl and agent only)
     "agent",
     "rl",

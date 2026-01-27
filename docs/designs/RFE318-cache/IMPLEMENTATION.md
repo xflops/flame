@@ -155,7 +155,7 @@ make e2e-ci
 ### Manual Testing
 ```python
 import flamepy
-from flamepy.core import put_object, get_object
+from flamepy import put_object, get_object
 
 # Put an object
 data = {"test": "data", "value": 123}

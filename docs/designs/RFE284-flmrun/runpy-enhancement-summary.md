@@ -203,7 +203,7 @@ cp my-app.tar.gz /opt/flame/packages/
 
 2. **Use with Runner**:
 ```python
-from flamepy.rl import Runner
+from flamepy import Runner
 
 with Runner("my-app") as rr:
     # Runner creates package and uploads to /opt/flame/packages/my-app.tar.gz
@@ -222,9 +222,7 @@ with Runner("my-app") as rr:
 
 ### Verify Cache Output
 ```python
-from flamepy.rl import Runner, RunnerContext, RunnerRequest, RunnerServiceKind
-from flamepy import create_session
-from flamepy.cache import get_object
+from flamepy import Runner, RunnerContext, RunnerRequest, RunnerServiceKind, create_session, get_object
 
 # Test that output is ObjectRef
 ctx = RunnerContext(

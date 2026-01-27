@@ -13,7 +13,7 @@ limitations under the License.
 
 import pytest
 import flamepy
-from flamepy import rl
+from flamepy import RunnerContext, RunnerRequest
 from e2e.helpers import (
     sum_func,
     multiply_func,
@@ -85,13 +85,13 @@ def test_flmrun_application_registered():
 def test_flmrun_sum_function():
     """Test Case 1: Run a simple sum function remotely."""
     # Create a session with RunnerContext and sum function
-    ctx = rl.RunnerContext(execution_object=sum_func)
+    ctx = RunnerContext(execution_object=sum_func)
     common_data_bytes = serialize_runner_context(ctx, FLMRUN_E2E_APP)
     ssn = flamepy.create_session(FLMRUN_E2E_APP, common_data_bytes)
 
     try:
         # Invoke the sum function remotely with positional arguments
-        req = rl.RunnerRequest(method=None, args=(1, 2))
+        req = RunnerRequest(method=None, args=(1, 2))
         req_bytes = serialize_runner_request(req)
         result_bytes = ssn.invoke(req_bytes)
 
@@ -117,27 +117,27 @@ def test_flmrun_class_method():
     calc = Calculator()
 
     # Create a session with the calculator instance
-    ctx = rl.RunnerContext(execution_object=calc)
+    ctx = RunnerContext(execution_object=calc)
     common_data_bytes = serialize_runner_context(ctx, FLMRUN_E2E_APP)
     ssn = flamepy.create_session(FLMRUN_E2E_APP, common_data_bytes)
 
     try:
         # Test add method
-        req = rl.RunnerRequest(method="add", args=(5, 3))
+        req = RunnerRequest(method="add", args=(5, 3))
         req_bytes = serialize_runner_request(req)
         result_bytes = ssn.invoke(req_bytes)
         result = get_object(ObjectRef.decode(result_bytes))
         assert result == 8, f"Expected 8, got {result}"
 
         # Test multiply method
-        req = rl.RunnerRequest(method="multiply", args=(4, 7))
+        req = RunnerRequest(method="multiply", args=(4, 7))
         req_bytes = serialize_runner_request(req)
         result_bytes = ssn.invoke(req_bytes)
         result = get_object(ObjectRef.decode(result_bytes))
         assert result == 28, f"Expected 28, got {result}"
 
         # Test subtract method
-        req = rl.RunnerRequest(method="subtract", args=(10, 3))
+        req = RunnerRequest(method="subtract", args=(10, 3))
         req_bytes = serialize_runner_request(req)
         result_bytes = ssn.invoke(req_bytes)
         result = get_object(ObjectRef.decode(result_bytes))
@@ -153,20 +153,20 @@ def test_flmrun_kwargs():
     from flamepy.core import get_object
 
     # Create a session with the function
-    ctx = rl.RunnerContext(execution_object=greet_func)
+    ctx = RunnerContext(execution_object=greet_func)
     common_data_bytes = serialize_runner_context(ctx, FLMRUN_E2E_APP)
     ssn = flamepy.create_session(FLMRUN_E2E_APP, common_data_bytes)
 
     try:
         # Test with keyword arguments
-        req = rl.RunnerRequest(method=None, kwargs={"name": "World", "greeting": "Hi"})
+        req = RunnerRequest(method=None, kwargs={"name": "World", "greeting": "Hi"})
         req_bytes = serialize_runner_request(req)
         result_bytes = ssn.invoke(req_bytes)
         result = get_object(ObjectRef.decode(result_bytes))
         assert result == "Hi, World!", f"Expected 'Hi, World!', got {result}"
 
         # Test with partial keyword arguments (uses default)
-        req = rl.RunnerRequest(method=None, kwargs={"name": "Python"})
+        req = RunnerRequest(method=None, kwargs={"name": "Python"})
         req_bytes = serialize_runner_request(req)
         result_bytes = ssn.invoke(req_bytes)
         result = get_object(ObjectRef.decode(result_bytes))
@@ -182,13 +182,13 @@ def test_flmrun_no_args():
     from flamepy.core import get_object
 
     # Create a session with the function
-    ctx = rl.RunnerContext(execution_object=get_message_func)
+    ctx = RunnerContext(execution_object=get_message_func)
     common_data_bytes = serialize_runner_context(ctx, FLMRUN_E2E_APP)
     ssn = flamepy.create_session(FLMRUN_E2E_APP, common_data_bytes)
 
     try:
         # Invoke with no arguments (all fields None)
-        req = rl.RunnerRequest(method=None)
+        req = RunnerRequest(method=None)
         req_bytes = serialize_runner_request(req)
         result_bytes = ssn.invoke(req_bytes)
         result = get_object(ObjectRef.decode(result_bytes))
@@ -206,7 +206,7 @@ def test_flmrun_multiple_tasks():
     from flamepy.core import get_object
 
     # Create a session with the function
-    ctx = rl.RunnerContext(execution_object=multiply_func)
+    ctx = RunnerContext(execution_object=multiply_func)
     common_data_bytes = serialize_runner_context(ctx, FLMRUN_E2E_APP)
     ssn = flamepy.create_session(FLMRUN_E2E_APP, common_data_bytes)
 
@@ -220,7 +220,7 @@ def test_flmrun_multiple_tasks():
         ]
 
         for args, expected in test_cases:
-            req = rl.RunnerRequest(method=None, args=args)
+            req = RunnerRequest(method=None, args=args)
             req_bytes = serialize_runner_request(req)
             result_bytes = ssn.invoke(req_bytes)
             result = get_object(ObjectRef.decode(result_bytes))
@@ -241,34 +241,34 @@ def test_flmrun_stateful_class():
     counter = Counter()
 
     # Create a session with the counter instance
-    ctx = rl.RunnerContext(execution_object=counter)
+    ctx = RunnerContext(execution_object=counter)
     common_data_bytes = serialize_runner_context(ctx, FLMRUN_E2E_APP)
     ssn = flamepy.create_session(FLMRUN_E2E_APP, common_data_bytes)
 
     try:
         # Test increment
-        req = rl.RunnerRequest(method="increment")
+        req = RunnerRequest(method="increment")
         req_bytes = serialize_runner_request(req)
         result_bytes = ssn.invoke(req_bytes)
         result = get_object(ObjectRef.decode(result_bytes))
         assert result == 1, f"Expected 1, got {result}"
 
         # Test increment again
-        req = rl.RunnerRequest(method="increment")
+        req = RunnerRequest(method="increment")
         req_bytes = serialize_runner_request(req)
         result_bytes = ssn.invoke(req_bytes)
         result = get_object(ObjectRef.decode(result_bytes))
         assert result == 2, f"Expected 2, got {result}"
 
         # Test add
-        req = rl.RunnerRequest(method="add", args=(5,))
+        req = RunnerRequest(method="add", args=(5,))
         req_bytes = serialize_runner_request(req)
         result_bytes = ssn.invoke(req_bytes)
         result = get_object(ObjectRef.decode(result_bytes))
         assert result == 7, f"Expected 7, got {result}"
 
         # Test get_count
-        req = rl.RunnerRequest(method="get_count")
+        req = RunnerRequest(method="get_count")
         req_bytes = serialize_runner_request(req)
         result_bytes = ssn.invoke(req_bytes)
         result = get_object(ObjectRef.decode(result_bytes))
@@ -284,14 +284,14 @@ def test_flmrun_lambda_function():
     from flamepy.core import get_object
 
     # Use module-level function instead of lambda (lambdas can't be pickled)
-    ctx = rl.RunnerContext(execution_object=square_func)
+    ctx = RunnerContext(execution_object=square_func)
     common_data_bytes = serialize_runner_context(ctx, FLMRUN_E2E_APP)
     ssn = flamepy.create_session(FLMRUN_E2E_APP, common_data_bytes)
 
     try:
         # Test with different values
         for x in [2, 5, 10, 15]:
-            req = rl.RunnerRequest(method=None, args=(x,))
+            req = RunnerRequest(method=None, args=(x,))
             req_bytes = serialize_runner_request(req)
             result_bytes = ssn.invoke(req_bytes)
             result = get_object(ObjectRef.decode(result_bytes))
@@ -308,11 +308,11 @@ def test_flmrun_complex_return_types():
     from flamepy.core import get_object
 
     # Test dict return
-    ctx = rl.RunnerContext(execution_object=return_dict_func)
+    ctx = RunnerContext(execution_object=return_dict_func)
     common_data_bytes = serialize_runner_context(ctx, FLMRUN_E2E_APP)
     ssn = flamepy.create_session(FLMRUN_E2E_APP, common_data_bytes)
     try:
-        req = rl.RunnerRequest(method=None, args=("test", 42))
+        req = RunnerRequest(method=None, args=("test", 42))
         req_bytes = serialize_runner_request(req)
         result_bytes = ssn.invoke(req_bytes)
         result = get_object(ObjectRef.decode(result_bytes))
@@ -321,11 +321,11 @@ def test_flmrun_complex_return_types():
         ssn.close()
 
     # Test list return
-    ctx = rl.RunnerContext(execution_object=return_list_func)
+    ctx = RunnerContext(execution_object=return_list_func)
     common_data_bytes = serialize_runner_context(ctx, FLMRUN_E2E_APP)
     ssn = flamepy.create_session(FLMRUN_E2E_APP, common_data_bytes)
     try:
-        req = rl.RunnerRequest(method=None, args=(5,))
+        req = RunnerRequest(method=None, args=(5,))
         req_bytes = serialize_runner_request(req)
         result_bytes = ssn.invoke(req_bytes)
         result = get_object(ObjectRef.decode(result_bytes))
@@ -334,11 +334,11 @@ def test_flmrun_complex_return_types():
         ssn.close()
 
     # Test tuple return
-    ctx = rl.RunnerContext(execution_object=return_tuple_func)
+    ctx = RunnerContext(execution_object=return_tuple_func)
     common_data_bytes = serialize_runner_context(ctx, FLMRUN_E2E_APP)
     ssn = flamepy.create_session(FLMRUN_E2E_APP, common_data_bytes)
     try:
-        req = rl.RunnerRequest(method=None, args=(123, "test"))
+        req = RunnerRequest(method=None, args=(123, "test"))
         req_bytes = serialize_runner_request(req)
         result_bytes = ssn.invoke(req_bytes)
         result = get_object(ObjectRef.decode(result_bytes))
@@ -350,21 +350,21 @@ def test_flmrun_complex_return_types():
 def test_flmrun_runner_request_validation():
     """Test Case 9: Test RunnerRequest validation."""
     # Test that args can be set alone
-    req = rl.RunnerRequest(method=None, args=(1, 2))
+    req = RunnerRequest(method=None, args=(1, 2))
     assert req.args == (1, 2)
     assert req.kwargs is None
 
     # Test that kwargs can be set alone
-    req = rl.RunnerRequest(method=None, kwargs={"a": 1})
+    req = RunnerRequest(method=None, kwargs={"a": 1})
     assert req.args is None
     assert req.kwargs == {"a": 1}
 
     # Test that both args and kwargs can be set together
-    req = rl.RunnerRequest(method=None, args=(1, 2), kwargs={"a": 1})
+    req = RunnerRequest(method=None, args=(1, 2), kwargs={"a": 1})
     assert req.args == (1, 2)
     assert req.kwargs == {"a": 1}
 
     # Test that no arguments is valid
-    req = rl.RunnerRequest(method=None)
+    req = RunnerRequest(method=None)
     assert req.args is None
     assert req.kwargs is None
