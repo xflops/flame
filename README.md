@@ -45,6 +45,8 @@ Future enhancements to the `Session Scheduler` will include features to improve 
 
 ## Quick Start Guide
 
+### Option 1: Docker Compose (Recommended for First-Time Users)
+
 This guide uses [Docker Compose](https://docs.docker.com/compose/) to start a local Flame cluster. After installing docker compose, you can start a local Flame cluster with the following steps:
 
 ```shell
@@ -56,6 +58,23 @@ After the Flame cluster is launched, use the following steps to log into the `fl
 ```shell
 $ docker compose exec flame-console /bin/bash
 ```
+
+### Option 2: Local Installation (Faster for Development)
+
+For development and testing, you can install Flame directly on your machine using `flmadm`:
+
+```shell
+# Quick start with helper script
+$ ./hack/local-test.sh install
+$ ./hack/local-test.sh start
+
+# Or using Make
+$ make install-dev
+$ /tmp/flame-dev/bin/flame-session-manager --config /tmp/flame-dev/conf/flame-cluster.yaml &
+$ /tmp/flame-dev/bin/flame-executor-manager --config /tmp/flame-dev/conf/flame-cluster.yaml &
+```
+
+For more details, see the [Local Development Guide](docs/tutorials/local-development.md).
 
 Then, verify the installation with `flmping` in the pod. Additionally, you can explore more meaningful examples [here](examples):
 
@@ -86,6 +105,33 @@ root@560624b037c9:/# flmctl list -s
  ID              State   App      Slots  Pending  Running  Succeed  Failed  Created  
  flmping-UdjmHs  Closed  flmping  1      0        0        10       0       06:57:53
 ```
+
+## CLI Tools
+
+Flame provides two separate command-line tools:
+
+- **`flmctl`**: User-facing CLI for submitting jobs, managing sessions, and querying cluster state
+- **`flmadm`**: Administrator CLI for installing, configuring, and managing Flame clusters
+
+### Installing Flame with flmadm
+
+For bare-metal or VM installations, use `flmadm` to install Flame:
+
+```shell
+# Basic installation (from GitHub)
+sudo flmadm install
+
+# Install from local source
+sudo flmadm install --src-dir /path/to/flame
+
+# Install and start services
+sudo flmadm install --enable
+
+# User-local installation (no systemd)
+flmadm install --no-systemd --prefix ~/flame
+```
+
+For more details, see the [flmadm README](flmadm/README.md).
 
 ## Documentation
 

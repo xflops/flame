@@ -34,7 +34,7 @@ mod view;
 struct Cli {
     /// The configuration of flmctl
     #[arg(long)]
-    flame_conf: Option<String>,
+    config: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -121,7 +121,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     flame_rs::apis::init_logger()?;
 
     let cli = Cli::parse();
-    let ctx = FlameContext::from_file(cli.flame_conf)?;
+    let ctx = FlameContext::from_file(cli.config)?;
 
     match &cli.command {
         Some(Commands::List {

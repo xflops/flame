@@ -36,7 +36,7 @@ use flame_cache;
 #[command(about = "Flame Executor Manager", long_about = None)]
 struct Cli {
     #[arg(long)]
-    flame_conf: Option<String>,
+    config: Option<String>,
     #[arg(long)]
     slots: Option<i32>,
 }
@@ -46,7 +46,7 @@ async fn main() -> Result<(), FlameError> {
     common::init_logger();
 
     let cli = Cli::parse();
-    let ctx = FlameClusterContext::from_file(cli.flame_conf)?;
+    let ctx = FlameClusterContext::from_file(cli.config)?;
 
     let mut handlers = vec![];
     let build_runtime = |name: &str, threads: usize| -> Result<Runtime, FlameError> {

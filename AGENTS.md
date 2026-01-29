@@ -38,20 +38,32 @@ Repo: https://github.com/xflops-io/flame
 
 ## Build, Test, and Development Commands
 
+### Docker-based Development (Traditional)
 - **Build:** `docker compose build` (compiles all images of Flame); if Docker is unavailable, Podman is an alternative
 - **Dev Environment:** 
-  - Start: `docker compose up -d` (start Flame cluster after rebuilding)
-  - Stop: `docker compose down` (stop the cluster)
-  - Restart: `docker compose restart` (restart specific services)
+ - Start: `docker compose up -d` (start Flame cluster after rebuilding)
+ - Stop: `docker compose down` (stop the cluster)
+ - Restart: `docker compose restart` (restart specific services)
 - **Test:**
-  - All tests: `make e2e` (runs all tests)
-  - Python tests: `make e2e-py`
-  - Rust tests: `make e2e-rs`
-  - Individual Rust tests: `cargo test` (from component directory)
+ - All tests: `make e2e` (runs all tests with docker compose)
+ - Python tests: `make e2e-py-docker`
+ - Rust tests: `make e2e-rs`
+
+### Local Development (New, Faster)
+- **Install:** `make install-dev` (installs Flame to /tmp/flame-dev, no sudo required)
+- **System Install:** `make install` (installs to /usr/local/flame, requires sudo)
+- **Quick Start:** `./hack/local-test.sh install && ./hack/local-test.sh start`
+- **Test:** `make e2e-py-local` (runs Python E2E tests against local cluster)
+- **Helper Script:** `./hack/local-test.sh {install|start|stop|restart|status|logs|test|clean}`
+- **Uninstall:** `make uninstall-dev` (removes local installation)
+- **Documentation:** See [docs/tutorials/local-development.md](docs/tutorials/local-development.md)
+
+### Build and Lint
+- **Build Release:** `cargo build --release` (builds all components)
 - **Lint/Format:** `make format` (auto-format all code using rustfmt and Python formatters)
-- **Build specific component:** `cargo build --release` (from component directory)
 - **Check without building:** `cargo check` (fast compilation check)
 - **Clippy linting:** `cargo clippy` (Rust linter)
+- **Build specific component:** `cargo build --release -p <component>` (e.g., `-p flmadm`)
 
 ## Coding Style & Naming Conventions
 

@@ -3,6 +3,7 @@ resolver = "1"
 members = [
     "common",
     "flmctl",
+    "flmadm",
     "flmping",
     "flmexec",
     "session_manager",

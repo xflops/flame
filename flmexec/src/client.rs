@@ -38,7 +38,7 @@ struct Script {
 #[command(about = "Flame Executor CLI", long_about = None)]
 struct Cli {
     #[arg(long)]
-    flame_conf: Option<String>,
+    config: Option<String>,
     #[arg(short, long)]
     slots: Option<u32>,
     #[arg(short, long)]
@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     flame::apis::init_logger()?;
     let cli = Cli::parse();
 
-    let ctx = FlameContext::from_file(cli.flame_conf)?;
+    let ctx = FlameContext::from_file(cli.config)?;
 
     let slots = cli.slots.unwrap_or(DEFAULT_SLOTS);
     let task_num = cli.task_num.unwrap_or(DEFAULT_TASK_NUM);

@@ -9,18 +9,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable]
         os: [ubuntu-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v2
+      
       - name: Set up Docker Compose
         uses: docker/setup-compose-action@v1
         with:
           version: latest
+      
       - name: Start Flame
         run: |
           docker compose up --build --force-recreate -d
+      
       - name: Run Python E2E Test
         run: |
-          make e2e-py
+          make e2e-py-docker

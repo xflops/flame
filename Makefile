@@ -22,8 +22,12 @@ FSM_DOCKERFILE = docker/Dockerfile.fsm
 FEM_DOCKERFILE = docker/Dockerfile.fem
 CONSOLE_DOCKERFILE = docker/Dockerfile.console
 
+# Installation configuration
+INSTALL_PREFIX ?= /tmp/flame-dev
+FLAME_ENDPOINT ?= http://127.0.0.1:8080
+
 # Default target
-.PHONY: help build docker-build docker-push docker-release docker-clean update_protos init sdk-go-build sdk-go-test sdk-go-clean e2e e2e-py e2e-rs format format-rust format-python
+.PHONY: help build build-release docker-build docker-push docker-release docker-clean update_protos init sdk-go-build sdk-go-test sdk-go-clean e2e e2e-py e2e-py-docker e2e-py-local e2e-local e2e-rs format format-rust format-python install install-dev uninstall uninstall-dev start-services stop-services
 
 help: ## Show this help message
 	@echo "Available targets:"
@@ -32,8 +36,36 @@ help: ## Show this help message
 build: update_protos ## Build the Rust project
 	cargo build
 
+build-release: update_protos ## Build the Rust project in release mode
+	cargo build --release
+
 init: ## Install required tools
 	cargo install cargo-get --force
+
+# Installation targets using flmadm
+install: build-release ## Install Flame to system (requires sudo)
+	sudo ./target/release/flmadm install --src-dir . --skip-build --enable
+
+install-dev: build-release ## Install Flame to dev location (no sudo required)
+	./target/release/flmadm install --src-dir . --skip-build --no-systemd --prefix $(INSTALL_PREFIX)
+	@echo ""
+	@echo "Flame installed to: $(INSTALL_PREFIX)"
+	@echo "Add to PATH: export PATH=$(INSTALL_PREFIX)/bin:\$$PATH"
+	@echo "Start services manually:"
+	@echo "  $(INSTALL_PREFIX)/bin/flame-session-manager --config $(INSTALL_PREFIX)/conf/flame-cluster.yaml &"
+	@echo "  $(INSTALL_PREFIX)/bin/flame-executor-manager --config $(INSTALL_PREFIX)/conf/flame-cluster.yaml &"
+
+uninstall: ## Uninstall Flame from system (requires sudo)
+	sudo ./target/release/flmadm uninstall --force
+
+uninstall-dev: ## Uninstall Flame from dev location
+	./target/release/flmadm uninstall --prefix $(INSTALL_PREFIX) --no-backup --force || true
+
+start-services: ## Start Flame services (systemd)
+	sudo systemctl start flame-session-manager flame-executor-manager
+
+stop-services: ## Stop Flame services (systemd)
+	sudo systemctl stop flame-executor-manager flame-session-manager
 
 update_protos: ## Update protobuf files
 	@cp rpc/protos/frontend.proto sdk/rust/protos
@@ -67,13 +99,21 @@ format-python: ## Format Python code with ruff
 format: format-rust format-python ## Format both Rust and Python code
 
 # E2E testing targets
-e2e-py: ## Run Python E2E tests
+e2e-py: ## Run Python E2E tests (use e2e-py-docker for docker compose or e2e-py-local for local cluster)
+	@echo "Use 'make e2e-py-docker' for docker compose tests or 'make e2e-py-local' for local cluster tests"
+
+e2e-py-docker: ## Run Python E2E tests with docker compose
 	$(CONTAINER_RUNTIME) compose exec -w /opt/e2e flame-console uv run -n pytest -vv --durations=0 .
+
+e2e-py-local: ## Run Python E2E tests against local cluster
+	cd e2e && FLAME_ENDPOINT=$(FLAME_ENDPOINT) uv run pytest -vv --durations=0 .
 
 e2e-rs: ## Run Rust E2E tests
 	cargo test --workspace --exclude cri-rs -- --nocapture
 
-e2e: e2e-py e2e-rs ## Run all E2E tests (Python and Rust)
+e2e: e2e-py-docker e2e-rs ## Run all E2E tests (Python and Rust) with docker compose
+
+e2e-local: e2e-py-local e2e-rs ## Run all E2E tests against local cluster
 
 # Docker build targets
 docker-build-fsm: update_protos ## Build session manager Docker image

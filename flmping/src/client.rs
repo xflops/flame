@@ -39,7 +39,7 @@ use flame_rs::{self as flame};
 struct Cli {
     #[arg(long)]
     /// The flame configuration file
-    flame_conf: Option<String>,
+    config: Option<String>,
     #[arg(short, long, default_value = "1")]
     /// The number of slots to use
     slots: u32,
@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     flame::apis::init_logger()?;
     let cli = Cli::parse();
 
-    let ctx = FlameContext::from_file(cli.flame_conf)?;
+    let ctx = FlameContext::from_file(cli.config)?;
 
     let slots = cli.slots;
     let task_num = cli.task_num;
