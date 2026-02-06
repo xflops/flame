@@ -10,7 +10,7 @@ The flame-object-cache is an embedded library that provides persistent object st
 
 - **Persistent Storage**: Objects are stored on disk using Arrow IPC format and survive server restarts
 - **Arrow Flight Protocol**: High-performance gRPC-based protocol for data transfer
-- **Key-based Organization**: Objects organized by session ID (`session_id/object_id`)
+- **Key-based Organization**: Objects organized by application and session ID (`application_id/session_id/object_id`)
 - **In-memory Index**: Fast O(1) lookups with disk-backed persistence
 - **Zero-copy Operations**: Leverages Arrow's efficient columnar format
 
@@ -40,6 +40,10 @@ clusters:
 
 - `FLAME_CACHE_STORAGE`: Override cache storage path
 - `FLAME_CACHE_ENDPOINT`: Override cache endpoint
+- `RUST_LOG`: Control log level (e.g., `debug`, `info`, `warn`, `error`)
+  - Set to `debug` to see detailed debug logs: `RUST_LOG=flame_cache=debug`
+  - Set to `trace` for even more verbose output: `RUST_LOG=flame_cache=trace`
+  - Set globally: `RUST_LOG=debug` (shows debug logs from all modules)
 
 ## Usage
 
@@ -50,10 +54,10 @@ The cache server is automatically started when the executor-manager starts. No s
 ### Python SDK
 
 ```python
-from flamepy import put_object, get_object, ObjectRef
+from flamepy import put_object, get_object, update_object, ObjectRef
 
-# Put an object
-ref = put_object("session123", my_data)
+# Put an object (application_id is required and is the first parameter)
+ref = put_object("my-app", "session123", my_data)
 print(f"Stored at: {ref.endpoint}/{ref.key}")
 
 # Get an object
@@ -67,10 +71,11 @@ new_ref = update_object(ref, new_data)
 
 ```
 /var/lib/flame/cache/
-└── session_id/
-    ├── object1.arrow
-    ├── object2.arrow
-    └── object3.arrow
+└── application_id/
+    └── session_id/
+        ├── object1.arrow
+        ├── object2.arrow
+        └── object3.arrow
 ```
 
 Each object is stored as an Arrow IPC file with schema: `{version: UInt64, data: Binary}`
@@ -97,11 +102,93 @@ cargo build --package object_cache --release
 cargo build --package executor_manager --release
 ```
 
+## Logging Configuration
+
+The object cache uses the `tracing` crate for logging. Log levels are controlled via the `RUST_LOG` environment variable.
+
+### Enable Debug Logs
+
+To see debug logs from object_cache:
+
+```bash
+# Enable debug logs for object_cache only
+export RUST_LOG=flame_cache=debug
+
+# Or enable debug logs for all modules
+export RUST_LOG=debug
+
+# For even more verbose output (trace level)
+export RUST_LOG=flame_cache=trace
+
+# Output ALL logs from all modules (maximum verbosity)
+export RUST_LOG=trace
+
+# Output all logs including third-party libraries (override default filters)
+export RUST_LOG=trace,h2=trace,hyper_util=trace,tower=trace
+```
+
+### Log Level Examples
+
+```bash
+# Debug level (recommended for development)
+RUST_LOG=flame_cache=debug flame-object-cache --endpoint grpc://127.0.0.1:9090
+
+# Info level (default)
+RUST_LOG=flame_cache=info flame-object-cache --endpoint grpc://127.0.0.1:9090
+
+# Trace level (very verbose, for deep debugging)
+RUST_LOG=flame_cache=trace flame-object-cache --endpoint grpc://127.0.0.1:9090
+
+# Output ALL logs from all modules (maximum verbosity)
+RUST_LOG=trace flame-object-cache --endpoint grpc://127.0.0.1:9090
+
+# Output all logs including network libraries (override default filters)
+RUST_LOG=trace,h2=trace,hyper_util=trace,tower=trace flame-object-cache --endpoint grpc://127.0.0.1:9090
+```
+
+### Available Log Levels
+
+- `error`: Only error messages
+- `warn`: Warnings and errors
+- `info`: Informational messages (default)
+- `debug`: Debug information including object operations
+- `trace`: Very detailed trace information
+
+### Debug Log Output
+
+When debug logging is enabled, you'll see logs for:
+- Object put/get/update/delete operations
+- Disk I/O operations
+- Object loading from disk
+- Key format parsing
+- Flight protocol operations
+
+### Output All Logs
+
+To output **all logs** including third-party libraries:
+
+```bash
+# Maximum verbosity - all modules at trace level
+RUST_LOG=trace flame-object-cache --endpoint grpc://127.0.0.1:9090
+
+# Override default filters to see network library logs too
+RUST_LOG=trace,h2=trace,hyper_util=trace,tower=trace,sqlx=trace flame-object-cache --endpoint grpc://127.0.0.1:9090
+
+# Or set globally before running
+export RUST_LOG=trace
+flame-object-cache --endpoint grpc://127.0.0.1:9090
+```
+
+**Note**: By default, some third-party libraries (h2, hyper_util, tower, sqlx) have their log levels restricted to reduce noise. To see their logs, explicitly set them to `trace` as shown above.
+
 ## Running with Docker Compose
 
 ```bash
 # Start all services (cache runs embedded in executor-manager)
 docker compose up -d
+
+# View cache logs with debug level
+RUST_LOG=flame_cache=debug docker compose up
 
 # View cache logs (part of executor-manager logs)
 docker compose logs flame-executor-manager | grep cache

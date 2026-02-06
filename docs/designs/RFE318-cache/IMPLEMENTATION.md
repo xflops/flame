@@ -99,7 +99,7 @@ class ObjectRef:
 @dataclass
 class ObjectRef:
     endpoint: str  # e.g., "grpc://127.0.0.1:9090"
-    key: str       # e.g., "session_id/object_id"
+    key: str       # e.g., "application_id/session_id/object_id"
     version: int   # Always 0 for now
 ```
 
@@ -126,7 +126,7 @@ cache:
 - `do_action`: Legacy operations (PUT, UPDATE, DELETE)
 
 ### Python SDK
-- `put_object(session_id, obj)`: Store object, returns ObjectRef
+- `put_object(application_id, session_id, obj)`: Store object, returns ObjectRef (application_id is required and is the first parameter)
 - `get_object(ref)`: Retrieve object from cache
 - `update_object(ref, new_obj)`: Update existing object
 
@@ -134,7 +134,7 @@ cache:
 
 Each object is stored as an Arrow IPC file with:
 - **Schema**: `{version: UInt64, data: Binary}`
-- **Filename**: `{session_id}/{object_id}.arrow`
+- **Filename**: `{application_id}/{session_id}/{object_id}.arrow`
 - **Format**: Arrow IPC File format (version 4)
 
 ## Testing
@@ -159,9 +159,9 @@ make e2e-py
 import flamepy
 from flamepy.core import put_object, get_object
 
-# Put an object
+# Put an object (application_id is required and is the first parameter)
 data = {"test": "data", "value": 123}
-ref = put_object("test-session", data)
+ref = put_object("test-app", "test-session", data)
 print(f"Stored: {ref.key} at {ref.endpoint}")
 
 # Get the object

@@ -29,7 +29,7 @@ class ObjectRef:
     """Object reference for remote cached objects."""
 
     endpoint: str  # Cache server endpoint (e.g., "grpc://127.0.0.1:9090")
-    key: str  # Object key in format "session_id/object_id"
+    key: str  # Object key in format "application_id/session_id/object_id"
     version: int = 0
 
     def encode(self) -> bytes:
@@ -149,10 +149,11 @@ def _do_put_remote(client: flight.FlightClient, descriptor: flight.FlightDescrip
     raise ValueError("No result metadata received from cache server")
 
 
-def put_object(session_id: str, obj: Any) -> "ObjectRef":
+def put_object(application_id: str, session_id: str, obj: Any) -> "ObjectRef":
     """Put an object into the cache.
 
     Args:
+        application_id: Application ID (required). Uses format "application_id/session_id/object_id".
         session_id: The session ID for the object
         obj: The object to cache (will be pickled)
 
@@ -184,6 +185,9 @@ def put_object(session_id: str, obj: Any) -> "ObjectRef":
     # Serialize object to Arrow RecordBatch
     batch = _serialize_object(obj)
 
+    # Generate object_id
+    object_id = str(uuid.uuid4())
+
     # Check if local storage is configured and accessible
     if cache_storage:
         storage_path = Path(cache_storage)
@@ -199,11 +203,11 @@ def put_object(session_id: str, obj: Any) -> "ObjectRef":
 
     if use_local_storage:
         # Write to local storage (optimization when client has access to cache filesystem)
-        object_id = str(uuid.uuid4())
-        key = f"{session_id}/{object_id}"
-
-        # Create session directory
-        session_dir = storage_path / session_id
+        # Format: application_id/session_id/object_id
+        key = f"{application_id}/{session_id}/{object_id}"
+        # Create application/session directory structure
+        application_dir = storage_path / application_id
+        session_dir = application_dir / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
 
         # Write Arrow IPC file
@@ -230,8 +234,10 @@ def put_object(session_id: str, obj: Any) -> "ObjectRef":
         # Use remote cache via Arrow Flight
         client = _get_flight_client(cache_endpoint)
 
-        # Encode session_id in FlightDescriptor path
-        upload_descriptor = flight.FlightDescriptor.for_path(session_id)
+        # Format: application_id/session_id/object_id
+        key_path = f"{application_id}/{session_id}/{object_id}"
+        upload_descriptor = flight.FlightDescriptor.for_path(key_path)
+
         return _do_put_remote(client, upload_descriptor, batch)
 
 
@@ -287,10 +293,11 @@ def update_object(ref: ObjectRef, new_obj: Any) -> "ObjectRef":
     client = _get_flight_client(ref.endpoint)
 
     # Parse key to validate format
+    # Format: application_id/session_id/object_id
     parts = ref.key.split("/")
-    if len(parts) != 2:
-        raise ValueError(f"Invalid key format: {ref.key}")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid key format (expected application_id/session_id/object_id): {ref.key}")
 
-    # Use full key (session_id/object_id) in FlightDescriptor to update existing object
+    # Use full key in FlightDescriptor to update existing object
     upload_descriptor = flight.FlightDescriptor.for_path(ref.key)
     return _do_put_remote(client, upload_descriptor, batch)

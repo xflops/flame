@@ -7,6 +7,10 @@ edition = "2021"
 name = "flame_cache"
 path = "src/lib.rs"
 
+[[bin]]
+name = "flame-object-cache"
+path = "src/main.rs"
+
 [dependencies]
 common = { path = "../common" }
 stdng = { path = "../stdng" }
@@ -21,6 +25,7 @@ uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_derive = { workspace = true }
+serde_yaml = { workspace = true }
 bytes = { workspace = true }
 url = { workspace = true }
 network-interface = "2"
@@ -34,3 +39,6 @@ prost-types = { workspace = true }
 base64 = "0.22"
 bson = "2"
 clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
