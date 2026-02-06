@@ -22,7 +22,8 @@ This document describes the enhancements made to the `FlameRunpyService` to impr
 ```python
 # Put the result into cache and return ObjectRef
 logger.debug("Putting result into cache")
-object_ref = put_object(context.session_id, result)
+application_id = self._ssn_ctx.application.name
+object_ref = put_object(application_id, context.session_id, result)
 logger.info(f"Result cached with ObjectRef: {object_ref}")
 
 # Return the ObjectRef as TaskOutput

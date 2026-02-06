@@ -918,7 +918,7 @@ def service(self, execution_object, stateful=None, autoscale=None):
     
     # Step 6: Serialize and store in cache
     serialized = cloudpickle.dumps(runner_context)
-    object_ref = put_object(session_id, serialized)
+    object_ref = put_object(self._name, session_id, serialized)
     
     # Step 7: Create session and RunnerService
     return RunnerService(self._name, execution_object, stateful, autoscale)
@@ -994,7 +994,8 @@ def on_task_invoke(self, context: TaskContext) -> Optional[TaskOutput]:
         update_object(object_ref, serialized)
     
     # Step 6: Return result
-    result_ref = put_object(context.session_id, result)
+    application_id = self._ssn_ctx.application.name
+    result_ref = put_object(application_id, context.session_id, result)
     return TaskOutput(result_ref.encode())
 ```
 

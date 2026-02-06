@@ -98,7 +98,7 @@ The cache server implements the Arrow Flight protocol with the following operati
    - Behavior: Reads data from disk using Arrow IPC
 
 3. **get_flight_info**: Get metadata about a flight
-   - Request: FlightDescriptor with path (`{session_id}/{object_id}`)
+   - Request: FlightDescriptor with path (`{application_id}/{session_id}/{object_id}`)
    - Response: FlightInfo with schema information
 
 4. **list_flights**: List all cached objects
@@ -143,7 +143,10 @@ class ObjectRef:
 
 **Python SDK Interface:**
 
-1. **put_object(session_id: str, obj: Any) -> ObjectRef**
+1. **put_object(application_id: str, session_id: str, obj: Any) -> ObjectRef**
+   - `application_id`: Required application ID for organizing objects (first parameter)
+   - `session_id`: The session ID for the object
+   - `obj`: The object to cache (will be pickled)
    - If `cache.storage` is set:
      - Write data to local storage using Arrow IPC
      - Get flight info to construct an ObjectRef with cache's remote endpoint
@@ -151,7 +154,7 @@ class ObjectRef:
      - Connect to remote cache server via endpoint
      - Use Arrow Flight do_put to upload object
    - If endpoint is not set: raise exception
-   - Returns ObjectRef built from FlightInfo
+   - Returns ObjectRef with key format "application_id/session_id/object_id"
 
 2. **get_object(ref: ObjectRef) -> Any**
    - Connect to cache server using ref.endpoint
@@ -320,9 +323,10 @@ pub struct ObjectMetadata {
 
 **Storage Organization:**
 - Root: `{storage_path}/`
-- Session directory: `{storage_path}/{session_id}/`
-- Object file: `{storage_path}/{session_id}/{object_id}.arrow`
-- Key format: `{session_id}/{object_id}`
+- Application directory: `{storage_path}/{application_id}/`
+- Session directory: `{storage_path}/{application_id}/{session_id}/`
+- Object file: `{storage_path}/{application_id}/{session_id}/{object_id}.arrow`
+- Key format: `{application_id}/{session_id}/{object_id}`
 
 **Arrow IPC File Format:**
 - Each object stored as a single RecordBatch in Arrow IPC file
@@ -341,11 +345,11 @@ pub struct ObjectMetadata {
 
 **do_put Algorithm:**
 1. Receive FlightData stream with RecordBatch
-2. Extract session_id from app_metadata
-3. Generate unique object_id (UUID)
-4. Construct key: `{session_id}/{object_id}`
-5. Create session directory if it doesn't exist
-6. Write RecordBatch to Arrow IPC file: `{storage_path}/{session_id}/{object_id}.arrow`
+2. Extract application_id, session_id, and object_id from FlightDescriptor path or app_metadata
+3. Generate unique object_id (UUID) if not provided
+4. Construct key: `{application_id}/{session_id}/{object_id}`
+5. Create application/session directory structure if it doesn't exist
+6. Write RecordBatch to Arrow IPC file: `{storage_path}/{application_id}/{session_id}/{object_id}.arrow`
 7. Update in-memory index: `HashMap<key, ObjectMetadata>`
 8. Construct ObjectRef: `{endpoint, key, version: 0}` (using public endpoint from ObjectCache)
 9. Serialize ObjectRef to BSON
@@ -353,9 +357,9 @@ pub struct ObjectMetadata {
 
 **do_get Algorithm:**
 1. Extract key from Ticket
-2. Parse key to get session_id and object_id
+2. Parse key to get application_id, session_id, and object_id
 3. Check in-memory index for key
-4. If found, read Arrow IPC file: `{storage_path}/{session_id}/{object_id}.arrow`
+4. If found, read Arrow IPC file: `{storage_path}/{application_id}/{session_id}/{object_id}.arrow`
 5. Deserialize RecordBatch from file
 6. Convert RecordBatch to FlightData
 7. Stream FlightData to client
@@ -366,8 +370,8 @@ pub struct ObjectMetadata {
 3. For each session directory:
    - List all `.arrow` files
    - For each file:
-     - Extract object_id from filename
-     - Construct key: `{session_id}/{object_id}`
+     - Extract application_id, session_id, and object_id from directory structure and filename
+     - Construct key: `{application_id}/{session_id}/{object_id}`
      - Create FlightInfo with key as ticket and cache service's public endpoint
      - Stream FlightInfo to client
 
@@ -376,19 +380,19 @@ pub struct ObjectMetadata {
 2. If set:
    - Serialize object to RecordBatch
    - Generate object_id (UUID)
-   - Write to local storage: `{cache.storage}/{session_id}/{object_id}.arrow`
+   - Write to local storage: `{cache.storage}/{application_id}/{session_id}/{object_id}.arrow`
    - Connect to cache server using `cache.endpoint`
-   - Get flight info using FlightDescriptor with path `{session_id}/{object_id}`
-   - Construct ObjectRef with cache server's endpoint from FlightInfo, key `{session_id}/{object_id}`, and version 0
+   - Get flight info using FlightDescriptor with path `{application_id}/{session_id}/{object_id}`
+   - Construct ObjectRef with cache server's endpoint from FlightInfo, key `{application_id}/{session_id}/{object_id}`, and version 0
 3. If not set:
    - Check if `cache.endpoint` is set, else raise exception
    - Connect to remote cache server via endpoint
-   - Call do_put to upload object
+   - Call do_put with path `{application_id}/{session_id}/{object_id}` to upload object
    - Extract ObjectRef from PutResult app_metadata
 4. Return ObjectRef
 
 **Key Construction:**
-- Format: `{session_id}/{object_id}`
+- Format: `{application_id}/{session_id}/{object_id}`
 - Session directory creation: Automatically created when first object is stored
 - Object ID generation: UUID v4
 
@@ -428,7 +432,7 @@ pub struct ObjectMetadata {
 - No authentication/authorization in this version
 - File permissions: Cache files should be readable/writable by cache server process only
 - Network: Server binds to both public IP and localhost (consider firewall rules)
-- Input validation: Validate session_id and object_id formats
+- Input validation: Validate application_id, session_id, and object_id formats
 
 **Observability:**
 - Logging: Use tracing for structured logging
@@ -471,28 +475,28 @@ pub struct ObjectMetadata {
 **Example 1: Python SDK Client Uploading Object to Remote Cache**
 - Description: A Python SDK client uploads an object to a remote cache server
 - Step-by-step workflow:
-  1. Client calls `put_object(session_id="sess123", obj=my_data)`
+  1. Client calls `put_object(application_id="my-app", session_id="sess123", obj=my_data)`
   2. SDK checks `cache.storage` - not set
   3. SDK checks `cache.endpoint` - set to "grpc://cache.example.com:9090"
   4. SDK serializes object to RecordBatch
   5. SDK connects to cache server via Arrow Flight
-  6. SDK calls do_put with RecordBatch and session_id in metadata
-  7. Cache server generates object_id, creates session directory, writes Arrow IPC file
-  8. Cache server returns ObjectRef in PutResult
+  6. SDK calls do_put with RecordBatch and path "my-app/sess123/{object_id}"
+  7. Cache server generates object_id, creates application/session directory, writes Arrow IPC file
+  8. Cache server returns ObjectRef in PutResult with key "my-app/sess123/{object_id}"
   9. SDK deserializes ObjectRef and returns to client
 - Expected outcome: Object is stored on cache server, client receives ObjectRef
 
 **Example 2: Python SDK Client Uploading Object to Local Cache**
 - Description: A Python SDK client uploads an object using local storage
 - Step-by-step workflow:
-  1. Client calls `put_object(session_id="sess123", obj=my_data)`
+  1. Client calls `put_object(application_id="my-app", session_id="sess123", obj=my_data)`
   2. SDK checks `cache.storage` - set to "/tmp/flame_cache"
   3. SDK serializes object to RecordBatch
   4. SDK generates object_id (UUID)
-  5. SDK writes RecordBatch to `/tmp/flame_cache/sess123/{object_id}.arrow`
+  5. SDK writes RecordBatch to `/tmp/flame_cache/my-app/sess123/{object_id}.arrow`
   6. SDK connects to cache server using `cache.endpoint`
-  7. SDK gets flight info using FlightDescriptor with path `sess123/{object_id}`
-  8. SDK constructs ObjectRef with cache server's endpoint from FlightInfo, key `sess123/{object_id}`, and version 0
+  7. SDK gets flight info using FlightDescriptor with path `my-app/sess123/{object_id}`
+  8. SDK constructs ObjectRef with cache server's endpoint from FlightInfo, key `my-app/sess123/{object_id}`, and version 0
   9. SDK returns ObjectRef to client
 - Expected outcome: Object is stored locally, client receives ObjectRef with remote endpoint from FlightInfo
 
@@ -542,8 +546,8 @@ pub struct ObjectMetadata {
 - Step-by-step workflow:
   1. RL module creates RunnerService with execution object
   2. RunnerService serializes RunnerContext using cloudpickle
-  3. RunnerService calls put_object with session_id and serialized context
-  4. Cache stores context and returns ObjectRef
+  3. RunnerService calls put_object with application_id, session_id, and serialized context
+  4. Cache stores context and returns ObjectRef with key "application_id/session_id/object_id"
   5. RunnerService encodes ObjectRef to bytes for core API
   6. Core API stores ObjectRef bytes as common_data
   7. Remote executor retrieves common_data, decodes ObjectRef

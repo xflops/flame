@@ -17,17 +17,18 @@ from flamepy.core import ObjectRef, get_object, put_object, update_object
 
 def test_cache_put_and_get():
     """Test basic put and get operations."""
+    application_id = "test-app"
     session_id = "test-session-001"
     test_data = {"message": "Hello, Flame!", "value": 42}
 
     # Put object
-    ref = put_object(session_id, test_data)
+    ref = put_object(application_id, session_id, test_data)
 
     # Verify ObjectRef structure
     assert isinstance(ref, ObjectRef)
     assert ref.endpoint is not None
     assert ref.key is not None
-    assert ref.key.startswith(session_id + "/")
+    assert ref.key.startswith(f"{application_id}/{session_id}/")
     assert ref.version == 0
 
     # Get object
@@ -39,12 +40,13 @@ def test_cache_put_and_get():
 
 def test_cache_update():
     """Test update operation."""
+    application_id = "test-app"
     session_id = "test-session-002"
     original_data = {"count": 0}
     updated_data = {"count": 1}
 
     # Put original object
-    ref = put_object(session_id, original_data)
+    ref = put_object(application_id, session_id, original_data)
 
     # Update object
     new_ref = update_object(ref, updated_data)
@@ -62,6 +64,7 @@ def test_cache_update():
 
 def test_cache_with_complex_objects():
     """Test caching complex Python objects."""
+    application_id = "test-app"
     session_id = "test-session-003"
 
     class ComplexObject:
@@ -75,7 +78,7 @@ def test_cache_with_complex_objects():
     test_obj = ComplexObject("test", [1, 2, 3, {"nested": "value"}])
 
     # Put object
-    ref = put_object(session_id, test_obj)
+    ref = put_object(application_id, session_id, test_obj)
 
     # Get object
     retrieved_obj = get_object(ref)
@@ -88,7 +91,7 @@ def test_cache_with_complex_objects():
 
 def test_objectref_encode_decode():
     """Test ObjectRef serialization and deserialization."""
-    ref = ObjectRef(endpoint="grpc://127.0.0.1:9090", key="session123/obj456", version=0)
+    ref = ObjectRef(endpoint="grpc://127.0.0.1:9090", key="app123/session123/obj456", version=0)
 
     # Encode
     encoded = ref.encode()
