@@ -153,19 +153,33 @@ impl HostShim {
         })
     }
 
-    /// Setup working directory for an application instance (per-instance).
-    fn setup_working_directory(work_dir: &Path) -> Result<(), FlameError> {
+    /// Setup working directory and tmp directory for an application instance (per-instance).
+    fn setup_working_directory(work_dir: &Path) -> Result<HashMap<String, String>, FlameError> {
         trace_fn!("HostShim::setup_working_directory");
+
+        let tmp_dir = work_dir.join("tmp");
 
         tracing::debug!(
             "Working directory of application instance: {}",
             work_dir.display()
         );
+        tracing::debug!(
+            "Temporary directory of application instance: {}",
+            tmp_dir.display()
+        );
 
-        Self::create_dir(work_dir, "working")
+        Self::create_dir(work_dir, "working")?;
+        Self::create_dir(&tmp_dir, "temporary")?;
+
+        let mut envs = HashMap::new();
+        envs.insert("TMPDIR".to_string(), tmp_dir.to_string_lossy().to_string());
+        envs.insert("TEMP".to_string(), tmp_dir.to_string_lossy().to_string());
+        envs.insert("TMP".to_string(), tmp_dir.to_string_lossy().to_string());
+
+        Ok(envs)
     }
 
-    /// Setup per-application cache directories for uv, pip, and tmp.
+    /// Setup per-application cache directories for uv and pip.
     /// These directories are shared across all instances of the same application.
     /// Uses FLAME_HOME/data/cache if FLAME_HOME is set, otherwise falls back to FLAME_WORKING_DIRECTORY/cache.
     fn setup_cache(app_name: &str) -> Result<HashMap<String, String>, FlameError> {
@@ -176,15 +190,9 @@ impl HostShim {
             Err(_) => Path::new(FLAME_WORKING_DIRECTORY).join("cache"),
         };
         let app_cache_base = cache_base.join(app_name);
-        let tmp_dir = app_cache_base.join("tmp");
         let uv_cache_dir = app_cache_base.join("uv");
         let pip_cache_dir = app_cache_base.join("pip");
 
-        tracing::debug!(
-            "Temporary directory of application <{}>: {}",
-            app_name,
-            tmp_dir.display()
-        );
         tracing::debug!(
             "UV cache directory of application <{}>: {}",
             app_name,
@@ -196,14 +204,10 @@ impl HostShim {
             pip_cache_dir.display()
         );
 
-        Self::create_dir(&tmp_dir, "temporary")?;
         Self::create_dir(&uv_cache_dir, "UV cache")?;
         Self::create_dir(&pip_cache_dir, "PIP cache")?;
 
         let mut envs = HashMap::new();
-        envs.insert("TMPDIR".to_string(), tmp_dir.to_string_lossy().to_string());
-        envs.insert("TEMP".to_string(), tmp_dir.to_string_lossy().to_string());
-        envs.insert("TMP".to_string(), tmp_dir.to_string_lossy().to_string());
         envs.insert(
             "UV_CACHE_DIR".to_string(),
             uv_cache_dir.to_string_lossy().to_string(),
@@ -288,8 +292,11 @@ impl HostShim {
 
         let work_dir = cur_dir.clone();
 
-        // Setup working directory (per-instance)
-        Self::setup_working_directory(&work_dir)?;
+        // Setup working directory and tmp (per-instance)
+        let work_dir_envs = Self::setup_working_directory(&work_dir)?;
+        for (key, value) in work_dir_envs {
+            envs.entry(key).or_insert(value);
+        }
 
         // Setup cache directories (per-application) and get environment defaults
         // Use entry().or_insert() so application-specific envs take precedence over defaults
