@@ -120,6 +120,8 @@ pub fn new_async_ptr<T>(t: T) -> AsyncMutexPtr<T> {
     Arc::new(tokio::sync::Mutex::new(t))
 }
 
+pub const FLAME_HOME: &str = "FLAME_HOME";
+pub const FLAME_LOG: &str = "FLAME_LOG";
 pub const FLAME_WORKING_DIRECTORY: &str = "/tmp/flame";
 pub const FLAME_INSTANCE_ENDPOINT: &str = "FLAME_INSTANCE_ENDPOINT";
 pub const FLAME_CACHE_ENDPOINT: &str = "FLAME_CACHE_ENDPOINT";
