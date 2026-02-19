@@ -46,8 +46,8 @@ use crate::shims::grpc_shim::GrpcShim;
 use crate::shims::{Shim, ShimPtr};
 use common::apis::{ApplicationContext, SessionContext, TaskContext, TaskOutput, TaskResult};
 use common::{
-    FlameError, FLAME_CACHE_ENDPOINT, FLAME_ENDPOINT, FLAME_INSTANCE_ENDPOINT,
-    FLAME_WORKING_DIRECTORY,
+    FlameError, FLAME_CACHE_ENDPOINT, FLAME_ENDPOINT, FLAME_HOME, FLAME_INSTANCE_ENDPOINT,
+    FLAME_LOG, FLAME_WORKING_DIRECTORY,
 };
 
 struct HostInstance {
@@ -122,7 +122,6 @@ pub struct HostShim {
 }
 
 const RUST_LOG: &str = "RUST_LOG";
-const FLAME_LOG: &str = "FLAME_LOG";
 const DEFAULT_SVC_LOG_LEVEL: &str = "info";
 
 impl HostShim {
@@ -154,12 +153,11 @@ impl HostShim {
         })
     }
 
+    /// Setup working directory and tmp directory for an application instance (per-instance).
     fn setup_working_directory(work_dir: &Path) -> Result<HashMap<String, String>, FlameError> {
         trace_fn!("HostShim::setup_working_directory");
 
         let tmp_dir = work_dir.join("tmp");
-        let uv_cache_dir = work_dir.join(".uv");
-        let pip_cache_dir = work_dir.join(".pip");
 
         tracing::debug!(
             "Working directory of application instance: {}",
@@ -169,26 +167,47 @@ impl HostShim {
             "Temporary directory of application instance: {}",
             tmp_dir.display()
         );
-        tracing::debug!(
-            "UV cache directory of application instance: {}",
-            uv_cache_dir.display()
-        );
-        tracing::debug!(
-            "PIP cache directory of application instance: {}",
-            pip_cache_dir.display()
-        );
 
-        // Create the working, temporary, and cache directories if they don't exist
-        Self::create_dir(&work_dir, "working")?;
+        Self::create_dir(work_dir, "working")?;
         Self::create_dir(&tmp_dir, "temporary")?;
-        Self::create_dir(&uv_cache_dir, "UV cache")?;
-        Self::create_dir(&pip_cache_dir, "PIP cache")?;
 
-        // Build environment variables for the application instance
         let mut envs = HashMap::new();
         envs.insert("TMPDIR".to_string(), tmp_dir.to_string_lossy().to_string());
         envs.insert("TEMP".to_string(), tmp_dir.to_string_lossy().to_string());
         envs.insert("TMP".to_string(), tmp_dir.to_string_lossy().to_string());
+
+        Ok(envs)
+    }
+
+    /// Setup per-application cache directories for uv and pip.
+    /// These directories are shared across all instances of the same application.
+    /// Uses FLAME_HOME/data/cache if FLAME_HOME is set, otherwise falls back to FLAME_WORKING_DIRECTORY/cache.
+    fn setup_cache(app_name: &str) -> Result<HashMap<String, String>, FlameError> {
+        trace_fn!("HostShim::setup_cache");
+
+        let cache_base = match env::var(FLAME_HOME) {
+            Ok(flame_home) => Path::new(&flame_home).join("data").join("cache"),
+            Err(_) => Path::new(FLAME_WORKING_DIRECTORY).join("cache"),
+        };
+        let app_cache_base = cache_base.join(app_name);
+        let uv_cache_dir = app_cache_base.join("uv");
+        let pip_cache_dir = app_cache_base.join("pip");
+
+        tracing::debug!(
+            "UV cache directory of application <{}>: {}",
+            app_name,
+            uv_cache_dir.display()
+        );
+        tracing::debug!(
+            "PIP cache directory of application <{}>: {}",
+            app_name,
+            pip_cache_dir.display()
+        );
+
+        Self::create_dir(&uv_cache_dir, "UV cache")?;
+        Self::create_dir(&pip_cache_dir, "PIP cache")?;
+
+        let mut envs = HashMap::new();
         envs.insert(
             "UV_CACHE_DIR".to_string(),
             uv_cache_dir.to_string_lossy().to_string(),
@@ -272,12 +291,19 @@ impl HostShim {
         };
 
         let work_dir = cur_dir.clone();
-        // Setup working directory and get environment defaults
+
+        // Setup working directory and tmp (per-instance)
+        let work_dir_envs = Self::setup_working_directory(&work_dir)?;
+        for (key, value) in work_dir_envs {
+            envs.entry(key).or_insert(value);
+        }
+
+        // Setup cache directories (per-application) and get environment defaults
         // Use entry().or_insert() so application-specific envs take precedence over defaults
         // This allows applications like flmrun to specify UV_CACHE_DIR pointing to
         // the pre-cached directory instead of using a per-instance empty cache
-        let wd_envs = Self::setup_working_directory(&work_dir)?;
-        for (key, value) in wd_envs {
+        let cache_envs = Self::setup_cache(&app.name)?;
+        for (key, value) in cache_envs {
             envs.entry(key).or_insert(value);
         }
 
