@@ -1,10 +1,21 @@
 use crate::managers::{
-    backup::BackupManager, build::BuildManager, config::ConfigGenerator,
+    backup::BackupManager, build::BuildManager, cert::generate_mtls_certs, config::ConfigGenerator,
     installation::InstallationManager, source::SourceManager, systemd::SystemdManager,
     user::UserManager,
 };
 use crate::types::{InstallConfig, InstallationPaths};
 use anyhow::Result;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+
+const DEFAULT_CONFIG: &str = r#"---
+cluster:
+  name: flame
+  endpoint: "http://127.0.0.1:8080"
+  storage: "sqlite://flame.db"
+  executors:
+    shim: host
+"#;
 
 pub fn run(config: InstallConfig) -> Result<()> {
     println!("🚀 Flame Installation");
@@ -55,7 +66,13 @@ pub fn run(config: InstallConfig) -> Result<()> {
         install_components(&artifacts, &src_dir, &paths, &config)?;
     }
 
-    // Phase 5: Systemd Setup (if requested and needed)
+    // Phase 5: mTLS Setup (if requested)
+    if config.with_mtls {
+        println!("\n═══ Phase 5: mTLS Certificate Generation ═══");
+        setup_mtls(&paths)?;
+    }
+
+    // Phase 6: Systemd Setup (if requested and needed)
     let has_control_plane = config
         .profiles
         .contains(&crate::types::InstallProfile::ControlPlane);
@@ -65,15 +82,21 @@ pub fn run(config: InstallConfig) -> Result<()> {
     let needs_systemd = has_control_plane || has_worker;
 
     if config.systemd && needs_systemd {
-        println!("\n═══ Phase 5: Systemd Setup ═══");
+        let phase = if config.with_mtls { 6 } else { 5 };
+        println!("\n═══ Phase {}: Systemd Setup ═══", phase);
         setup_systemd(&paths, &config)?;
     } else if !config.systemd {
-        println!("\n═══ Phase 5: Skipping Systemd (--no-systemd) ═══");
+        let phase = if config.with_mtls { 6 } else { 5 };
+        println!("\n═══ Phase {}: Skipping Systemd (--no-systemd) ═══", phase);
     } else {
-        println!("\n═══ Phase 5: Skipping Systemd (no services to install) ═══");
+        let phase = if config.with_mtls { 6 } else { 5 };
+        println!(
+            "\n═══ Phase {}: Skipping Systemd (no services to install) ═══",
+            phase
+        );
     }
 
-    // Phase 6: Summary
+    // Final Phase: Summary
     println!("\n═══ Installation Complete ═══");
     print_summary(&paths, &config);
 
@@ -275,6 +298,197 @@ fn setup_systemd(paths: &InstallationPaths, config: &InstallConfig) -> Result<()
             println!("   sudo systemctl enable --now flame-executor-manager");
         }
     }
+
+    Ok(())
+}
+
+fn setup_mtls(paths: &InstallationPaths) -> Result<()> {
+    let tls_dir = paths.conf.join("tls");
+    fs::create_dir_all(&tls_dir)?;
+    println!("  Creating TLS directory: {}", tls_dir.display());
+
+    println!("  Generating mTLS certificates...");
+    let certs = generate_mtls_certs()?;
+
+    let ca_cert_path = tls_dir.join("ca.crt");
+    let ca_key_path = tls_dir.join("ca.key");
+    fs::write(&ca_cert_path, &certs.ca.cert_pem)?;
+    fs::write(&ca_key_path, &certs.ca.key_pem)?;
+    fs::set_permissions(&ca_key_path, fs::Permissions::from_mode(0o600))?;
+    println!("  ✓ CA certificate: {}", ca_cert_path.display());
+
+    let server_cert_path = tls_dir.join("server.crt");
+    let server_key_path = tls_dir.join("server.key");
+    fs::write(&server_cert_path, &certs.server.cert_pem)?;
+    fs::write(&server_key_path, &certs.server.key_pem)?;
+    fs::set_permissions(&server_key_path, fs::Permissions::from_mode(0o600))?;
+    println!("  ✓ Server certificate: {}", server_cert_path.display());
+
+    let users_dir = tls_dir.join("users");
+    fs::create_dir_all(&users_dir)?;
+
+    let root_cert_path = users_dir.join("root.crt");
+    let root_key_path = users_dir.join("root.key");
+    fs::write(&root_cert_path, &certs.root_user.cert_pem)?;
+    fs::write(&root_key_path, &certs.root_user.key_pem)?;
+    fs::set_permissions(&root_key_path, fs::Permissions::from_mode(0o600))?;
+    println!("  ✓ Root user certificate: {}", root_cert_path.display());
+
+    let executor_cert_path = users_dir.join("flame-executor.crt");
+    let executor_key_path = users_dir.join("flame-executor.key");
+    fs::write(&executor_cert_path, &certs.flame_executor.cert_pem)?;
+    fs::write(&executor_key_path, &certs.flame_executor.key_pem)?;
+    fs::set_permissions(&executor_key_path, fs::Permissions::from_mode(0o600))?;
+    println!("  ✓ Executor certificate: {}", executor_cert_path.display());
+
+    println!("  Bootstrapping RBAC (root user and role)...");
+    bootstrap_rbac(paths)?;
+
+    println!("  Updating configuration with TLS settings...");
+    update_config_with_tls(paths)?;
+
+    println!("✓ mTLS setup complete");
+    println!();
+    println!("  Client certificates for authentication:");
+    println!("    • Root user: {}", root_cert_path.display());
+    println!("    • Executor:  {}", executor_cert_path.display());
+    println!();
+    println!("  To use mTLS with flmctl:");
+    println!("    export FLAME_CA_FILE={}", ca_cert_path.display());
+    println!("    export FLAME_CERT_FILE={}", root_cert_path.display());
+    println!("    export FLAME_KEY_FILE={}", root_key_path.display());
+
+    Ok(())
+}
+
+fn bootstrap_rbac(paths: &InstallationPaths) -> Result<()> {
+    use std::io::Write;
+
+    fs::create_dir_all(&paths.data)?;
+
+    let db_path = paths.data.join("flame.db");
+
+    let bootstrap_sql = r#"
+INSERT OR IGNORE INTO roles (name, description, permissions, workspaces, creation_time)
+VALUES (
+    'root',
+    'Root administrator role with full access to all workspaces and resources',
+    '["*:*"]',
+    '["*"]',
+    strftime('%s', 'now')
+);
+
+INSERT OR IGNORE INTO roles (name, description, permissions, workspaces, creation_time)
+VALUES (
+    'flame-executor',
+    'Internal role for flame executor manager',
+    '["session:*", "task:*", "node:*", "executor:*"]',
+    '["*"]',
+    strftime('%s', 'now')
+);
+
+INSERT OR IGNORE INTO users (name, display_name, email, certificate_cn, enabled, creation_time)
+VALUES (
+    'root',
+    'Root Administrator',
+    NULL,
+    'root',
+    1,
+    strftime('%s', 'now')
+);
+
+INSERT OR IGNORE INTO users (name, display_name, email, certificate_cn, enabled, creation_time)
+VALUES (
+    'flame-executor',
+    'Flame Executor Manager',
+    NULL,
+    'flame-executor',
+    1,
+    strftime('%s', 'now')
+);
+
+INSERT OR IGNORE INTO user_roles (user_name, role_name)
+VALUES ('root', 'root');
+
+INSERT OR IGNORE INTO user_roles (user_name, role_name)
+VALUES ('flame-executor', 'flame-executor');
+
+INSERT OR IGNORE INTO workspaces (name, description, labels, creation_time)
+VALUES (
+    'default',
+    'Default workspace',
+    '{}',
+    strftime('%s', 'now')
+);
+"#;
+
+    let bootstrap_path = paths.data.join("bootstrap-rbac.sql");
+    let mut file = fs::File::create(&bootstrap_path)?;
+    file.write_all(bootstrap_sql.as_bytes())?;
+
+    println!(
+        "  ✓ Created RBAC bootstrap SQL: {}",
+        bootstrap_path.display()
+    );
+    println!("    Note: The bootstrap SQL will be executed when the session manager starts.");
+    println!("    Database location: {}", db_path.display());
+
+    Ok(())
+}
+
+fn update_config_with_tls(paths: &InstallationPaths) -> Result<()> {
+    let config_path = paths.conf.join("flame-cluster.yaml");
+    let tls_dir = paths.conf.join("tls");
+
+    let config_content = if config_path.exists() {
+        fs::read_to_string(&config_path)?
+    } else {
+        DEFAULT_CONFIG.to_string()
+    };
+
+    if config_content.contains("tls:") {
+        println!("  ⚠️  TLS configuration already exists, skipping update");
+        return Ok(());
+    }
+
+    let mut new_config = config_content.clone();
+
+    new_config = new_config.replace(
+        "endpoint: \"http://127.0.0.1:8080\"",
+        "endpoint: \"https://127.0.0.1:8080\"",
+    );
+    new_config = new_config.replace(
+        "endpoint: http://127.0.0.1:8080",
+        "endpoint: https://127.0.0.1:8080",
+    );
+
+    let tls_config = format!(
+        r#"  tls:
+    cert_file: "{}/server.crt"
+    key_file: "{}/server.key"
+    ca_file: "{}/ca.crt"
+    ca_key_file: "{}/ca.key"
+    cert_validity: "24h"
+"#,
+        tls_dir.display(),
+        tls_dir.display(),
+        tls_dir.display(),
+        tls_dir.display()
+    );
+
+    if let Some(pos) = new_config.find("  executors:") {
+        new_config.insert_str(pos, &tls_config);
+    } else if let Some(pos) = new_config.find("storage:") {
+        if let Some(end_pos) = new_config[pos..].find('\n') {
+            let insert_pos = pos + end_pos + 1;
+            new_config.insert_str(insert_pos, &tls_config);
+        }
+    } else {
+        new_config.push_str(&tls_config);
+    }
+
+    fs::write(&config_path, &new_config)?;
+    println!("  ✓ Updated configuration: {}", config_path.display());
 
     Ok(())
 }

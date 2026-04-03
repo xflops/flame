@@ -45,6 +45,8 @@ fn get_ca_cert_path() -> String {
 async fn get_connection() -> Result<flame::client::Connection, FlameError> {
     let tls_config = FlameClientTls {
         ca_file: Some(get_ca_cert_path()),
+        cert_file: None,
+        key_file: None,
     };
     flame::client::connect_with_tls(FLAME_DEFAULT_ADDR, Some(&tls_config)).await
 }

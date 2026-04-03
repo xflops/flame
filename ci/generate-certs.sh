@@ -10,10 +10,12 @@
 #   -h, --help             Show this help message
 #
 # Output files:
-#   ca.crt     - CA certificate
-#   ca.key     - CA private key
-#   server.crt - Server certificate (signed by CA)
-#   server.key - Server private key
+#   ca.crt       - CA certificate
+#   ca.key       - CA private key
+#   server.crt   - Server certificate (signed by CA)
+#   server.key   - Server private key
+#   client.crt   - Client certificate for mTLS (signed by CA)
+#   client.key   - Client private key
 
 set -e
 
@@ -116,7 +118,7 @@ openssl req -new -key "$OUTPUT_DIR/server.key" \
     -out "$OUTPUT_DIR/server.csr" \
     -subj "/CN=flame-server/O=Flame"
 
-# Create extensions file for SAN
+# Create extensions file for server SAN
 cat > "$OUTPUT_DIR/server.ext" << EOF
 authorityKeyIdentifier=keyid,issuer
 basicConstraints=CA:FALSE
@@ -132,18 +134,47 @@ openssl x509 -req -in "$OUTPUT_DIR/server.csr" \
     -CAcreateserial -out "$OUTPUT_DIR/server.crt" \
     -days $VALID_DAYS -extfile "$OUTPUT_DIR/server.ext"
 
+# Generate client private key (for mTLS)
+echo "→ Generating client private key..."
+openssl genrsa -out "$OUTPUT_DIR/client.key" 4096
+
+# Generate client CSR
+echo "→ Generating client CSR..."
+openssl req -new -key "$OUTPUT_DIR/client.key" \
+    -out "$OUTPUT_DIR/client.csr" \
+    -subj "/CN=flame-client/O=Flame"
+
+# Create extensions file for client cert
+cat > "$OUTPUT_DIR/client.ext" << EOF
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = clientAuth
+EOF
+
+# Sign client certificate with CA
+echo "→ Signing client certificate with CA..."
+openssl x509 -req -in "$OUTPUT_DIR/client.csr" \
+    -CA "$OUTPUT_DIR/ca.crt" -CAkey "$OUTPUT_DIR/ca.key" \
+    -CAcreateserial -out "$OUTPUT_DIR/client.crt" \
+    -days $VALID_DAYS -extfile "$OUTPUT_DIR/client.ext"
+
 # Clean up temporary files
-rm -f "$OUTPUT_DIR/server.csr" "$OUTPUT_DIR/server.ext" "$OUTPUT_DIR/ca.srl"
+rm -f "$OUTPUT_DIR/server.csr" "$OUTPUT_DIR/server.ext" \
+      "$OUTPUT_DIR/client.csr" "$OUTPUT_DIR/client.ext" \
+      "$OUTPUT_DIR/ca.srl"
 
 # Set restrictive permissions on private keys
-chmod 600 "$OUTPUT_DIR/ca.key" "$OUTPUT_DIR/server.key"
+chmod 600 "$OUTPUT_DIR/ca.key" "$OUTPUT_DIR/server.key" "$OUTPUT_DIR/client.key"
 
 echo ""
 echo "✓ Generated certificates in $OUTPUT_DIR:"
 echo "  - ca.crt      (CA certificate)"
-echo "  - ca.key      (CA private key)"
+echo "  - ca.key      (CA private key - for signing session certs)"
 echo "  - server.crt  (Server certificate)"
 echo "  - server.key  (Server private key)"
+echo "  - client.crt  (Client certificate for mTLS)"
+echo "  - client.key  (Client private key)"
 echo ""
 echo "Server certificate SANs:"
 openssl x509 -in "$OUTPUT_DIR/server.crt" -noout -ext subjectAltName | grep -v "X509v3" || echo "  $SAN_LIST"

@@ -19,6 +19,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "flame.ExecutorState",
             "#[allow(clippy::enum_variant_names)]",
         )
+        .type_attribute(
+            "flame.CredentialScope",
+            "#[allow(clippy::enum_variant_names)]",
+        )
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_protos(
             &[
@@ -26,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "protos/frontend.proto",
                 "protos/backend.proto",
                 "protos/shim.proto",
+                "protos/admin.proto",
             ],
             &["protos"],
         )?;

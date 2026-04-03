@@ -12,7 +12,9 @@ limitations under the License.
 */
 
 pub mod apis;
+pub mod authz;
 pub mod ctx;
+pub mod rbac;
 pub mod storage;
 
 use std::string::FromUtf8Error;
@@ -134,6 +136,9 @@ pub const FLAME_INSTANCE_ENDPOINT: &str = "FLAME_INSTANCE_ENDPOINT";
 pub const FLAME_CACHE_ENDPOINT: &str = "FLAME_CACHE_ENDPOINT";
 pub const FLAME_ENDPOINT: &str = "FLAME_ENDPOINT";
 pub const FLAME_CA_FILE: &str = "FLAME_CA_FILE";
+pub const FLAME_CERT_FILE: &str = "FLAME_CERT_FILE";
+pub const FLAME_KEY_FILE: &str = "FLAME_KEY_FILE";
+pub const FLAME_WORKSPACE: &str = "FLAME_WORKSPACE";
 
 /// Returns the system temporary directory path.
 /// This is cross-platform: /tmp on Unix, %TEMP% on Windows.

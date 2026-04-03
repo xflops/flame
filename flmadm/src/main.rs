@@ -79,6 +79,10 @@ enum Commands {
         /// Show detailed build output
         #[arg(long)]
         verbose: bool,
+
+        /// Generate CA and TLS certificates for mTLS authentication
+        #[arg(long)]
+        with_mtls: bool,
     },
 
     /// Uninstall Flame from this machine
@@ -111,6 +115,13 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    Create(crate::commands::rbac::CreateCmd),
+    List(crate::commands::rbac::ListCmd),
+    Get(crate::commands::rbac::GetCmd),
+    Update(crate::commands::rbac::UpdateCmd),
+    Delete(crate::commands::rbac::DeleteCmd),
+    Enable(crate::commands::rbac::EnableCmd),
+    Disable(crate::commands::rbac::DisableCmd),
 }
 
 #[cfg(unix)]
@@ -139,6 +150,7 @@ fn main() {
             clean,
             force,
             verbose,
+            with_mtls,
         } => {
             // Validate profile flags
             if all && (control_plane || worker || client) {
@@ -195,6 +207,7 @@ fn main() {
                 verbose,
                 profiles,
                 force_overwrite: force,
+                with_mtls,
             };
             commands::install::run(config)
         }
@@ -217,6 +230,27 @@ fn main() {
                 force,
             };
             commands::uninstall::run(config)
+        }
+        Commands::Create(cmd) => {
+            crate::commands::rbac::handle_create(&cmd).map_err(|e| anyhow::anyhow!(e))
+        }
+        Commands::List(cmd) => {
+            crate::commands::rbac::handle_list(&cmd).map_err(|e| anyhow::anyhow!(e))
+        }
+        Commands::Get(cmd) => {
+            crate::commands::rbac::handle_get(&cmd).map_err(|e| anyhow::anyhow!(e))
+        }
+        Commands::Update(cmd) => {
+            crate::commands::rbac::handle_update(&cmd).map_err(|e| anyhow::anyhow!(e))
+        }
+        Commands::Delete(cmd) => {
+            crate::commands::rbac::handle_delete(&cmd).map_err(|e| anyhow::anyhow!(e))
+        }
+        Commands::Enable(cmd) => {
+            crate::commands::rbac::handle_enable(&cmd).map_err(|e| anyhow::anyhow!(e))
+        }
+        Commands::Disable(cmd) => {
+            crate::commands::rbac::handle_disable(&cmd).map_err(|e| anyhow::anyhow!(e))
         }
     };
 

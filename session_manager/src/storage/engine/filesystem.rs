@@ -51,9 +51,9 @@ use serde::{Deserialize, Serialize};
 
 use common::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationSchema, ApplicationState,
-    ExecutorID, ExecutorState, Node, NodeInfo, NodeState, ResourceRequirement, Session,
+    ExecutorID, ExecutorState, Node, NodeInfo, NodeState, ResourceRequirement, Role, Session,
     SessionAttributes, SessionID, SessionState, SessionStatus, Shim, Task, TaskGID, TaskID,
-    TaskInput, TaskOutput, TaskResult, TaskState,
+    TaskInput, TaskOutput, TaskResult, TaskState, User, Workspace,
 };
 use common::{FlameError, FLAME_HOME};
 
@@ -88,10 +88,11 @@ struct TaskMetadata {
     pub output_len: u64,
 }
 
-/// Session metadata stored as JSON.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct SessionMetadata {
     pub id: String,
+    #[serde(default = "default_workspace")]
+    pub workspace: String,
     pub application: String,
     pub slots: u32,
     pub version: u32,
@@ -100,19 +101,19 @@ struct SessionMetadata {
     pub completion_time: Option<i64>,
     pub min_instances: u32,
     pub max_instances: Option<u32>,
-    /// Offset in common_data file (if any)
     pub common_data_len: u64,
 }
 
-/// Application metadata stored as JSON.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ApplicationMetadata {
     pub name: String,
+    #[serde(default = "default_workspace")]
+    pub workspace: String,
     pub version: u32,
     pub state: i32,
     pub creation_time: i64,
     #[serde(default)]
-    pub shim: i32, // 0 = Host (default), 1 = Wasm
+    pub shim: i32,
     pub image: Option<String>,
     pub description: Option<String>,
     pub labels: Vec<String>,
@@ -124,6 +125,10 @@ struct ApplicationMetadata {
     pub delay_release_seconds: i64,
     pub schema: Option<ApplicationSchemaMetadata>,
     pub url: Option<String>,
+}
+
+fn default_workspace() -> String {
+    common::apis::WORKSPACE_DEFAULT.to_string()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -159,6 +164,35 @@ struct ExecutorMetadata {
     pub ssn_id: Option<String>,
     pub creation_time: i64,
     pub state: i32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct UserMetadata {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+    pub certificate_cn: String,
+    pub enabled: bool,
+    pub creation_time: i64,
+    pub last_login_time: Option<i64>,
+    pub roles: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct RoleMetadata {
+    pub name: String,
+    pub description: Option<String>,
+    pub permissions: Vec<String>,
+    pub workspaces: Vec<String>,
+    pub creation_time: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct WorkspaceMetadata {
+    pub name: String,
+    pub description: Option<String>,
+    pub labels: std::collections::HashMap<String, String>,
+    pub creation_time: i64,
 }
 
 /// Bincode configuration for fixed-size encoding.
@@ -272,6 +306,9 @@ impl FilesystemEngine {
         let sessions_path = path.join("sessions");
         let applications_path = path.join("applications");
         let nodes_path = path.join("nodes");
+        let users_path = path.join("users");
+        let roles_path = path.join("roles");
+        let workspaces_path = path.join("workspaces");
 
         fs::create_dir_all(&sessions_path).map_err(|e| {
             FlameError::Storage(format!("Failed to create sessions directory: {e}"))
@@ -281,6 +318,13 @@ impl FilesystemEngine {
         })?;
         fs::create_dir_all(&nodes_path)
             .map_err(|e| FlameError::Storage(format!("Failed to create nodes directory: {e}")))?;
+        fs::create_dir_all(&users_path)
+            .map_err(|e| FlameError::Storage(format!("Failed to create users directory: {e}")))?;
+        fs::create_dir_all(&roles_path)
+            .map_err(|e| FlameError::Storage(format!("Failed to create roles directory: {e}")))?;
+        fs::create_dir_all(&workspaces_path).map_err(|e| {
+            FlameError::Storage(format!("Failed to create workspaces directory: {e}"))
+        })?;
 
         let record_size = task_record_size();
         tracing::info!(
@@ -718,6 +762,7 @@ impl FilesystemEngine {
         Ok(Task {
             id: meta.id as TaskID,
             ssn_id: session_id.to_string(),
+            workspace: common::apis::WORKSPACE_DEFAULT.to_string(),
             version: meta.version,
             input,
             output,
@@ -739,6 +784,7 @@ impl FilesystemEngine {
 
         Ok(Session {
             id: meta.id.clone(),
+            workspace: meta.workspace.clone(),
             application: meta.application.clone(),
             slots: meta.slots,
             version: meta.version,
@@ -766,6 +812,7 @@ impl FilesystemEngine {
 
         Ok(Application {
             name: meta.name.clone(),
+            workspace: meta.workspace.clone(),
             version: meta.version,
             state,
             creation_time: DateTime::from_timestamp(meta.creation_time, 0)
@@ -840,6 +887,7 @@ impl Engine for FilesystemEngine {
 
         let meta = ApplicationMetadata {
             name: name.clone(),
+            workspace: common::apis::WORKSPACE_DEFAULT.to_string(),
             version: 1,
             state: ApplicationState::Enabled as i32,
             creation_time: Utc::now().timestamp(),
@@ -985,6 +1033,7 @@ impl Engine for FilesystemEngine {
 
         let meta = SessionMetadata {
             id: attr.id.clone(),
+            workspace: common::apis::WORKSPACE_DEFAULT.to_string(),
             application: attr.application.clone(),
             slots: attr.slots,
             version: 1,
@@ -1599,6 +1648,464 @@ impl Engine for FilesystemEngine {
         }
 
         Ok(executors)
+    }
+
+    async fn get_user(&self, name: &str) -> Result<Option<User>, FlameError> {
+        let user_path = self.base_path.join("users").join(name).join("metadata");
+        if !user_path.exists() {
+            return Ok(None);
+        }
+
+        let content = fs::read_to_string(&user_path)
+            .map_err(|e| FlameError::Storage(format!("failed to read user: {e}")))?;
+        let meta: UserMetadata = serde_json::from_str(&content)
+            .map_err(|e| FlameError::Storage(format!("failed to parse user: {e}")))?;
+
+        Ok(Some(User {
+            name: meta.name,
+            display_name: meta.display_name,
+            email: meta.email,
+            certificate_cn: meta.certificate_cn,
+            enabled: meta.enabled,
+            creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
+            last_login_time: meta
+                .last_login_time
+                .and_then(|t| DateTime::from_timestamp(t, 0)),
+            roles: meta.roles,
+        }))
+    }
+
+    async fn get_user_by_cn(&self, cn: &str) -> Result<Option<User>, FlameError> {
+        let users_dir = self.base_path.join("users");
+        if let Ok(entries) = fs::read_dir(&users_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path().join("metadata");
+                if path.exists() {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        if let Ok(meta) = serde_json::from_str::<UserMetadata>(&content) {
+                            if meta.certificate_cn == cn {
+                                return Ok(Some(User {
+                                    name: meta.name,
+                                    display_name: meta.display_name,
+                                    email: meta.email,
+                                    certificate_cn: meta.certificate_cn,
+                                    enabled: meta.enabled,
+                                    creation_time: DateTime::from_timestamp(meta.creation_time, 0)
+                                        .unwrap_or_default(),
+                                    last_login_time: meta
+                                        .last_login_time
+                                        .and_then(|t| DateTime::from_timestamp(t, 0)),
+                                    roles: meta.roles,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn get_user_roles(&self, user_name: &str) -> Result<Vec<Role>, FlameError> {
+        let user_path = self
+            .base_path
+            .join("users")
+            .join(user_name)
+            .join("metadata");
+        if !user_path.exists() {
+            return Err(FlameError::NotFound(format!("user not found: {user_name}")));
+        }
+
+        let content = fs::read_to_string(&user_path)
+            .map_err(|e| FlameError::Storage(format!("failed to read user: {e}")))?;
+        let user_meta: UserMetadata = serde_json::from_str(&content)
+            .map_err(|e| FlameError::Storage(format!("failed to parse user: {e}")))?;
+
+        let mut roles = Vec::new();
+        for role_name in &user_meta.roles {
+            if let Some(role) = self.get_role(role_name).await? {
+                roles.push(role);
+            }
+        }
+        Ok(roles)
+    }
+
+    async fn create_user(&self, user: &User) -> Result<User, FlameError> {
+        let user_dir = self.base_path.join("users").join(&user.name);
+        fs::create_dir_all(&user_dir)
+            .map_err(|e| FlameError::Storage(format!("failed to create user directory: {e}")))?;
+
+        let meta = UserMetadata {
+            name: user.name.clone(),
+            display_name: user.display_name.clone(),
+            email: user.email.clone(),
+            certificate_cn: user.certificate_cn.clone(),
+            enabled: user.enabled,
+            creation_time: Utc::now().timestamp(),
+            last_login_time: None,
+            roles: user.roles.clone(),
+        };
+
+        let path = user_dir.join("metadata");
+        let content = serde_json::to_string_pretty(&meta)
+            .map_err(|e| FlameError::Storage(format!("failed to serialize user: {e}")))?;
+        fs::write(&path, content)
+            .map_err(|e| FlameError::Storage(format!("failed to write user: {e}")))?;
+
+        Ok(User {
+            name: meta.name,
+            display_name: meta.display_name,
+            email: meta.email,
+            certificate_cn: meta.certificate_cn,
+            enabled: meta.enabled,
+            creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
+            last_login_time: None,
+            roles: meta.roles,
+        })
+    }
+
+    async fn update_user(
+        &self,
+        user: &User,
+        assign_roles: &[String],
+        revoke_roles: &[String],
+    ) -> Result<User, FlameError> {
+        let user_path = self
+            .base_path
+            .join("users")
+            .join(&user.name)
+            .join("metadata");
+        if !user_path.exists() {
+            return Err(FlameError::NotFound(format!(
+                "user not found: {}",
+                user.name
+            )));
+        }
+
+        let content = fs::read_to_string(&user_path)
+            .map_err(|e| FlameError::Storage(format!("failed to read user: {e}")))?;
+        let mut meta: UserMetadata = serde_json::from_str(&content)
+            .map_err(|e| FlameError::Storage(format!("failed to parse user: {e}")))?;
+
+        meta.display_name = user.display_name.clone();
+        meta.email = user.email.clone();
+        meta.enabled = user.enabled;
+
+        for role in revoke_roles {
+            meta.roles.retain(|r| r != role);
+        }
+        for role in assign_roles {
+            if !meta.roles.contains(role) {
+                meta.roles.push(role.clone());
+            }
+        }
+
+        let content = serde_json::to_string_pretty(&meta)
+            .map_err(|e| FlameError::Storage(format!("failed to serialize user: {e}")))?;
+        fs::write(&user_path, content)
+            .map_err(|e| FlameError::Storage(format!("failed to write user: {e}")))?;
+
+        Ok(User {
+            name: meta.name,
+            display_name: meta.display_name,
+            email: meta.email,
+            certificate_cn: meta.certificate_cn,
+            enabled: meta.enabled,
+            creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
+            last_login_time: meta
+                .last_login_time
+                .and_then(|t| DateTime::from_timestamp(t, 0)),
+            roles: meta.roles,
+        })
+    }
+
+    async fn delete_user(&self, name: &str) -> Result<(), FlameError> {
+        let user_dir = self.base_path.join("users").join(name);
+        if user_dir.exists() {
+            fs::remove_dir_all(&user_dir)
+                .map_err(|e| FlameError::Storage(format!("failed to delete user: {e}")))?;
+        }
+        Ok(())
+    }
+
+    async fn find_users(&self, role_filter: Option<&str>) -> Result<Vec<User>, FlameError> {
+        let mut users = Vec::new();
+        let users_dir = self.base_path.join("users");
+
+        if let Ok(entries) = fs::read_dir(&users_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path().join("metadata");
+                if path.exists() {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        if let Ok(meta) = serde_json::from_str::<UserMetadata>(&content) {
+                            let include = match role_filter {
+                                Some(role) => meta.roles.contains(&role.to_string()),
+                                None => true,
+                            };
+                            if include {
+                                users.push(User {
+                                    name: meta.name,
+                                    display_name: meta.display_name,
+                                    email: meta.email,
+                                    certificate_cn: meta.certificate_cn,
+                                    enabled: meta.enabled,
+                                    creation_time: DateTime::from_timestamp(meta.creation_time, 0)
+                                        .unwrap_or_default(),
+                                    last_login_time: meta
+                                        .last_login_time
+                                        .and_then(|t| DateTime::from_timestamp(t, 0)),
+                                    roles: meta.roles,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(users)
+    }
+
+    async fn get_role(&self, name: &str) -> Result<Option<Role>, FlameError> {
+        let path = self.base_path.join("roles").join(name).join("metadata");
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let content = fs::read_to_string(&path)
+            .map_err(|e| FlameError::Storage(format!("failed to read role: {e}")))?;
+        let meta: RoleMetadata = serde_json::from_str(&content)
+            .map_err(|e| FlameError::Storage(format!("failed to parse role: {e}")))?;
+
+        Ok(Some(Role {
+            name: meta.name,
+            description: meta.description,
+            permissions: meta.permissions,
+            workspaces: meta.workspaces,
+            creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
+        }))
+    }
+
+    async fn create_role(&self, role: &Role) -> Result<Role, FlameError> {
+        let role_dir = self.base_path.join("roles").join(&role.name);
+        fs::create_dir_all(&role_dir)
+            .map_err(|e| FlameError::Storage(format!("failed to create role directory: {e}")))?;
+
+        let meta = RoleMetadata {
+            name: role.name.clone(),
+            description: role.description.clone(),
+            permissions: role.permissions.clone(),
+            workspaces: role.workspaces.clone(),
+            creation_time: Utc::now().timestamp(),
+        };
+
+        let path = role_dir.join("metadata");
+        let content = serde_json::to_string_pretty(&meta)
+            .map_err(|e| FlameError::Storage(format!("failed to serialize role: {e}")))?;
+        fs::write(&path, content)
+            .map_err(|e| FlameError::Storage(format!("failed to write role: {e}")))?;
+
+        Ok(Role {
+            name: meta.name,
+            description: meta.description,
+            permissions: meta.permissions,
+            workspaces: meta.workspaces,
+            creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
+        })
+    }
+
+    async fn update_role(&self, role: &Role) -> Result<Role, FlameError> {
+        let role_path = self
+            .base_path
+            .join("roles")
+            .join(&role.name)
+            .join("metadata");
+        if !role_path.exists() {
+            return Err(FlameError::NotFound(format!(
+                "role not found: {}",
+                role.name
+            )));
+        }
+
+        let content = fs::read_to_string(&role_path)
+            .map_err(|e| FlameError::Storage(format!("failed to read role: {e}")))?;
+        let mut meta: RoleMetadata = serde_json::from_str(&content)
+            .map_err(|e| FlameError::Storage(format!("failed to parse role: {e}")))?;
+
+        meta.description = role.description.clone();
+        meta.permissions = role.permissions.clone();
+        meta.workspaces = role.workspaces.clone();
+
+        let content = serde_json::to_string_pretty(&meta)
+            .map_err(|e| FlameError::Storage(format!("failed to serialize role: {e}")))?;
+        fs::write(&role_path, content)
+            .map_err(|e| FlameError::Storage(format!("failed to write role: {e}")))?;
+
+        Ok(Role {
+            name: meta.name,
+            description: meta.description,
+            permissions: meta.permissions,
+            workspaces: meta.workspaces,
+            creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
+        })
+    }
+
+    async fn delete_role(&self, name: &str) -> Result<(), FlameError> {
+        let role_dir = self.base_path.join("roles").join(name);
+        if role_dir.exists() {
+            fs::remove_dir_all(&role_dir)
+                .map_err(|e| FlameError::Storage(format!("failed to delete role: {e}")))?;
+        }
+        Ok(())
+    }
+
+    async fn find_roles(&self, workspace_filter: Option<&str>) -> Result<Vec<Role>, FlameError> {
+        let mut roles = Vec::new();
+        let roles_dir = self.base_path.join("roles");
+
+        if let Ok(entries) = fs::read_dir(&roles_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path().join("metadata");
+                if path.exists() {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        if let Ok(meta) = serde_json::from_str::<RoleMetadata>(&content) {
+                            let include = match workspace_filter {
+                                Some(ws) => meta.workspaces.contains(&ws.to_string()),
+                                None => true,
+                            };
+                            if include {
+                                roles.push(Role {
+                                    name: meta.name,
+                                    description: meta.description,
+                                    permissions: meta.permissions,
+                                    workspaces: meta.workspaces,
+                                    creation_time: DateTime::from_timestamp(meta.creation_time, 0)
+                                        .unwrap_or_default(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(roles)
+    }
+
+    async fn get_workspace(&self, name: &str) -> Result<Option<Workspace>, FlameError> {
+        let path = self
+            .base_path
+            .join("workspaces")
+            .join(name)
+            .join("metadata");
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let content = fs::read_to_string(&path)
+            .map_err(|e| FlameError::Storage(format!("failed to read workspace: {e}")))?;
+        let meta: WorkspaceMetadata = serde_json::from_str(&content)
+            .map_err(|e| FlameError::Storage(format!("failed to parse workspace: {e}")))?;
+
+        Ok(Some(Workspace {
+            name: meta.name,
+            description: meta.description,
+            labels: meta.labels,
+            creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
+        }))
+    }
+
+    async fn create_workspace(&self, workspace: &Workspace) -> Result<Workspace, FlameError> {
+        let ws_dir = self.base_path.join("workspaces").join(&workspace.name);
+        fs::create_dir_all(&ws_dir).map_err(|e| {
+            FlameError::Storage(format!("failed to create workspace directory: {e}"))
+        })?;
+
+        let meta = WorkspaceMetadata {
+            name: workspace.name.clone(),
+            description: workspace.description.clone(),
+            labels: workspace.labels.clone(),
+            creation_time: Utc::now().timestamp(),
+        };
+
+        let path = ws_dir.join("metadata");
+        let content = serde_json::to_string_pretty(&meta)
+            .map_err(|e| FlameError::Storage(format!("failed to serialize workspace: {e}")))?;
+        fs::write(&path, content)
+            .map_err(|e| FlameError::Storage(format!("failed to write workspace: {e}")))?;
+
+        Ok(Workspace {
+            name: meta.name,
+            description: meta.description,
+            labels: meta.labels,
+            creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
+        })
+    }
+
+    async fn update_workspace(&self, workspace: &Workspace) -> Result<Workspace, FlameError> {
+        let ws_path = self
+            .base_path
+            .join("workspaces")
+            .join(&workspace.name)
+            .join("metadata");
+        if !ws_path.exists() {
+            return Err(FlameError::NotFound(format!(
+                "workspace not found: {}",
+                workspace.name
+            )));
+        }
+
+        let content = fs::read_to_string(&ws_path)
+            .map_err(|e| FlameError::Storage(format!("failed to read workspace: {e}")))?;
+        let mut meta: WorkspaceMetadata = serde_json::from_str(&content)
+            .map_err(|e| FlameError::Storage(format!("failed to parse workspace: {e}")))?;
+
+        meta.description = workspace.description.clone();
+        meta.labels = workspace.labels.clone();
+
+        let content = serde_json::to_string_pretty(&meta)
+            .map_err(|e| FlameError::Storage(format!("failed to serialize workspace: {e}")))?;
+        fs::write(&ws_path, content)
+            .map_err(|e| FlameError::Storage(format!("failed to write workspace: {e}")))?;
+
+        Ok(Workspace {
+            name: meta.name,
+            description: meta.description,
+            labels: meta.labels,
+            creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
+        })
+    }
+
+    async fn delete_workspace(&self, name: &str) -> Result<(), FlameError> {
+        let ws_dir = self.base_path.join("workspaces").join(name);
+        if ws_dir.exists() {
+            fs::remove_dir_all(&ws_dir)
+                .map_err(|e| FlameError::Storage(format!("failed to delete workspace: {e}")))?;
+        }
+        Ok(())
+    }
+
+    async fn find_workspaces(&self) -> Result<Vec<Workspace>, FlameError> {
+        let mut workspaces = Vec::new();
+        let ws_dir = self.base_path.join("workspaces");
+
+        if let Ok(entries) = fs::read_dir(&ws_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path().join("metadata");
+                if path.exists() {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        if let Ok(meta) = serde_json::from_str::<WorkspaceMetadata>(&content) {
+                            workspaces.push(Workspace {
+                                name: meta.name,
+                                description: meta.description,
+                                labels: meta.labels,
+                                creation_time: DateTime::from_timestamp(meta.creation_time, 0)
+                                    .unwrap_or_default(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(workspaces)
     }
 }
 

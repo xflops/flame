@@ -19,8 +19,8 @@ use crate::model::Executor;
 use crate::FlameError;
 use common::apis::{
     Application, ApplicationAttributes, ApplicationID, CommonData, Event, ExecutorID,
-    ExecutorState, Node, Session, SessionAttributes, SessionID, Task, TaskGID, TaskInput,
-    TaskOutput, TaskResult, TaskState,
+    ExecutorState, Node, Role, Session, SessionAttributes, SessionID, Task, TaskGID, TaskInput,
+    TaskOutput, TaskResult, TaskState, User, Workspace,
 };
 
 mod filesystem;
@@ -107,6 +107,34 @@ pub trait Engine: Send + Sync + 'static {
     ) -> Result<Executor, FlameError>;
     async fn delete_executor(&self, id: &ExecutorID) -> Result<(), FlameError>;
     async fn find_executors(&self, node: Option<&str>) -> Result<Vec<Executor>, FlameError>;
+
+    // User operations
+    async fn get_user(&self, name: &str) -> Result<Option<User>, FlameError>;
+    async fn get_user_by_cn(&self, cn: &str) -> Result<Option<User>, FlameError>;
+    async fn get_user_roles(&self, user_name: &str) -> Result<Vec<Role>, FlameError>;
+    async fn create_user(&self, user: &User) -> Result<User, FlameError>;
+    async fn update_user(
+        &self,
+        user: &User,
+        assign_roles: &[String],
+        revoke_roles: &[String],
+    ) -> Result<User, FlameError>;
+    async fn delete_user(&self, name: &str) -> Result<(), FlameError>;
+    async fn find_users(&self, role_filter: Option<&str>) -> Result<Vec<User>, FlameError>;
+
+    // Role operations
+    async fn get_role(&self, name: &str) -> Result<Option<Role>, FlameError>;
+    async fn create_role(&self, role: &Role) -> Result<Role, FlameError>;
+    async fn update_role(&self, role: &Role) -> Result<Role, FlameError>;
+    async fn delete_role(&self, name: &str) -> Result<(), FlameError>;
+    async fn find_roles(&self, workspace_filter: Option<&str>) -> Result<Vec<Role>, FlameError>;
+
+    // Workspace operations
+    async fn get_workspace(&self, name: &str) -> Result<Option<Workspace>, FlameError>;
+    async fn create_workspace(&self, workspace: &Workspace) -> Result<Workspace, FlameError>;
+    async fn update_workspace(&self, workspace: &Workspace) -> Result<Workspace, FlameError>;
+    async fn delete_workspace(&self, name: &str) -> Result<(), FlameError>;
+    async fn find_workspaces(&self) -> Result<Vec<Workspace>, FlameError>;
 }
 
 /// Connect to a storage engine based on the URL scheme.

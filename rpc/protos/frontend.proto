@@ -39,6 +39,13 @@ service Frontend {
   rpc GetTask (GetTaskRequest) returns (Task) {}
   rpc WatchTask (WatchTaskRequest) returns (stream Task) {}
   rpc ListTask (ListTaskRequest) returns (stream Task) {}
+
+  // Workspace operations (user-facing)
+  rpc CreateWorkspace(CreateWorkspaceRequest) returns (Workspace) {}
+  rpc GetWorkspace(GetWorkspaceRequest) returns (Workspace) {}
+  rpc UpdateWorkspace(UpdateWorkspaceRequest) returns (Workspace) {}
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (Result) {}
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (WorkspaceList) {}
 }
 
 message RegisterApplicationRequest {
@@ -128,4 +135,26 @@ message WatchTaskRequest {
 
 message ListTaskRequest {
   string session_id = 1;
+}
+
+message CreateWorkspaceRequest {
+  string name = 1;
+  WorkspaceSpec spec = 2;
+}
+
+message GetWorkspaceRequest {
+  string name = 1;
+}
+
+message UpdateWorkspaceRequest {
+  string name = 1;
+  WorkspaceSpec spec = 2;
+}
+
+message DeleteWorkspaceRequest {
+  string name = 1;
+  bool force = 2;
+}
+
+message ListWorkspacesRequest {
 }

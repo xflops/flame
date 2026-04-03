@@ -41,6 +41,7 @@ pub struct InstallConfig {
     pub verbose: bool,
     pub profiles: Vec<InstallProfile>,
     pub force_overwrite: bool,
+    pub with_mtls: bool,
 }
 
 impl Default for InstallConfig {
@@ -59,6 +60,7 @@ impl Default for InstallConfig {
                 InstallProfile::Client,
             ],
             force_overwrite: false,
+            with_mtls: false,
         }
     }
 }
@@ -95,13 +97,10 @@ pub struct InstallationPaths {
     pub prefix: PathBuf,
     pub bin: PathBuf,
     pub sdk_python: PathBuf,
-    pub wheels: PathBuf,
     pub work: PathBuf,
     pub logs: PathBuf,
     pub conf: PathBuf,
     pub data: PathBuf,
-    pub cache: PathBuf,
-    pub migrations: PathBuf,
 }
 
 impl InstallationPaths {
@@ -109,13 +108,10 @@ impl InstallationPaths {
         Self {
             bin: prefix.join("bin"),
             sdk_python: prefix.join("sdk/python"),
-            wheels: prefix.join("wheels"),
             work: prefix.join("work"),
             logs: prefix.join("logs"),
             conf: prefix.join("conf"),
             data: prefix.join("data"),
-            cache: prefix.join("data/cache"),
-            migrations: prefix.join("migrations"),
             prefix,
         }
     }

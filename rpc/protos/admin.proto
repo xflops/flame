@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+import "types.proto";
+
+package flame;
+
+option go_package = "github.com/flame-sh/flame/sdk/go/rpc";
+
+service Admin {
+  rpc CreateUser(CreateUserRequest) returns (User) {}
+  rpc GetUser(GetUserRequest) returns (User) {}
+  rpc UpdateUser(UpdateUserRequest) returns (User) {}
+  rpc DeleteUser(DeleteUserRequest) returns (Result) {}
+  rpc ListUsers(ListUsersRequest) returns (UserList) {}
+
+  rpc CreateRole(CreateRoleRequest) returns (Role) {}
+  rpc GetRole(GetRoleRequest) returns (Role) {}
+  rpc UpdateRole(UpdateRoleRequest) returns (Role) {}
+  rpc DeleteRole(DeleteRoleRequest) returns (Result) {}
+  rpc ListRoles(ListRolesRequest) returns (RoleList) {}
+}
+
+message CreateUserRequest {
+  string name = 1;
+  UserSpec spec = 2;
+}
+
+message GetUserRequest {
+  string name = 1;
+}
+
+message UpdateUserRequest {
+  string name = 1;
+  UserSpec spec = 2;
+  repeated string assign_roles = 3;
+  repeated string revoke_roles = 4;
+}
+
+message DeleteUserRequest {
+  string name = 1;
+}
+
+message ListUsersRequest {
+  optional string role_filter = 1;
+}
+
+message CreateRoleRequest {
+  string name = 1;
+  RoleSpec spec = 2;
+}
+
+message GetRoleRequest {
+  string name = 1;
+}
+
+message UpdateRoleRequest {
+  string name = 1;
+  RoleSpec spec = 2;
+}
+
+message DeleteRoleRequest {
+  string name = 1;
+}
+
+message ListRolesRequest {
+  optional string workspace_filter = 1;
+}

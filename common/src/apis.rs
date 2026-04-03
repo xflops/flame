@@ -84,6 +84,7 @@ pub struct ApplicationSchema {
 #[derive(Clone, Debug, Default)]
 pub struct Application {
     pub name: String,
+    pub workspace: String,
     pub version: u32,
     pub state: ApplicationState,
     pub creation_time: DateTime<Utc>,
@@ -174,6 +175,7 @@ pub struct SessionStatus {
 #[derive(Debug, Default)]
 pub struct Session {
     pub id: SessionID,
+    pub workspace: String,
     pub application: String,
     pub slots: u32,
     pub version: u32,
@@ -186,8 +188,8 @@ pub struct Session {
     pub events: Vec<Event>,
 
     pub status: SessionStatus,
-    pub min_instances: u32,         // Minimum number of instances
-    pub max_instances: Option<u32>, // Maximum number of instances (None means unlimited)
+    pub min_instances: u32,
+    pub max_instances: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, strum_macros::Display)]
@@ -216,6 +218,7 @@ pub struct TaskGID {
 pub struct Task {
     pub id: TaskID,
     pub ssn_id: SessionID,
+    pub workspace: String,
     pub version: u32,
 
     pub input: Option<TaskInput>,
@@ -510,6 +513,7 @@ impl From<Node> for rpc::Node {
             metadata: Some(rpc::Metadata {
                 id: node.name.clone(),
                 name: node.name.clone(),
+                workspace: Some(WORKSPACE_SYSTEM.to_string()),
             }),
             spec: Some(rpc::NodeSpec {
                 hostname: node.name.clone(),
@@ -651,6 +655,7 @@ impl Clone for Session {
     fn clone(&self) -> Self {
         let mut ssn = Session {
             id: self.id.clone(),
+            workspace: self.workspace.clone(),
             application: self.application.clone(),
             slots: self.slots,
             version: self.version,
@@ -818,6 +823,7 @@ impl From<&Task> for rpc::Task {
         let metadata = Some(rpc::Metadata {
             id: task.id.to_string(),
             name: task.id.to_string(),
+            workspace: Some(task.workspace.clone()),
         });
 
         let spec = Some(rpc::TaskSpec {
@@ -872,6 +878,7 @@ impl From<&Session> for rpc::Session {
             metadata: Some(rpc::Metadata {
                 id: ssn.id.to_string(),
                 name: ssn.id.to_string(),
+                workspace: Some(ssn.workspace.clone()),
             }),
             spec: Some(rpc::SessionSpec {
                 application: ssn.application.clone(),
@@ -879,6 +886,7 @@ impl From<&Session> for rpc::Session {
                 common_data: ssn.common_data.clone().map(CommonData::into),
                 min_instances: ssn.min_instances,
                 max_instances: ssn.max_instances,
+                credential: None,
             }),
             status: Some(status),
         }
@@ -929,12 +937,16 @@ impl TryFrom<&rpc::Application> for Application {
 
         Ok(Application {
             name: metadata.name.clone(),
+            workspace: metadata
+                .workspace
+                .clone()
+                .unwrap_or_else(|| WORKSPACE_DEFAULT.to_string()),
             version: 0,
             state: ApplicationState::from(status.state()),
             creation_time: DateTime::<Utc>::from_timestamp(status.creation_time, 0).ok_or(
                 FlameError::InvalidState("invalid creation time".to_string()),
             )?,
-            shim: Shim::from(spec.shim()), // Get shim from spec
+            shim: Shim::from(spec.shim()),
             image: spec.image.clone(),
             description: spec.description.clone(),
             labels: spec.labels.clone(),
@@ -988,6 +1000,7 @@ impl From<&Application> for rpc::Application {
         let metadata = Some(rpc::Metadata {
             id: app.name.clone(),
             name: app.name.clone(),
+            workspace: Some(app.workspace.clone()),
         });
 
         let status = Some(rpc::ApplicationStatus {
@@ -1305,6 +1318,252 @@ impl From<TaskGID> for EventOwner {
     }
 }
 
+// ============================================================
+// RBAC: User, Role, Workspace
+// ============================================================
+
+/// Pre-defined workspace constants
+pub const WORKSPACE_DEFAULT: &str = "default";
+pub const WORKSPACE_SYSTEM: &str = "system";
+
+/// User represents an authenticated identity
+#[derive(Clone, Debug, Default)]
+pub struct User {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+    pub certificate_cn: String,
+    pub enabled: bool,
+    pub creation_time: DateTime<Utc>,
+    pub last_login_time: Option<DateTime<Utc>>,
+    /// Role names assigned to this user
+    pub roles: Vec<String>,
+}
+
+/// Role defines a named collection of permissions for workspaces
+#[derive(Clone, Debug, Default)]
+pub struct Role {
+    pub name: String,
+    pub description: Option<String>,
+    /// Permission strings (e.g., "session:create", "application:*")
+    pub permissions: Vec<String>,
+    /// Workspaces this role grants access to ("*" for all)
+    pub workspaces: Vec<String>,
+    pub creation_time: DateTime<Utc>,
+}
+
+impl Role {
+    /// Check if this role has the required permission
+    pub fn has_permission(&self, required: &str) -> bool {
+        let (req_resource, req_action) = required.split_once(':').unwrap_or((required, "*"));
+
+        for perm in &self.permissions {
+            let (perm_resource, perm_action) = perm.split_once(':').unwrap_or((perm, "*"));
+
+            let resource_match = perm_resource == "*" || perm_resource == req_resource;
+            let action_match = perm_action == "*" || perm_action == req_action;
+
+            if resource_match && action_match {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Check if this role grants access to the specified workspace
+    pub fn has_workspace(&self, workspace: &str) -> bool {
+        self.workspaces.iter().any(|w| w == "*" || w == workspace)
+    }
+}
+
+/// Workspace represents a logical isolation boundary
+#[derive(Clone, Debug, Default)]
+pub struct Workspace {
+    pub name: String,
+    pub description: Option<String>,
+    pub labels: HashMap<String, String>,
+    pub creation_time: DateTime<Utc>,
+}
+
+impl From<User> for rpc::User {
+    fn from(user: User) -> Self {
+        rpc::User::from(&user)
+    }
+}
+
+impl From<&User> for rpc::User {
+    fn from(user: &User) -> Self {
+        rpc::User {
+            metadata: Some(rpc::Metadata {
+                id: user.name.clone(),
+                name: user.name.clone(),
+                workspace: None,
+            }),
+            spec: Some(rpc::UserSpec {
+                display_name: user.display_name.clone().unwrap_or_default(),
+                email: user.email.clone().unwrap_or_default(),
+                role_refs: user.roles.clone(),
+                certificate_cn: user.certificate_cn.clone(),
+            }),
+            status: Some(rpc::UserStatus {
+                creation_time: user.creation_time.timestamp(),
+                last_login_time: user.last_login_time.map(|t| t.timestamp()),
+                enabled: user.enabled,
+            }),
+        }
+    }
+}
+
+impl TryFrom<rpc::User> for User {
+    type Error = FlameError;
+
+    fn try_from(user: rpc::User) -> Result<Self, Self::Error> {
+        let metadata = user
+            .metadata
+            .ok_or_else(|| FlameError::InvalidConfig("user metadata is empty".to_string()))?;
+        let spec = user
+            .spec
+            .ok_or_else(|| FlameError::InvalidConfig("user spec is empty".to_string()))?;
+        let status = user
+            .status
+            .ok_or_else(|| FlameError::InvalidConfig("user status is empty".to_string()))?;
+
+        Ok(User {
+            name: metadata.name,
+            display_name: if spec.display_name.is_empty() {
+                None
+            } else {
+                Some(spec.display_name)
+            },
+            email: if spec.email.is_empty() {
+                None
+            } else {
+                Some(spec.email)
+            },
+            certificate_cn: spec.certificate_cn,
+            enabled: status.enabled,
+            creation_time: DateTime::from_timestamp(status.creation_time, 0)
+                .ok_or_else(|| FlameError::InvalidState("invalid creation time".to_string()))?,
+            last_login_time: status
+                .last_login_time
+                .and_then(|t| DateTime::from_timestamp(t, 0)),
+            roles: spec.role_refs,
+        })
+    }
+}
+
+impl From<Role> for rpc::Role {
+    fn from(role: Role) -> Self {
+        rpc::Role::from(&role)
+    }
+}
+
+impl From<&Role> for rpc::Role {
+    fn from(role: &Role) -> Self {
+        rpc::Role {
+            metadata: Some(rpc::Metadata {
+                id: role.name.clone(),
+                name: role.name.clone(),
+                workspace: None,
+            }),
+            spec: Some(rpc::RoleSpec {
+                description: role.description.clone().unwrap_or_default(),
+                permissions: role.permissions.clone(),
+                workspaces: role.workspaces.clone(),
+            }),
+            status: Some(rpc::RoleStatus {
+                creation_time: role.creation_time.timestamp(),
+                user_count: 0,
+            }),
+        }
+    }
+}
+
+impl TryFrom<rpc::Role> for Role {
+    type Error = FlameError;
+
+    fn try_from(role: rpc::Role) -> Result<Self, Self::Error> {
+        let metadata = role
+            .metadata
+            .ok_or_else(|| FlameError::InvalidConfig("role metadata is empty".to_string()))?;
+        let spec = role
+            .spec
+            .ok_or_else(|| FlameError::InvalidConfig("role spec is empty".to_string()))?;
+        let status = role
+            .status
+            .ok_or_else(|| FlameError::InvalidConfig("role status is empty".to_string()))?;
+
+        Ok(Role {
+            name: metadata.name,
+            description: if spec.description.is_empty() {
+                None
+            } else {
+                Some(spec.description)
+            },
+            permissions: spec.permissions,
+            workspaces: spec.workspaces,
+            creation_time: DateTime::from_timestamp(status.creation_time, 0)
+                .ok_or_else(|| FlameError::InvalidState("invalid creation time".to_string()))?,
+        })
+    }
+}
+
+impl From<Workspace> for rpc::Workspace {
+    fn from(ws: Workspace) -> Self {
+        rpc::Workspace::from(&ws)
+    }
+}
+
+impl From<&Workspace> for rpc::Workspace {
+    fn from(ws: &Workspace) -> Self {
+        rpc::Workspace {
+            metadata: Some(rpc::Metadata {
+                id: ws.name.clone(),
+                name: ws.name.clone(),
+                workspace: None,
+            }),
+            spec: Some(rpc::WorkspaceSpec {
+                description: ws.description.clone().unwrap_or_default(),
+                labels: ws.labels.clone(),
+            }),
+            status: Some(rpc::WorkspaceStatus {
+                creation_time: ws.creation_time.timestamp(),
+                session_count: 0,
+                application_count: 0,
+            }),
+        }
+    }
+}
+
+impl TryFrom<rpc::Workspace> for Workspace {
+    type Error = FlameError;
+
+    fn try_from(ws: rpc::Workspace) -> Result<Self, Self::Error> {
+        let metadata = ws
+            .metadata
+            .ok_or_else(|| FlameError::InvalidConfig("workspace metadata is empty".to_string()))?;
+        let spec = ws
+            .spec
+            .ok_or_else(|| FlameError::InvalidConfig("workspace spec is empty".to_string()))?;
+        let status = ws
+            .status
+            .ok_or_else(|| FlameError::InvalidConfig("workspace status is empty".to_string()))?;
+
+        Ok(Workspace {
+            name: metadata.name,
+            description: if spec.description.is_empty() {
+                None
+            } else {
+                Some(spec.description)
+            },
+            labels: spec.labels,
+            creation_time: DateTime::from_timestamp(status.creation_time, 0)
+                .ok_or_else(|| FlameError::InvalidState("invalid creation time".to_string()))?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1346,5 +1605,62 @@ mod tests {
     fn test_application_attributes_default_shim() {
         let attrs = ApplicationAttributes::default();
         assert_eq!(attrs.shim, Shim::Host);
+    }
+
+    #[test]
+    fn test_role_has_permission() {
+        let role = Role {
+            name: "developer".to_string(),
+            permissions: vec!["session:*".to_string(), "application:read".to_string()],
+            workspaces: vec!["team-a".to_string()],
+            ..Default::default()
+        };
+
+        assert!(role.has_permission("session:create"));
+        assert!(role.has_permission("session:delete"));
+        assert!(role.has_permission("application:read"));
+        assert!(!role.has_permission("application:create"));
+        assert!(!role.has_permission("workspace:create"));
+    }
+
+    #[test]
+    fn test_role_has_permission_wildcard() {
+        let role = Role {
+            name: "admin".to_string(),
+            permissions: vec!["*:*".to_string()],
+            workspaces: vec!["*".to_string()],
+            ..Default::default()
+        };
+
+        assert!(role.has_permission("session:create"));
+        assert!(role.has_permission("application:delete"));
+        assert!(role.has_permission("workspace:update"));
+    }
+
+    #[test]
+    fn test_role_has_workspace() {
+        let role = Role {
+            name: "developer".to_string(),
+            permissions: vec!["session:*".to_string()],
+            workspaces: vec!["team-a".to_string(), "team-b".to_string()],
+            ..Default::default()
+        };
+
+        assert!(role.has_workspace("team-a"));
+        assert!(role.has_workspace("team-b"));
+        assert!(!role.has_workspace("team-c"));
+    }
+
+    #[test]
+    fn test_role_has_workspace_wildcard() {
+        let role = Role {
+            name: "admin".to_string(),
+            permissions: vec!["*:*".to_string()],
+            workspaces: vec!["*".to_string()],
+            ..Default::default()
+        };
+
+        assert!(role.has_workspace("any-workspace"));
+        assert!(role.has_workspace("production"));
     }
 }

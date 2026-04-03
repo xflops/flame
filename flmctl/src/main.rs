@@ -38,6 +38,10 @@ struct Cli {
     #[arg(long)]
     config: Option<String>,
 
+    /// The workspace to operate in (default: "default")
+    #[arg(long, short = 'w', global = true)]
+    workspace: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -130,7 +134,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     flame_rs::apis::init_logger()?;
 
     let cli = Cli::parse();
-    let ctx = FlameContext::from_file(cli.config)?;
+    let ctx = FlameContext::from_file(cli.config)?.with_workspace(cli.workspace);
 
     match &cli.command {
         Some(Commands::List {

@@ -876,13 +876,14 @@ impl From<&Executor> for rpc::Executor {
         let metadata = Some(rpc::Metadata {
             id: e.id.clone(),
             name: e.id.clone(),
+            workspace: Some(common::apis::WORKSPACE_SYSTEM.to_string()),
         });
 
         let spec = Some(rpc::ExecutorSpec {
             resreq: Some(e.resreq.clone().into()),
             node: e.node.clone(),
             slots: e.slots,
-            shim: rpc::Shim::from(e.shim).into(), // Include shim in spec
+            shim: rpc::Shim::from(e.shim).into(),
         });
 
         let status = Some(rpc::ExecutorStatus {

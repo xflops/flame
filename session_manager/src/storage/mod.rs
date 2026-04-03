@@ -21,9 +21,9 @@ use stdng::{lock_ptr, logs::TraceFn, trace_fn, MutexPtr};
 
 use common::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationPtr, CommonData, Event,
-    EventOwner, ExecutorID, ExecutorState, Node, NodePtr, ResourceRequirement, Session,
+    EventOwner, ExecutorID, ExecutorState, Node, NodePtr, ResourceRequirement, Role, Session,
     SessionAttributes, SessionID, SessionPtr, SessionState, Shim, Task, TaskGID, TaskID, TaskInput,
-    TaskOutput, TaskPtr, TaskResult, TaskState,
+    TaskOutput, TaskPtr, TaskResult, TaskState, User, Workspace,
 };
 use common::ctx::FlameClusterContext;
 use common::FlameError;
@@ -828,6 +828,84 @@ impl Storage {
     pub async fn record_event(&self, owner: EventOwner, event: Event) -> Result<(), FlameError> {
         trace_fn!("Storage::record_event");
         self.event_manager.record_event(owner, event)
+    }
+
+    pub async fn get_user(&self, name: &str) -> Result<Option<User>, FlameError> {
+        self.engine.get_user(name).await
+    }
+
+    pub async fn get_user_by_cn(&self, cn: &str) -> Result<Option<User>, FlameError> {
+        self.engine.get_user_by_cn(cn).await
+    }
+
+    pub async fn get_user_roles(&self, user_name: &str) -> Result<Vec<Role>, FlameError> {
+        self.engine.get_user_roles(user_name).await
+    }
+
+    pub async fn create_user(&self, user: &User) -> Result<User, FlameError> {
+        self.engine.create_user(user).await
+    }
+
+    pub async fn update_user(
+        &self,
+        user: &User,
+        assign_roles: &[String],
+        revoke_roles: &[String],
+    ) -> Result<User, FlameError> {
+        self.engine
+            .update_user(user, assign_roles, revoke_roles)
+            .await
+    }
+
+    pub async fn delete_user(&self, name: &str) -> Result<(), FlameError> {
+        self.engine.delete_user(name).await
+    }
+
+    pub async fn find_users(&self, role_filter: Option<&str>) -> Result<Vec<User>, FlameError> {
+        self.engine.find_users(role_filter).await
+    }
+
+    pub async fn get_role(&self, name: &str) -> Result<Option<Role>, FlameError> {
+        self.engine.get_role(name).await
+    }
+
+    pub async fn create_role(&self, role: &Role) -> Result<Role, FlameError> {
+        self.engine.create_role(role).await
+    }
+
+    pub async fn update_role(&self, role: &Role) -> Result<Role, FlameError> {
+        self.engine.update_role(role).await
+    }
+
+    pub async fn delete_role(&self, name: &str) -> Result<(), FlameError> {
+        self.engine.delete_role(name).await
+    }
+
+    pub async fn find_roles(
+        &self,
+        workspace_filter: Option<&str>,
+    ) -> Result<Vec<Role>, FlameError> {
+        self.engine.find_roles(workspace_filter).await
+    }
+
+    pub async fn get_workspace(&self, name: &str) -> Result<Option<Workspace>, FlameError> {
+        self.engine.get_workspace(name).await
+    }
+
+    pub async fn create_workspace(&self, workspace: &Workspace) -> Result<Workspace, FlameError> {
+        self.engine.create_workspace(workspace).await
+    }
+
+    pub async fn update_workspace(&self, workspace: &Workspace) -> Result<Workspace, FlameError> {
+        self.engine.update_workspace(workspace).await
+    }
+
+    pub async fn delete_workspace(&self, name: &str) -> Result<(), FlameError> {
+        self.engine.delete_workspace(name).await
+    }
+
+    pub async fn find_workspaces(&self) -> Result<Vec<Workspace>, FlameError> {
+        self.engine.find_workspaces().await
     }
 }
 

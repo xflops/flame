@@ -138,6 +138,8 @@ async fn benchmark_multi_session_throughput() -> Result<(), FlameError> {
     let metrics = Arc::new(BenchmarkMetrics::new());
     let tls_config = FlameClientTls {
         ca_file: Some(get_ca_cert_path()),
+        cert_file: None,
+        key_file: None,
     };
     let conn = flame::client::connect_with_tls(FLAME_ADDR, Some(&tls_config)).await?;
 

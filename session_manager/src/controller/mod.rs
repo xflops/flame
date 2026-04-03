@@ -19,8 +19,9 @@ use std::task::{Context, Poll};
 
 use common::apis::{
     Application, ApplicationAttributes, ApplicationID, CommonData, Event, EventOwner, ExecutorID,
-    ExecutorState, Node, NodeState, Session, SessionAttributes, SessionID, SessionPtr,
+    ExecutorState, Node, NodeState, Role, Session, SessionAttributes, SessionID, SessionPtr,
     SessionState, Task, TaskGID, TaskID, TaskInput, TaskOutput, TaskPtr, TaskResult, TaskState,
+    User, Workspace,
 };
 
 use common::FlameError;
@@ -797,6 +798,113 @@ impl Controller {
     pub async fn record_event(&self, owner: EventOwner, event: Event) -> Result<(), FlameError> {
         trace_fn!("Controller::record_event");
         self.storage.record_event(owner, event).await
+    }
+
+    // ========================================================================
+    // Workspace Operations
+    // ========================================================================
+
+    pub async fn create_workspace(&self, workspace: &Workspace) -> Result<Workspace, FlameError> {
+        trace_fn!("Controller::create_workspace");
+        self.storage.create_workspace(workspace).await
+    }
+
+    pub async fn get_workspace(&self, name: &str) -> Result<Option<Workspace>, FlameError> {
+        trace_fn!("Controller::get_workspace");
+        self.storage.get_workspace(name).await
+    }
+
+    pub async fn update_workspace(&self, workspace: &Workspace) -> Result<Workspace, FlameError> {
+        trace_fn!("Controller::update_workspace");
+        self.storage.update_workspace(workspace).await
+    }
+
+    pub async fn delete_workspace(&self, name: &str) -> Result<(), FlameError> {
+        trace_fn!("Controller::delete_workspace");
+        self.storage.delete_workspace(name).await
+    }
+
+    pub async fn list_workspaces(&self) -> Result<Vec<Workspace>, FlameError> {
+        trace_fn!("Controller::list_workspaces");
+        self.storage.find_workspaces().await
+    }
+
+    // ========================================================================
+    // User Operations
+    // ========================================================================
+
+    pub async fn create_user(&self, user: &User) -> Result<User, FlameError> {
+        trace_fn!("Controller::create_user");
+        self.storage.create_user(user).await
+    }
+
+    pub async fn get_user(&self, name: &str) -> Result<Option<User>, FlameError> {
+        trace_fn!("Controller::get_user");
+        self.storage.get_user(name).await
+    }
+
+    pub async fn update_user(
+        &self,
+        user: &User,
+        assign_roles: &[String],
+        revoke_roles: &[String],
+    ) -> Result<User, FlameError> {
+        trace_fn!("Controller::update_user");
+        self.storage
+            .update_user(user, assign_roles, revoke_roles)
+            .await
+    }
+
+    pub async fn delete_user(&self, name: &str) -> Result<(), FlameError> {
+        trace_fn!("Controller::delete_user");
+        self.storage.delete_user(name).await
+    }
+
+    pub async fn list_users(&self, role_filter: Option<&str>) -> Result<Vec<User>, FlameError> {
+        trace_fn!("Controller::list_users");
+        self.storage.find_users(role_filter).await
+    }
+
+    pub async fn get_user_by_cn(&self, cn: &str) -> Result<Option<User>, FlameError> {
+        trace_fn!("Controller::get_user_by_cn");
+        self.storage.get_user_by_cn(cn).await
+    }
+
+    pub async fn get_user_roles(&self, user_name: &str) -> Result<Vec<Role>, FlameError> {
+        trace_fn!("Controller::get_user_roles");
+        self.storage.get_user_roles(user_name).await
+    }
+
+    // ========================================================================
+    // Role Operations
+    // ========================================================================
+
+    pub async fn create_role(&self, role: &Role) -> Result<Role, FlameError> {
+        trace_fn!("Controller::create_role");
+        self.storage.create_role(role).await
+    }
+
+    pub async fn get_role(&self, name: &str) -> Result<Option<Role>, FlameError> {
+        trace_fn!("Controller::get_role");
+        self.storage.get_role(name).await
+    }
+
+    pub async fn update_role(&self, role: &Role) -> Result<Role, FlameError> {
+        trace_fn!("Controller::update_role");
+        self.storage.update_role(role).await
+    }
+
+    pub async fn delete_role(&self, name: &str) -> Result<(), FlameError> {
+        trace_fn!("Controller::delete_role");
+        self.storage.delete_role(name).await
+    }
+
+    pub async fn list_roles(
+        &self,
+        workspace_filter: Option<&str>,
+    ) -> Result<Vec<Role>, FlameError> {
+        trace_fn!("Controller::list_roles");
+        self.storage.find_roles(workspace_filter).await
     }
 }
 

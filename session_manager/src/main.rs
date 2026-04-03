@@ -20,6 +20,7 @@ use common::ctx::FlameClusterContext;
 use common::FlameError;
 
 mod apiserver;
+mod cert;
 mod controller;
 mod events;
 mod model;

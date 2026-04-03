@@ -3,7 +3,7 @@ on: [push, pull_request]
 env:
   CLICOLOR_FORCE: 1
   INSTALL_PREFIX: /opt/flame-test
-  FLAME_ENDPOINT: http://127.0.0.1:8080
+  FLAME_ENDPOINT: https://127.0.0.1:8080
 jobs:
   ci:
     name: BareMetal Python Test
@@ -44,6 +44,23 @@ jobs:
         run: |
           cargo build --release
       
+      - name: Generate mTLS certificates
+        run: |
+          echo "=== Generating mTLS certificates ==="
+          ./ci/generate-certs.sh -o ./ci/certs -s "localhost,127.0.0.1"
+          echo "✓ Generated certificates in ./ci/certs"
+          ls -la ./ci/certs/
+      
+      - name: Setup mTLS certificates
+        run: |
+          echo "=== Setting up mTLS certificates ==="
+          sudo mkdir -p /etc/flame/certs
+          sudo cp ./ci/certs/* /etc/flame/certs/
+          sudo chmod 644 /etc/flame/certs/*.crt
+          sudo chmod 600 /etc/flame/certs/*.key
+          echo "✓ Copied certificates to /etc/flame/certs"
+          ls -la /etc/flame/certs/
+      
       - name: Verify systemd availability
         run: |
           echo "=== Checking systemd ==="
@@ -71,13 +88,22 @@ jobs:
         run: |
           sudo ./target/release/flmadm install --all --src-dir . --skip-build --prefix $INSTALL_PREFIX --enable
           echo "$INSTALL_PREFIX/bin" >> $GITHUB_PATH
+          
+          echo "=== Updating cluster config with mTLS settings ==="
+          sudo cp ci/flame-cluster-local-mtls.yaml $INSTALL_PREFIX/conf/flame-cluster.yaml
+          echo "✓ Copied mTLS cluster config"
+          
+          echo "=== Restarting services with mTLS config ==="
+          sudo systemctl restart flame-session-manager
+          sudo systemctl restart flame-executor-manager
+          echo "✓ Restarted services with mTLS"
       
       - name: Setup local configuration and packages directory
         run: |
-          echo "=== Copy local configuration ==="
+          echo "=== Copy mTLS client configuration ==="
           mkdir -p ~/.flame
-          cp ci/flame-local.yaml ~/.flame/flame.yaml
-          echo "✓ Copied flame-local.yaml to ~/.flame/flame.yaml"
+          cp ci/flame-local-mtls.yaml ~/.flame/flame.yaml
+          echo "✓ Copied flame-local-mtls.yaml to ~/.flame/flame.yaml"
 
           echo "=== Create packages directory ==="
           sudo mkdir -p /opt/flame/packages

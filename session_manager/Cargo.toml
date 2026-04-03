@@ -38,6 +38,15 @@ uuid = { workspace = true }
 # Filesystem storage engine dependencies
 crc32fast = "1.3"
 
+# Certificate management dependencies
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+x509-parser = "0.16"
+base64 = "0.22"
+
+# Tower middleware
+tower = { version = "0.5" }
+http = "1.0"
+
 [dev-dependencies]
 tokio-test = "*"
 rand = { workspace = true }

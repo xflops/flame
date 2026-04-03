@@ -3,19 +3,19 @@ current-context: flame
 contexts:
   - name: flame
     cluster:
-      endpoint: "https://flame-session-manager:8080"
+      endpoint: "https://127.0.0.1:8080"
       tls:
         ca_file: "/etc/flame/certs/ca.crt"
         cert_file: "/etc/flame/certs/client.crt"
         key_file: "/etc/flame/certs/client.key"
     cache:
-      endpoint: "grpcs://flame-executor-manager:9090"
+      endpoint: "grpcs://127.0.0.1:9090"
       tls:
         ca_file: "/etc/flame/certs/ca.crt"
         cert_file: "/etc/flame/certs/client.crt"
         key_file: "/etc/flame/certs/client.key"
     package:
-      storage: "http://flame-package-storage:5000"
+      storage: "http://127.0.0.1:5050"
       excludes:
         - "*.log"
         - "*.pkl"

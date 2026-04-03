@@ -81,6 +81,10 @@ struct FlameTlsYaml {
     pub key_file: Option<String>,
     /// Path to PEM-encoded CA certificate (for certificate chain validation)
     pub ca_file: Option<String>,
+    /// Path to PEM-encoded CA private key (for signing session certificates)
+    pub ca_key_file: Option<String>,
+    /// Default validity for session certificates (e.g., "24h", "7d")
+    pub cert_validity: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,11 +155,15 @@ pub struct FlameTls {
     pub key_file: String,
     /// Path to PEM-encoded CA certificate (optional)
     pub ca_file: Option<String>,
+    /// Path to PEM-encoded CA private key (for signing session certificates)
+    pub ca_key_file: Option<String>,
+    /// Default validity for session certificates
+    pub cert_validity: std::time::Duration,
 }
 
 impl FlameTls {
     /// Load server TLS config for tonic.
-    /// Returns ServerTlsConfig with identity loaded from cert/key files.
+    /// When ca_file is configured, mTLS is enabled (client certificates required).
     pub fn server_tls_config(&self) -> Result<ServerTlsConfig, FlameError> {
         let cert = fs::read_to_string(&self.cert_file).map_err(|e| {
             FlameError::InvalidConfig(format!(
@@ -171,13 +179,23 @@ impl FlameTls {
         })?;
 
         let identity = Identity::from_pem(cert, key);
-        let config = ServerTlsConfig::new().identity(identity);
+        let mut config = ServerTlsConfig::new().identity(identity);
+
+        // Enable mTLS when CA file is configured - requires client certificates
+        if let Some(ca_file) = &self.ca_file {
+            let ca = fs::read_to_string(ca_file).map_err(|e| {
+                FlameError::InvalidConfig(format!("failed to read ca_file <{}>: {}", ca_file, e))
+            })?;
+            config = config.client_ca_root(Certificate::from_pem(ca));
+            tracing::info!("mTLS enabled: client certificates will be required");
+        }
 
         Ok(config)
     }
 
-    /// Load client TLS config for tonic.
-    /// If ca_file is specified, use it; otherwise use system CA bundle.
+    /// Load client TLS config for tonic with optional mTLS.
+    /// If ca_file is specified, use it for server verification.
+    /// If cert_file and key_file are specified, use them for client authentication.
     pub fn client_tls_config(&self) -> Result<ClientTlsConfig, FlameError> {
         let mut config = ClientTlsConfig::new();
 
@@ -188,7 +206,27 @@ impl FlameTls {
             config = config.ca_certificate(Certificate::from_pem(ca));
         }
 
+        if !self.cert_file.is_empty() && !self.key_file.is_empty() {
+            let cert = fs::read_to_string(&self.cert_file).map_err(|e| {
+                FlameError::InvalidConfig(format!(
+                    "failed to read cert_file <{}>: {}",
+                    self.cert_file, e
+                ))
+            })?;
+            let key = fs::read_to_string(&self.key_file).map_err(|e| {
+                FlameError::InvalidConfig(format!(
+                    "failed to read key_file <{}>: {}",
+                    self.key_file, e
+                ))
+            })?;
+            config = config.identity(Identity::from_pem(cert, key));
+        }
+
         Ok(config)
+    }
+
+    pub fn can_sign_certificates(&self) -> bool {
+        self.ca_key_file.is_some()
     }
 }
 
@@ -416,6 +454,40 @@ impl Default for FlameCluster {
     }
 }
 
+/// Parse a duration string (e.g., "24h", "7d", "30m") into std::time::Duration
+fn parse_duration(s: &str) -> Result<std::time::Duration, FlameError> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(FlameError::InvalidConfig(
+            "empty duration string".to_string(),
+        ));
+    }
+
+    // Find where the numeric part ends and the unit begins
+    let unit_start = s.find(|c: char| c.is_alphabetic()).unwrap_or(s.len());
+    let (num_part, unit_part) = s.split_at(unit_start);
+
+    let value: u64 = num_part
+        .parse()
+        .map_err(|_| FlameError::InvalidConfig(format!("invalid duration number: {}", s)))?;
+
+    let seconds = match unit_part.to_lowercase().as_str() {
+        "s" | "sec" | "second" | "seconds" => value,
+        "m" | "min" | "minute" | "minutes" => value * 60,
+        "h" | "hr" | "hour" | "hours" => value * 60 * 60,
+        "d" | "day" | "days" => value * 60 * 60 * 24,
+        "" => value, // Default to seconds if no unit
+        _ => {
+            return Err(FlameError::InvalidConfig(format!(
+                "invalid duration unit: {}",
+                unit_part
+            )))
+        }
+    };
+
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
 impl TryFrom<FlameTlsYaml> for FlameTls {
     type Error = FlameError;
     fn try_from(yaml: FlameTlsYaml) -> Result<Self, Self::Error> {
@@ -426,6 +498,13 @@ impl TryFrom<FlameTlsYaml> for FlameTls {
             .key_file
             .ok_or_else(|| FlameError::InvalidConfig("tls.key_file is required".to_string()))?;
 
+        // Parse cert_validity duration, default to 24 hours
+        let cert_validity = yaml
+            .cert_validity
+            .map(|s| parse_duration(&s))
+            .transpose()?
+            .unwrap_or_else(|| std::time::Duration::from_secs(24 * 60 * 60));
+
         // Note: File existence is validated when loading certificates in server_tls_config()
         // and client_tls_config() methods, which provide more descriptive error messages.
 
@@ -433,6 +512,8 @@ impl TryFrom<FlameTlsYaml> for FlameTls {
             cert_file,
             key_file,
             ca_file: yaml.ca_file,
+            ca_key_file: yaml.ca_key_file,
+            cert_validity,
         })
     }
 }

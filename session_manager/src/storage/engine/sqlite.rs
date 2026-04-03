@@ -32,16 +32,17 @@ use stdng::{logs::TraceFn, trace_fn};
 use common::{
     apis::{
         Application, ApplicationAttributes, ApplicationID, ApplicationSchema, ApplicationState,
-        CommonData, Event, ExecutorID, ExecutorState, Node, Session, SessionAttributes, SessionID,
-        SessionState, SessionStatus, Shim, Task, TaskGID, TaskID, TaskInput, TaskOutput,
-        TaskResult, TaskState, DEFAULT_DELAY_RELEASE, DEFAULT_MAX_INSTANCES,
+        CommonData, Event, ExecutorID, ExecutorState, Node, Role, Session, SessionAttributes,
+        SessionID, SessionState, SessionStatus, Shim, Task, TaskGID, TaskID, TaskInput, TaskOutput,
+        TaskResult, TaskState, User, Workspace, DEFAULT_DELAY_RELEASE, DEFAULT_MAX_INSTANCES,
     },
     FlameError,
 };
 
 use crate::model::Executor;
 use crate::storage::engine::types::{
-    AppSchemaDao, ApplicationDao, EventDao, ExecutorDao, NodeDao, SessionDao, TaskDao,
+    AppSchemaDao, ApplicationDao, EventDao, ExecutorDao, NodeDao, RoleDao, SessionDao, TaskDao,
+    UserDao, WorkspaceDao,
 };
 
 use crate::storage::engine::{Engine, EnginePtr};
@@ -223,6 +224,16 @@ impl SqliteEngine {
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
         ssn.try_into()
+    }
+
+    async fn get_user_role_names(&self, user_name: &str) -> Result<Vec<String>, FlameError> {
+        let sql = "SELECT role_name FROM user_roles WHERE user_name = ?";
+        let roles: Vec<String> = sqlx::query_scalar(sql)
+            .bind(user_name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to get user role names: {e}")))?;
+        Ok(roles)
     }
 }
 
@@ -1144,6 +1155,388 @@ impl Engine for SqliteEngine {
             .map(Executor::try_from)
             .filter_map(Result::ok)
             .collect())
+    }
+
+    async fn get_user(&self, name: &str) -> Result<Option<User>, FlameError> {
+        let sql = "SELECT * FROM users WHERE name = ?";
+        let dao: Option<UserDao> = sqlx::query_as(sql)
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to get user: {e}")))?;
+
+        match dao {
+            Some(dao) => {
+                let mut user: User = dao.try_into()?;
+                user.roles = self.get_user_role_names(&user.name).await?;
+                Ok(Some(user))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn get_user_by_cn(&self, cn: &str) -> Result<Option<User>, FlameError> {
+        let sql = "SELECT * FROM users WHERE certificate_cn = ?";
+        let dao: Option<UserDao> = sqlx::query_as(sql)
+            .bind(cn)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to get user by cn: {e}")))?;
+
+        match dao {
+            Some(dao) => {
+                let mut user: User = dao.try_into()?;
+                user.roles = self.get_user_role_names(&user.name).await?;
+                Ok(Some(user))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn get_user_roles(&self, user_name: &str) -> Result<Vec<Role>, FlameError> {
+        let sql = r#"
+            SELECT r.* FROM roles r
+            INNER JOIN user_roles ur ON ur.role_name = r.name
+            WHERE ur.user_name = ?
+        "#;
+        let daos: Vec<RoleDao> = sqlx::query_as(sql)
+            .bind(user_name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to get user roles: {e}")))?;
+
+        daos.into_iter().map(Role::try_from).collect()
+    }
+
+    async fn create_user(&self, user: &User) -> Result<User, FlameError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to begin TX: {e}")))?;
+
+        let sql = r#"
+            INSERT INTO users (name, display_name, email, certificate_cn, enabled, creation_time)
+            VALUES (?, ?, ?, ?, ?, ?)
+            RETURNING *
+        "#;
+        let dao: UserDao = sqlx::query_as(sql)
+            .bind(&user.name)
+            .bind(&user.display_name)
+            .bind(&user.email)
+            .bind(&user.certificate_cn)
+            .bind(if user.enabled { 1 } else { 0 })
+            .bind(Utc::now().timestamp())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to create user: {e}")))?;
+
+        for role_name in &user.roles {
+            let sql = "INSERT INTO user_roles (user_name, role_name) VALUES (?, ?)";
+            sqlx::query(sql)
+                .bind(&user.name)
+                .bind(role_name)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| FlameError::Storage(format!("failed to assign role: {e}")))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to commit TX: {e}")))?;
+
+        let mut result: User = dao.try_into()?;
+        result.roles = user.roles.clone();
+        Ok(result)
+    }
+
+    async fn update_user(
+        &self,
+        user: &User,
+        assign_roles: &[String],
+        revoke_roles: &[String],
+    ) -> Result<User, FlameError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to begin TX: {e}")))?;
+
+        let sql = r#"
+            UPDATE users SET
+                display_name = ?,
+                email = ?,
+                enabled = ?
+            WHERE name = ?
+            RETURNING *
+        "#;
+        let dao: UserDao = sqlx::query_as(sql)
+            .bind(&user.display_name)
+            .bind(&user.email)
+            .bind(if user.enabled { 1 } else { 0 })
+            .bind(&user.name)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to update user: {e}")))?;
+
+        for role_name in revoke_roles {
+            let sql = "DELETE FROM user_roles WHERE user_name = ? AND role_name = ?";
+            sqlx::query(sql)
+                .bind(&user.name)
+                .bind(role_name)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| FlameError::Storage(format!("failed to revoke role: {e}")))?;
+        }
+
+        for role_name in assign_roles {
+            let sql = "INSERT OR IGNORE INTO user_roles (user_name, role_name) VALUES (?, ?)";
+            sqlx::query(sql)
+                .bind(&user.name)
+                .bind(role_name)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| FlameError::Storage(format!("failed to assign role: {e}")))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to commit TX: {e}")))?;
+
+        let mut result: User = dao.try_into()?;
+        result.roles = self.get_user_role_names(&result.name).await?;
+        Ok(result)
+    }
+
+    async fn delete_user(&self, name: &str) -> Result<(), FlameError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to begin TX: {e}")))?;
+
+        let sql = "DELETE FROM user_roles WHERE user_name = ?";
+        sqlx::query(sql)
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to delete user roles: {e}")))?;
+
+        let sql = "DELETE FROM users WHERE name = ?";
+        sqlx::query(sql)
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to delete user: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to commit TX: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn find_users(&self, role_filter: Option<&str>) -> Result<Vec<User>, FlameError> {
+        let daos: Vec<UserDao> = match role_filter {
+            Some(role) => {
+                let sql = r#"
+                    SELECT DISTINCT u.* FROM users u
+                    INNER JOIN user_roles ur ON ur.user_name = u.name
+                    WHERE ur.role_name = ?
+                "#;
+                sqlx::query_as(sql)
+                    .bind(role)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| FlameError::Storage(format!("failed to find users: {e}")))?
+            }
+            None => {
+                let sql = "SELECT * FROM users";
+                sqlx::query_as(sql)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| FlameError::Storage(format!("failed to find users: {e}")))?
+            }
+        };
+
+        let mut users = Vec::with_capacity(daos.len());
+        for dao in daos {
+            let mut user: User = dao.try_into()?;
+            user.roles = self.get_user_role_names(&user.name).await?;
+            users.push(user);
+        }
+        Ok(users)
+    }
+
+    async fn get_role(&self, name: &str) -> Result<Option<Role>, FlameError> {
+        let sql = "SELECT * FROM roles WHERE name = ?";
+        let dao: Option<RoleDao> = sqlx::query_as(sql)
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to get role: {e}")))?;
+
+        dao.map(Role::try_from).transpose()
+    }
+
+    async fn create_role(&self, role: &Role) -> Result<Role, FlameError> {
+        let sql = r#"
+            INSERT INTO roles (name, description, permissions, workspaces, creation_time)
+            VALUES (?, ?, ?, ?, ?)
+            RETURNING *
+        "#;
+        let dao: RoleDao = sqlx::query_as(sql)
+            .bind(&role.name)
+            .bind(&role.description)
+            .bind(Json(&role.permissions))
+            .bind(Json(&role.workspaces))
+            .bind(Utc::now().timestamp())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to create role: {e}")))?;
+
+        dao.try_into()
+    }
+
+    async fn update_role(&self, role: &Role) -> Result<Role, FlameError> {
+        let sql = r#"
+            UPDATE roles SET
+                description = ?,
+                permissions = ?,
+                workspaces = ?
+            WHERE name = ?
+            RETURNING *
+        "#;
+        let dao: RoleDao = sqlx::query_as(sql)
+            .bind(&role.description)
+            .bind(Json(&role.permissions))
+            .bind(Json(&role.workspaces))
+            .bind(&role.name)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to update role: {e}")))?;
+
+        dao.try_into()
+    }
+
+    async fn delete_role(&self, name: &str) -> Result<(), FlameError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to begin TX: {e}")))?;
+
+        let sql = "DELETE FROM user_roles WHERE role_name = ?";
+        sqlx::query(sql)
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to delete role bindings: {e}")))?;
+
+        let sql = "DELETE FROM roles WHERE name = ?";
+        sqlx::query(sql)
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to delete role: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to commit TX: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn find_roles(&self, workspace_filter: Option<&str>) -> Result<Vec<Role>, FlameError> {
+        let daos: Vec<RoleDao> = match workspace_filter {
+            Some(workspace) => {
+                let sql = "SELECT * FROM roles WHERE workspaces LIKE ?";
+                let pattern = format!("%\"{}\"%", workspace);
+                sqlx::query_as(sql)
+                    .bind(pattern)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| FlameError::Storage(format!("failed to find roles: {e}")))?
+            }
+            None => {
+                let sql = "SELECT * FROM roles";
+                sqlx::query_as(sql)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| FlameError::Storage(format!("failed to find roles: {e}")))?
+            }
+        };
+
+        daos.into_iter().map(Role::try_from).collect()
+    }
+
+    async fn get_workspace(&self, name: &str) -> Result<Option<Workspace>, FlameError> {
+        let sql = "SELECT * FROM workspaces WHERE name = ?";
+        let dao: Option<WorkspaceDao> = sqlx::query_as(sql)
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to get workspace: {e}")))?;
+
+        dao.map(Workspace::try_from).transpose()
+    }
+
+    async fn create_workspace(&self, workspace: &Workspace) -> Result<Workspace, FlameError> {
+        let sql = r#"
+            INSERT INTO workspaces (name, description, labels, creation_time)
+            VALUES (?, ?, ?, ?)
+            RETURNING *
+        "#;
+        let dao: WorkspaceDao = sqlx::query_as(sql)
+            .bind(&workspace.name)
+            .bind(&workspace.description)
+            .bind(Json(&workspace.labels))
+            .bind(Utc::now().timestamp())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to create workspace: {e}")))?;
+
+        dao.try_into()
+    }
+
+    async fn update_workspace(&self, workspace: &Workspace) -> Result<Workspace, FlameError> {
+        let sql = r#"
+            UPDATE workspaces SET
+                description = ?,
+                labels = ?
+            WHERE name = ?
+            RETURNING *
+        "#;
+        let dao: WorkspaceDao = sqlx::query_as(sql)
+            .bind(&workspace.description)
+            .bind(Json(&workspace.labels))
+            .bind(&workspace.name)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to update workspace: {e}")))?;
+
+        dao.try_into()
+    }
+
+    async fn delete_workspace(&self, name: &str) -> Result<(), FlameError> {
+        let sql = "DELETE FROM workspaces WHERE name = ?";
+        sqlx::query(sql)
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to delete workspace: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn find_workspaces(&self) -> Result<Vec<Workspace>, FlameError> {
+        let sql = "SELECT * FROM workspaces";
+        let daos: Vec<WorkspaceDao> = sqlx::query_as(sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to find workspaces: {e}")))?;
+
+        daos.into_iter().map(Workspace::try_from).collect()
     }
 }
 

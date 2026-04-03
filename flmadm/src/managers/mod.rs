@@ -1,5 +1,7 @@
+pub mod admin;
 pub mod backup;
 pub mod build;
+pub mod cert;
 pub mod config;
 pub mod installation;
 pub mod source;

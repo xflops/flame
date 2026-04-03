@@ -20,7 +20,7 @@ use crate::FlameError;
 use bytes::Bytes;
 use common::apis::{
     Application, ApplicationSchema, ApplicationState, ExecutorState, Node, NodeInfo, NodeState,
-    ResourceRequirement, Session, SessionStatus, Shim, Task,
+    ResourceRequirement, Role, Session, SessionStatus, Shim, Task, User, Workspace,
 };
 use common::apis::{ApplicationID, Event, ExecutorID, SessionID, TaskID};
 
@@ -45,6 +45,7 @@ pub struct AppSchemaDao {
 #[derive(Clone, FromRow, Debug)]
 pub struct ApplicationDao {
     pub name: ApplicationID,
+    pub workspace: String,
     pub version: u32,
     pub shim: i32,
     pub image: Option<String>,
@@ -65,6 +66,7 @@ pub struct ApplicationDao {
 #[derive(Clone, FromRow, Debug)]
 pub struct SessionDao {
     pub id: SessionID,
+    pub workspace: String,
     pub application: String,
     pub slots: i64,
     pub version: u32,
@@ -74,14 +76,15 @@ pub struct SessionDao {
     pub completion_time: Option<i64>,
 
     pub state: i32,
-    pub min_instances: i64,         // Minimum number of instances
-    pub max_instances: Option<i64>, // Maximum number of instances (NULL means unlimited)
+    pub min_instances: i64,
+    pub max_instances: Option<i64>,
 }
 
 #[derive(Clone, FromRow, Debug)]
 pub struct TaskDao {
     pub id: TaskID,
     pub ssn_id: SessionID,
+    pub workspace: String,
     pub version: u32,
     pub input: Option<Vec<u8>>,
     pub output: Option<Vec<u8>>,
@@ -138,6 +141,7 @@ impl TryFrom<&SessionDao> for Session {
     fn try_from(ssn: &SessionDao) -> Result<Self, Self::Error> {
         Ok(Self {
             id: ssn.id.clone(),
+            workspace: ssn.workspace.clone(),
             application: ssn.application.clone(),
             slots: ssn.slots as u32,
             version: ssn.version,
@@ -157,8 +161,8 @@ impl TryFrom<&SessionDao> for Session {
                 state: ssn.state.try_into()?,
             },
             events: vec![],
-            min_instances: ssn.min_instances as u32, // Convert i64 to u32
-            max_instances: ssn.max_instances.map(|v| v as u32), // Convert Option<i64> to Option<u32>
+            min_instances: ssn.min_instances as u32,
+            max_instances: ssn.max_instances.map(|v| v as u32),
         })
     }
 }
@@ -178,6 +182,7 @@ impl TryFrom<&TaskDao> for Task {
         Ok(Self {
             id: task.id,
             ssn_id: task.ssn_id.clone(),
+            workspace: task.workspace.clone(),
             version: task.version,
             input: task.input.clone().map(Bytes::from),
             output: task.output.clone().map(Bytes::from),
@@ -212,6 +217,7 @@ impl TryFrom<&ApplicationDao> for Application {
     fn try_from(app: &ApplicationDao) -> Result<Self, Self::Error> {
         Ok(Self {
             name: app.name.clone(),
+            workspace: app.workspace.clone(),
             version: app.version,
             state: ApplicationState::try_from(app.state)?,
             creation_time: DateTime::<Utc>::from_timestamp(app.creation_time, 0)
@@ -377,5 +383,120 @@ impl From<&Executor> for ExecutorDao {
             creation_time: exec.creation_time.timestamp(),
             state: i32::from(exec.state),
         }
+    }
+}
+
+// ============================================================
+// RBAC DAO types
+// ============================================================
+
+#[derive(Clone, FromRow, Debug)]
+pub struct UserDao {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+    pub certificate_cn: String,
+    pub enabled: i32,
+    pub creation_time: i64,
+    pub last_login_time: Option<i64>,
+}
+
+#[derive(Clone, FromRow, Debug)]
+pub struct RoleDao {
+    pub name: String,
+    pub description: Option<String>,
+    pub permissions: Option<Json<Vec<String>>>,
+    pub workspaces: Option<Json<Vec<String>>>,
+    pub creation_time: i64,
+}
+
+#[derive(Clone, FromRow, Debug)]
+pub struct WorkspaceDao {
+    pub name: String,
+    pub description: Option<String>,
+    pub labels: Option<Json<HashMap<String, String>>>,
+    pub creation_time: i64,
+}
+
+#[derive(Clone, FromRow, Debug)]
+pub struct UserRoleDao {
+    pub user_name: String,
+    pub role_name: String,
+}
+
+impl TryFrom<&UserDao> for User {
+    type Error = FlameError;
+
+    fn try_from(dao: &UserDao) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: dao.name.clone(),
+            display_name: dao.display_name.clone(),
+            email: dao.email.clone(),
+            certificate_cn: dao.certificate_cn.clone(),
+            enabled: dao.enabled != 0,
+            creation_time: DateTime::<Utc>::from_timestamp(dao.creation_time, 0)
+                .ok_or(FlameError::Storage("invalid creation time".to_string()))?,
+            last_login_time: dao
+                .last_login_time
+                .map(|t| {
+                    DateTime::<Utc>::from_timestamp(t, 0)
+                        .ok_or(FlameError::Storage("invalid last login time".to_string()))
+                })
+                .transpose()?,
+            roles: vec![],
+        })
+    }
+}
+
+impl TryFrom<UserDao> for User {
+    type Error = FlameError;
+
+    fn try_from(dao: UserDao) -> Result<Self, Self::Error> {
+        User::try_from(&dao)
+    }
+}
+
+impl TryFrom<&RoleDao> for Role {
+    type Error = FlameError;
+
+    fn try_from(dao: &RoleDao) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: dao.name.clone(),
+            description: dao.description.clone(),
+            permissions: dao.permissions.clone().map(|p| p.0).unwrap_or_default(),
+            workspaces: dao.workspaces.clone().map(|w| w.0).unwrap_or_default(),
+            creation_time: DateTime::<Utc>::from_timestamp(dao.creation_time, 0)
+                .ok_or(FlameError::Storage("invalid creation time".to_string()))?,
+        })
+    }
+}
+
+impl TryFrom<RoleDao> for Role {
+    type Error = FlameError;
+
+    fn try_from(dao: RoleDao) -> Result<Self, Self::Error> {
+        Role::try_from(&dao)
+    }
+}
+
+impl TryFrom<&WorkspaceDao> for Workspace {
+    type Error = FlameError;
+
+    fn try_from(dao: &WorkspaceDao) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: dao.name.clone(),
+            description: dao.description.clone(),
+            labels: dao.labels.clone().map(|l| l.0).unwrap_or_default(),
+            creation_time: DateTime::<Utc>::from_timestamp(dao.creation_time, 0)
+                .ok_or(FlameError::Storage("invalid creation time".to_string()))?,
+        })
+    }
+}
+
+impl TryFrom<WorkspaceDao> for Workspace {
+    type Error = FlameError;
+
+    fn try_from(dao: WorkspaceDao) -> Result<Self, Self::Error> {
+        Workspace::try_from(&dao)
     }
 }

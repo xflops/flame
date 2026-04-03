@@ -25,16 +25,20 @@ use tonic::{Request, Response, Status};
 use self::rpc::frontend_server::Frontend;
 use self::rpc::{
     ApplicationList, CloseSessionRequest, CreateSessionRequest, CreateTaskRequest,
-    DeleteSessionRequest, DeleteTaskRequest, ExecutorList, GetApplicationRequest, GetNodeRequest,
-    GetNodeResponse, GetSessionRequest, GetTaskRequest, ListApplicationRequest,
-    ListExecutorRequest, ListNodesRequest, ListSessionRequest, ListTaskRequest, NodeList,
+    CreateWorkspaceRequest, DeleteSessionRequest, DeleteTaskRequest, DeleteWorkspaceRequest,
+    ExecutorList, GetApplicationRequest, GetNodeRequest, GetNodeResponse, GetSessionRequest,
+    GetTaskRequest, GetWorkspaceRequest, ListApplicationRequest, ListExecutorRequest,
+    ListNodesRequest, ListSessionRequest, ListTaskRequest, ListWorkspacesRequest, NodeList,
     OpenSessionRequest, RegisterApplicationRequest, Session, SessionList, Task,
-    UnregisterApplicationRequest, UpdateApplicationRequest, WatchTaskRequest,
+    UnregisterApplicationRequest, UpdateApplicationRequest, UpdateWorkspaceRequest,
+    WatchTaskRequest,
 };
 
 use rpc::flame as rpc;
 
-use common::{apis, FlameError};
+use common::apis::{self, Workspace};
+use common::rbac::validate_workspace_name;
+use common::FlameError;
 
 use crate::apiserver::Flame;
 
@@ -59,6 +63,7 @@ impl Frontend for Flame {
         req: Request<ListTaskRequest>,
     ) -> Result<Response<Self::ListTaskStream>, Status> {
         trace_fn!("Frontend::list_task");
+
         let req = req.into_inner();
         let ssn_id = req
             .session_id
@@ -145,6 +150,7 @@ impl Frontend for Flame {
         req: Request<UnregisterApplicationRequest>,
     ) -> Result<Response<rpc::Result>, Status> {
         trace_fn!("Frontend::unregister_application");
+
         let req = req.into_inner();
         let res = self.controller.unregister_application(req.name).await;
 
@@ -165,6 +171,7 @@ impl Frontend for Flame {
         req: Request<UpdateApplicationRequest>,
     ) -> Result<Response<rpc::Result>, Status> {
         trace_fn!("Frontend::update_application");
+
         let req = req.into_inner();
         let spec = req.application.ok_or(FlameError::InvalidConfig(
             "applilcation spec is missed".to_string(),
@@ -230,9 +237,10 @@ impl Frontend for Flame {
 
     async fn list_application(
         &self,
-        _: Request<ListApplicationRequest>,
+        req: Request<ListApplicationRequest>,
     ) -> Result<Response<ApplicationList>, Status> {
         trace_fn!("Frontend::list_application");
+
         let app_list = self
             .controller
             .list_application()
@@ -246,9 +254,10 @@ impl Frontend for Flame {
 
     async fn list_executor(
         &self,
-        _: tonic::Request<ListExecutorRequest>,
+        req: tonic::Request<ListExecutorRequest>,
     ) -> Result<Response<ExecutorList>, Status> {
         trace_fn!("Frontend::list_executor");
+
         let executor_list = self.controller.list_executor().map_err(Status::from)?;
         let executors = executor_list.iter().map(rpc::Executor::from).collect();
         Ok(Response::new(ExecutorList { executors }))
@@ -256,9 +265,10 @@ impl Frontend for Flame {
 
     async fn list_nodes(
         &self,
-        _: tonic::Request<ListNodesRequest>,
+        req: tonic::Request<ListNodesRequest>,
     ) -> Result<Response<NodeList>, Status> {
         trace_fn!("Frontend::list_nodes");
+
         let node_list = self.controller.list_node().map_err(Status::from)?;
         let nodes = node_list.iter().map(rpc::Node::from).collect();
         Ok(Response::new(NodeList { nodes }))
@@ -269,6 +279,7 @@ impl Frontend for Flame {
         req: tonic::Request<GetNodeRequest>,
     ) -> Result<Response<GetNodeResponse>, Status> {
         trace_fn!("Frontend::get_node");
+
         let name = req.into_inner().name;
         let node = self
             .controller
@@ -285,6 +296,7 @@ impl Frontend for Flame {
         req: Request<CreateSessionRequest>,
     ) -> Result<Response<Session>, Status> {
         trace_fn!("Frontend::create_session");
+
         let req = req.into_inner();
         let ssn_spec = req
             .session
@@ -326,6 +338,8 @@ impl Frontend for Flame {
         &self,
         req: Request<DeleteSessionRequest>,
     ) -> Result<Response<rpc::Session>, Status> {
+        trace_fn!("Frontend::delete_session");
+
         let ssn_id = req
             .into_inner()
             .session_id
@@ -346,6 +360,7 @@ impl Frontend for Flame {
         req: Request<OpenSessionRequest>,
     ) -> Result<Response<rpc::Session>, Status> {
         trace_fn!("Frontend::open_session");
+
         let req = req.into_inner();
         let ssn_id = req
             .session_id
@@ -377,6 +392,7 @@ impl Frontend for Flame {
         req: Request<CloseSessionRequest>,
     ) -> Result<Response<rpc::Session>, Status> {
         trace_fn!("Frontend::close_session");
+
         let ssn_id = req
             .into_inner()
             .session_id
@@ -398,6 +414,7 @@ impl Frontend for Flame {
         req: Request<GetSessionRequest>,
     ) -> Result<Response<Session>, Status> {
         trace_fn!("Frontend::get_session");
+
         let ssn_id = req
             .into_inner()
             .session_id
@@ -414,9 +431,10 @@ impl Frontend for Flame {
     }
     async fn list_session(
         &self,
-        _: Request<ListSessionRequest>,
+        req: Request<ListSessionRequest>,
     ) -> Result<Response<SessionList>, Status> {
         trace_fn!("Frontend::list_session");
+
         let ssn_list = self.controller.list_session().map_err(Status::from)?;
 
         let sessions = ssn_list.iter().map(Session::from).collect();
@@ -426,6 +444,7 @@ impl Frontend for Flame {
 
     async fn create_task(&self, req: Request<CreateTaskRequest>) -> Result<Response<Task>, Status> {
         trace_fn!("Frontend::create_task");
+
         let task_spec = req
             .into_inner()
             .task
@@ -446,7 +465,7 @@ impl Frontend for Flame {
     }
     async fn delete_task(
         &self,
-        _: Request<DeleteTaskRequest>,
+        req: Request<DeleteTaskRequest>,
     ) -> Result<Response<rpc::Task>, Status> {
         todo!()
     }
@@ -455,6 +474,8 @@ impl Frontend for Flame {
         &self,
         req: Request<WatchTaskRequest>,
     ) -> Result<Response<Self::WatchTaskStream>, Status> {
+        trace_fn!("Frontend::watch_task");
+
         let req = req.into_inner();
         let gid = apis::TaskGID {
             ssn_id: req
@@ -500,6 +521,8 @@ impl Frontend for Flame {
     }
 
     async fn get_task(&self, req: Request<GetTaskRequest>) -> Result<Response<Task>, Status> {
+        trace_fn!("Frontend::get_task");
+
         let req = req.into_inner();
         let ssn_id = req
             .session_id
@@ -518,5 +541,146 @@ impl Frontend for Flame {
             .map_err(Status::from)?;
 
         Ok(Response::new(task))
+    }
+
+    async fn create_workspace(
+        &self,
+        req: Request<CreateWorkspaceRequest>,
+    ) -> Result<Response<rpc::Workspace>, Status> {
+        trace_fn!("Frontend::create_workspace");
+
+        let req = req.into_inner();
+        let spec = req
+            .spec
+            .ok_or_else(|| Status::invalid_argument("workspace spec is required"))?;
+
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("workspace name is required"));
+        }
+
+        validate_workspace_name(&req.name).map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let workspace = Workspace {
+            name: req.name,
+            description: if spec.description.is_empty() {
+                None
+            } else {
+                Some(spec.description)
+            },
+            labels: spec.labels,
+            creation_time: chrono::Utc::now(),
+        };
+
+        let workspace = self
+            .controller
+            .create_workspace(&workspace)
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(rpc::Workspace::from(workspace)))
+    }
+
+    async fn get_workspace(
+        &self,
+        req: Request<GetWorkspaceRequest>,
+    ) -> Result<Response<rpc::Workspace>, Status> {
+        trace_fn!("Frontend::get_workspace");
+
+        let req = req.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("workspace name is required"));
+        }
+
+        let workspace = self
+            .controller
+            .get_workspace(&req.name)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("workspace '{}' not found", req.name)))?;
+
+        Ok(Response::new(rpc::Workspace::from(workspace)))
+    }
+
+    async fn update_workspace(
+        &self,
+        req: Request<UpdateWorkspaceRequest>,
+    ) -> Result<Response<rpc::Workspace>, Status> {
+        trace_fn!("Frontend::update_workspace");
+
+        let req = req.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("workspace name is required"));
+        }
+
+        let existing = self
+            .controller
+            .get_workspace(&req.name)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("workspace '{}' not found", req.name)))?;
+
+        let spec = req.spec.unwrap_or_default();
+
+        let workspace = Workspace {
+            name: existing.name,
+            description: if spec.description.is_empty() {
+                existing.description
+            } else {
+                Some(spec.description)
+            },
+            labels: if spec.labels.is_empty() {
+                existing.labels
+            } else {
+                spec.labels
+            },
+            creation_time: existing.creation_time,
+        };
+
+        let workspace = self
+            .controller
+            .update_workspace(&workspace)
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(rpc::Workspace::from(workspace)))
+    }
+
+    async fn delete_workspace(
+        &self,
+        req: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<rpc::Result>, Status> {
+        trace_fn!("Frontend::delete_workspace");
+
+        let req = req.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("workspace name is required"));
+        }
+
+        self.controller
+            .delete_workspace(&req.name)
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(rpc::Result {
+            return_code: 0,
+            message: None,
+        }))
+    }
+
+    async fn list_workspaces(
+        &self,
+        req: Request<ListWorkspacesRequest>,
+    ) -> Result<Response<rpc::WorkspaceList>, Status> {
+        trace_fn!("Frontend::list_workspaces");
+
+        let workspaces = self
+            .controller
+            .list_workspaces()
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(rpc::WorkspaceList {
+            workspaces: workspaces.into_iter().map(rpc::Workspace::from).collect(),
+        }))
     }
 }

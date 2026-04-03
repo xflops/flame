@@ -16,7 +16,7 @@ use std::env;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::Path;
-use tonic::transport::{Certificate, ClientTlsConfig};
+use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 
 use crate::apis::FlameError;
 
@@ -24,23 +24,20 @@ const DEFAULT_FLAME_CONF: &str = "flame.yaml";
 const FLAME_ENDPOINT: &str = "FLAME_ENDPOINT";
 const FLAME_CACHE_ENDPOINT: &str = "FLAME_CACHE_ENDPOINT";
 const FLAME_CA_FILE: &str = "FLAME_CA_FILE";
+const FLAME_CERT_FILE: &str = "FLAME_CERT_FILE";
+const FLAME_KEY_FILE: &str = "FLAME_KEY_FILE";
 
-/// Client TLS configuration for connecting to Flame services.
-///
-/// Note: To disable TLS for development, use http:// instead of https://
-/// in the endpoint URL.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FlameClientTls {
-    /// Path to CA certificate for server verification
     #[serde(default)]
     pub ca_file: Option<String>,
+    #[serde(default)]
+    pub cert_file: Option<String>,
+    #[serde(default)]
+    pub key_file: Option<String>,
 }
 
 impl FlameClientTls {
-    /// Load client TLS config for tonic.
-    ///
-    /// If ca_file is specified, use it; otherwise use system CA bundle.
-    /// The domain parameter is used for server name verification.
     pub fn client_tls_config(&self, domain: &str) -> Result<ClientTlsConfig, FlameError> {
         let mut config = ClientTlsConfig::new().domain_name(domain);
 
@@ -51,7 +48,32 @@ impl FlameClientTls {
             config = config.ca_certificate(Certificate::from_pem(ca));
         }
 
+        if let (Some(cert_file), Some(key_file)) = (&self.cert_file, &self.key_file) {
+            let cert = fs::read_to_string(cert_file).map_err(|e| {
+                FlameError::InvalidConfig(format!(
+                    "failed to read cert_file <{}>: {}",
+                    cert_file, e
+                ))
+            })?;
+            let key = fs::read_to_string(key_file).map_err(|e| {
+                FlameError::InvalidConfig(format!("failed to read key_file <{}>: {}", key_file, e))
+            })?;
+            config = config.identity(Identity::from_pem(cert, key));
+        }
+
         Ok(config)
+    }
+
+    pub fn from_env() -> Self {
+        Self {
+            ca_file: env::var(FLAME_CA_FILE).ok(),
+            cert_file: env::var(FLAME_CERT_FILE).ok(),
+            key_file: env::var(FLAME_KEY_FILE).ok(),
+        }
+    }
+
+    pub fn has_mtls_credentials(&self) -> bool {
+        self.cert_file.is_some() && self.key_file.is_some()
     }
 }
 
@@ -144,10 +166,20 @@ pub struct FlameContext {
     #[serde(rename = "current-context")]
     pub current_context: String,
     pub contexts: Vec<FlameContextEntry>,
+    #[serde(skip)]
+    pub workspace: Option<String>,
 }
 
 impl FlameContext {
-    /// Get the current context entry.
+    pub fn with_workspace(mut self, workspace: Option<String>) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    pub fn get_workspace(&self) -> &str {
+        self.workspace.as_deref().unwrap_or("default")
+    }
+
     pub fn get_current_context(&self) -> Result<&FlameContextEntry, FlameError> {
         self.contexts
             .iter()
@@ -173,7 +205,13 @@ impl FlameContext {
         })?;
 
         let ca_file = env::var(FLAME_CA_FILE).ok();
-        let tls = ca_file.map(|f| FlameClientTls { ca_file: Some(f) });
+        let cert_file = env::var(FLAME_CERT_FILE).ok();
+        let key_file = env::var(FLAME_KEY_FILE).ok();
+        let tls = ca_file.map(|f| FlameClientTls {
+            ca_file: Some(f),
+            cert_file: cert_file.clone(),
+            key_file: key_file.clone(),
+        });
 
         let cache_endpoint = env::var(FLAME_CACHE_ENDPOINT).ok();
         let cache = cache_endpoint.map(|ep| FlameClientCache {
@@ -193,6 +231,7 @@ impl FlameContext {
         Ok(FlameContext {
             current_context: "env".to_string(),
             contexts: vec![ctx],
+            workspace: None,
         })
     }
 
@@ -222,6 +261,8 @@ impl FlameContext {
                 if current.cluster.tls.is_none() {
                     current.cluster.tls = Some(FlameClientTls {
                         ca_file: Some(ca_file.clone()),
+                        cert_file: None,
+                        key_file: None,
                     });
                 } else if let Some(ref mut tls) = current.cluster.tls {
                     if tls.ca_file.is_none() {
@@ -234,6 +275,8 @@ impl FlameContext {
                     if cache.tls.is_none() {
                         cache.tls = Some(FlameClientTls {
                             ca_file: Some(ca_file.clone()),
+                            cert_file: None,
+                            key_file: None,
                         });
                     } else if let Some(ref mut tls) = cache.tls {
                         if tls.ca_file.is_none() {
