@@ -138,7 +138,6 @@ pub struct ExecutorInfo {
     pub shim: Shim,
     pub task_id: Option<TaskID>,
     pub ssn_id: Option<SessionID>,
-    pub batch_index: Option<u32>,
 
     pub creation_time: DateTime<Utc>,
     pub state: ExecutorState,
@@ -196,7 +195,6 @@ impl From<&Executor> for ExecutorInfo {
             shim: exec.shim,
             task_id: exec.task_id,
             ssn_id: exec.ssn_id.clone(),
-            batch_index: exec.batch_index,
             creation_time: exec.creation_time,
             state: exec.state,
         }
@@ -762,7 +760,6 @@ impl SnapShot {
             slots: exec.slots,
             shim: exec.shim,
             ssn_id: exec.ssn_id.clone(),
-            batch_index: exec.batch_index,
             creation_time: exec.creation_time,
             state,
         });
@@ -817,7 +814,6 @@ pub struct Executor {
     pub shim: Shim,
     pub task_id: Option<TaskID>,
     pub ssn_id: Option<SessionID>,
-    pub batch_index: Option<u32>,
 
     pub creation_time: DateTime<Utc>,
     pub state: ExecutorState,
@@ -833,7 +829,6 @@ impl Default for Executor {
             shim: Shim::Host,
             task_id: None,
             ssn_id: None,
-            batch_index: None,
             creation_time: Utc::now(),
             state: ExecutorState::default(),
         }
@@ -864,7 +859,6 @@ impl From<&rpc::Executor> for Executor {
             shim: Shim::from(spec.shim()),
             task_id: None,
             ssn_id: None,
-            batch_index: status.batch_index,
             creation_time: Utc::now(),
             state,
         }
@@ -894,7 +888,6 @@ impl From<&Executor> for rpc::Executor {
         let status = Some(rpc::ExecutorStatus {
             state: rpc::ExecutorState::from(e.state).into(),
             session_id: e.ssn_id.clone(),
-            batch_index: e.batch_index,
         });
 
         rpc::Executor {
@@ -923,7 +916,6 @@ mod tests {
             shim: Shim::Host,
             task_id: None,
             ssn_id: None,
-            batch_index: None,
             creation_time: Utc::now(),
             state,
         })

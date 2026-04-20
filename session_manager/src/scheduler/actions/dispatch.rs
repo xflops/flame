@@ -11,18 +11,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use stdng::collections::{BinaryHeap, Cmp};
 use stdng::{logs::TraceFn, trace_fn};
 
-use crate::model::{
-    ExecutorInfoPtr, SessionInfoPtr, ALL_EXECUTOR, IDLE_EXECUTOR, OPEN_SESSION, UNBINDING_EXECUTOR,
-    VOID_EXECUTOR,
-};
+use crate::model::{IDLE_EXECUTOR, OPEN_SESSION};
 use crate::scheduler::actions::{Action, ActionPtr};
 use crate::scheduler::plugins::ssn_order_fn;
+use crate::scheduler::statement::Statement;
 use crate::scheduler::Context;
 
 use crate::FlameError;
@@ -32,15 +29,6 @@ pub struct DispatchAction {}
 impl DispatchAction {
     pub fn new_ptr() -> ActionPtr {
         Arc::new(DispatchAction {})
-    }
-
-    fn next_batch_index(ssn: &SessionInfoPtr, bound_count: u32) -> Option<u32> {
-        let batch_size = ssn.batch_size.max(1);
-        if batch_size <= 1 {
-            None
-        } else {
-            Some(bound_count % batch_size)
-        }
     }
 }
 
@@ -59,21 +47,9 @@ impl Action for DispatchAction {
         }
 
         let mut idle_executors = ss.find_executors(IDLE_EXECUTOR)?;
-        let mut void_executors = ss.find_executors(VOID_EXECUTOR)?;
-        let mut unbinding_executors = ss.find_executors(UNBINDING_EXECUTOR)?;
-
-        let all_executors = ss.find_executors(ALL_EXECUTOR)?;
-        let mut bound_counts: HashMap<String, u32> = HashMap::new();
-        for exec in all_executors.values() {
-            if let Some(ssn_id) = &exec.ssn_id {
-                *bound_counts.entry(ssn_id.clone()).or_insert(0) += 1;
-            }
-        }
 
         tracing::debug!("Open sessions: <{:?}>", open_ssns.len());
         tracing::debug!("Idle executors: <{:?}>", idle_executors.len());
-        tracing::debug!("Void executors: <{:?}>", void_executors.len());
-        tracing::debug!("Unbinding executors: <{:?}>", unbinding_executors.len());
 
         loop {
             if open_ssns.is_empty() {
@@ -94,56 +70,37 @@ impl Action for DispatchAction {
                 &ssn.id
             );
 
-            // Allocate idle executors to underused sessions.
-            let mut exec: Option<ExecutorInfoPtr> = None;
-            for (_, e) in idle_executors.iter_mut() {
-                if ctx.is_available(e, &ssn)? {
-                    exec = Some(e.clone());
-                    break;
-                }
-            }
+            let mut stmt = Statement::new(ss.clone(), ctx.plugins.clone(), ctx.controller.clone());
 
-            if let Some(exec) = exec {
-                let bound_count = bound_counts.entry(ssn.id.clone()).or_insert(0);
-                let batch_index = Self::next_batch_index(&ssn, *bound_count);
-
-                tracing::debug!(
-                    "Bind executor <{}> for session <{}> with batch_index={:?}.",
-                    exec.id,
-                    ssn.id,
-                    batch_index
-                );
-                ctx.bind_session(&exec, &ssn, batch_index).await?;
-                idle_executors.remove(&exec.id);
-                *bound_count += 1;
-
-                open_ssns.push(ssn);
-                continue;
-            }
-
-            // Pipeline void/unbinding executors to underused sessions.
-            // * For void executors, it means the executor is not registered; it'll be idle later.
-            //   Pipeline it to the underused session to avoid over allocation.
-            // * For unbinding executors, it means the executor is being unbound from a session.
-            //   Pipeline it to the underused session to avoid over preemption.
-            for exe_list in [&mut void_executors, &mut unbinding_executors] {
-                let mut exec = None;
-                for (_, e) in exe_list.iter_mut() {
-                    if ctx.is_available(e, &ssn)? {
-                        exec = Some(e.clone());
+            for (_, exec) in idle_executors.iter() {
+                if ctx.is_available(exec, &ssn)? {
+                    stmt.bind(exec, &ssn)?;
+                    if ctx.is_fulfilled(&ssn)? {
                         break;
                     }
                 }
+            }
 
-                if let Some(exec) = exec {
-                    tracing::debug!("Pipeline executor <{}> for session <{}>.", exec.id, ssn.id);
-
-                    ctx.pipeline_session(&exec, &ssn).await?;
-                    exe_list.remove(&exec.id);
-
-                    open_ssns.push(ssn.clone());
-                    continue;
+            if ctx.is_fulfilled(&ssn)? {
+                tracing::debug!("Bind executor for session <{}>.", ssn.id);
+                let bound_ids = stmt.commit().await?;
+                for id in &bound_ids {
+                    idle_executors.remove(id);
                 }
+
+                // Re-queue only if we actually bound executors; otherwise the session
+                // would loop infinitely when is_underused() keeps returning true but
+                // no idle executors remain.
+                if !bound_ids.is_empty() {
+                    open_ssns.push(ssn);
+                }
+                continue;
+            } else if !stmt.is_empty() {
+                tracing::debug!(
+                    "Discarding unfulfilled binding for session <{}>: no available idle executors",
+                    ssn.id
+                );
+                stmt.discard()?;
             }
         }
 

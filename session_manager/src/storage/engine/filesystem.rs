@@ -162,8 +162,6 @@ struct ExecutorMetadata {
     pub shim: i32,
     pub task_id: Option<i64>,
     pub ssn_id: Option<String>,
-    #[serde(default)]
-    pub batch_index: Option<u32>,
     pub creation_time: i64,
     pub state: i32,
 }
@@ -1041,21 +1039,18 @@ impl Engine for FilesystemEngine {
                     )));
                 }
 
-                // If spec provided, validate it matches
+                let ssn = self.session_from_metadata(&meta)?;
+
+                // If spec provided, validate full session attributes (same as sqlite engine
+                // and in-memory cache). Only checking application/slots was insufficient:
+                // a persisted session could have batch_size/min_instances/max_instances that
+                // differ from the client spec, leading to gang scheduling deadlocks (tasks
+                // never allocated) without a clear error.
                 if let Some(ref attr) = spec {
-                    if meta.application != attr.application {
-                        return Err(FlameError::InvalidConfig(format!(
-                            "Session {id} spec mismatch: application differs"
-                        )));
-                    }
-                    if meta.slots != attr.slots {
-                        return Err(FlameError::InvalidConfig(format!(
-                            "Session {id} spec mismatch: slots differs"
-                        )));
-                    }
+                    ssn.validate_spec(attr)?;
                 }
 
-                self.session_from_metadata(&meta)
+                Ok(ssn)
             }
             Err(_) => {
                 // Session doesn't exist
@@ -1453,7 +1448,6 @@ impl Engine for FilesystemEngine {
             shim: i32::from(executor.shim),
             task_id: executor.task_id,
             ssn_id: executor.ssn_id.clone(),
-            batch_index: executor.batch_index,
             creation_time: executor.creation_time.timestamp(),
             state: i32::from(executor.state),
         };
@@ -1483,7 +1477,6 @@ impl Engine for FilesystemEngine {
                 shim: Shim::try_from(meta.shim).unwrap_or_default(),
                 task_id: meta.task_id.map(|t| t as TaskID),
                 ssn_id: meta.ssn_id,
-                batch_index: meta.batch_index,
                 creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
                 state: ExecutorState::from(meta.state),
             })),
@@ -1504,7 +1497,6 @@ impl Engine for FilesystemEngine {
             shim: i32::from(executor.shim),
             task_id: executor.task_id,
             ssn_id: executor.ssn_id.clone(),
-            batch_index: executor.batch_index,
             creation_time: executor.creation_time.timestamp(),
             state: i32::from(executor.state),
         };
@@ -1536,7 +1528,6 @@ impl Engine for FilesystemEngine {
             shim: Shim::try_from(meta.shim).unwrap_or_default(),
             task_id: meta.task_id.map(|t| t as TaskID),
             ssn_id: meta.ssn_id,
-            batch_index: meta.batch_index,
             creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
             state,
         })
@@ -1602,7 +1593,6 @@ impl Engine for FilesystemEngine {
                             shim: Shim::try_from(meta.shim).unwrap_or_default(),
                             task_id: meta.task_id.map(|t| t as TaskID),
                             ssn_id: meta.ssn_id,
-                            batch_index: meta.batch_index,
                             creation_time: DateTime::from_timestamp(meta.creation_time, 0)
                                 .unwrap_or_default(),
                             state: ExecutorState::from(meta.state),
@@ -2206,7 +2196,6 @@ mod tests {
             shim: Shim::Host,
             task_id: None,
             ssn_id: None,
-            batch_index: None,
             creation_time: Utc::now(),
             state: ExecutorState::Void,
         };
@@ -2271,7 +2260,6 @@ mod tests {
                 shim: Shim::Host,
                 task_id: None,
                 ssn_id: None,
-                batch_index: None,
                 creation_time: Utc::now(),
                 state: ExecutorState::Void,
             };

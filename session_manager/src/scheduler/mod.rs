@@ -44,6 +44,8 @@ impl FlameThread for ScheduleRunner {
         loop {
             let mut ctx = Context::new(self.controller.clone())?;
 
+            // Same `ctx` (and thus same in-memory `plugins`) for every action: Dispatch mutations
+            // are visible to Allocate (e.g. Gang `is_fulfilled` / `is_ready` after binds).
             for action in ctx.actions.clone() {
                 if let Err(e) = action.execute(&mut ctx).await {
                     tracing::error!("Failed to run scheduling: {e}");
@@ -129,12 +131,12 @@ mod tests {
                 .add_directive("sqlx=error".parse()?)
                 .add_directive("tower=error".parse()?);
 
-            tracing_subscriber::fmt()
+            let _ = tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_test_writer()
                 .with_target(true)
                 .with_ansi(false)
-                .init();
+                .try_init();
 
             let url = common::temp_db_path("flame_test_env");
             let config = FlameClusterContext {
@@ -222,6 +224,31 @@ mod tests {
             assert_eq!(exec_list.len(), 1);
         }
 
+        Ok(())
+    }
+
+    /// One scheduling cycle must keep the same in-memory [`crate::scheduler::plugins::PluginManager`]
+    /// so Gang (and similar) state from Dispatch is visible to Allocate.
+    #[test]
+    fn test_scheduler_cycle_reuses_plugin_manager_across_actions() -> Result<(), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        tokio_test::block_on(
+            controller
+                .storage()
+                .register_node(&new_test_node("node_1".to_string())),
+        )?;
+
+        let mut ctx = Context::new(controller.clone())?;
+        let plugins_ptr = Arc::as_ptr(&ctx.plugins);
+        for action in ctx.actions.clone() {
+            tokio_test::block_on(action.execute(&mut ctx))?;
+        }
+        assert_eq!(plugins_ptr, Arc::as_ptr(&ctx.plugins));
         Ok(())
     }
 }

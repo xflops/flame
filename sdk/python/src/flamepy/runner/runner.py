@@ -180,6 +180,7 @@ class RunnerService:
             slots=1,
             min_instances=runner_context.min_instances,
             max_instances=runner_context.max_instances,
+            batch_size=1,
         )
         self._session = open_session(session_id=session_id, spec=session_spec)
 

@@ -113,7 +113,6 @@ impl From<&Executor> for rpc::Executor {
         let status = Some(ExecutorStatus {
             state: rpc::ExecutorState::from(e.state).into(),
             session_id: e.session.clone().map(|s| s.session_id),
-            batch_index: None,
         });
 
         rpc::Executor {

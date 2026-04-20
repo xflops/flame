@@ -100,15 +100,7 @@ impl States for BoundState {
             app_ptr.delay_release
         );
 
-        let (batch_index, batch_size) = {
-            let executor = lock_ptr!(self.executor)?;
-            let ssn = lock_ptr!(ssn_ptr)?;
-            (executor.batch_index, ssn.batch_size.max(1))
-        };
-
-        let task_ptr =
-            WaitForTaskFuture::new(&ssn_ptr, app_ptr.delay_release, batch_index, batch_size)
-                .await?;
+        let task_ptr = WaitForTaskFuture::new(&ssn_ptr, app_ptr.delay_release).await?;
         tracing::debug!("Got task!");
 
         let (exec_id, host) = {
@@ -193,23 +185,14 @@ struct WaitForTaskFuture {
     ssn: SessionPtr,
     delay_release: Duration,
     start_time: DateTime<Utc>,
-    batch_index: u32,
-    batch_size: u32,
 }
 
 impl WaitForTaskFuture {
-    pub fn new(
-        ssn: &SessionPtr,
-        delay_release: Duration,
-        batch_index: Option<u32>,
-        batch_size: u32,
-    ) -> Self {
+    pub fn new(ssn: &SessionPtr, delay_release: Duration) -> Self {
         Self {
             ssn: ssn.clone(),
             delay_release,
             start_time: Utc::now(),
-            batch_index: batch_index.unwrap_or(0),
-            batch_size: batch_size.max(1),
         }
     }
 }
@@ -220,7 +203,7 @@ impl Future for WaitForTaskFuture {
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut ssn = lock_ptr!(self.ssn)?;
 
-        match ssn.pop_pending_task(self.batch_index, self.batch_size) {
+        match ssn.pop_pending_task() {
             None => {
                 let now = Utc::now();
                 let duration = now.signed_duration_since(self.start_time);

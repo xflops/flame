@@ -137,7 +137,6 @@ mod tests {
             shim: Shim::Host,
             task_id: None,
             ssn_id: None,
-            batch_index: None,
             creation_time: Utc::now(),
             state: ExecutorState::Void,
         };
@@ -215,7 +214,6 @@ mod tests {
                 shim: Shim::Host,
                 task_id: None,
                 ssn_id: None,
-                batch_index: None,
                 creation_time: Utc::now(),
                 state: ExecutorState::Idle,
             };
@@ -270,7 +268,6 @@ mod tests {
             shim: Shim::Host,
             task_id: None,
             ssn_id: None,
-            batch_index: None,
             creation_time: Utc::now(),
             state: ExecutorState::Void,
         };

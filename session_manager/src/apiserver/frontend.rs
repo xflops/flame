@@ -49,6 +49,37 @@ fn validate_working_directory(working_dir: &Option<String>) -> Result<(), FlameE
     Ok(())
 }
 
+/// Validates that min_instances and max_instances are batch-aligned when batch_size > 1.
+fn validate_batch_alignment(
+    batch_size: u32,
+    min_instances: u32,
+    max_instances: Option<u32>,
+) -> Result<(), FlameError> {
+    let batch_size = batch_size.max(1);
+
+    if batch_size == 1 {
+        return Ok(());
+    }
+
+    if min_instances != 0 && !min_instances.is_multiple_of(batch_size) {
+        return Err(FlameError::InvalidConfig(format!(
+            "min_instances ({}) must be 0 or a multiple of batch_size ({})",
+            min_instances, batch_size
+        )));
+    }
+
+    if let Some(max) = max_instances {
+        if !max.is_multiple_of(batch_size) {
+            return Err(FlameError::InvalidConfig(format!(
+                "max_instances ({}) must be a multiple of batch_size ({})",
+                max, batch_size
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 #[async_trait]
 impl Frontend for Flame {
     type WatchTaskStream = Pin<Box<dyn Stream<Item = Result<Task, Status>> + Send>>;
@@ -294,6 +325,13 @@ impl Frontend for Flame {
             .parse::<apis::SessionID>()
             .map_err(|_| Status::invalid_argument("invalid session id"))?;
 
+        validate_batch_alignment(
+            ssn_spec.batch_size,
+            ssn_spec.min_instances,
+            ssn_spec.max_instances,
+        )
+        .map_err(Status::from)?;
+
         let attr = SessionAttributes {
             id: ssn_id,
             application: ssn_spec.application,
@@ -305,12 +343,13 @@ impl Frontend for Flame {
         };
 
         tracing::debug!(
-            "Creating session with attributes: id={}, application={}, slots={}, min_instances={}, max_instances={:?}",
+            "Creating session with attributes: id={}, application={}, slots={}, min_instances={}, max_instances={:?}, batch_size={}",
             attr.id,
             attr.application,
             attr.slots,
             attr.min_instances,
-            attr.max_instances
+            attr.max_instances,
+            attr.batch_size
         );
 
         let ssn = self
@@ -353,16 +392,27 @@ impl Frontend for Flame {
             .parse::<apis::SessionID>()
             .map_err(|_| Status::invalid_argument("invalid session id"))?;
 
-        // Convert optional SessionSpec to SessionAttributes
-        let spec = req.session.map(|ssn_spec| SessionAttributes {
-            id: ssn_id.clone(),
-            application: ssn_spec.application,
-            slots: ssn_spec.slots,
-            common_data: ssn_spec.common_data.map(apis::CommonData::from),
-            min_instances: ssn_spec.min_instances,
-            max_instances: ssn_spec.max_instances,
-            batch_size: ssn_spec.batch_size.max(1),
-        });
+        let spec = match req.session {
+            Some(ssn_spec) => {
+                validate_batch_alignment(
+                    ssn_spec.batch_size,
+                    ssn_spec.min_instances,
+                    ssn_spec.max_instances,
+                )
+                .map_err(Status::from)?;
+
+                Some(SessionAttributes {
+                    id: ssn_id.clone(),
+                    application: ssn_spec.application,
+                    slots: ssn_spec.slots,
+                    common_data: ssn_spec.common_data.map(apis::CommonData::from),
+                    min_instances: ssn_spec.min_instances,
+                    max_instances: ssn_spec.max_instances,
+                    batch_size: ssn_spec.batch_size.max(1),
+                })
+            }
+            None => None,
+        };
 
         let ssn = self
             .controller

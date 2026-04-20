@@ -16,7 +16,7 @@ use std::sync::Arc;
 use stdng::collections::{BinaryHeap, Cmp};
 use stdng::{logs::TraceFn, trace_fn};
 
-use crate::model::{ALL_NODE, OPEN_SESSION};
+use crate::model::{ALL_NODE, OPEN_SESSION, UNBINDING_EXECUTOR, VOID_EXECUTOR};
 use crate::scheduler::actions::{Action, ActionPtr};
 use crate::scheduler::plugins::node_order_fn;
 use crate::scheduler::plugins::ssn_order_fn;
@@ -57,6 +57,15 @@ impl Action for AllocateAction {
             "AllocateAction: {} open sessions, {} nodes available",
             open_ssns.len(),
             nodes.len()
+        );
+
+        let mut void_executors = ss.find_executors(VOID_EXECUTOR)?;
+        let mut unbinding_executors = ss.find_executors(UNBINDING_EXECUTOR)?;
+
+        tracing::debug!(
+            "AllocateAction: {} void executors, {} unbinding executors",
+            void_executors.len(),
+            unbinding_executors.len()
         );
 
         let node_order_fn = node_order_fn(ctx);
@@ -105,44 +114,58 @@ impl Action for AllocateAction {
                 }
             }
 
-            let pipelined_executors = ss.pipelined_executors(ssn.clone())?;
-            if !pipelined_executors.is_empty() {
+            // Dispatch runs first in this cycle. `PluginManager` is not re-setup between actions
+            // (see `Context`): Gang's counters include binds Dispatch committed via
+            // `Statement` in this same `Context`. If those already satisfy gang scheduling, do not
+            // create more executors here.
+            let fulfilled = ctx.is_fulfilled(&ssn)?;
+            let ready = ctx.is_ready(&ssn)?;
+            if fulfilled || ready {
                 tracing::debug!(
-                    "Skip allocate resources for session <{}> because there are <{}> executors in pipeline.",
+                    "Skip allocate resources for session <{}>: is_fulfilled={}, is_ready={}",
                     ssn.id,
-                    pipelined_executors.len()
+                    fulfilled,
+                    ready
                 );
                 continue;
             }
 
             let mut stmt = Statement::new(ss.clone(), ctx.plugins.clone(), ctx.controller.clone());
 
-            for node in nodes.iter() {
-                while ctx.is_allocatable(node, &ssn)? {
-                    stmt.pipeline(node, &ssn)?;
+            let pipelineable = void_executors
+                .values()
+                .chain(unbinding_executors.values())
+                .filter(|e| ctx.is_available(e, &ssn).unwrap_or(false));
 
-                    if stmt.is_ready(&ssn)? {
-                        break;
-                    }
-                }
-
-                if stmt.is_ready(&ssn)? {
+            for exec in pipelineable {
+                stmt.pipeline(exec, &ssn)?;
+                if ctx.is_ready(&ssn)? {
                     break;
                 }
             }
 
-            if stmt.is_ready(&ssn)? {
-                tracing::info!(
-                    "Committing {} executor(s) for session <{}>",
-                    stmt.len(),
-                    ssn.id
-                );
-                stmt.commit().await?;
+            for node in nodes.iter() {
+                if ctx.is_ready(&ssn)? {
+                    break;
+                }
+                while ctx.is_allocatable(node, &ssn)? && !ctx.is_ready(&ssn)? {
+                    stmt.allocate(node, &ssn)?;
+                }
+            }
+
+            if ctx.is_ready(&ssn)? {
+                let op_count = stmt.len();
+                let pipelined_ids = stmt.commit().await?;
+                for id in &pipelined_ids {
+                    void_executors.remove(id);
+                    unbinding_executors.remove(id);
+                }
+                tracing::info!("Committed {} op(s) for session <{}>", op_count, ssn.id);
                 nodes.sort_by(|a, b| node_order_fn.cmp(a, b));
                 open_ssns.push(ssn.clone());
             } else if !stmt.is_empty() {
                 tracing::debug!(
-                    "Discarding incomplete batch for session <{}>: not enough allocatable nodes",
+                    "Discarding incomplete batch for session <{}>: not enough resources",
                     ssn.id
                 );
                 stmt.discard()?;

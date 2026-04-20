@@ -166,8 +166,12 @@ pub fn temp_sqlite_url(prefix: &str) -> String {
 /// // Later: std::fs::remove_file(&path).ok();
 /// ```
 pub fn temp_db_path(prefix: &str) -> String {
-    let timestamp = chrono::Utc::now().timestamp();
-    let temp_path = temp_dir().join(format!("{}_{}.db", prefix, timestamp));
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let timestamp = chrono::Utc::now().timestamp_micros();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp_path = temp_dir().join(format!("{}_{}_{}.db", prefix, timestamp, counter));
     temp_path.to_string_lossy().to_string()
 }
 

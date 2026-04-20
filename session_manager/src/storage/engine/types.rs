@@ -127,7 +127,6 @@ pub struct ExecutorDao {
 
     pub task_id: Option<TaskID>,
     pub ssn_id: Option<SessionID>,
-    pub batch_index: Option<i64>,
 
     pub creation_time: i64,
     pub state: i32,
@@ -350,7 +349,6 @@ impl TryFrom<&ExecutorDao> for Executor {
             shim: Shim::try_from(dao.shim).unwrap_or_default(),
             task_id: dao.task_id,
             ssn_id: dao.ssn_id.clone(),
-            batch_index: dao.batch_index.map(|v| v as u32),
             creation_time: DateTime::<Utc>::from_timestamp(dao.creation_time, 0)
                 .ok_or(FlameError::Storage("invalid creation time".to_string()))?,
             state: ExecutorState::from(dao.state),
@@ -377,7 +375,6 @@ impl From<&Executor> for ExecutorDao {
             shim: i32::from(exec.shim),
             task_id: exec.task_id,
             ssn_id: exec.ssn_id.clone(),
-            batch_index: exec.batch_index.map(|v| v as i64),
             creation_time: exec.creation_time.timestamp(),
             state: i32::from(exec.state),
         }

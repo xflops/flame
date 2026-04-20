@@ -14,17 +14,33 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::controller::ControllerPtr;
-use crate::model::{ExecutorInfo, NodeInfoPtr, SessionInfoPtr, SnapShotPtr};
+use crate::model::{
+    ExecutorInfo, ExecutorInfoPtr, NodeInfoPtr, SessionInfoPtr, SnapShotPtr, ALL_NODE,
+};
 use crate::scheduler::plugins::PluginManagerPtr;
+use common::apis::{ExecutorID, ExecutorState};
 use common::FlameError;
 
-struct PipelinedAllocation {
+struct Allocation {
+    node: NodeInfoPtr,
+    ssn: SessionInfoPtr,
+}
+
+struct Pipeline {
+    executor: ExecutorInfoPtr,
+    ssn: SessionInfoPtr,
+}
+
+struct Binding {
+    executor: ExecutorInfoPtr,
     node: NodeInfoPtr,
     ssn: SessionInfoPtr,
 }
 
 pub struct Statement {
-    operations: Vec<PipelinedAllocation>,
+    allocations: Vec<Allocation>,
+    pipelines: Vec<Pipeline>,
+    bindings: Vec<Binding>,
     snapshot: SnapShotPtr,
     plugins: PluginManagerPtr,
     controller: ControllerPtr,
@@ -37,58 +53,108 @@ impl Statement {
         controller: ControllerPtr,
     ) -> Self {
         Statement {
-            operations: Vec::new(),
+            allocations: Vec::new(),
+            pipelines: Vec::new(),
+            bindings: Vec::new(),
             snapshot,
             plugins,
             controller,
         }
     }
 
-    pub fn pipeline(&mut self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Result<(), FlameError> {
+    pub fn allocate(&mut self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Result<(), FlameError> {
         self.plugins
-            .on_pipeline_executor(node.clone(), ssn.clone())?;
-        self.operations.push(PipelinedAllocation {
+            .on_executor_allocate(node.clone(), ssn.clone())?;
+        self.allocations.push(Allocation {
             node: node.clone(),
             ssn: ssn.clone(),
         });
         Ok(())
     }
 
-    pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
-        self.plugins.is_ready(ssn)
+    pub fn pipeline(
+        &mut self,
+        executor: &ExecutorInfoPtr,
+        ssn: &SessionInfoPtr,
+    ) -> Result<(), FlameError> {
+        self.plugins
+            .on_executor_pipeline(executor.clone(), ssn.clone())?;
+        self.pipelines.push(Pipeline {
+            executor: executor.clone(),
+            ssn: ssn.clone(),
+        });
+        Ok(())
     }
 
-    pub async fn commit(self) -> Result<(), FlameError> {
-        let batch_size = self.operations.len() as u32;
-        for (idx, op) in self.operations.into_iter().enumerate() {
-            let batch_index = if batch_size > 1 {
-                Some(idx as u32)
-            } else {
-                None
-            };
+    pub fn bind(
+        &mut self,
+        executor: &ExecutorInfoPtr,
+        ssn: &SessionInfoPtr,
+    ) -> Result<(), FlameError> {
+        let nodes = self.snapshot.find_nodes(ALL_NODE)?;
+        let node = nodes.get(&executor.node).ok_or_else(|| {
+            FlameError::Internal(format!(
+                "Node {} not found for executor {}",
+                executor.node, executor.id
+            ))
+        })?;
+
+        self.plugins.on_session_bind(ssn.clone())?;
+        self.bindings.push(Binding {
+            executor: executor.clone(),
+            node: node.clone(),
+            ssn: ssn.clone(),
+        });
+        Ok(())
+    }
+
+    pub async fn commit(self) -> Result<Vec<ExecutorID>, FlameError> {
+        let mut executor_ids = Vec::new();
+
+        for op in self.allocations.into_iter() {
             let executor = self
                 .controller
-                .create_executor(op.node.name.clone(), op.ssn.id.clone(), batch_index)
+                .create_executor(op.node.name.clone(), op.ssn.id.clone())
                 .await?;
 
             let exec_info = ExecutorInfo::from(&executor);
             self.snapshot.add_executor(Arc::new(exec_info))?;
         }
-        Ok(())
+
+        for p in self.pipelines.into_iter() {
+            executor_ids.push(p.executor.id.clone());
+        }
+
+        for binding in self.bindings.into_iter() {
+            self.controller
+                .bind_session(binding.executor.id.clone(), binding.ssn.id.clone())
+                .await?;
+            self.snapshot
+                .update_executor_state(binding.executor.clone(), ExecutorState::Binding)?;
+            executor_ids.push(binding.executor.id.clone());
+        }
+
+        Ok(executor_ids)
     }
 
     pub fn discard(self) -> Result<(), FlameError> {
-        for op in self.operations.into_iter().rev() {
-            self.plugins.on_discard_executor(op.node, op.ssn)?;
+        for op in self.allocations.into_iter().rev() {
+            self.plugins.on_executor_unallocate(op.node, op.ssn)?;
+        }
+        for p in self.pipelines.into_iter().rev() {
+            self.plugins.on_executor_discard(p.executor, p.ssn)?;
+        }
+        for binding in self.bindings.into_iter().rev() {
+            self.plugins.on_session_unbind(binding.ssn)?;
         }
         Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.operations.is_empty()
+        self.allocations.is_empty() && self.pipelines.is_empty() && self.bindings.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.operations.len()
+        self.allocations.len() + self.pipelines.len() + self.bindings.len()
     }
 }

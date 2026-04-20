@@ -228,7 +228,7 @@ impl Storage {
             }
 
             // Sort by completion time (oldest first)
-            closed_sessions.sort_by(|a, b| a.1.cmp(&b.1));
+            closed_sessions.sort_by_key(|a| a.1);
 
             // Evict the oldest closed session
             if let Some((ssn_id, _)) = closed_sessions.first() {
@@ -371,7 +371,6 @@ impl Storage {
                     shim: exec.shim,
                     task_id: exec.task_id,
                     ssn_id: exec.ssn_id.clone(),
-                    batch_index: exec.batch_index,
                     creation_time: exec.creation_time,
                     state: exec.state,
                 });
@@ -895,7 +894,6 @@ impl Storage {
         &self,
         node_name: String,
         ssn_id: SessionID,
-        batch_index: Option<u32>,
     ) -> Result<Executor, FlameError> {
         trace_fn!("Storage::create_executor");
         let ssn = self.get_session_ptr(ssn_id.clone())?;
@@ -916,7 +914,6 @@ impl Storage {
             shim: Shim::default(),
             task_id: None,
             ssn_id: None,
-            batch_index,
             creation_time: Utc::now(),
             state: ExecutorState::Void,
         };

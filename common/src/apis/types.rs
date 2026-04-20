@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::{env, fmt};
 
 use chrono::{DateTime, Duration, Utc};
@@ -177,7 +177,7 @@ pub struct Session {
     pub version: u32,
     pub common_data: Option<CommonData>,
     pub tasks: HashMap<TaskID, TaskPtr>,
-    pub tasks_index: HashMap<TaskState, HashMap<TaskID, TaskPtr>>,
+    pub tasks_index: HashMap<TaskState, BTreeMap<TaskID, TaskPtr>>,
     pub creation_time: DateTime<Utc>,
     pub completion_time: Option<DateTime<Utc>>,
     pub events: Vec<Event>,

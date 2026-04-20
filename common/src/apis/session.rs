@@ -83,23 +83,10 @@ impl Session {
         Ok(())
     }
 
-    pub fn pop_pending_task(&mut self, batch_index: u32, batch_size: u32) -> Option<TaskPtr> {
+    pub fn pop_pending_task(&mut self) -> Option<TaskPtr> {
         let pending_tasks = self.tasks_index.get_mut(&TaskState::Pending)?;
-
-        if batch_size <= 1 {
-            let task_id = *pending_tasks.keys().next()?;
-            return pending_tasks.remove(&task_id);
-        }
-
-        let mut sorted_task_ids: Vec<_> = pending_tasks.keys().copied().collect();
-        sorted_task_ids.sort();
-
-        for task_id in sorted_task_ids {
-            if (task_id as u32) % batch_size == batch_index {
-                return pending_tasks.remove(&task_id);
-            }
-        }
-        None
+        let task_id = *pending_tasks.keys().next()?;
+        pending_tasks.remove(&task_id)
     }
 
     pub fn validate_spec(&self, attr: &SessionAttributes) -> Result<(), FlameError> {

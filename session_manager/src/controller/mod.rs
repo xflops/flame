@@ -385,12 +385,11 @@ impl Controller {
         &self,
         node_name: String,
         ssn_id: SessionID,
-        batch_index: Option<u32>,
     ) -> Result<Executor, FlameError> {
         trace_fn!("Controller::create_executor");
         let executor = self
             .storage
-            .create_executor(node_name.clone(), ssn_id, batch_index)
+            .create_executor(node_name.clone(), ssn_id)
             .await?;
 
         // Notify the node about the new executor
@@ -500,12 +499,7 @@ impl Controller {
         Ok(Some((*ssn).clone()))
     }
 
-    pub async fn bind_session(
-        &self,
-        id: ExecutorID,
-        ssn_id: SessionID,
-        batch_index: Option<u32>,
-    ) -> Result<(), FlameError> {
+    pub async fn bind_session(&self, id: ExecutorID, ssn_id: SessionID) -> Result<(), FlameError> {
         trace_fn!("Controller::bind_session");
 
         let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
@@ -515,8 +509,7 @@ impl Controller {
         state.bind_session(ssn_ptr).await?;
 
         let executor = {
-            let mut exe = lock_ptr!(exe_ptr)?;
-            exe.batch_index = batch_index;
+            let exe = lock_ptr!(exe_ptr)?;
             (*exe).clone()
         };
         self.storage.update_executor(&executor).await?;
