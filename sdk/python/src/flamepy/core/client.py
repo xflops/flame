@@ -21,6 +21,8 @@ from urllib.parse import urlparse
 
 import grpc
 
+from typing import Callable
+
 from flamepy.core.types import (
     Application,
     ApplicationAttributes,
@@ -719,33 +721,30 @@ class Session:
         except grpc.RpcError as e:
             raise FlameError(FlameErrorCode.INTERNAL, f"failed to watch task: {e.details()}")
 
-    def invoke(self, input_data: Any, informer: Optional[TaskInformer] = None) -> Any:
-        """Invoke a task with the given input and optional informer (synchronous).
+    def invoke(self, input_data: Any) -> Any:
+        """Invoke a task with the given input (synchronous).
 
         This method blocks until the task completes or fails.
 
         Args:
             input_data: The input data for the task
-            informer: Optional task informer for monitoring task progress
 
         Returns:
-            The task output (or None if informer is provided)
+            The task output
 
         Example:
             >>> result = session.invoke(b"input data")
             >>> print(result)
         """
-        return self._invoke_impl(input_data, informer)
+        return self.run(input_data).result()
 
-    def run(self, input_data: Any, informer: Optional[TaskInformer] = None) -> Future:
-        """Run a task asynchronously and return a Future (async-style execution).
+    def run(self, input_data: Any) -> Future:
+        """Run a task asynchronously and return a Future.
 
-        This method returns immediately with a Future object that can be used to
-        retrieve the result later or run multiple tasks in parallel.
+        This method returns immediately after task creation.
 
         Args:
             input_data: The input data for the task
-            informer: Optional task informer for monitoring task progress
 
         Returns:
             A Future object that will contain the result when the task completes
@@ -760,30 +759,25 @@ class Session:
             >>> wait(futures)
             >>> results = [f.result() for f in futures]
         """
-        return self.connection._executor.submit(self._invoke_impl, input_data, informer)
-
-    def _invoke_impl(self, input_data: Any, informer: Optional[TaskInformer] = None) -> Any:
-        """Internal implementation of invoke/run."""
         task = self.create_task(input_data)
-        watcher = self.watch_task(task.id)
+        future = _LazyTaskFuture(self, task.id)
+        future_informer = _FutureTaskInformer(future)
 
-        for task in watcher:
-            # If informer is provided, use it to update the task and
-            # return None to indicate that the task is handled by the informer.
-            if informer is not None:
-                with self.mutex:
-                    informer.on_update(task)
-                if task.is_completed():
-                    return None
+        def _watch():
+            try:
+                watcher = self.watch_task(task.id)
+                for t in watcher:
+                    future_informer.on_update(t)
+                    if t.is_completed() or t.is_failed():
+                        return
+            except Exception as e:
+                if isinstance(e, FlameError):
+                    future_informer.on_error(e)
+                else:
+                    future_informer.on_error(FlameError(FlameErrorCode.INTERNAL, f"Watch failed: {str(e)}"))
 
-            # If the task is failed, raise an error.
-            if task.is_failed():
-                for event in task.events:
-                    if event.code == TaskState.FAILED:
-                        raise FlameError(FlameErrorCode.INTERNAL, f"{event.message}")
-            # If the task is completed, return the output.
-            elif task.is_completed():
-                return task.output
+        self.connection._executor.submit(_watch)
+        return future
 
     def close(self) -> None:
         """Close the session."""
@@ -861,3 +855,41 @@ class TaskIterator:
             raise FlameError(FlameErrorCode.INTERNAL, f"failed to list tasks: {e.details()}")
         except Exception as e:
             raise FlameError(FlameErrorCode.INTERNAL, f"failed to list tasks: {str(e)}")
+
+
+class _LazyTaskFuture(Future):
+    """A Future that tracks a Flame task, compatible with concurrent.futures.wait()/as_completed()."""
+
+    def __init__(
+        self,
+        session: "Session",
+        task_id: TaskID,
+    ):
+        super().__init__()
+        self._session = session
+        self._task_id = task_id
+
+
+class _FutureTaskInformer(TaskInformer):
+    """TaskInformer that updates a _LazyTaskFuture when task state changes."""
+
+    def __init__(self, future: Future):
+        self._future = future
+
+    def on_update(self, task: Task) -> None:
+        """Called when task status changes."""
+        if self._future.done():
+            return
+        if task.is_failed():
+            for event in task.events:
+                if event.code == TaskState.FAILED:
+                    self._future.set_exception(FlameError(FlameErrorCode.INTERNAL, f"{event.message}"))
+                    return
+            self._future.set_exception(FlameError(FlameErrorCode.INTERNAL, "Task failed without error message"))
+        elif task.is_completed():
+            self._future.set_result(task.output)
+
+    def on_error(self, error: FlameError) -> None:
+        """Called when watch stream encounters an error."""
+        if not self._future.done():
+            self._future.set_exception(error)

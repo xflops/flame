@@ -4,7 +4,7 @@ WORKDIR /usr/src/flame
 COPY . .
 
 RUN apt-get update && apt-get install -y protobuf-compiler pkg-config libssl-dev
-RUN CARGO_BUILD_JOBS=1 cargo build --release
+RUN cargo build --release
 
 # Copy uv before flmadm install (flmadm will detect and copy it to FLAME_HOME/bin)
 COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /usr/bin/

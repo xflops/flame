@@ -106,7 +106,6 @@ class ObjectFutureIterator:
     """Iterator wrapper over futures that yields ObjectFuture as they complete."""
 
     def __init__(self, futures: List[ObjectFuture]):
-        """Initialize an iterator from a list of ObjectFuture instances."""
         self._future_map = {future._future: future for future in futures}
 
     def __iter__(self):

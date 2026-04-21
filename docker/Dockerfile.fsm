@@ -4,7 +4,7 @@ WORKDIR /usr/src/flame
 COPY . .
 
 RUN apt-get update && apt-get install -y protobuf-compiler pkg-config libssl-dev
-RUN CARGO_BUILD_JOBS=1 cargo build --release
+RUN cargo build --release
 
 # Install using flmadm with control-plane profile
 RUN ./target/release/flmadm install \
