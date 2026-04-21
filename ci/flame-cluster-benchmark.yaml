@@ -18,11 +18,10 @@ cluster:
 cache:
   endpoint: "grpcs://flame-executor-manager:9090"
   network_interface: "eth0"
-  storage: "/var/lib/flame/cache"
   eviction:
     policy: "lru"
-    max_memory: "512M"
-    max_objects: 10000
+    max_memory: "1024M"
+    max_objects: 20000
   tls:
     cert_file: "/etc/flame/certs/server.crt"
     key_file: "/etc/flame/certs/server.key"

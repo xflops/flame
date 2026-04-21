@@ -13,7 +13,6 @@ limitations under the License.
 
 use clap::Parser;
 use futures::future::select_all;
-use tokio::runtime::{Builder, Runtime};
 use tokio::task::JoinHandle;
 
 use common::ctx::FlameClusterContext;
@@ -54,81 +53,45 @@ async fn main() -> Result<(), FlameError> {
     storage.load_data().await?;
 
     let controller = controller::new_ptr(storage.clone());
-    let build_runtime = |name: &str, threads: usize| -> Result<Runtime, FlameError> {
-        Builder::new_multi_thread()
-            .worker_threads(threads)
-            .thread_name(name)
-            .enable_all()
-            .build()
-            .map_err(|e| FlameError::Internal(format!("failed to build runtime <{name}>: {e}")))
-    };
 
-    let num_cpus = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4);
-    let frontend_threads = 1;
-    let scheduler_threads = 1;
-    let provider_threads = 1;
-    let reserved_threads = frontend_threads + scheduler_threads + provider_threads;
-    let backend_threads = if num_cpus > reserved_threads {
-        num_cpus - reserved_threads
-    } else {
-        1
-    };
-
-    tracing::info!(
-        "CPU allocation: total={}, frontend={}, scheduler={}, provider={}, backend={}",
-        num_cpus,
-        frontend_threads,
-        scheduler_threads,
-        provider_threads,
-        backend_threads
-    );
-
-    let frontend_rt = build_runtime("frontend", frontend_threads)?;
-    let backend_rt = build_runtime("backend", backend_threads)?;
-    let scheduler_rt = build_runtime("scheduler", scheduler_threads)?;
-    let provider_rt = build_runtime("provider", provider_threads)?;
-
-    // Start provider thread.
+    // Start provider task.
     #[allow(clippy::let_underscore_future)]
     {
         let controller = controller.clone();
         let ctx = ctx.clone();
-        let _ = provider_rt.spawn(async move {
+        let _ = tokio::spawn(async move {
             let provider = provider::new("none", controller)?;
             provider.run(ctx).await
         });
-        // handlers.push(handler);
     }
 
-    // Start apiserver frontend thread.
+    // Start apiserver frontend task.
     {
         let controller = controller.clone();
         let ctx = ctx.clone();
-        let handler = frontend_rt.spawn(async move {
+        let handler = tokio::spawn(async move {
             let apiserver = apiserver::new_frontend(controller);
             apiserver.run(ctx).await
         });
         handlers.push(handler);
     }
 
-    // Start apiserver backend thread.
+    // Start apiserver backend task.
     {
         let controller = controller.clone();
         let ctx = ctx.clone();
-        let handler = backend_rt.spawn(async move {
+        let handler = tokio::spawn(async move {
             let apiserver = apiserver::new_backend(controller);
             apiserver.run(ctx).await
         });
         handlers.push(handler);
     }
 
-    // Start scheduler thread.
+    // Start scheduler task.
     {
         let controller = controller.clone();
         let ctx = ctx.clone();
-        let handler = scheduler_rt.spawn(async move {
+        let handler = tokio::spawn(async move {
             let scheduler = scheduler::new(controller);
             scheduler.run(ctx).await
         });
