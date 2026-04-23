@@ -16,7 +16,7 @@ use stdng::{lock_ptr, logs::TraceFn, trace_fn, MutexPtr};
 use crate::controller::executors::States;
 use crate::model::ExecutorPtr;
 use crate::storage::StoragePtr;
-use common::apis::{ExecutorState, SessionPtr, Task, TaskOutput, TaskPtr, TaskResult};
+use common::apis::{ExecutorState, SessionPtr, Task, TaskPtr, TaskResult};
 use common::FlameError;
 
 pub struct BindingState {
@@ -80,7 +80,11 @@ impl States for BindingState {
         Err(FlameError::InvalidState("Executor is binding".to_string()))
     }
 
-    async fn launch_task(&self, _ssn: SessionPtr) -> Result<Option<Task>, FlameError> {
+    async fn launch_task(
+        &self,
+        _ssn: SessionPtr,
+        _task: TaskPtr,
+    ) -> Result<Option<Task>, FlameError> {
         trace_fn!("BindingState::launch_task");
 
         Err(FlameError::InvalidState("Executor is binding".to_string()))

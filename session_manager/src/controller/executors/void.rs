@@ -16,7 +16,7 @@ use crate::storage::StoragePtr;
 use stdng::{lock_ptr, logs::TraceFn, trace_fn, MutexPtr};
 
 use crate::model::ExecutorPtr;
-use common::apis::{ExecutorState, SessionPtr, Task, TaskOutput, TaskPtr, TaskResult};
+use common::apis::{ExecutorState, SessionPtr, Task, TaskPtr, TaskResult};
 use common::FlameError;
 
 pub struct VoidState {
@@ -70,7 +70,11 @@ impl States for VoidState {
         Err(FlameError::InvalidState("Executor is void".to_string()))
     }
 
-    async fn launch_task(&self, _ssn: SessionPtr) -> Result<Option<Task>, FlameError> {
+    async fn launch_task(
+        &self,
+        _ssn: SessionPtr,
+        _task: TaskPtr,
+    ) -> Result<Option<Task>, FlameError> {
         trace_fn!("VoidState::launch_task");
 
         Err(FlameError::InvalidState("Executor is void".to_string()))

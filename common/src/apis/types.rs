@@ -203,7 +203,7 @@ impl TaskState {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TaskGID {
     pub ssn_id: SessionID,
     pub task_id: TaskID,
