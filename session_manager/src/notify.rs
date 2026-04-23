@@ -272,13 +272,29 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_fresh_subscribe_changed_blocks_without_notify() {
+            let notifier = TaskNotifier::new();
+            let ssn_id = "session-1".to_string();
+
+            let mut rx = notifier.subscribe(&ssn_id, 1).unwrap();
+
+            // NO notify - just call changed() immediately after subscribe
+            // This should BLOCK (timeout) because no notification was sent
+            let result =
+                tokio::time::timeout(tokio::time::Duration::from_millis(50), rx.changed()).await;
+            assert!(
+                result.is_err(),
+                "changed() should block/timeout without any notify"
+            );
+        }
+
+        #[tokio::test]
         async fn test_changed_twice_blocks_second_time() {
             let notifier = TaskNotifier::new();
             let ssn_id = "session-1".to_string();
 
             let mut rx = notifier.subscribe(&ssn_id, 1).unwrap();
 
-            // First notify
             notifier.notify(&ssn_id, 1).unwrap();
 
             // First changed() should return immediately

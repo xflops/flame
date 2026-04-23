@@ -854,6 +854,7 @@ impl Controller {
             (*exe).clone()
         };
         self.storage.update_executor(&executor).await?;
+        self.notifier.executors.notify(&id)?;
 
         if let Err(e) = self
             .connection_manager
