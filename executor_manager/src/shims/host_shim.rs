@@ -16,7 +16,7 @@ use std::env;
 use std::fs::{self, create_dir_all, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -183,6 +183,50 @@ impl HostShim {
             .into_owned()
     }
 
+    /// Find site-packages directory under lib/ that contains flamepy
+    fn find_site_packages(lib_path: &Path) -> Option<PathBuf> {
+        if !lib_path.exists() {
+            return None;
+        }
+
+        for entry in fs::read_dir(lib_path).ok()?.flatten() {
+            let python_dir = entry.path();
+            if python_dir.is_dir() && entry.file_name().to_string_lossy().starts_with("python") {
+                let site_packages = python_dir.join("site-packages");
+                if site_packages.join("flamepy").exists() {
+                    return Some(site_packages);
+                }
+            }
+        }
+        None
+    }
+
+    /// Find all package directories containing .so files (native extensions)
+    fn find_native_lib_paths(site_packages: &Path) -> Vec<String> {
+        let mut paths = std::collections::HashSet::new();
+
+        fn scan_dir(dir: &Path, paths: &mut std::collections::HashSet<String>, depth: usize) {
+            if depth > 4 {
+                return;
+            }
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        scan_dir(&path, paths, depth + 1);
+                    } else if path.extension().map(|e| e == "so").unwrap_or(false) {
+                        if let Some(parent) = path.parent() {
+                            paths.insert(parent.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        scan_dir(site_packages, &mut paths, 0);
+        paths.into_iter().collect()
+    }
+
     fn launch_instance(
         app: &ApplicationContext,
         executor: &Executor,
@@ -233,6 +277,26 @@ impl HostShim {
         // This is needed when flamepy is installed with --user flag for the flame user
         if let Ok(home) = env::var("HOME") {
             envs.entry("HOME".to_string()).or_insert(home);
+        }
+
+        // Set PYTHONPATH and LD_LIBRARY_PATH if flamepy is installed via --prefix
+        if let Ok(flame_home) = env::var(FLAME_HOME) {
+            let lib_path = Path::new(&flame_home).join("lib");
+            if let Some(site_packages) = Self::find_site_packages(&lib_path) {
+                let site_packages_str = site_packages.to_string_lossy().to_string();
+                envs.entry("PYTHONPATH".to_string())
+                    .and_modify(|e| *e = format!("{}:{}", site_packages_str, e))
+                    .or_insert(site_packages_str);
+
+                // Set LD_LIBRARY_PATH for all packages with native extensions (.so files)
+                let ld_paths = Self::find_native_lib_paths(&site_packages);
+                if !ld_paths.is_empty() {
+                    let ld_paths_str = ld_paths.join(":");
+                    envs.entry("LD_LIBRARY_PATH".to_string())
+                        .and_modify(|e| *e = format!("{}:{}", ld_paths_str, e))
+                        .or_insert(ld_paths_str);
+                }
+            }
         }
 
         tracing::debug!(

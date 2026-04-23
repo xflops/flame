@@ -36,8 +36,6 @@ mod nodes;
 
 pub use connections::ConnectionManager;
 
-/// Callbacks for node connection lifecycle events.
-/// Implements the state machine transitions for node states.
 struct NodeCallbacks {
     storage: StoragePtr,
 }
@@ -362,18 +360,6 @@ impl Controller {
         self.storage.list_task(ssn_id)
     }
 
-    pub async fn update_task_result(
-        &self,
-        ssn: SessionPtr,
-        task: TaskPtr,
-        task_result: TaskResult,
-    ) -> Result<(), FlameError> {
-        trace_fn!("Controller::update_task_result");
-        self.storage
-            .update_task_result(ssn, task, task_result)
-            .await
-    }
-
     pub async fn create_executor(
         &self,
         node_name: String,
@@ -613,6 +599,7 @@ impl Controller {
     pub async fn launch_task(&self, id: ExecutorID) -> Result<Option<Task>, FlameError> {
         trace_fn!("Controller::launch_task");
         let exe_ptr = self.storage.get_executor_ptr(id)?;
+        let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         let (ssn_id, task_id) = {
             let exec = lock_ptr!(exe_ptr)?;
             (exec.ssn_id.clone(), exec.task_id)

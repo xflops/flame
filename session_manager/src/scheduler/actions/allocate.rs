@@ -160,7 +160,7 @@ impl Action for AllocateAction {
                     void_executors.remove(id);
                     unbinding_executors.remove(id);
                 }
-                tracing::info!("Committed {} op(s) for session <{}>", op_count, ssn.id);
+                tracing::debug!("Committed {} op(s) for session <{}>", op_count, ssn.id);
                 nodes.sort_by(|a, b| node_order_fn.cmp(a, b));
                 open_ssns.push(ssn.clone());
             } else if !stmt.is_empty() {

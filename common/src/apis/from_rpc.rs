@@ -76,7 +76,7 @@ impl From<rpc::Event> for Event {
         Self {
             code: event.code,
             message: event.message,
-            creation_time: DateTime::from_timestamp(event.creation_time, 0).unwrap_or_default(),
+            creation_time: DateTime::from_timestamp_millis(event.creation_time).unwrap_or_default(),
         }
     }
 }
@@ -189,7 +189,7 @@ impl TryFrom<&rpc::Application> for Application {
             name: metadata.name.clone(),
             version: 0,
             state: ApplicationState::from(status.state()),
-            creation_time: DateTime::<Utc>::from_timestamp(status.creation_time, 0).ok_or(
+            creation_time: DateTime::<Utc>::from_timestamp_millis(status.creation_time).ok_or(
                 FlameError::InvalidState("invalid creation time".to_string()),
             )?,
             shim: Shim::from(spec.shim()),

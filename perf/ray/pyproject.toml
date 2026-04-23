@@ -1,0 +1,9 @@
+[project]
+name = "ray-perf"
+version = "0.1.0"
+description = "Performance of Ray"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "ray[client]>=2.55.0",
+]

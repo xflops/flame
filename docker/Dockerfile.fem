@@ -10,6 +10,7 @@ RUN cargo build --release
 COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /usr/bin/
 
 # Install using flmadm with worker profile
+# This builds wheel and installs flamepy to lib/ via --prefix
 RUN ./target/release/flmadm install \
     --src-dir /usr/src/flame \
     --prefix /usr/local/flame \
@@ -18,25 +19,13 @@ RUN ./target/release/flmadm install \
     --skip-build \
     --force
 
-# Install Python 3.12 via uv to match runtime (ubuntu:24.04)
-# Then pre-warm uv cache for flamepy dependencies in the builder
-# This avoids network access during runtime container startup
-RUN /usr/bin/uv python install 3.12 && \
-    UV_CACHE_DIR=/usr/local/flame/data/cache/uv \
-    UV_LINK_MODE=copy \
-    /usr/bin/uv run --python 3.12 \
-    --find-links /usr/local/flame/wheels \
-    --with pip \
-    --with flamepy \
-    python -c "import flamepy; print('flamepy cache warmed in builder')"
-
 FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y python3-pip git && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/local/flame/work
 
-# Copy the entire installation from builder (including uv in bin/ and pre-warmed cache)
+# Copy the entire installation from builder (includes lib/ with flamepy)
 COPY --from=builder /usr/local/flame /usr/local/flame
 
 ENV FLAME_HOME=/usr/local/flame

@@ -89,7 +89,7 @@ impl From<Event> for rpc::Event {
         Self {
             code: event.code,
             message: event.message,
-            creation_time: event.creation_time.timestamp(),
+            creation_time: event.creation_time.timestamp_millis(),
         }
     }
 }
@@ -147,8 +147,8 @@ impl From<&Task> for rpc::Task {
         });
         let status = Some(rpc::TaskStatus {
             state: task.state as i32,
-            creation_time: task.creation_time.timestamp(),
-            completion_time: task.completion_time.map(|s| s.timestamp()),
+            creation_time: task.creation_time.timestamp_millis(),
+            completion_time: task.completion_time.map(|s| s.timestamp_millis()),
             events: task.events.clone().into_iter().map(Event::into).collect(),
         });
         rpc::Task {
@@ -169,8 +169,8 @@ impl From<&Session> for rpc::Session {
     fn from(ssn: &Session) -> Self {
         let mut status = rpc::SessionStatus {
             state: ssn.status.state as i32,
-            creation_time: ssn.creation_time.timestamp(),
-            completion_time: ssn.completion_time.map(|s| s.timestamp()),
+            creation_time: ssn.creation_time.timestamp_millis(),
+            completion_time: ssn.completion_time.map(|s| s.timestamp_millis()),
             failed: 0,
             pending: 0,
             running: 0,
@@ -250,7 +250,7 @@ impl From<&Application> for rpc::Application {
 
         let status = Some(rpc::ApplicationStatus {
             state: app.state.into(),
-            creation_time: app.creation_time.timestamp(),
+            creation_time: app.creation_time.timestamp_millis(),
         });
         rpc::Application {
             metadata,

@@ -149,7 +149,7 @@ impl EventManager for FsEventManager {
             owner: owner.task_id,
             code: event.code,
             message: msg_index,
-            creation_time: event.creation_time.timestamp(),
+            creation_time: event.creation_time.timestamp_millis(),
         };
 
         storage.object_storage.save(&event_dao)?;
@@ -186,7 +186,7 @@ impl EventManager for FsEventManager {
             event_list.push(Event {
                 code: event_dao.code,
                 message: Some(String::from_utf8(message)?),
-                creation_time: DateTime::<Utc>::from_timestamp(event_dao.creation_time, 0)
+                creation_time: DateTime::<Utc>::from_timestamp_millis(event_dao.creation_time)
                     .ok_or(FlameError::Internal("Invalid creation time".to_string()))?,
             });
         }

@@ -239,5 +239,5 @@ message EmptyRequest {
 message Event {
   int32 code = 1;
   optional string message = 2;
-  int64 creation_time = 3;
+  int64 creation_time = 3;  // Unix timestamp in milliseconds
 }

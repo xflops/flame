@@ -1,0 +1,29 @@
+---
+cluster:
+  name: flame
+  endpoint: "https://flame-session-manager:8080"
+  slot: "cpu=2,mem=1g"
+  policy: priority
+  storage: none
+  schedule_interval: 100
+  executors:
+    shim: host
+  limits:
+    max_sessions: 1000
+    max_executors: 10
+  tls:
+    cert_file: "/etc/flame/certs/server.crt"
+    key_file: "/etc/flame/certs/server.key"
+    ca_file: "/etc/flame/certs/ca.crt"
+cache:
+  endpoint: "grpcs://flame-executor-manager:9090"
+  network_interface: "eth0"
+  storage: "/var/lib/flame/cache"
+  eviction:
+    policy: "lru"
+    max_memory: "1024M"
+    max_objects: 100000
+  tls:
+    cert_file: "/etc/flame/certs/server.crt"
+    key_file: "/etc/flame/certs/server.key"
+    ca_file: "/etc/flame/certs/ca.crt"

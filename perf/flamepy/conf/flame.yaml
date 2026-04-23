@@ -1,0 +1,14 @@
+---
+current-context: flame
+contexts:
+  - name: flame
+    cluster:
+      endpoint: "https://flame-session-manager:8080"
+      tls:
+        ca_file: "/etc/flame/certs/ca.crt"
+    cache:
+      endpoint: "grpcs://flame-executor-manager:9090"
+      tls:
+        ca_file: "/etc/flame/certs/ca.crt"
+    package:
+      storage: "http://flame-package-storage:5000"

@@ -57,28 +57,30 @@ impl EventManager for MemoryEventManager {
             .push(InMemoryEvent {
                 code: event.code,
                 message: event.message.unwrap_or_default(),
-                creation_time: event.creation_time.timestamp(),
+                creation_time: event.creation_time.timestamp_millis(),
             });
         Ok(())
     }
 
     fn find_events(&self, owner: EventOwner) -> Result<Vec<Event>, FlameError> {
         let events = lock_ptr!(self.events)?;
-        let event_list = events
-            .get(&owner.session_id)
-            .and_then(|s| s.get(&owner.task_id))
-            .map(|events| {
-                events
-                    .iter()
-                    .map(|e| Event {
-                        code: e.code,
-                        message: Some(e.message.clone()),
-                        creation_time: DateTime::<Utc>::from_timestamp(e.creation_time, 0)
-                            .unwrap_or_else(Utc::now),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let Some(session_events) = events.get(&owner.session_id) else {
+            return Ok(vec![]);
+        };
+        let Some(task_events) = session_events.get(&owner.task_id) else {
+            return Ok(vec![]);
+        };
+
+        let mut event_list = Vec::with_capacity(task_events.len());
+        for e in task_events {
+            let creation_time = DateTime::<Utc>::from_timestamp_millis(e.creation_time)
+                .ok_or(FlameError::Internal("Invalid creation time".to_string()))?;
+            event_list.push(Event {
+                code: e.code,
+                message: Some(e.message.clone()),
+                creation_time,
+            });
+        }
         Ok(event_list)
     }
 

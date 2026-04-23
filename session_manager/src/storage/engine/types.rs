@@ -276,7 +276,7 @@ impl TryFrom<EventDao> for Event {
         Ok(Self {
             code: event.code,
             message: event.message.clone(),
-            creation_time: DateTime::<Utc>::from_timestamp(event.creation_time, 0)
+            creation_time: DateTime::<Utc>::from_timestamp_millis(event.creation_time)
                 .ok_or(FlameError::Storage("invalid creation time".to_string()))?,
         })
     }

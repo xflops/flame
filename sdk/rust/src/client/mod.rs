@@ -669,9 +669,7 @@ impl TryFrom<&rpc::Session> for Session {
 impl TryFrom<&rpc::Event> for Event {
     type Error = FlameError;
     fn try_from(event: &rpc::Event) -> Result<Self, FlameError> {
-        let second = event.creation_time / 1000;
-        let nanosecond = ((event.creation_time % 1000) * 1_000_000) as u32;
-        let creation_time = DateTime::from_timestamp(second, nanosecond)
+        let creation_time = DateTime::from_timestamp_millis(event.creation_time)
             .ok_or_else(|| FlameError::Internal("invalid timestamp".to_string()))?;
         Ok(Event {
             code: event.code,

@@ -29,7 +29,7 @@ mod unknown;
 mod void;
 
 pub fn from(client: BackendClient, e: Executor) -> Box<dyn State> {
-    tracing::info!("Build state <{}> for Executor <{}>.", e.state, e.id);
+    tracing::debug!("Build state <{}> for Executor <{}>.", e.state, e.id);
 
     match e.state {
         ExecutorState::Void => Box::new(void::VoidState {

@@ -1,0 +1,75 @@
+services:
+  flame-session-manager:
+    image: xflops/flame-session-manager:latest
+    container_name: flame-session-manager
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ./conf/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
+      - ./conf/certs:/etc/flame/certs:ro
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    networks:
+      - flame-network
+
+  flame-executor-manager:
+    image: xflops/flame-executor-manager:latest
+    environment:
+      - RUST_LOG=info
+    deploy:
+      mode: replicated
+      replicas: 3
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
+    depends_on:
+      - flame-session-manager
+    volumes:
+      - ./conf/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
+      - ./conf/certs:/etc/flame/certs:ro
+      - flame-work:/usr/local/flame/work
+      - flame-cache-storage:/var/lib/flame/cache
+    restart: unless-stopped
+    networks:
+      - flame-network
+
+  flame-package-storage:
+    image: sigoden/dufs:v0.43.0
+    command: ["/data", "-A"]
+    volumes:
+      - flame-packages:/data
+    ports:
+      - "5050:5000"
+    networks:
+      - flame-network
+
+  flame-console:
+    image: xflops/flame-console:latest
+    container_name: flame-console
+    working_dir: /opt/perf
+    command: ["sleep", "infinity"]
+    environment:
+      - RUST_LOG=info
+    depends_on:
+      - flame-session-manager
+      - flame-package-storage
+    volumes:
+      - ./conf/flame.yaml:/root/.flame/flame.yaml
+      - ./conf/certs:/etc/flame/certs:ro
+      - ./:/opt/perf
+    networks:
+      - flame-network
+
+networks:
+  flame-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  flame-packages:
+  flame-work:
+  flame-cache-storage:

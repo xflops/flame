@@ -30,7 +30,7 @@ const DEFAULT_SLOT: &str = "cpu=1,mem=2g";
 const DEFAULT_POLICY: &str = "proportion";
 const DEFAULT_STORAGE: &str = "sqlite://flame.db";
 const DEFAULT_MAX_EXECUTORS_PER_NODE: u32 = 128;
-const DEFAULT_SCHEDULE_INTERVAL: u64 = 500;
+const DEFAULT_SCHEDULE_INTERVAL: u64 = 100;
 const DEFAULT_SHIM: &str = "host";
 const DEFAULT_FLAME_CACHE_ENDPOINT: &str = "http://127.0.0.1:9090";
 const DEFAULT_FLAME_CACHE_NETWORK_INTERFACE: &str = "eth0";

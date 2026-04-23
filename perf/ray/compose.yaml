@@ -1,0 +1,58 @@
+services:
+  ray-head:
+    image: rayproject/ray:2.55.0
+    container_name: ray-head
+    shm_size: "4g"
+    ports:
+      - "8265:8265"   # Ray Dashboard
+      - "6379:6379"   # Ray GCS
+      - "10001:10001" # Ray Client Server
+    command: >
+      ray start --head
+      --port=6379
+      --dashboard-host=0.0.0.0
+      --dashboard-port=8265
+      --ray-client-server-port=10001
+      --num-cpus=4
+      --block
+    volumes:
+      - ray-data:/tmp/ray
+    healthcheck:
+      test: ["CMD", "ray", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - ray-network
+
+  ray-worker:
+    image: rayproject/ray:2.55.0
+    shm_size: "4g"
+    deploy:
+      mode: replicated
+      replicas: 3
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
+    depends_on:
+      ray-head:
+        condition: service_healthy
+    command: >
+      ray start
+      --address=ray-head:6379
+      --num-cpus=4
+      --block
+    volumes:
+      - ray-data:/tmp/ray
+    restart: unless-stopped
+    networks:
+      - ray-network
+
+networks:
+  ray-network:
+    driver: bridge
+
+volumes:
+  ray-data:

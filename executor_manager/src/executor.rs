@@ -125,7 +125,7 @@ impl From<&Executor> for rpc::Executor {
 
 impl Executor {
     pub fn update(&mut self, next: &Executor) {
-        tracing::info!(
+        tracing::debug!(
             "Update executor <{}> from <{}> to <{}>",
             self.id,
             self.state,
