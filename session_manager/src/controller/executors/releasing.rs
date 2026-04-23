@@ -17,7 +17,7 @@ use crate::controller::executors::States;
 use crate::model::ExecutorPtr;
 use crate::storage::StoragePtr;
 
-use common::apis::{ExecutorState, SessionPtr, Task, TaskOutput, TaskPtr, TaskResult};
+use common::apis::{ExecutorState, SessionPtr, Task, TaskPtr, TaskResult};
 use common::FlameError;
 
 pub struct ReleasingState {
@@ -84,7 +84,11 @@ impl States for ReleasingState {
         ))
     }
 
-    async fn launch_task(&self, _ssn: SessionPtr) -> Result<Option<Task>, FlameError> {
+    async fn launch_task(
+        &self,
+        _ssn: SessionPtr,
+        _task: TaskPtr,
+    ) -> Result<Option<Task>, FlameError> {
         trace_fn!("ReleasingState::launch_task");
 
         Err(FlameError::InvalidState(

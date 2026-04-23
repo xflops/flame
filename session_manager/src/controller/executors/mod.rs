@@ -20,7 +20,7 @@ use crate::controller::executors::{
 use crate::storage::StoragePtr;
 
 use crate::model::ExecutorPtr;
-use common::apis::{ExecutorID, ExecutorState, SessionPtr, Task, TaskOutput, TaskPtr, TaskResult};
+use common::apis::{ExecutorState, SessionPtr, Task, TaskPtr, TaskResult};
 use common::FlameError;
 use stdng::{lock_ptr, new_ptr, MutexPtr};
 
@@ -76,7 +76,8 @@ pub trait States: Send + Sync + 'static {
     async fn unbind_executor(&self) -> Result<(), FlameError>;
     async fn unbind_executor_completed(&self) -> Result<(), FlameError>;
 
-    async fn launch_task(&self, ssn: SessionPtr) -> Result<Option<Task>, FlameError>;
+    async fn launch_task(&self, ssn: SessionPtr, task: TaskPtr)
+        -> Result<Option<Task>, FlameError>;
     async fn complete_task(
         &self,
         ssn: SessionPtr,
@@ -260,7 +261,8 @@ mod tests {
             };
 
             let ssn_ptr = new_ptr(common::apis::Session::default());
-            let result = state.launch_task(ssn_ptr).await;
+            let task_ptr = new_ptr(common::apis::Task::default());
+            let result = state.launch_task(ssn_ptr, task_ptr).await;
 
             assert!(result.is_err());
             assert!(matches!(result, Err(FlameError::InvalidState(_))));
@@ -377,7 +379,8 @@ mod tests {
             };
 
             let ssn_ptr = new_ptr(common::apis::Session::default());
-            let result = state.launch_task(ssn_ptr).await;
+            let task_ptr = new_ptr(common::apis::Task::default());
+            let result = state.launch_task(ssn_ptr, task_ptr).await;
 
             assert!(result.is_err());
             assert!(matches!(result, Err(FlameError::InvalidState(_))));
@@ -490,7 +493,8 @@ mod tests {
             };
 
             let ssn_ptr = new_ptr(common::apis::Session::default());
-            let result = state.launch_task(ssn_ptr).await;
+            let task_ptr = new_ptr(common::apis::Task::default());
+            let result = state.launch_task(ssn_ptr, task_ptr).await;
 
             assert!(result.is_err());
             assert!(matches!(result, Err(FlameError::InvalidState(_))));
@@ -727,7 +731,8 @@ mod tests {
             };
 
             let ssn_ptr = new_ptr(common::apis::Session::default());
-            let result = state.launch_task(ssn_ptr).await;
+            let task_ptr = new_ptr(common::apis::Task::default());
+            let result = state.launch_task(ssn_ptr, task_ptr).await;
 
             assert!(result.is_ok());
             assert!(result.unwrap().is_none());
@@ -847,7 +852,8 @@ mod tests {
             };
 
             let ssn_ptr = new_ptr(common::apis::Session::default());
-            let result = state.launch_task(ssn_ptr).await;
+            let task_ptr = new_ptr(common::apis::Task::default());
+            let result = state.launch_task(ssn_ptr, task_ptr).await;
 
             assert!(result.is_err());
             assert!(matches!(result, Err(FlameError::InvalidState(_))));

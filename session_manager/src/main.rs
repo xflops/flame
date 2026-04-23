@@ -22,6 +22,7 @@ mod apiserver;
 mod controller;
 mod events;
 mod model;
+mod notify;
 mod provider;
 pub mod scheduler;
 mod storage;

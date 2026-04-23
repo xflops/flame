@@ -16,7 +16,7 @@ use crate::storage::StoragePtr;
 use stdng::{lock_ptr, logs::TraceFn, trace_fn, MutexPtr};
 
 use crate::model::ExecutorPtr;
-use common::apis::{ExecutorState, SessionPtr, Task, TaskOutput, TaskPtr, TaskResult, TaskState};
+use common::apis::{ExecutorState, SessionPtr, Task, TaskPtr, TaskResult, TaskState};
 use common::FlameError;
 
 pub struct UnbindingState {
@@ -86,7 +86,11 @@ impl States for UnbindingState {
         Ok(())
     }
 
-    async fn launch_task(&self, _ssn: SessionPtr) -> Result<Option<Task>, FlameError> {
+    async fn launch_task(
+        &self,
+        _ssn: SessionPtr,
+        _task: TaskPtr,
+    ) -> Result<Option<Task>, FlameError> {
         trace_fn!("UnbindingState::launch_task");
 
         Ok(None)
