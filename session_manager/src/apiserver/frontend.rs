@@ -340,16 +340,18 @@ impl Frontend for Flame {
             min_instances: ssn_spec.min_instances,
             max_instances: ssn_spec.max_instances,
             batch_size: ssn_spec.batch_size.max(1),
+            priority: ssn_spec.priority,
         };
 
         tracing::debug!(
-            "Creating session with attributes: id={}, application={}, slots={}, min_instances={}, max_instances={:?}, batch_size={}",
+            "Creating session with attributes: id={}, application={}, slots={}, min_instances={}, max_instances={:?}, batch_size={}, priority={}",
             attr.id,
             attr.application,
             attr.slots,
             attr.min_instances,
             attr.max_instances,
-            attr.batch_size
+            attr.batch_size,
+            attr.priority,
         );
 
         let ssn = self
@@ -409,6 +411,7 @@ impl Frontend for Flame {
                     min_instances: ssn_spec.min_instances,
                     max_instances: ssn_spec.max_instances,
                     batch_size: ssn_spec.batch_size.max(1),
+                    priority: ssn_spec.priority,
                 })
             }
             None => None,

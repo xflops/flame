@@ -21,6 +21,7 @@ use stdng::{lock_ptr, new_ptr, MutexPtr};
 use crate::model::{ExecutorInfoPtr, NodeInfo, NodeInfoPtr, SessionInfo, SessionInfoPtr, SnapShot};
 use crate::scheduler::plugins::fairshare::FairShare;
 use crate::scheduler::plugins::gang::GangPlugin;
+use crate::scheduler::plugins::priority::PriorityPlugin;
 use crate::scheduler::plugins::shim::ShimPlugin;
 use crate::scheduler::Context;
 
@@ -28,6 +29,7 @@ use common::FlameError;
 
 mod fairshare;
 mod gang;
+mod priority;
 mod shim;
 
 pub type PluginPtr = Box<dyn Plugin>;
@@ -108,18 +110,19 @@ pub trait Plugin: Send + Sync + 'static {
 }
 
 pub struct PluginManager {
-    pub plugins: MutexPtr<HashMap<String, PluginPtr>>,
+    pub plugins: MutexPtr<Vec<(String, PluginPtr)>>,
 }
 
 impl PluginManager {
     pub fn setup(ss: &SnapShot) -> Result<PluginManagerPtr, FlameError> {
-        let mut plugins = HashMap::from([
+        let mut plugins: Vec<(String, PluginPtr)> = vec![
+            ("priority".to_string(), PriorityPlugin::new_ptr()),
             ("fairshare".to_string(), FairShare::new_ptr()),
             ("shim".to_string(), ShimPlugin::new_ptr()),
             ("gang".to_string(), GangPlugin::new_ptr()),
-        ]);
+        ];
 
-        for plugin in plugins.values_mut() {
+        for (_, plugin) in plugins.iter_mut() {
             plugin.setup(ss)?;
         }
 
@@ -128,20 +131,33 @@ impl PluginManager {
         }))
     }
 
+    /// Returns whether the session is underused (needs more executors).
+    ///
+    /// Uses "first non-`None` wins" ordering, identical to `ssn_order_fn`.
+    /// Plugins are consulted in registration order (Priority → FairShare → Shim → Gang).
+    /// The first plugin that returns `Some(result)` wins; `None` means "no opinion, ask the
+    /// next plugin".  If no plugin has an opinion, the session is considered NOT underused.
+    ///
+    /// This gives `PriorityPlugin` (registered first) full authority:
+    /// - `Some(false)` → blocked; no further plugins consulted.
+    /// - `Some(true)` → underused; overrides any FairShare veto.
+    /// - `None` → defer to FairShare for proportional underuse check.
     pub fn is_underused(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
         let plugins = lock_ptr!(self.plugins)?;
-
-        Ok(plugins
-            .values()
-            .any(|plugin| plugin.is_underused(ssn).unwrap_or(false)))
+        for (_, plugin) in plugins.iter() {
+            if let Some(result) = plugin.is_underused(ssn) {
+                return Ok(result);
+            }
+        }
+        Ok(false)
     }
 
     pub fn is_preemptible(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
         let plugins = lock_ptr!(self.plugins)?;
 
         Ok(plugins
-            .values()
-            .all(|plugin| plugin.is_preemptible(ssn).unwrap_or(false)))
+            .iter()
+            .all(|(_, plugin)| plugin.is_preemptible(ssn).unwrap_or(false)))
     }
 
     /// Check if an executor is available for a session.
@@ -197,16 +213,16 @@ impl PluginManager {
         let plugins = lock_ptr!(self.plugins)?;
 
         Ok(plugins
-            .values()
-            .all(|plugin| plugin.is_allocatable(node, ssn).unwrap_or(true)))
+            .iter()
+            .all(|(_, plugin)| plugin.is_allocatable(node, ssn).unwrap_or(true)))
     }
 
     pub fn is_reclaimable(&self, exec: &ExecutorInfoPtr) -> Result<bool, FlameError> {
         let plugins = lock_ptr!(self.plugins)?;
 
         Ok(plugins
-            .values()
-            .all(|plugin| plugin.is_reclaimable(exec).unwrap_or(true)))
+            .iter()
+            .all(|(_, plugin)| plugin.is_reclaimable(exec).unwrap_or(true)))
     }
 
     pub fn on_executor_allocate(
@@ -216,7 +232,7 @@ impl PluginManager {
     ) -> Result<(), FlameError> {
         let mut plugins = lock_ptr!(self.plugins)?;
 
-        for plugin in plugins.values_mut() {
+        for (_, plugin) in plugins.iter_mut() {
             plugin.on_executor_allocate(node.clone(), ssn.clone());
         }
 
@@ -230,7 +246,7 @@ impl PluginManager {
     ) -> Result<(), FlameError> {
         let mut plugins = lock_ptr!(self.plugins)?;
 
-        for plugin in plugins.values_mut() {
+        for (_, plugin) in plugins.iter_mut() {
             plugin.on_executor_unallocate(node.clone(), ssn.clone());
         }
 
@@ -240,7 +256,7 @@ impl PluginManager {
     pub fn on_session_bind(&self, ssn: SessionInfoPtr) -> Result<(), FlameError> {
         let mut plugins = lock_ptr!(self.plugins)?;
 
-        for plugin in plugins.values_mut() {
+        for (_, plugin) in plugins.iter_mut() {
             plugin.on_session_bind(ssn.clone());
         }
 
@@ -250,7 +266,7 @@ impl PluginManager {
     pub fn on_session_unbind(&self, ssn: SessionInfoPtr) -> Result<(), FlameError> {
         let mut plugins = lock_ptr!(self.plugins)?;
 
-        for plugin in plugins.values_mut() {
+        for (_, plugin) in plugins.iter_mut() {
             plugin.on_session_unbind(ssn.clone());
         }
         Ok(())
@@ -264,8 +280,8 @@ impl PluginManager {
         let plugins = lock_ptr!(self.plugins)?;
 
         Ok(plugins
-            .values()
-            .all(|plugin| plugin.is_ready(ssn).unwrap_or(true)))
+            .iter()
+            .all(|(_, plugin)| plugin.is_ready(ssn).unwrap_or(true)))
     }
 
     /// True if every plugin that implements [`Plugin::is_fulfilled`] reports fulfillment (no opinion
@@ -275,8 +291,8 @@ impl PluginManager {
         let plugins = lock_ptr!(self.plugins)?;
 
         Ok(plugins
-            .values()
-            .all(|plugin| plugin.is_fulfilled(ssn).unwrap_or(true)))
+            .iter()
+            .all(|(_, plugin)| plugin.is_fulfilled(ssn).unwrap_or(true)))
     }
 
     pub fn on_executor_pipeline(
@@ -286,7 +302,7 @@ impl PluginManager {
     ) -> Result<(), FlameError> {
         let mut plugins = lock_ptr!(self.plugins)?;
 
-        for plugin in plugins.values_mut() {
+        for (_, plugin) in plugins.iter_mut() {
             plugin.on_executor_pipeline(exec.clone(), ssn.clone());
         }
 
@@ -300,7 +316,7 @@ impl PluginManager {
     ) -> Result<(), FlameError> {
         let mut plugins = lock_ptr!(self.plugins)?;
 
-        for plugin in plugins.values_mut() {
+        for (_, plugin) in plugins.iter_mut() {
             plugin.on_executor_discard(exec.clone(), ssn.clone());
         }
 
@@ -309,7 +325,7 @@ impl PluginManager {
 
     pub fn ssn_order_fn(&self, t1: &SessionInfoPtr, t2: &SessionInfoPtr) -> Ordering {
         if let Ok(plugins) = lock_ptr!(self.plugins) {
-            for plugin in plugins.values() {
+            for (_, plugin) in plugins.iter() {
                 if let Some(order) = plugin.ssn_order_fn(t1, t2) {
                     if order != Ordering::Equal {
                         return order;
@@ -323,7 +339,7 @@ impl PluginManager {
 
     pub fn node_order_fn(&self, t1: &NodeInfoPtr, t2: &NodeInfoPtr) -> Ordering {
         if let Ok(plugins) = lock_ptr!(self.plugins) {
-            for plugin in plugins.values() {
+            for (_, plugin) in plugins.iter() {
                 if let Some(order) = plugin.node_order_fn(t1, t2) {
                     if order != Ordering::Equal {
                         return order;
@@ -438,6 +454,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         })
     }
 

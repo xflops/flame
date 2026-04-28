@@ -58,6 +58,9 @@ struct Cli {
     /// Performance benchmark mode (summary only, no per-task output)
     #[arg(short, long, default_value = "false")]
     perf: bool,
+    /// Session priority (higher value = higher priority, default: 0 = lowest)
+    #[arg(short = 'P', long, default_value = "0")]
+    priority: u32,
 }
 
 const DEFAULT_APP: &str = "flmping";
@@ -93,6 +96,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         min_instances: 0,
         max_instances: None,
         batch_size: 1,
+        priority: cli.priority,
     };
     let ssn = conn.create_session(&ssn_attr).await?;
     let ssn_creation_end_time = Instant::now();

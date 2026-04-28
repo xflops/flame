@@ -179,6 +179,7 @@ pub struct SessionAttributes {
     pub min_instances: u32,
     pub max_instances: Option<u32>,
     pub batch_size: u32,
+    pub priority: u32,
 }
 
 impl Default for SessionAttributes {
@@ -191,6 +192,7 @@ impl Default for SessionAttributes {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         }
     }
 }
@@ -223,6 +225,7 @@ pub struct Session {
     pub min_instances: u32,
     pub max_instances: Option<u32>,
     pub batch_size: u32,
+    pub priority: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, strum_macros::Display)]

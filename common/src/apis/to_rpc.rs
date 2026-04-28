@@ -201,6 +201,7 @@ impl From<&Session> for rpc::Session {
                 min_instances: ssn.min_instances,
                 max_instances: ssn.max_instances,
                 batch_size: ssn.batch_size,
+                priority: ssn.priority,
             }),
             status: Some(status),
         }

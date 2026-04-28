@@ -106,6 +106,9 @@ enum Commands {
         /// Number of executors per batch for gang scheduling
         #[arg(short, long, default_value = "1")]
         batch_size: u32,
+        /// Session priority (higher = more important, default: 0)
+        #[arg(short = 'p', long, default_value = "0")]
+        priority: u32,
     },
     /// Migrate Flame metadata
     Migrate {
@@ -155,7 +158,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             app,
             slots,
             batch_size,
-        }) => create::run(&ctx, app, slots, batch_size).await?,
+            priority,
+        }) => create::run(&ctx, app, slots, batch_size, priority).await?,
         Some(Commands::View {
             application,
             session,
