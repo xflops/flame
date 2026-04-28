@@ -48,6 +48,7 @@ This example implements the REINFORCE (policy gradient) algorithm on environment
 ### Files
 
 - **`main.py`**: REINFORCE training (distributed by default, use `--local` for local mode)
+- **`model.py`**: Shared components (policy networks, environment configs)
 - **`pyproject.toml`**: Package dependencies including `torch`, `gymnasium[mujoco]`, and `flamepy`
 - **`README.md`**: This documentation file
 
