@@ -14,7 +14,6 @@ limitations under the License.
 mod apis;
 
 use std::error::Error;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use byte_unit::Byte;
@@ -25,7 +24,7 @@ use flame_rs::apis::FlameError;
 use flame_rs::client::{Session, SessionAttributes, Task, TaskInformer};
 use futures::future::try_join_all;
 use indicatif::HumanCount;
-use stdng::{lock_ptr, new_ptr};
+use stdng::{lock_ptr, new_ptr, MutexPtr};
 
 use crate::apis::{PingRequest, PingResponse};
 
@@ -114,6 +113,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+async fn run_tasks<T: TaskInformer + 'static>(
+    ssn: &Session,
+    task_num: i32,
+    duration: Option<u64>,
+    memory: Option<u64>,
+    informer: MutexPtr<T>,
+) -> Result<u128, Box<dyn Error>> {
+    let input: flame_rs::apis::TaskInput = PingRequest { duration, memory }.try_into()?;
+    let start = Instant::now();
+
+    let tasks: Vec<_> = (0..task_num)
+        .map(|_| ssn.run_task(Some(input.clone()), informer.clone()))
+        .collect();
+
+    try_join_all(tasks).await?;
+    Ok(start.elapsed().as_millis())
+}
+
 async fn run_perf_mode(
     ssn: &Session,
     task_num: i32,
@@ -121,20 +138,7 @@ async fn run_perf_mode(
     memory: Option<u64>,
 ) -> Result<(), Box<dyn Error>> {
     let info = new_ptr(PerfInformer::new());
-    let start = Instant::now();
-
-    let tasks: Vec<_> = (0..task_num)
-        .map(|_| {
-            let input = PingRequest { duration, memory }.try_into();
-            async {
-                let input = input?;
-                ssn.run_task(Some(input), info.clone()).await
-            }
-        })
-        .collect();
-
-    try_join_all(tasks).await?;
-    let duration_ms = start.elapsed().as_millis();
+    let duration_ms = run_tasks(ssn, task_num, duration, memory, info.clone()).await?;
 
     let info = lock_ptr!(info)?;
     info.print_summary(task_num, duration_ms);
@@ -149,20 +153,7 @@ async fn run_output_mode(
     memory: Option<u64>,
 ) -> Result<(), Box<dyn Error>> {
     let info = new_ptr(OutputInfor::new());
-    let start = Instant::now();
-
-    let tasks: Vec<_> = (0..task_num)
-        .map(|_| {
-            let input = PingRequest { duration, memory }.try_into();
-            async {
-                let input = input?;
-                ssn.run_task(Some(input), info.clone()).await
-            }
-        })
-        .collect();
-
-    try_join_all(tasks).await?;
-    let duration_ms = start.elapsed().as_millis();
+    let duration_ms = run_tasks(ssn, task_num, duration, memory, info.clone()).await?;
 
     {
         let info = lock_ptr!(info)?;
@@ -221,24 +212,22 @@ impl OutputInfor {
 }
 
 struct PerfInformer {
-    succeeded: AtomicU32,
-    failed: AtomicU32,
+    succeeded: u32,
+    failed: u32,
 }
 
 impl PerfInformer {
     fn new() -> Self {
         Self {
-            succeeded: AtomicU32::new(0),
-            failed: AtomicU32::new(0),
+            succeeded: 0,
+            failed: 0,
         }
     }
 
     fn print_summary(&self, task_num: i32, duration_ms: u128) {
-        let succeeded = self.succeeded.load(Ordering::Relaxed);
-        let failed = self.failed.load(Ordering::Relaxed);
         let duration_secs = duration_ms as f64 / 1000.0;
         let throughput = if duration_secs > 0.0 {
-            succeeded as f64 / duration_secs
+            self.succeeded as f64 / duration_secs
         } else {
             0.0
         };
@@ -247,8 +236,8 @@ impl PerfInformer {
         println!("BENCHMARK RESULTS");
         println!("{}", "=".repeat(60));
         println!("Duration:        {:.2}s", duration_secs);
-        println!("Succeeded:       {}/{}", succeeded, task_num);
-        println!("Failed:          {}", failed);
+        println!("Succeeded:       {}/{}", self.succeeded, task_num);
+        println!("Failed:          {}", self.failed);
         println!("Throughput:      {:.2} tasks/sec", throughput);
         println!("{}\n", "=".repeat(60));
     }
@@ -258,14 +247,14 @@ impl TaskInformer for PerfInformer {
     fn on_update(&mut self, task: Task) {
         if task.is_completed() {
             if task.is_succeed() {
-                self.succeeded.fetch_add(1, Ordering::Relaxed);
+                self.succeeded += 1;
             } else {
-                self.failed.fetch_add(1, Ordering::Relaxed);
+                self.failed += 1;
             }
         }
     }
 
     fn on_error(&mut self, _: FlameError) {
-        self.failed.fetch_add(1, Ordering::Relaxed);
+        self.failed += 1;
     }
 }
