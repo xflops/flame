@@ -17,6 +17,7 @@ services:
       --block
     volumes:
       - ray-data:/tmp/ray
+      - ./:/opt/ray
     healthcheck:
       test: ["CMD", "ray", "status"]
       interval: 10s
