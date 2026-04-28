@@ -33,8 +33,8 @@ Deserializer = Callable[[Any, List[Any]], Any]
 class ObjectRef:
     """Object reference for remote cached objects."""
 
-    endpoint: str  # Cache server endpoint (e.g., "grpc://127.0.0.1:9090")
-    key: str  # Object key in format "session_id/object_id"
+    endpoint: str
+    key: str  # Object key in format "<app>/<ssn>/<uuid>"
     version: int = 0
 
     def encode(self) -> bytes:
@@ -45,6 +45,70 @@ class ObjectRef:
     def decode(cls, json_data: bytes) -> "ObjectRef":
         data = bson.decode(json_data)
         return cls(**data)
+
+
+@dataclass(frozen=True)
+class ObjectKey:
+    """Parsed object key: <app_name>/<session_id>/<object_id>"""
+
+    app_name: str
+    session_id: str
+    object_id: Optional[str] = None
+
+    def __post_init__(self):
+        for name, value in [("app_name", self.app_name), ("session_id", self.session_id)]:
+            if not value:
+                raise ValueError(f"{name} cannot be empty")
+            if ".." in value or "\\" in value or "/" in value:
+                raise ValueError(f"{name} contains invalid characters: '{value}'")
+
+        if self.object_id is not None:
+            if not self.object_id:
+                raise ValueError("object_id cannot be empty string")
+            if ".." in self.object_id or "\\" in self.object_id:
+                raise ValueError(f"object_id contains invalid characters: '{self.object_id}'")
+
+    @classmethod
+    def from_prefix(cls, prefix: str) -> "ObjectKey":
+        """Parse from key prefix '<app>/<ssn>'."""
+        parts = prefix.split("/")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid key prefix '{prefix}': expected '<app>/<ssn>' format")
+        return cls(app_name=parts[0], session_id=parts[1], object_id=None)
+
+    @classmethod
+    def from_key(cls, key: str) -> "ObjectKey":
+        """Parse from full key '<app>/<ssn>/<uuid>'."""
+        parts = key.split("/")
+        if len(parts) != 3:
+            raise ValueError(f"Invalid object key '{key}': expected '<app>/<ssn>/<uuid>' format")
+        return cls(app_name=parts[0], session_id=parts[1], object_id=parts[2])
+
+    @classmethod
+    def for_shared(cls, app_name: str) -> "ObjectKey":
+        """Create key for shared storage: '<app>/shared'."""
+        return cls(app_name=app_name, session_id="shared", object_id=None)
+
+    def with_generated_id(self) -> "ObjectKey":
+        """Return new ObjectKey with a generated UUID."""
+        return ObjectKey(
+            app_name=self.app_name,
+            session_id=self.session_id,
+            object_id=str(uuid.uuid4()),
+        )
+
+    def to_prefix(self) -> str:
+        """Return key prefix '<app>/<ssn>'."""
+        return f"{self.app_name}/{self.session_id}"
+
+    def to_key(self) -> Optional[str]:
+        """Return full key '<app>/<ssn>/<uuid>' or None if object_id not set."""
+        if self.object_id is None:
+            return None
+        return f"{self.app_name}/{self.session_id}/{self.object_id}"
+
+    def __str__(self) -> str:
+        return self.to_key() or self.to_prefix()
 
 
 def _serialize_object(obj: Any) -> pa.RecordBatch:
@@ -187,38 +251,36 @@ def _get_cache_tls_config() -> Optional[FlameClientTls]:
     return None
 
 
-def put_object(session_id: str, obj: Any) -> "ObjectRef":
+def put_object(key_prefix: str, obj: Any) -> "ObjectRef":
     """Put an object into the cache.
 
     Args:
-        session_id: The session ID for the object
+        key_prefix: Key prefix in format "<app>/<session>"
         obj: The object to cache (will be pickled)
 
     Returns:
         ObjectRef pointing to the cached object
 
     Raises:
-        Exception: If cache endpoint is not configured or request fails
+        ValueError: If key_prefix format is invalid or cache not configured
     """
+    object_key = ObjectKey.from_prefix(key_prefix)
+
     context = FlameContext()
     cache_config = context.cache
 
     if cache_config is None:
         raise ValueError("Cache configuration not found")
 
-    # Get endpoint, storage, and TLS config from cache config
     if isinstance(cache_config, str):
-        # Legacy format - just endpoint string
         cache_endpoint = cache_config
         cache_storage = None
         cache_tls = None
     elif isinstance(cache_config, FlameClientCache):
-        # New format - FlameClientCache dataclass
         cache_endpoint = cache_config.endpoint
         cache_storage = cache_config.storage
         cache_tls = cache_config.tls
     else:
-        # Dict format (for backward compatibility)
         cache_endpoint = cache_config.get("endpoint")
         cache_storage = cache_config.get("storage")
         cache_tls = None
@@ -226,57 +288,47 @@ def put_object(session_id: str, obj: Any) -> "ObjectRef":
     if not cache_endpoint:
         raise ValueError("Cache endpoint not configured")
 
-    # Serialize object to Arrow RecordBatch
     batch = _serialize_object(obj)
 
-    # Check if local storage is configured and accessible
+    storage_path: Optional[Path] = None
+    use_local_storage = False
+
     if cache_storage:
         storage_path = Path(cache_storage)
-        # Only use local storage if the path exists or can be created
         try:
             storage_path.mkdir(parents=True, exist_ok=True)
             use_local_storage = storage_path.exists() and storage_path.is_dir()
         except (PermissionError, OSError):
-            # Path not accessible, fall back to remote cache
             use_local_storage = False
-    else:
-        use_local_storage = False
 
-    if use_local_storage:
-        # Write to local storage (optimization when client has access to cache filesystem)
-        object_id = str(uuid.uuid4())
-        key = f"{session_id}/{object_id}"
+    if use_local_storage and storage_path is not None:
+        object_key_with_id = object_key.with_generated_id()
+        key = object_key_with_id.to_key()
+        if key is None:
+            raise ValueError("Failed to generate object key")
 
-        # Create session directory
-        session_dir = storage_path / session_id
-        session_dir.mkdir(parents=True, exist_ok=True)
+        app_session_dir = storage_path / object_key.app_name / object_key.session_id
+        app_session_dir.mkdir(parents=True, exist_ok=True)
 
-        # Write Arrow IPC file
-        object_path = session_dir / f"{object_id}.arrow"
+        object_path = app_session_dir / f"{object_key_with_id.object_id}.arrow"
         writer = pa.ipc.new_file(object_path, batch.schema)
         writer.write_batch(batch)
         writer.close()
 
-        # Get flight info to construct ObjectRef with cache server's endpoint
         client = _get_flight_client(cache_endpoint, cache_tls)
         descriptor = flight.FlightDescriptor.for_path(key)
         flight_info = client.get_flight_info(descriptor)
 
-        # Extract endpoint from flight info
         if flight_info.endpoints:
             remote_endpoint = flight_info.endpoints[0].locations[0]
-            # Extract URI string from Location object
             endpoint_str = remote_endpoint.uri.decode("utf-8") if isinstance(remote_endpoint.uri, bytes) else str(remote_endpoint.uri)
         else:
             endpoint_str = cache_endpoint
 
         return ObjectRef(endpoint=endpoint_str, key=key, version=0)
     else:
-        # Use remote cache via Arrow Flight
         client = _get_flight_client(cache_endpoint, cache_tls)
-
-        # Encode session_id in FlightDescriptor path
-        upload_descriptor = flight.FlightDescriptor.for_path(session_id)
+        upload_descriptor = flight.FlightDescriptor.for_path(object_key.to_prefix())
         return _do_put_remote(client, upload_descriptor, batch)
 
 
@@ -294,8 +346,10 @@ def get_object(ref: ObjectRef, deserializer: Optional[Deserializer] = None) -> A
         deserializer(base, deltas). Otherwise returns the base object.
 
     Raises:
-        Exception: If request fails
+        ValueError: If key format is invalid or request fails
     """
+    ObjectKey.from_key(ref.key)
+
     tls_config = _get_cache_tls_config()
     client = _get_flight_client(ref.endpoint, tls_config)
     ticket = flight.Ticket(ref.key.encode())
@@ -331,21 +385,15 @@ def update_object(ref: ObjectRef, new_obj: Any) -> "ObjectRef":
         Updated ObjectRef (same as input for now, since version is always 0)
 
     Raises:
-        Exception: If request fails
+        ValueError: If key format is invalid or request fails
     """
-    # Serialize new object to Arrow RecordBatch
+    ObjectKey.from_key(ref.key)
+
     batch = _serialize_object(new_obj)
 
-    # Connect to cache server
     tls_config = _get_cache_tls_config()
     client = _get_flight_client(ref.endpoint, tls_config)
 
-    # Parse key to validate format
-    parts = ref.key.split("/")
-    if len(parts) != 2:
-        raise ValueError(f"Invalid key format: {ref.key}")
-
-    # Use full key (session_id/object_id) in FlightDescriptor to update existing object
     upload_descriptor = flight.FlightDescriptor.for_path(ref.key)
     return _do_put_remote(client, upload_descriptor, batch)
 
@@ -364,17 +412,15 @@ def patch_object(ref: ObjectRef, delta: Any) -> "ObjectRef":
         Updated ObjectRef (same key, potentially updated metadata)
 
     Raises:
-        ValueError: If the object doesn't exist (must put first)
-        Exception: If request fails
+        ValueError: If key format invalid or object doesn't exist
     """
-    # Serialize delta to bytes using cloudpickle
+    ObjectKey.from_key(ref.key)
+
     delta_bytes = cloudpickle.dumps(delta, protocol=cloudpickle.DEFAULT_PROTOCOL)
 
-    # Connect to cache server
     tls_config = _get_cache_tls_config()
     client = _get_flight_client(ref.endpoint, tls_config)
 
-    # Encode action body: {key}:{base64(delta_bytes)}
     delta_b64 = base64.b64encode(delta_bytes).decode("utf-8")
     action_body = f"{ref.key}:{delta_b64}"
 

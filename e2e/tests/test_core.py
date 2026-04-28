@@ -11,17 +11,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import pytest
 import flamepy
-from e2e.api import TestRequest, TestResponse, TestContext
-from tests.utils import random_string
+import pytest
+
+from e2e.api import TestContext, TestRequest
 from e2e.helpers import (
-    serialize_common_data,
-    deserialize_common_data,
-    serialize_request,
-    deserialize_response,
     invoke_task,
+    serialize_common_data,
 )
+from tests.utils import random_string
 
 FLM_TEST_SVC_APP = "flme2e-svc"
 
@@ -47,7 +45,7 @@ def setup_test_env():
     for sess in sessions:
         try:
             flamepy.close_session(sess.id)
-        except:
+        except Exception:
             pass
 
     flamepy.unregister_application(FLM_TEST_SVC_APP)
@@ -275,7 +273,7 @@ def test_update_common_data():
 
     session = flamepy.create_session(application=FLM_TEST_SVC_APP, common_data=common_data_bytes)
 
-    previous_common_data = sys_context
+    _previous_common_data = sys_context
     for i in range(3):
         new_input_data = random_string()
         request = TestRequest(input=new_input_data, update_common_data=True)
@@ -299,7 +297,7 @@ def test_update_common_data():
 
         # For this test, we expect the response to show the update was processed
         # but it won't persist to the next iteration
-        previous_common_data = new_input_data
+        _previous_common_data = new_input_data
 
     session.close()
 
@@ -377,11 +375,11 @@ def test_context_info_selective_request():
 
 def test_task_invoke_exception_handling():
     """Test that exceptions in on_task_invoke are properly handled and recorded."""
-    FLM_ERROR_SVC_APP = "flme2e-error-svc"
+    flm_error_svc_app = "flme2e-error-svc"
 
     # Register the error service application
     flamepy.register_application(
-        FLM_ERROR_SVC_APP,
+        flm_error_svc_app,
         flamepy.ApplicationAttributes(
             command="python3",
             working_directory="/opt/e2e",
@@ -392,7 +390,7 @@ def test_task_invoke_exception_handling():
     )
 
     try:
-        session = flamepy.create_session(application=FLM_ERROR_SVC_APP, common_data=None)
+        session = flamepy.create_session(application=flm_error_svc_app, common_data=None)
 
         # Create a task that will fail
         input_data = b"test input"
@@ -436,10 +434,10 @@ def test_task_invoke_exception_handling():
             sessions = flamepy.list_sessions()
             for sess in sessions:
                 try:
-                    if sess.application == FLM_ERROR_SVC_APP:
+                    if sess.application == flm_error_svc_app:
                         flamepy.close_session(sess.id)
-                except:
+                except Exception:
                     pass
-        except:
+        except Exception:
             pass
-        flamepy.unregister_application(FLM_ERROR_SVC_APP)
+        flamepy.unregister_application(flm_error_svc_app)

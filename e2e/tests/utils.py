@@ -11,8 +11,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import string
 import random
+import string
 
 
 def random_string(size=16) -> str:

@@ -167,8 +167,9 @@ class RunnerService:
         runner_context = RunnerContext(execution_object=execution_object, stateful=stateful, autoscale=autoscale, warmup=warmup)
         # Serialize the context using cloudpickle
         serialized_ctx = cloudpickle.dumps(runner_context, protocol=cloudpickle.DEFAULT_PROTOCOL)
-        # Put in cache to get ObjectRef
-        object_ref = put_object(session_id, serialized_ctx)
+        # Put in cache with <app>/<session_id> key prefix
+        key_prefix = f"{app}/{session_id}"
+        object_ref = put_object(key_prefix, serialized_ctx)
         # Encode ObjectRef to bytes for core API
         common_data_bytes = object_ref.encode()
         # Pass min_instances and max_instances from RunnerContext to open_session
@@ -597,6 +598,20 @@ class Runner:
             ObjectFutureIterator yielding futures in completion order
         """
         return ObjectFutureIterator(futures)
+
+    def put_object(self, obj: Any) -> ObjectRef:
+        """Put an object into the cache with <app_name>/shared key prefix.
+
+        Args:
+            obj: The object to cache (will be pickled)
+
+        Returns:
+            ObjectRef pointing to the cached object
+        """
+        from flamepy.core.cache import ObjectKey, put_object
+
+        object_key = ObjectKey.for_shared(self._name)
+        return put_object(object_key.to_prefix(), obj)
 
     def _create_package(self) -> str:
         """Create a .tar.gz package of the current working directory.

@@ -13,6 +13,7 @@ limitations under the License.
 
 # Cache classes and functions
 from .cache import (
+    ObjectKey,
     ObjectRef,
     get_object,
     patch_object,
@@ -157,6 +158,7 @@ __all__ = [
     # Service functions
     "run",
     # Cache classes
+    "ObjectKey",
     "ObjectRef",
     # Cache functions
     "get_object",

@@ -1,4 +1,3 @@
-
 import cloudpickle
 
 import flamepy.agent.client as agent_client

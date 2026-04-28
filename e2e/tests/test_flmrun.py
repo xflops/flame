@@ -11,25 +11,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import pytest
 import flamepy
+import pytest
 from flamepy import runner
+from flamepy.core import ObjectRef
+
 from e2e.helpers import (
-    sum_func,
-    multiply_func,
-    greet_func,
+    Calculator,
+    Counter,
     get_message_func,
+    greet_func,
+    multiply_func,
     return_dict_func,
     return_list_func,
     return_tuple_func,
-    square_func,
-    Calculator,
-    Counter,
     serialize_runner_context,
     serialize_runner_request,
+    square_func,
+    sum_func,
 )
-from flamepy.core import ObjectRef
-
 
 # Application name for flmrun with e2e package installation
 FLMRUN_E2E_APP = "flmrun-e2e"
@@ -92,7 +92,7 @@ def test_flmrun_sum_function():
         result_bytes = ssn.invoke(req_bytes)
 
         # The result is bytes (ObjectRef encoded), decode to ObjectRef, then get the actual value from cache
-        from flamepy.core import get_object, ObjectRef
+        from flamepy.core import ObjectRef, get_object
 
         result_ref = ObjectRef.decode(result_bytes)
         result = get_object(result_ref)

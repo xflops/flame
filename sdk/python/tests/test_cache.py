@@ -1,4 +1,3 @@
-
 import pyarrow as pa
 
 from flamepy.core.cache import ObjectRef, _deserialize_object, _serialize_object
@@ -29,7 +28,7 @@ def test_get_object_with_fake_flight_client(monkeypatch):
     table = pa.Table.from_batches([batch])
 
     class DummyReader:
-        def read_all(self_inner):
+        def read_all(self):
             return table
 
     class DummyFlightClient:

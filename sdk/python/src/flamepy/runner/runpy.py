@@ -251,7 +251,8 @@ class FlameRunpyService(FlameService):
             # Step 6: Put the result into cache and return ObjectRef encoded as bytes
             # This enables efficient data transfer for large objects
             logger.debug("Putting result into cache")
-            result_object_ref = put_object(context.session_id, result)
+            key_prefix = f"{self._ssn_ctx.application.name}/{self._ssn_ctx.session_id}"
+            result_object_ref = put_object(key_prefix, result)
             logger.info(f"Result cached with ObjectRef: {result_object_ref}")
 
             # For RL module: encode ObjectRef to bytes for core API

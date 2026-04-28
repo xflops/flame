@@ -9,9 +9,7 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-"""
 
-"""
 E2E tests for shim selection feature (Issue #379).
 
 These tests verify the shim selection logic that ensures applications are
@@ -24,11 +22,12 @@ Test scenarios:
 """
 
 import time
-import pytest
+
 import flamepy
+import pytest
+
 from e2e.api import TestRequest
 from e2e.helpers import invoke_task
-
 
 FLM_SHIM_TEST_APP = "flme2e-shim-test"
 
@@ -129,7 +128,7 @@ class TestShimSelectionNegative:
         finally:
             try:
                 flamepy.unregister_application(app_name)
-            except:
+            except Exception:
                 pass
 
     def test_wasm_app_task_stays_pending(self):
@@ -171,7 +170,7 @@ class TestShimSelectionNegative:
         finally:
             try:
                 flamepy.unregister_application(app_name)
-            except:
+            except Exception:
                 pass
 
 

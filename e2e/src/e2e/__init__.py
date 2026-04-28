@@ -12,9 +12,9 @@ limitations under the License.
 """
 
 from .api import (
+    TestContext,
     TestRequest,
     TestResponse,
-    TestContext,
 )
 
 __version__ = "0.4.0"

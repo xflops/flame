@@ -11,14 +11,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import pytest
 import flamepy
-from flamepy import SessionState, TaskState, FlameError, FlameErrorCode, TaskInformer
+import pytest
+from flamepy import SessionState
 from flamepy.agent import Agent
-from e2e.api import TestRequest, TestResponse, TestContext
+
+from e2e.api import TestContext, TestRequest
 from tests.utils import random_string
-import threading
-from concurrent.futures import wait
 
 FLM_TEST_APP = "flme2e"
 
@@ -43,7 +42,7 @@ def setup_test_env():
     for sess in sessions:
         try:
             flamepy.close_session(sess.id)
-        except:
+        except Exception:
             pass
 
     flamepy.unregister_application(FLM_TEST_APP)
