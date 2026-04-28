@@ -15,3 +15,6 @@ plot = ["matplotlib"]
 
 [dependency-groups]
 dev = ["flamepy"]
+
+[tool.setuptools]
+py-modules = ["main", "model"]
