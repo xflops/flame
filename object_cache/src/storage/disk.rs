@@ -52,8 +52,12 @@ impl DiskStorage {
         self.storage_path.join(format!("{}.deltas", key))
     }
 
-    fn session_dir(&self, session_id: &str) -> PathBuf {
-        self.storage_path.join(session_id)
+    fn app_dir(&self, app_name: &str) -> PathBuf {
+        self.storage_path.join(app_name)
+    }
+
+    fn app_session_dir(&self, app_name: &str, session_id: &str) -> PathBuf {
+        self.storage_path.join(app_name).join(session_id)
     }
 }
 
@@ -61,21 +65,22 @@ impl DiskStorage {
 impl StorageEngine for DiskStorage {
     async fn write_object(&self, key: &str, object: &Object) -> Result<(), FlameError> {
         let parts: Vec<&str> = key.split('/').collect();
-        if parts.len() != 2 {
+        if parts.len() != 3 {
             return Err(FlameError::InvalidConfig(format!(
-                "Invalid key format: {}",
+                "Invalid key format '{}': expected '<app>/<ssn>/<uuid>'",
                 key
             )));
         }
-        let session_id = parts[0].to_string();
+        let app_name = parts[0].to_string();
+        let session_id = parts[1].to_string();
 
-        let session_dir = self.session_dir(&session_id);
+        let app_session_dir = self.app_session_dir(&app_name, &session_id);
         let object_path = self.object_path(key);
         let delta_dir = self.delta_dir(key);
         let object_clone = object.clone();
 
         tokio::task::spawn_blocking(move || {
-            fs::create_dir_all(&session_dir)?;
+            fs::create_dir_all(&app_session_dir)?;
             let batch = object_to_batch(&object_clone)?;
             write_batch_to_file(&object_path, &batch)?;
             if delta_dir.exists() {
@@ -186,13 +191,23 @@ impl StorageEngine for DiskStorage {
         .map_err(|e| FlameError::Internal(format!("Task join error: {}", e)))?
     }
 
-    async fn delete_objects(&self, session_id: &str) -> Result<(), FlameError> {
-        let session_dir = self.session_dir(session_id);
+    async fn delete_objects(&self, prefix: &str) -> Result<(), FlameError> {
+        let parts: Vec<&str> = prefix.split('/').collect();
+        let dir_to_delete = match parts.len() {
+            1 => self.app_dir(parts[0]),
+            2 => self.app_session_dir(parts[0], parts[1]),
+            _ => {
+                return Err(FlameError::InvalidConfig(format!(
+                    "Invalid prefix '{}': expected '<app>' or '<app>/<ssn>'",
+                    prefix
+                )))
+            }
+        };
 
         tokio::task::spawn_blocking(move || {
-            if session_dir.exists() {
-                fs::remove_dir_all(&session_dir)?;
-                tracing::debug!("Deleted session directory: {:?}", session_dir);
+            if dir_to_delete.exists() {
+                fs::remove_dir_all(&dir_to_delete)?;
+                tracing::debug!("Deleted directory: {:?}", dir_to_delete);
             }
             Ok(())
         })
@@ -210,49 +225,65 @@ impl StorageEngine for DiskStorage {
                 return Ok(results);
             }
 
-            for session_entry in fs::read_dir(&storage_path)? {
-                let session_entry = session_entry?;
-                let session_path = session_entry.path();
+            for app_entry in fs::read_dir(&storage_path)? {
+                let app_entry = app_entry?;
+                let app_path = app_entry.path();
 
-                if !session_path.is_dir() {
+                if !app_path.is_dir() {
                     continue;
                 }
 
-                let session_id = session_path
+                let app_name = app_path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .ok_or_else(|| {
-                        FlameError::Internal("Invalid session directory name".to_string())
+                        FlameError::Internal("Invalid app directory name".to_string())
                     })?;
 
-                for object_entry in fs::read_dir(&session_path)? {
-                    let object_entry = object_entry?;
-                    let object_path = object_entry.path();
+                for session_entry in fs::read_dir(&app_path)? {
+                    let session_entry = session_entry?;
+                    let session_path = session_entry.path();
 
-                    if object_path.is_dir() {
+                    if !session_path.is_dir() {
                         continue;
                     }
 
-                    if object_path.extension().and_then(|e| e.to_str()) != Some("arrow") {
-                        continue;
-                    }
-
-                    let object_id = object_path
-                        .file_stem()
+                    let session_id = session_path
+                        .file_name()
                         .and_then(|n| n.to_str())
                         .ok_or_else(|| {
-                            FlameError::Internal("Invalid object file name".to_string())
+                            FlameError::Internal("Invalid session directory name".to_string())
                         })?;
 
-                    let key = format!("{}/{}", session_id, object_id);
-                    let delta_dir = session_path.join(format!("{}.deltas", object_id));
-                    let delta_count = count_deltas_sync(&delta_dir);
+                    for object_entry in fs::read_dir(&session_path)? {
+                        let object_entry = object_entry?;
+                        let object_path = object_entry.path();
 
-                    let base = load_object_from_file(&object_path)?;
-                    let deltas = read_deltas_sync(&delta_dir)?;
-                    let object = Object::with_deltas(base.version, base.data, deltas);
+                        if object_path.is_dir() {
+                            continue;
+                        }
 
-                    results.push((key, object, delta_count));
+                        if object_path.extension().and_then(|e| e.to_str()) != Some("arrow") {
+                            continue;
+                        }
+
+                        let object_id = object_path
+                            .file_stem()
+                            .and_then(|n| n.to_str())
+                            .ok_or_else(|| {
+                                FlameError::Internal("Invalid object file name".to_string())
+                            })?;
+
+                        let key = format!("{}/{}/{}", app_name, session_id, object_id);
+                        let delta_dir = session_path.join(format!("{}.deltas", object_id));
+                        let delta_count = count_deltas_sync(&delta_dir);
+
+                        let base = load_object_from_file(&object_path)?;
+                        let deltas = read_deltas_sync(&delta_dir)?;
+                        let object = Object::with_deltas(base.version, base.data, deltas);
+
+                        results.push((key, object, delta_count));
+                    }
                 }
             }
 
@@ -407,11 +438,14 @@ mod tests {
 
         let object = Object::new(1, vec![1, 2, 3, 4, 5]);
         storage
-            .write_object("test-session/obj1", &object)
+            .write_object("test-app/test-session/obj1", &object)
             .await
             .unwrap();
 
-        let result = storage.read_object("test-session/obj1").await.unwrap();
+        let result = storage
+            .read_object("test-app/test-session/obj1")
+            .await
+            .unwrap();
         assert!(result.is_some());
         let loaded = result.unwrap();
         assert_eq!(loaded.version, 1);
@@ -426,19 +460,19 @@ mod tests {
 
         let object = Object::new(1, vec![1, 2, 3]);
         storage
-            .write_object("test-session/obj1", &object)
+            .write_object("test-app/test-session/obj1", &object)
             .await
             .unwrap();
 
         let delta = Object::new(0, vec![4, 5, 6]);
         let meta = storage
-            .patch_object("test-session/obj1", &delta)
+            .patch_object("test-app/test-session/obj1", &delta)
             .await
             .unwrap();
         assert_eq!(meta.delta_count, 1);
 
         let loaded = storage
-            .read_object("test-session/obj1")
+            .read_object("test-app/test-session/obj1")
             .await
             .unwrap()
             .unwrap();
@@ -453,13 +487,19 @@ mod tests {
 
         let object = Object::new(1, vec![1, 2, 3]);
         storage
-            .write_object("test-session/obj1", &object)
+            .write_object("test-app/test-session/obj1", &object)
             .await
             .unwrap();
 
-        storage.delete_object("test-session/obj1").await.unwrap();
+        storage
+            .delete_object("test-app/test-session/obj1")
+            .await
+            .unwrap();
 
-        let result = storage.read_object("test-session/obj1").await.unwrap();
+        let result = storage
+            .read_object("test-app/test-session/obj1")
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -471,18 +511,27 @@ mod tests {
         let object1 = Object::new(1, vec![1, 2, 3]);
         let object2 = Object::new(2, vec![4, 5, 6]);
         storage
-            .write_object("test-session/obj1", &object1)
+            .write_object("test-app/test-session/obj1", &object1)
             .await
             .unwrap();
         storage
-            .write_object("test-session/obj2", &object2)
+            .write_object("test-app/test-session/obj2", &object2)
             .await
             .unwrap();
 
-        storage.delete_objects("test-session").await.unwrap();
+        storage
+            .delete_objects("test-app/test-session")
+            .await
+            .unwrap();
 
-        let result1 = storage.read_object("test-session/obj1").await.unwrap();
-        let result2 = storage.read_object("test-session/obj2").await.unwrap();
+        let result1 = storage
+            .read_object("test-app/test-session/obj1")
+            .await
+            .unwrap();
+        let result2 = storage
+            .read_object("test-app/test-session/obj2")
+            .await
+            .unwrap();
         assert!(result1.is_none());
         assert!(result2.is_none());
     }
@@ -495,11 +544,11 @@ mod tests {
         let object1 = Object::new(1, vec![1, 2, 3]);
         let object2 = Object::new(2, vec![4, 5, 6]);
         storage
-            .write_object("session1/obj1", &object1)
+            .write_object("app1/session1/obj1", &object1)
             .await
             .unwrap();
         storage
-            .write_object("session2/obj2", &object2)
+            .write_object("app1/session2/obj2", &object2)
             .await
             .unwrap();
 

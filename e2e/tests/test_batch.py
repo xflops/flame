@@ -41,7 +41,7 @@ def setup_test_env():
     for sess in sessions:
         try:
             flamepy.close_session(sess.id)
-        except:
+        except Exception:
             pass
 
     flamepy.unregister_application(FLM_TEST_SVC_APP)

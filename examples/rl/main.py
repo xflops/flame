@@ -73,7 +73,6 @@ def train_distributed(
 ):
     from functools import partial
 
-    from flamepy import put_object
     from flamepy.runner import Runner
 
     env_config = ENV_CONFIGS[env_name]
@@ -82,7 +81,7 @@ def train_distributed(
     print("=" * 60)
     print(f"Distributed REINFORCE on {env_config.name} using Flame Runner")
     print("=" * 60)
-    print(f"\nConfiguration:")
+    print("\nConfiguration:")
     print(f"  Environment: {env_config.name}")
     print(f"  Observation dim: {env_config.obs_dim}")
     print(f"  Action dim: {env_config.act_dim}")
@@ -90,7 +89,7 @@ def train_distributed(
     print(f"  Training iterations: {num_iterations}")
     print(f"  Episodes per iteration: {episodes_per_iteration}")
     print(f"  Total episodes: {total_episodes}")
-    print(f"\nStarting distributed training...")
+    print("\nStarting distributed training...")
 
     policy = create_policy(env_config)
     lr = 3e-4 if env_config.continuous else 1e-2
@@ -105,7 +104,7 @@ def train_distributed(
         collector = rr.service(collect_fn)
 
         for iteration in range(num_iterations):
-            weights_ref = put_object(f"rl-weights-{iteration}", policy.state_dict())
+            weights_ref = rr.put_object(policy.state_dict())
 
             futures = [collector(weights_ref) for _ in range(episodes_per_iteration)]
             episodes = rr.get(futures)
@@ -144,7 +143,7 @@ def train_distributed(
     print("\n" + "=" * 60)
     print("Training Complete!")
     print(f"  Total time: {elapsed:.2f}s")
-    print(f"  Episodes: {total_episodes} ({total_episodes/elapsed:.1f} episodes/sec)")
+    print(f"  Episodes: {total_episodes} ({total_episodes / elapsed:.1f} episodes/sec)")
     print(f"  Final Mean Reward: {mean_reward:.1f}")
     print("=" * 60)
 
@@ -160,7 +159,7 @@ def train_local(
     print("=" * 60)
     print(f"Local REINFORCE on {env_config.name}")
     print("=" * 60)
-    print(f"\nConfiguration:")
+    print("\nConfiguration:")
     print(f"  Environment: {env_config.name}")
     print(f"  Observation dim: {env_config.obs_dim}")
     print(f"  Action dim: {env_config.act_dim}")
@@ -168,7 +167,7 @@ def train_local(
     print(f"  Training iterations: {num_iterations}")
     print(f"  Episodes per iteration: {episodes_per_iteration}")
     print(f"  Total episodes: {total_episodes}")
-    print(f"\nStarting local training...")
+    print("\nStarting local training...")
 
     start_time = time.time()
     env = gym.make(env_config.name)
@@ -201,13 +200,15 @@ def train_local(
                 log_probs.append(log_prob)
                 rewards.append(reward)
 
-            iteration_episodes.append({
-                "states": states,
-                "actions": actions,
-                "rewards": rewards,
-                "log_probs": log_probs,
-                "total_reward": sum(rewards),
-            })
+            iteration_episodes.append(
+                {
+                    "states": states,
+                    "actions": actions,
+                    "rewards": rewards,
+                    "log_probs": log_probs,
+                    "total_reward": sum(rewards),
+                }
+            )
 
         iteration_rewards = [ep["total_reward"] for ep in iteration_episodes]
         mean_reward = np.mean(iteration_rewards)
@@ -239,7 +240,7 @@ def train_local(
     print("\n" + "=" * 60)
     print("Training Complete!")
     print(f"  Total time: {elapsed:.2f}s")
-    print(f"  Episodes: {total_episodes} ({total_episodes/elapsed:.1f} episodes/sec)")
+    print(f"  Episodes: {total_episodes} ({total_episodes / elapsed:.1f} episodes/sec)")
     print(f"  Final Mean Reward: {mean_reward:.1f}")
     print("=" * 60)
 
@@ -268,9 +269,7 @@ def main():
     parser.add_argument(
         "--episodes-per-iter", type=int, default=100, help="Episodes per iteration"
     )
-    parser.add_argument(
-        "--plot", action="store_true", help="Show training reward plot"
-    )
+    parser.add_argument("--plot", action="store_true", help="Show training reward plot")
 
     args = parser.parse_args()
 

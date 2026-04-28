@@ -70,7 +70,7 @@ def test_connection_connect_https_with_tls(monkeypatch, tmp_path):
 def test_session_create_task_with_mocked_frontend(monkeypatch):
 
     class DummyFrontend:
-        def CreateTask(self, req):
+        def CreateTask(self, req):  # noqa: N802 - matches gRPC stub name
             class Resp:
                 metadata = type("M", (), {"id": "tid-1"})
                 status = type("S", (), {"state": 0, "creation_time": int(time.time() * 1000), "completion_time": int(time.time() * 1000), "events": []})()

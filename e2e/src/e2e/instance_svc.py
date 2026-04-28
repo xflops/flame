@@ -13,7 +13,7 @@ limitations under the License.
 
 from flamepy import agent
 
-from e2e.api import TestRequest, TestResponse, TestContext
+from e2e.api import TestContext, TestRequest, TestResponse
 
 instance = agent.FlameInstance()
 

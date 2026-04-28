@@ -11,20 +11,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import pytest
-import flamepy
-from flamepy import runner
-from flamepy.runner import SessionContext
 import os
 import tempfile
 from pathlib import Path
+
+import flamepy
+import pytest
+from flamepy import runner
+from flamepy.runner import SessionContext
+
 from e2e.helpers import (
-    sum_func,
-    multiply_func,
-    greet_func,
     Calculator,
     Counter,
     RecursiveService,
+    greet_func,
+    sum_func,
 )
 
 
@@ -49,7 +50,7 @@ def check_flmrun_app():
 def test_runner_context_manager(check_package_config, check_flmrun_app):
     """Test Case 1: Test Runner as a context manager."""
     # Use Runner as a context manager
-    with runner.Runner("test-runner-cm") as rr:
+    with runner.Runner("test-runner-cm"):
         # Verify that the application is registered
         apps = flamepy.list_applications()
         app_names = [app.name for app in apps]
@@ -190,7 +191,7 @@ def test_runner_package_excludes(check_package_config, check_flmrun_app):
             Path("__pycache__/test.pyc").write_text("compiled")
 
             # Use Runner (should exclude .log, .pkl, __pycache__)
-            with runner.Runner("test-runner-excludes") as rr:
+            with runner.Runner("test-runner-excludes"):
                 # Just verify it works - the exclusion is tested by successful packaging
                 pass
 
@@ -273,7 +274,7 @@ def test_runner_error_no_package_config():
 
     # Try to use Runner without package config
     with pytest.raises(flamepy.FlameError) as exc_info:
-        with runner.Runner("test-no-config") as rr:
+        with runner.Runner("test-no-config"):
             pass
 
     assert exc_info.value.code == flamepy.FlameErrorCode.INVALID_CONFIG
@@ -681,10 +682,10 @@ def test_session_context_dynamic_class(check_package_config, check_flmrun_app):
 
         return DynamicService
 
-    ServiceClass = create_service_class("dynamic-session-001")
+    service_class = create_service_class("dynamic-session-001")
 
     with runner.Runner("test-dynamic-ctx") as rr:
-        service = rr.service(ServiceClass)
+        service = rr.service(service_class)
 
         # Verify the session ID matches
         assert service._session.id == "dynamic-session-001", f"Expected session ID 'dynamic-session-001', got '{service._session.id}'"
@@ -741,7 +742,7 @@ def test_runner_recursive_same_session(check_package_config, check_flmrun_app):
         # Test with depth=0 (base case)
         logger.info("[TEST] Testing depth=0")
         result0 = service.compute_recursive(0)
-        logger.info(f"[TEST] Got future for depth=0, calling get()")
+        logger.info("[TEST] Got future for depth=0, calling get()")
         value0 = result0.get()
         logger.info(f"[TEST] depth=0 result: {value0}")
         assert value0 == 1, f"Expected 1 for depth=0, got {value0}"
@@ -749,7 +750,7 @@ def test_runner_recursive_same_session(check_package_config, check_flmrun_app):
         # Test with depth=1 (one level of recursion)
         logger.info("[TEST] Testing depth=1")
         result1 = service.compute_recursive(1)
-        logger.info(f"[TEST] Got future for depth=1, calling get()")
+        logger.info("[TEST] Got future for depth=1, calling get()")
         value1 = result1.get()
         logger.info(f"[TEST] depth=1 result: {value1}")
         assert value1 == 2, f"Expected 2 for depth=1, got {value1}"
@@ -757,7 +758,7 @@ def test_runner_recursive_same_session(check_package_config, check_flmrun_app):
         # Test with depth=2 (two levels of recursion)
         logger.info("[TEST] Testing depth=2")
         result2 = service.compute_recursive(2)
-        logger.info(f"[TEST] Got future for depth=2, calling get()")
+        logger.info("[TEST] Got future for depth=2, calling get()")
         value2 = result2.get()
         logger.info(f"[TEST] depth=2 result: {value2}")
         assert value2 == 4, f"Expected 4 for depth=2, got {value2}"
