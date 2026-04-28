@@ -282,8 +282,8 @@ export PIP_CACHE_DIR="$FLAME_HOME/data/cache/pip"
 export UV_LINK_MODE=copy
 
 # Create cache directories if they don't exist
-mkdir -p "$UV_CACHE_DIR" 2>/dev/null
-mkdir -p "$PIP_CACHE_DIR" 2>/dev/null
+mkdir -p "$UV_CACHE_DIR" 2>/dev/null || true
+mkdir -p "$PIP_CACHE_DIR" 2>/dev/null || true
 
 # Python environment for flamepy
 FLAME_SITE_PACKAGES="{site_packages}"
@@ -295,12 +295,13 @@ if [ -d "$FLAME_SITE_PACKAGES" ]; then
     
     # Find all directories containing shared libraries for native extensions
     while IFS= read -r dir; do
+        [ -z "$dir" ] && continue
         abs_dir=$(cd "$dir" 2>/dev/null && pwd)
         if [ -n "$abs_dir" ] && [[ ":$LD_LIBRARY_PATH:" != *":$abs_dir:"* ]]; then
             export LD_LIBRARY_PATH="$abs_dir:$LD_LIBRARY_PATH"
             FLAME_LD_DIRS="$FLAME_LD_DIRS $abs_dir"
         fi
-    done < <(find "$FLAME_SITE_PACKAGES" \( -name "*.so" -o -name "*.dylib" \) -type f 2>/dev/null | xargs -n1 dirname | sort -u)
+    done < <(find "$FLAME_SITE_PACKAGES" \( -name "*.so" -o -name "*.dylib" \) -type f 2>/dev/null | xargs -r -n1 dirname 2>/dev/null | sort -u)
 fi
 
 # Print environment info (only when sourced interactively)
