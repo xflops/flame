@@ -567,14 +567,14 @@ impl FlightCacheServer {
         if let Some(ref desc) = flight_data.flight_descriptor {
             if !desc.path.is_empty() {
                 let path_str = &desc.path[0];
-                if path_str.contains('/') {
-                    let parts: Vec<&str> = path_str.split('/').collect();
-                    if parts.len() == 2 {
-                        *session_id = Some(parts[0].to_string());
-                        *object_id = Some(parts[1].to_string());
+                match ObjectKey::from_path(path_str) {
+                    Ok(key) => {
+                        *session_id = Some(key.to_prefix());
+                        *object_id = key.object_id;
                     }
-                } else {
-                    *session_id = Some(path_str.clone());
+                    Err(_) => {
+                        *session_id = Some(path_str.clone());
+                    }
                 }
             }
         }
@@ -883,8 +883,6 @@ impl FlightService for FlightCacheServer {
             return Err(Status::invalid_argument("Empty descriptor path"));
         };
 
-        // Key format: "session_id/object_id"
-
         // Create endpoint with cache server's public endpoint
         let endpoint_uri = self.cache.endpoint.to_uri();
 
@@ -926,8 +924,6 @@ impl FlightService for FlightCacheServer {
         let key = String::from_utf8(ticket.ticket.to_vec())
             .map_err(|e| Status::invalid_argument(format!("Invalid ticket: {}", e)))?;
 
-        // Key format: "session_id/object_id"
-        // Returns Object with base data and all deltas populated per HLD
         let object = self.cache.get(key.clone()).await?;
 
         tracing::debug!(
