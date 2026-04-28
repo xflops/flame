@@ -136,6 +136,7 @@ impl Installer for PythonInstaller {
         let status = tokio::process::Command::new(&uv_cmd)
             .arg("pip")
             .arg("install")
+            .arg("--link-mode=copy")
             .arg("--target")
             .arg(&deps_path)
             .arg(".")
