@@ -14,6 +14,7 @@ limitations under the License.
 mod apis;
 
 use std::error::Error;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use byte_unit::Byte;
@@ -21,7 +22,7 @@ use clap::Parser;
 use comfy_table::presets::NOTHING;
 use comfy_table::Table;
 use flame_rs::apis::FlameError;
-use flame_rs::client::{SessionAttributes, Task, TaskInformer};
+use flame_rs::client::{Session, SessionAttributes, Task, TaskInformer};
 use futures::future::try_join_all;
 use indicatif::HumanCount;
 use stdng::{lock_ptr, new_ptr};
@@ -55,6 +56,9 @@ struct Cli {
     /// The memory (bytes) to allocate to the tasks
     #[arg(short, long)]
     memory: Option<String>,
+    /// Performance benchmark mode (summary only, no per-task output)
+    #[arg(short, long, default_value = "false")]
+    perf: bool,
 }
 
 const DEFAULT_APP: &str = "flmping";
@@ -99,26 +103,66 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .as_millis();
     println!("Session <{}> was created in <{ssn_creation_time} ms>, start to run <{}> tasks in the session:\n", ssn.id, HumanCount(task_num as u64));
 
-    let mut tasks = vec![];
-    let tasks_creations_start_time = Instant::now();
-
-    let info = new_ptr(OutputInfor::new());
-
-    for _ in 0..task_num {
-        let input = PingRequest {
-            duration: cli.duration,
-            memory,
-        }
-        .try_into()?;
-        tasks.push(ssn.run_task(Some(input), info.clone()));
+    if cli.perf {
+        run_perf_mode(&ssn, task_num, cli.duration, memory).await?;
+    } else {
+        run_output_mode(&ssn, task_num, cli.duration, memory).await?;
     }
 
-    try_join_all(tasks).await?;
-    let tasks_creation_end_time = Instant::now();
+    ssn.close().await?;
 
-    let tasks_creation_time = tasks_creation_end_time
-        .duration_since(tasks_creations_start_time)
-        .as_millis();
+    Ok(())
+}
+
+async fn run_perf_mode(
+    ssn: &Session,
+    task_num: i32,
+    duration: Option<u64>,
+    memory: Option<u64>,
+) -> Result<(), Box<dyn Error>> {
+    let info = new_ptr(PerfInformer::new());
+    let start = Instant::now();
+
+    let tasks: Vec<_> = (0..task_num)
+        .map(|_| {
+            let input = PingRequest { duration, memory }.try_into();
+            async {
+                let input = input?;
+                ssn.run_task(Some(input), info.clone()).await
+            }
+        })
+        .collect();
+
+    try_join_all(tasks).await?;
+    let duration_ms = start.elapsed().as_millis();
+
+    let info = lock_ptr!(info)?;
+    info.print_summary(task_num, duration_ms);
+
+    Ok(())
+}
+
+async fn run_output_mode(
+    ssn: &Session,
+    task_num: i32,
+    duration: Option<u64>,
+    memory: Option<u64>,
+) -> Result<(), Box<dyn Error>> {
+    let info = new_ptr(OutputInfor::new());
+    let start = Instant::now();
+
+    let tasks: Vec<_> = (0..task_num)
+        .map(|_| {
+            let input = PingRequest { duration, memory }.try_into();
+            async {
+                let input = input?;
+                ssn.run_task(Some(input), info.clone()).await
+            }
+        })
+        .collect();
+
+    try_join_all(tasks).await?;
+    let duration_ms = start.elapsed().as_millis();
 
     {
         let info = lock_ptr!(info)?;
@@ -128,10 +172,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "\n\n<{}> tasks was completed in <{} ms>.\n",
         HumanCount(task_num as u64),
-        HumanCount(tasks_creation_time as u64)
+        HumanCount(duration_ms as u64)
     );
-
-    ssn.close().await?;
 
     Ok(())
 }
@@ -175,5 +217,55 @@ impl TaskInformer for OutputInfor {
 impl OutputInfor {
     fn print(&self) {
         println!("{}", self.table);
+    }
+}
+
+struct PerfInformer {
+    succeeded: AtomicU32,
+    failed: AtomicU32,
+}
+
+impl PerfInformer {
+    fn new() -> Self {
+        Self {
+            succeeded: AtomicU32::new(0),
+            failed: AtomicU32::new(0),
+        }
+    }
+
+    fn print_summary(&self, task_num: i32, duration_ms: u128) {
+        let succeeded = self.succeeded.load(Ordering::Relaxed);
+        let failed = self.failed.load(Ordering::Relaxed);
+        let duration_secs = duration_ms as f64 / 1000.0;
+        let throughput = if duration_secs > 0.0 {
+            succeeded as f64 / duration_secs
+        } else {
+            0.0
+        };
+
+        println!("\n{}", "=".repeat(60));
+        println!("BENCHMARK RESULTS");
+        println!("{}", "=".repeat(60));
+        println!("Duration:        {:.2}s", duration_secs);
+        println!("Succeeded:       {}/{}", succeeded, task_num);
+        println!("Failed:          {}", failed);
+        println!("Throughput:      {:.2} tasks/sec", throughput);
+        println!("{}\n", "=".repeat(60));
+    }
+}
+
+impl TaskInformer for PerfInformer {
+    fn on_update(&mut self, task: Task) {
+        if task.is_completed() {
+            if task.is_succeed() {
+                self.succeeded.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn on_error(&mut self, _: FlameError) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
     }
 }

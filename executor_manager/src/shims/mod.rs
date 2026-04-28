@@ -13,6 +13,7 @@ limitations under the License.
 
 mod grpc_shim;
 mod host_shim;
+#[cfg(feature = "wasm")]
 mod wasm_shim;
 
 use std::collections::HashMap;
@@ -25,6 +26,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use self::host_shim::HostShim;
+#[cfg(feature = "wasm")]
 use self::wasm_shim::WasmShim;
 
 use crate::executor::Executor;
@@ -206,7 +208,12 @@ pub async fn new(
     );
 
     match shim_type {
+        #[cfg(feature = "wasm")]
         ShimType::Wasm => Ok(WasmShim::new_ptr(executor, app, install_env_vars).await?),
+        #[cfg(not(feature = "wasm"))]
+        ShimType::Wasm => Err(FlameError::InvalidConfig(
+            "WASM shim is not enabled. Rebuild with --features wasm".to_string(),
+        )),
         ShimType::Host => Ok(HostShim::new_ptr(executor, app, install_env_vars).await?),
     }
 }
