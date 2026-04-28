@@ -380,9 +380,9 @@ impl ObjectCache {
             None => object_key.with_generated_id(),
         };
 
-        let key = object_key
-            .to_key()
-            .ok_or_else(|| FlameError::Internal("Failed to generate object key".to_string()))?;
+        let key = object_key.to_key().ok_or_else(|| {
+            FlameError::Internal("ObjectKey missing object_id in put_with_id".to_string())
+        })?;
         let size = object.data.len() as u64;
 
         self.storage.write_object(&key, &object).await?;

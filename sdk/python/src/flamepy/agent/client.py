@@ -86,8 +86,9 @@ class Agent:
                 temp_session_id = short_name(name)
                 # Serialize the context using cloudpickle
                 serialized_ctx = cloudpickle.dumps(ctx, protocol=cloudpickle.DEFAULT_PROTOCOL)
-                # Put in cache to get ObjectRef
-                object_ref = put_object(temp_session_id, serialized_ctx)
+                # Put in cache with <app>/<session_id> key prefix
+                key_prefix = f"{name}/{temp_session_id}"
+                object_ref = put_object(key_prefix, serialized_ctx)
                 # Encode ObjectRef to bytes for core API
                 common_data_bytes = object_ref.encode()
 

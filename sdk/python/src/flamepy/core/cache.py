@@ -59,7 +59,7 @@ class ObjectKey:
         for name, value in [("app_name", self.app_name), ("session_id", self.session_id)]:
             if not value:
                 raise ValueError(f"{name} cannot be empty")
-            if ".." in value or "\\" in value:
+            if ".." in value or "\\" in value or "/" in value:
                 raise ValueError(f"{name} contains invalid characters: '{value}'")
 
         if self.object_id is not None:
