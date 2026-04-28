@@ -276,20 +276,31 @@ if [[ ":$PATH:" != *":{prefix}/bin:"* ]]; then
     export PATH="{prefix}/bin:$PATH"
 fi
 
+# UV and pip cache directories (shared across containers)
+export UV_CACHE_DIR="$FLAME_HOME/data/cache/uv"
+export PIP_CACHE_DIR="$FLAME_HOME/data/cache/pip"
+export UV_LINK_MODE=copy
+
+# Create cache directories if they don't exist
+mkdir -p "$UV_CACHE_DIR" 2>/dev/null
+mkdir -p "$PIP_CACHE_DIR" 2>/dev/null
+
 # Python environment for flamepy
 FLAME_SITE_PACKAGES="{site_packages}"
+FLAME_LD_DIRS=""
 if [ -d "$FLAME_SITE_PACKAGES" ]; then
     if [[ ":$PYTHONPATH:" != *":$FLAME_SITE_PACKAGES:"* ]]; then
         export PYTHONPATH="$FLAME_SITE_PACKAGES:$PYTHONPATH"
     fi
     
-    # Find pyarrow lib directory for native extensions
-    PYARROW_DIR=$(find "$FLAME_SITE_PACKAGES" -name "pyarrow" -type d 2>/dev/null | head -1)
-    if [ -n "$PYARROW_DIR" ] && [ -d "$PYARROW_DIR" ]; then
-        if [[ ":$LD_LIBRARY_PATH:" != *":$PYARROW_DIR:"* ]]; then
-            export LD_LIBRARY_PATH="$PYARROW_DIR:$LD_LIBRARY_PATH"
+    # Find all directories containing shared libraries for native extensions
+    while IFS= read -r dir; do
+        abs_dir=$(cd "$dir" 2>/dev/null && pwd)
+        if [ -n "$abs_dir" ] && [[ ":$LD_LIBRARY_PATH:" != *":$abs_dir:"* ]]; then
+            export LD_LIBRARY_PATH="$abs_dir:$LD_LIBRARY_PATH"
+            FLAME_LD_DIRS="$FLAME_LD_DIRS $abs_dir"
         fi
-    fi
+    done < <(find "$FLAME_SITE_PACKAGES" \( -name "*.so" -o -name "*.dylib" \) -type f 2>/dev/null | xargs -n1 dirname | sort -u)
 fi
 
 # Print environment info (only when sourced interactively)
@@ -297,8 +308,13 @@ if [[ $- == *i* ]]; then
     echo "Flame environment loaded:"
     echo "  FLAME_HOME=$FLAME_HOME"
     echo "  PATH includes: {prefix}/bin"
+    echo "  UV_CACHE_DIR=$UV_CACHE_DIR"
+    echo "  PIP_CACHE_DIR=$PIP_CACHE_DIR"
     if [ -d "$FLAME_SITE_PACKAGES" ]; then
         echo "  PYTHONPATH includes: $FLAME_SITE_PACKAGES"
+    fi
+    if [ -n "$FLAME_LD_DIRS" ]; then
+        echo "  LD_LIBRARY_PATH includes: $FLAME_LD_DIRS"
     fi
 fi
 "#,

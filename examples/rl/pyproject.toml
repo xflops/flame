@@ -1,0 +1,17 @@
+[project]
+name = "rl"
+version = "0.1.0"
+description = "Distributed Reinforcement Learning Example using Flame Runner"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "numpy",
+    "gymnasium[mujoco]",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib"]
+
+[dependency-groups]
+dev = ["flamepy"]
