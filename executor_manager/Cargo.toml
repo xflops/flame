@@ -5,6 +5,10 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = []
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
+
 [dependencies]
 rpc = { path = "../rpc" }
 common = { path = "../common" }
@@ -36,8 +40,8 @@ tar = "0.4"
 zip = "2"
 reqwest = { version = "0.12", features = ["rustls-tls", "stream"], default-features = false }
 futures-util = "0.3"
-wasmtime = "43"
-wasmtime-wasi = "43"
+wasmtime = { version = "43", optional = true }
+wasmtime-wasi = { version = "43", optional = true }
 anyhow = "1"
 tokio-stream = { workspace = true }
 shellexpand = "3.1"

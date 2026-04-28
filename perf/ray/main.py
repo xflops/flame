@@ -17,9 +17,7 @@ from dataclasses import dataclass
 
 import ray
 
-NUM_SESSIONS = 3
-TASKS_PER_SESSION = 300
-TOTAL_TASKS = NUM_SESSIONS * TASKS_PER_SESSION
+TOTAL_TASKS = 900
 TIMEOUT_SECS = 600
 
 
@@ -35,59 +33,34 @@ class BenchmarkResult:
 
 
 @ray.remote
-def benchmark_task(session_id: int, task_id: int, input: bytes) -> bytes:
-    return b"ok" 
-
-
-@ray.remote
-def run_session(session_id: int, tasks_per_session: int) -> tuple[int, int]:
-    task_refs = [
-        benchmark_task.remote(session_id, task_id, b"benchmark")
-        for task_id in range(tasks_per_session)
-    ]
-
-    succeeded = 0
-    failed = 0
-
-    results = ray.get(task_refs)
-    for result in results:
-        if result:
-            succeeded += 1
-        else:
-            failed += 1
-
-    return succeeded, failed
+def benchmark_task(task_id: int, input: bytes) -> bytes:
+    return b"ok"
 
 
 def run_benchmark(
-    num_sessions: int = NUM_SESSIONS,
-    tasks_per_session: int = TASKS_PER_SESSION,
+    total_tasks: int = TOTAL_TASKS,
 ) -> BenchmarkResult:
-    total_tasks = num_sessions * tasks_per_session
-
     print("\n" + "=" * 60)
-    print(
-        f"BENCHMARK: {num_sessions} sessions × {tasks_per_session} tasks = {total_tasks} total"
-    )
+    print(f"BENCHMARK: {total_tasks} tasks")
     print("=" * 60 + "\n")
 
     start = time.perf_counter()
 
-    session_refs = [
-        run_session.remote(session_id, tasks_per_session)
-        for session_id in range(num_sessions)
+    task_refs = [
+        benchmark_task.remote(task_id, b"benchmark")
+        for task_id in range(total_tasks)
     ]
 
-    results = ray.get(session_refs)
+    results = ray.get(task_refs)
 
     duration = time.perf_counter() - start
 
-    total_succeeded = sum(r[0] for r in results)
-    total_failed = sum(r[1] for r in results)
+    succeeded = sum(1 for r in results if r)
+    failed = sum(1 for r in results if not r)
 
     return BenchmarkResult(
-        succeeded=total_succeeded,
-        failed=total_failed,
+        succeeded=succeeded,
+        failed=failed,
         duration_secs=duration,
     )
 
@@ -111,16 +84,10 @@ def main():
         help="Ray cluster address (default: auto, use 'ray://<ip>:10001' for Ray Client)",
     )
     parser.add_argument(
-        "--sessions",
-        type=int,
-        default=NUM_SESSIONS,
-        help=f"Number of concurrent sessions (default: {NUM_SESSIONS})",
-    )
-    parser.add_argument(
         "--tasks",
         type=int,
-        default=TASKS_PER_SESSION,
-        help=f"Tasks per session (default: {TASKS_PER_SESSION})",
+        default=TOTAL_TASKS,
+        help=f"Total number of tasks (default: {TOTAL_TASKS})",
     )
     parser.add_argument(
         "--timeout",
@@ -130,24 +97,19 @@ def main():
     )
     args = parser.parse_args()
 
-    total_tasks = args.sessions * args.tasks
-
     if args.address == "auto":
         ray.init()
     else:
         ray.init(args.address)
 
     try:
-        result = run_benchmark(
-            num_sessions=args.sessions,
-            tasks_per_session=args.tasks,
-        )
+        result = run_benchmark(total_tasks=args.tasks)
 
-        print_results(result, total_tasks)
+        print_results(result, args.tasks)
 
         assert result.failed == 0, f"Benchmark had {result.failed} failed tasks"
-        assert result.succeeded == total_tasks, (
-            f"Not all tasks succeeded: {result.succeeded}/{total_tasks}"
+        assert result.succeeded == args.tasks, (
+            f"Not all tasks succeeded: {result.succeeded}/{args.tasks}"
         )
         assert result.duration_secs < args.timeout, (
             f"Benchmark exceeded {args.timeout}s timeout: {result.duration_secs:.2f}s"
