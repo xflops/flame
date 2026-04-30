@@ -135,9 +135,10 @@ sudo flmadm uninstall --backup-dir /backups/flame-backup-2026-01-28
 
 - `--src-dir <PATH>`: Source code directory for building Flame (default: clone from GitHub)
 - `--prefix <PATH>`: Target installation directory (default: `/usr/local/flame`)
-- `--all`: Explicitly install all components (control plane + worker + client)
+- `--all`: Explicitly install all components (control plane + worker + cache + client)
 - `--control-plane`: Install control plane components only (flame-session-manager, flmctl, flmadm)
 - `--worker`: Install worker components only (flame-executor-manager, flmping-service, flmexec-service, flamepy)
+- `--cache`: Install cache component only (flame-object-cache)
 - `--client`: Install client components only (flmping, flmexec, flamepy)
 - `--no-systemd`: Skip systemd service generation (for user-local installs)
 - `--enable`: Enable and start systemd services after installation
@@ -147,13 +148,13 @@ sudo flmadm uninstall --backup-dir /backups/flame-backup-2026-01-28
 - `--verbose`: Show detailed build output (useful for debugging build issues)
 
 **Note:** 
-- You **must** specify at least one profile flag (`--all`, `--control-plane`, `--worker`, or `--client`)
-- The `--all` flag cannot be combined with `--control-plane`, `--worker`, or `--client`
-- Profile flags can be combined (e.g., `--control-plane --worker` for a combined node)
+- You **must** specify at least one profile flag (`--all`, `--control-plane`, `--worker`, `--cache`, or `--client`)
+- The `--all` flag cannot be combined with `--control-plane`, `--worker`, `--cache`, or `--client`
+- Profile flags can be combined (e.g., `--control-plane --worker --cache` for a combined node)
 
 ## Installation Profiles
 
-Flame supports three installation profiles to allow flexible deployment architectures:
+Flame supports four installation profiles to allow flexible deployment architectures:
 
 ### Control Plane Profile (`--control-plane`)
 
@@ -174,6 +175,13 @@ Installs components required for executing workloads:
 
 **Use case:** Deploy on worker nodes that execute user workloads.
 
+### Cache Profile (`--cache`)
+
+Installs the standalone object cache:
+- `flame-object-cache`: Dedicated object cache server
+
+**Use case:** Deploy on nodes that provide object caching for the cluster. Can be co-located with workers or run as a dedicated service.
+
 ### Client Profile (`--client`)
 
 Installs client tools for submitting jobs:
@@ -192,13 +200,13 @@ Profiles can be combined in a single installation:
 
 ```bash
 # Single-node deployment (all-in-one)
-sudo flmadm install --control-plane --worker --enable
+sudo flmadm install --control-plane --worker --cache --enable
 
 # Control plane + client tools
 sudo flmadm install --control-plane --client
 
-# Worker + client tools
-sudo flmadm install --worker --client
+# Worker + cache (typical worker node setup)
+sudo flmadm install --worker --cache --enable
 ```
 
 ### Component Overwrite Behavior

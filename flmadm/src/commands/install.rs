@@ -14,6 +14,7 @@ pub fn run(config: InstallConfig) -> Result<()> {
         let profile_name = match profile {
             crate::types::InstallProfile::ControlPlane => "Control Plane",
             crate::types::InstallProfile::Worker => "Worker",
+            crate::types::InstallProfile::Cache => "Cache",
             crate::types::InstallProfile::Client => "Client",
         };
         println!("     • {}", profile_name);
@@ -62,7 +63,10 @@ pub fn run(config: InstallConfig) -> Result<()> {
     let has_worker = config
         .profiles
         .contains(&crate::types::InstallProfile::Worker);
-    let needs_systemd = has_control_plane || has_worker;
+    let has_cache = config
+        .profiles
+        .contains(&crate::types::InstallProfile::Cache);
+    let needs_systemd = has_control_plane || has_worker || has_cache;
 
     if config.systemd && needs_systemd {
         println!("\n═══ Phase 5: Systemd Setup ═══");
@@ -295,6 +299,7 @@ fn print_summary(paths: &InstallationPaths, config: &InstallConfig) {
         let profile_name = match profile {
             crate::types::InstallProfile::ControlPlane => "Control Plane",
             crate::types::InstallProfile::Worker => "Worker",
+            crate::types::InstallProfile::Cache => "Cache",
             crate::types::InstallProfile::Client => "Client",
         };
         println!(
@@ -326,12 +331,18 @@ fn print_summary(paths: &InstallationPaths, config: &InstallConfig) {
     let has_worker = config
         .profiles
         .contains(&crate::types::InstallProfile::Worker);
+    let has_cache = config
+        .profiles
+        .contains(&crate::types::InstallProfile::Cache);
 
-    if config.systemd && (has_control_plane || has_worker) {
+    if config.systemd && (has_control_plane || has_worker || has_cache) {
         println!("Systemd Services:");
         if config.enable {
             if has_control_plane {
                 println!("  • flame-session-manager: enabled and running");
+            }
+            if has_cache {
+                println!("  • flame-object-cache: enabled and running");
             }
             if has_worker {
                 println!("  • flame-executor-manager: enabled and running");
@@ -341,12 +352,18 @@ fn print_summary(paths: &InstallationPaths, config: &InstallConfig) {
             if has_control_plane {
                 println!("  sudo systemctl status flame-session-manager");
             }
+            if has_cache {
+                println!("  sudo systemctl status flame-object-cache");
+            }
             if has_worker {
                 println!("  sudo systemctl status flame-executor-manager");
             }
         } else {
             if has_control_plane {
                 println!("  • flame-session-manager: installed (not enabled)");
+            }
+            if has_cache {
+                println!("  • flame-object-cache: installed (not enabled)");
             }
             if has_worker {
                 println!("  • flame-executor-manager: installed (not enabled)");
@@ -355,6 +372,9 @@ fn print_summary(paths: &InstallationPaths, config: &InstallConfig) {
             println!("To start services:");
             if has_control_plane {
                 println!("  sudo systemctl enable --now flame-session-manager");
+            }
+            if has_cache {
+                println!("  sudo systemctl enable --now flame-object-cache");
             }
             if has_worker {
                 println!("  sudo systemctl enable --now flame-executor-manager");
@@ -366,14 +386,22 @@ fn print_summary(paths: &InstallationPaths, config: &InstallConfig) {
             println!("  sudo journalctl -u flame-session-manager -f");
             println!("  tail -f {}/logs/fsm.log", paths.prefix.display());
         }
+        if has_cache {
+            println!("  sudo journalctl -u flame-object-cache -f");
+            println!("  tail -f {}/logs/foc.log", paths.prefix.display());
+        }
         if has_worker {
             println!("  sudo journalctl -u flame-executor-manager -f");
             println!("  tail -f {}/logs/fem.log", paths.prefix.display());
         }
-    } else if !config.systemd && (has_control_plane || has_worker) {
+    } else if !config.systemd && (has_control_plane || has_worker || has_cache) {
         println!("Manual Service Management:");
         if has_control_plane {
             println!("  • Start session manager: {}/bin/flame-session-manager --config {}/conf/flame-cluster.yaml", 
+                     paths.prefix.display(), paths.prefix.display());
+        }
+        if has_cache {
+            println!("  • Start object cache: {}/bin/flame-object-cache --config {}/conf/flame-cluster.yaml", 
                      paths.prefix.display(), paths.prefix.display());
         }
         if has_worker {

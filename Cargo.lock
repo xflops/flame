@@ -1711,8 +1711,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
-name = "flame-cache"
-version = "0.1.0"
+name = "flame-executor-manager"
+version = "0.5.0"
+dependencies = [
+ "actix-rt",
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "clap",
+ "common",
+ "flate2",
+ "futures",
+ "futures-util",
+ "hyper-util",
+ "nix 0.30.1",
+ "prost 0.14.3",
+ "reqwest",
+ "rpc",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "shellexpand",
+ "stdng",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "wasmtime",
+ "wasmtime-wasi",
+ "zip",
+]
+
+[[package]]
+name = "flame-object-cache"
+version = "0.5.0"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -1738,56 +1777,10 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "url",
  "uuid",
-]
-
-[[package]]
-name = "flame-executor-manager"
-version = "0.5.0"
-dependencies = [
- "actix-rt",
- "anyhow",
- "arrow",
- "arrow-flight",
- "arrow-ipc",
- "async-trait",
- "base64",
- "bson",
- "bytes",
- "chrono",
- "clap",
- "common",
- "flame-cache",
- "flate2",
- "futures",
- "futures-util",
- "hyper-util",
- "network-interface",
- "nix 0.30.1",
- "prost 0.14.3",
- "regex",
- "reqwest",
- "rpc",
- "serde",
- "serde_derive",
- "serde_json",
- "shellexpand",
- "stdng",
- "tar",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
- "tower",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "wasmtime",
- "wasmtime-wasi",
- "zip",
 ]
 
 [[package]]

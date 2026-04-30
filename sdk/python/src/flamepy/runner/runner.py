@@ -169,7 +169,9 @@ class RunnerService:
         serialized_ctx = cloudpickle.dumps(runner_context, protocol=cloudpickle.DEFAULT_PROTOCOL)
         # Put in cache with <app>/<session_id> key prefix
         key_prefix = f"{app}/{session_id}"
+        logger.debug(f"[RunnerService] Putting RunnerContext in cache: key_prefix={key_prefix}, stateful={stateful}, autoscale={autoscale}")
         object_ref = put_object(key_prefix, serialized_ctx)
+        logger.debug(f"[RunnerService] RunnerContext cached: key={object_ref.key}, version={object_ref.version}")
         # Encode ObjectRef to bytes for core API
         common_data_bytes = object_ref.encode()
         # Pass min_instances and max_instances from RunnerContext to open_session
@@ -183,9 +185,14 @@ class RunnerService:
             max_instances=runner_context.max_instances,
             batch_size=1,
         )
-        self._session = open_session(session_id=session_id, spec=session_spec)
+        logger.info(f"[RunnerService] Opening session: session_id={session_id}, app={app}")
+        try:
+            self._session = open_session(session_id=session_id, spec=session_spec)
+        except Exception as e:
+            logger.error(f"[RunnerService] Failed to open session: {type(e).__name__}: {e}", exc_info=True)
+            raise
 
-        logger.debug(f"Created RunnerService for app '{app}' with session '{self._session.id}' (stateful={stateful}, autoscale={autoscale}, custom_session_id={custom_session_id is not None})")
+        logger.info(f"[RunnerService] Session opened: id={self._session.id}")
 
         # Generate wrapper methods for all public methods of the execution object
         self._generate_wrappers()
@@ -273,6 +280,7 @@ class RunnerService:
 
             # For RL module: serialize RunnerRequest with cloudpickle, then call core API
             request_bytes = cloudpickle.dumps(request, protocol=cloudpickle.DEFAULT_PROTOCOL)
+            logger.info(f"[RunnerService] Submitting task: method={method_name}, session={self._session.id}")
             # Submit task and return ObjectFuture
             future = self._session.run(request_bytes)
             return ObjectFuture(future)
@@ -371,7 +379,7 @@ class Runner:
             if self._fail_if_exists:
                 raise FlameError(FlameErrorCode.ALREADY_EXISTS, f"Application '{self._name}' already exists. Set fail_if_exists=False to skip registration.")
             else:
-                logger.debug(f"Application '{self._name}' already exists, skipping registration")
+                logger.debug(f"[Runner._start] Application '{self._name}' already exists, skipping registration")
                 self._started = True
                 return
 
@@ -462,9 +470,10 @@ class Runner:
         This method can be called explicitly or is automatically called when
         exiting the context manager. It performs the following cleanup:
         1. Closes all RunnerService instances (only if app was registered by this Runner)
-        2. Unregisters the application (only if registered by this Runner instance)
-        3. Deletes the package from storage (only if uploaded by this Runner)
-        4. Removes the local package file (only if created by this Runner)
+        2. Deletes all cached objects for this application from flame-cache
+        3. Unregisters the application (only if registered by this Runner instance)
+        4. Deletes the package from storage (only if uploaded by this Runner)
+        5. Removes the local package file (only if created by this Runner)
 
         Note: If the application already existed when the Runner was created
         (fail_if_exists=False), the Runner will NOT perform any cleanup.
@@ -496,6 +505,14 @@ class Runner:
             logger.debug(f"Unregistered application '{self._name}'")
         except Exception as e:
             logger.error(f"Error unregistering application: {e}", exc_info=True)
+
+        try:
+            from flamepy.core.cache import ObjectKey, delete_objects
+
+            delete_objects(ObjectKey.for_all_sessions(self._name).to_prefix())
+            logger.debug(f"Deleted cached objects for '{self._name}'")
+        except Exception as e:
+            logger.error(f"Error deleting cached objects: {e}", exc_info=True)
 
         self._cleanup_storage()
 

@@ -24,13 +24,12 @@ use rayon::prelude::*;
 
 use common::FlameError;
 
-use crate::{Object, ObjectMetadata};
+use crate::cache::{Object, ObjectKey, ObjectMetadata};
 
 use super::StorageEngine;
 
 const MAX_DELTAS_PER_OBJECT: u64 = 1000;
 
-/// Disk-based storage engine using Arrow IPC format.
 pub struct DiskStorage {
     storage_path: PathBuf,
 }
@@ -44,43 +43,41 @@ impl DiskStorage {
         Ok(Self { storage_path })
     }
 
-    fn object_path(&self, key: &str) -> PathBuf {
-        self.storage_path.join(format!("{}.arrow", key))
+    fn object_path(&self, key: &ObjectKey) -> PathBuf {
+        let object_id = key.object_id.as_ref().expect("object_id required");
+        self.storage_path
+            .join(&key.app_name)
+            .join(&key.session_id)
+            .join(format!("{}.arrow", object_id))
     }
 
-    fn delta_dir(&self, key: &str) -> PathBuf {
-        self.storage_path.join(format!("{}.deltas", key))
+    fn delta_dir(&self, key: &ObjectKey) -> PathBuf {
+        let object_id = key.object_id.as_ref().expect("object_id required");
+        self.storage_path
+            .join(&key.app_name)
+            .join(&key.session_id)
+            .join(format!("{}.deltas", object_id))
     }
 
-    fn app_dir(&self, app_name: &str) -> PathBuf {
-        self.storage_path.join(app_name)
+    fn session_dir(&self, key: &ObjectKey) -> PathBuf {
+        self.storage_path.join(&key.app_name).join(&key.session_id)
     }
 
-    fn app_session_dir(&self, app_name: &str, session_id: &str) -> PathBuf {
-        self.storage_path.join(app_name).join(session_id)
+    fn app_dir(&self, key: &ObjectKey) -> PathBuf {
+        self.storage_path.join(&key.app_name)
     }
 }
 
 #[async_trait]
 impl StorageEngine for DiskStorage {
-    async fn write_object(&self, key: &str, object: &Object) -> Result<(), FlameError> {
-        let parts: Vec<&str> = key.split('/').collect();
-        if parts.len() != 3 {
-            return Err(FlameError::InvalidConfig(format!(
-                "Invalid key format '{}': expected '<app>/<ssn>/<uuid>'",
-                key
-            )));
-        }
-        let app_name = parts[0].to_string();
-        let session_id = parts[1].to_string();
-
-        let app_session_dir = self.app_session_dir(&app_name, &session_id);
+    async fn write_object(&self, key: &ObjectKey, object: &Object) -> Result<(), FlameError> {
+        let session_dir = self.session_dir(key);
         let object_path = self.object_path(key);
         let delta_dir = self.delta_dir(key);
         let object_clone = object.clone();
 
         tokio::task::spawn_blocking(move || {
-            fs::create_dir_all(&app_session_dir)?;
+            fs::create_dir_all(&session_dir)?;
             let batch = object_to_batch(&object_clone)?;
             write_batch_to_file(&object_path, &batch)?;
             if delta_dir.exists() {
@@ -93,7 +90,7 @@ impl StorageEngine for DiskStorage {
         .map_err(|e| FlameError::Internal(format!("Task join error: {}", e)))?
     }
 
-    async fn read_object(&self, key: &str) -> Result<Option<Object>, FlameError> {
+    async fn read_object(&self, key: &ObjectKey) -> Result<Option<Object>, FlameError> {
         let object_path = self.object_path(key);
         let delta_dir = self.delta_dir(key);
 
@@ -109,17 +106,21 @@ impl StorageEngine for DiskStorage {
         .map_err(|e| FlameError::Internal(format!("Task join error: {}", e)))?
     }
 
-    async fn patch_object(&self, key: &str, delta: &Object) -> Result<ObjectMetadata, FlameError> {
+    async fn patch_object(
+        &self,
+        key: &ObjectKey,
+        delta: &Object,
+    ) -> Result<ObjectMetadata, FlameError> {
         let object_path = self.object_path(key);
         let delta_dir = self.delta_dir(key);
-        let key_owned = key.to_string();
+        let key_str = key.to_key().expect("object_id required");
         let delta_clone = delta.clone();
 
         tokio::task::spawn_blocking(move || {
             if !object_path.exists() {
                 return Err(FlameError::NotFound(format!(
                     "object <{}> not found, must put first",
-                    key_owned
+                    key_str
                 )));
             }
 
@@ -131,8 +132,8 @@ impl StorageEngine for DiskStorage {
             loop {
                 if index >= MAX_DELTAS_PER_OBJECT {
                     return Err(FlameError::InvalidState(format!(
-                        "object <{}> has reached maximum delta count ({}). Use update_object to compact deltas.",
-                        key_owned, MAX_DELTAS_PER_OBJECT
+                        "object <{}> has reached maximum delta count ({})",
+                        key_str, MAX_DELTAS_PER_OBJECT
                     )));
                 }
 
@@ -164,7 +165,7 @@ impl StorageEngine for DiskStorage {
             let size = fs::metadata(&object_path)?.len();
             Ok(ObjectMetadata {
                 endpoint: String::new(),
-                key: key_owned,
+                key: key_str,
                 version: 0,
                 size,
                 delta_count: index + 1,
@@ -174,34 +175,11 @@ impl StorageEngine for DiskStorage {
         .map_err(|e| FlameError::Internal(format!("Task join error: {}", e)))?
     }
 
-    async fn delete_object(&self, key: &str) -> Result<(), FlameError> {
-        let object_path = self.object_path(key);
-        let delta_dir = self.delta_dir(key);
-
-        tokio::task::spawn_blocking(move || {
-            if object_path.exists() {
-                fs::remove_file(&object_path)?;
-            }
-            if delta_dir.exists() {
-                fs::remove_dir_all(&delta_dir)?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| FlameError::Internal(format!("Task join error: {}", e)))?
-    }
-
-    async fn delete_objects(&self, prefix: &str) -> Result<(), FlameError> {
-        let parts: Vec<&str> = prefix.split('/').collect();
-        let dir_to_delete = match parts.len() {
-            1 => self.app_dir(parts[0]),
-            2 => self.app_session_dir(parts[0], parts[1]),
-            _ => {
-                return Err(FlameError::InvalidConfig(format!(
-                    "Invalid prefix '{}': expected '<app>' or '<app>/<ssn>'",
-                    prefix
-                )))
-            }
+    async fn delete_objects(&self, key: &ObjectKey) -> Result<(), FlameError> {
+        let dir_to_delete = if key.is_all_sessions() {
+            self.app_dir(key)
+        } else {
+            self.session_dir(key)
         };
 
         tokio::task::spawn_blocking(move || {
@@ -215,7 +193,7 @@ impl StorageEngine for DiskStorage {
         .map_err(|e| FlameError::Internal(format!("Task join error: {}", e)))?
     }
 
-    async fn load_objects(&self) -> Result<Vec<(String, Object, u64)>, FlameError> {
+    async fn load_objects(&self) -> Result<Vec<(ObjectKey, Object)>, FlameError> {
         let storage_path = self.storage_path.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -236,9 +214,8 @@ impl StorageEngine for DiskStorage {
                 let app_name = app_path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .ok_or_else(|| {
-                        FlameError::Internal("Invalid app directory name".to_string())
-                    })?;
+                    .ok_or_else(|| FlameError::Internal("Invalid app directory name".to_string()))?
+                    .to_string();
 
                 for session_entry in fs::read_dir(&app_path)? {
                     let session_entry = session_entry?;
@@ -253,7 +230,8 @@ impl StorageEngine for DiskStorage {
                         .and_then(|n| n.to_str())
                         .ok_or_else(|| {
                             FlameError::Internal("Invalid session directory name".to_string())
-                        })?;
+                        })?
+                        .to_string();
 
                     for object_entry in fs::read_dir(&session_path)? {
                         let object_entry = object_entry?;
@@ -272,17 +250,21 @@ impl StorageEngine for DiskStorage {
                             .and_then(|n| n.to_str())
                             .ok_or_else(|| {
                                 FlameError::Internal("Invalid object file name".to_string())
-                            })?;
+                            })?
+                            .to_string();
 
-                        let key = format!("{}/{}/{}", app_name, session_id, object_id);
+                        let key = ObjectKey {
+                            app_name: app_name.clone(),
+                            session_id: session_id.clone(),
+                            object_id: Some(object_id.clone()),
+                        };
+
                         let delta_dir = session_path.join(format!("{}.deltas", object_id));
-                        let delta_count = count_deltas_sync(&delta_dir);
-
                         let base = load_object_from_file(&object_path)?;
                         let deltas = read_deltas_sync(&delta_dir)?;
                         let object = Object::with_deltas(base.version, base.data, deltas);
 
-                        results.push((key, object, delta_count));
+                        results.push((key, object));
                     }
                 }
             }
@@ -385,12 +367,7 @@ fn load_object_from_file(path: &Path) -> Result<Object, FlameError> {
     let reader = FileReader::try_new(file, None)
         .map_err(|e| FlameError::Internal(format!("Failed to create reader: {}", e)))?;
 
-    // SAFETY: Skipping Arrow IPC validation is safe here because:
-    // 1. All data in this cache directory was written by this service using write_batch_to_file()
-    // 2. The Arrow IPC format includes checksums that detect corruption during read
-    // 3. This provides 3-9x faster reads for trusted cache data
-    // 4. If files are externally modified/corrupted, Arrow will still detect most issues
-    //    via schema validation and array bounds checking in batch_to_object()
+    // SAFETY: Skipping validation is safe because all data was written by this service
     let reader = unsafe { reader.with_skip_validation(true) };
 
     let batch = reader
@@ -431,21 +408,24 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn test_key(app: &str, session: &str, object: &str) -> ObjectKey {
+        ObjectKey {
+            app_name: app.to_string(),
+            session_id: session.to_string(),
+            object_id: Some(object.to_string()),
+        }
+    }
+
     #[tokio::test]
     async fn test_disk_storage_write_read() {
         let temp_dir = tempdir().unwrap();
         let storage = DiskStorage::new(temp_dir.path().to_path_buf()).unwrap();
 
+        let key = test_key("test-app", "test-session", "obj1");
         let object = Object::new(1, vec![1, 2, 3, 4, 5]);
-        storage
-            .write_object("test-app/test-session/obj1", &object)
-            .await
-            .unwrap();
+        storage.write_object(&key, &object).await.unwrap();
 
-        let result = storage
-            .read_object("test-app/test-session/obj1")
-            .await
-            .unwrap();
+        let result = storage.read_object(&key).await.unwrap();
         assert!(result.is_some());
         let loaded = result.unwrap();
         assert_eq!(loaded.version, 1);
@@ -458,49 +438,17 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let storage = DiskStorage::new(temp_dir.path().to_path_buf()).unwrap();
 
+        let key = test_key("test-app", "test-session", "obj1");
         let object = Object::new(1, vec![1, 2, 3]);
-        storage
-            .write_object("test-app/test-session/obj1", &object)
-            .await
-            .unwrap();
+        storage.write_object(&key, &object).await.unwrap();
 
         let delta = Object::new(0, vec![4, 5, 6]);
-        let meta = storage
-            .patch_object("test-app/test-session/obj1", &delta)
-            .await
-            .unwrap();
+        let meta = storage.patch_object(&key, &delta).await.unwrap();
         assert_eq!(meta.delta_count, 1);
 
-        let loaded = storage
-            .read_object("test-app/test-session/obj1")
-            .await
-            .unwrap()
-            .unwrap();
+        let loaded = storage.read_object(&key).await.unwrap().unwrap();
         assert_eq!(loaded.deltas.len(), 1);
         assert_eq!(loaded.deltas[0].data, vec![4, 5, 6]);
-    }
-
-    #[tokio::test]
-    async fn test_disk_storage_delete() {
-        let temp_dir = tempdir().unwrap();
-        let storage = DiskStorage::new(temp_dir.path().to_path_buf()).unwrap();
-
-        let object = Object::new(1, vec![1, 2, 3]);
-        storage
-            .write_object("test-app/test-session/obj1", &object)
-            .await
-            .unwrap();
-
-        storage
-            .delete_object("test-app/test-session/obj1")
-            .await
-            .unwrap();
-
-        let result = storage
-            .read_object("test-app/test-session/obj1")
-            .await
-            .unwrap();
-        assert!(result.is_none());
     }
 
     #[tokio::test]
@@ -508,32 +456,22 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let storage = DiskStorage::new(temp_dir.path().to_path_buf()).unwrap();
 
-        let object1 = Object::new(1, vec![1, 2, 3]);
-        let object2 = Object::new(2, vec![4, 5, 6]);
+        let key1 = test_key("test-app", "test-session", "obj1");
+        let key2 = test_key("test-app", "test-session", "obj2");
         storage
-            .write_object("test-app/test-session/obj1", &object1)
+            .write_object(&key1, &Object::new(1, vec![1, 2, 3]))
             .await
             .unwrap();
         storage
-            .write_object("test-app/test-session/obj2", &object2)
+            .write_object(&key2, &Object::new(2, vec![4, 5, 6]))
             .await
             .unwrap();
 
-        storage
-            .delete_objects("test-app/test-session")
-            .await
-            .unwrap();
+        let delete_key = ObjectKey::from_path("test-app/test-session").unwrap();
+        storage.delete_objects(&delete_key).await.unwrap();
 
-        let result1 = storage
-            .read_object("test-app/test-session/obj1")
-            .await
-            .unwrap();
-        let result2 = storage
-            .read_object("test-app/test-session/obj2")
-            .await
-            .unwrap();
-        assert!(result1.is_none());
-        assert!(result2.is_none());
+        assert!(storage.read_object(&key1).await.unwrap().is_none());
+        assert!(storage.read_object(&key2).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -541,14 +479,14 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let storage = DiskStorage::new(temp_dir.path().to_path_buf()).unwrap();
 
-        let object1 = Object::new(1, vec![1, 2, 3]);
-        let object2 = Object::new(2, vec![4, 5, 6]);
+        let key1 = test_key("app1", "session1", "obj1");
+        let key2 = test_key("app1", "session2", "obj2");
         storage
-            .write_object("app1/session1/obj1", &object1)
+            .write_object(&key1, &Object::new(1, vec![1, 2, 3]))
             .await
             .unwrap();
         storage
-            .write_object("app1/session2/obj2", &object2)
+            .write_object(&key2, &Object::new(2, vec![4, 5, 6]))
             .await
             .unwrap();
 

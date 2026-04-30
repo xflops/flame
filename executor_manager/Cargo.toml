@@ -3,8 +3,6 @@ name = "flame-executor-manager"
 version = "0.5.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [features]
 default = []
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
@@ -13,7 +11,6 @@ wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 rpc = { path = "../rpc" }
 common = { path = "../common" }
 stdng = { path = "../stdng" }
-flame-cache = { path = "../object_cache" }
 
 tokio = { workspace = true }
 tonic = { workspace = true }
@@ -45,15 +42,6 @@ wasmtime-wasi = { version = "43", optional = true }
 anyhow = "1"
 tokio-stream = { workspace = true }
 shellexpand = "3.1"
-
-# Dependencies for embedded object cache
-arrow = { workspace = true }
-arrow-flight = { workspace = true }
-arrow-ipc = { workspace = true }
-network-interface = "2"
-regex = "1"
-base64 = "0.22"
-bson = "2"
 
 [lints.rust]
 unused = "allow"

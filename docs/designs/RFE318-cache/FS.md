@@ -112,7 +112,9 @@ The cache server implements the Arrow Flight protocol with the following operati
 5. **do_action**: Perform cache operations (PUT, UPDATE, DELETE, PATCH)
    - PUT: Put object (legacy support)
    - UPDATE: Update existing object (replaces base and all deltas)
-   - DELETE: Delete session and all its objects
+   - DELETE: Delete objects by key prefix. Supports:
+     - `{app}/{session}` - delete all objects in a specific session
+     - `{app}/*` - delete all objects across all sessions of an application (wildcard)
    - **PATCH**: Append delta data to an existing object (new)
 
 
@@ -325,6 +327,39 @@ pub struct Object {
 }
 ```
 
+**ObjectKey (Rust/Python):**
+```rust
+/// Constant for wildcard session
+pub const WILDCARD_SESSION: &str = "*";
+
+/// Parsed object key: `<app_name>/<session_id>/<object_id>`
+/// session_id can be "*" for wildcard (all sessions), requires object_id to be None
+pub struct ObjectKey {
+    pub app_name: String,
+    pub session_id: String,      // Can be WILDCARD_SESSION ("*") for all sessions
+    pub object_id: Option<String>,  // Must be None when session_id is wildcard
+}
+```
+
+```python
+WILDCARD_SESSION = "*"
+
+@dataclass
+class ObjectKey:
+    app_name: str
+    session_id: str      # Can be WILDCARD_SESSION ("*") for all sessions
+    object_id: Optional[str] = None  # Must be None when session_id is wildcard
+    
+    @classmethod
+    def for_all_sessions(cls, app_name: str) -> "ObjectKey":
+        """Create wildcard key for all sessions: '<app>/*'."""
+        return cls(app_name=app_name, session_id=WILDCARD_SESSION, object_id=None)
+    
+    def is_all_sessions(self) -> bool:
+        """Return True if this key represents all sessions."""
+        return self.session_id == WILDCARD_SESSION
+```
+
 **ObjectRef (Python):**
 ```python
 @dataclass
@@ -346,9 +381,11 @@ pub struct ObjectMetadata {
 
 **Storage Organization:**
 - Root: `{storage_path}/`
-- Session directory: `{storage_path}/{session_id}/`
-- Object file: `{storage_path}/{session_id}/{object_id}.arrow`
-- Key format: `{session_id}/{object_id}`
+- App directory: `{storage_path}/{app_name}/`
+- Session directory: `{storage_path}/{app_name}/{session_id}/`
+- Object file: `{storage_path}/{app_name}/{session_id}/{object_id}.arrow`
+- Key format: `{app_name}/{session_id}/{object_id}`
+- Wildcard key format: `{app_name}/*` (for delete operations across all sessions)
 
 **Arrow IPC File Format:**
 - Each object stored as a single RecordBatch in Arrow IPC file
@@ -415,9 +452,17 @@ pub struct ObjectMetadata {
 4. Return ObjectRef
 
 **Key Construction:**
-- Format: `{session_id}/{object_id}`
+- Format: `{app_name}/{session_id}/{object_id}`
+- Wildcard session: `{app_name}/*` - matches all sessions of an application (object_id must be None)
 - Session directory creation: Automatically created when first object is stored
 - Object ID generation: UUID v4
+
+**Wildcard Session Support:**
+The special session_id value `*` (constant: `WILDCARD_SESSION`) indicates all sessions of an application:
+- Used primarily for bulk delete operations (e.g., `delete_objects("myapp/*")`)
+- When session_id is `*`, object_id must be None (wildcard keys cannot reference specific objects)
+- The `ObjectKey.for_all_sessions(app_name)` helper creates wildcard keys
+- `ObjectKey.is_wildcard()` returns True when session_id is `*`
 
 ### System Considerations
 
