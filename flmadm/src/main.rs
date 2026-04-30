@@ -52,11 +52,15 @@ enum Commands {
         #[arg(long)]
         worker: bool,
 
+        /// Install cache component (flame-object-cache)
+        #[arg(long)]
+        cache: bool,
+
         /// Install client components (flmping, flmexec, flamepy)
         #[arg(long)]
         client: bool,
 
-        /// Install all components (control plane + worker + client)
+        /// Install all components (control plane + worker + cache + client)
         #[arg(long)]
         all: bool,
 
@@ -145,6 +149,7 @@ fn main() {
             prefix,
             control_plane,
             worker,
+            cache,
             client,
             all,
             no_systemd,
@@ -156,24 +161,26 @@ fn main() {
             python_version,
         } => {
             // Validate profile flags
-            if all && (control_plane || worker || client) {
+            if all && (control_plane || worker || cache || client) {
                 eprintln!(
-                    "Error: --all cannot be used with --control-plane, --worker, or --client"
+                    "Error: --all cannot be used with --control-plane, --worker, --cache, or --client"
                 );
                 std::process::exit(types::exit_codes::INSTALL_FAILURE);
             }
 
             // Require explicit profile selection
-            if !all && !control_plane && !worker && !client {
+            if !all && !control_plane && !worker && !cache && !client {
                 eprintln!("Error: You must specify which components to install:");
                 eprintln!(
-                    "  --all              Install all components (control plane + worker + client)"
+                    "  --all              Install all components (control plane + worker + cache + client)"
                 );
                 eprintln!("  --control-plane    Install control plane components only");
                 eprintln!("  --worker           Install worker components only");
+                eprintln!("  --cache            Install cache component only");
                 eprintln!("  --client           Install client components only");
                 eprintln!("\nYou can also combine profiles, for example:");
                 eprintln!("  --control-plane --worker    Install control plane and worker");
+                eprintln!("  --worker --cache            Install worker with object cache");
                 std::process::exit(types::exit_codes::INSTALL_FAILURE);
             }
 
@@ -183,6 +190,7 @@ fn main() {
                 vec![
                     types::InstallProfile::ControlPlane,
                     types::InstallProfile::Worker,
+                    types::InstallProfile::Cache,
                     types::InstallProfile::Client,
                 ]
             } else {
@@ -193,6 +201,9 @@ fn main() {
                 }
                 if worker {
                     profiles.push(types::InstallProfile::Worker);
+                }
+                if cache {
+                    profiles.push(types::InstallProfile::Cache);
                 }
                 if client {
                     profiles.push(types::InstallProfile::Client);

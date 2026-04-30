@@ -26,7 +26,7 @@ def test_cache_put_and_get():
     assert ref.endpoint is not None
     assert ref.key is not None
     assert ref.key.startswith(key_prefix + "/")
-    assert ref.version == 0
+    assert ref.version == 1
 
     result = get_object(ref)
     assert result == test_data

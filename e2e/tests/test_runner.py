@@ -713,15 +713,16 @@ def test_runner_recursive_same_session(check_package_config, check_flmrun_app):
     fail_if_exists=False reuse the existing application registration.
     """
     import logging
+    import time
 
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
 
     # Shared application name and session ID
     shared_app_name = "test-runner-recursive"
     shared_session_id = "recursive-session-001"
 
-    logger.info(f"[TEST] Starting test with app={shared_app_name}, session={shared_session_id}")
+    logger.info(f"[TEST] Starting recursive test: app={shared_app_name}, session={shared_session_id}")
 
     # Create an instance with the shared session ID and app name
     recursive_instance = RecursiveService(
@@ -730,7 +731,6 @@ def test_runner_recursive_same_session(check_package_config, check_flmrun_app):
     )
 
     with runner.Runner(shared_app_name) as rr:
-        logger.info(f"[TEST] Runner created, _app_registered={rr._app_registered}")
         # Use autoscale=True to allow multiple executors for recursive calls
         # Without autoscale, a single executor would deadlock waiting for its own recursive task
         service = rr.service(recursive_instance, autoscale=True)
@@ -741,24 +741,24 @@ def test_runner_recursive_same_session(check_package_config, check_flmrun_app):
 
         # Test with depth=0 (base case)
         logger.info("[TEST] Testing depth=0")
+        start_time = time.time()
         result0 = service.compute_recursive(0)
-        logger.info("[TEST] Got future for depth=0, calling get()")
         value0 = result0.get()
-        logger.info(f"[TEST] depth=0 result: {value0}")
+        logger.info(f"[TEST] depth=0 result={value0} ({time.time() - start_time:.2f}s)")
         assert value0 == 1, f"Expected 1 for depth=0, got {value0}"
 
         # Test with depth=1 (one level of recursion)
         logger.info("[TEST] Testing depth=1")
+        start_time = time.time()
         result1 = service.compute_recursive(1)
-        logger.info("[TEST] Got future for depth=1, calling get()")
         value1 = result1.get()
-        logger.info(f"[TEST] depth=1 result: {value1}")
+        logger.info(f"[TEST] depth=1 result={value1} ({time.time() - start_time:.2f}s)")
         assert value1 == 2, f"Expected 2 for depth=1, got {value1}"
 
         # Test with depth=2 (two levels of recursion)
         logger.info("[TEST] Testing depth=2")
+        start_time = time.time()
         result2 = service.compute_recursive(2)
-        logger.info("[TEST] Got future for depth=2, calling get()")
         value2 = result2.get()
-        logger.info(f"[TEST] depth=2 result: {value2}")
+        logger.info(f"[TEST] depth=2 result={value2} ({time.time() - start_time:.2f}s)")
         assert value2 == 4, f"Expected 4 for depth=2, got {value2}"

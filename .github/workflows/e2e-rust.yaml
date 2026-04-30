@@ -21,7 +21,7 @@ jobs:
       - name: Generate TLS certificates
         run: |
           chmod +x ci/generate-certs.sh
-          ci/generate-certs.sh -o ci/certs -s "flame-session-manager,flame-executor-manager,localhost,127.0.0.1" -i "172.20.0.0/24"
+          ci/generate-certs.sh -o ci/certs -s "flame-session-manager,flame-executor-manager,flame-object-cache,localhost,127.0.0.1" -i "172.20.0.0/24"
       - name: Start Flame
         run: |
           cp ci/flame-cluster-docker.yaml ci/flame-cluster.yaml

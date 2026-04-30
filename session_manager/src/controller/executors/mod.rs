@@ -472,7 +472,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_unbind_executor_fails() {
+        async fn test_unbind_executor_transitions_to_unbinding() {
             let exe_ptr = create_test_executor("exe-1", ExecutorState::Binding);
             let state = BindingState {
                 storage: create_mock_storage().await,
@@ -481,8 +481,8 @@ mod tests {
 
             let result = state.unbind_executor().await;
 
-            assert!(result.is_err());
-            assert!(matches!(result, Err(FlameError::InvalidState(_))));
+            assert!(result.is_ok());
+            assert_eq!(get_state(&exe_ptr).unwrap(), ExecutorState::Unbinding);
         }
 
         #[tokio::test]

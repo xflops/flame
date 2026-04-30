@@ -11,9 +11,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import base64
-import json
+import logging
 import threading
+
+logger = logging.getLogger(__name__)
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -28,10 +29,18 @@ from flamepy.core.types import FlameClientCache, FlameClientTls, FlameContext
 
 Deserializer = Callable[[Any, List[Any]], Any]
 
+WILDCARD_SESSION = "*"
+
 
 @dataclass
 class ObjectRef:
-    """Object reference for remote cached objects."""
+    """Object reference for remote cached objects.
+
+    Version semantics:
+    - version=0: Force fresh download (bypass client cache)
+    - version>=1: Normal versioned object from server
+    Server always returns version >= 1 for stored objects.
+    """
 
     endpoint: str
     key: str  # Object key in format "<app>/<ssn>/<uuid>"
@@ -47,22 +56,95 @@ class ObjectRef:
         return cls(**data)
 
 
+@dataclass
+class Object:
+    """Cached object with version and deserialized data.
+
+    Note: Stores deserialized data to avoid repeated deserialization.
+    Different deserializers on the same cached object are not supported.
+    """
+
+    version: int
+    data: Any
+
+
+# Client-side LRU cache with max size limit
+_CACHE_MAX_SIZE = 1000  # Max number of cached objects
+_object_cache: Dict[tuple, Object] = {}
+_cache_access_order: List[tuple] = []  # LRU tracking: most recent at end
+_cache_lock = threading.Lock()
+
+
+def _cache_get(key: tuple) -> Optional[Object]:
+    """Get from cache and update LRU order."""
+    with _cache_lock:
+        obj = _object_cache.get(key)
+        if obj is not None and key in _cache_access_order:
+            _cache_access_order.remove(key)
+            _cache_access_order.append(key)
+        return obj
+
+
+def _cache_put(key: tuple, obj: Object) -> None:
+    """Put to cache with LRU eviction."""
+    with _cache_lock:
+        if key in _object_cache:
+            _cache_access_order.remove(key)
+        _object_cache[key] = obj
+        _cache_access_order.append(key)
+
+        while len(_object_cache) > _CACHE_MAX_SIZE:
+            oldest_key = _cache_access_order.pop(0)
+            _object_cache.pop(oldest_key, None)
+
+
+def _cache_remove(key: tuple) -> None:
+    """Remove from cache."""
+    with _cache_lock:
+        _object_cache.pop(key, None)
+        if key in _cache_access_order:
+            _cache_access_order.remove(key)
+
+
+def _cache_remove_prefix(prefix: str) -> None:
+    """Remove all entries matching prefix."""
+    with _cache_lock:
+        keys_to_remove = [k for k in _object_cache if k[1].startswith(prefix)]
+        for key in keys_to_remove:
+            _object_cache.pop(key, None)
+            if key in _cache_access_order:
+                _cache_access_order.remove(key)
+
+
 @dataclass(frozen=True)
 class ObjectKey:
-    """Parsed object key: <app_name>/<session_id>/<object_id>"""
+    """Parsed object key: <app_name>/<session_id>/<object_id>
+
+    session_id can be WILDCARD_SESSION ('*') for all sessions, requires object_id to be None.
+    """
 
     app_name: str
     session_id: str
     object_id: Optional[str] = None
 
     def __post_init__(self):
-        for name, value in [("app_name", self.app_name), ("session_id", self.session_id)]:
-            if not value:
-                raise ValueError(f"{name} cannot be empty")
-            if ".." in value or "\\" in value or "/" in value:
-                raise ValueError(f"{name} contains invalid characters: '{value}'")
+        if not self.app_name:
+            raise ValueError("app_name cannot be empty")
+        if ".." in self.app_name or "\\" in self.app_name or "/" in self.app_name:
+            raise ValueError(f"app_name contains invalid characters: '{self.app_name}'")
+
+        if not self.session_id:
+            raise ValueError("session_id cannot be empty")
+
+        is_wildcard = self.session_id == WILDCARD_SESSION
+
+        if not is_wildcard:
+            if ".." in self.session_id or "\\" in self.session_id or "/" in self.session_id:
+                raise ValueError(f"session_id contains invalid characters: '{self.session_id}'")
 
         if self.object_id is not None:
+            if is_wildcard:
+                raise ValueError("Wildcard session '*' cannot have object_id")
             if not self.object_id:
                 raise ValueError("object_id cannot be empty string")
             if ".." in self.object_id or "\\" in self.object_id:
@@ -88,6 +170,15 @@ class ObjectKey:
     def for_shared(cls, app_name: str) -> "ObjectKey":
         """Create key for shared storage: '<app>/shared'."""
         return cls(app_name=app_name, session_id="shared", object_id=None)
+
+    @classmethod
+    def for_all_sessions(cls, app_name: str) -> "ObjectKey":
+        """Create wildcard key for all sessions: '<app>/*'."""
+        return cls(app_name=app_name, session_id=WILDCARD_SESSION, object_id=None)
+
+    def is_all_sessions(self) -> bool:
+        """Return True if this key represents all sessions (session_id == '*')."""
+        return self.session_id == WILDCARD_SESSION
 
     def with_generated_id(self) -> "ObjectKey":
         """Return new ObjectKey with a generated UUID."""
@@ -264,6 +355,7 @@ def put_object(key_prefix: str, obj: Any) -> "ObjectRef":
     Raises:
         ValueError: If key_prefix format is invalid or cache not configured
     """
+
     object_key = ObjectKey.from_prefix(key_prefix)
 
     context = FlameContext()
@@ -325,15 +417,21 @@ def put_object(key_prefix: str, obj: Any) -> "ObjectRef":
         else:
             endpoint_str = cache_endpoint
 
+        logger.debug(f"put_object local_storage: key={key}, endpoint={endpoint_str}")
         return ObjectRef(endpoint=endpoint_str, key=key, version=0)
     else:
         client = _get_flight_client(cache_endpoint, cache_tls)
         upload_descriptor = flight.FlightDescriptor.for_path(object_key.to_prefix())
-        return _do_put_remote(client, upload_descriptor, batch)
+        ref = _do_put_remote(client, upload_descriptor, batch)
+        logger.debug(f"put_object remote: key={ref.key}, version={ref.version}")
+        return ref
 
 
 def get_object(ref: ObjectRef, deserializer: Optional[Deserializer] = None) -> Any:
     """Get an object from the cache.
+
+    Uses client-side caching with version checking to avoid unnecessary downloads.
+    To force a fresh download, set ref.version = 0 before calling.
 
     Args:
         ref: ObjectRef pointing to the cached object
@@ -349,27 +447,56 @@ def get_object(ref: ObjectRef, deserializer: Optional[Deserializer] = None) -> A
         ValueError: If key format is invalid or request fails
     """
     ObjectKey.from_key(ref.key)
+    cache_key = (ref.endpoint, ref.key)
 
+    if ref.version == 0:
+        cached_version = 0
+    else:
+        cached = _cache_get(cache_key)
+        cached_version = cached.version if cached else 0
+
+    logger.debug(f"get_object: key={ref.key}, cached_version={cached_version}")
+    result = _fetch_object_data(ref, cached_version, deserializer)
+
+    if result is None:
+        if cached_version > 0:
+            cached = _cache_get(cache_key)
+            if cached is not None:
+                logger.debug(f"get_object: not_modified, returning cached for key={ref.key}")
+                return cached.data
+        logger.error(f"get_object: cache miss after not_modified! key={ref.key}, cached_version={cached_version}")
+        raise ValueError(f"Object not found: {ref.key}")
+
+    data, version = result
+    _cache_put(cache_key, Object(version=version, data=data))
+
+    logger.debug(f"get_object: key={ref.key}, version={version}")
+    return data
+
+
+def _fetch_object_data(ref: ObjectRef, cached_version: int, deserializer: Optional[Deserializer] = None) -> Optional[tuple[Any, int]]:
     tls_config = _get_cache_tls_config()
     client = _get_flight_client(ref.endpoint, tls_config)
-    ticket = flight.Ticket(ref.key.encode())
+
+    ticket_str = f"{ref.key}:{cached_version}"
+    ticket = flight.Ticket(ticket_str.encode())
     reader = client.do_get(ticket)
 
     table = reader.read_all()
     if table.num_rows == 0:
-        raise ValueError(f"No data received for object {ref.key}")
+        return None
 
     batches = table.to_batches()
     base = _deserialize_object(batches[0])
+    version = batches[0].column("version")[0].as_py()
 
-    if deserializer is None:
-        return base
+    if deserializer is not None:
+        deltas = [_deserialize_object(batch) for batch in batches[1:]]
+        data = deserializer(base, deltas)
+    else:
+        data = base
 
-    deltas: List[Any] = []
-    for batch in batches[1:]:
-        deltas.append(_deserialize_object(batch))
-
-    return deserializer(base, deltas)
+    return data, version
 
 
 def update_object(ref: ObjectRef, new_obj: Any) -> "ObjectRef":
@@ -382,7 +509,7 @@ def update_object(ref: ObjectRef, new_obj: Any) -> "ObjectRef":
         new_obj: The new object to store (will be pickled)
 
     Returns:
-        Updated ObjectRef (same as input for now, since version is always 0)
+        Updated ObjectRef with new version from server
 
     Raises:
         ValueError: If key format is invalid or request fails
@@ -395,7 +522,11 @@ def update_object(ref: ObjectRef, new_obj: Any) -> "ObjectRef":
     client = _get_flight_client(ref.endpoint, tls_config)
 
     upload_descriptor = flight.FlightDescriptor.for_path(ref.key)
-    return _do_put_remote(client, upload_descriptor, batch)
+    new_ref = _do_put_remote(client, upload_descriptor, batch)
+
+    _cache_remove((ref.endpoint, ref.key))
+
+    return new_ref
 
 
 def patch_object(ref: ObjectRef, delta: Any) -> "ObjectRef":
@@ -409,37 +540,68 @@ def patch_object(ref: ObjectRef, delta: Any) -> "ObjectRef":
         delta: The delta data to append (will be pickled)
 
     Returns:
-        Updated ObjectRef (same key, potentially updated metadata)
+        Updated ObjectRef with new version from server
 
     Raises:
         ValueError: If key format invalid or object doesn't exist
     """
     ObjectKey.from_key(ref.key)
 
-    delta_bytes = cloudpickle.dumps(delta, protocol=cloudpickle.DEFAULT_PROTOCOL)
+    batch = _serialize_object(delta)
 
     tls_config = _get_cache_tls_config()
     client = _get_flight_client(ref.endpoint, tls_config)
 
-    delta_b64 = base64.b64encode(delta_bytes).decode("utf-8")
-    action_body = f"{ref.key}:{delta_b64}"
+    upload_descriptor = flight.FlightDescriptor.for_command(f"PATCH:{ref.key}".encode())
+    new_ref = _do_put_remote(client, upload_descriptor, batch)
 
-    # Call do_action with action type "PATCH"
-    action = flight.Action("PATCH", action_body.encode("utf-8"))
+    _cache_remove((ref.endpoint, ref.key))
 
-    # Execute action and get result
+    return new_ref
+
+
+def delete_objects(key_prefix: str) -> None:
+    """Delete all objects under a key prefix from the cache.
+
+    This deletes all objects matching the prefix pattern from the server.
+    Also clears any matching entries from the client-side cache.
+
+    Args:
+        key_prefix: Key prefix in format "<app>/*" (all sessions) or "<app>/<session>"
+
+    Raises:
+        ValueError: If key_prefix format is invalid or cache not configured
+    """
+    context = FlameContext()
+    cache_config = context.cache
+
+    if cache_config is None:
+        raise ValueError("Cache configuration not found")
+
+    if isinstance(cache_config, str):
+        cache_endpoint = cache_config
+        cache_tls = None
+    elif isinstance(cache_config, FlameClientCache):
+        cache_endpoint = cache_config.endpoint
+        cache_tls = cache_config.tls
+    else:
+        cache_endpoint = cache_config.get("endpoint")
+        cache_tls = None
+
+    if not cache_endpoint:
+        raise ValueError("Cache endpoint not configured")
+
+    client = _get_flight_client(cache_endpoint, cache_tls)
+
+    action = flight.Action("DELETE", key_prefix.encode("utf-8"))
     results = list(client.do_action(action))
 
     if not results:
-        raise ValueError("No result received from PATCH action")
+        raise ValueError("No result received from DELETE action")
 
-    # Parse response to get updated ObjectMetadata
-    result_body = results[0].body.to_pybytes().decode("utf-8")
-    metadata = json.loads(result_body)
+    if key_prefix.endswith("/*"):
+        app_prefix = key_prefix[:-1]
+    else:
+        app_prefix = f"{key_prefix}/"
 
-    # Return ObjectRef with same key
-    return ObjectRef(
-        endpoint=metadata.get("endpoint", ref.endpoint),
-        key=metadata.get("key", ref.key),
-        version=metadata.get("version", ref.version),
-    )
+    _cache_remove_prefix(app_prefix)

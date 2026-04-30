@@ -22,12 +22,18 @@ jobs:
       - name: Generate TLS certificates
         run: |
           chmod +x ci/generate-certs.sh
-          ci/generate-certs.sh -o ci/certs -s "flame-session-manager,flame-executor-manager,localhost,127.0.0.1" -i "172.20.0.0/24"
+          ci/generate-certs.sh -o ci/certs -s "flame-session-manager,flame-executor-manager,flame-object-cache,localhost,127.0.0.1" -i "172.20.0.0/24"
       
       - name: Start Flame
         run: |
           cp ci/flame-cluster-docker.yaml ci/flame-cluster.yaml
           docker compose up --build --force-recreate -d
+      
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for services to be ready..."
+          sleep 10
+          docker compose ps
       
       - name: Run Python E2E Test
         timeout-minutes: 60
@@ -45,3 +51,9 @@ jobs:
         run: |
           echo "=== Executor Manager Logs ==="
           docker compose logs flame-executor-manager --tail=500
+      
+      - name: Print object-cache logs
+        if: always()
+        run: |
+          echo "=== Object Cache Logs ==="
+          docker compose logs flame-object-cache --tail=500

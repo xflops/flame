@@ -6,6 +6,7 @@ pub enum InstallProfile {
     ControlPlane,
     Worker,
     Client,
+    Cache,
 }
 
 impl InstallProfile {
@@ -20,6 +21,7 @@ impl InstallProfile {
                 "flamepy",
             ],
             InstallProfile::Client => &["flmctl", "flmping", "flmexec", "flamepy"],
+            InstallProfile::Cache => &["flame-object-cache"],
         }
     }
 
@@ -60,6 +62,7 @@ impl Default for InstallConfig {
                 InstallProfile::ControlPlane,
                 InstallProfile::Worker,
                 InstallProfile::Client,
+                InstallProfile::Cache,
             ],
             force_overwrite: false,
             python_version: DEFAULT_PYTHON_VERSION.to_string(),
@@ -137,6 +140,7 @@ impl InstallationPaths {
 pub struct BuildArtifacts {
     pub session_manager: PathBuf,
     pub executor_manager: PathBuf,
+    pub object_cache: PathBuf,
     pub flmctl: PathBuf,
     pub flmadm: PathBuf,
     pub flmping: PathBuf,
@@ -153,6 +157,7 @@ impl BuildArtifacts {
         let artifacts = Self {
             session_manager: target_dir.join("flame-session-manager"),
             executor_manager: target_dir.join("flame-executor-manager"),
+            object_cache: target_dir.join("flame-object-cache"),
             flmctl: target_dir.join("flmctl"),
             flmadm: target_dir.join("flmadm"),
             flmping: target_dir.join("flmping"),
@@ -165,6 +170,7 @@ impl BuildArtifacts {
         for (name, path) in [
             ("flame-session-manager", &artifacts.session_manager),
             ("flame-executor-manager", &artifacts.executor_manager),
+            ("flame-object-cache", &artifacts.object_cache),
             ("flmctl", &artifacts.flmctl),
             ("flmadm", &artifacts.flmadm),
             ("flmping", &artifacts.flmping),
@@ -258,10 +264,11 @@ mod tests {
         #[test]
         fn default_profiles_include_all() {
             let config = InstallConfig::default();
-            assert_eq!(config.profiles.len(), 3);
+            assert_eq!(config.profiles.len(), 4);
             assert!(config.profiles.contains(&InstallProfile::ControlPlane));
             assert!(config.profiles.contains(&InstallProfile::Worker));
             assert!(config.profiles.contains(&InstallProfile::Client));
+            assert!(config.profiles.contains(&InstallProfile::Cache));
         }
 
         #[test]

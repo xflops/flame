@@ -15,11 +15,10 @@ use async_trait::async_trait;
 
 use common::FlameError;
 
-use crate::{Object, ObjectMetadata};
+use crate::cache::{Object, ObjectKey, ObjectMetadata};
 
 use super::StorageEngine;
 
-/// Memory-only storage engine - no persistence.
 pub struct NoneStorage;
 
 impl NoneStorage {
@@ -37,30 +36,33 @@ impl Default for NoneStorage {
 
 #[async_trait]
 impl StorageEngine for NoneStorage {
-    async fn write_object(&self, _key: &str, _object: &Object) -> Result<(), FlameError> {
+    async fn write_object(&self, _key: &ObjectKey, _object: &Object) -> Result<(), FlameError> {
         Ok(())
     }
 
-    async fn read_object(&self, _key: &str) -> Result<Option<Object>, FlameError> {
+    async fn read_object(&self, _key: &ObjectKey) -> Result<Option<Object>, FlameError> {
         Ok(None)
     }
 
-    async fn patch_object(&self, key: &str, _delta: &Object) -> Result<ObjectMetadata, FlameError> {
-        Err(FlameError::InvalidConfig(format!(
-            "patch operation not supported with none storage for object <{}>. Use update_object instead.",
-            key
-        )))
+    async fn patch_object(
+        &self,
+        key: &ObjectKey,
+        _delta: &Object,
+    ) -> Result<ObjectMetadata, FlameError> {
+        Ok(ObjectMetadata {
+            endpoint: String::new(),
+            key: key.to_key().unwrap_or_default(),
+            version: 0,
+            size: 0,
+            delta_count: 0,
+        })
     }
 
-    async fn delete_object(&self, _key: &str) -> Result<(), FlameError> {
+    async fn delete_objects(&self, _key: &ObjectKey) -> Result<(), FlameError> {
         Ok(())
     }
 
-    async fn delete_objects(&self, _session_id: &str) -> Result<(), FlameError> {
-        Ok(())
-    }
-
-    async fn load_objects(&self) -> Result<Vec<(String, Object, u64)>, FlameError> {
+    async fn load_objects(&self) -> Result<Vec<(ObjectKey, Object)>, FlameError> {
         Ok(Vec::new())
     }
 }
@@ -69,33 +71,42 @@ impl StorageEngine for NoneStorage {
 mod tests {
     use super::*;
 
+    fn test_key() -> ObjectKey {
+        ObjectKey {
+            app_name: "app".to_string(),
+            session_id: "session".to_string(),
+            object_id: Some("obj1".to_string()),
+        }
+    }
+
     #[tokio::test]
-    async fn test_none_storage_write_read() {
+    async fn test_none_storage_basic_operations() {
         let storage = NoneStorage::new();
-        let object = Object::new(0, vec![1, 2, 3]);
 
-        storage.write_object("session/obj1", &object).await.unwrap();
+        let key = test_key();
+        let object = Object::new(1, vec![1, 2, 3]);
+        storage.write_object(&key, &object).await.unwrap();
 
-        let result = storage.read_object("session/obj1").await.unwrap();
+        let result = storage.read_object(&key).await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
-    async fn test_none_storage_patch_returns_error() {
+    async fn test_none_storage_patch_returns_ok() {
         let storage = NoneStorage::new();
-        let delta = Object::new(0, vec![4, 5, 6]);
 
-        let result = storage.patch_object("session/obj1", &delta).await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), FlameError::InvalidConfig(_)));
+        let key = test_key();
+        let delta = Object::new(1, vec![4, 5, 6]);
+        let result = storage.patch_object(&key, &delta).await;
+
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
-    async fn test_none_storage_delete() {
+    async fn test_none_storage_delete_objects() {
         let storage = NoneStorage::new();
-
-        storage.delete_object("session/obj1").await.unwrap();
-        storage.delete_objects("session").await.unwrap();
+        let key = ObjectKey::from_path("app/session").unwrap();
+        storage.delete_objects(&key).await.unwrap();
     }
 
     #[tokio::test]

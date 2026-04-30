@@ -19,6 +19,7 @@ impl SystemdManager {
 
         let has_control_plane = profiles.contains(&InstallProfile::ControlPlane);
         let has_worker = profiles.contains(&InstallProfile::Worker);
+        let has_cache = profiles.contains(&InstallProfile::Cache);
 
         // Write to /etc/systemd/system/
         if has_control_plane {
@@ -41,8 +42,18 @@ impl SystemdManager {
             println!("  ⊘ Skipped flame-executor-manager.service (worker not selected)");
         }
 
+        if has_cache {
+            let foc_service = self.generate_object_cache_service(prefix_str);
+            let foc_path = PathBuf::from("/etc/systemd/system/flame-object-cache.service");
+            fs::write(&foc_path, foc_service)
+                .context("Failed to write flame-object-cache.service")?;
+            println!("  ✓ Installed flame-object-cache.service");
+        } else {
+            println!("  ⊘ Skipped flame-object-cache.service (cache not selected)");
+        }
+
         // Only reload if we installed at least one service
-        if has_control_plane || has_worker {
+        if has_control_plane || has_worker || has_cache {
             self.daemon_reload()?;
         }
 
@@ -56,13 +67,16 @@ impl SystemdManager {
 
         let fsm_path = PathBuf::from("/etc/systemd/system/flame-session-manager.service");
         let fem_path = PathBuf::from("/etc/systemd/system/flame-executor-manager.service");
+        let foc_path = PathBuf::from("/etc/systemd/system/flame-object-cache.service");
 
         // Stop services first
         let _ = self.stop_service("flame-executor-manager");
+        let _ = self.stop_service("flame-object-cache");
         let _ = self.stop_service("flame-session-manager");
 
         // Disable services
         let _ = self.disable_service("flame-executor-manager");
+        let _ = self.disable_service("flame-object-cache");
         let _ = self.disable_service("flame-session-manager");
 
         // Remove service files
@@ -72,6 +86,9 @@ impl SystemdManager {
         if fem_path.exists() {
             fs::remove_file(&fem_path)
                 .context("Failed to remove flame-executor-manager.service")?;
+        }
+        if foc_path.exists() {
+            fs::remove_file(&foc_path).context("Failed to remove flame-object-cache.service")?;
         }
 
         // Reload systemd daemon
@@ -87,16 +104,21 @@ impl SystemdManager {
 
         let has_control_plane = profiles.contains(&InstallProfile::ControlPlane);
         let has_worker = profiles.contains(&InstallProfile::Worker);
+        let has_cache = profiles.contains(&InstallProfile::Cache);
 
         if has_control_plane {
-            // Enable and start session manager
             self.enable_service("flame-session-manager")?;
             self.start_service("flame-session-manager")?;
             self.wait_for_service_active("flame-session-manager", 15)?;
         }
 
+        if has_cache {
+            self.enable_service("flame-object-cache")?;
+            self.start_service("flame-object-cache")?;
+            self.wait_for_service_active("flame-object-cache", 15)?;
+        }
+
         if has_worker {
-            // Enable and start executor manager
             self.enable_service("flame-executor-manager")?;
             self.start_service("flame-executor-manager")?;
             self.wait_for_service_active("flame-executor-manager", 15)?;
@@ -297,6 +319,34 @@ StandardError=append:{prefix}/logs/fem.log
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+"#,
+            prefix = prefix
+        )
+    }
+
+    fn generate_object_cache_service(&self, prefix: &str) -> String {
+        format!(
+            r#"[Unit]
+Description=Flame Object Cache
+Documentation=https://github.com/xflops-io/flame
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="RUST_LOG=info"
+Environment="FLAME_HOME={prefix}"
+WorkingDirectory={prefix}
+ExecStart={prefix}/bin/flame-object-cache --config {prefix}/conf/flame-cluster.yaml
+StandardOutput=append:{prefix}/logs/foc.log
+StandardError=append:{prefix}/logs/foc.log
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+MemoryMax=12G
 
 [Install]
 WantedBy=multi-user.target

@@ -1,9 +1,6 @@
 services:
   flame-session-manager:
     image: xflops/flame-session-manager:latest
-    logging:
-      options:
-        max-size: "100m"
     build:
       context: .
       dockerfile: docker/Dockerfile.fsm
@@ -18,11 +15,29 @@ services:
     networks:
       - flame-net
 
+  flame-object-cache:
+    image: xflops/flame-object-cache:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.foc
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ./ci/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
+      - ./ci/certs:/etc/flame/certs:ro
+      - flame-cache-storage:/var/lib/flame/cache
+      - ./logs:/usr/local/flame/logs
+    ports:
+      - 9090:9090
+    networks:
+      - flame-net
+    deploy:
+      resources:
+        limits:
+          memory: 12G
+
   flame-executor-manager:
     image: xflops/flame-executor-manager:latest
-    logging:
-      options:
-        max-size: "100m"
     build:
       context: .
       dockerfile: docker/Dockerfile.fem
@@ -36,24 +51,21 @@ services:
         delay: 5s
         max_attempts: 3
         window: 120s
+    depends_on:
+      - flame-object-cache
     volumes:
       - ./ci/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
       - ./ci/certs:/etc/flame/certs:ro
       - ./examples:/opt/examples
       - ./e2e:/opt/e2e
       - flame-work:/usr/local/flame/work
-      - flame-cache-storage:/var/lib/flame/cache
       - ./logs:/usr/local/flame/logs
-    expose:
-      - "9090"
+      - ./work/cache:/usr/local/flame/data/cache
     networks:
       - flame-net
 
   flame-console:
     image: xflops/flame-console:latest
-    logging:
-      options:
-        max-size: "100m"
     build:
       context: .
       dockerfile: docker/Dockerfile.console
@@ -64,16 +76,15 @@ services:
       - ./ci/certs:/etc/flame/certs:ro
       - ./examples:/opt/examples
       - ./e2e:/opt/e2e
+      - ./work/cache:/usr/local/flame/data/cache
     depends_on:
       - flame-package-storage
+      - flame-object-cache
     networks:
       - flame-net
 
   flame-package-storage:
     image: sigoden/dufs:v0.43.0
-    logging:
-      options:
-        max-size: "100m"
     command: ["/data", "-A"]
     volumes:
       - flame-packages:/data

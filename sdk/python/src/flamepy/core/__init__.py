@@ -13,6 +13,7 @@ limitations under the License.
 
 # Cache classes and functions
 from .cache import (
+    WILDCARD_SESSION,
     ObjectKey,
     ObjectRef,
     get_object,
@@ -158,6 +159,7 @@ __all__ = [
     # Service functions
     "run",
     # Cache classes
+    "WILDCARD_SESSION",
     "ObjectKey",
     "ObjectRef",
     # Cache functions

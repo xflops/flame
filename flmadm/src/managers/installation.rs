@@ -80,6 +80,11 @@ impl InstallationManager {
                 &artifacts.executor_manager,
                 paths.bin.join("flame-executor-manager"),
             ),
+            (
+                "flame-object-cache",
+                &artifacts.object_cache,
+                paths.bin.join("flame-object-cache"),
+            ),
             ("flmctl", &artifacts.flmctl, paths.bin.join("flmctl")),
             ("flmadm", &artifacts.flmadm, paths.bin.join("flmadm")),
             ("flmping", &artifacts.flmping, paths.bin.join("flmping")),

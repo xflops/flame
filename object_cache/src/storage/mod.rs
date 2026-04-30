@@ -11,14 +11,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Storage engine module for ObjectCache.
-//!
-//! This module provides pluggable storage engines for the object cache:
-//! - `DiskStorage` - Persistent storage using Arrow IPC format
-//! - `NoneStorage` - Memory-only storage with no persistence
-//!
-//! Use `connect()` to create a storage engine from a URL string.
-
 mod disk;
 mod none;
 
@@ -31,77 +23,36 @@ use async_trait::async_trait;
 
 use common::FlameError;
 
-use crate::{Object, ObjectMetadata};
+use crate::cache::{Object, ObjectKey, ObjectMetadata};
 
 /// Storage engine trait for ObjectCache.
 ///
 /// Implementations must be thread-safe (Send + Sync).
-///
-/// The storage engine is responsible for:
-/// - Persisting objects (base data + deltas)
-/// - Managing delta files internally
-/// - Loading objects with their deltas on read
 #[async_trait]
 pub trait StorageEngine: Send + Sync + 'static {
-    /// Write an object to persistent storage.
-    /// Clears any existing deltas for this key.
-    async fn write_object(&self, key: &str, object: &Object) -> Result<(), FlameError>;
+    /// Write an object to persistent storage. Clears any existing deltas.
+    async fn write_object(&self, key: &ObjectKey, object: &Object) -> Result<(), FlameError>;
 
-    /// Read an object from persistent storage.
-    /// Returns the object with all deltas populated in `object.deltas`.
-    /// Returns None if object doesn't exist in storage.
-    async fn read_object(&self, key: &str) -> Result<Option<Object>, FlameError>;
+    /// Read an object with all deltas. Returns None if not found.
+    async fn read_object(&self, key: &ObjectKey) -> Result<Option<Object>, FlameError>;
 
-    /// Append a delta to an existing object (PATCH operation).
-    /// Returns updated metadata including new delta count.
-    ///
-    /// # Errors
-    /// - Returns NotFound if the base object doesn't exist
-    /// - Returns InvalidConfig if patch is not supported (e.g., none storage)
-    async fn patch_object(&self, key: &str, delta: &Object) -> Result<ObjectMetadata, FlameError>;
+    /// Append a delta to an existing object. Returns NotFound if base doesn't exist.
+    async fn patch_object(
+        &self,
+        key: &ObjectKey,
+        delta: &Object,
+    ) -> Result<ObjectMetadata, FlameError>;
 
-    /// Delete an object and all its deltas from persistent storage.
-    async fn delete_object(&self, key: &str) -> Result<(), FlameError>;
-
-    /// Delete all objects for a session.
-    async fn delete_objects(&self, session_id: &str) -> Result<(), FlameError>;
+    /// Delete all objects matching the key prefix (app/session).
+    async fn delete_objects(&self, key: &ObjectKey) -> Result<(), FlameError>;
 
     /// Load all objects from storage (for startup recovery).
-    /// Returns Vec of (key, object, delta_count).
-    /// Objects are returned with deltas populated.
-    async fn load_objects(&self) -> Result<Vec<(String, Object, u64)>, FlameError>;
+    async fn load_objects(&self) -> Result<Vec<(ObjectKey, Object)>, FlameError>;
 }
 
 pub type StorageEnginePtr = Box<dyn StorageEngine>;
 
-/// Connect to a storage engine based on the URL scheme.
-///
-/// Supported URL schemes:
-/// - `none` - Memory-only, no persistence
-/// - `fs://` or `file://` - Filesystem storage
-/// - Plain path (legacy) - Treated as filesystem storage
-///
-/// Path resolution for `fs://`:
-/// - Triple slash (e.g., `fs:///data`) - Absolute path (`/data`)
-/// - Double slash (e.g., `fs://data`) - Relative to FLAME_HOME (`${FLAME_HOME}/data`)
-///
-/// # Examples
-///
-/// ```ignore
-/// // Memory-only storage
-/// let storage = connect("none").await?;
-///
-/// // Filesystem storage (absolute path)
-/// let storage = connect("fs:///var/lib/flame/cache").await?;
-///
-/// // Filesystem storage (relative to FLAME_HOME)
-/// let storage = connect("fs://cache").await?;  // -> ${FLAME_HOME}/cache
-///
-/// // Legacy plain path (still supported)
-/// let storage = connect("/var/lib/flame/cache").await?;
-/// ```
 pub async fn connect(url: &str) -> Result<StorageEnginePtr, FlameError> {
-    // Check environment variable override
     let url = std::env::var("FLAME_CACHE_STORAGE")
         .ok()
         .filter(|s| !s.is_empty())
@@ -117,11 +68,9 @@ pub async fn connect(url: &str) -> Result<StorageEnginePtr, FlameError> {
         return Ok(Box::new(NoneStorage::new()));
     }
 
-    // Parse filesystem URL or plain path
     let storage_path = if url.starts_with("fs://") || url.starts_with("file://") {
         parse_storage_url(&url)?
     } else {
-        // Legacy plain path support
         PathBuf::from(&url)
     };
 
@@ -129,7 +78,6 @@ pub async fn connect(url: &str) -> Result<StorageEnginePtr, FlameError> {
     Ok(Box::new(DiskStorage::new(storage_path)?))
 }
 
-/// Parse storage URL and resolve path.
 fn parse_storage_url(url: &str) -> Result<PathBuf, FlameError> {
     let path_part = url
         .strip_prefix("fs://")
@@ -137,10 +85,8 @@ fn parse_storage_url(url: &str) -> Result<PathBuf, FlameError> {
         .ok_or_else(|| FlameError::InvalidConfig(format!("Invalid storage URL: {}", url)))?;
 
     if path_part.starts_with('/') {
-        // Absolute path (triple slash: fs:///path -> /path)
         Ok(PathBuf::from(path_part))
     } else {
-        // Relative to FLAME_HOME (double slash: fs://path -> ${FLAME_HOME}/path)
         let flame_home =
             std::env::var("FLAME_HOME").unwrap_or_else(|_| "/var/lib/flame".to_string());
         Ok(PathBuf::from(flame_home).join(path_part))
@@ -173,7 +119,6 @@ mod tests {
     #[tokio::test]
     async fn test_connect_none() {
         let storage = connect("none").await.unwrap();
-        // Verify it's a NoneStorage by checking load_objects returns empty
         let objects = storage.load_objects().await.unwrap();
         assert!(objects.is_empty());
     }

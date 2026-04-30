@@ -124,6 +124,7 @@ jobs:
           # Check service status
           sudo systemctl status flame-session-manager || (echo "Session manager not running" && sudo journalctl -u flame-session-manager -n 50 && exit 1)
           sudo systemctl status flame-executor-manager || (echo "Executor manager not running" && sudo journalctl -u flame-executor-manager -n 50 && exit 1)
+          sudo systemctl status flame-object-cache || (echo "Object cache not running" && sudo journalctl -u flame-object-cache -n 50 && exit 1)
           
           echo "✓ Services are running via systemd"
 
@@ -139,6 +140,7 @@ jobs:
         timeout-minutes: 10
         run: |
           export PYTHONPATH="$(pwd)/e2e/src:$PYTHONPATH"
+          export FLAME_LOG=DEBUG
           cd e2e
           pytest -vv --durations=0 tests/test_runner.py
 
@@ -149,16 +151,22 @@ jobs:
           cat /tmp/dufs.log || echo "No dufs log file found"
           echo ""
           echo "=== Session Manager Logs (systemd) ==="
-          sudo journalctl -u flame-session-manager -n 200 || echo "No systemd logs found"
+          sudo journalctl -u flame-session-manager -n 500 || echo "No systemd logs found"
           echo ""
           echo "=== Session Manager Logs (file) ==="
           sudo cat $INSTALL_PREFIX/logs/fsm.log || echo "No FSM log file found"
           echo ""
           echo "=== Executor Manager Logs (systemd) ==="
-          sudo journalctl -u flame-executor-manager -n 200 || echo "No systemd logs found"
+          sudo journalctl -u flame-executor-manager -n 500 || echo "No systemd logs found"
           echo ""
           echo "=== Executor Manager Logs (file) ==="
           sudo cat $INSTALL_PREFIX/logs/fem.log || echo "No FEM log file found"
+          echo ""
+          echo "=== Object Cache Logs (systemd) ==="
+          sudo journalctl -u flame-object-cache -n 500 || echo "No systemd logs found"
+          echo ""
+          echo "=== Object Cache Logs (file) ==="
+          sudo cat $INSTALL_PREFIX/logs/foc.log || echo "No FOC log file found"
           echo ""
           echo "=== Active processes ==="
           ps aux | grep -E "(flame|dufs|python)" || true
@@ -171,6 +179,7 @@ jobs:
         run: |
           # Stop services via systemd
           sudo systemctl stop flame-executor-manager || true
+          sudo systemctl stop flame-object-cache || true
           sudo systemctl stop flame-session-manager || true
       
       - name: Cleanup

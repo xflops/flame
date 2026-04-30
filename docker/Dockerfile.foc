@@ -1,0 +1,30 @@
+FROM rust:1.94 AS builder
+
+WORKDIR /usr/src/flame
+COPY . .
+
+RUN apt-get update && apt-get install -y protobuf-compiler pkg-config libssl-dev
+RUN cargo build --release
+
+# Install using flmadm with cache profile
+RUN ./target/release/flmadm install \
+    --src-dir /usr/src/flame \
+    --prefix /usr/local/flame \
+    --cache \
+    --no-systemd \
+    --skip-build \
+    --force
+
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/local/flame
+
+COPY --from=builder /usr/local/flame /usr/local/flame
+
+RUN mkdir -p /var/lib/flame/cache
+
+ENV FLAME_HOME=/usr/local/flame
+
+ENTRYPOINT ["/usr/local/flame/bin/flame-object-cache"]

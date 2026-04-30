@@ -16,7 +16,7 @@ cluster:
     key_file: "/etc/flame/certs/server.key"
     ca_file: "/etc/flame/certs/ca.crt"
 cache:
-  endpoint: "grpcs://flame-executor-manager:9090"
+  endpoint: "grpcs://flame-object-cache:9090"
   network_interface: "eth0"
   storage: "/var/lib/flame/cache"
   eviction:

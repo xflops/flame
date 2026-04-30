@@ -71,13 +71,30 @@ impl States for BindingState {
     async fn unbind_executor(&self) -> Result<(), FlameError> {
         trace_fn!("BindingState::unbind_executor");
 
-        Err(FlameError::InvalidState("Executor is binding".to_string()))
+        let mut e = lock_ptr!(self.executor)?;
+        tracing::debug!(
+            "Executor <{}> unbinding from binding state, session=<{:?}>",
+            e.id,
+            e.ssn_id
+        );
+        e.state = ExecutorState::Unbinding;
+
+        Ok(())
     }
 
     async fn unbind_executor_completed(&self) -> Result<(), FlameError> {
         trace_fn!("BindingState::unbind_executor_completed");
 
-        Err(FlameError::InvalidState("Executor is binding".to_string()))
+        let mut e = lock_ptr!(self.executor)?;
+        tracing::debug!(
+            "Executor <{}> unbind completed from binding state, returning to idle",
+            e.id
+        );
+        e.state = ExecutorState::Idle;
+        e.ssn_id = None;
+        e.task_id = None;
+
+        Ok(())
     }
 
     async fn launch_task(

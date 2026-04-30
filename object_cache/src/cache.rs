@@ -29,7 +29,6 @@ use arrow_flight::{
     Ticket,
 };
 use async_trait::async_trait;
-use base64::Engine;
 use bytes::Bytes;
 use bytesize::ByteSize;
 use futures::Stream;
@@ -39,7 +38,6 @@ use stdng::{lock_ptr, new_ptr, MutexPtr};
 use tonic::{Request, Response, Status, Streaming};
 use url::Url;
 
-use common::apis::SessionID;
 use common::ctx::FlameCache;
 use common::FlameError;
 
@@ -48,7 +46,11 @@ use crate::eviction::{new_policy, EvictionConfig, EvictionPolicyPtr};
 /// Default batch size for eviction operations
 const EVICTION_BATCH_SIZE: usize = 10;
 
+/// Wildcard session identifier for matching all sessions of an application
+pub const WILDCARD_SESSION: &str = "*";
+
 /// Parsed object key: `<app_name>/<session_id>/<object_id>`
+/// session_id can be "*" for wildcard (all sessions), requires object_id to be None
 #[derive(Debug, Clone)]
 pub struct ObjectKey {
     pub app_name: String,
@@ -57,16 +59,27 @@ pub struct ObjectKey {
 }
 
 impl ObjectKey {
-    /// Parse from path string (2-part or 3-part)
+    /// Parse from path string.
+    ///
+    /// Wildcard '*' handling:
+    /// - Only allowed for session_id (e.g., "app/*" for delete all sessions)
+    /// - Not allowed for app_name or object_id
+    /// - Wildcard session cannot have object_id (e.g., "app/*/obj" is invalid)
     pub fn from_path(path_str: &str) -> Result<Self, FlameError> {
         let parts: Vec<&str> = path_str.split('/').collect();
 
-        for part in &parts {
+        for (i, part) in parts.iter().enumerate() {
             if part.is_empty() || part.contains("..") || part.contains('\\') {
                 return Err(FlameError::InvalidConfig(format!(
                     "Invalid key component: '{}'",
                     part
                 )));
+            }
+            // Wildcard only allowed at index 1 (session_id position)
+            if *part == WILDCARD_SESSION && i != 1 {
+                return Err(FlameError::InvalidConfig(
+                    "Wildcard '*' only allowed for session_id".to_string(),
+                ));
             }
         }
 
@@ -76,11 +89,25 @@ impl ObjectKey {
                 session_id: parts[1].to_string(),
                 object_id: None,
             }),
-            3 => Ok(ObjectKey {
-                app_name: parts[0].to_string(),
-                session_id: parts[1].to_string(),
-                object_id: Some(parts[2].to_string()),
-            }),
+            3 => {
+                // Wildcard session cannot reference specific objects
+                if parts[1] == WILDCARD_SESSION {
+                    return Err(FlameError::InvalidConfig(
+                        "Wildcard session '*' cannot have object_id".to_string(),
+                    ));
+                }
+                // Object ID cannot be wildcard
+                if parts[2] == WILDCARD_SESSION {
+                    return Err(FlameError::InvalidConfig(
+                        "Wildcard '*' not allowed for object_id".to_string(),
+                    ));
+                }
+                Ok(ObjectKey {
+                    app_name: parts[0].to_string(),
+                    session_id: parts[1].to_string(),
+                    object_id: Some(parts[2].to_string()),
+                })
+            }
             _ => Err(FlameError::InvalidConfig(format!(
                 "Invalid path '{}': expected '<app>/<ssn>' or '<app>/<ssn>/<uuid>'",
                 path_str
@@ -88,14 +115,33 @@ impl ObjectKey {
         }
     }
 
+    pub fn is_all_sessions(&self) -> bool {
+        self.session_id == WILDCARD_SESSION
+    }
+
     pub fn to_key(&self) -> Option<String> {
+        if self.is_all_sessions() {
+            return None;
+        }
         self.object_id
             .as_ref()
             .map(|oid| format!("{}/{}/{}", self.app_name, self.session_id, oid))
     }
 
     pub fn to_prefix(&self) -> String {
-        format!("{}/{}", self.app_name, self.session_id)
+        if self.is_all_sessions() {
+            self.app_name.clone()
+        } else {
+            format!("{}/{}", self.app_name, self.session_id)
+        }
+    }
+
+    pub fn matches(&self, key_str: &str) -> bool {
+        if self.is_all_sessions() {
+            key_str.starts_with(&format!("{}/", self.app_name))
+        } else {
+            key_str.starts_with(&format!("{}/", self.to_prefix()))
+        }
     }
 
     pub fn with_generated_id(self) -> Self {
@@ -103,6 +149,24 @@ impl ObjectKey {
             object_id: Some(uuid::Uuid::new_v4().to_string()),
             ..self
         }
+    }
+
+    pub fn with_object_id(self, id: String) -> Result<Self, FlameError> {
+        if self.is_all_sessions() {
+            return Err(FlameError::InvalidConfig(
+                "Wildcard session '*' cannot have object_id".to_string(),
+            ));
+        }
+        if id.is_empty() || id.contains("..") || id.contains('\\') || id.contains('/') {
+            return Err(FlameError::InvalidConfig(format!(
+                "Invalid object_id: '{}'",
+                id
+            )));
+        }
+        Ok(Self {
+            object_id: Some(id),
+            ..self
+        })
     }
 }
 
@@ -140,11 +204,6 @@ impl From<&ObjectKey> for String {
     fn from(key: &ObjectKey) -> Self {
         key.to_key().unwrap_or_else(|| key.to_prefix())
     }
-}
-
-fn validate_key(key: &str) -> Result<(), FlameError> {
-    let _ = ObjectKey::try_from(key)?;
-    Ok(())
 }
 
 /// Object with optional delta support
@@ -278,6 +337,8 @@ pub struct ObjectCache {
     objects: MutexPtr<HashMap<String, Object>>,
     metadata: MutexPtr<HashMap<String, ObjectMetadata>>,
     eviction_policy: EvictionPolicyPtr,
+    /// Per-key write locks to prevent concurrent PUT/PATCH race conditions
+    write_locks: MutexPtr<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl ObjectCache {
@@ -294,6 +355,7 @@ impl ObjectCache {
             objects: new_ptr(HashMap::new()),
             metadata: new_ptr(HashMap::new()),
             eviction_policy,
+            write_locks: new_ptr(HashMap::new()),
         })
     }
 
@@ -303,14 +365,17 @@ impl ObjectCache {
         let mut objects = lock_ptr!(self.objects)?;
         let mut metadata = lock_ptr!(self.metadata)?;
 
-        for (key, object, delta_count) in items {
+        for (key, object) in items {
+            let key_str = key.to_key().expect("loaded key must have object_id");
             let size = object.data.len() as u64;
-            let meta = self.create_metadata(key.clone(), size, delta_count);
+            let version = object.version;
+            let delta_count = object.deltas.len() as u64;
+            let meta = self.create_metadata(key_str.clone(), version, size, delta_count);
 
-            objects.insert(key.clone(), object);
-            metadata.insert(key.clone(), meta);
+            objects.insert(key_str.clone(), object);
+            metadata.insert(key_str.clone(), meta);
 
-            self.eviction_policy.on_add(&key, size);
+            self.eviction_policy.on_add(&key_str, size);
         }
 
         drop(objects);
@@ -320,11 +385,25 @@ impl ObjectCache {
         Ok(())
     }
 
-    fn create_metadata(&self, key: String, size: u64, delta_count: u64) -> ObjectMetadata {
+    fn get_write_lock(&self, key: &str) -> Result<Arc<tokio::sync::Mutex<()>>, FlameError> {
+        let mut locks = lock_ptr!(self.write_locks)?;
+        Ok(locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone())
+    }
+
+    fn create_metadata(
+        &self,
+        key: String,
+        version: u64,
+        size: u64,
+        delta_count: u64,
+    ) -> ObjectMetadata {
         ObjectMetadata {
             endpoint: self.endpoint.to_uri(),
             key,
-            version: 0,
+            version,
             size,
             delta_count,
         }
@@ -349,193 +428,181 @@ impl ObjectCache {
         Ok(())
     }
 
-    async fn put(
-        &self,
-        session_id: SessionID,
-        object: Object,
-    ) -> Result<ObjectMetadata, FlameError> {
-        self.put_with_id(session_id, None, object).await
-    }
-
-    async fn put_with_id(
-        &self,
-        key_prefix: SessionID,
-        object_id: Option<String>,
-        object: Object,
-    ) -> Result<ObjectMetadata, FlameError> {
-        let object_key = ObjectKey::from_path(&key_prefix)?;
-        let object_key = match object_id {
-            Some(id) => {
-                if id.is_empty() || id.contains("..") || id.contains('\\') || id.contains('/') {
-                    return Err(FlameError::InvalidConfig(format!(
-                        "Invalid object_id: '{}'",
-                        id
-                    )));
-                }
-                ObjectKey {
-                    object_id: Some(id),
-                    ..object_key
-                }
-            }
-            None => object_key.with_generated_id(),
+    async fn put(&self, key: ObjectKey, object: Object) -> Result<ObjectMetadata, FlameError> {
+        let key = match key.object_id {
+            Some(_) => key,
+            None => key.with_generated_id(),
         };
 
-        let key = object_key.to_key().ok_or_else(|| {
-            FlameError::Internal("ObjectKey missing object_id in put_with_id".to_string())
+        let key_str = key.to_key().ok_or_else(|| {
+            FlameError::Internal("ObjectKey missing object_id in put".to_string())
         })?;
         let size = object.data.len() as u64;
 
-        self.storage.write_object(&key, &object).await?;
+        // Acquire per-key lock to prevent concurrent version increments
+        let write_lock = self.get_write_lock(&key_str)?;
+        let _guard = write_lock.lock().await;
 
-        let meta = self.create_metadata(key.clone(), size, 0);
+        let version_from_memory = {
+            let metadata = lock_ptr!(self.metadata)?;
+            metadata.get(&key_str).map(|m| m.version)
+        };
+
+        let current_version = match version_from_memory {
+            Some(v) => v,
+            None => self
+                .storage
+                .read_object(&key)
+                .await?
+                .map(|obj| obj.version)
+                .unwrap_or(0),
+        };
+        let new_version = current_version + 1;
+
+        let versioned_object = Object::new(new_version, object.data);
+
+        self.storage.write_object(&key, &versioned_object).await?;
+
+        let meta = self.create_metadata(key_str.clone(), new_version, size, 0);
 
         {
             let mut objects = lock_ptr!(self.objects)?;
             let mut metadata = lock_ptr!(self.metadata)?;
 
-            objects.insert(key.clone(), object);
-            metadata.insert(key.clone(), meta.clone());
+            objects.insert(key_str.clone(), versioned_object);
+            metadata.insert(key_str.clone(), meta.clone());
         }
 
-        self.eviction_policy.on_add(&key, size);
+        self.eviction_policy.on_add(&key_str, size);
         self.run_eviction()?;
 
-        tracing::debug!("Object put: {}", key);
+        tracing::debug!("Object put: {} (version={})", key_str, new_version);
 
         Ok(meta)
     }
 
-    async fn get(&self, key: String) -> Result<Object, FlameError> {
-        validate_key(&key)?;
+    async fn get(&self, key: &ObjectKey) -> Result<Object, FlameError> {
+        let key_str = key.to_key().ok_or_else(|| {
+            FlameError::InvalidConfig("ObjectKey requires object_id for get".to_string())
+        })?;
 
-        self.eviction_policy.on_access(&key);
+        self.eviction_policy.on_access(&key_str);
 
         {
             let objects = lock_ptr!(self.objects)?;
-            if let Some(object) = objects.get(&key) {
-                tracing::debug!("Object get from memory: {}", key);
+            if let Some(object) = objects.get(&key_str) {
+                tracing::debug!("Object get from memory: {}", key_str);
                 return Ok(object.clone());
             }
         }
 
-        if let Some(object) = self.storage.read_object(&key).await? {
+        if let Some(object) = self.storage.read_object(key).await? {
             let size = object.data.len() as u64;
             let delta_count = object.deltas.len() as u64;
+            let version = object.version;
 
             {
                 let mut objects = lock_ptr!(self.objects)?;
                 let mut metadata = lock_ptr!(self.metadata)?;
 
-                objects.insert(key.clone(), object.clone());
+                objects.insert(key_str.clone(), object.clone());
 
-                let meta = self.create_metadata(key.clone(), size, delta_count);
-                metadata.insert(key.clone(), meta);
+                let meta = self.create_metadata(key_str.clone(), version, size, delta_count);
+                metadata.insert(key_str.clone(), meta);
             }
 
-            self.eviction_policy.on_add(&key, size);
+            self.eviction_policy.on_add(&key_str, size);
             self.run_eviction()?;
 
-            tracing::debug!("Object loaded from storage: {}", key);
+            tracing::debug!("Object loaded from storage: {}", key_str);
             return Ok(object);
         }
 
-        Err(FlameError::NotFound(format!("object <{}> not found", key)))
+        Err(FlameError::NotFound(format!(
+            "object <{}> not found",
+            key_str
+        )))
     }
 
-    async fn update(&self, key: String, new_object: Object) -> Result<ObjectMetadata, FlameError> {
-        validate_key(&key)?;
+    async fn patch(&self, key: &ObjectKey, delta: Object) -> Result<ObjectMetadata, FlameError> {
+        let key_str = key.to_key().ok_or_else(|| {
+            FlameError::InvalidConfig("ObjectKey requires object_id for patch".to_string())
+        })?;
 
-        let size = new_object.data.len() as u64;
+        // Acquire per-key lock to prevent concurrent version increments
+        let write_lock = self.get_write_lock(&key_str)?;
+        let _guard = write_lock.lock().await;
 
-        self.storage.write_object(&key, &new_object).await?;
+        self.eviction_policy.on_access(&key_str);
 
-        let meta = self.create_metadata(key.clone(), size, 0);
+        let version_from_memory = {
+            let metadata = lock_ptr!(self.metadata)?;
+            metadata.get(&key_str).map(|m| m.version)
+        };
 
-        {
-            let mut objects = lock_ptr!(self.objects)?;
-            let mut metadata = lock_ptr!(self.metadata)?;
+        let current_version = match version_from_memory {
+            Some(v) => v,
+            None => self
+                .storage
+                .read_object(key)
+                .await?
+                .map(|obj| obj.version)
+                .ok_or_else(|| {
+                    FlameError::NotFound(format!("object <{}> not found for patch", key_str))
+                })?,
+        };
+        let new_version = current_version + 1;
 
-            objects.insert(key.clone(), new_object);
-            metadata.insert(key.clone(), meta.clone());
-        }
-
-        self.eviction_policy.on_add(&key, size);
-        self.run_eviction()?;
-
-        tracing::debug!("Object update: {}", key);
-
-        Ok(meta)
-    }
-
-    async fn patch(&self, key: String, delta: Object) -> Result<ObjectMetadata, FlameError> {
-        validate_key(&key)?;
-
-        self.eviction_policy.on_access(&key);
-
-        let mut meta = self.storage.patch_object(&key, &delta).await?;
+        let mut meta = self.storage.patch_object(key, &delta).await?;
         meta.endpoint = self.endpoint.to_uri();
+        meta.version = new_version;
 
         {
             let mut metadata = lock_ptr!(self.metadata)?;
-            metadata.insert(key.clone(), meta.clone());
+            metadata.insert(key_str.clone(), meta.clone());
         }
 
-        // Invalidate in-memory cache to force reload with new delta on next access
         {
             let mut objects = lock_ptr!(self.objects)?;
-            if objects.remove(&key).is_some() {
-                self.eviction_policy.on_remove(&key);
+            if objects.remove(&key_str).is_some() {
+                self.eviction_policy.on_remove(&key_str);
             }
         }
 
-        tracing::debug!("Object patch: {} (delta_count: {})", key, meta.delta_count);
+        tracing::debug!(
+            "Object patch: {} (version={}, delta_count={})",
+            key_str,
+            new_version,
+            meta.delta_count
+        );
         Ok(meta)
     }
 
-    async fn delete(&self, prefix: SessionID) -> Result<(), FlameError> {
-        let parts: Vec<&str> = prefix.split('/').collect();
-        if parts.is_empty() || parts.len() > 2 {
-            return Err(FlameError::InvalidConfig(format!(
-                "Invalid prefix '{}': expected '<app>' or '<app>/<ssn>'",
-                prefix
-            )));
-        }
-
-        for part in &parts {
-            if part.is_empty() || part.contains("..") || part.contains('\\') {
-                return Err(FlameError::InvalidConfig(format!(
-                    "Invalid prefix component: '{}'",
-                    part
-                )));
-            }
-        }
-
-        let prefix_with_slash = format!("{}/", prefix);
-
+    async fn delete(&self, key: &ObjectKey) -> Result<(), FlameError> {
         let keys_to_remove: Vec<String> = {
             let metadata = lock_ptr!(self.metadata)?;
             metadata
                 .keys()
-                .filter(|k| k.starts_with(&prefix_with_slash))
+                .filter(|k| key.matches(k))
                 .cloned()
                 .collect()
         };
 
-        for key in &keys_to_remove {
-            self.eviction_policy.on_remove(key);
+        for k in &keys_to_remove {
+            self.eviction_policy.on_remove(k);
         }
 
-        self.storage.delete_objects(&prefix).await?;
+        self.storage.delete_objects(key).await?;
 
         {
             let mut objects = lock_ptr!(self.objects)?;
             let mut metadata = lock_ptr!(self.metadata)?;
 
-            objects.retain(|key, _| !key.starts_with(&prefix_with_slash));
-            metadata.retain(|key, _| !key.starts_with(&prefix_with_slash));
+            objects.retain(|k, _| !key.matches(k));
+            metadata.retain(|k, _| !key.matches(k));
         }
 
-        tracing::debug!("Deleted prefix: <{}>", prefix);
+        tracing::debug!("Deleted: <{}>", key.to_prefix());
 
         Ok(())
     }
@@ -610,10 +677,11 @@ impl FlightCacheServer {
 
     async fn collect_batches_from_stream(
         mut stream: Streaming<FlightData>,
-    ) -> Result<(String, Option<String>, Vec<RecordBatch>), FlameError> {
+    ) -> Result<(String, Option<String>, Option<String>, Vec<RecordBatch>), FlameError> {
         let mut batches = Vec::new();
         let mut session_id: Option<String> = None;
         let mut object_id: Option<String> = None;
+        let mut command: Option<String> = None;
         let mut schema: Option<Arc<Schema>> = None;
 
         while let Some(flight_data) = stream
@@ -623,12 +691,43 @@ impl FlightCacheServer {
         {
             Self::extract_session_and_object_id(&flight_data, &mut session_id, &mut object_id);
 
-            // Extract schema from data_header in first message
+            if command.is_none() {
+                if let Some(ref desc) = flight_data.flight_descriptor {
+                    if !desc.cmd.is_empty() {
+                        if let Ok(cmd_str) = String::from_utf8(desc.cmd.to_vec()) {
+                            if let Some(key) = cmd_str.strip_prefix("PATCH:") {
+                                command = Some("PATCH".to_string());
+                                if session_id.is_none() {
+                                    match ObjectKey::from_path(key) {
+                                        Ok(parsed) => {
+                                            session_id = Some(parsed.to_prefix());
+                                            object_id = parsed.object_id;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Failed to parse PATCH key '{}': {}",
+                                                key,
+                                                e
+                                            );
+                                            return Err(FlameError::InvalidConfig(format!(
+                                                "Invalid PATCH key '{}': {}",
+                                                key, e
+                                            )));
+                                        }
+                                    }
+                                }
+                            } else {
+                                command = Some(cmd_str);
+                            }
+                        }
+                    }
+                }
+            }
+
             if schema.is_none() && !flight_data.data_header.is_empty() {
                 schema = Some(Self::extract_schema_from_flight_data(&flight_data)?);
             }
 
-            // Decode batch if we have schema and data_body
             if let Some(ref schema_ref) = schema {
                 if !flight_data.data_body.is_empty() {
                     let batch = Self::decode_batch_from_flight_data(&flight_data, schema_ref)?;
@@ -643,11 +742,11 @@ impl FlightCacheServer {
 
         let session_id = session_id.ok_or_else(|| {
             FlameError::InvalidState(
-                "session_id must be provided in app_metadata as 'session_id:{id}'".to_string(),
+                "key must be provided in descriptor path or command".to_string(),
             )
         })?;
 
-        Ok((session_id, object_id, batches))
+        Ok((session_id, object_id, command, batches))
     }
 
     fn combine_batches(batches: Vec<RecordBatch>) -> Result<RecordBatch, FlameError> {
@@ -677,61 +776,18 @@ impl FlightCacheServer {
         })
     }
 
-    async fn handle_put_action(&self, action_body: &str) -> Result<String, FlameError> {
-        let (session_id_str, data_b64) = action_body
-            .split_once(':')
-            .ok_or_else(|| FlameError::InvalidState("Invalid PUT action format".to_string()))?;
-
-        let session_id = session_id_str.to_string();
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(data_b64)
-            .map_err(|e| FlameError::InvalidState(format!("Invalid base64: {}", e)))?;
-
-        let object = Object::new(0, data);
-        let metadata = self.cache.put(session_id, object).await?;
-
-        serde_json::to_string(&metadata)
-            .map_err(|e| FlameError::Internal(format!("Failed to serialize: {}", e)))
-    }
-
-    async fn handle_update_action(&self, action_body: &str) -> Result<String, FlameError> {
-        let (key_str, data_b64) = action_body
-            .split_once(':')
-            .ok_or_else(|| FlameError::InvalidState("Invalid UPDATE action format".to_string()))?;
-
-        let key = key_str.to_string();
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(data_b64)
-            .map_err(|e| FlameError::InvalidState(format!("Invalid base64: {}", e)))?;
-
-        let object = Object::new(0, data);
-        let metadata = self.cache.update(key, object).await?;
-
-        serde_json::to_string(&metadata)
-            .map_err(|e| FlameError::Internal(format!("Failed to serialize: {}", e)))
-    }
-
-    async fn handle_delete_action(&self, session_id: String) -> Result<String, FlameError> {
-        self.cache.delete(session_id).await?;
+    async fn handle_delete_action(&self, key_prefix: String) -> Result<String, FlameError> {
+        tracing::debug!(
+            "handle_delete_action: deleting objects with prefix={}",
+            key_prefix
+        );
+        let key = ObjectKey::from_path(&key_prefix)?;
+        self.cache.delete(&key).await?;
+        tracing::debug!(
+            "handle_delete_action: deleted objects with prefix={}",
+            key_prefix
+        );
         Ok("OK".to_string())
-    }
-
-    /// Handle PATCH action: append delta to an existing object
-    async fn handle_patch_action(&self, action_body: &str) -> Result<String, FlameError> {
-        let (key_str, data_b64) = action_body
-            .split_once(':')
-            .ok_or_else(|| FlameError::InvalidState("Invalid PATCH action format".to_string()))?;
-
-        let key = key_str.to_string();
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(data_b64)
-            .map_err(|e| FlameError::InvalidState(format!("Invalid base64: {}", e)))?;
-
-        let delta = Object::new(0, data);
-        let metadata = self.cache.patch(key, delta).await?;
-
-        serde_json::to_string(&metadata)
-            .map_err(|e| FlameError::Internal(format!("Failed to serialize: {}", e)))
     }
 }
 
@@ -797,6 +853,23 @@ fn batch_to_object(batch: &RecordBatch) -> Result<Object, FlameError> {
     let data = data_col.value(0).to_vec();
 
     Ok(Object::new(version, data))
+}
+
+fn create_empty_flight_data() -> Result<Vec<FlightData>, FlameError> {
+    let schema = get_object_schema();
+    let options = IpcWriteOptions::default();
+    let data_gen = IpcDataGenerator::default();
+    let mut dict_tracker = DictionaryTracker::new(false);
+
+    let encoded =
+        data_gen.schema_to_bytes_with_dictionary_tracker(&schema, &mut dict_tracker, &options);
+
+    Ok(vec![FlightData {
+        data_header: encoded.ipc_message.into(),
+        data_body: Bytes::new(),
+        flight_descriptor: None,
+        app_metadata: Bytes::new(),
+    }])
 }
 
 /// Convert Object (with deltas) to FlightData stream
@@ -921,23 +994,58 @@ impl FlightService for FlightCacheServer {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket = request.into_inner();
-        let key = String::from_utf8(ticket.ticket.to_vec())
+        let ticket_str = String::from_utf8(ticket.ticket.to_vec())
             .map_err(|e| Status::invalid_argument(format!("Invalid ticket: {}", e)))?;
 
-        let object = self.cache.get(key.clone()).await?;
+        let (key_str, client_version) = if let Some((k, v)) = ticket_str.split_once(':') {
+            let version: u64 = v
+                .parse()
+                .map_err(|e| Status::invalid_argument(format!("Invalid version: {}", e)))?;
+            (k.to_string(), version)
+        } else {
+            (ticket_str, 0)
+        };
+
+        tracing::debug!("do_get: key={}, client_version={}", key_str, client_version);
+
+        let key = ObjectKey::try_from(key_str.as_str())?;
+
+        let (server_version, metadata_keys) = {
+            let metadata = lock_ptr!(self.cache.metadata)
+                .map_err(|e| Status::internal(format!("Lock error: {}", e)))?;
+            let version = metadata.get(&key_str).map(|m| m.version).unwrap_or(0);
+            let keys: Vec<String> = metadata.keys().cloned().collect();
+            (version, keys)
+        };
+
+        tracing::debug!(
+            "do_get: key={}, server_version={}, metadata_keys_count={}",
+            key_str,
+            server_version,
+            metadata_keys.len()
+        );
+
+        if client_version != 0 && server_version == client_version {
+            tracing::debug!(
+                "do_get: key={}, not_modified (version={})",
+                key_str,
+                server_version
+            );
+            let flight_data_vec = create_empty_flight_data()?;
+            let stream = futures::stream::iter(flight_data_vec.into_iter().map(Ok));
+            return Ok(Response::new(Box::pin(stream)));
+        }
+
+        let object = self.cache.get(&key).await?;
 
         tracing::debug!(
             "do_get: key={}, base_size={}, delta_count={}",
-            key,
+            key_str,
             object.data.len(),
             object.deltas.len()
         );
 
         let flight_data_vec = object_to_flight_data_vec(&object)?;
-        tracing::debug!(
-            "do_get: generated {} FlightData messages",
-            flight_data_vec.len()
-        );
 
         let stream = futures::stream::iter(flight_data_vec.into_iter().map(Ok));
         Ok(Response::new(Box::pin(stream)))
@@ -949,18 +1057,51 @@ impl FlightService for FlightCacheServer {
     ) -> Result<Response<Self::DoPutStream>, Status> {
         let stream = request.into_inner();
 
-        let (session_id, object_id, batches) = Self::collect_batches_from_stream(stream).await?;
+        let (key_or_prefix, object_id, command, batches) =
+            Self::collect_batches_from_stream(stream).await?;
+        tracing::debug!(
+            "do_put: key_or_prefix={}, object_id={:?}, command={:?}, batch_count={}",
+            key_or_prefix,
+            object_id,
+            command,
+            batches.len()
+        );
+
         let combined_batch = Self::combine_batches(batches)?;
         let object = batch_to_object(&combined_batch)?;
 
-        let metadata = self
-            .cache
-            .put_with_id(session_id, object_id, object)
-            .await?;
+        let metadata = if command.as_deref() == Some("PATCH") {
+            let key_str = match object_id {
+                Some(oid) => format!("{}/{}", key_or_prefix, oid),
+                None => key_or_prefix,
+            };
+            tracing::debug!("do_put: PATCH operation for key={}", key_str);
+            let key = ObjectKey::try_from(key_str.as_str())?;
+            self.cache.patch(&key, object).await?
+        } else {
+            let key = ObjectKey::from_path(&key_or_prefix)?;
+            let key = match object_id {
+                Some(oid) => {
+                    tracing::debug!(
+                        "do_put: PUT with explicit object_id={} for prefix={}",
+                        oid,
+                        key_or_prefix
+                    );
+                    key.with_object_id(oid)?
+                }
+                None => key,
+            };
+            self.cache.put(key, object).await?
+        };
+
+        tracing::debug!(
+            "do_put: key={}, version={}, size={} bytes",
+            metadata.key,
+            metadata.version,
+            metadata.size
+        );
 
         let result = Self::create_put_result(&metadata)?;
-
-        tracing::debug!("do_put: sending PutResult with key: {}", metadata.key);
         let stream = futures::stream::iter(vec![Ok(result)]);
         Ok(Response::new(Box::pin(stream)))
     }
@@ -975,13 +1116,10 @@ impl FlightService for FlightCacheServer {
             .map_err(|e| Status::invalid_argument(format!("Invalid action body: {}", e)))?;
 
         let result = match action_type.as_str() {
-            "PUT" => self.handle_put_action(&action_body).await?,
-            "UPDATE" => self.handle_update_action(&action_body).await?,
             "DELETE" => self.handle_delete_action(action_body).await?,
-            "PATCH" => self.handle_patch_action(&action_body).await?,
             _ => {
                 return Err(Status::invalid_argument(format!(
-                    "Unknown action type: {}",
+                    "Unknown action type: {}. Only DELETE is supported.",
                     action_type
                 )))
             }
@@ -999,25 +1137,10 @@ impl FlightService for FlightCacheServer {
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        let actions = vec![
-            ActionType {
-                r#type: "PUT".to_string(),
-                description: "Put an object into cache".to_string(),
-            },
-            ActionType {
-                r#type: "UPDATE".to_string(),
-                description: "Update an existing object (replaces base and clears deltas)"
-                    .to_string(),
-            },
-            ActionType {
-                r#type: "DELETE".to_string(),
-                description: "Delete a session and all its objects".to_string(),
-            },
-            ActionType {
-                r#type: "PATCH".to_string(),
-                description: "Append delta data to an existing object".to_string(),
-            },
-        ];
+        let actions = vec![ActionType {
+            r#type: "DELETE".to_string(),
+            description: "Delete objects by key prefix".to_string(),
+        }];
 
         let stream = futures::stream::iter(actions.into_iter().map(Ok));
         Ok(Response::new(Box::pin(stream)))
@@ -1178,29 +1301,31 @@ mod tests {
         use super::*;
 
         #[test]
-        fn validate_key_accepts_valid_keys() {
-            assert!(validate_key("app/session/object").is_ok());
-            assert!(validate_key("my-app/my-session/my-object").is_ok());
-            assert!(validate_key("test-app/test-session/test-object").is_ok());
-            assert!(validate_key("app1/session1/550e8400-e29b-41d4-a716-446655440000").is_ok());
+        fn object_key_accepts_valid_keys() {
+            assert!(ObjectKey::try_from("app/session/object").is_ok());
+            assert!(ObjectKey::try_from("my-app/my-session/my-object").is_ok());
+            assert!(ObjectKey::try_from("test-app/test-session/test-object").is_ok());
+            assert!(
+                ObjectKey::try_from("app1/session1/550e8400-e29b-41d4-a716-446655440000").is_ok()
+            );
         }
 
         #[test]
-        fn validate_key_rejects_path_traversal() {
-            assert!(validate_key("../etc/passwd").is_err());
-            assert!(validate_key("app/../other/object").is_err());
-            assert!(validate_key("app/session/..").is_err());
+        fn object_key_rejects_path_traversal() {
+            assert!(ObjectKey::try_from("../etc/passwd").is_err());
+            assert!(ObjectKey::try_from("app/../other/object").is_err());
+            assert!(ObjectKey::try_from("app/session/..").is_err());
         }
 
         #[test]
-        fn validate_key_rejects_two_part_keys() {
-            assert!(validate_key("session/object").is_err());
+        fn object_key_rejects_two_part_keys() {
+            assert!(ObjectKey::try_from("session/object").is_err());
         }
 
         #[test]
-        fn validate_key_rejects_empty_components() {
-            assert!(validate_key("app//object").is_err());
-            assert!(validate_key("/session/object").is_err());
+        fn object_key_rejects_empty_components() {
+            assert!(ObjectKey::try_from("app//object").is_err());
+            assert!(ObjectKey::try_from("/session/object").is_err());
         }
 
         #[test]
@@ -1384,14 +1509,13 @@ mod tests {
             let cache = create_test_cache().await;
             let obj = Object::new(1, vec![1, 2, 3]);
 
-            let meta = cache
-                .put("test-app/test-session".to_string(), obj.clone())
-                .await
-                .unwrap();
+            let key = ObjectKey::from_path("test-app/test-session").unwrap();
+            let meta = cache.put(key, obj.clone()).await.unwrap();
             assert!(meta.key.starts_with("test-app/test-session/"));
             assert_eq!(meta.size, 3);
 
-            let retrieved = cache.get(meta.key.clone()).await.unwrap();
+            let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
+            let retrieved = cache.get(&key).await.unwrap();
             assert_eq!(retrieved.version, 1);
             assert_eq!(retrieved.data, vec![1, 2, 3]);
         }
@@ -1401,14 +1525,11 @@ mod tests {
             let cache = create_test_cache().await;
             let obj = Object::new(0, vec![42]);
 
-            let meta = cache
-                .put_with_id(
-                    "app/session".to_string(),
-                    Some("custom-id".to_string()),
-                    obj,
-                )
-                .await
+            let key = ObjectKey::from_path("app/session")
+                .unwrap()
+                .with_object_id("custom-id".to_string())
                 .unwrap();
+            let meta = cache.put(key, obj).await.unwrap();
 
             assert_eq!(meta.key, "app/session/custom-id");
         }
@@ -1416,55 +1537,37 @@ mod tests {
         #[tokio::test]
         async fn get_returns_not_found_for_missing_key() {
             let cache = create_test_cache().await;
-            let result = cache.get("app/session/nonexistent".to_string()).await;
+            let key = ObjectKey::try_from("app/session/nonexistent").unwrap();
+            let result = cache.get(&key).await;
             assert!(result.is_err());
         }
 
         #[tokio::test]
         async fn get_rejects_invalid_key() {
-            let cache = create_test_cache().await;
-            let result = cache.get("../invalid".to_string()).await;
-            assert!(result.is_err());
-        }
-
-        #[tokio::test]
-        async fn update_replaces_object() {
-            let cache = create_test_cache().await;
-            let obj1 = Object::new(1, vec![1, 2, 3]);
-
-            let meta = cache.put("app/session".to_string(), obj1).await.unwrap();
-
-            let obj2 = Object::new(2, vec![4, 5, 6, 7]);
-            let updated_meta = cache.update(meta.key.clone(), obj2).await.unwrap();
-
-            assert_eq!(updated_meta.size, 4);
-
-            let retrieved = cache.get(meta.key).await.unwrap();
-            assert_eq!(retrieved.version, 2);
-            assert_eq!(retrieved.data, vec![4, 5, 6, 7]);
+            let _cache = create_test_cache().await;
+            let key = ObjectKey::try_from("../invalid");
+            assert!(key.is_err());
         }
 
         #[tokio::test]
         async fn delete_removes_session_objects() {
             let cache = create_test_cache().await;
 
+            let key = ObjectKey::from_path("app/session-to-delete").unwrap();
             cache
-                .put("app/session-to-delete".to_string(), Object::new(0, vec![1]))
+                .put(key.clone(), Object::new(0, vec![1]))
                 .await
                 .unwrap();
             cache
-                .put("app/session-to-delete".to_string(), Object::new(0, vec![2]))
-                .await
-                .unwrap();
-            cache
-                .put("app/other-session".to_string(), Object::new(0, vec![3]))
+                .put(key.clone(), Object::new(0, vec![2]))
                 .await
                 .unwrap();
 
-            cache
-                .delete("app/session-to-delete".to_string())
-                .await
-                .unwrap();
+            let other_key = ObjectKey::from_path("app/other-session").unwrap();
+            cache.put(other_key, Object::new(0, vec![3])).await.unwrap();
+
+            let delete_key = ObjectKey::from_path("app/session-to-delete").unwrap();
+            cache.delete(&delete_key).await.unwrap();
 
             let all = cache.list_all().await.unwrap();
             assert_eq!(all.len(), 1);
@@ -1475,14 +1578,11 @@ mod tests {
         async fn list_all_returns_all_metadata() {
             let cache = create_test_cache().await;
 
-            cache
-                .put("app/s1".to_string(), Object::new(0, vec![1]))
-                .await
-                .unwrap();
-            cache
-                .put("app/s2".to_string(), Object::new(0, vec![2]))
-                .await
-                .unwrap();
+            let key1 = ObjectKey::from_path("app/s1").unwrap();
+            cache.put(key1, Object::new(0, vec![1])).await.unwrap();
+
+            let key2 = ObjectKey::from_path("app/s2").unwrap();
+            cache.put(key2, Object::new(0, vec![2])).await.unwrap();
 
             let all = cache.list_all().await.unwrap();
             assert_eq!(all.len(), 2);
@@ -1490,35 +1590,72 @@ mod tests {
 
         #[tokio::test]
         async fn put_rejects_invalid_key_prefix() {
-            let cache = create_test_cache().await;
-            let result = cache
-                .put("../bad".to_string(), Object::new(0, vec![]))
-                .await;
-            assert!(result.is_err());
+            let key = ObjectKey::from_path("../bad");
+            assert!(key.is_err());
         }
 
         #[tokio::test]
-        async fn put_with_id_rejects_invalid_object_id() {
-            let cache = create_test_cache().await;
-            let result = cache
-                .put_with_id(
-                    "app/session".to_string(),
-                    Some("../bad".to_string()),
-                    Object::new(0, vec![]),
-                )
-                .await;
+        async fn put_rejects_invalid_object_id() {
+            let key = ObjectKey::from_path("app/session").unwrap();
+            let result = key.with_object_id("../bad".to_string());
             assert!(result.is_err());
         }
 
         #[tokio::test]
         async fn create_metadata_includes_endpoint() {
             let cache = create_test_cache().await;
-            let meta = cache.create_metadata("app/session/key".to_string(), 100, 5);
+            let meta = cache.create_metadata("app/session/key".to_string(), 1, 100, 5);
 
             assert_eq!(meta.key, "app/session/key");
+            assert_eq!(meta.version, 1);
             assert_eq!(meta.size, 100);
             assert_eq!(meta.delta_count, 5);
             assert!(meta.endpoint.contains("localhost:9090"));
+        }
+    }
+
+    mod versioning {
+        use super::*;
+
+        async fn create_test_cache() -> ObjectCache {
+            let endpoint = CacheEndpoint {
+                scheme: "grpc".to_string(),
+                host: "localhost".to_string(),
+                port: 9090,
+            };
+            let storage = crate::storage::connect("none").await.unwrap();
+            ObjectCache::new(endpoint, storage, None).unwrap()
+        }
+
+        #[tokio::test]
+        async fn put_initializes_version_to_one() {
+            let cache = create_test_cache().await;
+            let obj = Object::new(0, vec![1, 2, 3]);
+
+            let key = ObjectKey::from_path("test-app/test-session").unwrap();
+            let meta = cache.put(key, obj).await.unwrap();
+
+            assert_eq!(meta.version, 1);
+
+            let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
+            let retrieved = cache.get(&key).await.unwrap();
+            assert_eq!(retrieved.version, 1);
+        }
+
+        #[tokio::test]
+        async fn version_persists_after_get() {
+            let cache = create_test_cache().await;
+            let obj = Object::new(0, vec![1, 2, 3]);
+
+            let key = ObjectKey::from_path("app/session").unwrap();
+            let meta = cache.put(key, obj).await.unwrap();
+
+            let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
+            let retrieved1 = cache.get(&key).await.unwrap();
+            assert_eq!(retrieved1.version, 1);
+
+            let retrieved2 = cache.get(&key).await.unwrap();
+            assert_eq!(retrieved2.version, 1);
         }
     }
 

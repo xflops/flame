@@ -11,6 +11,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from .cache import ObjectRef, get_object, put_object, update_object
+from flamepy.core.cache import (
+    ObjectRef,
+    delete_objects,
+    get_object,
+    patch_object,
+    put_object,
+    update_object,
+)
 
-__all__ = ["get_object", "put_object", "update_object", "ObjectRef"]
+__all__ = [
+    "ObjectRef",
+    "delete_objects",
+    "get_object",
+    "patch_object",
+    "put_object",
+    "update_object",
+]

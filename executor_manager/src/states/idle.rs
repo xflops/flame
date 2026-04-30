@@ -109,6 +109,7 @@ impl State for IdleState {
                         e
                     );
                     last_error = Some(e);
+
                     if attempt < ON_SESSION_ENTER_MAX_RETRIES {
                         let delay = (attempt * attempt) as u64 * ON_SESSION_ENTER_RETRY_DELAY_SECS;
                         tracing::debug!("Retrying in {} seconds...", delay);
@@ -119,12 +120,18 @@ impl State for IdleState {
         }
 
         if let Some(e) = last_error {
-            tracing::error!(
-                "on_session_enter failed after {} retries: {}",
-                ON_SESSION_ENTER_MAX_RETRIES,
+            tracing::warn!(
+                "Executor <{}> failed to enter session <{}>: {}, transitioning to unbinding state",
+                &self.executor.id,
+                &ssn.session_id,
                 e
             );
-            return Err(e);
+
+            self.executor.session = Some(ssn.clone());
+            self.executor.shim_instance = Some(shim_ptr.clone());
+            self.executor.state = ExecutorState::Unbinding;
+
+            return Ok(self.executor.clone());
         }
 
         self.client
