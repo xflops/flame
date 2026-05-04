@@ -102,6 +102,8 @@ struct SessionMetadata {
     pub max_instances: Option<u32>,
     #[serde(default = "default_batch_size")]
     pub batch_size: u32,
+    #[serde(default)]
+    pub priority: u32,
     pub common_data_len: u64,
 }
 
@@ -760,6 +762,7 @@ impl FilesystemEngine {
             min_instances: meta.min_instances,
             max_instances: meta.max_instances,
             batch_size: meta.batch_size.max(1),
+            priority: meta.priority,
         })
     }
 
@@ -1005,6 +1008,7 @@ impl Engine for FilesystemEngine {
             min_instances: attr.min_instances,
             max_instances: attr.max_instances,
             batch_size: attr.batch_size.max(1),
+            priority: attr.priority,
             common_data_len,
         };
 
@@ -1810,6 +1814,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         };
 
         let session = engine.create_session(ssn_attr).await.unwrap();
@@ -1875,6 +1880,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         };
         engine.create_session(ssn_attr).await.unwrap();
 
@@ -2012,6 +2018,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         };
 
         engine.create_session(ssn_attr.clone()).await.unwrap();
@@ -2055,6 +2062,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         };
         engine.create_session(ssn_attr).await.unwrap();
 
@@ -2115,6 +2123,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         };
         engine.create_session(ssn_attr).await.unwrap();
 

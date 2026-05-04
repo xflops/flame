@@ -806,10 +806,18 @@ impl Storage {
         {
             Ok(task) => task,
             Err(FlameError::NotFound(_)) => {
-                let mut task_ptr = lock_ptr!(task)?;
-                task_ptr.state = task_state;
-                task_ptr.version += 1;
-                task_ptr.clone()
+                // Clone first without mutating the Arc in self.tasks.
+                // Mutating in-place would advance the version on the shared Arc,
+                // causing update_task() to see equal versions and skip tasks_index update.
+                let current = {
+                    let task_guard = lock_ptr!(task)?;
+                    task_guard.clone()
+                };
+                common::apis::Task {
+                    state: task_state,
+                    version: current.version + 1,
+                    ..current
+                }
             }
             Err(e) => return Err(e),
         };
@@ -858,12 +866,20 @@ impl Storage {
         {
             Ok(task) => task,
             Err(FlameError::NotFound(_)) => {
-                let mut task_ptr = lock_ptr!(task)?;
-                task_ptr.state = task_state;
-                task_ptr.version += 1;
-                task_ptr.completion_time = Some(Utc::now());
-                task_ptr.output = task_output;
-                task_ptr.clone()
+                // Clone first without mutating the Arc in self.tasks.
+                // Mutating in-place would advance the version on the shared Arc,
+                // causing update_task() to see equal versions and skip tasks_index update.
+                let current = {
+                    let task_guard = lock_ptr!(task)?;
+                    task_guard.clone()
+                };
+                common::apis::Task {
+                    state: task_state,
+                    version: current.version + 1,
+                    completion_time: Some(Utc::now()),
+                    output: task_output,
+                    ..current
+                }
             }
             Err(e) => return Err(e),
         };

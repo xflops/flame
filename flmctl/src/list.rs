@@ -77,7 +77,8 @@ async fn list_session(conn: Connection) -> Result<(), Box<dyn Error>> {
     let mut ssn_list = conn.list_session().await?;
     let mut table = Table::new();
     table.load_preset(NOTHING).set_header(vec![
-        "ID", "State", "App", "Slots", "Pending", "Running", "Succeed", "Failed", "Created",
+        "ID", "State", "App", "Slots", "Priority", "Pending", "Running", "Succeed", "Failed",
+        "Created",
     ]);
 
     ssn_list.sort_by(|l, r| {
@@ -98,6 +99,7 @@ async fn list_session(conn: Connection) -> Result<(), Box<dyn Error>> {
             ssn.state.to_string(),
             ssn.application.to_string(),
             ssn.slots.to_string(),
+            ssn.priority.to_string(),
             ssn.pending.to_string(),
             ssn.running.to_string(),
             ssn.succeed.to_string(),

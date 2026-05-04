@@ -196,10 +196,11 @@ impl SqliteEngine {
         attr: SessionAttributes,
     ) -> Result<Session, FlameError> {
         let common_data: Option<Vec<u8>> = attr.common_data.map(Bytes::into);
-        let sql = r#"INSERT INTO sessions (id, application, slots, common_data, creation_time, state, min_instances, max_instances)
+        let sql = r#"INSERT INTO sessions (id, application, slots, common_data, creation_time, state, min_instances, max_instances, priority)
             VALUES (
                 ?,
                 (SELECT name FROM applications WHERE name=? AND state=?),
+                ?,
                 ?,
                 ?,
                 ?,
@@ -218,6 +219,7 @@ impl SqliteEngine {
             .bind(SessionState::Open as i32)
             .bind(attr.min_instances as i64)
             .bind(attr.max_instances.map(|v| v as i64))
+            .bind(attr.priority as i64)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;
@@ -1174,6 +1176,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         }))?;
         assert_eq!(ssn_1.id, ssn_1_id);
         assert_eq!(ssn_1.application, "flmexec");
@@ -1278,6 +1281,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         }))?;
         assert_eq!(ssn_1.id, ssn_1_id);
         assert_eq!(ssn_1.application, "flmexec");
@@ -1590,6 +1594,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         }))?;
 
         assert_eq!(ssn_1.id, ssn_1_id);
@@ -1642,6 +1647,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         }))?;
 
         assert_eq!(ssn_1.id, ssn_1_id);
@@ -1677,6 +1683,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         }))?;
 
         assert_eq!(ssn_2.id, ssn_2_id);
@@ -1730,6 +1737,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         }))?;
 
         assert_eq!(ssn_1.id, ssn_1_id);
@@ -1770,6 +1778,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         }))?;
 
         assert_eq!(ssn_1.status.state, SessionState::Open);
@@ -1802,6 +1811,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         }))?;
 
         assert_eq!(ssn_1.id, ssn_1_id);
@@ -1843,6 +1853,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         }))?;
 
         assert_eq!(ssn_1.id, ssn_1_id);

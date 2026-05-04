@@ -118,6 +118,12 @@ impl Session {
                 self.id, self.batch_size, attr.batch_size
             )));
         }
+        if self.priority != attr.priority {
+            return Err(FlameError::InvalidConfig(format!(
+                "session <{}> spec mismatch: priority differs (expected {}, got {})",
+                self.id, self.priority, attr.priority
+            )));
+        }
         Ok(())
     }
 }

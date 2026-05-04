@@ -142,6 +142,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size,
+            priority: 0,
         })
     }
 

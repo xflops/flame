@@ -21,6 +21,7 @@ pub async fn run(
     app: &str,
     slots: &u32,
     batch_size: &u32,
+    priority: &u32,
 ) -> Result<(), Box<dyn Error>> {
     let current_ctx = ctx.get_current_context()?;
     let conn = flame::client::connect_with_tls(
@@ -36,6 +37,7 @@ pub async fn run(
         min_instances: 0,
         max_instances: None,
         batch_size: *batch_size,
+        priority: *priority,
     };
 
     let ssn = conn.create_session(&attr).await?;

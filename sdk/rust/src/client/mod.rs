@@ -119,6 +119,8 @@ pub struct SessionAttributes {
     pub max_instances: Option<u32>,
     #[serde(default = "default_batch_size")]
     pub batch_size: u32,
+    #[serde(default)]
+    pub priority: u32,
 }
 
 fn default_batch_size() -> u32 {
@@ -208,6 +210,7 @@ pub struct Session {
 
     pub events: Vec<Event>,
     pub tasks: Option<Vec<Task>>,
+    pub priority: u32,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -263,6 +266,7 @@ impl Connection {
                 min_instances: attrs.min_instances,
                 max_instances: attrs.max_instances,
                 batch_size: attrs.batch_size.max(1),
+                priority: attrs.priority,
             }),
         };
 
@@ -312,6 +316,7 @@ impl Connection {
             min_instances: attrs.min_instances,
             max_instances: attrs.max_instances,
             batch_size: attrs.batch_size.max(1),
+            priority: attrs.priority,
         });
 
         let open_ssn_req = OpenSessionRequest {
@@ -663,6 +668,7 @@ impl TryFrom<&rpc::Session> for Session {
             failed: status.failed,
             events,
             tasks: None,
+            priority: spec.priority,
         })
     }
 }

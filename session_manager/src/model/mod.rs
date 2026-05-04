@@ -127,6 +127,7 @@ pub struct SessionInfo {
     pub min_instances: u32,
     pub max_instances: Option<u32>,
     pub batch_size: u32,
+    pub priority: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -231,6 +232,7 @@ impl From<&Session> for SessionInfo {
             min_instances: ssn.min_instances,
             max_instances: ssn.max_instances,
             batch_size: ssn.batch_size.max(1),
+            priority: ssn.priority,
         }
     }
 }
@@ -934,6 +936,7 @@ mod tests {
             min_instances: 0,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         })
     }
 

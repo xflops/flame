@@ -190,6 +190,7 @@ mod tests {
                 min_instances: 0,
                 max_instances: None,
                 batch_size: 1,
+                priority: 0,
             }))?;
 
         for _ in 0..task_num {

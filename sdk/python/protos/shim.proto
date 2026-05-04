@@ -13,6 +13,7 @@ message ApplicationContext {
     optional string command = 4;
     optional string working_directory = 5;
     optional string url = 6;
+    optional string installer = 7;
 }
 
 message SessionContext {

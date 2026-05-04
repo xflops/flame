@@ -190,6 +190,7 @@ impl Engine for NoneEngine {
             min_instances: attr.min_instances,
             max_instances: attr.max_instances,
             batch_size: attr.batch_size.max(1),
+            priority: attr.priority,
             status: SessionStatus {
                 state: SessionState::Open,
             },
@@ -354,6 +355,7 @@ mod tests {
             min_instances: 1,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         };
 
         let session = engine.create_session(attr).await.unwrap();
@@ -391,6 +393,7 @@ mod tests {
             min_instances: 1,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         };
         engine.create_session(attr).await.unwrap();
 
@@ -425,6 +428,7 @@ mod tests {
             min_instances: 1,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         };
         engine.create_session(attr1).await.unwrap();
 
@@ -436,6 +440,7 @@ mod tests {
             min_instances: 1,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         };
         engine.create_session(attr2).await.unwrap();
 
@@ -470,6 +475,7 @@ mod tests {
             min_instances: 1,
             max_instances: None,
             batch_size: 1,
+            priority: 0,
         };
         engine.create_session(attr.clone()).await.unwrap();
 
