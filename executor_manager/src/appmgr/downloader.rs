@@ -18,6 +18,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
+use tonic::transport::ClientTlsConfig;
 
 use common::FlameError;
 
@@ -108,11 +109,22 @@ impl PackageDownloader for HttpDownloader {
 
 pub struct GrpcDownloader {
     connect_timeout: Duration,
+    tls_config: Option<ClientTlsConfig>,
 }
 
 impl GrpcDownloader {
     pub fn new(connect_timeout: Duration) -> Self {
-        Self { connect_timeout }
+        Self {
+            connect_timeout,
+            tls_config: None,
+        }
+    }
+
+    pub fn with_tls(connect_timeout: Duration, tls_config: ClientTlsConfig) -> Self {
+        Self {
+            connect_timeout,
+            tls_config: Some(tls_config),
+        }
     }
 }
 
@@ -129,20 +141,32 @@ impl PackageDownloader for GrpcDownloader {
             .ok_or_else(|| FlameError::InvalidConfig("missing host in grpc URL".to_string()))?;
         let port = url.port().unwrap_or(9090);
 
-        let endpoint = if url.scheme() == "grpcs" {
-            format!("https://{}:{}", host, port)
-        } else {
-            format!("http://{}:{}", host, port)
-        };
-
         let key = url.path().trim_start_matches('/');
 
-        let channel = Channel::from_shared(endpoint)
-            .map_err(|e| FlameError::Internal(format!("invalid endpoint: {}", e)))?
-            .connect_timeout(self.connect_timeout)
-            .connect()
-            .await
-            .map_err(|e| FlameError::Internal(format!("failed to connect to cache: {}", e)))?;
+        let channel = if url.scheme() == "grpcs" {
+            let endpoint = format!("https://{}:{}", host, port);
+            let mut channel_builder = Channel::from_shared(endpoint)
+                .map_err(|e| FlameError::Internal(format!("invalid endpoint: {}", e)))?
+                .connect_timeout(self.connect_timeout);
+
+            if let Some(ref tls_config) = self.tls_config {
+                channel_builder = channel_builder
+                    .tls_config(tls_config.clone())
+                    .map_err(|e| FlameError::Internal(format!("TLS config error: {}", e)))?;
+            }
+
+            channel_builder.connect().await.map_err(|e| {
+                FlameError::Internal(format!("failed to connect to cache (TLS): {}", e))
+            })?
+        } else {
+            let endpoint = format!("http://{}:{}", host, port);
+            Channel::from_shared(endpoint)
+                .map_err(|e| FlameError::Internal(format!("invalid endpoint: {}", e)))?
+                .connect_timeout(self.connect_timeout)
+                .connect()
+                .await
+                .map_err(|e| FlameError::Internal(format!("failed to connect to cache: {}", e)))?
+        };
 
         let mut client = FlightClient::new(channel);
 
@@ -205,6 +229,10 @@ pub struct DownloaderRegistry {
 
 impl DownloaderRegistry {
     pub fn new() -> Self {
+        Self::new_with_tls(None)
+    }
+
+    pub fn new_with_tls(tls_config: Option<ClientTlsConfig>) -> Self {
         let mut downloaders: HashMap<String, Box<dyn PackageDownloader>> = HashMap::new();
 
         downloaders.insert("file".to_string(), Box::new(FileDownloader));
@@ -216,9 +244,15 @@ impl DownloaderRegistry {
             "https".to_string(),
             Box::new(HttpDownloader::new(Duration::from_secs(HTTP_TIMEOUT_SECS))),
         );
+
         let grpc_downloader = GrpcDownloader::new(Duration::from_secs(GRPC_CONNECT_TIMEOUT_SECS));
         downloaders.insert("grpc".to_string(), Box::new(grpc_downloader));
-        let grpcs_downloader = GrpcDownloader::new(Duration::from_secs(GRPC_CONNECT_TIMEOUT_SECS));
+
+        let grpcs_downloader = if let Some(tls) = tls_config {
+            GrpcDownloader::with_tls(Duration::from_secs(GRPC_CONNECT_TIMEOUT_SECS), tls)
+        } else {
+            GrpcDownloader::new(Duration::from_secs(GRPC_CONNECT_TIMEOUT_SECS))
+        };
         downloaders.insert("grpcs".to_string(), Box::new(grpcs_downloader));
 
         Self { downloaders }

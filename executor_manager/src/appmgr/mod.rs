@@ -30,6 +30,7 @@ use flate2::read::GzDecoder;
 use stdng::{lock_ptr, MutexPtr};
 use tar::Archive;
 use tokio::sync::RwLock;
+use tonic::transport::ClientTlsConfig;
 
 use common::apis::ApplicationContext;
 use common::FlameError;
@@ -72,6 +73,10 @@ pub struct ApplicationManager {
 
 impl ApplicationManager {
     pub fn new() -> Result<Self, FlameError> {
+        Self::new_with_tls(None)
+    }
+
+    pub fn new_with_tls(tls_config: Option<ClientTlsConfig>) -> Result<Self, FlameError> {
         let flame_home = env::var("FLAME_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/opt/flame"));
@@ -79,7 +84,7 @@ impl ApplicationManager {
         Ok(Self {
             apps: Arc::new(std::sync::Mutex::new(HashMap::new())),
             flame_home,
-            downloader: DownloaderRegistry::new(),
+            downloader: DownloaderRegistry::new_with_tls(tls_config),
         })
     }
 
