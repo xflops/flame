@@ -11,31 +11,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod downloader;
 mod installer;
 mod python;
 
+pub use downloader::{DownloaderRegistry, PackageDownloader};
 pub use installer::{Installer, InstallerType};
 pub use python::PythonInstaller;
 
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
-use futures_util::StreamExt;
 use stdng::{lock_ptr, MutexPtr};
 use tar::Archive;
 use tokio::sync::RwLock;
 
 use common::apis::ApplicationContext;
 use common::FlameError;
-
-const HTTP_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum InstallState {
@@ -70,6 +67,7 @@ impl AppInstaller {
 pub struct ApplicationManager {
     apps: MutexPtr<HashMap<String, Arc<RwLock<AppInstaller>>>>,
     flame_home: PathBuf,
+    downloader: DownloaderRegistry,
 }
 
 impl ApplicationManager {
@@ -81,6 +79,7 @@ impl ApplicationManager {
         Ok(Self {
             apps: Arc::new(std::sync::Mutex::new(HashMap::new())),
             flame_home,
+            downloader: DownloaderRegistry::new(),
         })
     }
 
@@ -290,69 +289,7 @@ impl ApplicationManager {
             return Ok(package_path);
         }
 
-        match parsed_url.scheme() {
-            "file" => {
-                let src_path = parsed_url
-                    .to_file_path()
-                    .map_err(|_| FlameError::InvalidConfig(format!("invalid file url: {}", url)))?;
-                fs::copy(&src_path, &package_path).map_err(|e| {
-                    FlameError::Internal(format!(
-                        "failed to copy package from {}: {}",
-                        src_path.display(),
-                        e
-                    ))
-                })?;
-            }
-            "http" | "https" => {
-                let client = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-                    .build()
-                    .map_err(|e| {
-                        FlameError::Internal(format!("failed to create HTTP client: {}", e))
-                    })?;
-
-                let response = client.get(url).send().await.map_err(|e| {
-                    FlameError::Internal(format!("failed to download package: {}", e))
-                })?;
-
-                if !response.status().is_success() {
-                    return Err(FlameError::Internal(format!(
-                        "failed to download package: HTTP {}",
-                        response.status()
-                    )));
-                }
-
-                let temp_path = download_dir.join(format!("{}.tmp", filename));
-                let mut file = fs::File::create(&temp_path).map_err(|e| {
-                    FlameError::Internal(format!("failed to create temp file: {}", e))
-                })?;
-
-                let mut stream = response.bytes_stream();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(|e| {
-                        FlameError::Internal(format!("failed to read response chunk: {}", e))
-                    })?;
-                    file.write_all(&chunk).map_err(|e| {
-                        FlameError::Internal(format!("failed to write to temp file: {}", e))
-                    })?;
-                }
-
-                file.sync_all().map_err(|e| {
-                    FlameError::Internal(format!("failed to sync temp file: {}", e))
-                })?;
-                drop(file);
-
-                fs::rename(&temp_path, &package_path).map_err(|e| {
-                    FlameError::Internal(format!("failed to rename temp file: {}", e))
-                })?;
-            }
-            scheme => {
-                return Err(FlameError::InvalidConfig(format!(
-                    "unsupported url scheme: {}",
-                    scheme
-                )));
-            }
-        }
+        self.downloader.download(url, &package_path).await?;
 
         tracing::info!("Downloaded package to: {}", package_path.display());
         Ok(package_path)

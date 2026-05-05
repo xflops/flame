@@ -279,11 +279,83 @@ class HttpStorage(StorageBackend):
             raise FlameError(FlameErrorCode.INTERNAL, f"Failed to download package from HTTP storage: {str(e)}")
 
 
-def create_storage_backend(storage_base: str) -> StorageBackend:
+class CacheStorage(StorageBackend):
+    """Storage backend using flame-object-cache via gRPC."""
+
+    def __init__(self, storage_base: str | None = None, app_name: str | None = None):
+        from flamepy.core.types import FlameClientCache, FlameContext
+
+        self._app_name = app_name
+
+        if storage_base is not None:
+            parsed_url = urlparse(storage_base)
+            if parsed_url.scheme not in ("grpc", "grpcs"):
+                raise FlameError(FlameErrorCode.INVALID_CONFIG, f"Invalid cache storage URL: {storage_base}")
+            self._scheme = parsed_url.scheme
+            self._host = parsed_url.hostname or "localhost"
+            self._port = parsed_url.port or 9090
+        else:
+            context = FlameContext()
+            if context.cache is None:
+                raise FlameError(FlameErrorCode.INVALID_CONFIG, "Cache not configured")
+
+            if isinstance(context.cache, FlameClientCache):
+                cache_endpoint = context.cache.endpoint
+            else:
+                cache_endpoint = context.cache if isinstance(context.cache, str) else context.cache.get("endpoint")
+
+            if not cache_endpoint:
+                raise FlameError(FlameErrorCode.INVALID_CONFIG, "Cache endpoint not configured")
+
+            parsed = urlparse(cache_endpoint)
+            self._scheme = parsed.scheme
+            self._host = parsed.hostname or "localhost"
+            self._port = parsed.port or 9090
+
+        self._endpoint = f"{self._scheme}://{self._host}:{self._port}"
+
+    def upload(self, local_path: str, filename: str) -> str:
+        from flamepy.core.cache import upload_object
+
+        if not self._app_name:
+            raise FlameError(FlameErrorCode.INVALID_CONFIG, "app_name is required for upload")
+
+        try:
+            key = f"{self._app_name}/pkg/{filename}"
+            ref = upload_object(key, local_path)
+            url = f"{self._scheme}://{self._host}:{self._port}/{ref.key}"
+            logger.debug(f"Uploaded package to cache: {url}")
+            return url
+        except Exception as e:
+            raise FlameError(FlameErrorCode.INTERNAL, f"Failed to upload package to cache: {str(e)}")
+
+    def download(self, filename: str, local_path: str) -> None:
+        from flamepy.core.cache import ObjectRef, download_object
+
+        try:
+            ref = ObjectRef(endpoint=self._endpoint, key=filename, version=0)
+            download_object(ref, local_path)
+            logger.debug(f"Downloaded package from cache: {filename} -> {local_path}")
+        except Exception as e:
+            raise FlameError(FlameErrorCode.INTERNAL, f"Failed to download package from cache: {str(e)}")
+
+    def delete(self, filename: str) -> None:
+        from flamepy.core.cache import delete_objects
+
+        try:
+            delete_objects(filename)
+            logger.debug(f"Deleted package from cache: {filename}")
+        except Exception as e:
+            logger.warning(f"Error deleting package from cache: {e}")
+
+
+def create_storage_backend(storage_base: str | None = None, app_name: str | None = None) -> StorageBackend:
     """Create a storage backend instance based on the storage URL scheme.
 
     Args:
-        storage_base: Storage base URL (e.g., "file:///path" or "http://host/path")
+        storage_base: Storage base URL (e.g., "file:///path" or "http://host/path").
+                      If None, uses CacheStorage with cache.endpoint from FlameContext.
+        app_name: Application name, required for CacheStorage upload.
 
     Returns:
         StorageBackend instance
@@ -291,14 +363,19 @@ def create_storage_backend(storage_base: str) -> StorageBackend:
     Raises:
         FlameError: If the storage scheme is not supported
     """
+    if storage_base is None:
+        return CacheStorage(app_name=app_name)
+
     parsed_url = urlparse(storage_base)
 
     if parsed_url.scheme == "file":
         return FileStorage(storage_base)
     elif parsed_url.scheme in ("http", "https"):
         return HttpStorage(storage_base)
+    elif parsed_url.scheme in ("grpc", "grpcs"):
+        return CacheStorage(storage_base, app_name=app_name)
     else:
         raise FlameError(
             FlameErrorCode.INVALID_CONFIG,
-            f"Unsupported storage scheme: {parsed_url.scheme}. Supported schemes: file://, http://, https://",
+            f"Unsupported storage scheme: {parsed_url.scheme}. Supported: file://, http://, https://, grpc://, grpcs://",
         )

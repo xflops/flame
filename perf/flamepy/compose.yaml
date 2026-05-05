@@ -36,16 +36,6 @@ services:
     networks:
       - flame-network
 
-  flame-package-storage:
-    image: sigoden/dufs:v0.43.0
-    command: ["/data", "-A"]
-    volumes:
-      - flame-packages:/data
-    ports:
-      - "5050:5000"
-    networks:
-      - flame-network
-
   flame-console:
     image: xflops/flame-console:latest
     container_name: flame-console
@@ -55,7 +45,6 @@ services:
       - RUST_LOG=info
     depends_on:
       - flame-session-manager
-      - flame-package-storage
     volumes:
       - ./conf/flame.yaml:/root/.flame/flame.yaml
       - ./conf/certs:/etc/flame/certs:ro
@@ -71,6 +60,5 @@ networks:
         - subnet: 172.20.0.0/24
 
 volumes:
-  flame-packages:
   flame-work:
   flame-cache-storage:

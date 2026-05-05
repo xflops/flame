@@ -7,7 +7,6 @@ contexts:
     cache:
       endpoint: "grpc://127.0.0.1:9090"
     package:
-      storage: "http://127.0.0.1:5050"
       excludes:
         - "*.log"
         - "*.pkl"
