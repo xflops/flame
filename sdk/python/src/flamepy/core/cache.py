@@ -667,11 +667,12 @@ def upload_object(key_or_prefix: str, file_path: str) -> ObjectRef:
 
     client = _get_flight_client(cache_endpoint, cache_tls)
     descriptor = flight.FlightDescriptor.for_path(key_or_prefix)
+    options = flight.FlightCallOptions(timeout=300)
 
     file_size = os.path.getsize(file_path)
     writer = None
     try:
-        writer, reader = client.do_put(descriptor, schema)
+        writer, reader = client.do_put(descriptor, schema, options)
 
         with open(file_path, "rb") as f:
             while True:

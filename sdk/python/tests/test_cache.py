@@ -275,7 +275,7 @@ class TestUploadDownloadObject:
                 return None
 
         class MockFlightClient:
-            def do_put(self, descriptor, schema):
+            def do_put(self, descriptor, schema, options=None):
                 nonlocal uploaded_key
                 uploaded_key = "/".join(p.decode() if isinstance(p, bytes) else p for p in descriptor.path)
                 return MockWriter(), MockReader()
@@ -323,7 +323,7 @@ class TestUploadDownloadObject:
                 return None
 
         class MockFlightClient:
-            def do_put(self, descriptor, schema):
+            def do_put(self, descriptor, schema, options=None):
                 nonlocal uploaded_key
                 uploaded_key = "/".join(p.decode() if isinstance(p, bytes) else p for p in descriptor.path)
                 return MockWriter(), MockReader()
