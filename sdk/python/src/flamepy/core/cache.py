@@ -13,8 +13,6 @@ limitations under the License.
 
 import logging
 import threading
-
-logger = logging.getLogger(__name__)
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -26,6 +24,8 @@ import pyarrow as pa
 import pyarrow.flight as flight
 
 from flamepy.core.types import FlameClientCache, FlameClientTls, FlameContext
+
+logger = logging.getLogger(__name__)
 
 Deserializer = Callable[[Any, List[Any]], Any]
 
@@ -605,3 +605,149 @@ def delete_objects(key_prefix: str) -> None:
         app_prefix = f"{key_prefix}/"
 
     _cache_remove_prefix(app_prefix)
+
+
+_UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
+
+
+def upload_object(key_or_prefix: str, file_path: str) -> ObjectRef:
+    """Upload a file to the cache using do_put with streaming.
+
+    Args:
+        key_or_prefix: Either full key (e.g., "myapp/pkg/myapp-1.0.0.tar.gz")
+                       or key prefix (e.g., "myapp/pkg"). If prefix, server
+                       generates a UUID for the object_id.
+        file_path: Path to the local file to upload
+
+    Returns:
+        ObjectRef pointing to the uploaded file
+
+    Raises:
+        ValueError: If cache not configured or upload fails
+        FileNotFoundError: If file_path does not exist
+    """
+    import os
+
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    parts = key_or_prefix.split("/")
+    if len(parts) == 2:
+        ObjectKey.from_prefix(key_or_prefix)
+    elif len(parts) == 3:
+        ObjectKey.from_key(key_or_prefix)
+    else:
+        raise ValueError(f"Invalid key format: {key_or_prefix}")
+
+    context = FlameContext()
+    cache_config = context.cache
+
+    if cache_config is None:
+        raise ValueError("Cache configuration not found")
+
+    if isinstance(cache_config, str):
+        cache_endpoint = cache_config
+        cache_tls = None
+    elif isinstance(cache_config, FlameClientCache):
+        cache_endpoint = cache_config.endpoint
+        cache_tls = cache_config.tls
+    else:
+        cache_endpoint = cache_config.get("endpoint")
+        cache_tls = None
+
+    if not cache_endpoint:
+        raise ValueError("Cache endpoint not configured")
+
+    schema = pa.schema(
+        [
+            pa.field("version", pa.uint64()),
+            pa.field("data", pa.binary()),
+        ]
+    )
+
+    client = _get_flight_client(cache_endpoint, cache_tls)
+    descriptor = flight.FlightDescriptor.for_path(key_or_prefix)
+    options = flight.FlightCallOptions(timeout=300)
+
+    file_size = os.path.getsize(file_path)
+    writer = None
+    try:
+        writer, reader = client.do_put(descriptor, schema, options)
+
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(_UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+
+                batch = pa.RecordBatch.from_arrays(
+                    [pa.array([0], type=pa.uint64()), pa.array([chunk], type=pa.binary())],
+                    schema=schema,
+                )
+                writer.write_batch(batch)
+
+        writer.done_writing()
+
+        while True:
+            metadata_buffer = reader.read()
+            if metadata_buffer is None:
+                break
+            obj_ref_data = bson.decode(bytes(metadata_buffer))
+            ref = ObjectRef(
+                endpoint=obj_ref_data["endpoint"],
+                key=obj_ref_data["key"],
+                version=obj_ref_data["version"],
+            )
+            logger.debug(f"upload_object: key={ref.key}, version={ref.version}, size={file_size}")
+            return ref
+
+        raise ValueError("No result metadata received from cache server")
+    except Exception as e:
+        raise ValueError(f"Failed to upload file to cache server: {e}")
+    finally:
+        if writer is not None:
+            writer.close()
+
+
+def download_object(ref: ObjectRef, dest_path: str) -> None:
+    """Download a file from the cache using do_get with streaming.
+
+    Args:
+        ref: ObjectRef pointing to the cached file
+        dest_path: Local path to save the downloaded file
+
+    Raises:
+        ValueError: If object not found or download fails
+    """
+    import os
+
+    tls_config = _get_cache_tls_config()
+    client = _get_flight_client(ref.endpoint, tls_config)
+
+    ticket = flight.Ticket(f"{ref.key}:0".encode())
+    reader = client.do_get(ticket)
+
+    dest_dir = os.path.dirname(dest_path)
+    if dest_dir and not os.path.exists(dest_dir):
+        os.makedirs(dest_dir, exist_ok=True)
+
+    total_size = 0
+    try:
+        with open(dest_path, "wb") as f:
+            for batch in reader:
+                data_array = batch.column("data")
+                for i in range(len(data_array)):
+                    chunk = data_array[i].as_py()
+                    if chunk:
+                        f.write(chunk)
+                        total_size += len(chunk)
+
+        if total_size == 0:
+            os.remove(dest_path)
+            raise ValueError(f"Object not found: {ref.key}")
+
+        logger.debug(f"download_object: key={ref.key} -> {dest_path}, size={total_size}")
+    except Exception as e:
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+        raise ValueError(f"Failed to download file from cache server: {e}")

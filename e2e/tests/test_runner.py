@@ -31,10 +31,13 @@ from e2e.helpers import (
 
 @pytest.fixture(scope="module")
 def check_package_config():
-    """Check that package configuration is available."""
+    """Check that storage configuration is available (via package.storage or cache.endpoint)."""
     ctx = flamepy.FlameContext()
-    if ctx.package is None:
-        pytest.skip("Package configuration not set in flame.yaml. Please add 'package' section with 'storage' field.")
+    # Storage can come from either package.storage or cache.endpoint
+    has_package_storage = ctx.package is not None and getattr(ctx.package, 'storage', None) is not None
+    has_cache_endpoint = ctx.cache is not None
+    if not has_package_storage and not has_cache_endpoint:
+        pytest.skip("Storage configuration not set in flame.yaml. Please add 'cache.endpoint' or 'package.storage' section.")
     yield ctx.package
 
 
@@ -263,16 +266,14 @@ def test_flame_package_dataclass():
     assert pkg2.excludes == ["*.log", "*.tmp"]
 
 
-def test_runner_error_no_package_config():
-    """Test Case 13: Test Runner fails gracefully without package config."""
-    # Temporarily clear package config by creating a new context
-    # This test assumes the package config might not be set
-    # Skip if package config is available
+def test_runner_error_no_storage_config():
+    """Test Runner fails gracefully without storage config (no package.storage and no cache.endpoint)."""
     ctx = flamepy.FlameContext()
-    if ctx.package is not None:
-        pytest.skip("Package config is set, cannot test error case")
+    has_package_storage = ctx.package is not None and getattr(ctx.package, 'storage', None) is not None
+    has_cache_endpoint = ctx.cache is not None
+    if has_package_storage or has_cache_endpoint:
+        pytest.skip("Storage config is available (package.storage or cache.endpoint), cannot test error case")
 
-    # Try to use Runner without package config
     with pytest.raises(flamepy.FlameError) as exc_info:
         with runner.Runner("test-no-config"):
             pass

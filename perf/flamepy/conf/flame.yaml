@@ -10,5 +10,3 @@ contexts:
       endpoint: "grpc://flame-executor-manager:9090"
     #      tls:
     #        ca_file: "/etc/flame/certs/ca.crt"
-    package:
-      storage: "http://flame-package-storage:5000"

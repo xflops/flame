@@ -16,10 +16,12 @@ from .cache import (
     WILDCARD_SESSION,
     ObjectKey,
     ObjectRef,
+    download_object,
     get_object,
     patch_object,
     put_object,
     update_object,
+    upload_object,
 )
 
 # Client classes
@@ -163,8 +165,10 @@ __all__ = [
     "ObjectKey",
     "ObjectRef",
     # Cache functions
+    "download_object",
     "get_object",
     "patch_object",
     "put_object",
     "update_object",
+    "upload_object",
 ]

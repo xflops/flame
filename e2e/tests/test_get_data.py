@@ -45,10 +45,12 @@ from e2e.helpers import (
 
 @pytest.fixture(scope="module")
 def check_package_config():
-    """Check that package configuration is available."""
+    """Check that storage configuration is available (via package.storage or cache.endpoint)."""
     ctx = flamepy.FlameContext()
-    if ctx.package is None:
-        pytest.skip("Package configuration not set in flame.yaml.")
+    has_package_storage = ctx.package is not None and getattr(ctx.package, 'storage', None) is not None
+    has_cache_endpoint = ctx.cache is not None
+    if not has_package_storage and not has_cache_endpoint:
+        pytest.skip("Storage configuration not set in flame.yaml. Please add 'cache.endpoint' or 'package.storage' section.")
     yield ctx.package
 
 

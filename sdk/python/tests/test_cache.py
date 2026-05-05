@@ -1,7 +1,10 @@
 import threading
 
+import bson
+
 from flamepy.core.cache import (
     Object,
+    ObjectKey,
     ObjectRef,
     _cache_lock,
     _deserialize_object,
@@ -239,3 +242,209 @@ class TestDeleteObjects:
             assert cache_key2 not in _object_cache
             assert cache_key3 not in _object_cache
             assert cache_key4 in _object_cache
+
+
+class TestUploadDownloadObject:
+    def test_upload_object_with_full_key(self, monkeypatch, tmp_path):
+        from flamepy.core import cache as cache_module
+        from flamepy.core.types import FlameClientCache
+
+        test_file = tmp_path / "test.tar.gz"
+        test_file.write_bytes(b"test content")
+
+        uploaded_key = None
+
+        class MockWriter:
+            def write_batch(self, batch):
+                pass
+
+            def done_writing(self):
+                pass
+
+            def close(self):
+                pass
+
+        class MockReader:
+            def __init__(self):
+                self._read_count = 0
+
+            def read(self):
+                if self._read_count == 0:
+                    self._read_count += 1
+                    return bson.encode({"endpoint": "grpc://host:9090", "key": "myapp/pkg/test.tar.gz", "version": 1})
+                return None
+
+        class MockFlightClient:
+            def do_put(self, descriptor, schema, options=None):
+                nonlocal uploaded_key
+                uploaded_key = "/".join(p.decode() if isinstance(p, bytes) else p for p in descriptor.path)
+                return MockWriter(), MockReader()
+
+        class MockContext:
+            cache = FlameClientCache(endpoint="grpc://host:9090")
+
+        monkeypatch.setattr(cache_module, "FlameContext", lambda: MockContext())
+        monkeypatch.setattr(cache_module, "_get_flight_client", lambda ep, tls=None: MockFlightClient())
+
+        ref = cache_module.upload_object("myapp/pkg/test.tar.gz", str(test_file))
+
+        assert ref.key == "myapp/pkg/test.tar.gz"
+        assert ref.endpoint == "grpc://host:9090"
+        assert ref.version == 1
+        assert uploaded_key == "myapp/pkg/test.tar.gz"
+
+    def test_upload_object_with_prefix(self, monkeypatch, tmp_path):
+        from flamepy.core import cache as cache_module
+        from flamepy.core.types import FlameClientCache
+
+        test_file = tmp_path / "test.tar.gz"
+        test_file.write_bytes(b"test content")
+
+        uploaded_key = None
+
+        class MockWriter:
+            def write_batch(self, batch):
+                pass
+
+            def done_writing(self):
+                pass
+
+            def close(self):
+                pass
+
+        class MockReader:
+            def __init__(self):
+                self._read_count = 0
+
+            def read(self):
+                if self._read_count == 0:
+                    self._read_count += 1
+                    return bson.encode({"endpoint": "grpc://host:9090", "key": "myapp/pkg/generated-uuid", "version": 1})
+                return None
+
+        class MockFlightClient:
+            def do_put(self, descriptor, schema, options=None):
+                nonlocal uploaded_key
+                uploaded_key = "/".join(p.decode() if isinstance(p, bytes) else p for p in descriptor.path)
+                return MockWriter(), MockReader()
+
+        class MockContext:
+            cache = FlameClientCache(endpoint="grpc://host:9090")
+
+        monkeypatch.setattr(cache_module, "FlameContext", lambda: MockContext())
+        monkeypatch.setattr(cache_module, "_get_flight_client", lambda ep, tls=None: MockFlightClient())
+
+        ref = cache_module.upload_object("myapp/pkg", str(test_file))
+
+        assert ref.key == "myapp/pkg/generated-uuid"
+        assert uploaded_key == "myapp/pkg"
+
+    def test_upload_object_file_not_found(self):
+        import pytest
+
+        from flamepy.core import cache as cache_module
+
+        with pytest.raises(FileNotFoundError):
+            cache_module.upload_object("myapp/pkg/test.tar.gz", "/nonexistent/file.tar.gz")
+
+    def test_upload_object_invalid_key_format(self, tmp_path):
+        import pytest
+
+        from flamepy.core import cache as cache_module
+
+        test_file = tmp_path / "test.tar.gz"
+        test_file.write_bytes(b"test content")
+
+        with pytest.raises(ValueError, match="Invalid key format"):
+            cache_module.upload_object("invalid", str(test_file))
+
+        with pytest.raises(ValueError, match="Invalid key format"):
+            cache_module.upload_object("a/b/c/d", str(test_file))
+
+    def test_download_object(self, monkeypatch, tmp_path):
+        import pyarrow as pa
+
+        from flamepy.core import cache as cache_module
+
+        dest_file = tmp_path / "downloaded.tar.gz"
+        test_content = b"downloaded content"
+
+        class MockBatch:
+            def column(self, name):
+                if name == "data":
+                    return pa.array([test_content], type=pa.binary())
+                return pa.array([0], type=pa.uint64())
+
+        class MockReader:
+            def __iter__(self):
+                return iter([MockBatch()])
+
+        class MockFlightClient:
+            def do_get(self, ticket):
+                return MockReader()
+
+        monkeypatch.setattr(cache_module, "_get_cache_tls_config", lambda: None)
+        monkeypatch.setattr(cache_module, "_get_flight_client", lambda ep, tls=None: MockFlightClient())
+
+        ref = ObjectRef(endpoint="grpc://host:9090", key="myapp/pkg/test.tar.gz", version=0)
+        cache_module.download_object(ref, str(dest_file))
+
+        assert dest_file.exists()
+        assert dest_file.read_bytes() == test_content
+
+    def test_download_object_not_found(self, monkeypatch, tmp_path):
+        import pytest
+
+        from flamepy.core import cache as cache_module
+
+        dest_file = tmp_path / "downloaded.tar.gz"
+
+        class MockReader:
+            def __iter__(self):
+                return iter([])
+
+        class MockFlightClient:
+            def do_get(self, ticket):
+                return MockReader()
+
+        monkeypatch.setattr(cache_module, "_get_cache_tls_config", lambda: None)
+        monkeypatch.setattr(cache_module, "_get_flight_client", lambda ep, tls=None: MockFlightClient())
+
+        ref = ObjectRef(endpoint="grpc://host:9090", key="myapp/pkg/notfound.tar.gz", version=0)
+
+        with pytest.raises(ValueError, match="Failed to download"):
+            cache_module.download_object(ref, str(dest_file))
+
+        assert not dest_file.exists()
+
+
+class TestObjectKey:
+    def test_from_prefix_valid(self):
+        key = ObjectKey.from_prefix("myapp/pkg")
+        assert key.app_name == "myapp"
+        assert key.session_id == "pkg"
+        assert key.object_id is None
+
+    def test_from_key_valid(self):
+        key = ObjectKey.from_key("myapp/pkg/file.tar.gz")
+        assert key.app_name == "myapp"
+        assert key.session_id == "pkg"
+        assert key.object_id == "file.tar.gz"
+
+    def test_from_prefix_invalid(self):
+        import pytest
+
+        with pytest.raises(ValueError):
+            ObjectKey.from_prefix("invalid")
+
+        with pytest.raises(ValueError):
+            ObjectKey.from_prefix("a/b/c")
+
+    def test_from_key_invalid(self):
+        import pytest
+
+        with pytest.raises(ValueError):
+            ObjectKey.from_key("a/b")
+
+        with pytest.raises(ValueError):
+            ObjectKey.from_key("a/b/c/d")

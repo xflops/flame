@@ -42,7 +42,15 @@ impl ExecutorManager {
             .map_err(|e| FlameError::Internal(format!("failed to create shim directory: {e}")))?;
 
         let client = BackendClient::new(ctx).await?;
-        let app_manager = Arc::new(ApplicationManager::new()?);
+
+        let cache_tls = match &ctx.cache {
+            Some(cache) => match &cache.tls {
+                Some(tls) => Some(tls.client_tls_config()?),
+                None => None,
+            },
+            None => None,
+        };
+        let app_manager = Arc::new(ApplicationManager::new_with_tls(cache_tls)?);
 
         Ok(Self {
             ctx: ctx.clone(),

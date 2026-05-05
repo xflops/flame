@@ -78,18 +78,7 @@ services:
       - ./e2e:/opt/e2e
       - ./work/cache:/usr/local/flame/data/cache
     depends_on:
-      - flame-package-storage
       - flame-object-cache
-    networks:
-      - flame-net
-
-  flame-package-storage:
-    image: sigoden/dufs:v0.43.0
-    command: ["/data", "-A"]
-    volumes:
-      - flame-packages:/data
-    ports:
-      - 5050:5000
     networks:
       - flame-net
 
@@ -101,6 +90,5 @@ networks:
         - subnet: 172.20.0.0/24
 
 volumes:
-  flame-packages:
   flame-work:
   flame-cache-storage:
