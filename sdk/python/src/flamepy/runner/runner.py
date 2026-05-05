@@ -648,8 +648,24 @@ class Runner:
         package_filename = f"{self._name}.tar.gz"
         package_path = os.path.join(dist_dir, package_filename)
 
-        # Get exclusion patterns
-        excludes = self._context.package.excludes if self._context.package else []
+        default_excludes = [
+            ".venv",
+            "venv",
+            "__pycache__",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".mypy_cache",
+            "*.egg-info",
+            ".git",
+            ".tox",
+            "node_modules",
+            "*.pyc",
+            "*.pyo",
+            ".DS_Store",
+        ]
+
+        user_excludes = self._context.package.excludes if self._context.package else []
+        excludes = list(set(default_excludes + user_excludes))
 
         logger.debug(f"Creating package with excludes: {excludes}")
 
