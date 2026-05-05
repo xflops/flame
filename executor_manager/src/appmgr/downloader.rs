@@ -285,6 +285,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use tokio::io::AsyncWriteExt;
+    use tonic::transport::ClientTlsConfig;
 
     #[test]
     fn test_registry_has_all_schemes() {
@@ -293,6 +294,26 @@ mod tests {
         assert!(registry.downloaders.contains_key("http"));
         assert!(registry.downloaders.contains_key("https"));
         assert!(registry.downloaders.contains_key("grpc"));
+        assert!(registry.downloaders.contains_key("grpcs"));
+    }
+
+    #[test]
+    fn test_registry_default() {
+        let registry = DownloaderRegistry::default();
+        assert!(registry.downloaders.contains_key("file"));
+        assert!(registry.downloaders.contains_key("grpcs"));
+    }
+
+    #[test]
+    fn test_registry_with_tls_config() {
+        let tls_config = ClientTlsConfig::new();
+        let registry = DownloaderRegistry::new_with_tls(Some(tls_config));
+        assert!(registry.downloaders.contains_key("grpcs"));
+    }
+
+    #[test]
+    fn test_registry_with_none_tls_config() {
+        let registry = DownloaderRegistry::new_with_tls(None);
         assert!(registry.downloaders.contains_key("grpcs"));
     }
 
@@ -351,6 +372,111 @@ mod tests {
         let url = format!("file://{}/nonexistent.tar.gz", temp_dir.path().display());
 
         let result = registry.download(&url, &dest_path).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_file_downloader_invalid_url() {
+        let downloader = FileDownloader;
+        let temp_dir = TempDir::new().unwrap();
+        let dest_path = temp_dir.path().join("dest.tar.gz");
+
+        let url = url::Url::parse("file://").unwrap();
+        let result = downloader.download(&url, &dest_path).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_http_downloader_new() {
+        let downloader = HttpDownloader::new(Duration::from_secs(30));
+        assert_eq!(downloader.timeout, Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn test_http_downloader_connection_refused() {
+        let downloader = HttpDownloader::new(Duration::from_secs(1));
+        let temp_dir = TempDir::new().unwrap();
+        let dest_path = temp_dir.path().join("dest.tar.gz");
+
+        let url = url::Url::parse("http://127.0.0.1:59999/nonexistent.tar.gz").unwrap();
+        let result = downloader.download(&url, &dest_path).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to download"));
+    }
+
+    #[test]
+    fn test_grpc_downloader_new() {
+        let downloader = GrpcDownloader::new(Duration::from_secs(30));
+        assert_eq!(downloader.connect_timeout, Duration::from_secs(30));
+        assert!(downloader.tls_config.is_none());
+    }
+
+    #[test]
+    fn test_grpc_downloader_with_tls() {
+        let tls_config = ClientTlsConfig::new();
+        let downloader = GrpcDownloader::with_tls(Duration::from_secs(30), tls_config);
+        assert_eq!(downloader.connect_timeout, Duration::from_secs(30));
+        assert!(downloader.tls_config.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_grpc_downloader_missing_host() {
+        let downloader = GrpcDownloader::new(Duration::from_secs(1));
+        let temp_dir = TempDir::new().unwrap();
+        let dest_path = temp_dir.path().join("dest.tar.gz");
+
+        let url = url::Url::parse("grpc:///path/to/file").unwrap();
+        let result = downloader.download(&url, &dest_path).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("missing host"));
+    }
+
+    #[tokio::test]
+    async fn test_grpc_downloader_connection_failed() {
+        let downloader = GrpcDownloader::new(Duration::from_secs(1));
+        let temp_dir = TempDir::new().unwrap();
+        let dest_path = temp_dir.path().join("dest.tar.gz");
+
+        let url = url::Url::parse("grpc://127.0.0.1:59999/app/pkg/file.tar.gz").unwrap();
+        let result = downloader.download(&url, &dest_path).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to connect"));
+    }
+
+    #[tokio::test]
+    async fn test_grpcs_downloader_connection_failed() {
+        let downloader = GrpcDownloader::new(Duration::from_secs(1));
+        let temp_dir = TempDir::new().unwrap();
+        let dest_path = temp_dir.path().join("dest.tar.gz");
+
+        let url = url::Url::parse("grpcs://127.0.0.1:59999/app/pkg/file.tar.gz").unwrap();
+        let result = downloader.download(&url, &dest_path).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to connect"));
+    }
+
+    #[tokio::test]
+    async fn test_grpcs_downloader_with_tls_connection_failed() {
+        let tls_config = ClientTlsConfig::new();
+        let downloader = GrpcDownloader::with_tls(Duration::from_secs(1), tls_config);
+        let temp_dir = TempDir::new().unwrap();
+        let dest_path = temp_dir.path().join("dest.tar.gz");
+
+        let url = url::Url::parse("grpcs://127.0.0.1:59999/app/pkg/file.tar.gz").unwrap();
+        let result = downloader.download(&url, &dest_path).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to connect"));
+    }
+
+    #[tokio::test]
+    async fn test_grpc_downloader_default_port() {
+        let downloader = GrpcDownloader::new(Duration::from_secs(1));
+        let temp_dir = TempDir::new().unwrap();
+        let dest_path = temp_dir.path().join("dest.tar.gz");
+
+        let url = url::Url::parse("grpc://127.0.0.1/app/pkg/file.tar.gz").unwrap();
+        assert!(url.port().is_none());
+        let result = downloader.download(&url, &dest_path).await;
         assert!(result.is_err());
     }
 }
