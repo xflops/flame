@@ -401,7 +401,10 @@ mod tests {
         let url = url::Url::parse("http://127.0.0.1:59999/nonexistent.tar.gz").unwrap();
         let result = downloader.download(&url, &dest_path).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("failed to download"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("failed to download"));
     }
 
     #[test]
@@ -440,7 +443,10 @@ mod tests {
         let url = url::Url::parse("grpc://127.0.0.1:59999/app/pkg/file.tar.gz").unwrap();
         let result = downloader.download(&url, &dest_path).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("failed to connect"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("failed to connect"));
     }
 
     #[tokio::test]
@@ -452,7 +458,10 @@ mod tests {
         let url = url::Url::parse("grpcs://127.0.0.1:59999/app/pkg/file.tar.gz").unwrap();
         let result = downloader.download(&url, &dest_path).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("failed to connect"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("failed to connect"));
     }
 
     #[tokio::test]
@@ -465,7 +474,10 @@ mod tests {
         let url = url::Url::parse("grpcs://127.0.0.1:59999/app/pkg/file.tar.gz").unwrap();
         let result = downloader.download(&url, &dest_path).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("failed to connect"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("failed to connect"));
     }
 
     #[tokio::test]
