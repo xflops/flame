@@ -332,19 +332,27 @@ class CacheStorage(StorageBackend):
     def download(self, filename: str, local_path: str) -> None:
         from flamepy.core.cache import ObjectRef, download_object
 
+        if not self._app_name:
+            raise FlameError(FlameErrorCode.INVALID_CONFIG, "app_name is required for download")
+
         try:
-            ref = ObjectRef(endpoint=self._endpoint, key=filename, version=0)
+            key = f"{self._app_name}/pkg/{filename}"
+            ref = ObjectRef(endpoint=self._endpoint, key=key, version=0)
             download_object(ref, local_path)
-            logger.debug(f"Downloaded package from cache: {filename} -> {local_path}")
+            logger.debug(f"Downloaded package from cache: {key} -> {local_path}")
         except Exception as e:
             raise FlameError(FlameErrorCode.INTERNAL, f"Failed to download package from cache: {str(e)}")
 
     def delete(self, filename: str) -> None:
         from flamepy.core.cache import delete_objects
 
+        if not self._app_name:
+            return
+
         try:
-            delete_objects(filename)
-            logger.debug(f"Deleted package from cache: {filename}")
+            key = f"{self._app_name}/pkg/{filename}"
+            delete_objects(key)
+            logger.debug(f"Deleted package from cache: {key}")
         except Exception as e:
             logger.warning(f"Error deleting package from cache: {e}")
 

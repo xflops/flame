@@ -667,10 +667,12 @@ def upload_object(key_or_prefix: str, file_path: str) -> ObjectRef:
 
     client = _get_flight_client(cache_endpoint, cache_tls)
     descriptor = flight.FlightDescriptor.for_path(key_or_prefix)
-    writer, reader = client.do_put(descriptor, schema)
 
     file_size = os.path.getsize(file_path)
+    writer = None
     try:
+        writer, reader = client.do_put(descriptor, schema)
+
         with open(file_path, "rb") as f:
             while True:
                 chunk = f.read(_UPLOAD_CHUNK_SIZE)
@@ -690,7 +692,6 @@ def upload_object(key_or_prefix: str, file_path: str) -> ObjectRef:
             if metadata_buffer is None:
                 break
             obj_ref_data = bson.decode(bytes(metadata_buffer))
-            writer.close()
             ref = ObjectRef(
                 endpoint=obj_ref_data["endpoint"],
                 key=obj_ref_data["key"],
@@ -698,12 +699,13 @@ def upload_object(key_or_prefix: str, file_path: str) -> ObjectRef:
             )
             logger.debug(f"upload_object: key={ref.key}, version={ref.version}, size={file_size}")
             return ref
-    except Exception as e:
-        writer.close()
-        raise ValueError(f"Failed to upload file to cache server: {e}")
 
-    writer.close()
-    raise ValueError("No result metadata received from cache server")
+        raise ValueError("No result metadata received from cache server")
+    except Exception as e:
+        raise ValueError(f"Failed to upload file to cache server: {e}")
+    finally:
+        if writer is not None:
+            writer.close()
 
 
 def download_object(ref: ObjectRef, dest_path: str) -> None:

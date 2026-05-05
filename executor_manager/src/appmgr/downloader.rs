@@ -12,17 +12,17 @@ limitations under the License.
 */
 
 use std::collections::HashMap;
-use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use tokio::io::AsyncWriteExt;
 
 use common::FlameError;
 
 const HTTP_TIMEOUT_SECS: u64 = 300;
+const GRPC_CONNECT_TIMEOUT_SECS: u64 = 30;
 
 #[async_trait]
 pub trait PackageDownloader: Send + Sync {
@@ -37,7 +37,7 @@ impl PackageDownloader for FileDownloader {
         let src_path = url
             .to_file_path()
             .map_err(|_| FlameError::InvalidConfig(format!("invalid file url: {}", url)))?;
-        fs::copy(&src_path, dest_path).map_err(|e| {
+        tokio::fs::copy(&src_path, dest_path).await.map_err(|e| {
             FlameError::Internal(format!(
                 "failed to copy package from {}: {}",
                 src_path.display(),
@@ -80,7 +80,8 @@ impl PackageDownloader for HttpDownloader {
         }
 
         let temp_path = dest_path.with_extension("tmp");
-        let mut file = fs::File::create(&temp_path)
+        let mut file = tokio::fs::File::create(&temp_path)
+            .await
             .map_err(|e| FlameError::Internal(format!("failed to create temp file: {}", e)))?;
 
         let mut stream = response.bytes_stream();
@@ -88,21 +89,32 @@ impl PackageDownloader for HttpDownloader {
             let chunk =
                 chunk.map_err(|e| FlameError::Internal(format!("failed to read chunk: {}", e)))?;
             file.write_all(&chunk)
+                .await
                 .map_err(|e| FlameError::Internal(format!("failed to write chunk: {}", e)))?;
         }
 
         file.sync_all()
+            .await
             .map_err(|e| FlameError::Internal(format!("failed to sync file: {}", e)))?;
         drop(file);
 
-        fs::rename(&temp_path, dest_path)
+        tokio::fs::rename(&temp_path, dest_path)
+            .await
             .map_err(|e| FlameError::Internal(format!("failed to rename temp file: {}", e)))?;
 
         Ok(())
     }
 }
 
-pub struct GrpcDownloader;
+pub struct GrpcDownloader {
+    connect_timeout: Duration,
+}
+
+impl GrpcDownloader {
+    pub fn new(connect_timeout: Duration) -> Self {
+        Self { connect_timeout }
+    }
+}
 
 #[async_trait]
 impl PackageDownloader for GrpcDownloader {
@@ -127,6 +139,7 @@ impl PackageDownloader for GrpcDownloader {
 
         let channel = Channel::from_shared(endpoint)
             .map_err(|e| FlameError::Internal(format!("invalid endpoint: {}", e)))?
+            .connect_timeout(self.connect_timeout)
             .connect()
             .await
             .map_err(|e| FlameError::Internal(format!("failed to connect to cache: {}", e)))?;
@@ -140,7 +153,8 @@ impl PackageDownloader for GrpcDownloader {
             .map_err(|e| FlameError::Internal(format!("do_get failed: {}", e)))?;
 
         let temp_path = dest_path.with_extension("tmp");
-        let mut file = fs::File::create(&temp_path)
+        let mut file = tokio::fs::File::create(&temp_path)
+            .await
             .map_err(|e| FlameError::Internal(format!("failed to create temp file: {}", e)))?;
 
         let mut total_size = 0usize;
@@ -153,7 +167,7 @@ impl PackageDownloader for GrpcDownloader {
                 if let Some(binary_array) = array.as_any().downcast_ref::<BinaryArray>() {
                     for i in 0..binary_array.len() {
                         let chunk = binary_array.value(i);
-                        file.write_all(chunk).map_err(|e| {
+                        file.write_all(chunk).await.map_err(|e| {
                             FlameError::Internal(format!("failed to write chunk: {}", e))
                         })?;
                         total_size += chunk.len();
@@ -163,15 +177,17 @@ impl PackageDownloader for GrpcDownloader {
         }
 
         if total_size == 0 {
-            fs::remove_file(&temp_path).ok();
+            tokio::fs::remove_file(&temp_path).await.ok();
             return Err(FlameError::Internal(format!("object not found: {}", key)));
         }
 
         file.sync_all()
+            .await
             .map_err(|e| FlameError::Internal(format!("failed to sync file: {}", e)))?;
         drop(file);
 
-        fs::rename(&temp_path, dest_path)
+        tokio::fs::rename(&temp_path, dest_path)
+            .await
             .map_err(|e| FlameError::Internal(format!("failed to rename temp file: {}", e)))?;
 
         tracing::info!(
@@ -200,8 +216,10 @@ impl DownloaderRegistry {
             "https".to_string(),
             Box::new(HttpDownloader::new(Duration::from_secs(HTTP_TIMEOUT_SECS))),
         );
-        downloaders.insert("grpc".to_string(), Box::new(GrpcDownloader));
-        downloaders.insert("grpcs".to_string(), Box::new(GrpcDownloader));
+        let grpc_downloader = GrpcDownloader::new(Duration::from_secs(GRPC_CONNECT_TIMEOUT_SECS));
+        downloaders.insert("grpc".to_string(), Box::new(grpc_downloader));
+        let grpcs_downloader = GrpcDownloader::new(Duration::from_secs(GRPC_CONNECT_TIMEOUT_SECS));
+        downloaders.insert("grpcs".to_string(), Box::new(grpcs_downloader));
 
         Self { downloaders }
     }
@@ -231,8 +249,8 @@ impl Default for DownloaderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::TempDir;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn test_registry_has_all_schemes() {
@@ -276,8 +294,8 @@ mod tests {
         let src_path = temp_dir.path().join("source.tar.gz");
         let dest_path = temp_dir.path().join("dest.tar.gz");
 
-        let mut src_file = fs::File::create(&src_path).unwrap();
-        src_file.write_all(b"test content").unwrap();
+        let mut src_file = tokio::fs::File::create(&src_path).await.unwrap();
+        src_file.write_all(b"test content").await.unwrap();
         drop(src_file);
 
         let registry = DownloaderRegistry::new();
@@ -286,7 +304,7 @@ mod tests {
         registry.download(&url, &dest_path).await.unwrap();
 
         assert!(dest_path.exists());
-        let content = fs::read(&dest_path).unwrap();
+        let content = tokio::fs::read(&dest_path).await.unwrap();
         assert_eq!(content, b"test content");
     }
 

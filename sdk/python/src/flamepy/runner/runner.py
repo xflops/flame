@@ -383,13 +383,11 @@ class Runner:
                 self._started = True
                 return
 
-        # Check that package configuration is available (only needed for new apps)
-        if self._context.package is None:
-            raise FlameError(FlameErrorCode.INVALID_CONFIG, "Package configuration is not set in FlameContext. Please configure the 'package' field in your flame.yaml.")
-
-        # Initialize storage backend
-        storage_base = self._context.package.storage
-        self._storage_backend = create_storage_backend(storage_base)
+        # Initialize storage backend (uses cache.endpoint if package.storage not set)
+        storage_base = self._context.package.storage if self._context.package else None
+        if storage_base is None and self._context.cache is None:
+            raise FlameError(FlameErrorCode.INVALID_CONFIG, "Storage not configured. Please set 'cache.endpoint' or 'package.storage' in flame.yaml.")
+        self._storage_backend = create_storage_backend(storage_base, app_name=self._name)
         logger.debug(f"Initialized storage backend: {type(self._storage_backend).__name__}")
 
         # Step 1: Package the current working directory

@@ -72,7 +72,7 @@ class TestCacheStorage:
         monkeypatch.setattr("flamepy.core.cache.download_object", mock_download_object)
 
         storage = CacheStorage("grpc://host:9090", app_name="myapp")
-        storage.download("myapp/pkg/myapp-1.0.0.tar.gz", str(dest_file))
+        storage.download("myapp-1.0.0.tar.gz", str(dest_file))
 
         assert dest_file.exists()
         assert dest_file.read_bytes() == b"downloaded content"
@@ -87,7 +87,7 @@ class TestCacheStorage:
         monkeypatch.setattr("flamepy.core.cache.delete_objects", mock_delete_objects)
 
         storage = CacheStorage("grpc://host:9090", app_name="myapp")
-        storage.delete("myapp/pkg/myapp-1.0.0.tar.gz")
+        storage.delete("myapp-1.0.0.tar.gz")
 
         assert deleted_key == "myapp/pkg/myapp-1.0.0.tar.gz"
 
