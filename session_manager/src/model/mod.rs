@@ -128,6 +128,7 @@ pub struct SessionInfo {
     pub max_instances: Option<u32>,
     pub batch_size: u32,
     pub priority: u32,
+    pub resreq: Option<ResourceRequirement>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -233,6 +234,7 @@ impl From<&Session> for SessionInfo {
             max_instances: ssn.max_instances,
             batch_size: ssn.batch_size.max(1),
             priority: ssn.priority,
+            resreq: ssn.resreq.clone(),
         }
     }
 }
@@ -938,6 +940,7 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         })
     }
 

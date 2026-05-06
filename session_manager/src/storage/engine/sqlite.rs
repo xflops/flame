@@ -196,10 +196,21 @@ impl SqliteEngine {
         attr: SessionAttributes,
     ) -> Result<Session, FlameError> {
         let common_data: Option<Vec<u8>> = attr.common_data.map(Bytes::into);
-        let sql = r#"INSERT INTO sessions (id, application, slots, common_data, creation_time, state, min_instances, max_instances, priority)
+        let (resreq_cpu, resreq_memory, resreq_gpu) = match &attr.resreq {
+            Some(r) => (
+                Some(r.cpu as i64),
+                Some(r.memory as i64),
+                Some(r.gpu as i64),
+            ),
+            None => (None, None, None),
+        };
+        let sql = r#"INSERT INTO sessions (id, application, slots, common_data, creation_time, state, min_instances, max_instances, priority, resreq_cpu, resreq_memory, resreq_gpu)
             VALUES (
                 ?,
                 (SELECT name FROM applications WHERE name=? AND state=?),
+                ?,
+                ?,
+                ?,
                 ?,
                 ?,
                 ?,
@@ -220,6 +231,9 @@ impl SqliteEngine {
             .bind(attr.min_instances as i64)
             .bind(attr.max_instances.map(|v| v as i64))
             .bind(attr.priority as i64)
+            .bind(resreq_cpu)
+            .bind(resreq_memory)
+            .bind(resreq_gpu)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;

@@ -105,6 +105,12 @@ struct SessionMetadata {
     #[serde(default)]
     pub priority: u32,
     pub common_data_len: u64,
+    #[serde(default)]
+    pub resreq_cpu: Option<u64>,
+    #[serde(default)]
+    pub resreq_memory: Option<u64>,
+    #[serde(default)]
+    pub resreq_gpu: Option<i32>,
 }
 
 fn default_batch_size() -> u32 {
@@ -148,8 +154,12 @@ struct NodeMetadata {
     pub state: i32,
     pub capacity_cpu: u64,
     pub capacity_memory: u64,
+    #[serde(default)]
+    pub capacity_gpu: i32,
     pub allocatable_cpu: u64,
     pub allocatable_memory: u64,
+    #[serde(default)]
+    pub allocatable_gpu: i32,
     pub info_arch: String,
     pub info_os: String,
     pub creation_time: i64,
@@ -162,6 +172,8 @@ struct ExecutorMetadata {
     pub node: String,
     pub resreq_cpu: u64,
     pub resreq_memory: u64,
+    #[serde(default)]
+    pub resreq_gpu: i32,
     pub slots: u32,
     pub shim: i32,
     pub task_id: Option<i64>,
@@ -746,6 +758,11 @@ impl FilesystemEngine {
             .completion_time
             .and_then(|t| DateTime::from_timestamp(t, 0));
 
+        let resreq = match (meta.resreq_cpu, meta.resreq_memory, meta.resreq_gpu) {
+            (Some(cpu), Some(memory), Some(gpu)) => Some(ResourceRequirement { cpu, memory, gpu }),
+            _ => None,
+        };
+
         Ok(Session {
             id: meta.id.clone(),
             application: meta.application.clone(),
@@ -763,6 +780,7 @@ impl FilesystemEngine {
             max_instances: meta.max_instances,
             batch_size: meta.batch_size.max(1),
             priority: meta.priority,
+            resreq,
         })
     }
 
@@ -1010,6 +1028,9 @@ impl Engine for FilesystemEngine {
             batch_size: attr.batch_size.max(1),
             priority: attr.priority,
             common_data_len,
+            resreq_cpu: attr.resreq.as_ref().map(|r| r.cpu),
+            resreq_memory: attr.resreq.as_ref().map(|r| r.memory),
+            resreq_gpu: attr.resreq.as_ref().map(|r| r.gpu),
         };
 
         self.write_session_metadata(&attr.id, &meta)?;
@@ -1331,8 +1352,10 @@ impl Engine for FilesystemEngine {
             state: i32::from(node.state),
             capacity_cpu: node.capacity.cpu,
             capacity_memory: node.capacity.memory,
+            capacity_gpu: node.capacity.gpu,
             allocatable_cpu: node.allocatable.cpu,
             allocatable_memory: node.allocatable.memory,
+            allocatable_gpu: node.allocatable.gpu,
             info_arch: node.info.arch.clone(),
             info_os: node.info.os.clone(),
             creation_time: now,
@@ -1353,12 +1376,12 @@ impl Engine for FilesystemEngine {
                 capacity: ResourceRequirement {
                     cpu: meta.capacity_cpu,
                     memory: meta.capacity_memory,
-                    gpu: 0,
+                    gpu: meta.capacity_gpu,
                 },
                 allocatable: ResourceRequirement {
                     cpu: meta.allocatable_cpu,
                     memory: meta.allocatable_memory,
-                    gpu: 0,
+                    gpu: meta.allocatable_gpu,
                 },
                 info: NodeInfo {
                     arch: meta.info_arch,
@@ -1384,8 +1407,10 @@ impl Engine for FilesystemEngine {
             state: i32::from(node.state),
             capacity_cpu: node.capacity.cpu,
             capacity_memory: node.capacity.memory,
+            capacity_gpu: node.capacity.gpu,
             allocatable_cpu: node.allocatable.cpu,
             allocatable_memory: node.allocatable.memory,
+            allocatable_gpu: node.allocatable.gpu,
             info_arch: node.info.arch.clone(),
             info_os: node.info.os.clone(),
             creation_time,
@@ -1430,12 +1455,12 @@ impl Engine for FilesystemEngine {
                         capacity: ResourceRequirement {
                             cpu: meta.capacity_cpu,
                             memory: meta.capacity_memory,
-                            gpu: 0,
+                            gpu: meta.capacity_gpu,
                         },
                         allocatable: ResourceRequirement {
                             cpu: meta.allocatable_cpu,
                             memory: meta.allocatable_memory,
-                            gpu: 0,
+                            gpu: meta.allocatable_gpu,
                         },
                         info: NodeInfo {
                             arch: meta.info_arch,
@@ -1457,6 +1482,7 @@ impl Engine for FilesystemEngine {
             node: executor.node.clone(),
             resreq_cpu: executor.resreq.cpu,
             resreq_memory: executor.resreq.memory,
+            resreq_gpu: executor.resreq.gpu,
             slots: executor.slots,
             shim: i32::from(executor.shim),
             task_id: executor.task_id,
@@ -1485,7 +1511,7 @@ impl Engine for FilesystemEngine {
                 resreq: ResourceRequirement {
                     cpu: meta.resreq_cpu,
                     memory: meta.resreq_memory,
-                    gpu: 0,
+                    gpu: meta.resreq_gpu,
                 },
                 slots: meta.slots,
                 shim: Shim::try_from(meta.shim).unwrap_or_default(),
@@ -1507,6 +1533,7 @@ impl Engine for FilesystemEngine {
             node: executor.node.clone(),
             resreq_cpu: executor.resreq.cpu,
             resreq_memory: executor.resreq.memory,
+            resreq_gpu: executor.resreq.gpu,
             slots: executor.slots,
             shim: i32::from(executor.shim),
             task_id: executor.task_id,
@@ -1537,7 +1564,7 @@ impl Engine for FilesystemEngine {
             resreq: ResourceRequirement {
                 cpu: meta.resreq_cpu,
                 memory: meta.resreq_memory,
-                gpu: 0,
+                gpu: meta.resreq_gpu,
             },
             slots: meta.slots,
             shim: Shim::try_from(meta.shim).unwrap_or_default(),
@@ -1603,7 +1630,7 @@ impl Engine for FilesystemEngine {
                             resreq: ResourceRequirement {
                                 cpu: meta.resreq_cpu,
                                 memory: meta.resreq_memory,
-                                gpu: 0,
+                                gpu: meta.resreq_gpu,
                             },
                             slots: meta.slots,
                             shim: Shim::try_from(meta.shim).unwrap_or_default(),

@@ -460,6 +460,7 @@ mod tests {
             max_instances,
             batch_size,
             priority: 0,
+            resreq: None,
         })
     }
 

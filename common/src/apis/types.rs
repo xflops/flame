@@ -228,6 +228,7 @@ pub struct Session {
     pub max_instances: Option<u32>,
     pub batch_size: u32,
     pub priority: u32,
+    pub resreq: Option<ResourceRequirement>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, strum_macros::Display)]
@@ -492,9 +493,13 @@ impl ResourceRequirement {
         };
 
         let gpu_slots = if unit.gpu > 0 {
-            (self.gpu / unit.gpu) as u64
+            if self.gpu < 0 {
+                0
+            } else {
+                (self.gpu as u64) / (unit.gpu as u64)
+            }
         } else {
-            u64::MAX // No GPU requirement = unlimited GPU slots
+            u64::MAX
         };
 
         cpu_slots.min(mem_slots).min(gpu_slots) as u32

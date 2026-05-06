@@ -69,6 +69,12 @@ impl DRFPlugin {
 
         dominant
     }
+
+    fn get_session_resreq(&self, ssn: &SessionInfoPtr) -> ResourceRequirement {
+        ssn.resreq
+            .clone()
+            .unwrap_or_else(|| ResourceRequirement::new(ssn.slots, &self.unit))
+    }
 }
 
 impl Plugin for DRFPlugin {
@@ -185,11 +191,11 @@ impl Plugin for DRFPlugin {
 
     fn is_allocatable(&self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Option<bool> {
         let node_alloc = self.node_allocations.get(&node.name)?;
-        let ssn_resreq = ResourceRequirement::new(ssn.slots, &self.unit);
+        let ssn_resreq = self.get_session_resreq(ssn);
 
         let cpu_ok = node_alloc.cpu + ssn_resreq.cpu <= node.allocatable.cpu;
         let mem_ok = node_alloc.memory + ssn_resreq.memory <= node.allocatable.memory;
-        let gpu_ok = if self.unit.gpu > 0 {
+        let gpu_ok = if ssn_resreq.gpu > 0 {
             node_alloc.gpu + ssn_resreq.gpu <= node.allocatable.gpu
         } else {
             true
@@ -199,7 +205,7 @@ impl Plugin for DRFPlugin {
     }
 
     fn on_executor_allocate(&mut self, node: NodeInfoPtr, ssn: SessionInfoPtr) {
-        let ssn_resreq = ResourceRequirement::new(ssn.slots, &self.unit);
+        let ssn_resreq = self.get_session_resreq(&ssn);
 
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
             entry.allocated.cpu += ssn_resreq.cpu;
@@ -222,7 +228,7 @@ impl Plugin for DRFPlugin {
     }
 
     fn on_executor_unallocate(&mut self, node: NodeInfoPtr, ssn: SessionInfoPtr) {
-        let ssn_resreq = ResourceRequirement::new(ssn.slots, &self.unit);
+        let ssn_resreq = self.get_session_resreq(&ssn);
 
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
             entry.allocated.cpu = entry.allocated.cpu.saturating_sub(ssn_resreq.cpu);
@@ -244,7 +250,7 @@ impl Plugin for DRFPlugin {
     }
 
     fn on_executor_pipeline(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
-        let ssn_resreq = ResourceRequirement::new(ssn.slots, &self.unit);
+        let ssn_resreq = self.get_session_resreq(&ssn);
 
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
             entry.allocated.cpu += ssn_resreq.cpu;
@@ -266,7 +272,7 @@ impl Plugin for DRFPlugin {
     }
 
     fn on_executor_discard(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
-        let ssn_resreq = ResourceRequirement::new(ssn.slots, &self.unit);
+        let ssn_resreq = self.get_session_resreq(&ssn);
 
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
             entry.allocated.cpu = entry.allocated.cpu.saturating_sub(ssn_resreq.cpu);
@@ -288,7 +294,7 @@ impl Plugin for DRFPlugin {
     }
 
     fn on_session_bind(&mut self, ssn: SessionInfoPtr) {
-        let ssn_resreq = ResourceRequirement::new(ssn.slots, &self.unit);
+        let ssn_resreq = self.get_session_resreq(&ssn);
 
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
             entry.allocated.cpu += ssn_resreq.cpu;
@@ -304,7 +310,7 @@ impl Plugin for DRFPlugin {
     }
 
     fn on_session_unbind(&mut self, ssn: SessionInfoPtr) {
-        let ssn_resreq = ResourceRequirement::new(ssn.slots, &self.unit);
+        let ssn_resreq = self.get_session_resreq(&ssn);
 
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
             entry.allocated.cpu = entry.allocated.cpu.saturating_sub(ssn_resreq.cpu);

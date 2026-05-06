@@ -79,6 +79,10 @@ pub struct SessionDao {
     pub max_instances: Option<i64>,
     pub batch_size: i64,
     pub priority: i64,
+
+    pub resreq_cpu: Option<i64>,
+    pub resreq_memory: Option<i64>,
+    pub resreq_gpu: Option<i64>,
 }
 
 #[derive(Clone, FromRow, Debug)]
@@ -138,6 +142,15 @@ impl TryFrom<&SessionDao> for Session {
     type Error = FlameError;
 
     fn try_from(ssn: &SessionDao) -> Result<Self, Self::Error> {
+        let resreq = match (ssn.resreq_cpu, ssn.resreq_memory, ssn.resreq_gpu) {
+            (Some(cpu), Some(memory), Some(gpu)) => Some(ResourceRequirement {
+                cpu: cpu as u64,
+                memory: memory as u64,
+                gpu: gpu as i32,
+            }),
+            _ => None,
+        };
+
         Ok(Self {
             id: ssn.id.clone(),
             application: ssn.application.clone(),
@@ -163,6 +176,7 @@ impl TryFrom<&SessionDao> for Session {
             max_instances: ssn.max_instances.map(|v| v as u32),
             batch_size: ssn.batch_size.max(1) as u32,
             priority: ssn.priority as u32,
+            resreq,
         })
     }
 }

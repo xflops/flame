@@ -191,6 +191,7 @@ impl Engine for NoneEngine {
             max_instances: attr.max_instances,
             batch_size: attr.batch_size.max(1),
             priority: attr.priority,
+            resreq: attr.resreq,
             status: SessionStatus {
                 state: SessionState::Open,
             },

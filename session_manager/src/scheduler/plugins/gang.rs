@@ -147,6 +147,7 @@ mod tests {
             max_instances: None,
             batch_size,
             priority: 0,
+            resreq: None,
         })
     }
 

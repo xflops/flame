@@ -7,3 +7,8 @@ ALTER TABLE nodes ADD COLUMN allocatable_gpu INTEGER NOT NULL DEFAULT 0;
 
 -- Add GPU to executor resource requirements
 ALTER TABLE executors ADD COLUMN resreq_gpu INTEGER NOT NULL DEFAULT 0;
+
+-- Add explicit resource requirements to sessions (mutually exclusive with slots)
+ALTER TABLE sessions ADD COLUMN resreq_cpu INTEGER;
+ALTER TABLE sessions ADD COLUMN resreq_memory INTEGER;
+ALTER TABLE sessions ADD COLUMN resreq_gpu INTEGER;
