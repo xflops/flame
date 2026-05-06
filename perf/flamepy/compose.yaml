@@ -24,6 +24,7 @@ services:
       - ./conf/certs:/etc/flame/certs:ro
     ports:
       - "9090:9090"
+      - "6061:6061"
     restart: unless-stopped
     networks:
       - flame-network

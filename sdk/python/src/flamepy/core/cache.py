@@ -14,6 +14,7 @@ limitations under the License.
 import logging
 import threading
 import uuid
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -68,42 +69,36 @@ class Object:
     data: Any
 
 
-# Client-side LRU cache with max size limit
-_CACHE_MAX_SIZE = 1000  # Max number of cached objects
-_object_cache: Dict[tuple, Object] = {}
-_cache_access_order: List[tuple] = []  # LRU tracking: most recent at end
+# Client-side LRU cache with max size limit (O(1) operations using OrderedDict)
+_CACHE_MAX_SIZE = 1000
+_object_cache: OrderedDict[tuple, Object] = OrderedDict()
 _cache_lock = threading.Lock()
 
 
 def _cache_get(key: tuple) -> Optional[Object]:
-    """Get from cache and update LRU order."""
+    """Get from cache and update LRU order (O(1) with OrderedDict)."""
     with _cache_lock:
-        obj = _object_cache.get(key)
-        if obj is not None and key in _cache_access_order:
-            _cache_access_order.remove(key)
-            _cache_access_order.append(key)
-        return obj
+        if key not in _object_cache:
+            return None
+        _object_cache.move_to_end(key)
+        return _object_cache[key]
 
 
 def _cache_put(key: tuple, obj: Object) -> None:
-    """Put to cache with LRU eviction."""
+    """Put to cache with LRU eviction (O(1) with OrderedDict)."""
     with _cache_lock:
         if key in _object_cache:
-            _cache_access_order.remove(key)
+            _object_cache.move_to_end(key)
         _object_cache[key] = obj
-        _cache_access_order.append(key)
 
         while len(_object_cache) > _CACHE_MAX_SIZE:
-            oldest_key = _cache_access_order.pop(0)
-            _object_cache.pop(oldest_key, None)
+            _object_cache.popitem(last=False)
 
 
 def _cache_remove(key: tuple) -> None:
     """Remove from cache."""
     with _cache_lock:
         _object_cache.pop(key, None)
-        if key in _cache_access_order:
-            _cache_access_order.remove(key)
 
 
 def _cache_remove_prefix(prefix: str) -> None:
@@ -112,8 +107,6 @@ def _cache_remove_prefix(prefix: str) -> None:
         keys_to_remove = [k for k in _object_cache if k[1].startswith(prefix)]
         for key in keys_to_remove:
             _object_cache.pop(key, None)
-            if key in _cache_access_order:
-                _cache_access_order.remove(key)
 
 
 @dataclass(frozen=True)
@@ -251,29 +244,75 @@ def _deserialize_object(batch: pa.RecordBatch) -> Any:
 _client_pool: Dict[str, flight.FlightClient] = {}
 _client_pool_lock = threading.Lock()
 
+_context_cache: Optional[FlameContext] = None
+_context_cache_lock = threading.Lock()
+
+
+def _get_cached_context() -> FlameContext:
+    """Get cached FlameContext singleton to avoid repeated config file reads."""
+    global _context_cache
+    if _context_cache is not None:
+        return _context_cache
+    with _context_cache_lock:
+        if _context_cache is None:
+            _context_cache = FlameContext()
+        return _context_cache
+
+
+def _normalize_endpoint(endpoint: str) -> str:
+    if endpoint.startswith("grpcs://"):
+        return endpoint.replace("grpcs://", "grpc+tls://")
+    return endpoint
+
+
+def _create_flight_client(location: str, tls_config: Optional[FlameClientTls] = None) -> flight.FlightClient:
+    if location.startswith("grpc+tls://"):
+        if tls_config and tls_config.ca_file:
+            with open(tls_config.ca_file, "rb") as f:
+                root_certs = f.read()
+            return flight.FlightClient(location, tls_root_certs=root_certs)
+        else:
+            return flight.FlightClient(location)
+    else:
+        return flight.FlightClient(location)
+
+
+def _remove_stale_client(location: str) -> None:
+    with _client_pool_lock:
+        _client_pool.pop(location, None)
+
 
 def _get_flight_client(endpoint: str, tls_config: Optional[FlameClientTls] = None) -> flight.FlightClient:
-    if endpoint.startswith("grpcs://"):
-        location = endpoint.replace("grpcs://", "grpc+tls://")
-    else:
-        location = endpoint
+    location = _normalize_endpoint(endpoint)
 
     with _client_pool_lock:
         if location in _client_pool:
             return _client_pool[location]
 
-        if location.startswith("grpc+tls://"):
-            if tls_config and tls_config.ca_file:
-                with open(tls_config.ca_file, "rb") as f:
-                    root_certs = f.read()
-                client = flight.FlightClient(location, tls_root_certs=root_certs)
-            else:
-                client = flight.FlightClient(location)
-        else:
-            client = flight.FlightClient(location)
-
+        client = _create_flight_client(location, tls_config)
         _client_pool[location] = client
         return client
+
+
+def _get_flight_client_with_retry(endpoint: str, tls_config: Optional[FlameClientTls] = None, max_retries: int = 1) -> flight.FlightClient:
+    """Get FlightClient with retry on stale connection - removes failed client from pool and retries."""
+    location = _normalize_endpoint(endpoint)
+
+    for attempt in range(max_retries + 1):
+        client = _get_flight_client(endpoint, tls_config)
+        if attempt == 0:
+            return client
+
+        try:
+            client.list_actions()
+            return client
+        except (flight.FlightUnavailableError, OSError) as e:
+            logger.warning(f"Flight client connection failed (attempt {attempt + 1}): {e}")
+            _remove_stale_client(location)
+            if attempt == max_retries:
+                raise
+
+    return _get_flight_client(endpoint, tls_config)
 
 
 def _do_put_remote(client: flight.FlightClient, descriptor: flight.FlightDescriptor, batch: pa.RecordBatch) -> "ObjectRef":
@@ -333,7 +372,7 @@ def _get_cache_tls_config() -> Optional[FlameClientTls]:
         FlameClientTls if configured, None otherwise
     """
     try:
-        context = FlameContext()
+        context = _get_cached_context()
         cache_config = context.cache
         if isinstance(cache_config, FlameClientCache) and cache_config.tls:
             return cache_config.tls
@@ -358,7 +397,7 @@ def put_object(key_prefix: str, obj: Any) -> "ObjectRef":
 
     object_key = ObjectKey.from_prefix(key_prefix)
 
-    context = FlameContext()
+    context = _get_cached_context()
     cache_config = context.cache
 
     if cache_config is None:
@@ -572,7 +611,7 @@ def delete_objects(key_prefix: str) -> None:
     Raises:
         ValueError: If key_prefix format is invalid or cache not configured
     """
-    context = FlameContext()
+    context = _get_cached_context()
     cache_config = context.cache
 
     if cache_config is None:
@@ -639,7 +678,7 @@ def upload_object(key_or_prefix: str, file_path: str) -> ObjectRef:
     else:
         raise ValueError(f"Invalid key format: {key_or_prefix}")
 
-    context = FlameContext()
+    context = _get_cached_context()
     cache_config = context.cache
 
     if cache_config is None:
