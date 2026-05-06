@@ -204,11 +204,10 @@ mod tests {
 
         for i in 0..10 {
             let snapshot = controller.snapshot()?;
-            let default_policies: Vec<String> = vec![
-                "priority".to_string(),
-                "fairshare".to_string(),
-                "gang".to_string(),
-            ];
+            let default_policies: Vec<String> = common::ctx::DEFAULT_POLICIES
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
             let plugins = PluginManager::setup(&snapshot.clone(), &default_policies)?;
 
             let mut ctx = Context {
@@ -255,11 +254,10 @@ mod tests {
                 .register_node(&new_test_node("node_1".to_string())),
         )?;
 
-        let default_policies: Vec<String> = vec![
-            "priority".to_string(),
-            "fairshare".to_string(),
-            "gang".to_string(),
-        ];
+        let default_policies: Vec<String> = common::ctx::DEFAULT_POLICIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let mut ctx = Context::new(controller.clone(), &default_policies)?;
         let plugins_ptr = Arc::as_ptr(&ctx.plugins);
         for action in ctx.actions.clone() {

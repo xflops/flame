@@ -118,17 +118,23 @@ impl PluginManager {
         ss: &SnapShot,
         enabled_policies: &[String],
     ) -> Result<PluginManagerPtr, FlameError> {
-        let configurable_plugins: Vec<(&str, PluginPtr)> = vec![
-            ("priority", PriorityPlugin::new_ptr()),
-            ("fairshare", FairShare::new_ptr()),
-            ("gang", GangPlugin::new_ptr()),
-        ];
+        for p in enabled_policies {
+            match p.as_str() {
+                "priority" | "fairshare" | "gang" => {}
+                _ => return Err(FlameError::InvalidConfig(format!("unknown policy: {}", p))),
+            }
+        }
 
-        let mut plugins: Vec<(String, PluginPtr)> = configurable_plugins
-            .into_iter()
-            .filter(|(name, _)| enabled_policies.iter().any(|p| p == *name))
-            .map(|(name, plugin)| (name.to_string(), plugin))
-            .collect();
+        let mut plugins: Vec<(String, PluginPtr)> = Vec::with_capacity(enabled_policies.len() + 1);
+        if enabled_policies.iter().any(|p| p == "priority") {
+            plugins.push(("priority".to_string(), PriorityPlugin::new_ptr()));
+        }
+        if enabled_policies.iter().any(|p| p == "fairshare") {
+            plugins.push(("fairshare".to_string(), FairShare::new_ptr()));
+        }
+        if enabled_policies.iter().any(|p| p == "gang") {
+            plugins.push(("gang".to_string(), GangPlugin::new_ptr()));
+        }
 
         // shim plugin is always required - it handles executor-to-session matching by slot count
         plugins.push(("shim".to_string(), ShimPlugin::new_ptr()));
@@ -493,11 +499,10 @@ mod tests {
     }
 
     fn default_policies() -> Vec<String> {
-        vec![
-            "priority".to_string(),
-            "fairshare".to_string(),
-            "gang".to_string(),
-        ]
+        common::ctx::DEFAULT_POLICIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// Test that is_available returns true when slots match.

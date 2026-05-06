@@ -30,7 +30,7 @@ const DEFAULT_SLOT: &str = "cpu=1,mem=2g";
 /// Default policies to enable when none specified in config.
 /// Available configurable policies: "priority", "fairshare", "gang"
 /// Note: "shim" plugin is always enabled (required for executor matching)
-const DEFAULT_POLICIES: &[&str] = &["priority", "fairshare", "gang"];
+pub const DEFAULT_POLICIES: &[&str] = &["priority", "fairshare", "gang"];
 const DEFAULT_STORAGE: &str = "sqlite://flame.db";
 const DEFAULT_MAX_EXECUTORS_PER_NODE: u32 = 128;
 const DEFAULT_SCHEDULE_INTERVAL: u64 = 100;
