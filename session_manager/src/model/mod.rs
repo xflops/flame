@@ -913,6 +913,7 @@ mod tests {
             resreq: ResourceRequirement {
                 cpu: 1,
                 memory: 1024,
+                gpu: 0,
             },
             slots,
             shim: Shim::Host,
@@ -946,6 +947,7 @@ mod tests {
         let ss = SnapShot::new(ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         });
 
         // Add executors with different states
@@ -986,6 +988,7 @@ mod tests {
         let ss = SnapShot::new(ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         });
 
         // Add sessions with different states
@@ -1014,6 +1017,7 @@ mod tests {
         let ss = SnapShot::new(ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         });
 
         // Add an idle executor
@@ -1043,6 +1047,7 @@ mod tests {
         let ss = SnapShot::new(ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         });
 
         // Add executors with different slots
@@ -1079,6 +1084,7 @@ mod tests {
         let ss = SnapShot::new(ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         });
 
         // Add some executors
@@ -1112,6 +1118,7 @@ mod tests {
         let ss = SnapShot::new(ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         });
 
         let exec = create_test_executor("exec-1", 2, ExecutorState::Idle);

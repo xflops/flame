@@ -33,10 +33,12 @@ mod tests {
             capacity: ResourceRequirement {
                 cpu: 8,
                 memory: 16384,
+                gpu: 0,
             },
             allocatable: ResourceRequirement {
                 cpu: 6,
                 memory: 12288,
+                gpu: 0,
             },
             info: NodeInfo {
                 arch: "x86_64".to_string(),
@@ -67,10 +69,12 @@ mod tests {
             capacity: ResourceRequirement {
                 cpu: 4,
                 memory: 8192,
+                gpu: 0,
             },
             allocatable: ResourceRequirement {
                 cpu: 4,
                 memory: 8192,
+                gpu: 0,
             },
             info: NodeInfo {
                 arch: "aarch64".to_string(),
@@ -83,6 +87,7 @@ mod tests {
         let updated_allocatable = ResourceRequirement {
             cpu: 3,
             memory: 6144,
+            gpu: 0,
         };
 
         // Merge logic (as implemented in backend.rs fix)
@@ -121,10 +126,12 @@ mod tests {
             capacity: ResourceRequirement {
                 cpu: 2,
                 memory: 4096,
+                gpu: 0,
             },
             allocatable: ResourceRequirement {
                 cpu: 2,
                 memory: 4096,
+                gpu: 0,
             },
             info: NodeInfo {
                 arch: "x86_64".to_string(),
@@ -153,10 +160,12 @@ mod tests {
             capacity: ResourceRequirement {
                 cpu: 8,
                 memory: 16384,
+                gpu: 0,
             },
             allocatable: ResourceRequirement {
                 cpu: 8,
                 memory: 16384,
+                gpu: 0,
             },
             info: NodeInfo {
                 arch: "x86_64".to_string(),
@@ -170,7 +179,7 @@ mod tests {
             name: existing_node.name.clone(),
             state: NodeState::NotReady,
             capacity: existing_node.capacity.clone(),
-            allocatable: ResourceRequirement { cpu: 0, memory: 0 },
+            allocatable: ResourceRequirement { cpu: 0, memory: 0, gpu: 0 },
             info: existing_node.info.clone(),
         };
 

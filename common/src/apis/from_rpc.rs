@@ -23,6 +23,7 @@ impl From<rpc::ResourceRequirement> for ResourceRequirement {
         Self {
             cpu: req.cpu,
             memory: req.memory,
+            gpu: req.gpu,
         }
     }
 }

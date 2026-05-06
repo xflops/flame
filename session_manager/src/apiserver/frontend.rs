@@ -341,6 +341,7 @@ impl Frontend for Flame {
             max_instances: ssn_spec.max_instances,
             batch_size: ssn_spec.batch_size.max(1),
             priority: ssn_spec.priority,
+            resreq: ssn_spec.resreq.map(apis::ResourceRequirement::from),
         };
 
         tracing::debug!(
@@ -412,6 +413,7 @@ impl Frontend for Flame {
                     max_instances: ssn_spec.max_instances,
                     batch_size: ssn_spec.batch_size.max(1),
                     priority: ssn_spec.priority,
+                    resreq: ssn_spec.resreq.map(apis::ResourceRequirement::from),
                 })
             }
             None => None,

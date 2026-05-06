@@ -41,10 +41,12 @@ mod tests {
             capacity: ResourceRequirement {
                 cpu: 8,
                 memory: 16384,
+                gpu: 0,
             },
             allocatable: ResourceRequirement {
                 cpu: 6,
                 memory: 12288,
+                gpu: 0,
             },
             info: NodeInfo {
                 arch: "x86_64".to_string(),
@@ -71,10 +73,12 @@ mod tests {
             capacity: ResourceRequirement {
                 cpu: 8,
                 memory: 16384,
+                gpu: 0,
             },
             allocatable: ResourceRequirement {
                 cpu: 4,
                 memory: 8192,
+                gpu: 0,
             },
             info: NodeInfo {
                 arch: "x86_64".to_string(),
@@ -113,10 +117,12 @@ mod tests {
             capacity: ResourceRequirement {
                 cpu: 8,
                 memory: 16384,
+                gpu: 0,
             },
             allocatable: ResourceRequirement {
                 cpu: 8,
                 memory: 16384,
+                gpu: 0,
             },
             info: NodeInfo {
                 arch: "x86_64".to_string(),
@@ -132,6 +138,7 @@ mod tests {
             resreq: ResourceRequirement {
                 cpu: 2,
                 memory: 4096,
+                gpu: 0,
             },
             slots: 2,
             shim: Shim::Host,
@@ -189,10 +196,12 @@ mod tests {
             capacity: ResourceRequirement {
                 cpu: 8,
                 memory: 16384,
+                gpu: 0,
             },
             allocatable: ResourceRequirement {
                 cpu: 8,
                 memory: 16384,
+                gpu: 0,
             },
             info: NodeInfo {
                 arch: "x86_64".to_string(),
@@ -209,6 +218,7 @@ mod tests {
                 resreq: ResourceRequirement {
                     cpu: 2,
                     memory: 4096,
+                    gpu: 0,
                 },
                 slots: 2,
                 shim: Shim::Host,
@@ -247,10 +257,12 @@ mod tests {
             capacity: ResourceRequirement {
                 cpu: 8,
                 memory: 16384,
+                gpu: 0,
             },
             allocatable: ResourceRequirement {
                 cpu: 8,
                 memory: 16384,
+                gpu: 0,
             },
             info: NodeInfo::default(),
         };
@@ -263,6 +275,7 @@ mod tests {
             resreq: ResourceRequirement {
                 cpu: 2,
                 memory: 4096,
+                gpu: 0,
             },
             slots: 2,
             shim: Shim::Host,

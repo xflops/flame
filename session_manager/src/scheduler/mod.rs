@@ -111,10 +111,12 @@ mod tests {
             allocatable: ResourceRequirement {
                 cpu: 64,
                 memory: 100 * 1024 * 1024 * 1024,
+                gpu: 0,
             },
             capacity: ResourceRequirement {
                 cpu: 64,
                 memory: 100 * 1024 * 1024 * 1024,
+                gpu: 0,
             },
             info: NodeInfo {
                 arch: "x86_64".to_string(),
@@ -196,6 +198,7 @@ mod tests {
                 max_instances: None,
                 batch_size: 1,
                 priority: 0,
+                resreq: None,
             }))?;
 
         for _ in 0..task_num {

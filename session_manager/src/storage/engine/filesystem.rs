@@ -1353,10 +1353,12 @@ impl Engine for FilesystemEngine {
                 capacity: ResourceRequirement {
                     cpu: meta.capacity_cpu,
                     memory: meta.capacity_memory,
+                    gpu: 0,
                 },
                 allocatable: ResourceRequirement {
                     cpu: meta.allocatable_cpu,
                     memory: meta.allocatable_memory,
+                    gpu: 0,
                 },
                 info: NodeInfo {
                     arch: meta.info_arch,
@@ -1428,10 +1430,12 @@ impl Engine for FilesystemEngine {
                         capacity: ResourceRequirement {
                             cpu: meta.capacity_cpu,
                             memory: meta.capacity_memory,
+                            gpu: 0,
                         },
                         allocatable: ResourceRequirement {
                             cpu: meta.allocatable_cpu,
                             memory: meta.allocatable_memory,
+                            gpu: 0,
                         },
                         info: NodeInfo {
                             arch: meta.info_arch,
@@ -1481,6 +1485,7 @@ impl Engine for FilesystemEngine {
                 resreq: ResourceRequirement {
                     cpu: meta.resreq_cpu,
                     memory: meta.resreq_memory,
+                    gpu: 0,
                 },
                 slots: meta.slots,
                 shim: Shim::try_from(meta.shim).unwrap_or_default(),
@@ -1532,6 +1537,7 @@ impl Engine for FilesystemEngine {
             resreq: ResourceRequirement {
                 cpu: meta.resreq_cpu,
                 memory: meta.resreq_memory,
+                gpu: 0,
             },
             slots: meta.slots,
             shim: Shim::try_from(meta.shim).unwrap_or_default(),
@@ -1597,6 +1603,7 @@ impl Engine for FilesystemEngine {
                             resreq: ResourceRequirement {
                                 cpu: meta.resreq_cpu,
                                 memory: meta.resreq_memory,
+                                gpu: 0,
                             },
                             slots: meta.slots,
                             shim: Shim::try_from(meta.shim).unwrap_or_default(),
@@ -1815,6 +1822,7 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         };
 
         let session = engine.create_session(ssn_attr).await.unwrap();
@@ -1881,6 +1889,7 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         };
         engine.create_session(ssn_attr).await.unwrap();
 
@@ -2019,6 +2028,7 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         };
 
         engine.create_session(ssn_attr.clone()).await.unwrap();
@@ -2063,6 +2073,7 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         };
         engine.create_session(ssn_attr).await.unwrap();
 
@@ -2124,6 +2135,7 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         };
         engine.create_session(ssn_attr).await.unwrap();
 
@@ -2151,10 +2163,12 @@ mod tests {
             capacity: ResourceRequirement {
                 cpu: 8,
                 memory: 16384,
+                gpu: 0,
             },
             allocatable: ResourceRequirement {
                 cpu: 6,
                 memory: 12288,
+                gpu: 0,
             },
             info: NodeInfo {
                 arch: "x86_64".to_string(),
@@ -2194,10 +2208,12 @@ mod tests {
             capacity: ResourceRequirement {
                 cpu: 4,
                 memory: 8192,
+                gpu: 0,
             },
             allocatable: ResourceRequirement {
                 cpu: 4,
                 memory: 8192,
+                gpu: 0,
             },
             info: NodeInfo {
                 arch: "x86_64".to_string(),
@@ -2212,6 +2228,7 @@ mod tests {
             resreq: ResourceRequirement {
                 cpu: 1,
                 memory: 1024,
+                gpu: 0,
             },
             slots: 1,
             shim: Shim::Host,
@@ -2257,10 +2274,12 @@ mod tests {
             capacity: ResourceRequirement {
                 cpu: 4,
                 memory: 8192,
+                gpu: 0,
             },
             allocatable: ResourceRequirement {
                 cpu: 4,
                 memory: 8192,
+                gpu: 0,
             },
             info: NodeInfo {
                 arch: "x86_64".to_string(),
@@ -2276,6 +2295,7 @@ mod tests {
                 resreq: ResourceRequirement {
                     cpu: 1,
                     memory: 1024,
+                    gpu: 0,
                 },
                 slots: 1,
                 shim: Shim::Host,

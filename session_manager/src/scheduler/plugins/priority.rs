@@ -306,6 +306,7 @@ mod tests {
         let ss = SnapShot::new(ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         });
         ss.add_application(create_test_app("test-app")).unwrap();
         for ssn in sessions {
@@ -326,6 +327,7 @@ mod tests {
             resreq: ResourceRequirement {
                 cpu: 1,
                 memory: 1024,
+                gpu: 0,
             },
             slots,
             shim: Shim::Host,

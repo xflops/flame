@@ -119,6 +119,7 @@ mod tests {
         SnapShot::new(ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         })
     }
 
@@ -149,6 +150,7 @@ mod tests {
             resreq: ResourceRequirement {
                 cpu: 1,
                 memory: 1024,
+                gpu: 0,
             },
             slots: 1,
             shim,

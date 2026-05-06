@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import Any, Optional
+from typing import Any, Optional, Union, Dict
 
 import cloudpickle
 
@@ -21,7 +21,7 @@ from flamepy.core.client import (
     create_session,
     open_session,
 )
-from flamepy.core.types import short_name
+from flamepy.core.types import FlameError, FlameErrorCode, ResourceRequirement, short_name
 
 
 class Agent:
@@ -47,6 +47,7 @@ class Agent:
         ctx: Optional[Any] = None,
         session_id: Optional[str] = None,
         slots: int = 1,
+        resreq: Optional[Union[ResourceRequirement, Dict[str, Any]]] = None,
     ):
         """Initialize an Agent.
 
@@ -57,14 +58,28 @@ class Agent:
             session_id: Optional session ID. If provided, opens an existing session.
                         Required if name is None. Mutually exclusive with name.
             slots: Number of slots for the session (default: 1). Only used when creating a new session.
+                   Ignored if resreq is provided.
+            resreq: Explicit resource requirements. Mutually exclusive with slots.
+                    Can be a ResourceRequirement or dict like {"cpu": 16, "memory": "64g", "gpu": 4}.
 
         Raises:
             ValueError: If both name and session_id are None, or if both are provided.
+            FlameError: If both slots and resreq are specified.
         """
         if name is None and session_id is None:
             raise ValueError("Either 'name' or 'session_id' must be provided")
         if name is not None and session_id is not None:
             raise ValueError("Cannot provide both 'name' and 'session_id'. They are mutually exclusive.")
+        if slots != 1 and resreq is not None:
+            raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "slots and resreq are mutually exclusive")
+
+        if isinstance(resreq, dict):
+            memory = resreq.get("memory") or resreq.get("mem", 0)
+            resreq = ResourceRequirement(
+                cpu=resreq.get("cpu", 0),
+                memory=ResourceRequirement._parse_memory(memory) if isinstance(memory, str) else memory,
+                gpu=resreq.get("gpu", 0),
+            )
 
         self._name = name
         self._session: Optional[Session] = None
@@ -92,12 +107,12 @@ class Agent:
                 # Encode ObjectRef to bytes for core API
                 common_data_bytes = object_ref.encode()
 
-            # Create session - session_id is optional, create_session will generate one if not provided
             self._session = create_session(
                 application=name,
                 common_data=common_data_bytes,
-                session_id=temp_session_id,  # Pass None if ctx is None, otherwise use temp_session_id
-                slots=slots,
+                session_id=temp_session_id,
+                slots=slots if resreq is None else 0,
+                resreq=resreq,
             )
 
     def invoke(self, req: Any) -> Any:

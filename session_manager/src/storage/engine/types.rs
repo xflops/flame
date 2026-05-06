@@ -100,15 +100,14 @@ pub struct NodeDao {
     pub name: String,
     pub state: i32,
 
-    // Capacity resources
     pub capacity_cpu: i64,
     pub capacity_memory: i64,
+    pub capacity_gpu: i64,
 
-    // Allocatable resources
     pub allocatable_cpu: i64,
     pub allocatable_memory: i64,
+    pub allocatable_gpu: i64,
 
-    // Node info
     pub info_arch: String,
     pub info_os: String,
 
@@ -123,6 +122,7 @@ pub struct ExecutorDao {
 
     pub resreq_cpu: i64,
     pub resreq_memory: i64,
+    pub resreq_gpu: i64,
 
     pub slots: i64,
     pub shim: i32,
@@ -298,10 +298,12 @@ impl TryFrom<&NodeDao> for Node {
             capacity: ResourceRequirement {
                 cpu: dao.capacity_cpu as u64,
                 memory: dao.capacity_memory as u64,
+                gpu: dao.capacity_gpu as i32,
             },
             allocatable: ResourceRequirement {
                 cpu: dao.allocatable_cpu as u64,
                 memory: dao.allocatable_memory as u64,
+                gpu: dao.allocatable_gpu as i32,
             },
             info: NodeInfo {
                 arch: dao.info_arch.clone(),
@@ -326,8 +328,10 @@ impl From<&Node> for NodeDao {
             state: i32::from(node.state),
             capacity_cpu: node.capacity.cpu as i64,
             capacity_memory: node.capacity.memory as i64,
+            capacity_gpu: node.capacity.gpu as i64,
             allocatable_cpu: node.allocatable.cpu as i64,
             allocatable_memory: node.allocatable.memory as i64,
+            allocatable_gpu: node.allocatable.gpu as i64,
             info_arch: node.info.arch.clone(),
             info_os: node.info.os.clone(),
             creation_time: Utc::now().timestamp(),
@@ -348,6 +352,7 @@ impl TryFrom<&ExecutorDao> for Executor {
             resreq: ResourceRequirement {
                 cpu: dao.resreq_cpu as u64,
                 memory: dao.resreq_memory as u64,
+                gpu: dao.resreq_gpu as i32,
             },
             slots: dao.slots as u32,
             shim: Shim::try_from(dao.shim).unwrap_or_default(),
@@ -375,6 +380,7 @@ impl From<&Executor> for ExecutorDao {
             node: exec.node.clone(),
             resreq_cpu: exec.resreq.cpu as i64,
             resreq_memory: exec.resreq.memory as i64,
+            resreq_gpu: exec.resreq.gpu as i64,
             slots: exec.slots as i64,
             shim: i32::from(exec.shim),
             task_id: exec.task_id,

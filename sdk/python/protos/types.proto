@@ -37,6 +37,7 @@ message SessionSpec {
   optional uint32 max_instances = 6;  // Maximum number of instances (null means unlimited)
   uint32 batch_size = 7;  // Number of executors per batch for gang scheduling (default: 1)
   uint32 priority = 8;  // Session priority (default: 0 = lowest)
+  optional ResourceRequirement resreq = 9;  // Explicit resource request (mutually exclusive with slots)
 }
 
 message Session {

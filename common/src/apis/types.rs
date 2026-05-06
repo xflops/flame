@@ -180,6 +180,7 @@ pub struct SessionAttributes {
     pub max_instances: Option<u32>,
     pub batch_size: u32,
     pub priority: u32,
+    pub resreq: Option<ResourceRequirement>,
 }
 
 impl Default for SessionAttributes {
@@ -193,6 +194,7 @@ impl Default for SessionAttributes {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         }
     }
 }
@@ -351,6 +353,7 @@ pub struct NodeInfo {
 pub struct ResourceRequirement {
     pub cpu: u64,
     pub memory: u64,
+    pub gpu: i32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -382,6 +385,32 @@ fn totalram() -> u64 {
     system::sysinfo().totalram
 }
 
+fn detect_gpus() -> i32 {
+    if let Ok(devices) = std::env::var("CUDA_VISIBLE_DEVICES") {
+        if devices.is_empty() || devices == "-1" {
+            return 0;
+        }
+        return devices.split(',').count() as i32;
+    }
+
+    match nvml_wrapper::Nvml::init() {
+        Ok(nvml) => match nvml.device_count() {
+            Ok(count) => {
+                tracing::info!("Detected {} GPU(s) via NVML", count);
+                count as i32
+            }
+            Err(e) => {
+                tracing::warn!("NVML initialized but failed to get device count: {}", e);
+                0
+            }
+        },
+        Err(e) => {
+            tracing::debug!("NVML not available, GPU detection skipped: {}", e);
+            0
+        }
+    }
+}
+
 impl Node {
     pub fn new() -> Self {
         let name = uname();
@@ -397,7 +426,8 @@ impl Node {
     pub fn refresh(&mut self) {
         let memory = totalram();
         let cpu = num_cpus::get() as u64;
-        let capacity = ResourceRequirement { cpu, memory };
+        let gpu = detect_gpus();
+        let capacity = ResourceRequirement { cpu, memory, gpu };
         let allocatable = capacity.clone();
         let info = NodeInfo {
             arch: env::consts::ARCH.to_string(),
@@ -420,6 +450,7 @@ impl From<&String> for ResourceRequirement {
         let parts = s.split(',');
         let mut cpu = 0;
         let mut memory = 0;
+        let mut gpu = 0;
         for p in parts {
             let mut parts = p.split('=').map(|s| s.trim());
             let key = parts.next();
@@ -428,12 +459,13 @@ impl From<&String> for ResourceRequirement {
                 (Some("cpu"), Some(value)) => cpu = value.parse::<u64>().unwrap_or(0),
                 (Some("memory"), Some(value)) => memory = Self::parse_memory(value),
                 (Some("mem"), Some(value)) => memory = Self::parse_memory(value),
+                (Some("gpu"), Some(value)) => gpu = value.parse::<i32>().unwrap_or(0),
                 _ => {
                     tracing::error!("Invalid resource requirement: {s}");
                 }
             }
         }
-        Self { cpu, memory }
+        Self { cpu, memory, gpu }
     }
 }
 
@@ -442,11 +474,30 @@ impl ResourceRequirement {
         Self {
             cpu: slots as u64 * unit.cpu,
             memory: slots as u64 * unit.memory,
+            gpu: slots as i32 * unit.gpu,
         }
     }
 
     pub fn to_slots(&self, unit: &ResourceRequirement) -> u32 {
-        (self.cpu / unit.cpu).min(self.memory / unit.memory) as u32
+        let cpu_slots = if unit.cpu > 0 {
+            self.cpu / unit.cpu
+        } else {
+            u64::MAX
+        };
+
+        let mem_slots = if unit.memory > 0 {
+            self.memory / unit.memory
+        } else {
+            u64::MAX
+        };
+
+        let gpu_slots = if unit.gpu > 0 {
+            (self.gpu / unit.gpu) as u64
+        } else {
+            u64::MAX // No GPU requirement = unlimited GPU slots
+        };
+
+        cpu_slots.min(mem_slots).min(gpu_slots) as u32
     }
 
     pub(crate) fn parse_memory(s: &str) -> u64 {

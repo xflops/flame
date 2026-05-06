@@ -4,97 +4,102 @@
 # source: types.proto
 # Protobuf Python Version: 6.31.1
 """Generated protocol buffer code."""
-
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
 from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
-
-_runtime_version.ValidateProtobufRuntimeVersion(_runtime_version.Domain.PUBLIC, 6, 31, 1, "", "types.proto")
+_runtime_version.ValidateProtobufRuntimeVersion(
+    _runtime_version.Domain.PUBLIC,
+    6,
+    31,
+    1,
+    '',
+    'types.proto'
+)
 # @@protoc_insertion_point(imports)
 
 _sym_db = _symbol_database.Default()
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
-    b'\n\x0btypes.proto\x12\x08\x66lame.v1"$\n\x08Metadata\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0c\n\x04name\x18\x02 \x01(\t"\xf6\x01\n\rSessionStatus\x12%\n\x05state\x18\x01 \x01(\x0e\x32\x16.flame.v1.SessionState\x12\x15\n\rcreation_time\x18\x02 \x01(\x03\x12\x1c\n\x0f\x63ompletion_time\x18\x03 \x01(\x03H\x00\x88\x01\x01\x12\x0f\n\x07pending\x18\x04 \x01(\x05\x12\x0f\n\x07running\x18\x05 \x01(\x05\x12\x0f\n\x07succeed\x18\x06 \x01(\x05\x12\x0e\n\x06\x66\x61iled\x18\x07 \x01(\x05\x12\x11\n\tcancelled\x18\t \x01(\x05\x12\x1f\n\x06\x65vents\x18\x08 \x03(\x0b\x32\x0f.flame.v1.EventB\x12\n\x10_completion_time"\xb4\x01\n\x0bSessionSpec\x12\x13\n\x0b\x61pplication\x18\x02 \x01(\t\x12\r\n\x05slots\x18\x03 \x01(\r\x12\x18\n\x0b\x63ommon_data\x18\x04 \x01(\x0cH\x00\x88\x01\x01\x12\x15\n\rmin_instances\x18\x05 \x01(\r\x12\x1a\n\rmax_instances\x18\x06 \x01(\rH\x01\x88\x01\x01\x12\x12\n\nbatch_size\x18\x07 \x01(\rB\x0e\n\x0c_common_dataB\x10\n\x0e_max_instances"}\n\x07Session\x12$\n\x08metadata\x18\x01 \x01(\x0b\x32\x12.flame.v1.Metadata\x12#\n\x04spec\x18\x02 \x01(\x0b\x32\x15.flame.v1.SessionSpec\x12\'\n\x06status\x18\x03 \x01(\x0b\x32\x17.flame.v1.SessionStatus"\x9a\x01\n\nTaskStatus\x12"\n\x05state\x18\x01 \x01(\x0e\x32\x13.flame.v1.TaskState\x12\x15\n\rcreation_time\x18\x02 \x01(\x03\x12\x1c\n\x0f\x63ompletion_time\x18\x03 \x01(\x03H\x00\x88\x01\x01\x12\x1f\n\x06\x65vents\x18\x04 \x03(\x0b\x32\x0f.flame.v1.EventB\x12\n\x10_completion_time"\\\n\x08TaskSpec\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\x12\n\x05input\x18\x03 \x01(\x0cH\x00\x88\x01\x01\x12\x13\n\x06output\x18\x04 \x01(\x0cH\x01\x88\x01\x01\x42\x08\n\x06_inputB\t\n\x07_output"t\n\x04Task\x12$\n\x08metadata\x18\x01 \x01(\x0b\x32\x12.flame.v1.Metadata\x12 \n\x04spec\x18\x02 \x01(\x0b\x32\x12.flame.v1.TaskSpec\x12$\n\x06status\x18\x03 \x01(\x0b\x32\x14.flame.v1.TaskStatus"U\n\x11\x41pplicationStatus\x12)\n\x05state\x18\x01 \x01(\x0e\x32\x1a.flame.v1.ApplicationState\x12\x15\n\rcreation_time\x18\x02 \x01(\x03"*\n\x0b\x45nvironment\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t"{\n\x11\x41pplicationSchema\x12\x12\n\x05input\x18\x01 \x01(\tH\x00\x88\x01\x01\x12\x13\n\x06output\x18\x02 \x01(\tH\x01\x88\x01\x01\x12\x18\n\x0b\x63ommon_data\x18\x03 \x01(\tH\x02\x88\x01\x01\x42\x08\n\x06_inputB\t\n\x07_outputB\x0e\n\x0c_common_data"\xf8\x03\n\x0f\x41pplicationSpec\x12\x1c\n\x04shim\x18\x01 \x01(\x0e\x32\x0e.flame.v1.Shim\x12\x18\n\x0b\x64\x65scription\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x0e\n\x06labels\x18\x03 \x03(\t\x12\x12\n\x05image\x18\x04 \x01(\tH\x01\x88\x01\x01\x12\x14\n\x07\x63ommand\x18\x05 \x01(\tH\x02\x88\x01\x01\x12\x11\n\targuments\x18\x06 \x03(\t\x12+\n\x0c\x65nvironments\x18\x07 \x03(\x0b\x32\x15.flame.v1.Environment\x12\x1e\n\x11working_directory\x18\x08 \x01(\tH\x03\x88\x01\x01\x12\x1a\n\rmax_instances\x18\t \x01(\rH\x04\x88\x01\x01\x12\x1a\n\rdelay_release\x18\n \x01(\x03H\x05\x88\x01\x01\x12\x30\n\x06schema\x18\x0b \x01(\x0b\x32\x1b.flame.v1.ApplicationSchemaH\x06\x88\x01\x01\x12\x10\n\x03url\x18\x0c \x01(\tH\x07\x88\x01\x01\x12\x16\n\tinstaller\x18\r \x01(\tH\x08\x88\x01\x01\x42\x0e\n\x0c_descriptionB\x08\n\x06_imageB\n\n\x08_commandB\x14\n\x12_working_directoryB\x10\n\x0e_max_instancesB\x10\n\x0e_delay_releaseB\t\n\x07_schemaB\x06\n\x04_urlB\x0c\n\n_installer"\x89\x01\n\x0b\x41pplication\x12$\n\x08metadata\x18\x01 \x01(\x0b\x32\x12.flame.v1.Metadata\x12\'\n\x04spec\x18\x02 \x01(\x0b\x32\x19.flame.v1.ApplicationSpec\x12+\n\x06status\x18\x03 \x01(\x0b\x32\x1b.flame.v1.ApplicationStatus"x\n\x0c\x45xecutorSpec\x12\x0c\n\x04node\x18\x01 \x01(\t\x12-\n\x06resreq\x18\x02 \x01(\x0b\x32\x1d.flame.v1.ResourceRequirement\x12\r\n\x05slots\x18\x03 \x01(\r\x12\x1c\n\x04shim\x18\x04 \x01(\x0e\x32\x0e.flame.v1.Shim"`\n\x0e\x45xecutorStatus\x12&\n\x05state\x18\x01 \x01(\x0e\x32\x17.flame.v1.ExecutorState\x12\x17\n\nsession_id\x18\x02 \x01(\tH\x00\x88\x01\x01\x42\r\n\x0b_session_id"\x80\x01\n\x08\x45xecutor\x12$\n\x08metadata\x18\x01 \x01(\x0b\x32\x12.flame.v1.Metadata\x12$\n\x04spec\x18\x02 \x01(\x0b\x32\x16.flame.v1.ExecutorSpec\x12(\n\x06status\x18\x03 \x01(\x0b\x32\x18.flame.v1.ExecutorStatus"5\n\x0c\x45xecutorList\x12%\n\texecutors\x18\x01 \x03(\x0b\x32\x12.flame.v1.Executor"2\n\x0bSessionList\x12#\n\x08sessions\x18\x01 \x03(\x0b\x32\x11.flame.v1.Session">\n\x0f\x41pplicationList\x12+\n\x0c\x61pplications\x18\x01 \x03(\x0b\x32\x15.flame.v1.Application"?\n\x13ResourceRequirement\x12\x0b\n\x03\x63pu\x18\x01 \x01(\x04\x12\x0e\n\x06memory\x18\x02 \x01(\x04\x12\x0b\n\x03gpu\x18\x03 \x01(\x05"\x1c\n\x08NodeSpec\x12\x10\n\x08hostname\x18\x01 \x01(\t"$\n\x08NodeInfo\x12\x0c\n\x04\x61rch\x18\x01 \x01(\t\x12\n\n\x02os\x18\x02 \x01(\t",\n\x0bNodeAddress\x12\x0c\n\x04type\x18\x01 \x01(\t\x12\x0f\n\x07\x61\x64\x64ress\x18\x02 \x01(\t"\xfe\x01\n\nNodeStatus\x12"\n\x05state\x18\x01 \x01(\x0e\x32\x13.flame.v1.NodeState\x12/\n\x08\x63\x61pacity\x18\x02 \x01(\x0b\x32\x1d.flame.v1.ResourceRequirement\x12\x32\n\x0b\x61llocatable\x18\x03 \x01(\x0b\x32\x1d.flame.v1.ResourceRequirement\x12 \n\x04info\x18\x04 \x01(\x0b\x32\x12.flame.v1.NodeInfo\x12(\n\taddresses\x18\x05 \x03(\x0b\x32\x15.flame.v1.NodeAddress\x12\x1b\n\x13last_heartbeat_time\x18\x06 \x01(\x03"t\n\x04Node\x12$\n\x08metadata\x18\x01 \x01(\x0b\x32\x12.flame.v1.Metadata\x12 \n\x04spec\x18\x02 \x01(\x0b\x32\x12.flame.v1.NodeSpec\x12$\n\x06status\x18\x03 \x01(\x0b\x32\x14.flame.v1.NodeStatus")\n\x08NodeList\x12\x1d\n\x05nodes\x18\x01 \x03(\x0b\x32\x0e.flame.v1.Node"?\n\x06Result\x12\x13\n\x0breturn_code\x18\x01 \x01(\x05\x12\x14\n\x07message\x18\x02 \x01(\tH\x00\x88\x01\x01\x42\n\n\x08_message"c\n\nTaskResult\x12\x13\n\x0breturn_code\x18\x01 \x01(\x05\x12\x13\n\x06output\x18\x02 \x01(\x0cH\x00\x88\x01\x01\x12\x14\n\x07message\x18\x03 \x01(\tH\x01\x88\x01\x01\x42\t\n\x07_outputB\n\n\x08_message"\x0e\n\x0c\x45mptyRequest"N\n\x05\x45vent\x12\x0c\n\x04\x63ode\x18\x01 \x01(\x05\x12\x14\n\x07message\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x15\n\rcreation_time\x18\x03 \x01(\x03\x42\n\n\x08_message*$\n\x0cSessionState\x12\x08\n\x04Open\x10\x00\x12\n\n\x06\x43losed\x10\x01*M\n\tTaskState\x12\x0b\n\x07Pending\x10\x00\x12\x0b\n\x07Running\x10\x01\x12\x0b\n\x07Succeed\x10\x02\x12\n\n\x06\x46\x61iled\x10\x03\x12\r\n\tCancelled\x10\x04*\x1a\n\x04Shim\x12\x08\n\x04Host\x10\x00\x12\x08\n\x04Wasm\x10\x01*-\n\x10\x41pplicationState\x12\x0b\n\x07\x45nabled\x10\x00\x12\x0c\n\x08\x44isabled\x10\x01*\xb4\x01\n\rExecutorState\x12\x13\n\x0f\x45xecutorUnknown\x10\x00\x12\x10\n\x0c\x45xecutorVoid\x10\x01\x12\x10\n\x0c\x45xecutorIdle\x10\x02\x12\x13\n\x0f\x45xecutorBinding\x10\x03\x12\x11\n\rExecutorBound\x10\x04\x12\x15\n\x11\x45xecutorUnbinding\x10\x05\x12\x15\n\x11\x45xecutorReleasing\x10\x06\x12\x14\n\x10\x45xecutorReleased\x10\x07*1\n\tNodeState\x12\x0b\n\x07Unknown\x10\x00\x12\t\n\x05Ready\x10\x01\x12\x0c\n\x08NotReady\x10\x02\x42)Z\'github.com/flame-sh/flame/sdk/go/rpc/v1b\x06proto3'
-)
+
+
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0btypes.proto\x12\x08\x66lame.v1\"$\n\x08Metadata\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0c\n\x04name\x18\x02 \x01(\t\"\xf6\x01\n\rSessionStatus\x12%\n\x05state\x18\x01 \x01(\x0e\x32\x16.flame.v1.SessionState\x12\x15\n\rcreation_time\x18\x02 \x01(\x03\x12\x1c\n\x0f\x63ompletion_time\x18\x03 \x01(\x03H\x00\x88\x01\x01\x12\x0f\n\x07pending\x18\x04 \x01(\x05\x12\x0f\n\x07running\x18\x05 \x01(\x05\x12\x0f\n\x07succeed\x18\x06 \x01(\x05\x12\x0e\n\x06\x66\x61iled\x18\x07 \x01(\x05\x12\x11\n\tcancelled\x18\t \x01(\x05\x12\x1f\n\x06\x65vents\x18\x08 \x03(\x0b\x32\x0f.flame.v1.EventB\x12\n\x10_completion_time\"\x85\x02\n\x0bSessionSpec\x12\x13\n\x0b\x61pplication\x18\x02 \x01(\t\x12\r\n\x05slots\x18\x03 \x01(\r\x12\x18\n\x0b\x63ommon_data\x18\x04 \x01(\x0cH\x00\x88\x01\x01\x12\x15\n\rmin_instances\x18\x05 \x01(\r\x12\x1a\n\rmax_instances\x18\x06 \x01(\rH\x01\x88\x01\x01\x12\x12\n\nbatch_size\x18\x07 \x01(\r\x12\x10\n\x08priority\x18\x08 \x01(\r\x12\x32\n\x06resreq\x18\t \x01(\x0b\x32\x1d.flame.v1.ResourceRequirementH\x02\x88\x01\x01\x42\x0e\n\x0c_common_dataB\x10\n\x0e_max_instancesB\t\n\x07_resreq\"}\n\x07Session\x12$\n\x08metadata\x18\x01 \x01(\x0b\x32\x12.flame.v1.Metadata\x12#\n\x04spec\x18\x02 \x01(\x0b\x32\x15.flame.v1.SessionSpec\x12\'\n\x06status\x18\x03 \x01(\x0b\x32\x17.flame.v1.SessionStatus\"\x9a\x01\n\nTaskStatus\x12\"\n\x05state\x18\x01 \x01(\x0e\x32\x13.flame.v1.TaskState\x12\x15\n\rcreation_time\x18\x02 \x01(\x03\x12\x1c\n\x0f\x63ompletion_time\x18\x03 \x01(\x03H\x00\x88\x01\x01\x12\x1f\n\x06\x65vents\x18\x04 \x03(\x0b\x32\x0f.flame.v1.EventB\x12\n\x10_completion_time\"\\\n\x08TaskSpec\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\x12\n\x05input\x18\x03 \x01(\x0cH\x00\x88\x01\x01\x12\x13\n\x06output\x18\x04 \x01(\x0cH\x01\x88\x01\x01\x42\x08\n\x06_inputB\t\n\x07_output\"t\n\x04Task\x12$\n\x08metadata\x18\x01 \x01(\x0b\x32\x12.flame.v1.Metadata\x12 \n\x04spec\x18\x02 \x01(\x0b\x32\x12.flame.v1.TaskSpec\x12$\n\x06status\x18\x03 \x01(\x0b\x32\x14.flame.v1.TaskStatus\"U\n\x11\x41pplicationStatus\x12)\n\x05state\x18\x01 \x01(\x0e\x32\x1a.flame.v1.ApplicationState\x12\x15\n\rcreation_time\x18\x02 \x01(\x03\"*\n\x0b\x45nvironment\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t\"{\n\x11\x41pplicationSchema\x12\x12\n\x05input\x18\x01 \x01(\tH\x00\x88\x01\x01\x12\x13\n\x06output\x18\x02 \x01(\tH\x01\x88\x01\x01\x12\x18\n\x0b\x63ommon_data\x18\x03 \x01(\tH\x02\x88\x01\x01\x42\x08\n\x06_inputB\t\n\x07_outputB\x0e\n\x0c_common_data\"\xf8\x03\n\x0f\x41pplicationSpec\x12\x1c\n\x04shim\x18\x01 \x01(\x0e\x32\x0e.flame.v1.Shim\x12\x18\n\x0b\x64\x65scription\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x0e\n\x06labels\x18\x03 \x03(\t\x12\x12\n\x05image\x18\x04 \x01(\tH\x01\x88\x01\x01\x12\x14\n\x07\x63ommand\x18\x05 \x01(\tH\x02\x88\x01\x01\x12\x11\n\targuments\x18\x06 \x03(\t\x12+\n\x0c\x65nvironments\x18\x07 \x03(\x0b\x32\x15.flame.v1.Environment\x12\x1e\n\x11working_directory\x18\x08 \x01(\tH\x03\x88\x01\x01\x12\x1a\n\rmax_instances\x18\t \x01(\rH\x04\x88\x01\x01\x12\x1a\n\rdelay_release\x18\n \x01(\x03H\x05\x88\x01\x01\x12\x30\n\x06schema\x18\x0b \x01(\x0b\x32\x1b.flame.v1.ApplicationSchemaH\x06\x88\x01\x01\x12\x10\n\x03url\x18\x0c \x01(\tH\x07\x88\x01\x01\x12\x16\n\tinstaller\x18\r \x01(\tH\x08\x88\x01\x01\x42\x0e\n\x0c_descriptionB\x08\n\x06_imageB\n\n\x08_commandB\x14\n\x12_working_directoryB\x10\n\x0e_max_instancesB\x10\n\x0e_delay_releaseB\t\n\x07_schemaB\x06\n\x04_urlB\x0c\n\n_installer\"\x89\x01\n\x0b\x41pplication\x12$\n\x08metadata\x18\x01 \x01(\x0b\x32\x12.flame.v1.Metadata\x12\'\n\x04spec\x18\x02 \x01(\x0b\x32\x19.flame.v1.ApplicationSpec\x12+\n\x06status\x18\x03 \x01(\x0b\x32\x1b.flame.v1.ApplicationStatus\"x\n\x0c\x45xecutorSpec\x12\x0c\n\x04node\x18\x01 \x01(\t\x12-\n\x06resreq\x18\x02 \x01(\x0b\x32\x1d.flame.v1.ResourceRequirement\x12\r\n\x05slots\x18\x03 \x01(\r\x12\x1c\n\x04shim\x18\x04 \x01(\x0e\x32\x0e.flame.v1.Shim\"`\n\x0e\x45xecutorStatus\x12&\n\x05state\x18\x01 \x01(\x0e\x32\x17.flame.v1.ExecutorState\x12\x17\n\nsession_id\x18\x02 \x01(\tH\x00\x88\x01\x01\x42\r\n\x0b_session_id\"\x80\x01\n\x08\x45xecutor\x12$\n\x08metadata\x18\x01 \x01(\x0b\x32\x12.flame.v1.Metadata\x12$\n\x04spec\x18\x02 \x01(\x0b\x32\x16.flame.v1.ExecutorSpec\x12(\n\x06status\x18\x03 \x01(\x0b\x32\x18.flame.v1.ExecutorStatus\"5\n\x0c\x45xecutorList\x12%\n\texecutors\x18\x01 \x03(\x0b\x32\x12.flame.v1.Executor\"2\n\x0bSessionList\x12#\n\x08sessions\x18\x01 \x03(\x0b\x32\x11.flame.v1.Session\">\n\x0f\x41pplicationList\x12+\n\x0c\x61pplications\x18\x01 \x03(\x0b\x32\x15.flame.v1.Application\"?\n\x13ResourceRequirement\x12\x0b\n\x03\x63pu\x18\x01 \x01(\x04\x12\x0e\n\x06memory\x18\x02 \x01(\x04\x12\x0b\n\x03gpu\x18\x03 \x01(\x05\"\x1c\n\x08NodeSpec\x12\x10\n\x08hostname\x18\x01 \x01(\t\"$\n\x08NodeInfo\x12\x0c\n\x04\x61rch\x18\x01 \x01(\t\x12\n\n\x02os\x18\x02 \x01(\t\",\n\x0bNodeAddress\x12\x0c\n\x04type\x18\x01 \x01(\t\x12\x0f\n\x07\x61\x64\x64ress\x18\x02 \x01(\t\"\xfe\x01\n\nNodeStatus\x12\"\n\x05state\x18\x01 \x01(\x0e\x32\x13.flame.v1.NodeState\x12/\n\x08\x63\x61pacity\x18\x02 \x01(\x0b\x32\x1d.flame.v1.ResourceRequirement\x12\x32\n\x0b\x61llocatable\x18\x03 \x01(\x0b\x32\x1d.flame.v1.ResourceRequirement\x12 \n\x04info\x18\x04 \x01(\x0b\x32\x12.flame.v1.NodeInfo\x12(\n\taddresses\x18\x05 \x03(\x0b\x32\x15.flame.v1.NodeAddress\x12\x1b\n\x13last_heartbeat_time\x18\x06 \x01(\x03\"t\n\x04Node\x12$\n\x08metadata\x18\x01 \x01(\x0b\x32\x12.flame.v1.Metadata\x12 \n\x04spec\x18\x02 \x01(\x0b\x32\x12.flame.v1.NodeSpec\x12$\n\x06status\x18\x03 \x01(\x0b\x32\x14.flame.v1.NodeStatus\")\n\x08NodeList\x12\x1d\n\x05nodes\x18\x01 \x03(\x0b\x32\x0e.flame.v1.Node\"?\n\x06Result\x12\x13\n\x0breturn_code\x18\x01 \x01(\x05\x12\x14\n\x07message\x18\x02 \x01(\tH\x00\x88\x01\x01\x42\n\n\x08_message\"c\n\nTaskResult\x12\x13\n\x0breturn_code\x18\x01 \x01(\x05\x12\x13\n\x06output\x18\x02 \x01(\x0cH\x00\x88\x01\x01\x12\x14\n\x07message\x18\x03 \x01(\tH\x01\x88\x01\x01\x42\t\n\x07_outputB\n\n\x08_message\"\x0e\n\x0c\x45mptyRequest\"N\n\x05\x45vent\x12\x0c\n\x04\x63ode\x18\x01 \x01(\x05\x12\x14\n\x07message\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x15\n\rcreation_time\x18\x03 \x01(\x03\x42\n\n\x08_message*$\n\x0cSessionState\x12\x08\n\x04Open\x10\x00\x12\n\n\x06\x43losed\x10\x01*M\n\tTaskState\x12\x0b\n\x07Pending\x10\x00\x12\x0b\n\x07Running\x10\x01\x12\x0b\n\x07Succeed\x10\x02\x12\n\n\x06\x46\x61iled\x10\x03\x12\r\n\tCancelled\x10\x04*\x1a\n\x04Shim\x12\x08\n\x04Host\x10\x00\x12\x08\n\x04Wasm\x10\x01*-\n\x10\x41pplicationState\x12\x0b\n\x07\x45nabled\x10\x00\x12\x0c\n\x08\x44isabled\x10\x01*\xb4\x01\n\rExecutorState\x12\x13\n\x0f\x45xecutorUnknown\x10\x00\x12\x10\n\x0c\x45xecutorVoid\x10\x01\x12\x10\n\x0c\x45xecutorIdle\x10\x02\x12\x13\n\x0f\x45xecutorBinding\x10\x03\x12\x11\n\rExecutorBound\x10\x04\x12\x15\n\x11\x45xecutorUnbinding\x10\x05\x12\x15\n\x11\x45xecutorReleasing\x10\x06\x12\x14\n\x10\x45xecutorReleased\x10\x07*1\n\tNodeState\x12\x0b\n\x07Unknown\x10\x00\x12\t\n\x05Ready\x10\x01\x12\x0c\n\x08NotReady\x10\x02\x42)Z\'github.com/flame-sh/flame/sdk/go/rpc/v1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
-_builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, "types_pb2", _globals)
+_builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'types_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
-    _globals["DESCRIPTOR"]._loaded_options = None
-    _globals["DESCRIPTOR"]._serialized_options = b"Z'github.com/flame-sh/flame/sdk/go/rpc/v1"
-    _globals["_SESSIONSTATE"]._serialized_start = 3275
-    _globals["_SESSIONSTATE"]._serialized_end = 3311
-    _globals["_TASKSTATE"]._serialized_start = 3313
-    _globals["_TASKSTATE"]._serialized_end = 3390
-    _globals["_SHIM"]._serialized_start = 3392
-    _globals["_SHIM"]._serialized_end = 3418
-    _globals["_APPLICATIONSTATE"]._serialized_start = 3420
-    _globals["_APPLICATIONSTATE"]._serialized_end = 3465
-    _globals["_EXECUTORSTATE"]._serialized_start = 3468
-    _globals["_EXECUTORSTATE"]._serialized_end = 3648
-    _globals["_NODESTATE"]._serialized_start = 3650
-    _globals["_NODESTATE"]._serialized_end = 3699
-    _globals["_METADATA"]._serialized_start = 25
-    _globals["_METADATA"]._serialized_end = 61
-    _globals["_SESSIONSTATUS"]._serialized_start = 64
-    _globals["_SESSIONSTATUS"]._serialized_end = 310
-    _globals["_SESSIONSPEC"]._serialized_start = 313
-    _globals["_SESSIONSPEC"]._serialized_end = 493
-    _globals["_SESSION"]._serialized_start = 495
-    _globals["_SESSION"]._serialized_end = 620
-    _globals["_TASKSTATUS"]._serialized_start = 623
-    _globals["_TASKSTATUS"]._serialized_end = 777
-    _globals["_TASKSPEC"]._serialized_start = 779
-    _globals["_TASKSPEC"]._serialized_end = 871
-    _globals["_TASK"]._serialized_start = 873
-    _globals["_TASK"]._serialized_end = 989
-    _globals["_APPLICATIONSTATUS"]._serialized_start = 991
-    _globals["_APPLICATIONSTATUS"]._serialized_end = 1076
-    _globals["_ENVIRONMENT"]._serialized_start = 1078
-    _globals["_ENVIRONMENT"]._serialized_end = 1120
-    _globals["_APPLICATIONSCHEMA"]._serialized_start = 1122
-    _globals["_APPLICATIONSCHEMA"]._serialized_end = 1245
-    _globals["_APPLICATIONSPEC"]._serialized_start = 1248
-    _globals["_APPLICATIONSPEC"]._serialized_end = 1752
-    _globals["_APPLICATION"]._serialized_start = 1755
-    _globals["_APPLICATION"]._serialized_end = 1892
-    _globals["_EXECUTORSPEC"]._serialized_start = 1894
-    _globals["_EXECUTORSPEC"]._serialized_end = 2014
-    _globals["_EXECUTORSTATUS"]._serialized_start = 2016
-    _globals["_EXECUTORSTATUS"]._serialized_end = 2112
-    _globals["_EXECUTOR"]._serialized_start = 2115
-    _globals["_EXECUTOR"]._serialized_end = 2243
-    _globals["_EXECUTORLIST"]._serialized_start = 2245
-    _globals["_EXECUTORLIST"]._serialized_end = 2298
-    _globals["_SESSIONLIST"]._serialized_start = 2300
-    _globals["_SESSIONLIST"]._serialized_end = 2350
-    _globals["_APPLICATIONLIST"]._serialized_start = 2352
-    _globals["_APPLICATIONLIST"]._serialized_end = 2414
-    _globals["_RESOURCEREQUIREMENT"]._serialized_start = 2416
-    _globals["_RESOURCEREQUIREMENT"]._serialized_end = 2479
-    _globals["_NODESPEC"]._serialized_start = 2481
-    _globals["_NODESPEC"]._serialized_end = 2509
-    _globals["_NODEINFO"]._serialized_start = 2511
-    _globals["_NODEINFO"]._serialized_end = 2547
-    _globals["_NODEADDRESS"]._serialized_start = 2549
-    _globals["_NODEADDRESS"]._serialized_end = 2593
-    _globals["_NODESTATUS"]._serialized_start = 2596
-    _globals["_NODESTATUS"]._serialized_end = 2850
-    _globals["_NODE"]._serialized_start = 2852
-    _globals["_NODE"]._serialized_end = 2968
-    _globals["_NODELIST"]._serialized_start = 2970
-    _globals["_NODELIST"]._serialized_end = 3011
-    _globals["_RESULT"]._serialized_start = 3013
-    _globals["_RESULT"]._serialized_end = 3076
-    _globals["_TASKRESULT"]._serialized_start = 3078
-    _globals["_TASKRESULT"]._serialized_end = 3177
-    _globals["_EMPTYREQUEST"]._serialized_start = 3179
-    _globals["_EMPTYREQUEST"]._serialized_end = 3193
-    _globals["_EVENT"]._serialized_start = 3195
-    _globals["_EVENT"]._serialized_end = 3273
+  _globals['DESCRIPTOR']._loaded_options = None
+  _globals['DESCRIPTOR']._serialized_options = b'Z\'github.com/flame-sh/flame/sdk/go/rpc/v1'
+  _globals['_SESSIONSTATE']._serialized_start=3356
+  _globals['_SESSIONSTATE']._serialized_end=3392
+  _globals['_TASKSTATE']._serialized_start=3394
+  _globals['_TASKSTATE']._serialized_end=3471
+  _globals['_SHIM']._serialized_start=3473
+  _globals['_SHIM']._serialized_end=3499
+  _globals['_APPLICATIONSTATE']._serialized_start=3501
+  _globals['_APPLICATIONSTATE']._serialized_end=3546
+  _globals['_EXECUTORSTATE']._serialized_start=3549
+  _globals['_EXECUTORSTATE']._serialized_end=3729
+  _globals['_NODESTATE']._serialized_start=3731
+  _globals['_NODESTATE']._serialized_end=3780
+  _globals['_METADATA']._serialized_start=25
+  _globals['_METADATA']._serialized_end=61
+  _globals['_SESSIONSTATUS']._serialized_start=64
+  _globals['_SESSIONSTATUS']._serialized_end=310
+  _globals['_SESSIONSPEC']._serialized_start=313
+  _globals['_SESSIONSPEC']._serialized_end=574
+  _globals['_SESSION']._serialized_start=576
+  _globals['_SESSION']._serialized_end=701
+  _globals['_TASKSTATUS']._serialized_start=704
+  _globals['_TASKSTATUS']._serialized_end=858
+  _globals['_TASKSPEC']._serialized_start=860
+  _globals['_TASKSPEC']._serialized_end=952
+  _globals['_TASK']._serialized_start=954
+  _globals['_TASK']._serialized_end=1070
+  _globals['_APPLICATIONSTATUS']._serialized_start=1072
+  _globals['_APPLICATIONSTATUS']._serialized_end=1157
+  _globals['_ENVIRONMENT']._serialized_start=1159
+  _globals['_ENVIRONMENT']._serialized_end=1201
+  _globals['_APPLICATIONSCHEMA']._serialized_start=1203
+  _globals['_APPLICATIONSCHEMA']._serialized_end=1326
+  _globals['_APPLICATIONSPEC']._serialized_start=1329
+  _globals['_APPLICATIONSPEC']._serialized_end=1833
+  _globals['_APPLICATION']._serialized_start=1836
+  _globals['_APPLICATION']._serialized_end=1973
+  _globals['_EXECUTORSPEC']._serialized_start=1975
+  _globals['_EXECUTORSPEC']._serialized_end=2095
+  _globals['_EXECUTORSTATUS']._serialized_start=2097
+  _globals['_EXECUTORSTATUS']._serialized_end=2193
+  _globals['_EXECUTOR']._serialized_start=2196
+  _globals['_EXECUTOR']._serialized_end=2324
+  _globals['_EXECUTORLIST']._serialized_start=2326
+  _globals['_EXECUTORLIST']._serialized_end=2379
+  _globals['_SESSIONLIST']._serialized_start=2381
+  _globals['_SESSIONLIST']._serialized_end=2431
+  _globals['_APPLICATIONLIST']._serialized_start=2433
+  _globals['_APPLICATIONLIST']._serialized_end=2495
+  _globals['_RESOURCEREQUIREMENT']._serialized_start=2497
+  _globals['_RESOURCEREQUIREMENT']._serialized_end=2560
+  _globals['_NODESPEC']._serialized_start=2562
+  _globals['_NODESPEC']._serialized_end=2590
+  _globals['_NODEINFO']._serialized_start=2592
+  _globals['_NODEINFO']._serialized_end=2628
+  _globals['_NODEADDRESS']._serialized_start=2630
+  _globals['_NODEADDRESS']._serialized_end=2674
+  _globals['_NODESTATUS']._serialized_start=2677
+  _globals['_NODESTATUS']._serialized_end=2931
+  _globals['_NODE']._serialized_start=2933
+  _globals['_NODE']._serialized_end=3049
+  _globals['_NODELIST']._serialized_start=3051
+  _globals['_NODELIST']._serialized_end=3092
+  _globals['_RESULT']._serialized_start=3094
+  _globals['_RESULT']._serialized_end=3157
+  _globals['_TASKRESULT']._serialized_start=3159
+  _globals['_TASKRESULT']._serialized_end=3258
+  _globals['_EMPTYREQUEST']._serialized_start=3260
+  _globals['_EMPTYREQUEST']._serialized_end=3274
+  _globals['_EVENT']._serialized_start=3276
+  _globals['_EVENT']._serialized_end=3354
 # @@protoc_insertion_point(module_scope)

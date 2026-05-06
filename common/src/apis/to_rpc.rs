@@ -20,7 +20,7 @@ impl From<ResourceRequirement> for rpc::ResourceRequirement {
         Self {
             cpu: req.cpu,
             memory: req.memory,
-            gpu: 0,
+            gpu: req.gpu,
         }
     }
 }
@@ -202,6 +202,7 @@ impl From<&Session> for rpc::Session {
                 max_instances: ssn.max_instances,
                 batch_size: ssn.batch_size,
                 priority: ssn.priority,
+                resreq: None,
             }),
             status: Some(status),
         }

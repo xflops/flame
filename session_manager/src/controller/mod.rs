@@ -949,10 +949,12 @@ mod tests {
             capacity: ResourceRequirement {
                 cpu: 8,
                 memory: 16384,
+                gpu: 0,
             },
             allocatable: ResourceRequirement {
                 cpu: 8,
                 memory: 16384,
+                gpu: 0,
             },
             info: NodeInfo {
                 arch: "x86_64".to_string(),
@@ -1083,10 +1085,12 @@ mod tests {
             node.capacity = ResourceRequirement {
                 cpu: 16,
                 memory: 32768,
+                gpu: 0,
             };
             node.allocatable = ResourceRequirement {
                 cpu: 14,
                 memory: 28672,
+                gpu: 0,
             };
 
             controller.register_node(&node, &[]).await.unwrap();

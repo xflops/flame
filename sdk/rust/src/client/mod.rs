@@ -121,10 +121,77 @@ pub struct SessionAttributes {
     pub batch_size: u32,
     #[serde(default)]
     pub priority: u32,
+    #[serde(default)]
+    pub resreq: Option<ResourceRequirement>,
 }
 
 fn default_batch_size() -> u32 {
     1
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ResourceRequirement {
+    pub cpu: u64,
+    pub memory: u64,
+    pub gpu: i32,
+}
+
+impl ResourceRequirement {
+    /// Parse memory string like "16g" into bytes.
+    fn parse_memory(s: &str) -> u64 {
+        if s.is_empty() {
+            return 0;
+        }
+        let s = s.to_lowercase();
+        let v = s[..s.len() - 1].parse::<u64>().unwrap_or(0);
+        let unit = s[s.len() - 1..].to_string();
+        match unit.as_str() {
+            "k" => v * 1024,
+            "m" => v * 1024 * 1024,
+            "g" => v * 1024 * 1024 * 1024,
+            _ => s.parse::<u64>().unwrap_or(0),
+        }
+    }
+}
+
+impl From<&str> for ResourceRequirement {
+    fn from(s: &str) -> Self {
+        Self::from(&s.to_string())
+    }
+}
+
+impl From<&String> for ResourceRequirement {
+    fn from(s: &String) -> Self {
+        let parts = s.split(',');
+        let mut cpu = 0;
+        let mut memory = 0;
+        let mut gpu = 0;
+        for p in parts {
+            let mut parts = p.split('=').map(|s| s.trim());
+            let key = parts.next();
+            let value = parts.next();
+            match (key, value) {
+                (Some("cpu"), Some(value)) => cpu = value.parse::<u64>().unwrap_or(0),
+                (Some("memory"), Some(value)) => memory = Self::parse_memory(value),
+                (Some("mem"), Some(value)) => memory = Self::parse_memory(value),
+                (Some("gpu"), Some(value)) => gpu = value.parse::<i32>().unwrap_or(0),
+                _ => {
+                    tracing::error!("Invalid resource requirement: {s}");
+                }
+            }
+        }
+        Self { cpu, memory, gpu }
+    }
+}
+
+impl From<&ResourceRequirement> for rpc::ResourceRequirement {
+    fn from(r: &ResourceRequirement) -> Self {
+        Self {
+            cpu: r.cpu,
+            memory: r.memory,
+            gpu: r.gpu,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -267,6 +334,7 @@ impl Connection {
                 max_instances: attrs.max_instances,
                 batch_size: attrs.batch_size.max(1),
                 priority: attrs.priority,
+                resreq: attrs.resreq.as_ref().map(rpc::ResourceRequirement::from),
             }),
         };
 
@@ -317,6 +385,7 @@ impl Connection {
             max_instances: attrs.max_instances,
             batch_size: attrs.batch_size.max(1),
             priority: attrs.priority,
+            resreq: attrs.resreq.as_ref().map(rpc::ResourceRequirement::from),
         });
 
         let open_ssn_req = OpenSessionRequest {

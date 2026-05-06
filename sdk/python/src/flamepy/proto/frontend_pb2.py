@@ -4,71 +4,75 @@
 # source: frontend.proto
 # Protobuf Python Version: 6.31.1
 """Generated protocol buffer code."""
-
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
 from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
-
-_runtime_version.ValidateProtobufRuntimeVersion(_runtime_version.Domain.PUBLIC, 6, 31, 1, "", "frontend.proto")
+_runtime_version.ValidateProtobufRuntimeVersion(
+    _runtime_version.Domain.PUBLIC,
+    6,
+    31,
+    1,
+    '',
+    'frontend.proto'
+)
 # @@protoc_insertion_point(imports)
 
 _sym_db = _symbol_database.Default()
 
 
+import flamepy.proto.types_pb2 as types__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
-    b'\n\x0e\x66rontend.proto\x12\x08\x66lame.v1\x1a\x0btypes.proto"Z\n\x1aRegisterApplicationRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12.\n\x0b\x61pplication\x18\x02 \x01(\x0b\x32\x19.flame.v1.ApplicationSpec",\n\x1cUnregisterApplicationRequest\x12\x0c\n\x04name\x18\x01 \x01(\t"X\n\x18UpdateApplicationRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12.\n\x0b\x61pplication\x18\x02 \x01(\x0b\x32\x19.flame.v1.ApplicationSpec"%\n\x15GetApplicationRequest\x12\x0c\n\x04name\x18\x01 \x01(\t"\x18\n\x16ListApplicationRequest"\x15\n\x13ListExecutorRequest"\x12\n\x10ListNodesRequest"\x1e\n\x0eGetNodeRequest\x12\x0c\n\x04name\x18\x01 \x01(\t"/\n\x0fGetNodeResponse\x12\x1c\n\x04node\x18\x01 \x01(\x0b\x32\x0e.flame.v1.Node"R\n\x14\x43reateSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12&\n\x07session\x18\x02 \x01(\x0b\x32\x15.flame.v1.SessionSpec"*\n\x14\x44\x65leteSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t"a\n\x12OpenSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12+\n\x07session\x18\x02 \x01(\x0b\x32\x15.flame.v1.SessionSpecH\x00\x88\x01\x01\x42\n\n\x08_session")\n\x13\x43loseSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t"\'\n\x11GetSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t"\x14\n\x12ListSessionRequest"5\n\x11\x43reateTaskRequest\x12 \n\x04task\x18\x01 \x01(\x0b\x32\x12.flame.v1.TaskSpec"8\n\x11\x44\x65leteTaskRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t"5\n\x0eGetTaskRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t"7\n\x10WatchTaskRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t"%\n\x0fListTaskRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t2\xa6\n\n\x08\x46rontend\x12O\n\x13RegisterApplication\x12$.flame.v1.RegisterApplicationRequest\x1a\x10.flame.v1.Result"\x00\x12S\n\x15UnregisterApplication\x12&.flame.v1.UnregisterApplicationRequest\x1a\x10.flame.v1.Result"\x00\x12K\n\x11UpdateApplication\x12".flame.v1.UpdateApplicationRequest\x1a\x10.flame.v1.Result"\x00\x12J\n\x0eGetApplication\x12\x1f.flame.v1.GetApplicationRequest\x1a\x15.flame.v1.Application"\x00\x12P\n\x0fListApplication\x12 .flame.v1.ListApplicationRequest\x1a\x19.flame.v1.ApplicationList"\x00\x12G\n\x0cListExecutor\x12\x1d.flame.v1.ListExecutorRequest\x1a\x16.flame.v1.ExecutorList"\x00\x12=\n\tListNodes\x12\x1a.flame.v1.ListNodesRequest\x1a\x12.flame.v1.NodeList"\x00\x12@\n\x07GetNode\x12\x18.flame.v1.GetNodeRequest\x1a\x19.flame.v1.GetNodeResponse"\x00\x12\x44\n\rCreateSession\x12\x1e.flame.v1.CreateSessionRequest\x1a\x11.flame.v1.Session"\x00\x12\x44\n\rDeleteSession\x12\x1e.flame.v1.DeleteSessionRequest\x1a\x11.flame.v1.Session"\x00\x12@\n\x0bOpenSession\x12\x1c.flame.v1.OpenSessionRequest\x1a\x11.flame.v1.Session"\x00\x12\x42\n\x0c\x43loseSession\x12\x1d.flame.v1.CloseSessionRequest\x1a\x11.flame.v1.Session"\x00\x12>\n\nGetSession\x12\x1b.flame.v1.GetSessionRequest\x1a\x11.flame.v1.Session"\x00\x12\x44\n\x0bListSession\x12\x1c.flame.v1.ListSessionRequest\x1a\x15.flame.v1.SessionList"\x00\x12;\n\nCreateTask\x12\x1b.flame.v1.CreateTaskRequest\x1a\x0e.flame.v1.Task"\x00\x12;\n\nDeleteTask\x12\x1b.flame.v1.DeleteTaskRequest\x1a\x0e.flame.v1.Task"\x00\x12\x35\n\x07GetTask\x12\x18.flame.v1.GetTaskRequest\x1a\x0e.flame.v1.Task"\x00\x12;\n\tWatchTask\x12\x1a.flame.v1.WatchTaskRequest\x1a\x0e.flame.v1.Task"\x00\x30\x01\x12\x39\n\x08ListTask\x12\x19.flame.v1.ListTaskRequest\x1a\x0e.flame.v1.Task"\x00\x30\x01\x42)Z\'github.com/flame-sh/flame/sdk/go/rpc/v1b\x06proto3'
-)
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0e\x66rontend.proto\x12\x08\x66lame.v1\x1a\x0btypes.proto\"Z\n\x1aRegisterApplicationRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12.\n\x0b\x61pplication\x18\x02 \x01(\x0b\x32\x19.flame.v1.ApplicationSpec\",\n\x1cUnregisterApplicationRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"X\n\x18UpdateApplicationRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12.\n\x0b\x61pplication\x18\x02 \x01(\x0b\x32\x19.flame.v1.ApplicationSpec\"%\n\x15GetApplicationRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"\x18\n\x16ListApplicationRequest\"\x15\n\x13ListExecutorRequest\"\x12\n\x10ListNodesRequest\"\x1e\n\x0eGetNodeRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"/\n\x0fGetNodeResponse\x12\x1c\n\x04node\x18\x01 \x01(\x0b\x32\x0e.flame.v1.Node\"R\n\x14\x43reateSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12&\n\x07session\x18\x02 \x01(\x0b\x32\x15.flame.v1.SessionSpec\"*\n\x14\x44\x65leteSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\"a\n\x12OpenSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12+\n\x07session\x18\x02 \x01(\x0b\x32\x15.flame.v1.SessionSpecH\x00\x88\x01\x01\x42\n\n\x08_session\")\n\x13\x43loseSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\"\'\n\x11GetSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\"\x14\n\x12ListSessionRequest\"5\n\x11\x43reateTaskRequest\x12 \n\x04task\x18\x01 \x01(\x0b\x32\x12.flame.v1.TaskSpec\"8\n\x11\x44\x65leteTaskRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\"5\n\x0eGetTaskRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\"7\n\x10WatchTaskRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\"%\n\x0fListTaskRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t2\xa6\n\n\x08\x46rontend\x12O\n\x13RegisterApplication\x12$.flame.v1.RegisterApplicationRequest\x1a\x10.flame.v1.Result\"\x00\x12S\n\x15UnregisterApplication\x12&.flame.v1.UnregisterApplicationRequest\x1a\x10.flame.v1.Result\"\x00\x12K\n\x11UpdateApplication\x12\".flame.v1.UpdateApplicationRequest\x1a\x10.flame.v1.Result\"\x00\x12J\n\x0eGetApplication\x12\x1f.flame.v1.GetApplicationRequest\x1a\x15.flame.v1.Application\"\x00\x12P\n\x0fListApplication\x12 .flame.v1.ListApplicationRequest\x1a\x19.flame.v1.ApplicationList\"\x00\x12G\n\x0cListExecutor\x12\x1d.flame.v1.ListExecutorRequest\x1a\x16.flame.v1.ExecutorList\"\x00\x12=\n\tListNodes\x12\x1a.flame.v1.ListNodesRequest\x1a\x12.flame.v1.NodeList\"\x00\x12@\n\x07GetNode\x12\x18.flame.v1.GetNodeRequest\x1a\x19.flame.v1.GetNodeResponse\"\x00\x12\x44\n\rCreateSession\x12\x1e.flame.v1.CreateSessionRequest\x1a\x11.flame.v1.Session\"\x00\x12\x44\n\rDeleteSession\x12\x1e.flame.v1.DeleteSessionRequest\x1a\x11.flame.v1.Session\"\x00\x12@\n\x0bOpenSession\x12\x1c.flame.v1.OpenSessionRequest\x1a\x11.flame.v1.Session\"\x00\x12\x42\n\x0c\x43loseSession\x12\x1d.flame.v1.CloseSessionRequest\x1a\x11.flame.v1.Session\"\x00\x12>\n\nGetSession\x12\x1b.flame.v1.GetSessionRequest\x1a\x11.flame.v1.Session\"\x00\x12\x44\n\x0bListSession\x12\x1c.flame.v1.ListSessionRequest\x1a\x15.flame.v1.SessionList\"\x00\x12;\n\nCreateTask\x12\x1b.flame.v1.CreateTaskRequest\x1a\x0e.flame.v1.Task\"\x00\x12;\n\nDeleteTask\x12\x1b.flame.v1.DeleteTaskRequest\x1a\x0e.flame.v1.Task\"\x00\x12\x35\n\x07GetTask\x12\x18.flame.v1.GetTaskRequest\x1a\x0e.flame.v1.Task\"\x00\x12;\n\tWatchTask\x12\x1a.flame.v1.WatchTaskRequest\x1a\x0e.flame.v1.Task\"\x00\x30\x01\x12\x39\n\x08ListTask\x12\x19.flame.v1.ListTaskRequest\x1a\x0e.flame.v1.Task\"\x00\x30\x01\x42)Z\'github.com/flame-sh/flame/sdk/go/rpc/v1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
-_builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, "frontend_pb2", _globals)
+_builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'frontend_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
-    _globals["DESCRIPTOR"]._loaded_options = None
-    _globals["DESCRIPTOR"]._serialized_options = b"Z'github.com/flame-sh/flame/sdk/go/rpc/v1"
-    _globals["_REGISTERAPPLICATIONREQUEST"]._serialized_start = 41
-    _globals["_REGISTERAPPLICATIONREQUEST"]._serialized_end = 131
-    _globals["_UNREGISTERAPPLICATIONREQUEST"]._serialized_start = 133
-    _globals["_UNREGISTERAPPLICATIONREQUEST"]._serialized_end = 177
-    _globals["_UPDATEAPPLICATIONREQUEST"]._serialized_start = 179
-    _globals["_UPDATEAPPLICATIONREQUEST"]._serialized_end = 267
-    _globals["_GETAPPLICATIONREQUEST"]._serialized_start = 269
-    _globals["_GETAPPLICATIONREQUEST"]._serialized_end = 306
-    _globals["_LISTAPPLICATIONREQUEST"]._serialized_start = 308
-    _globals["_LISTAPPLICATIONREQUEST"]._serialized_end = 332
-    _globals["_LISTEXECUTORREQUEST"]._serialized_start = 334
-    _globals["_LISTEXECUTORREQUEST"]._serialized_end = 355
-    _globals["_LISTNODESREQUEST"]._serialized_start = 357
-    _globals["_LISTNODESREQUEST"]._serialized_end = 375
-    _globals["_GETNODEREQUEST"]._serialized_start = 377
-    _globals["_GETNODEREQUEST"]._serialized_end = 407
-    _globals["_GETNODERESPONSE"]._serialized_start = 409
-    _globals["_GETNODERESPONSE"]._serialized_end = 456
-    _globals["_CREATESESSIONREQUEST"]._serialized_start = 458
-    _globals["_CREATESESSIONREQUEST"]._serialized_end = 540
-    _globals["_DELETESESSIONREQUEST"]._serialized_start = 542
-    _globals["_DELETESESSIONREQUEST"]._serialized_end = 584
-    _globals["_OPENSESSIONREQUEST"]._serialized_start = 586
-    _globals["_OPENSESSIONREQUEST"]._serialized_end = 683
-    _globals["_CLOSESESSIONREQUEST"]._serialized_start = 685
-    _globals["_CLOSESESSIONREQUEST"]._serialized_end = 726
-    _globals["_GETSESSIONREQUEST"]._serialized_start = 728
-    _globals["_GETSESSIONREQUEST"]._serialized_end = 767
-    _globals["_LISTSESSIONREQUEST"]._serialized_start = 769
-    _globals["_LISTSESSIONREQUEST"]._serialized_end = 789
-    _globals["_CREATETASKREQUEST"]._serialized_start = 791
-    _globals["_CREATETASKREQUEST"]._serialized_end = 844
-    _globals["_DELETETASKREQUEST"]._serialized_start = 846
-    _globals["_DELETETASKREQUEST"]._serialized_end = 902
-    _globals["_GETTASKREQUEST"]._serialized_start = 904
-    _globals["_GETTASKREQUEST"]._serialized_end = 957
-    _globals["_WATCHTASKREQUEST"]._serialized_start = 959
-    _globals["_WATCHTASKREQUEST"]._serialized_end = 1014
-    _globals["_LISTTASKREQUEST"]._serialized_start = 1016
-    _globals["_LISTTASKREQUEST"]._serialized_end = 1053
-    _globals["_FRONTEND"]._serialized_start = 1056
-    _globals["_FRONTEND"]._serialized_end = 2374
+  _globals['DESCRIPTOR']._loaded_options = None
+  _globals['DESCRIPTOR']._serialized_options = b'Z\'github.com/flame-sh/flame/sdk/go/rpc/v1'
+  _globals['_REGISTERAPPLICATIONREQUEST']._serialized_start=41
+  _globals['_REGISTERAPPLICATIONREQUEST']._serialized_end=131
+  _globals['_UNREGISTERAPPLICATIONREQUEST']._serialized_start=133
+  _globals['_UNREGISTERAPPLICATIONREQUEST']._serialized_end=177
+  _globals['_UPDATEAPPLICATIONREQUEST']._serialized_start=179
+  _globals['_UPDATEAPPLICATIONREQUEST']._serialized_end=267
+  _globals['_GETAPPLICATIONREQUEST']._serialized_start=269
+  _globals['_GETAPPLICATIONREQUEST']._serialized_end=306
+  _globals['_LISTAPPLICATIONREQUEST']._serialized_start=308
+  _globals['_LISTAPPLICATIONREQUEST']._serialized_end=332
+  _globals['_LISTEXECUTORREQUEST']._serialized_start=334
+  _globals['_LISTEXECUTORREQUEST']._serialized_end=355
+  _globals['_LISTNODESREQUEST']._serialized_start=357
+  _globals['_LISTNODESREQUEST']._serialized_end=375
+  _globals['_GETNODEREQUEST']._serialized_start=377
+  _globals['_GETNODEREQUEST']._serialized_end=407
+  _globals['_GETNODERESPONSE']._serialized_start=409
+  _globals['_GETNODERESPONSE']._serialized_end=456
+  _globals['_CREATESESSIONREQUEST']._serialized_start=458
+  _globals['_CREATESESSIONREQUEST']._serialized_end=540
+  _globals['_DELETESESSIONREQUEST']._serialized_start=542
+  _globals['_DELETESESSIONREQUEST']._serialized_end=584
+  _globals['_OPENSESSIONREQUEST']._serialized_start=586
+  _globals['_OPENSESSIONREQUEST']._serialized_end=683
+  _globals['_CLOSESESSIONREQUEST']._serialized_start=685
+  _globals['_CLOSESESSIONREQUEST']._serialized_end=726
+  _globals['_GETSESSIONREQUEST']._serialized_start=728
+  _globals['_GETSESSIONREQUEST']._serialized_end=767
+  _globals['_LISTSESSIONREQUEST']._serialized_start=769
+  _globals['_LISTSESSIONREQUEST']._serialized_end=789
+  _globals['_CREATETASKREQUEST']._serialized_start=791
+  _globals['_CREATETASKREQUEST']._serialized_end=844
+  _globals['_DELETETASKREQUEST']._serialized_start=846
+  _globals['_DELETETASKREQUEST']._serialized_end=902
+  _globals['_GETTASKREQUEST']._serialized_start=904
+  _globals['_GETTASKREQUEST']._serialized_end=957
+  _globals['_WATCHTASKREQUEST']._serialized_start=959
+  _globals['_WATCHTASKREQUEST']._serialized_end=1014
+  _globals['_LISTTASKREQUEST']._serialized_start=1016
+  _globals['_LISTTASKREQUEST']._serialized_end=1053
+  _globals['_FRONTEND']._serialized_start=1056
+  _globals['_FRONTEND']._serialized_end=2374
 # @@protoc_insertion_point(module_scope)

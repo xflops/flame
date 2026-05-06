@@ -830,9 +830,10 @@ impl Engine for SqliteEngine {
 
         let now = Utc::now().timestamp();
         let sql = r#"INSERT INTO nodes 
-            (name, state, capacity_cpu, capacity_memory, allocatable_cpu, allocatable_memory, 
+            (name, state, capacity_cpu, capacity_memory, capacity_gpu,
+             allocatable_cpu, allocatable_memory, allocatable_gpu,
              info_arch, info_os, creation_time, last_heartbeat)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING *"#;
 
         let dao: NodeDao = sqlx::query_as(sql)
@@ -840,8 +841,10 @@ impl Engine for SqliteEngine {
             .bind(i32::from(node.state))
             .bind(node.capacity.cpu as i64)
             .bind(node.capacity.memory as i64)
+            .bind(node.capacity.gpu as i64)
             .bind(node.allocatable.cpu as i64)
             .bind(node.allocatable.memory as i64)
+            .bind(node.allocatable.gpu as i64)
             .bind(&node.info.arch)
             .bind(&node.info.os)
             .bind(now)
@@ -891,8 +894,8 @@ impl Engine for SqliteEngine {
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
         let sql = r#"UPDATE nodes 
-            SET state=?, capacity_cpu=?, capacity_memory=?, 
-                allocatable_cpu=?, allocatable_memory=?,
+            SET state=?, capacity_cpu=?, capacity_memory=?, capacity_gpu=?,
+                allocatable_cpu=?, allocatable_memory=?, allocatable_gpu=?,
                 info_arch=?, info_os=?, last_heartbeat=?
             WHERE name=?
             RETURNING *"#;
@@ -901,8 +904,10 @@ impl Engine for SqliteEngine {
             .bind(i32::from(node.state))
             .bind(node.capacity.cpu as i64)
             .bind(node.capacity.memory as i64)
+            .bind(node.capacity.gpu as i64)
             .bind(node.allocatable.cpu as i64)
             .bind(node.allocatable.memory as i64)
+            .bind(node.allocatable.gpu as i64)
             .bind(&node.info.arch)
             .bind(&node.info.os)
             .bind(Utc::now().timestamp())
@@ -978,8 +983,8 @@ impl Engine for SqliteEngine {
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
         let sql = r#"INSERT INTO executors 
-            (id, node, resreq_cpu, resreq_memory, slots, shim, task_id, ssn_id, creation_time, state)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, node, resreq_cpu, resreq_memory, resreq_gpu, slots, shim, task_id, ssn_id, creation_time, state)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING *"#;
 
         let dao: ExecutorDao = sqlx::query_as(sql)
@@ -987,6 +992,7 @@ impl Engine for SqliteEngine {
             .bind(&executor.node)
             .bind(executor.resreq.cpu as i64)
             .bind(executor.resreq.memory as i64)
+            .bind(executor.resreq.gpu as i64)
             .bind(executor.slots as i64)
             .bind(i32::from(executor.shim))
             .bind(executor.task_id)
@@ -1038,7 +1044,7 @@ impl Engine for SqliteEngine {
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
         let sql = r#"UPDATE executors 
-            SET node=?, resreq_cpu=?, resreq_memory=?, slots=?, shim=?, 
+            SET node=?, resreq_cpu=?, resreq_memory=?, resreq_gpu=?, slots=?, shim=?, 
                 task_id=?, ssn_id=?, state=?
             WHERE id=?
             RETURNING *"#;
@@ -1047,6 +1053,7 @@ impl Engine for SqliteEngine {
             .bind(&executor.node)
             .bind(executor.resreq.cpu as i64)
             .bind(executor.resreq.memory as i64)
+            .bind(executor.resreq.gpu as i64)
             .bind(executor.slots as i64)
             .bind(i32::from(executor.shim))
             .bind(executor.task_id)
@@ -1177,6 +1184,7 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         }))?;
         assert_eq!(ssn_1.id, ssn_1_id);
         assert_eq!(ssn_1.application, "flmexec");
@@ -1282,6 +1290,7 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         }))?;
         assert_eq!(ssn_1.id, ssn_1_id);
         assert_eq!(ssn_1.application, "flmexec");
@@ -1595,6 +1604,7 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         }))?;
 
         assert_eq!(ssn_1.id, ssn_1_id);
@@ -1648,6 +1658,7 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         }))?;
 
         assert_eq!(ssn_1.id, ssn_1_id);
@@ -1684,6 +1695,7 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         }))?;
 
         assert_eq!(ssn_2.id, ssn_2_id);
@@ -1738,6 +1750,7 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         }))?;
 
         assert_eq!(ssn_1.id, ssn_1_id);
@@ -1779,6 +1792,7 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         }))?;
 
         assert_eq!(ssn_1.status.state, SessionState::Open);
@@ -1812,6 +1826,7 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         }))?;
 
         assert_eq!(ssn_1.id, ssn_1_id);
@@ -1854,6 +1869,7 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
+            resreq: None,
         }))?;
 
         assert_eq!(ssn_1.id, ssn_1_id);

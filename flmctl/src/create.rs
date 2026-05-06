@@ -14,30 +14,44 @@ limitations under the License.
 use std::error::Error;
 
 use flame_rs as flame;
-use flame_rs::{apis::FlameContext, client::SessionAttributes};
+use flame_rs::apis::FlameContext;
+use flame_rs::client::{ResourceRequirement, SessionAttributes};
 
 pub async fn run(
     ctx: &FlameContext,
     app: &str,
-    slots: &u32,
+    slots: &Option<u32>,
     batch_size: &u32,
     priority: &u32,
+    resreq_str: &Option<String>,
 ) -> Result<(), Box<dyn Error>> {
+    if slots.is_some() && resreq_str.is_some() {
+        return Err("slots and resreq are mutually exclusive".into());
+    }
+
+    if slots.is_none() && resreq_str.is_none() {
+        return Err("must specify either --slots or --resreq".into());
+    }
+
     let current_ctx = ctx.get_current_context()?;
     let conn = flame::client::connect_with_tls(
         &current_ctx.cluster.endpoint,
         current_ctx.cluster.tls.as_ref(),
     )
     .await?;
+
+    let resreq = resreq_str.as_ref().map(|s| ResourceRequirement::from(s.as_str()));
+
     let attr = SessionAttributes {
         id: format!("{app}-{}", stdng::rand::short_name()),
         application: app.to_owned(),
-        slots: *slots,
+        slots: slots.unwrap_or(0),
         common_data: None,
         min_instances: 0,
         max_instances: None,
         batch_size: *batch_size,
         priority: *priority,
+        resreq,
     };
 
     let ssn = conn.create_session(&attr).await?;

@@ -19,6 +19,7 @@ use stdng::collections;
 use stdng::{lock_ptr, new_ptr, MutexPtr};
 
 use crate::model::{ExecutorInfoPtr, NodeInfo, NodeInfoPtr, SessionInfo, SessionInfoPtr, SnapShot};
+use crate::scheduler::plugins::drf::DRFPlugin;
 use crate::scheduler::plugins::fairshare::FairShare;
 use crate::scheduler::plugins::gang::GangPlugin;
 use crate::scheduler::plugins::priority::PriorityPlugin;
@@ -27,6 +28,7 @@ use crate::scheduler::Context;
 
 use common::FlameError;
 
+mod drf;
 mod fairshare;
 mod gang;
 mod priority;
@@ -129,6 +131,11 @@ const PLUGIN_REGISTRY: &[PluginInfo] = &[
     PluginInfo {
         name: "fairshare",
         constructor: FairShare::new_ptr,
+        configurable: true,
+    },
+    PluginInfo {
+        name: "drf",
+        constructor: DRFPlugin::new_ptr,
         configurable: true,
     },
     PluginInfo {
@@ -526,6 +533,7 @@ mod tests {
             resreq: ResourceRequirement {
                 cpu: 1,
                 memory: 1024,
+                gpu: 0,
             },
             slots,
             shim: Shim::Host,
@@ -549,6 +557,7 @@ mod tests {
         let ss = SnapShot::new(ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         });
         let pm = PluginManager::setup(&ss, &default_policies()).unwrap();
 
@@ -567,6 +576,7 @@ mod tests {
         let ss = SnapShot::new(ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         });
         let pm = PluginManager::setup(&ss, &default_policies()).unwrap();
 
@@ -585,6 +595,7 @@ mod tests {
         let ss = SnapShot::new(ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         });
         let pm = PluginManager::setup(&ss, &default_policies()).unwrap();
 

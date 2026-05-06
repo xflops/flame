@@ -99,16 +99,55 @@ class Event:
 
 
 @dataclass
+class ResourceRequirement:
+    """Resource requirements for a session."""
+
+    cpu: int = 0
+    memory: int = 0
+    gpu: int = 0
+
+    @classmethod
+    def from_string(cls, s: str) -> "ResourceRequirement":
+        """Parse resource requirements from string format: cpu=N,mem=SIZE,gpu=N"""
+        cpu = 0
+        memory = 0
+        gpu = 0
+        for part in s.split(","):
+            key, _, value = part.partition("=")
+            key = key.strip().lower()
+            value = value.strip()
+            if key == "cpu":
+                cpu = int(value)
+            elif key in ("mem", "memory"):
+                memory = cls._parse_memory(value)
+            elif key == "gpu":
+                gpu = int(value)
+        return cls(cpu=cpu, memory=memory, gpu=gpu)
+
+    @staticmethod
+    def _parse_memory(s: str) -> int:
+        """Parse memory string like '16g' into bytes."""
+        s = s.lower().strip()
+        if not s:
+            return 0
+        multipliers = {"k": 1024, "m": 1024**2, "g": 1024**3}
+        if s[-1] in multipliers:
+            return int(s[:-1]) * multipliers[s[-1]]
+        return int(s)
+
+
+@dataclass
 class SessionAttributes:
     """Attributes for creating a session."""
 
     application: str
-    slots: int
+    slots: int = 0
     id: Optional[str] = None
     common_data: Any = None
     min_instances: int = 0
     max_instances: Optional[int] = None
     batch_size: int = 1
+    resreq: Optional[ResourceRequirement] = None
 
 
 @dataclass

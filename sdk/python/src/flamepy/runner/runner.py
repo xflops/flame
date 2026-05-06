@@ -27,6 +27,7 @@ from flamepy.core.types import (
     FlameContext,
     FlameError,
     FlameErrorCode,
+    ResourceRequirement,
     SessionAttributes,
     short_name,
 )
@@ -126,7 +127,16 @@ class RunnerService:
         _session: The Flame session for task execution
     """
 
-    def __init__(self, app: str, execution_object: Any, stateful: bool = False, autoscale: bool = True, warmup: int = 0):
+    def __init__(
+        self,
+        app: str,
+        execution_object: Any,
+        stateful: bool = False,
+        autoscale: bool = True,
+        warmup: int = 0,
+        slots: int = 1,
+        resreq: Optional[ResourceRequirement] = None,
+    ):
         """Initialize a RunnerService.
 
         Args:
@@ -142,7 +152,12 @@ class RunnerService:
             autoscale: If True, create instances dynamically based on pending tasks (min=0, max=None).
                       If False, create exactly one instance (min=1, max=1).
             warmup: Number of instances to pre-create at session start. Only used when autoscale=True.
+            slots: Number of slots per session (default: 1). Ignored if resreq is provided.
+            resreq: Explicit resource requirements. Mutually exclusive with slots.
         """
+        if slots != 1 and resreq is not None:
+            raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "slots and resreq are mutually exclusive")
+
         self._app = app
         self._execution_object = execution_object
         self._function_wrapper = None  # For callable functions
@@ -174,16 +189,15 @@ class RunnerService:
         logger.debug(f"[RunnerService] RunnerContext cached: key={object_ref.key}, version={object_ref.version}")
         # Encode ObjectRef to bytes for core API
         common_data_bytes = object_ref.encode()
-        # Pass min_instances and max_instances from RunnerContext to open_session
-        # Use open_session to allow reusing existing sessions (e.g., for recursive calls)
         session_spec = SessionAttributes(
             id=session_id,
             application=app,
             common_data=common_data_bytes,
-            slots=1,
+            slots=slots if resreq is None else 0,
             min_instances=runner_context.min_instances,
             max_instances=runner_context.max_instances,
             batch_size=1,
+            resreq=resreq,
         )
         logger.info(f"[RunnerService] Opening session: session_id={session_id}, app={app}")
         try:
@@ -523,7 +537,15 @@ class Runner:
 
         self._started = False
 
-    def service(self, execution_object: Any, stateful: Optional[bool] = None, autoscale: Optional[bool] = None, warmup: int = 0) -> RunnerService:
+    def service(
+        self,
+        execution_object: Any,
+        stateful: Optional[bool] = None,
+        autoscale: Optional[bool] = None,
+        warmup: int = 0,
+        slots: int = 1,
+        resreq: Optional[ResourceRequirement] = None,
+    ) -> RunnerService:
         """Create a RunnerService for the given execution object.
 
         Args:
@@ -536,37 +558,42 @@ class Runner:
                       If None, use default based on execution_object type.
             warmup: Number of instances to pre-create at session start. Only used when autoscale=True.
                    When set, min_instances is set to this value for warmup. Default: 0.
+            slots: Number of slots per session (default: 1). Ignored if resreq is provided.
+            resreq: Explicit resource requirements. Mutually exclusive with slots.
 
         Returns:
             A RunnerService instance
 
         Raises:
             ValueError: If stateful=True is set for a class (only instances can be stateful)
+            FlameError: If both slots and resreq are specified
         """
-        # Step 1: Determine execution object type
         is_function = callable(execution_object) and not inspect.isclass(execution_object)
         is_class = inspect.isclass(execution_object)
 
-        # Step 2: Apply defaults if not specified
         if stateful is None:
-            stateful = False  # All types default to False
+            stateful = False
 
         if autoscale is None:
             if is_function:
-                autoscale = True  # Functions benefit from autoscaling
-            else:  # class or instance
-                autoscale = False  # Classes/instances typically want single instance
+                autoscale = True
+            else:
+                autoscale = False
 
-        # Step 3: Validation
         if stateful and is_class:
             raise ValueError("Cannot set stateful=True for a class. Classes themselves cannot maintain state; only instances can. Pass an instance instead, or set stateful=False.")
 
-        # Step 4: Do NOT instantiate classes (keep as-is)
-        # The class will be instantiated on each executor in FlameRunpyService.on_session_enter
         logger.debug(f"Creating service for {type(execution_object).__name__} (stateful={stateful}, autoscale={autoscale}, warmup={warmup})")
 
-        # Step 5: Create the RunnerService
-        runner_service = RunnerService(self._name, execution_object, stateful=stateful, autoscale=autoscale, warmup=warmup)
+        runner_service = RunnerService(
+            self._name,
+            execution_object,
+            stateful=stateful,
+            autoscale=autoscale,
+            warmup=warmup,
+            slots=slots,
+            resreq=resreq,
+        )
         self._services.append(runner_service)
 
         logger.debug(f"Created service for execution object in Runner '{self._name}'")

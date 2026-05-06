@@ -466,7 +466,7 @@ mod tests {
     fn create_test_node(name: &str, cpu: u64, memory: u64) -> Arc<NodeInfo> {
         Arc::new(NodeInfo {
             name: name.to_string(),
-            allocatable: ResourceRequirement { cpu, memory },
+            allocatable: ResourceRequirement { cpu, memory, gpu: 0 },
             state: NodeState::Ready,
         })
     }
@@ -501,6 +501,7 @@ mod tests {
         let unit = ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         };
         let ssn_a = create_test_session("ssn-a", 4, 1, 8, 0, None);
         let ssn_b = create_test_session("ssn-b", 1, 1, 4, 0, None);
@@ -531,6 +532,7 @@ mod tests {
         let unit = ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         };
         let ssn_a = create_test_session("ssn-a", 4, 1, 8, 4, None);
         let node = create_test_node("node-1", 10, 10240);
@@ -555,6 +557,7 @@ mod tests {
         let unit = ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         };
         let ssn = create_test_session("ssn-1", 4, 1, 8, 0, None);
         let node = create_test_node("node-1", 10, 10240);
@@ -588,6 +591,7 @@ mod tests {
         let unit = ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         };
         let ssn_a = create_test_session("ssn-a", 1, 1, 7, 0, None);
         let ssn_b = create_test_session("ssn-b", 1, 1, 5, 0, None);
@@ -619,6 +623,7 @@ mod tests {
         let unit = ResourceRequirement {
             cpu: 1,
             memory: 1024,
+            gpu: 0,
         };
         let ssn = create_test_session("ssn-1", 5, 1, 10, 0, None);
         let node = create_test_node("node-1", 8, 8192);

@@ -31,6 +31,7 @@ from flamepy.core.types import (
     FlameContext,
     FlameError,
     FlameErrorCode,
+    ResourceRequirement,
     SessionAttributes,
     SessionID,
     SessionState,
@@ -59,6 +60,7 @@ from flamepy.proto.frontend_pb2 import (
 from flamepy.proto.frontend_pb2_grpc import FrontendStub
 from flamepy.proto.types_pb2 import ApplicationSchema as ApplicationSchemaProto
 from flamepy.proto.types_pb2 import ApplicationSpec, Environment, SessionSpec, TaskSpec
+from flamepy.proto.types_pb2 import ResourceRequirement as ResourceRequirementProto
 
 logger = logging.getLogger(__name__)
 
@@ -73,20 +75,39 @@ def connect(addr: str, tls_config: Optional[FlameClientTls] = None) -> "Connecti
     return Connection.connect(addr, tls_config)
 
 
-def create_session(application: str, common_data: Optional[bytes] = None, session_id: Optional[str] = None, slots: int = 1, min_instances: int = 0, max_instances: Optional[int] = None, batch_size: int = 1) -> "Session":
+def create_session(
+    application: str,
+    common_data: Optional[bytes] = None,
+    session_id: Optional[str] = None,
+    slots: int = 1,
+    min_instances: int = 0,
+    max_instances: Optional[int] = None,
+    batch_size: int = 1,
+    resreq: Optional[ResourceRequirement] = None,
+) -> "Session":
     """Create a new session.
 
     Args:
         application: Application name
         common_data: Common data as bytes (core API works with bytes)
         session_id: Optional session ID
-        slots: Number of slots
+        slots: Number of slots (ignored if resreq is provided)
         min_instances: Minimum number of instances (default: 0)
         max_instances: Maximum number of instances (None = unlimited)
         batch_size: Number of executors per batch for gang scheduling (default: 1)
+        resreq: Explicit resource requirements. Mutually exclusive with slots.
     """
     conn = ConnectionInstance.instance()
-    return conn.create_session(SessionAttributes(id=session_id, application=application, common_data=common_data, slots=slots, min_instances=min_instances, max_instances=max_instances, batch_size=batch_size))
+    return conn.create_session(SessionAttributes(
+        id=session_id,
+        application=application,
+        common_data=common_data,
+        slots=slots if resreq is None else 0,
+        min_instances=min_instances,
+        max_instances=max_instances,
+        batch_size=batch_size,
+        resreq=resreq,
+    ))
 
 
 def open_session(session_id: SessionID, spec: Optional[SessionAttributes] = None) -> "Session":
@@ -419,6 +440,12 @@ class Connection:
             max_instances=attrs.max_instances if attrs.max_instances is not None else None,
             batch_size=attrs.batch_size,
         )
+        if attrs.resreq is not None:
+            session_spec.resreq.CopyFrom(ResourceRequirementProto(
+                cpu=attrs.resreq.cpu,
+                memory=attrs.resreq.memory,
+                gpu=attrs.resreq.gpu,
+            ))
 
         request = CreateSessionRequest(session_id=session_id, session=session_spec)
 
@@ -500,6 +527,12 @@ class Connection:
                 max_instances=spec.max_instances,
                 batch_size=spec.batch_size,
             )
+            if spec.resreq is not None:
+                session_spec.resreq.CopyFrom(ResourceRequirementProto(
+                    cpu=spec.resreq.cpu,
+                    memory=spec.resreq.memory,
+                    gpu=spec.resreq.gpu,
+                ))
 
         request = OpenSessionRequest(session_id=session_id, session=session_spec)
 

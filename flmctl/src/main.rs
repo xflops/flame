@@ -102,13 +102,16 @@ enum Commands {
         app: String,
         /// The slots requirements of each task
         #[arg(short, long)]
-        slots: u32,
+        slots: Option<u32>,
         /// Number of executors per batch for gang scheduling
         #[arg(short, long, default_value = "1")]
         batch_size: u32,
         /// Session priority (higher = more important, default: 0)
         #[arg(short = 'p', long, default_value = "0")]
         priority: u32,
+        /// Explicit resource request (format: "cpu=N,mem=SIZE,gpu=N")
+        #[arg(short, long)]
+        resreq: Option<String>,
     },
     /// Migrate Flame metadata
     Migrate {
@@ -159,7 +162,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             slots,
             batch_size,
             priority,
-        }) => create::run(&ctx, app, slots, batch_size, priority).await?,
+            resreq,
+        }) => create::run(&ctx, app, slots, batch_size, priority, resreq).await?,
         Some(Commands::View {
             application,
             session,

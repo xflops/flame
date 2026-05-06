@@ -93,6 +93,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         max_instances: None,
         batch_size: 1,
         priority: 0,
+        resreq: None,
     };
     let ssn = conn.create_session(&ssn_attr).await?;
     let ssn_creation_end_time = Local::now();
