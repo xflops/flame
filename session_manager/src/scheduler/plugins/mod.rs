@@ -114,13 +114,29 @@ pub struct PluginManager {
 }
 
 impl PluginManager {
-    pub fn setup(ss: &SnapShot) -> Result<PluginManagerPtr, FlameError> {
-        let mut plugins: Vec<(String, PluginPtr)> = vec![
-            ("priority".to_string(), PriorityPlugin::new_ptr()),
-            ("fairshare".to_string(), FairShare::new_ptr()),
-            ("shim".to_string(), ShimPlugin::new_ptr()),
-            ("gang".to_string(), GangPlugin::new_ptr()),
+    pub fn setup(
+        ss: &SnapShot,
+        enabled_policies: &[String],
+    ) -> Result<PluginManagerPtr, FlameError> {
+        let configurable_plugins: Vec<(&str, PluginPtr)> = vec![
+            ("priority", PriorityPlugin::new_ptr()),
+            ("fairshare", FairShare::new_ptr()),
+            ("gang", GangPlugin::new_ptr()),
         ];
+
+        let mut plugins: Vec<(String, PluginPtr)> = configurable_plugins
+            .into_iter()
+            .filter(|(name, _)| enabled_policies.iter().any(|p| p == *name))
+            .map(|(name, plugin)| (name.to_string(), plugin))
+            .collect();
+
+        // shim plugin is always required - it handles executor-to-session matching by slot count
+        plugins.push(("shim".to_string(), ShimPlugin::new_ptr()));
+
+        tracing::info!(
+            "Enabled scheduler plugins: {:?}",
+            plugins.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+        );
 
         for (_, plugin) in plugins.iter_mut() {
             plugin.setup(ss)?;
@@ -476,6 +492,14 @@ mod tests {
         })
     }
 
+    fn default_policies() -> Vec<String> {
+        vec![
+            "priority".to_string(),
+            "fairshare".to_string(),
+            "gang".to_string(),
+        ]
+    }
+
     /// Test that is_available returns true when slots match.
     #[test]
     fn test_is_available_slots_match() {
@@ -483,7 +507,7 @@ mod tests {
             cpu: 1,
             memory: 1024,
         });
-        let pm = PluginManager::setup(&ss).unwrap();
+        let pm = PluginManager::setup(&ss, &default_policies()).unwrap();
 
         let ssn = create_test_session("ssn-1", 2);
         let exec = create_test_executor("exec-1", 2);
@@ -501,7 +525,7 @@ mod tests {
             cpu: 1,
             memory: 1024,
         });
-        let pm = PluginManager::setup(&ss).unwrap();
+        let pm = PluginManager::setup(&ss, &default_policies()).unwrap();
 
         let ssn = create_test_session("ssn-1", 2);
         let exec = create_test_executor("exec-1", 4);
@@ -519,7 +543,7 @@ mod tests {
             cpu: 1,
             memory: 1024,
         });
-        let pm = PluginManager::setup(&ss).unwrap();
+        let pm = PluginManager::setup(&ss, &default_policies()).unwrap();
 
         let ssn = create_test_session("ssn-1", 2);
 

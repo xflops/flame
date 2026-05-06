@@ -39,10 +39,15 @@ struct ScheduleRunner {
 impl FlameThread for ScheduleRunner {
     async fn run(&self, flame_ctx: FlameClusterContext) -> Result<(), FlameError> {
         let schedule_interval = flame_ctx.cluster.schedule_interval;
-        tracing::info!("Scheduler started with interval: {}ms", schedule_interval);
+        let policies = &flame_ctx.cluster.policies;
+        tracing::info!(
+            "Scheduler started with interval: {}ms, enabled policies: {:?}",
+            schedule_interval,
+            policies
+        );
 
         loop {
-            let mut ctx = Context::new(self.controller.clone())?;
+            let mut ctx = Context::new(self.controller.clone(), policies)?;
 
             // Same `ctx` (and thus same in-memory `plugins`) for every action: Dispatch mutations
             // are visible to Allocate (e.g. Gang `is_fulfilled` / `is_ready` after binds).
@@ -199,7 +204,12 @@ mod tests {
 
         for i in 0..10 {
             let snapshot = controller.snapshot()?;
-            let plugins = PluginManager::setup(&snapshot.clone())?;
+            let default_policies: Vec<String> = vec![
+                "priority".to_string(),
+                "fairshare".to_string(),
+                "gang".to_string(),
+            ];
+            let plugins = PluginManager::setup(&snapshot.clone(), &default_policies)?;
 
             let mut ctx = Context {
                 snapshot: snapshot.clone(),
@@ -245,7 +255,12 @@ mod tests {
                 .register_node(&new_test_node("node_1".to_string())),
         )?;
 
-        let mut ctx = Context::new(controller.clone())?;
+        let default_policies: Vec<String> = vec![
+            "priority".to_string(),
+            "fairshare".to_string(),
+            "gang".to_string(),
+        ];
+        let mut ctx = Context::new(controller.clone(), &default_policies)?;
         let plugins_ptr = Arc::as_ptr(&ctx.plugins);
         for action in ctx.actions.clone() {
             tokio_test::block_on(action.execute(&mut ctx))?;

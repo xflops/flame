@@ -3,7 +3,10 @@ cluster:
   name: flame
   endpoint: "http://127.0.0.1:30080"
   slot: "cpu=1,mem=1g"
-  policy: priority
+  policies:
+    - priority
+    - fairshare
+    - gang
   storage: fs://data/
   schedule_interval: 100           # Scheduler loop interval in milliseconds (default: 500)
   executors:

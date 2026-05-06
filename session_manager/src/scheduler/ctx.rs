@@ -34,9 +34,9 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(controller: ControllerPtr) -> Result<Self, FlameError> {
+    pub fn new(controller: ControllerPtr, policies: &[String]) -> Result<Self, FlameError> {
         let snapshot = controller.snapshot()?;
-        let plugins = PluginManager::setup(&snapshot.clone())?;
+        let plugins = PluginManager::setup(&snapshot.clone(), policies)?;
 
         Ok(Context {
             snapshot,

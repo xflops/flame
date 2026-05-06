@@ -27,7 +27,10 @@ const DEFAULT_FLAME_CONF: &str = "flame-cluster.yaml";
 const DEFAULT_CONTEXT_NAME: &str = "flame";
 const DEFAULT_FLAME_ENDPOINT: &str = "http://127.0.0.1:8080";
 const DEFAULT_SLOT: &str = "cpu=1,mem=2g";
-const DEFAULT_POLICY: &str = "proportion";
+/// Default policies to enable when none specified in config.
+/// Available configurable policies: "priority", "fairshare", "gang"
+/// Note: "shim" plugin is always enabled (required for executor matching)
+const DEFAULT_POLICIES: &[&str] = &["priority", "fairshare", "gang"];
 const DEFAULT_STORAGE: &str = "sqlite://flame.db";
 const DEFAULT_MAX_EXECUTORS_PER_NODE: u32 = 128;
 const DEFAULT_SCHEDULE_INTERVAL: u64 = 100;
@@ -52,7 +55,7 @@ struct FlameClusterYaml {
     pub name: String,
     pub endpoint: String,
     pub slot: Option<String>,
-    pub policy: Option<String>,
+    pub policies: Option<Vec<String>>,
     pub storage: Option<String>,
     /// Schedule interval in milliseconds for the session scheduler loop
     pub schedule_interval: Option<u64>,
@@ -135,7 +138,7 @@ pub struct FlameCluster {
     pub name: String,
     pub endpoint: String,
     pub slot: ResourceRequirement,
-    pub policy: String,
+    pub policies: Vec<String>,
     pub storage: String,
     pub schedule_interval: u64,
     pub executors: FlameExecutors,
@@ -386,7 +389,9 @@ impl TryFrom<FlameClusterYaml> for FlameCluster {
             name: cluster.name,
             endpoint: cluster.endpoint,
             slot: ResourceRequirement::from(&cluster.slot.unwrap_or(DEFAULT_SLOT.to_string())),
-            policy: cluster.policy.unwrap_or(DEFAULT_POLICY.to_string()),
+            policies: cluster
+                .policies
+                .unwrap_or_else(|| DEFAULT_POLICIES.iter().map(|s| s.to_string()).collect()),
             storage: cluster.storage.unwrap_or(DEFAULT_STORAGE.to_string()),
             schedule_interval: cluster
                 .schedule_interval
@@ -440,7 +445,7 @@ impl Default for FlameCluster {
             name: DEFAULT_CONTEXT_NAME.to_string(),
             endpoint: DEFAULT_FLAME_ENDPOINT.to_string(),
             slot: ResourceRequirement::from(&DEFAULT_SLOT.to_string()),
-            policy: DEFAULT_POLICY.to_string(),
+            policies: DEFAULT_POLICIES.iter().map(|s| s.to_string()).collect(),
             storage: DEFAULT_STORAGE.to_string(),
             schedule_interval: DEFAULT_SCHEDULE_INTERVAL,
             executors: FlameExecutors::default(),
@@ -530,7 +535,9 @@ cluster:
   name: flame
   endpoint: "http://flame-session-manager:8080"
   slot: "cpu=1,mem=1g"
-  policy: priority
+  policies:
+    - priority
+    - gang
   storage: sqlite://flame.db
   executors:
     shim: host
@@ -548,7 +555,7 @@ cluster:
         assert_eq!(ctx.cluster.name, "flame");
         assert_eq!(ctx.cluster.endpoint, "http://flame-session-manager:8080");
         assert_eq!(ctx.cluster.slot, ResourceRequirement::from("cpu=1,mem=1g"));
-        assert_eq!(ctx.cluster.policy, "priority");
+        assert_eq!(ctx.cluster.policies, vec!["priority", "gang"]);
         assert_eq!(ctx.cluster.storage, "sqlite://flame.db");
         assert_eq!(ctx.cluster.executors.shim, Shim::Host);
         assert_eq!(ctx.cluster.limits.max_executors, 10);

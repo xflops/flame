@@ -42,7 +42,10 @@ cluster:
   name: flame
   endpoint: "http://127.0.0.1:8080"
   slot: "cpu=1,mem=2g"
-  policy: proportion
+  policies:
+    - priority
+    - fairshare
+    - gang
   storage: "fs://{prefix}/data"
   executors:
     shim: host

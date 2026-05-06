@@ -130,7 +130,7 @@ mod tests {
                 endpoint: "http://localhost:8080".to_string(),
                 storage: url,
                 slot: ResourceRequirement::default(),
-                policy: "fifo".to_string(),
+                policies: vec!["priority".to_string(), "gang".to_string()],
                 schedule_interval: 1000,
                 executors: FlameExecutors {
                     shim: Shim::default(),

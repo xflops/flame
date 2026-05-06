@@ -3,7 +3,10 @@ cluster:
   name: flame
   endpoint: "http://flame-session-manager:8080"
   slot: "cpu=2,mem=1g"
-  policy: priority
+  policies:
+    - priority
+    - fairshare
+    - gang
   storage: none
   schedule_interval: 100
   pprof:
