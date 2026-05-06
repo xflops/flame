@@ -35,3 +35,6 @@ dist/
 tmp/
 session_manager/events/
 certs/
+
+# AI agent working directories
+.sisyphus/
