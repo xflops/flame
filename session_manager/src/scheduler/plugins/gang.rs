@@ -39,6 +39,10 @@ impl GangPlugin {
 }
 
 impl Plugin for GangPlugin {
+    fn name(&self) -> &'static str {
+        "gang"
+    }
+
     fn setup(&mut self, ss: &SnapShot) -> Result<(), FlameError> {
         self.ssn_state.clear();
 

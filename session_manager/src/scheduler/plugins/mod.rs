@@ -55,6 +55,9 @@ pub type PluginManagerPtr = Arc<PluginManager>;
 /// 2. The next cycle will pick up any changes
 /// 3. Over-allocation is prevented by explicit checks in actions (e.g., max_instances)
 pub trait Plugin: Send + Sync + 'static {
+    /// Returns the plugin's canonical name used in configuration
+    fn name(&self) -> &'static str;
+
     // Installation of plugin
     fn setup(&mut self, ss: &SnapShot) -> Result<(), FlameError>;
 
@@ -109,6 +112,45 @@ pub trait Plugin: Send + Sync + 'static {
     fn on_executor_discard(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {}
 }
 
+type PluginConstructor = fn() -> PluginPtr;
+
+struct PluginInfo {
+    name: &'static str,
+    constructor: PluginConstructor,
+    configurable: bool,
+}
+
+const PLUGIN_REGISTRY: &[PluginInfo] = &[
+    PluginInfo {
+        name: "priority",
+        constructor: PriorityPlugin::new_ptr,
+        configurable: true,
+    },
+    PluginInfo {
+        name: "fairshare",
+        constructor: FairShare::new_ptr,
+        configurable: true,
+    },
+    PluginInfo {
+        name: "gang",
+        constructor: GangPlugin::new_ptr,
+        configurable: true,
+    },
+    PluginInfo {
+        name: "shim",
+        constructor: ShimPlugin::new_ptr,
+        configurable: false,
+    },
+];
+
+pub fn configurable_policy_names() -> Vec<&'static str> {
+    PLUGIN_REGISTRY
+        .iter()
+        .filter(|p| p.configurable)
+        .map(|p| p.name)
+        .collect()
+}
+
 pub struct PluginManager {
     pub plugins: MutexPtr<Vec<(String, PluginPtr)>>,
 }
@@ -118,26 +160,22 @@ impl PluginManager {
         ss: &SnapShot,
         enabled_policies: &[String],
     ) -> Result<PluginManagerPtr, FlameError> {
+        let valid_names = configurable_policy_names();
+
         for p in enabled_policies {
-            match p.as_str() {
-                "priority" | "fairshare" | "gang" => {}
-                _ => return Err(FlameError::InvalidConfig(format!("unknown policy: {}", p))),
+            if !valid_names.contains(&p.as_str()) {
+                return Err(FlameError::InvalidConfig(format!(
+                    "unknown policy: {}. available: {:?}",
+                    p, valid_names
+                )));
             }
         }
 
-        let mut plugins: Vec<(String, PluginPtr)> = Vec::with_capacity(enabled_policies.len() + 1);
-        if enabled_policies.iter().any(|p| p == "priority") {
-            plugins.push(("priority".to_string(), PriorityPlugin::new_ptr()));
-        }
-        if enabled_policies.iter().any(|p| p == "fairshare") {
-            plugins.push(("fairshare".to_string(), FairShare::new_ptr()));
-        }
-        if enabled_policies.iter().any(|p| p == "gang") {
-            plugins.push(("gang".to_string(), GangPlugin::new_ptr()));
-        }
-
-        // shim plugin is always required - it handles executor-to-session matching by slot count
-        plugins.push(("shim".to_string(), ShimPlugin::new_ptr()));
+        let mut plugins: Vec<(String, PluginPtr)> = PLUGIN_REGISTRY
+            .iter()
+            .filter(|info| !info.configurable || enabled_policies.iter().any(|p| p == info.name))
+            .map(|info| (info.name.to_string(), (info.constructor)()))
+            .collect();
 
         tracing::info!(
             "Enabled scheduler plugins: {:?}",

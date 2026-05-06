@@ -41,6 +41,10 @@ impl ShimPlugin {
 }
 
 impl Plugin for ShimPlugin {
+    fn name(&self) -> &'static str {
+        "shim"
+    }
+
     fn setup(&mut self, ss: &SnapShot) -> Result<(), FlameError> {
         // Clear previous state
         self.ssn_shim_map.clear();

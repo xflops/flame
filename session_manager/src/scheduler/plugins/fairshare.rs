@@ -114,6 +114,10 @@ impl FairShare {
 }
 
 impl Plugin for FairShare {
+    fn name(&self) -> &'static str {
+        "fairshare"
+    }
+
     fn setup(&mut self, ss: &SnapShot) -> Result<(), FlameError> {
         self.unit = ss.unit.clone();
 

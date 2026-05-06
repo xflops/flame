@@ -74,6 +74,10 @@ impl PriorityPlugin {
 }
 
 impl Plugin for PriorityPlugin {
+    fn name(&self) -> &'static str {
+        "priority"
+    }
+
     fn setup(&mut self, ss: &SnapShot) -> Result<(), FlameError> {
         self.ssn_priority.clear();
         self.ssn_desired.clear();
