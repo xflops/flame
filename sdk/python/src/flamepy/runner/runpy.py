@@ -14,7 +14,8 @@ limitations under the License.
 import inspect
 import logging
 import os
-from typing import Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
 
 import cloudpickle
 
@@ -24,6 +25,8 @@ from flamepy.core.types import TaskOutput
 from flamepy.runner.types import RunnerContext, RunnerRequest
 
 logger = logging.getLogger(__name__)
+
+MAX_PARALLEL_RESOLVE = 8
 
 
 class FlameRunpyService(FlameService):
@@ -82,6 +85,95 @@ class FlameRunpyService(FlameService):
                 return value
 
         return value
+
+    def _collect_object_refs(self, args: Tuple, kwargs: Dict[str, Any]) -> List[Tuple[str, Any, ObjectRef]]:
+        """Collect all ObjectRefs from args and kwargs for parallel resolution.
+
+        Returns list of (location, original_value, object_ref) tuples where location
+        is either 'arg:N' for positional args or 'kwarg:key' for keyword args.
+        """
+        refs = []
+
+        for i, value in enumerate(args):
+            if isinstance(value, ObjectRef):
+                refs.append((f"arg:{i}", value, value))
+            elif isinstance(value, bytes):
+                try:
+                    object_ref = ObjectRef.decode(value)
+                    refs.append((f"arg:{i}", value, object_ref))
+                except Exception:
+                    pass
+
+        for key, value in kwargs.items():
+            if isinstance(value, ObjectRef):
+                refs.append((f"kwarg:{key}", value, value))
+            elif isinstance(value, bytes):
+                try:
+                    object_ref = ObjectRef.decode(value)
+                    refs.append((f"kwarg:{key}", value, object_ref))
+                except Exception:
+                    pass
+
+        return refs
+
+    def _resolve_object_refs_parallel(self, args: Tuple, kwargs: Dict[str, Any]) -> Tuple[Tuple, Dict[str, Any]]:
+        """Resolve all ObjectRefs in args and kwargs in parallel.
+
+        This significantly improves performance when multiple ObjectRefs need
+        to be fetched, as cache requests are made concurrently.
+        """
+        refs = self._collect_object_refs(args, kwargs)
+
+        if not refs:
+            return args, kwargs
+
+        if len(refs) == 1:
+            location, original, obj_ref = refs[0]
+            resolved = get_object(obj_ref)
+            if resolved is None:
+                raise ValueError(f"Failed to retrieve ObjectRef from cache: {obj_ref}")
+
+            if location.startswith("arg:"):
+                idx = int(location.split(":")[1])
+                args = tuple(resolved if i == idx else v for i, v in enumerate(args))
+            else:
+                key = location.split(":")[1]
+                kwargs = {k: resolved if k == key else v for k, v in kwargs.items()}
+
+            return args, kwargs
+
+        resolved_values: Dict[str, Any] = {}
+        max_workers = min(len(refs), MAX_PARALLEL_RESOLVE)
+
+        logger.debug(f"Resolving {len(refs)} ObjectRefs in parallel with {max_workers} workers")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_location = {executor.submit(get_object, obj_ref): location for location, _, obj_ref in refs}
+
+            for future in as_completed(future_to_location):
+                location = future_to_location[future]
+                try:
+                    result = future.result()
+                    if result is None:
+                        raise ValueError(f"Failed to retrieve ObjectRef from cache at {location}")
+                    resolved_values[location] = result
+                except Exception as e:
+                    raise ValueError(f"Failed to resolve ObjectRef at {location}: {e}")
+
+        new_args = list(args)
+        for i, value in enumerate(args):
+            location = f"arg:{i}"
+            if location in resolved_values:
+                new_args[i] = resolved_values[location]
+
+        new_kwargs = dict(kwargs)
+        for key in kwargs:
+            location = f"kwarg:{key}"
+            if location in resolved_values:
+                new_kwargs[key] = resolved_values[location]
+
+        logger.debug(f"Resolved {len(refs)} ObjectRefs in parallel")
+        return tuple(new_args), new_kwargs
 
     def on_session_enter(self, context: SessionContext) -> bool:
         """
@@ -186,25 +278,22 @@ class FlameRunpyService(FlameService):
 
             logger.debug(f"RunnerRequest: method={request.method}, has_args={request.args is not None}, has_kwargs={request.kwargs is not None}")
 
-            # Step 3: Resolve ObjectRef instances in args and kwargs
-            invoke_args = ()
-            invoke_kwargs = {}
+            # Step 3: Resolve ObjectRef instances in args and kwargs (in parallel)
+            raw_args = ()
+            raw_kwargs = {}
 
             if request.args is not None:
-                # Ensure args is iterable (tuple or list)
                 if not isinstance(request.args, (tuple, list)):
                     raise ValueError(f"request.args must be a tuple or list, got {type(request.args)}: {request.args}")
-                # Resolve any ObjectRef instances in args
-                invoke_args = tuple(self._resolve_object_ref(arg) for arg in request.args)
-                logger.debug(f"Resolved args: {len(invoke_args)} arguments")
+                raw_args = tuple(request.args)
 
             if request.kwargs is not None:
-                # Ensure kwargs is a dictionary
                 if not isinstance(request.kwargs, dict):
                     raise ValueError(f"request.kwargs must be a dict, got {type(request.kwargs)}: {request.kwargs}")
-                # Resolve any ObjectRef instances in kwargs
-                invoke_kwargs = {key: self._resolve_object_ref(value) for key, value in request.kwargs.items()}
-                logger.debug(f"Resolved kwargs: {len(invoke_kwargs)} keyword arguments")
+                raw_kwargs = dict(request.kwargs)
+
+            invoke_args, invoke_kwargs = self._resolve_object_refs_parallel(raw_args, raw_kwargs)
+            logger.debug(f"Resolved args: {len(invoke_args)} arguments, kwargs: {len(invoke_kwargs)} keyword arguments")
 
             # Step 4: Execute the requested method
             if request.method is None:

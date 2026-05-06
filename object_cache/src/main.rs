@@ -52,6 +52,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Storage: {}", storage);
     }
 
+    if let Some(pprof_config) = &cache_config.pprof {
+        let port = pprof_config.port;
+        tokio::spawn(async move {
+            common::pprof::run_pprof_server(Some(port)).await;
+        });
+    }
+
     cache::run(&cache_config).await?;
 
     Ok(())

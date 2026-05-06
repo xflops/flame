@@ -101,6 +101,8 @@ struct FlameCacheYaml {
     pub eviction: Option<FlameEvictionYaml>,
     /// TLS configuration for Object Cache (optional, independent from cluster.tls)
     pub tls: Option<FlameTlsYaml>,
+    /// pprof profiling configuration
+    pub pprof: Option<FlamePprofYaml>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +223,7 @@ pub struct FlameCache {
     pub eviction: FlameEviction,
     /// TLS configuration for Object Cache (optional, independent from cluster.tls)
     pub tls: Option<FlameTls>,
+    pub pprof: Option<FlamePprof>,
 }
 
 impl FlameCache {
@@ -473,6 +476,7 @@ impl TryFrom<FlameCacheYaml> for FlameCache {
     type Error = FlameError;
     fn try_from(cache: FlameCacheYaml) -> Result<Self, Self::Error> {
         let tls = cache.tls.map(FlameTls::try_from).transpose()?;
+        let pprof = cache.pprof.map(FlamePprof::from);
 
         Ok(FlameCache {
             endpoint: cache
@@ -488,6 +492,7 @@ impl TryFrom<FlameCacheYaml> for FlameCache {
                 .transpose()?
                 .unwrap_or_default(),
             tls,
+            pprof,
         })
     }
 }

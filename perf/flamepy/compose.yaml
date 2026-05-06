@@ -14,6 +14,25 @@ services:
     networks:
       - flame-network
 
+  flame-object-cache:
+    image: xflops/flame-object-cache:latest
+    container_name: flame-object-cache
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ./conf/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
+      - ./conf/certs:/etc/flame/certs:ro
+    ports:
+      - "9090:9090"
+      - "6061:6061"
+    restart: unless-stopped
+    networks:
+      - flame-network
+    deploy:
+      resources:
+        limits:
+          memory: 12G
+
   flame-executor-manager:
     image: xflops/flame-executor-manager:latest
     environment:
@@ -27,11 +46,11 @@ services:
           memory: 8G
     depends_on:
       - flame-session-manager
+      - flame-object-cache
     volumes:
       - ./conf/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
       - ./conf/certs:/etc/flame/certs:ro
       - flame-work:/usr/local/flame/work
-      - flame-cache-storage:/var/lib/flame/cache
     restart: unless-stopped
     networks:
       - flame-network
@@ -45,6 +64,7 @@ services:
       - RUST_LOG=info
     depends_on:
       - flame-session-manager
+      - flame-object-cache
     volumes:
       - ./conf/flame.yaml:/root/.flame/flame.yaml
       - ./conf/certs:/etc/flame/certs:ro
@@ -61,4 +81,3 @@ networks:
 
 volumes:
   flame-work:
-  flame-cache-storage:
