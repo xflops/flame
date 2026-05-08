@@ -17,6 +17,28 @@ As Agentic AI become increasingly adopted for innovation, a common workload runt
 * **Security**: Flame utilizes microVM as a runtime for enhanced security, with each runtime environment (executor) dedicated to a single session to prevent data leakage. All Flame components communicate using mTLS for secure inter-component communication.
 * **Flexibility**: Flame defines a comprehensive set of general APIs to support multiple user scenarios. Additionally, Flame supports applications across multiple programming languages through gRPC, including Rust, Go, and Python.
 
+## Performance
+
+Flame is designed for high-throughput task execution. Here's a benchmark running 30,000 tasks:
+
+```shell
+root@06383dd94875:/# flmping -p -t 30000
+Session <flmping-1N1sIX> was created in <1 ms>, start to run <30,000> tasks in the session:
+
+============================================================
+BENCHMARK RESULTS
+============================================================
+Duration:        3.29s
+Succeeded:       30000/30000
+Failed:          0
+Throughput:      9124.09 tasks/sec
+============================================================
+
+root@06383dd94875:/# flmctl list -s
+ ID              State   App      Slots  Priority  Pending  Running  Succeed  Failed  Created
+ flmping-1N1sIX  Closed  flmping  1      0         0        0        30000    0       18:11:26
+```
+
 ## Architecture Overview
 
 ![Flame Architecture](docs/images/flame-arch.jpg)
@@ -59,51 +81,51 @@ After the Flame cluster is launched, use the following steps to log into the `fl
 $ docker compose exec flame-console /bin/bash
 ```
 
-### Option 2: Local Installation (Faster for Development)
+### Option 2: Local Installation with flmadm (Faster for Development)
 
 For development and testing, you can install Flame directly on your machine using `flmadm`:
 
 ```shell
-# Quick start with helper script
-$ ./hack/local-test.sh install
-$ ./hack/local-test.sh start
+# Build and install flmadm
+$ cargo build --release -p flmadm
+$ sudo cp target/release/flmadm /usr/local/bin/
 
-# Or using Make
-$ make install-dev
-$ /tmp/flame-dev/bin/flame-session-manager --config /tmp/flame-dev/conf/flame-cluster.yaml &
-$ /tmp/flame-dev/bin/flame-executor-manager --config /tmp/flame-dev/conf/flame-cluster.yaml &
+# Install all components from local source and start services
+$ sudo flmadm install --all --src-dir . --enable
 ```
 
-For more details, see the [Local Development Guide](docs/tutorials/local-development.md).
+For more details, see the [flmadm README](flmadm/README.md).
 
-Then, verify the installation with `flmping` in the pod. Additionally, you can explore more meaningful examples [here](examples):
+### Verify the Installation
+
+After starting Flame (via either option), verify the installation with `flmping`:
 
 ```shell
-root@560624b037c9:/# flmping
-Session <1> was created in <3 ms>, start to run <10> tasks in the session:
+$ flmping
+Session <flmping-Sf4R2o> was created in <1 ms>, start to run <10> tasks in the session:
 
- Session         Task  State    Output                                                          
- flmping-UdjmHs  8     Succeed  Completed on <fc5afd603feb> in <0> milliseconds with <0> memory 
- flmping-UdjmHs  6     Succeed  Completed on <fc5afd603feb> in <0> milliseconds with <0> memory 
- flmping-UdjmHs  10    Succeed  Completed on <fc5afd603feb> in <0> milliseconds with <0> memory 
- flmping-UdjmHs  7     Succeed  Completed on <fc5afd603feb> in <0> milliseconds with <0> memory 
- flmping-UdjmHs  2     Succeed  Completed on <fc5afd603feb> in <0> milliseconds with <0> memory 
- flmping-UdjmHs  1     Succeed  Completed on <fc5afd603feb> in <0> milliseconds with <0> memory 
- flmping-UdjmHs  3     Succeed  Completed on <fc5afd603feb> in <0> milliseconds with <0> memory 
- flmping-UdjmHs  5     Succeed  Completed on <fc5afd603feb> in <0> milliseconds with <0> memory 
- flmping-UdjmHs  9     Succeed  Completed on <fc5afd603feb> in <0> milliseconds with <0> memory 
- flmping-UdjmHs  4     Succeed  Completed on <fc5afd603feb> in <0> milliseconds with <0> memory 
+ Session         Task  State    Output
+ flmping-Sf4R2o  1     Succeed  Completed on <396003ae48dd> in <0> milliseconds with <0> memory
+ flmping-Sf4R2o  2     Succeed  Completed on <396003ae48dd> in <0> milliseconds with <0> memory
+ flmping-Sf4R2o  3     Succeed  Completed on <396003ae48dd> in <0> milliseconds with <0> memory
+ flmping-Sf4R2o  4     Succeed  Completed on <396003ae48dd> in <0> milliseconds with <0> memory
+ flmping-Sf4R2o  5     Succeed  Completed on <396003ae48dd> in <0> milliseconds with <0> memory
+ flmping-Sf4R2o  6     Succeed  Completed on <396003ae48dd> in <0> milliseconds with <0> memory
+ flmping-Sf4R2o  7     Succeed  Completed on <396003ae48dd> in <0> milliseconds with <0> memory
+ flmping-Sf4R2o  8     Succeed  Completed on <396003ae48dd> in <0> milliseconds with <0> memory
+ flmping-Sf4R2o  9     Succeed  Completed on <396003ae48dd> in <0> milliseconds with <0> memory
+ flmping-Sf4R2o  10    Succeed  Completed on <396003ae48dd> in <0> milliseconds with <0> memory
 
 
-<10> tasks was completed in <473 ms>.
+<10> tasks was completed in <153 ms>.
 ```
 
-You can check session status using `flmctl` as follows. It also includes several sub-commands, such as `list`:
+You can check session status using `flmctl`. Explore more examples [here](examples):
 
 ```shell
-root@560624b037c9:/# flmctl list -s
- ID              State   App      Slots  Pending  Running  Succeed  Failed  Created  
- flmping-UdjmHs  Closed  flmping  1      0        0        10       0       06:57:53
+$ flmctl list -s
+ ID              State   App      Slots  Priority  Pending  Running  Succeed  Failed  Created
+ flmping-Sf4R2o  Closed  flmping  1      0         0        0        10       0       13:33:30
 ```
 
 ## CLI Tools
@@ -115,20 +137,20 @@ Flame provides two separate command-line tools:
 
 ### Installing Flame with flmadm
 
-For bare-metal or VM installations, use `flmadm` to install Flame:
+For multi-node bare-metal or VM deployments, use `flmadm` to install Flame components on each node:
 
 ```shell
-# Basic installation (from GitHub)
-sudo flmadm install
+# On control plane node
+sudo flmadm install --control-plane --enable
 
-# Install from local source
-sudo flmadm install --src-dir /path/to/flame
+# On worker nodes
+sudo flmadm install --worker --enable
 
-# Install and start services
-sudo flmadm install --enable
+# On cache nodes (optional, can be co-located with workers)
+sudo flmadm install --cache --enable
 
-# User-local installation (no systemd)
-flmadm install --no-systemd --prefix ~/flame
+# Or deploy all components on a single node
+sudo flmadm install --all --enable
 ```
 
 For more details, see the [flmadm README](flmadm/README.md).
