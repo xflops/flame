@@ -220,11 +220,13 @@ session = flame.open_session(
 │  │  │     (NEW)        │  │                   │  │                  │  │    │
 │  │  │                  │  │                   │  │                  │  │    │
 │  │  │ setup():         │  │ setup():          │  │ setup():         │  │    │
-│  │  │  compute         │  │  compute          │  │  track batch     │  │    │
-│  │  │  max_needy_prio  │  │  deserved/        │  │  state           │  │    │
-│  │  │  among sessions  │  │  allocated        │  │                  │  │    │
-│  │  │  with pending    │  │                   │  │                  │  │    │
-│  │  │  tasks           │  │                   │  │                  │  │    │
+│  │  │  read total_slots│  │  compute          │  │  track batch     │  │    │
+│  │  │  distribute by   │  │  deserved/        │  │  state           │  │    │
+│  │  │  (priority desc, │  │  allocated        │  │                  │  │    │
+│  │  │   creation asc)  │  │  (unchanged)      │  │                  │  │    │
+│  │  │  → ssn_desired   │  │                   │  │                  │  │    │
+│  │  │  init            │  │                   │  │                  │  │    │
+│  │  │  ssn_allocated   │  │                   │  │                  │  │    │
 │  │  │                  │  │                   │  │                  │  │    │
 │  │  │ ssn_order_fn():  │  │ ssn_order_fn():   │  │   (no opinion)   │  │    │
 │  │  │  sort descending │  │  sort by alloc/   │  │                  │  │    │
@@ -234,7 +236,10 @@ session = flame.open_session(
 │  │  │ is_underused():  │  │ is_underused():   │  │ is_underused():  │  │    │
 │  │  │  Some(false) if  │  │  check alloc      │  │  check batch     │  │    │
 │  │  │  lower priority  │  │  vs deserved      │  │  capacity        │  │    │
-│  │  │  than max_needy  │  │                   │  │                  │  │    │
+│  │  │  than max_needy; │  │                   │  │                  │  │    │
+│  │  │  else Some(true) │  │                   │  │                  │  │    │
+│  │  │  while alloc <   │  │                   │  │                  │  │    │
+│  │  │  ssn_desired     │  │                   │  │                  │  │    │
 │  │  └──────────────────┘  └───────────────────┘  └──────────────────┘  │    │
 │  │       consulted first       consulted second       consulted third  │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
@@ -363,15 +368,29 @@ fn session_spec_to_attributes(id: &str, spec: &SessionSpec) -> SessionAttributes
 
 **Location:** `session_manager/src/scheduler/plugins/priority.rs`
 
-The `PriorityPlugin` implements the `Plugin` trait. It is stateful across a scheduling cycle: `setup()` computes the global `max_needy_priority`, which is then used by `ssn_order_fn` and `is_underused` during that cycle.
+The `PriorityPlugin` owns priority-aware resource distribution. Each scheduling cycle, `setup()`:
+
+1. Retrieves the cluster's total slot count (`total_slots`).
+2. Distributes `total_slots` across open sessions in descending order of priority. Within a priority tier, sessions are ordered by creation time ascending — earlier sessions take precedence. Each session's share is recorded as `ssn_desired[id]`.
+3. Initializes `ssn_allocated[id]` from currently-bound executors. The update process for `ssn_allocated` after `setup()` is unchanged from the existing implementation: per-session executor counts are adjusted by the existing `on_executor_*` / `on_session_*` callbacks the plugin already provides.
+
+`max_needy_priority` is computed in the same pass — the highest priority among sessions that still have pending tasks — and used by `is_underused` to block lower-priority sessions even when slack appears in their tier.
 
 ```rust
 pub struct PriorityPlugin {
-    /// Maximum priority among sessions that are "needy" (have pending tasks).
-    /// Computed in setup(); used during ssn_order_fn and is_underused.
+    /// Maximum priority among open sessions with pending tasks.
+    /// Computed in `setup()`; used in `is_underused`.
     max_needy_priority: u32,
     /// Priority for each open session, keyed by session ID.
+    /// Populated in `setup()` for fast lookup during `ssn_order_fn` / `is_underused`.
     ssn_priority: HashMap<SessionID, u32>,
+    /// Per-session priority-distributed share. Populated in `setup()` from the
+    /// total-slots distribution loop. Read-only thereafter for the cycle.
+    ssn_desired: HashMap<SessionID, f64>,
+    /// Slots currently allocated to each session.
+    /// Initialised in `setup()` from existing bound executors; updated thereafter
+    /// by the executor / session lifecycle callbacks (unchanged).
+    ssn_allocated: HashMap<SessionID, f64>,
 }
 
 impl PriorityPlugin {
@@ -379,6 +398,8 @@ impl PriorityPlugin {
         Self {
             max_needy_priority: 0,
             ssn_priority: HashMap::new(),
+            ssn_desired: HashMap::new(),
+            ssn_allocated: HashMap::new(),
         }
     }
 }
@@ -386,25 +407,57 @@ impl PriorityPlugin {
 impl Plugin for PriorityPlugin {
     fn setup(&mut self, ss: &SnapShot) -> Result<(), FlameError> {
         self.ssn_priority.clear();
+        self.ssn_desired.clear();
+        self.ssn_allocated.clear();
         self.max_needy_priority = 0;
 
-        for ssn in ss.sessions.values() {
-            if ssn.state != SessionState::Open {
-                continue;
-            }
+        // ── Step 1: total_slots ──────────────────────────────────────────────
+        // Cluster's physical scheduling capacity, taken from the same snapshot
+        // every plugin sees this cycle.
+        let total_slots: f64 = ss.find_nodes(ALL_NODE)?
+            .values()
+            .map(|n| n.allocatable.to_slots(&ss.unit) as f64)
+            .sum();
 
-            let priority = ssn.priority;
-            self.ssn_priority.insert(ssn.id.clone(), priority);
+        // ── Step 2: distribute total_slots by (priority desc, creation_time asc) ─
+        // Earlier-created sessions take precedence within a priority tier.
+        let mut sessions: Vec<&SessionInfoPtr> = ss
+            .find_sessions(OPEN_SESSION)?
+            .values()
+            .collect();
+        sessions.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)              // priority descending
+                .then(a.creation_time.cmp(&b.creation_time)) // earlier first
+        });
 
-            // A session is "needy" if it has pending tasks.
-            // A pending task implies the session can use more executors.
+        let mut remaining = total_slots;
+        for ssn in &sessions {
+            self.ssn_priority.insert(ssn.id.clone(), ssn.priority);
+
+            let demand = compute_demand(ssn);             // task-driven ceiling
+            let granted = demand.min(remaining.max(0.0));
+
+            self.ssn_desired.insert(ssn.id.clone(), granted);
+            self.ssn_allocated.insert(ssn.id.clone(), 0.0);
+            remaining -= granted;
+
+            // max_needy_priority pass (same loop, unchanged criterion)
             let pending = ssn.tasks_status
                 .get(&TaskState::Pending)
                 .copied()
                 .unwrap_or(0);
+            if pending > 0 && ssn.priority > self.max_needy_priority {
+                self.max_needy_priority = ssn.priority;
+            }
+        }
 
-            if pending > 0 && priority > self.max_needy_priority {
-                self.max_needy_priority = priority;
+        // ── Step 3: ssn_allocated initial counts (existing logic, unchanged) ──
+        for exe in ss.find_executors(ALL_EXECUTOR)?.values() {
+            if let Some(ssn_id) = &exe.ssn_id {
+                if let Some(slot) = self.ssn_allocated.get_mut(ssn_id) {
+                    *slot += exe.slots as f64;
+                }
             }
         }
 
@@ -416,34 +469,94 @@ impl Plugin for PriorityPlugin {
         let p2 = self.ssn_priority.get(&s2.id).copied().unwrap_or(0);
 
         if p1 != p2 {
-            // Higher priority sessions come first (descending order).
-            // p2.cmp(&p1) reverses the natural ascending order.
+            // Higher priority comes first (descending order).
             Some(p2.cmp(&p1))
         } else {
-            // Equal priority: no opinion; defer to FairShare for ratio-based tiebreaking.
+            // Equal priority: defer to creation time at AllocateAction level via
+            // the same comparator (earlier session first); for ssn_order_fn we
+            // return None and let FairShare break the tie within the priority tier.
             None
         }
     }
 
     fn is_underused(&self, ssn: &SessionInfoPtr) -> Option<bool> {
-        let ssn = lock_ptr!(ssn).ok()?;
-        let priority = self.ssn_priority.get(&ssn.id).copied().unwrap_or(0);
+        let priority = self.ssn_priority.get(&ssn.id).copied()?;
 
+        // Lower than the highest needy priority → hard-blocked.
         if priority < self.max_needy_priority {
-            // A higher-priority session is still needy.
-            // Block this session from receiving new resources.
-            Some(false)
+            return Some(false);
+        }
+
+        // Eligible tier: still underused while allocated < desired.
+        let desired = self.ssn_desired.get(&ssn.id).copied().unwrap_or(0.0);
+        let allocated = self.ssn_allocated.get(&ssn.id).copied().unwrap_or(0.0);
+        if desired > 0.0 && allocated < desired {
+            Some(true)   // overrides FairShare's deserved-based veto
         } else {
-            // This session is at or above the highest needy priority.
-            // Defer to FairShare and GangPlugin to determine underuse.
-            None
+            None         // demand met (or no demand) — defer to FairShare/Gang
         }
     }
 
-    // All other Plugin methods return their default (None / no-op).
-    // PriorityPlugin does not influence node ordering, preemptibility,
-    // executor availability, allocatability, reclaimability, gang readiness,
-    // or event callbacks.
+    // ── ssn_allocated update: existing process, UNCHANGED ────────────────────
+    // The four executor callbacks and two session callbacks below mirror the
+    // existing implementation. They are listed here only to make the contract
+    // explicit; their bodies are unchanged.
+
+    fn on_executor_allocate(&mut self, _node: NodeInfoPtr, ssn: SessionInfoPtr) {
+        if let Some(slot) = self.ssn_allocated.get_mut(&ssn.id) {
+            *slot += ssn.slots as f64;
+        }
+    }
+    fn on_executor_unallocate(&mut self, _node: NodeInfoPtr, ssn: SessionInfoPtr) {
+        if let Some(slot) = self.ssn_allocated.get_mut(&ssn.id) {
+            *slot -= ssn.slots as f64;
+        }
+    }
+    fn on_executor_pipeline(&mut self, _exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
+        if let Some(slot) = self.ssn_allocated.get_mut(&ssn.id) {
+            *slot += ssn.slots as f64;
+        }
+    }
+    fn on_executor_discard(&mut self, _exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
+        if let Some(slot) = self.ssn_allocated.get_mut(&ssn.id) {
+            *slot -= ssn.slots as f64;
+        }
+    }
+    fn on_session_bind(&mut self, ssn: SessionInfoPtr) {
+        if let Some(slot) = self.ssn_allocated.get_mut(&ssn.id) {
+            *slot += ssn.slots as f64;
+        }
+    }
+    fn on_session_unbind(&mut self, ssn: SessionInfoPtr) {
+        if let Some(slot) = self.ssn_allocated.get_mut(&ssn.id) {
+            *slot -= ssn.slots as f64;
+        }
+    }
+
+    // All other Plugin methods (node ordering, preemptibility, availability,
+    // allocatability, reclaimability, gang readiness) return defaults.
+}
+```
+
+**`compute_demand(ssn)`** — the per-session demand ceiling used in the distribution loop. Existing behavior:
+
+```rust
+fn compute_demand(ssn: &SessionInfo) -> f64 {
+    // Sum pending + running task counts; round down to whole batches; multiply by slots.
+    let mut task_count = 0.0_f64;
+    for state in [TaskState::Pending, TaskState::Running] {
+        if let Some(c) = ssn.tasks_status.get(&state) {
+            task_count += *c as f64;
+        }
+    }
+    let batch_size = ssn.batch_size.max(1) as f64;
+    let batched = (task_count / batch_size).floor() * batch_size;
+    let mut demand = batched * ssn.slots as f64;
+
+    if let Some(max_i) = ssn.max_instances {
+        demand = demand.min((max_i * ssn.slots) as f64);
+    }
+    demand.max((ssn.min_instances * ssn.slots) as f64)
 }
 ```
 
@@ -537,6 +650,8 @@ struct CreateArgs {
 | -------------------- | ------------------------- | --------------------------------------------------------------------------- |
 | `max_needy_priority` | `u32`                     | Highest priority among sessions with pending tasks; computed in `setup()`   |
 | `ssn_priority`       | `HashMap<SessionID, u32>` | Priority for each open session; populated in `setup()`; consulted in order functions |
+| `ssn_desired`        | `HashMap<SessionID, f64>` | Per-session priority-distributed share; populated in `setup()` step 2 from the `total_slots` distribution loop; read-only thereafter for the cycle |
+| `ssn_allocated`      | `HashMap<SessionID, f64>` | Slots currently allocated to each session; initialised in `setup()` step 3 from bound executors; updated thereafter by the existing executor / session lifecycle callbacks |
 
 **`SessionInfo` extension:**
 
@@ -563,6 +678,57 @@ PluginManager chain (first non-None wins):
   PriorityPlugin → FairShare → GangPlugin → Ordering::Equal
 ```
 
+#### Priority-Aware Resource Distribution (PriorityPlugin.setup)
+
+The distribution algorithm runs once per scheduling cycle inside `PriorityPlugin::setup`. It produces `ssn_desired[id]` for every open session. `ssn_allocated[id]` is updated by the existing process — initialized from current bound executors and adjusted thereafter by the executor / session lifecycle callbacks.
+
+```
+Input : SnapShot ss
+Output: ssn_desired   : map<SessionID, f64>
+        ssn_allocated : map<SessionID, f64>   (initial counts only; runtime updates unchanged)
+        max_needy_priority : u32
+
+# Step 1 — total_slots
+total_slots = Σ node.allocatable.to_slots(unit)   for node in ss.nodes
+remaining   = total_slots
+
+# Step 2 — distribute by (priority desc, creation_time asc)
+sorted = ss.open_sessions sorted by:
+    primary  : priority      (descending)         # higher priority first
+    secondary: creation_time (ascending)          # earlier session first
+
+for ssn in sorted:
+    demand  = compute_demand(ssn)                 # task-driven ceiling
+    granted = min(demand, max(remaining, 0))
+    ssn_desired[ssn.id]   = granted
+    ssn_allocated[ssn.id] = 0                     # filled in step 3
+    remaining            -= granted
+
+    if pending(ssn) > 0 and ssn.priority > max_needy_priority:
+        max_needy_priority = ssn.priority
+
+# Step 3 — initial ssn_allocated from bound executors (existing process, unchanged)
+for exe in ss.executors where exe.ssn_id is set:
+    ssn_allocated[exe.ssn_id] += exe.slots
+
+# After setup, ssn_allocated continues to be updated by the existing
+# on_executor_allocate / on_executor_unallocate / on_executor_pipeline /
+# on_executor_discard / on_session_bind / on_session_unbind callbacks.
+```
+
+**Invariants enforced by this algorithm:**
+
+| Invariant | Justification |
+| --------- | ------------- |
+| `Σ ssn_desired ≤ total_slots` | Each grant is capped at `remaining`, which starts at `total_slots` and is monotonically decremented. |
+| `Σ ssn_desired = total_slots` when `Σ compute_demand ≥ total_slots` | Higher-priority (and earlier within a tier) sessions saturate first; later sessions absorb the residual until cluster capacity is exhausted. |
+| Within equal priority, earlier-created sessions are filled first | `creation_time ascending` is the secondary sort key. |
+| `ssn_allocated` update flow is unchanged | Only the *initial* counts are populated in `setup()`; runtime adjustments use the same callbacks as before this RFE. |
+
+**Why creation time as the tiebreaker:**
+
+Within a priority tier, the earlier session represents work that has been waiting longer for resources. Filling it first reduces head-of-line latency for established sessions while remaining deterministic and stable across scheduling cycles. Session IDs are not used as a tiebreaker because they are not ordered by submission time and would give arbitrary winners.
+
 #### Priority Blocking (is_underused)
 
 ```
@@ -587,74 +753,88 @@ Aggregation (ANY semantics):
 
 A session with pending tasks has work it cannot yet run — it can benefit from additional executors. A session with zero pending tasks is either idle or satisfied; it should not block lower-priority sessions even if it holds fewer executors than its `deserved` allocation.
 
-#### FairShare `desired` Calculation (updated for priority scheduling)
+#### FairShare's Role with Priority Scheduling
 
-With priority scheduling active, each session's `desired` equals exactly one scheduling unit — the resources it was configured to use — rather than scaling with its task backlog:
+FairShare itself is **unchanged**. It continues to compute `deserved` and `allocated` per session and continues to provide `ssn_order_fn` (allocated/deserved ratio ascending) and `is_underused` (allocated < deserved). Its responsibilities and formulas inside `setup()` are not modified by this RFE.
 
-```
-desired = batch_size × slots   (when task_count > 0)
-desired = 0                    (when task_count == 0, no work to do)
+What changes is **which plugin owns the cluster-capacity cap on `desired`**. PriorityPlugin's `setup()` performs the priority-aware total-slots distribution (see *Priority-Aware Resource Distribution* above) and writes the resulting per-session share into `ssn_desired`. PriorityPlugin's `is_underused` then uses `ssn_allocated < ssn_desired` to override FairShare's deserved-based veto for high-priority sessions. The plugin consultation order — `PriorityPlugin → FairShare → GangPlugin` with first-non-`None` semantics — guarantees PriorityPlugin's decision wins whenever it has an opinion.
 
-Then apply:
-  desired = min(desired, max_instances × slots)   # cap at max_instances if set
-  desired = max(desired, min_instances × slots)   # floor at min_instances guarantee
-```
-
-**Old formula (removed):** `desired = floor(task_count / batch_size) × batch_size × slots`
-
-The old formula caused sessions with large backlogs to claim proportionally more resources than sessions with small backlogs. With priority scheduling, backlog size must not influence resource allocation — that role belongs to the PriorityPlugin's ordering and blocking logic. Each session claims its one scheduling unit; priority determines which session receives it.
+Because PriorityPlugin caps `Σ ssn_desired ≤ total_slots` (see invariants), the previous over-allocation symptom — where aggregate demand asked for more than the cluster physically has — cannot occur even when individual session demand is large.
 
 #### Example Walkthrough
 
-All sessions below use `batch_size=1`, so `desired = 1 × slots = slots`.
+All sessions below use `batch_size=1` for clarity, so `compute_demand(ssn) = task_count × slots` capped/floored as usual.
+
+**Case 1 — Cluster has slack (`total_slots = 22`):**
 
 ```
-Cluster: 6 slots total, all idle
+Cluster: total_slots = 22, all idle
 
-Sessions:
-  Session A: priority=100, slots=2, pending=8   → desired=2
-  Session B: priority=100, slots=2, pending=4   → desired=2
-  Session C: priority=10,  slots=2, pending=12  → desired=2
+Sessions (creation_time shown as relative t₀ < t₁ < t₂):
+  Session A: priority=100, slots=2, pending=4,  created t₀ → demand = 8
+  Session B: priority=100, slots=2, pending=3,  created t₁ → demand = 6
+  Session C: priority=10,  slots=4, pending=5,  created t₂ → demand = 20
 
-FairShare.setup():
-  remaining = 6 (no min_instances, no executors yet)
-  Distribute: A gets 2, B gets 2, C gets 2 (each desired=2, cluster has enough)
-  A: desired=2, deserved=2, allocated=0
-  B: desired=2, deserved=2, allocated=0
-  C: desired=2, deserved=2, allocated=0
+PriorityPlugin.setup() — Step 1: total_slots = 22, remaining = 22
+                        Step 2: sort by (priority desc, creation_time asc)
+                                → [A (100, t₀), B (100, t₁), C (10, t₂)]
 
-PriorityPlugin.setup():
-  A: pending=8 > 0, priority=100 → max_needy_priority = 100
-  B: pending=4 > 0, priority=100 → max_needy_priority = 100 (unchanged)
-  C: pending=12 > 0, priority=10 → 10 < 100, skip
-  Result: max_needy_priority = 100
+  A: demand = 8;  granted = min(8, 22) = 8  → ssn_desired[A] = 8,  remaining = 14
+  B: demand = 6;  granted = min(6, 14) = 6  → ssn_desired[B] = 6,  remaining = 8
+  C: demand = 20; granted = min(20, 8) = 8  → ssn_desired[C] = 8,  remaining = 0
 
-ssn_order_fn():
-  A vs B: same priority (100) → None → FairShare breaks tie
-    FairShare: A ratio=0/2=0.0, B ratio=0/2=0.0 → equal → Ordering::Equal
-  A vs C: 100 > 10 → Some(Less) → A before C
-  B vs C: 100 > 10 → Some(Less) → B before C
-  Final order: [A, B, C]  (A and B equal within their tier)
+  Σ ssn_desired = 22 = total_slots ✓
+  max_needy_priority = 100
 
 is_underused():
-  A: priority=100 == max_needy_priority(100) → None → FairShare: 0 < 2 → true
-  B: priority=100 == max_needy_priority(100) → None → FairShare: 0 < 2 → true
-  C: priority=10  <  max_needy_priority(100) → Some(false)  ← BLOCKED
+  A: priority=100 == max_needy_priority → ssn_allocated(0) < ssn_desired(8)  → Some(true)
+  B: priority=100 == max_needy_priority → ssn_allocated(0) < ssn_desired(6)  → Some(true)
+  C: priority=10  <  max_needy_priority → Some(false)  ← BLOCKED, even though C
+                                                        was granted 8 in step 2
 
 AllocateAction iterates [A, B, C]:
-  A: underused → allocate 2 slots (1 executor) → allocated=2
-  B: underused → allocate 2 slots (1 executor) → allocated=2
+  A: underused → fill ssn_desired=8  → ssn_allocated[A] = 8
+  B: underused → fill ssn_desired=6  → ssn_allocated[B] = 6
   C: blocked by PriorityPlugin → skip
+```
+
+**Case 2 — Cluster is contended (`total_slots = 4`):**
+
+Same three sessions, smaller cluster.
+
+```
+Cluster: total_slots = 4
+
+PriorityPlugin.setup():
+  Sort: [A (100, t₀), B (100, t₁), C (10, t₂)]
+
+  A: demand = 8;  granted = min(8, 4) = 4  → ssn_desired[A] = 4,  remaining = 0
+  B: demand = 6;  granted = min(6, 0) = 0  → ssn_desired[B] = 0,  remaining = 0
+  C: demand = 20; granted = min(20, 0) = 0 → ssn_desired[C] = 0,  remaining = 0
+
+  Σ ssn_desired = 4 = total_slots ✓ (capacity binds; demand exceeds cluster)
+  max_needy_priority = 100
+
+is_underused():
+  A: priority=100 == max_needy_priority → 0 < 4  → Some(true)
+  B: priority=100 == max_needy_priority → 0 == 0 → None → FairShare decides
+                                                          (FairShare's deserved
+                                                          for B is also bounded
+                                                          by the cluster.)
+  C: priority=10  <  max_needy_priority → Some(false)
 
 Result:
-  A: 1 executor (2 slots), processes its 8 pending tasks one at a time
-  B: 1 executor (2 slots), processes its 4 pending tasks one at a time
-  C: 0 executors — blocked until both A and B drain their pending queues
-
-Key point: C has 12 pending tasks but desired=2 (= slots), the same as A and B.
-The large backlog does not give C any advantage in the FairShare calculation.
-Priority alone determines which sessions receive resources.
+  A receives all 4 cluster slots.
+  B (same priority as A but created later) waits until A drains.
+  C waits behind both A and B.
 ```
+
+**Key points:**
+
+- `priority` is the primary sort key.
+- `creation_time ascending` resolves equal-priority ties — earlier sessions are filled first (Case 1 fills A before B; Case 2 starves B until A completes).
+- `Σ ssn_desired ≤ total_slots` holds by construction, with equality once cluster capacity is the binding constraint (Case 1 and Case 2).
+- `ssn_allocated` is initialized in step 3 of `setup()` from currently-bound executors and tracked thereafter by the existing executor / session callbacks — that update path is unchanged.
 
 ### System Considerations
 
@@ -880,3 +1060,6 @@ Remaining 4 slots idle (cannot form another batch for llm-inferenm-inference pen
 | **Default `priority = 0`** | Proto3 default for `uint32` is `0`. All existing sessions automatically start at the lowest priority without any migration or explicit opt-in. Clusters that don't use the priority feature are unaffected. |
 | **Global priority across applications** | Priority is a per-session attribute independent of application. Sessions from different applications compete globally. This is the natural consequence of `ssn_order_fn` acting on all open sessions in a single scheduler snapshot. |
 | **No preemption in V1** | Preemption adds significant complexity: partial batch reclaim must respect gang constraints, executor teardown has latency, and priority inversion must be avoided. A dedicated follow-on RFE can add `is_preemptible` logic to `PriorityPlugin` once the simpler ordering semantics are validated in production. |
+| **PriorityPlugin owns the cluster-capacity cap on `ssn_desired`** | The previous formula computed each session's `desired` independently of cluster size, allowing `Σ desired > total_slots` (the "FairShare allocated more than 22 slots" symptom). Moving the cap into `PriorityPlugin::setup` — as a single priority-ordered distribution loop bounded by `total_slots` — makes capacity an explicit invariant by construction. FairShare retains its existing role for within-tier fairness; only the source of `ssn_desired` changes. |
+| **Within-tier tiebreaker: creation time ascending (earlier first)** | When two sessions share a priority, the one that has been waiting longer should be filled first. This reduces head-of-line latency for established sessions, is deterministic across cycles, and reflects user intuition (FIFO within priority). Session IDs are not used because they are not ordered by submission time. |
+| **`ssn_allocated` update process is unchanged** | The runtime adjustments via `on_executor_allocate` / `on_executor_unallocate` / `on_executor_pipeline` / `on_executor_discard` / `on_session_bind` / `on_session_unbind` already correctly reflect bind/release events. This RFE only changes the *initial value* of `ssn_allocated` (computed in `setup()` from the snapshot's bound executors); per-event updates after `setup()` keep their existing implementation. |
