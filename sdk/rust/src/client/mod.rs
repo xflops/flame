@@ -14,7 +14,7 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, Utc};
 use futures::TryFutureExt;
 // use serde::{Deserialize, Serialize};
 use serde_derive::{Deserialize, Serialize};
@@ -713,9 +713,8 @@ impl TryFrom<&rpc::Session> for Session {
             .clone()
             .ok_or_else(|| FlameError::Internal("missing spec in response".to_string()))?;
 
-        let naivedatetime_utc = DateTime::from_timestamp_millis(status.creation_time * 1000)
+        let creation_time = DateTime::from_timestamp_millis(status.creation_time)
             .ok_or_else(|| FlameError::Internal("invalid timestamp".to_string()))?;
-        let creation_time = Utc.from_utc_datetime(&naivedatetime_utc.naive_utc());
 
         let events = status
             .events
@@ -777,9 +776,8 @@ impl TryFrom<&rpc::Application> for Application {
             .status
             .ok_or_else(|| FlameError::Internal("missing status in application".to_string()))?;
 
-        let naivedatetime_utc = DateTime::from_timestamp_millis(status.creation_time * 1000)
+        let creation_time = DateTime::from_timestamp_millis(status.creation_time)
             .ok_or_else(|| FlameError::Internal("invalid timestamp".to_string()))?;
-        let creation_time = Utc.from_utc_datetime(&naivedatetime_utc.naive_utc());
 
         Ok(Self {
             name: metadata.name,
@@ -990,5 +988,94 @@ mod serde_message {
     {
         let data: String = String::deserialize(deserializer)?;
         Ok(Some(Bytes::from(data.encode_to_vec())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// Regression test for `Session::try_from` creation_time parsing.
+    ///
+    /// The wire protocol carries `creation_time` as Unix milliseconds (see
+    /// `common/src/apis/to_rpc.rs` which calls `.timestamp_millis()`). The SDK
+    /// must parse it as milliseconds without an extra `* 1000` multiplication.
+    ///
+    /// Previously the SDK multiplied by 1000 again, producing a `DateTime`
+    /// roughly 1000× off (year ~57000 instead of the expected year). This test
+    /// locks the correct behavior.
+    #[test]
+    fn session_try_from_parses_creation_time_as_millis() {
+        let expected = Utc.with_ymd_and_hms(2026, 5, 8, 10, 0, 0).unwrap();
+        let wire_millis = expected.timestamp_millis();
+
+        let rpc_session = rpc::Session {
+            metadata: Some(rpc::Metadata {
+                id: "ssn-1".to_string(),
+                name: String::new(),
+            }),
+            spec: Some(rpc::SessionSpec {
+                application: "app".to_string(),
+                slots: 1,
+                common_data: None,
+                min_instances: 0,
+                max_instances: None,
+                batch_size: 1,
+                priority: 0,
+                resreq: None,
+            }),
+            status: Some(rpc::SessionStatus {
+                state: rpc::SessionState::Open as i32,
+                creation_time: wire_millis,
+                completion_time: None,
+                pending: 0,
+                running: 0,
+                succeed: 0,
+                failed: 0,
+                cancelled: 0,
+                events: vec![],
+            }),
+        };
+
+        let parsed = Session::try_from(&rpc_session).expect("Session::try_from should succeed");
+        assert_eq!(parsed.creation_time, expected);
+    }
+
+    /// Regression test for `Application::try_from` creation_time parsing.
+    /// See `session_try_from_parses_creation_time_as_millis` for context.
+    #[test]
+    fn application_try_from_parses_creation_time_as_millis() {
+        let expected = Utc.with_ymd_and_hms(2026, 5, 8, 10, 0, 0).unwrap();
+        let wire_millis = expected.timestamp_millis();
+
+        let rpc_app = rpc::Application {
+            metadata: Some(rpc::Metadata {
+                id: String::new(),
+                name: "app-1".to_string(),
+            }),
+            spec: Some(rpc::ApplicationSpec {
+                shim: rpc::Shim::Host as i32,
+                description: None,
+                labels: vec![],
+                image: None,
+                command: None,
+                arguments: vec![],
+                environments: vec![],
+                working_directory: None,
+                max_instances: None,
+                delay_release: None,
+                schema: None,
+                url: None,
+                installer: None,
+            }),
+            status: Some(rpc::ApplicationStatus {
+                state: rpc::ApplicationState::Enabled as i32,
+                creation_time: wire_millis,
+            }),
+        };
+
+        let parsed = Application::try_from(&rpc_app).expect("Application::try_from should succeed");
+        assert_eq!(parsed.creation_time, expected);
     }
 }
