@@ -19,7 +19,7 @@ As Agentic AI become increasingly adopted for innovation, a common workload runt
 
 ## Performance
 
-Flame is designed for high-throughput task execution. Here's a benchmark running 30,000 tasks:
+Flame is designed for high-throughput task execution. Here's a benchmark running 30,000 tasks on a single-node deployment:
 
 ```shell
 root@06383dd94875:/# flmping -p -t 30000
@@ -83,15 +83,18 @@ $ docker compose exec flame-console /bin/bash
 
 ### Option 2: Local Installation with flmadm (Faster for Development)
 
-For development and testing, you can install Flame directly on your machine using `flmadm`:
+For development and testing, you can install Flame directly on your machine using `flmadm` (requires [Rust](https://rustup.rs/) and [uv](https://astral.sh/uv)):
 
 ```shell
 # Build and install flmadm
 $ cargo build --release -p flmadm
-$ sudo cp target/release/flmadm /usr/local/bin/
+$ sudo install -m 755 target/release/flmadm /usr/local/bin/
 
 # Install all components from local source and start services
 $ sudo flmadm install --all --src-dir . --enable
+
+# Add Flame binaries to PATH
+$ source /usr/local/flame/sbin/flmenv.sh
 ```
 
 For more details, see the [flmadm README](flmadm/README.md).
