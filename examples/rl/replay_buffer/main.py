@@ -53,7 +53,8 @@ def run_distributed(
             stats = buffer_svc.state().get()
             total_size = stats["size"]
             total_added = stats["total_added"]
-            avg_reward = sum(r["avg_reward"] for r in collect_results) / num_collections
+            total_episodes = sum(r["episode_count"] for r in collect_results)
+            avg_reward = sum(r["avg_reward"] * r["episode_count"] for r in collect_results) / max(1, total_episodes)
 
             print(
                 f"Iteration {iteration:2d} | "
