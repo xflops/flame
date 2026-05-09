@@ -26,11 +26,10 @@ use crate::FlameError;
 const DEFAULT_FLAME_CONF: &str = "flame-cluster.yaml";
 const DEFAULT_CONTEXT_NAME: &str = "flame";
 const DEFAULT_FLAME_ENDPOINT: &str = "http://127.0.0.1:8080";
-const DEFAULT_SLOT: &str = "cpu=1,mem=2g";
 /// Default policies to enable when none specified in config.
-/// Available configurable policies: "priority", "fairshare", "gang"
+/// Available configurable policies: "priority", "drf", "gang"
 /// Note: "shim" plugin is always enabled (required for executor matching)
-pub const DEFAULT_POLICIES: &[&str] = &["priority", "fairshare", "gang"];
+pub const DEFAULT_POLICIES: &[&str] = &["priority", "drf", "gang"];
 const DEFAULT_STORAGE: &str = "sqlite://flame.db";
 const DEFAULT_MAX_EXECUTORS_PER_NODE: u32 = 128;
 const DEFAULT_SCHEDULE_INTERVAL: u64 = 100;
@@ -54,7 +53,10 @@ struct FlameClusterContextYaml {
 struct FlameClusterYaml {
     pub name: String,
     pub endpoint: String,
-    pub slot: Option<String>,
+    /// Cluster-wide default `resreq` for sessions that supply no explicit
+    /// `resreq`. String form `"cpu=2,mem=4g,gpu=1"` parsed by
+    /// `impl From<&String> for ResourceRequirement`.
+    pub resreq: Option<String>,
     pub policies: Option<Vec<String>>,
     pub storage: Option<String>,
     /// Schedule interval in milliseconds for the session scheduler loop
@@ -137,7 +139,9 @@ pub struct FlameClusterContext {
 pub struct FlameCluster {
     pub name: String,
     pub endpoint: String,
-    pub slot: ResourceRequirement,
+    /// Cluster-wide default `resreq`. Applied server-side when a session
+    /// spec sets no explicit `resreq`. `None` if not configured.
+    pub resreq: Option<ResourceRequirement>,
     pub policies: Vec<String>,
     pub storage: String,
     pub schedule_interval: u64,
@@ -388,7 +392,7 @@ impl TryFrom<FlameClusterYaml> for FlameCluster {
         Ok(FlameCluster {
             name: cluster.name,
             endpoint: cluster.endpoint,
-            slot: ResourceRequirement::from(&cluster.slot.unwrap_or(DEFAULT_SLOT.to_string())),
+            resreq: cluster.resreq.as_ref().map(ResourceRequirement::from),
             policies: cluster
                 .policies
                 .unwrap_or_else(|| DEFAULT_POLICIES.iter().map(|s| s.to_string()).collect()),
@@ -444,7 +448,7 @@ impl Default for FlameCluster {
         FlameCluster {
             name: DEFAULT_CONTEXT_NAME.to_string(),
             endpoint: DEFAULT_FLAME_ENDPOINT.to_string(),
-            slot: ResourceRequirement::from(&DEFAULT_SLOT.to_string()),
+            resreq: None,
             policies: DEFAULT_POLICIES.iter().map(|s| s.to_string()).collect(),
             storage: DEFAULT_STORAGE.to_string(),
             schedule_interval: DEFAULT_SCHEDULE_INTERVAL,
@@ -534,7 +538,7 @@ mod tests {
 cluster:
   name: flame
   endpoint: "http://flame-session-manager:8080"
-  slot: "cpu=1,mem=1g"
+  resreq: "cpu=1,mem=1g"
   policies:
     - priority
     - gang
@@ -554,7 +558,10 @@ cluster:
             .map_err(|e| FlameError::Internal(e.to_string()))?;
         assert_eq!(ctx.cluster.name, "flame");
         assert_eq!(ctx.cluster.endpoint, "http://flame-session-manager:8080");
-        assert_eq!(ctx.cluster.slot, ResourceRequirement::from("cpu=1,mem=1g"));
+        assert_eq!(
+            ctx.cluster.resreq,
+            Some(ResourceRequirement::from("cpu=1,mem=1g"))
+        );
         assert_eq!(ctx.cluster.policies, vec!["priority", "gang"]);
         assert_eq!(ctx.cluster.storage, "sqlite://flame.db");
         assert_eq!(ctx.cluster.executors.shim, Shim::Host);
@@ -905,6 +912,58 @@ cache:
 
         let result = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()));
         assert!(result.is_err());
+    }
+
+    // ============================================================
+    // Tests for cluster.resreq (cluster-wide default
+    // resreq applied server-side when a session spec supplies neither
+    // `slots` nor `resreq`).
+    // ============================================================
+
+    #[test]
+    fn cluster_yaml_with_resreq_parses() -> Result<(), FlameError> {
+        let context_string = r#"---
+cluster:
+  name: flame
+  endpoint: "http://flame-session-manager:8080"
+  resreq: "cpu=2,mem=4g,gpu=1"
+  executors:
+    shim: host
+        "#;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
+        fs::write(&tmp_file, context_string).map_err(|e| FlameError::Internal(e.to_string()))?;
+
+        let ctx = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()))?;
+
+        let resreq = ctx.cluster.resreq.expect("resreq should be parsed");
+        assert_eq!(resreq.cpu, 2);
+        assert_eq!(resreq.memory, 4 * 1024 * 1024 * 1024);
+        assert_eq!(resreq.gpu, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn cluster_yaml_without_resreq_is_none() -> Result<(), FlameError> {
+        let context_string = r#"---
+cluster:
+  name: flame
+  endpoint: "http://flame-session-manager:8080"
+  executors:
+    shim: host
+        "#;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
+        fs::write(&tmp_file, context_string).map_err(|e| FlameError::Internal(e.to_string()))?;
+
+        let ctx = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()))?;
+
+        assert!(ctx.cluster.resreq.is_none());
+
+        Ok(())
     }
 
     #[test]

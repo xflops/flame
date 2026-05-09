@@ -38,7 +38,6 @@ pub type AppInfoPtr = Arc<AppInfo>;
 
 #[derive(Clone)]
 pub struct SnapShot {
-    pub unit: ResourceRequirement,
     pub applications: MutexPtr<HashMap<String, AppInfoPtr>>,
 
     pub sessions: MutexPtr<HashMap<SessionID, SessionInfoPtr>>,
@@ -52,10 +51,15 @@ pub struct SnapShot {
 
 pub type SnapShotPtr = Arc<SnapShot>;
 
+impl Default for SnapShot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SnapShot {
-    pub fn new(unit: ResourceRequirement) -> Self {
+    pub fn new() -> Self {
         SnapShot {
-            unit,
             applications: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             ssn_index: Arc::new(Mutex::new(HashMap::new())),
@@ -116,7 +120,6 @@ pub struct TaskInfo {
 pub struct SessionInfo {
     pub id: SessionID,
     pub application: String,
-    pub slots: u32,
 
     pub tasks_status: HashMap<TaskState, i32>,
 
@@ -136,7 +139,6 @@ pub struct ExecutorInfo {
     pub id: ExecutorID,
     pub node: String,
     pub resreq: ResourceRequirement,
-    pub slots: u32,
     pub shim: Shim,
     pub task_id: Option<TaskID>,
     pub ssn_id: Option<SessionID>,
@@ -193,7 +195,6 @@ impl From<&Executor> for ExecutorInfo {
             id: exec.id.clone(),
             node: exec.node.clone(),
             resreq: exec.resreq.clone(),
-            slots: exec.slots,
             shim: exec.shim,
             task_id: exec.task_id,
             ssn_id: exec.ssn_id.clone(),
@@ -225,7 +226,6 @@ impl From<&Session> for SessionInfo {
         SessionInfo {
             id: ssn.id.clone(),
             application: ssn.application.clone(),
-            slots: ssn.slots,
             tasks_status,
             creation_time: ssn.creation_time,
             completion_time: ssn.completion_time,
@@ -761,7 +761,6 @@ impl SnapShot {
             node: exec.node.clone(),
             resreq: exec.resreq.clone(),
             task_id: exec.task_id,
-            slots: exec.slots,
             shim: exec.shim,
             ssn_id: exec.ssn_id.clone(),
             creation_time: exec.creation_time,
@@ -802,8 +801,20 @@ impl SnapShot {
             .map(|app| app.shim)
             .unwrap_or(Shim::Host);
 
+        // Match by exact resreq equality when the session has an explicit
+        // resource request. With slots fully removed, an executor created for a
+        // session is sized by that session's resreq, so equality is the
+        // appropriate match condition — the same role `slots == exec.slots`
+        // previously played.
         Ok(executors
-            .filter(|exec| ssn.slots == exec.slots && exec.shim == app_shim)
+            .filter(|exec| {
+                exec.shim == app_shim
+                    && ssn
+                        .resreq
+                        .as_ref()
+                        .map(|rr| rr == &exec.resreq)
+                        .unwrap_or(true)
+            })
             .cloned()
             .collect())
     }
@@ -814,7 +825,6 @@ pub struct Executor {
     pub id: ExecutorID,
     pub node: String,
     pub resreq: ResourceRequirement,
-    pub slots: u32,
     pub shim: Shim,
     pub task_id: Option<TaskID>,
     pub ssn_id: Option<SessionID>,
@@ -829,7 +839,6 @@ impl Default for Executor {
             id: String::new(),
             node: String::new(),
             resreq: ResourceRequirement::default(),
-            slots: 0,
             shim: Shim::Host,
             task_id: None,
             ssn_id: None,
@@ -859,7 +868,6 @@ impl From<&rpc::Executor> for Executor {
             id: metadata.id.clone(),
             node: spec.node.clone(),
             resreq: spec.resreq.unwrap().into(),
-            slots: spec.slots,
             shim: Shim::from(spec.shim()),
             task_id: None,
             ssn_id: None,
@@ -885,7 +893,6 @@ impl From<&Executor> for rpc::Executor {
         let spec = Some(rpc::ExecutorSpec {
             resreq: Some(e.resreq.clone().into()),
             node: e.node.clone(),
-            slots: e.slots,
             shim: rpc::Shim::from(e.shim).into(), // Include shim in spec
         });
 
@@ -907,17 +914,16 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    /// Helper to create a test executor with given parameters.
-    fn create_test_executor(id: &str, slots: u32, state: ExecutorState) -> ExecutorInfoPtr {
+    /// Helper to create a test executor with given resreq.
+    fn create_test_executor(
+        id: &str,
+        resreq: ResourceRequirement,
+        state: ExecutorState,
+    ) -> ExecutorInfoPtr {
         Arc::new(ExecutorInfo {
             id: id.to_string(),
             node: "test-node".to_string(),
-            resreq: ResourceRequirement {
-                cpu: 1,
-                memory: 1024,
-                gpu: 0,
-            },
-            slots,
+            resreq,
             shim: Shim::Host,
             task_id: None,
             ssn_id: None,
@@ -926,12 +932,15 @@ mod tests {
         })
     }
 
-    /// Helper to create a test session with given parameters.
-    fn create_test_session(id: &str, slots: u32, state: SessionState) -> SessionInfoPtr {
+    /// Helper to create a test session with given resreq.
+    fn create_test_session(
+        id: &str,
+        resreq: Option<ResourceRequirement>,
+        state: SessionState,
+    ) -> SessionInfoPtr {
         Arc::new(SessionInfo {
             id: id.to_string(),
             application: "test-app".to_string(),
-            slots,
             tasks_status: HashMap::from([(TaskState::Pending, 1)]),
             creation_time: Utc::now(),
             completion_time: None,
@@ -940,24 +949,35 @@ mod tests {
             max_instances: None,
             batch_size: 1,
             priority: 0,
-            resreq: None,
+            resreq,
         })
+    }
+
+    /// Default per-slot unit kept for backward-compatible test scaffolding.
+    fn unit_rr() -> ResourceRequirement {
+        ResourceRequirement {
+            cpu: 1,
+            memory: 1024,
+            gpu: 0,
+        }
+    }
+
+    /// Scale `unit_rr` by `n`. Mirrors the old `slots × unit` arithmetic the
+    /// pre-cleanup tests relied on.
+    fn slots_rr(n: u32) -> ResourceRequirement {
+        unit_rr().mul(n)
     }
 
     /// Test that SnapShot correctly filters executors by state.
     #[test]
     fn test_snapshot_find_executors_by_state() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
+        let ss = SnapShot::new();
 
         // Add executors with different states
-        let exec_idle1 = create_test_executor("exec-idle-1", 2, ExecutorState::Idle);
-        let exec_idle2 = create_test_executor("exec-idle-2", 2, ExecutorState::Idle);
-        let exec_bound = create_test_executor("exec-bound", 2, ExecutorState::Bound);
-        let exec_void = create_test_executor("exec-void", 2, ExecutorState::Void);
+        let exec_idle1 = create_test_executor("exec-idle-1", slots_rr(2), ExecutorState::Idle);
+        let exec_idle2 = create_test_executor("exec-idle-2", slots_rr(2), ExecutorState::Idle);
+        let exec_bound = create_test_executor("exec-bound", slots_rr(2), ExecutorState::Bound);
+        let exec_void = create_test_executor("exec-void", slots_rr(2), ExecutorState::Void);
 
         ss.add_executor(exec_idle1.clone()).unwrap();
         ss.add_executor(exec_idle2.clone()).unwrap();
@@ -988,16 +1008,12 @@ mod tests {
     /// Test that SnapShot correctly filters sessions by state.
     #[test]
     fn test_snapshot_find_sessions_by_state() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
+        let ss = SnapShot::new();
 
         // Add sessions with different states
-        let ssn_open1 = create_test_session("ssn-open-1", 2, SessionState::Open);
-        let ssn_open2 = create_test_session("ssn-open-2", 2, SessionState::Open);
-        let ssn_closed = create_test_session("ssn-closed", 2, SessionState::Closed);
+        let ssn_open1 = create_test_session("ssn-open-1", Some(slots_rr(2)), SessionState::Open);
+        let ssn_open2 = create_test_session("ssn-open-2", Some(slots_rr(2)), SessionState::Open);
+        let ssn_closed = create_test_session("ssn-closed", Some(slots_rr(2)), SessionState::Closed);
 
         ss.add_session(ssn_open1.clone()).unwrap();
         ss.add_session(ssn_open2.clone()).unwrap();
@@ -1017,14 +1033,10 @@ mod tests {
     /// Test that update_executor_state correctly updates the exec_index.
     #[test]
     fn test_snapshot_update_executor_state() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
+        let ss = SnapShot::new();
 
         // Add an idle executor
-        let exec = create_test_executor("exec-1", 2, ExecutorState::Idle);
+        let exec = create_test_executor("exec-1", slots_rr(2), ExecutorState::Idle);
         ss.add_executor(exec.clone()).unwrap();
 
         // Verify it's in the idle index
@@ -1044,54 +1056,56 @@ mod tests {
         assert_eq!(bound_execs.len(), 1);
     }
 
-    /// Test pipelined_executors filters by slots correctly.
+    /// Test pipelined_executors filters by resreq equality correctly.
     #[test]
-    fn test_snapshot_pipelined_executors_filters_by_slots() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
+    fn test_snapshot_pipelined_executors_filters_by_resreq() {
+        let ss = SnapShot::new();
 
-        // Add executors with different slots
-        let exec_slots2_idle = create_test_executor("exec-2-idle", 2, ExecutorState::Idle);
-        let exec_slots4_idle = create_test_executor("exec-4-idle", 4, ExecutorState::Idle);
-        let exec_slots2_void = create_test_executor("exec-2-void", 2, ExecutorState::Void);
-        let exec_slots2_bound = create_test_executor("exec-2-bound", 2, ExecutorState::Bound);
+        // Register the application so `pipelined_executors` can look up its shim.
+        ss.add_application(Arc::new(AppInfo {
+            name: "test-app".to_string(),
+            shim: Shim::Host,
+            max_instances: 0,
+            delay_release: chrono::Duration::zero(),
+        }))
+        .unwrap();
 
-        ss.add_executor(exec_slots2_idle.clone()).unwrap();
-        ss.add_executor(exec_slots4_idle.clone()).unwrap();
-        ss.add_executor(exec_slots2_void.clone()).unwrap();
-        ss.add_executor(exec_slots2_bound.clone()).unwrap();
+        // Executors sized by different resreq values.
+        let exec_r2_idle = create_test_executor("exec-r2-idle", slots_rr(2), ExecutorState::Idle);
+        let exec_r4_idle = create_test_executor("exec-r4-idle", slots_rr(4), ExecutorState::Idle);
+        let exec_r2_void = create_test_executor("exec-r2-void", slots_rr(2), ExecutorState::Void);
+        let exec_r2_bound =
+            create_test_executor("exec-r2-bound", slots_rr(2), ExecutorState::Bound);
 
-        // Create a session with slots=2
-        let ssn = create_test_session("ssn-1", 2, SessionState::Open);
+        ss.add_executor(exec_r2_idle.clone()).unwrap();
+        ss.add_executor(exec_r4_idle.clone()).unwrap();
+        ss.add_executor(exec_r2_void.clone()).unwrap();
+        ss.add_executor(exec_r2_bound.clone()).unwrap();
 
-        // Get pipelined executors (should only include idle and void with matching slots)
+        // Session asks for resreq equivalent to "2 × unit".
+        let ssn = create_test_session("ssn-1", Some(slots_rr(2)), SessionState::Open);
+
+        // Get pipelined executors (should only include idle and void with matching resreq).
         let pipelined = ss.pipelined_executors(ssn).unwrap();
 
-        // Should include exec-2-idle and exec-2-void (both have slots=2 and are idle/void)
-        // Should NOT include exec-4-idle (wrong slots) or exec-2-bound (wrong state)
+        // Should include exec-r2-idle and exec-r2-void (resreq matches and state is idle/void).
+        // Should NOT include exec-r4-idle (wrong resreq) or exec-r2-bound (wrong state).
         assert_eq!(pipelined.len(), 2);
 
         let ids: Vec<&str> = pipelined.iter().map(|e| e.id.as_str()).collect();
-        assert!(ids.contains(&"exec-2-idle"));
-        assert!(ids.contains(&"exec-2-void"));
-        assert!(!ids.contains(&"exec-4-idle"));
-        assert!(!ids.contains(&"exec-2-bound"));
+        assert!(ids.contains(&"exec-r2-idle"));
+        assert!(ids.contains(&"exec-r2-void"));
+        assert!(!ids.contains(&"exec-r4-idle"));
+        assert!(!ids.contains(&"exec-r2-bound"));
     }
 
     /// Test that empty filters return empty results.
     #[test]
     fn test_snapshot_empty_filters() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
+        let ss = SnapShot::new();
 
         // Add some executors
-        let exec = create_test_executor("exec-1", 2, ExecutorState::Idle);
+        let exec = create_test_executor("exec-1", slots_rr(2), ExecutorState::Idle);
         ss.add_executor(exec).unwrap();
 
         // Filter by state that doesn't exist
@@ -1118,13 +1132,9 @@ mod tests {
     /// Test that delete_executor removes from both main map and index.
     #[test]
     fn test_snapshot_delete_executor() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
+        let ss = SnapShot::new();
 
-        let exec = create_test_executor("exec-1", 2, ExecutorState::Idle);
+        let exec = create_test_executor("exec-1", slots_rr(2), ExecutorState::Idle);
         ss.add_executor(exec.clone()).unwrap();
 
         // Verify it exists

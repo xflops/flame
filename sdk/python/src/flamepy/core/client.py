@@ -79,7 +79,6 @@ def create_session(
     application: str,
     common_data: Optional[bytes] = None,
     session_id: Optional[str] = None,
-    slots: int = 1,
     min_instances: int = 0,
     max_instances: Optional[int] = None,
     batch_size: int = 1,
@@ -91,18 +90,18 @@ def create_session(
         application: Application name
         common_data: Common data as bytes (core API works with bytes)
         session_id: Optional session ID
-        slots: Number of slots (ignored if resreq is provided)
         min_instances: Minimum number of instances (default: 0)
         max_instances: Maximum number of instances (None = unlimited)
         batch_size: Number of executors per batch for gang scheduling (default: 1)
-        resreq: Explicit resource requirements. Mutually exclusive with slots.
+        resreq: Optional explicit resource requirements. When omitted, the
+                server applies cluster.resource_requirement (or a hardcoded
+                fallback when that is unset).
     """
     conn = ConnectionInstance.instance()
     return conn.create_session(SessionAttributes(
         id=session_id,
         application=application,
         common_data=common_data,
-        slots=slots if resreq is None else 0,
         min_instances=min_instances,
         max_instances=max_instances,
         batch_size=batch_size,
@@ -434,7 +433,6 @@ class Connection:
 
         session_spec = SessionSpec(
             application=attrs.application,
-            slots=attrs.slots,
             common_data=common_data_bytes,
             min_instances=attrs.min_instances,
             max_instances=attrs.max_instances if attrs.max_instances is not None else None,
@@ -458,7 +456,6 @@ class Connection:
                 connection=self,
                 id=response.metadata.id,
                 application=response.spec.application,
-                slots=response.spec.slots,
                 state=SessionState(response.status.state),
                 creation_time=datetime.fromtimestamp(response.status.creation_time / 1000, tz=timezone.utc),
                 pending=response.status.pending,
@@ -489,7 +486,6 @@ class Connection:
                         connection=self,
                         id=session.metadata.id,
                         application=session.spec.application,
-                        slots=session.spec.slots,
                         state=SessionState(session.status.state),
                         creation_time=datetime.fromtimestamp(session.status.creation_time / 1000, tz=timezone.utc),
                         pending=session.status.pending,
@@ -521,7 +517,6 @@ class Connection:
         if spec is not None:
             session_spec = SessionSpec(
                 application=spec.application,
-                slots=spec.slots,
                 common_data=spec.common_data,
                 min_instances=spec.min_instances,
                 max_instances=spec.max_instances,
@@ -545,7 +540,6 @@ class Connection:
                 connection=self,
                 id=response.metadata.id,
                 application=response.spec.application,
-                slots=response.spec.slots,
                 state=SessionState(response.status.state),
                 creation_time=datetime.fromtimestamp(response.status.creation_time / 1000, tz=timezone.utc),
                 pending=response.status.pending,
@@ -573,7 +567,6 @@ class Connection:
                 connection=self,
                 id=response.metadata.id,
                 application=response.spec.application,
-                slots=response.spec.slots,
                 state=SessionState(response.status.state),
                 creation_time=datetime.fromtimestamp(response.status.creation_time / 1000, tz=timezone.utc),
                 pending=response.status.pending,
@@ -601,7 +594,6 @@ class Connection:
                 connection=self,
                 id=response.metadata.id,
                 application=response.spec.application,
-                slots=response.spec.slots,
                 state=SessionState(response.status.state),
                 creation_time=datetime.fromtimestamp(response.status.creation_time / 1000, tz=timezone.utc),
                 pending=response.status.pending,
@@ -621,7 +613,6 @@ class Session:
     """Represents a computing session."""
     id: SessionID
     application: str
-    slots: int
     state: SessionState
     creation_time: datetime
     pending: int = 0
@@ -637,7 +628,6 @@ class Session:
         connection: Connection,
         id: SessionID,
         application: str,
-        slots: int,
         state: SessionState,
         creation_time: datetime,
         pending: int,
@@ -650,7 +640,6 @@ class Session:
         self.connection = connection
         self.id = id
         self.application = application
-        self.slots = slots
         self.state = state
         self.creation_time = creation_time
         self.pending = pending

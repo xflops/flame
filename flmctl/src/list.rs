@@ -20,7 +20,7 @@ use flame_rs as flame;
 use flame_rs::apis::{FlameContext, FlameError, SessionState};
 use flame_rs::client::{Connection, NodeState};
 
-use crate::utils::format_memory;
+use crate::utils::{format_memory, format_resreq};
 
 pub async fn run(
     ctx: &FlameContext,
@@ -77,7 +77,15 @@ async fn list_session(conn: Connection) -> Result<(), Box<dyn Error>> {
     let mut ssn_list = conn.list_session().await?;
     let mut table = Table::new();
     table.load_preset(NOTHING).set_header(vec![
-        "ID", "State", "App", "Slots", "Priority", "Pending", "Running", "Succeed", "Failed",
+        "ID",
+        "State",
+        "App",
+        "Resources",
+        "Priority",
+        "Pending",
+        "Running",
+        "Succeed",
+        "Failed",
         "Created",
     ]);
 
@@ -98,7 +106,7 @@ async fn list_session(conn: Connection) -> Result<(), Box<dyn Error>> {
             ssn.id.to_string(),
             ssn.state.to_string(),
             ssn.application.to_string(),
-            ssn.slots.to_string(),
+            format_resreq(&ssn.resreq),
             ssn.priority.to_string(),
             ssn.pending.to_string(),
             ssn.running.to_string(),
@@ -118,14 +126,13 @@ async fn list_executor(conn: Connection) -> Result<(), Box<dyn Error>> {
     let mut table = Table::new();
     table
         .load_preset(NOTHING)
-        .set_header(vec!["ID", "State", "Session", "Slots", "Node"]);
+        .set_header(vec!["ID", "State", "Session", "Node"]);
 
     for executor in &executor_list {
         table.add_row(vec![
             executor.id.to_string(),
             executor.state.to_string(),
             executor.session_id.clone().unwrap_or("-".to_string()),
-            executor.slots.to_string(),
             executor.node.to_string(),
         ]);
     }

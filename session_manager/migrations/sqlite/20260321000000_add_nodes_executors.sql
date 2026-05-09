@@ -24,12 +24,11 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE TABLE IF NOT EXISTS executors (
     id                  TEXT PRIMARY KEY,
     node                TEXT NOT NULL,
-    
+
     -- Resource requirements
     resreq_cpu          INTEGER NOT NULL DEFAULT 0,
     resreq_memory       INTEGER NOT NULL DEFAULT 0,
-    
-    slots               INTEGER NOT NULL DEFAULT 0,
+
     shim                INTEGER NOT NULL DEFAULT 0,
     
     task_id             INTEGER,

@@ -172,7 +172,6 @@ pub trait Engine: Send + Sync + 'static {
 - `state`: Enum (Idle, Bound, Running, etc.)
 - `session_id`: String (Nullable)
 - `task_id`: String (Nullable)
-- `slots`: Integer
 - `application`: String
 - `creation_time`: Timestamp (Unix epoch seconds)
 
@@ -210,8 +209,8 @@ CREATE TABLE IF NOT EXISTS executors (
     -- Resource requirements (flattened)
     resreq_cpu          INTEGER NOT NULL DEFAULT 0,
     resreq_memory       INTEGER NOT NULL DEFAULT 0,
-    
-    slots               INTEGER NOT NULL DEFAULT 0,
+    resreq_gpu          INTEGER NOT NULL DEFAULT 0,
+
     shim                INTEGER NOT NULL DEFAULT 0,
     
     task_id             INTEGER,

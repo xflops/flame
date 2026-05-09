@@ -149,7 +149,6 @@ impl TryFrom<(rpc::Application, rpc::Session)> for SessionContext {
         Ok(SessionContext {
             session_id: metadata.id,
             application,
-            slots: spec.slots,
             common_data: spec.common_data.map(CommonData::from),
         })
     }

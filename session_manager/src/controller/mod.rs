@@ -922,7 +922,7 @@ mod tests {
                 name: "test".to_string(),
                 endpoint: "http://localhost:8080".to_string(),
                 storage: url,
-                slot: ResourceRequirement::default(),
+                resreq: None,
                 policies: vec!["priority".to_string(), "gang".to_string()],
                 schedule_interval: 1000,
                 executors: FlameExecutors {

@@ -31,8 +31,6 @@ use flame_rs::{self as flame};
 struct Cli {
     #[arg(short, long)]
     app: Option<String>,
-    #[arg(short, long)]
-    slots: Option<u32>,
     #[arg(long)]
     task_num: Option<u32>,
     #[arg(long)]
@@ -40,7 +38,6 @@ struct Cli {
 }
 
 const DEFAULT_APP: &str = "pi-app";
-const DEFAULT_SLOTS: u32 = 1;
 const DEFAULT_TASK_NUM: u32 = 10;
 const DEFAULT_TASK_INPUT: u32 = 10000;
 
@@ -50,7 +47,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     let app = cli.app.unwrap_or(DEFAULT_APP.to_string());
-    let slots = cli.slots.unwrap_or(DEFAULT_SLOTS);
     let task_num = cli.task_num.unwrap_or(DEFAULT_TASK_NUM);
     let task_input = cli.task_input.unwrap_or(DEFAULT_TASK_INPUT);
 
@@ -66,7 +62,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .create_session(&SessionAttributes {
             id: format!("{app}-{}", stdng::rand::short_name()),
             application: app,
-            slots,
             common_data: None,
             min_instances: 0,
             max_instances: None,

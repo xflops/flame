@@ -41,7 +41,6 @@ mod tests {
             let attr = SessionAttributes {
                 id: format!("ssn-{}", i),
                 application: "test-app".to_string(),
-                slots: 1,
                 common_data: None,
                 min_instances: 1,
                 max_instances: None,
@@ -69,7 +68,6 @@ mod tests {
             let attr = SessionAttributes {
                 id: format!("ssn-{}", i),
                 application: "test-app".to_string(),
-                slots: 1,
                 common_data: None,
                 min_instances: 1,
                 max_instances: None,
@@ -101,7 +99,6 @@ mod tests {
             let attr = SessionAttributes {
                 id: format!("ssn-{}", i),
                 application: "test-app".to_string(),
-                slots: 1,
                 common_data: None,
                 min_instances: 1,
                 max_instances: None,
@@ -127,7 +124,6 @@ mod tests {
             let attr = SessionAttributes {
                 id: format!("ssn-{}", i),
                 application: "test-app".to_string(),
-                slots: 1,
                 common_data: None,
                 min_instances: 1,
                 max_instances: None,

@@ -204,11 +204,10 @@ impl SqliteEngine {
             ),
             None => (None, None, None),
         };
-        let sql = r#"INSERT INTO sessions (id, application, slots, common_data, creation_time, state, min_instances, max_instances, priority, resreq_cpu, resreq_memory, resreq_gpu)
+        let sql = r#"INSERT INTO sessions (id, application, common_data, creation_time, state, min_instances, max_instances, priority, resreq_cpu, resreq_memory, resreq_gpu)
             VALUES (
                 ?,
                 (SELECT name FROM applications WHERE name=? AND state=?),
-                ?,
                 ?,
                 ?,
                 ?,
@@ -224,7 +223,6 @@ impl SqliteEngine {
             .bind(attr.id.clone())
             .bind(attr.application)
             .bind(ApplicationState::Enabled as i32)
-            .bind(attr.slots)
             .bind(common_data)
             .bind(Utc::now().timestamp())
             .bind(SessionState::Open as i32)
@@ -996,9 +994,9 @@ impl Engine for SqliteEngine {
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
-        let sql = r#"INSERT INTO executors 
-            (id, node, resreq_cpu, resreq_memory, resreq_gpu, slots, shim, task_id, ssn_id, creation_time, state)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        let sql = r#"INSERT INTO executors
+            (id, node, resreq_cpu, resreq_memory, resreq_gpu, shim, task_id, ssn_id, creation_time, state)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING *"#;
 
         let dao: ExecutorDao = sqlx::query_as(sql)
@@ -1007,7 +1005,6 @@ impl Engine for SqliteEngine {
             .bind(executor.resreq.cpu as i64)
             .bind(executor.resreq.memory as i64)
             .bind(executor.resreq.gpu as i64)
-            .bind(executor.slots as i64)
             .bind(i32::from(executor.shim))
             .bind(executor.task_id)
             .bind(&executor.ssn_id)
@@ -1057,8 +1054,8 @@ impl Engine for SqliteEngine {
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
-        let sql = r#"UPDATE executors 
-            SET node=?, resreq_cpu=?, resreq_memory=?, resreq_gpu=?, slots=?, shim=?, 
+        let sql = r#"UPDATE executors
+            SET node=?, resreq_cpu=?, resreq_memory=?, resreq_gpu=?, shim=?,
                 task_id=?, ssn_id=?, state=?
             WHERE id=?
             RETURNING *"#;
@@ -1068,7 +1065,6 @@ impl Engine for SqliteEngine {
             .bind(executor.resreq.cpu as i64)
             .bind(executor.resreq.memory as i64)
             .bind(executor.resreq.gpu as i64)
-            .bind(executor.slots as i64)
             .bind(i32::from(executor.shim))
             .bind(executor.task_id)
             .bind(&executor.ssn_id)
@@ -1192,7 +1188,6 @@ mod tests {
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,
@@ -1298,7 +1293,6 @@ mod tests {
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,
@@ -1612,7 +1606,6 @@ mod tests {
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,
@@ -1666,7 +1659,6 @@ mod tests {
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,
@@ -1703,7 +1695,6 @@ mod tests {
         let ssn_2 = tokio_test::block_on(storage.create_session(SessionAttributes {
             id: ssn_2_id.clone(),
             application: "flmping".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,
@@ -1758,7 +1749,6 @@ mod tests {
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,
@@ -1800,7 +1790,6 @@ mod tests {
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,
@@ -1834,7 +1823,6 @@ mod tests {
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,
@@ -1877,7 +1865,6 @@ mod tests {
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,

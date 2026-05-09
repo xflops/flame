@@ -185,7 +185,6 @@ impl Engine for NoneEngine {
         Ok(Session {
             id: attr.id,
             application: attr.application,
-            slots: attr.slots,
             common_data: attr.common_data,
             min_instances: attr.min_instances,
             max_instances: attr.max_instances,
@@ -351,7 +350,6 @@ mod tests {
         let attr = SessionAttributes {
             id: "test-session".to_string(),
             application: "test-app".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 1,
             max_instances: None,
@@ -390,7 +388,6 @@ mod tests {
         let attr = SessionAttributes {
             id: "test-session".to_string(),
             application: "test-app".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 1,
             max_instances: None,
@@ -426,7 +423,6 @@ mod tests {
         let attr1 = SessionAttributes {
             id: "session-1".to_string(),
             application: "test-app".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 1,
             max_instances: None,
@@ -439,7 +435,6 @@ mod tests {
         let attr2 = SessionAttributes {
             id: "session-2".to_string(),
             application: "test-app".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 1,
             max_instances: None,
@@ -475,7 +470,6 @@ mod tests {
         let attr = SessionAttributes {
             id: "test-session".to_string(),
             application: "test-app".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 1,
             max_instances: None,

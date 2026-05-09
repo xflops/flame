@@ -30,7 +30,6 @@ pub struct Executor {
     pub id: String,
     pub resreq: ResourceRequirement,
     pub node: String,
-    pub slots: u32,
     /// Supported shim type from executor-manager config.
     /// This indicates what type of shim this executor supports (Host or Wasm).
     pub shim: Shim,
@@ -80,7 +79,6 @@ impl TryFrom<&rpc::Executor> for Executor {
             id: metadata.id.clone(),
             resreq: resreq.into(),
             node: spec.node.clone(),
-            slots: spec.slots,
             shim: Shim::from(spec.shim()), // Get shim from spec
             session: None,
             task: None,
@@ -106,7 +104,6 @@ impl From<&Executor> for rpc::Executor {
 
         let spec = Some(ExecutorSpec {
             resreq: Some(e.resreq.clone().into()),
-            slots: e.slots,
             node: e.node.clone(),
             shim: rpc::Shim::from(e.shim).into(), // Include shim in spec
         });

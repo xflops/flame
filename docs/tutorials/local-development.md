@@ -220,7 +220,7 @@ The default configuration is generated at `/tmp/flame-dev/conf/flame-cluster.yam
 cluster:
   name: flame
   endpoint: "http://127.0.0.1:8080"
-  slot: "cpu=1,mem=2g"
+  resreq: "cpu=1,mem=2g"
   policy: proportion
   storage: "sqlite:///tmp/flame-dev/data/sessions.db"
 executors:

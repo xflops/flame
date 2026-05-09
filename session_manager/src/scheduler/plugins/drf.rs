@@ -27,14 +27,12 @@ struct DRFSessionInfo {
     pub id: SessionID,
     pub allocated: ResourceRequirement,
     pub dominant_share: f64,
-    pub slots: u32,
 }
 
 pub struct DRFPlugin {
     total: ResourceRequirement,
     ssn_map: HashMap<SessionID, DRFSessionInfo>,
     node_allocations: HashMap<String, ResourceRequirement>,
-    unit: ResourceRequirement,
 }
 
 impl DRFPlugin {
@@ -43,7 +41,6 @@ impl DRFPlugin {
             total: ResourceRequirement::default(),
             ssn_map: HashMap::new(),
             node_allocations: HashMap::new(),
-            unit: ResourceRequirement::default(),
         })
     }
 
@@ -70,10 +67,13 @@ impl DRFPlugin {
         dominant
     }
 
+    /// After the slots-cleanup refactor, every session's `resreq` is populated
+    /// by `resolve_session_resreq` server-side, so this is just a `.clone()` of
+    /// the explicit value. The `expect` documents that invariant.
     fn get_session_resreq(&self, ssn: &SessionInfoPtr) -> ResourceRequirement {
         ssn.resreq
             .clone()
-            .unwrap_or_else(|| ResourceRequirement::new(ssn.slots, &self.unit))
+            .expect("SessionInfo.resreq must be populated by resolve_session_resreq")
     }
 }
 
@@ -86,7 +86,6 @@ impl Plugin for DRFPlugin {
         self.ssn_map.clear();
         self.node_allocations.clear();
         self.total = ResourceRequirement::default();
-        self.unit = ss.unit.clone();
 
         let nodes = ss.find_nodes(ALL_NODE)?;
         for node in nodes.values() {
@@ -129,15 +128,18 @@ impl Plugin for DRFPlugin {
         let sessions = ss.find_sessions(OPEN_SESSION)?;
         for ssn in sessions.values() {
             let ssn_id = ssn.id.clone();
-            let entry = self
+            let _ = self
                 .ssn_map
                 .entry(ssn_id.clone())
                 .or_insert_with(|| DRFSessionInfo {
                     id: ssn.id.clone(),
                     ..Default::default()
                 });
-            entry.slots = ssn.slots;
-            let allocated_clone = entry.allocated.clone();
+            let allocated_clone = self
+                .ssn_map
+                .get(&ssn_id)
+                .map(|e| e.allocated.clone())
+                .unwrap_or_default();
             let dominant_share = self.calculate_dominant_share(&allocated_clone);
             if let Some(entry) = self.ssn_map.get_mut(&ssn_id) {
                 entry.dominant_share = dominant_share;

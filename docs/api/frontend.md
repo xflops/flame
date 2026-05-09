@@ -114,7 +114,7 @@ Creates a new session for task execution.
 ```python
 session = flamepy.create_session(
     application="my-app",
-    slots=1,
+    resreq={"cpu": 1, "mem": "1g"},  # optional; falls back to cluster.resreq
     min_instances=2,
     max_instances=10,
     batch_size=1

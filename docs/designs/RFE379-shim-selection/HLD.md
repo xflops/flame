@@ -58,7 +58,9 @@ message ApplicationSpec {
 message ExecutorSpec {
   string node = 1;
   ResourceRequirement resreq = 2;
-  uint32 slots = 3;
+  // Field number 3 (slots) reserved — removed in the slots-cleanup refactor; do not reuse.
+  reserved 3;
+  reserved "slots";
   Shim shim = 4;  // NEW: Supported shim type reported by executor
 }
 ```
@@ -251,7 +253,6 @@ The executor already has access to shim via `FlameClusterContext`. For RPC, we a
 let spec = ExecutorSpec {
     node: node_name,
     resreq: resource_requirement,
-    slots: slots,
     shim: self.context.executors.shim,  // NEW
 };
 ```

@@ -29,7 +29,7 @@ def sample_event():
 def sample_session_attrs():
     from flamepy.core.types import SessionAttributes
 
-    return SessionAttributes(application="test-app", slots=1)
+    return SessionAttributes(application="test-app")
 
 
 @pytest.fixture

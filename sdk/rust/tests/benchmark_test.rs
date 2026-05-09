@@ -102,7 +102,6 @@ async fn run_session(
     let ssn_attr = SessionAttributes {
         id: format!("benchmark-ssn-{}", session_id),
         application: FLAME_APP.to_string(),
-        slots: 1,
         common_data: None,
         min_instances: 0,
         max_instances: None,
@@ -216,7 +215,6 @@ async fn benchmark_gang_scheduling_no_partial_start() -> Result<(), FlameError> 
     let ssn_attr = SessionAttributes {
         id: format!("gang-test-{}", stdng::rand::short_name()),
         application: FLAME_APP.to_string(),
-        slots: 1,
         common_data: None,
         min_instances: 0,
         max_instances: None,

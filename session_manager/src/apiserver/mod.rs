@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tonic::transport::Server;
 
+use common::apis::ResourceRequirement;
 use common::ctx::FlameClusterContext;
 use rpc::flame::v1::backend_server::BackendServer;
 use rpc::flame::v1::frontend_server::FrontendServer;
@@ -30,6 +31,11 @@ const ALL_HOST_ADDRESS: &str = "0.0.0.0";
 
 pub struct Flame {
     controller: ControllerPtr,
+    /// Cluster-wide default `resreq` (from `cluster.resreq`
+    /// in `flame-cluster.yaml`), used by the frontend when a session spec
+    /// supplies no explicit `resreq`. The backend service does not need this
+    /// — it is always `None` for the backend `Flame` instance.
+    cluster_default_resreq: Option<ResourceRequirement>,
 }
 
 pub fn new_frontend(controller: ControllerPtr) -> Arc<dyn FlameThread> {
@@ -62,6 +68,7 @@ impl FlameThread for FrontendRunner {
 
         let frontend_service = Flame {
             controller: self.controller.clone(),
+            cluster_default_resreq: ctx.cluster.resreq.clone(),
         };
 
         let mut builder = Server::builder().tcp_keepalive(Some(Duration::from_secs(1)));
@@ -106,6 +113,9 @@ impl FlameThread for BackendRunner {
 
         let backend_service = Flame {
             controller: self.controller.clone(),
+            // Backend never resolves session resreq — it serves executor-side
+            // RPCs only. Always `None` here.
+            cluster_default_resreq: None,
         };
 
         let mut builder = Server::builder().tcp_keepalive(Some(Duration::from_secs(1)));

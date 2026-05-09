@@ -112,7 +112,6 @@ pub struct Connection {
 pub struct SessionAttributes {
     pub id: SessionID,
     pub application: String,
-    pub slots: u32,
     #[serde(with = "serde_message")]
     pub common_data: Option<CommonData>,
     pub min_instances: u32,
@@ -194,6 +193,16 @@ impl From<&ResourceRequirement> for rpc::ResourceRequirement {
     }
 }
 
+impl From<rpc::ResourceRequirement> for ResourceRequirement {
+    fn from(r: rpc::ResourceRequirement) -> Self {
+        Self {
+            cpu: r.cpu,
+            memory: r.memory,
+            gpu: r.gpu,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ApplicationSchema {
     pub input: Option<String>,
@@ -235,7 +244,6 @@ pub struct Executor {
     pub id: String,
     pub state: ExecutorState,
     pub session_id: Option<String>,
-    pub slots: u32,
     pub node: String,
 }
 
@@ -264,7 +272,6 @@ pub struct Session {
     pub(crate) client: Option<FlameClient>,
 
     pub id: SessionID,
-    pub slots: u32,
     pub application: String,
     #[serde(with = "serde_utc")]
     pub creation_time: DateTime<Utc>,
@@ -278,6 +285,8 @@ pub struct Session {
     pub events: Vec<Event>,
     pub tasks: Option<Vec<Task>>,
     pub priority: u32,
+    #[serde(default)]
+    pub resreq: Option<ResourceRequirement>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -328,7 +337,6 @@ impl Connection {
             session_id: attrs.id.clone(),
             session: Some(SessionSpec {
                 application: attrs.application.clone(),
-                slots: attrs.slots,
                 common_data: attrs.common_data.clone().map(CommonData::into),
                 min_instances: attrs.min_instances,
                 max_instances: attrs.max_instances,
@@ -379,7 +387,6 @@ impl Connection {
     ) -> Result<Session, FlameError> {
         let session_spec = spec.map(|attrs| SessionSpec {
             application: attrs.application.clone(),
-            slots: attrs.slots,
             common_data: attrs.common_data.clone().map(CommonData::into),
             min_instances: attrs.min_instances,
             max_instances: attrs.max_instances,
@@ -726,7 +733,6 @@ impl TryFrom<&rpc::Session> for Session {
         Ok(Session {
             client: None,
             id: metadata.id,
-            slots: spec.slots,
             application: spec.application,
             creation_time,
             state: SessionState::try_from(status.state).unwrap_or(SessionState::default()),
@@ -737,6 +743,7 @@ impl TryFrom<&rpc::Session> for Session {
             events,
             tasks: None,
             priority: spec.priority,
+            resreq: spec.resreq.map(ResourceRequirement::from),
         })
     }
 }
@@ -883,7 +890,6 @@ impl TryFrom<&rpc::Executor> for Executor {
         Ok(Executor {
             id: metadata.id,
             session_id: status.session_id,
-            slots: spec.slots,
             node: spec.node,
             state,
         })
@@ -1017,7 +1023,6 @@ mod tests {
             }),
             spec: Some(rpc::SessionSpec {
                 application: "app".to_string(),
-                slots: 1,
                 common_data: None,
                 min_instances: 0,
                 max_instances: None,
@@ -1040,6 +1045,65 @@ mod tests {
 
         let parsed = Session::try_from(&rpc_session).expect("Session::try_from should succeed");
         assert_eq!(parsed.creation_time, expected);
+    }
+
+    /// Verifies that `From<rpc::ResourceRequirement> for ResourceRequirement`
+    /// preserves all fields when converting from the wire type into the SDK type.
+    #[test]
+    fn resource_requirement_from_rpc_preserves_fields() {
+        let rpc_rr = rpc::ResourceRequirement {
+            cpu: 4,
+            memory: 16 * 1024 * 1024 * 1024,
+            gpu: 2,
+        };
+        let sdk_rr = ResourceRequirement::from(rpc_rr);
+        assert_eq!(sdk_rr.cpu, 4);
+        assert_eq!(sdk_rr.memory, 16 * 1024 * 1024 * 1024);
+        assert_eq!(sdk_rr.gpu, 2);
+    }
+
+    /// Verifies that `Session::try_from` extracts the optional `resreq` from
+    /// the RPC `SessionSpec` so the CLI can display per-session resource
+    /// requirements end-to-end.
+    #[test]
+    fn session_try_from_extracts_resreq() {
+        let when = Utc.with_ymd_and_hms(2026, 5, 8, 10, 0, 0).unwrap();
+        let rpc_session = rpc::Session {
+            metadata: Some(rpc::Metadata {
+                id: "ssn-1".to_string(),
+                name: String::new(),
+            }),
+            spec: Some(rpc::SessionSpec {
+                application: "app".to_string(),
+                common_data: None,
+                min_instances: 0,
+                max_instances: None,
+                batch_size: 1,
+                priority: 0,
+                resreq: Some(rpc::ResourceRequirement {
+                    cpu: 8,
+                    memory: 32 * 1024 * 1024 * 1024,
+                    gpu: 1,
+                }),
+            }),
+            status: Some(rpc::SessionStatus {
+                state: rpc::SessionState::Open as i32,
+                creation_time: when.timestamp_millis(),
+                completion_time: None,
+                pending: 0,
+                running: 0,
+                succeed: 0,
+                failed: 0,
+                cancelled: 0,
+                events: vec![],
+            }),
+        };
+
+        let parsed = Session::try_from(&rpc_session).expect("Session::try_from should succeed");
+        let resreq = parsed.resreq.expect("resreq should be populated");
+        assert_eq!(resreq.cpu, 8);
+        assert_eq!(resreq.memory, 32 * 1024 * 1024 * 1024);
+        assert_eq!(resreq.gpu, 1);
     }
 
     /// Regression test for `Application::try_from` creation_time parsing.

@@ -305,7 +305,6 @@ mod tests {
                 url: None,
                 installer: None,
             },
-            slots: 1,
             common_data: None,
         };
 

@@ -35,7 +35,7 @@ Similar to Rust client, it's time to connect to the Flame cluster and create a s
 
 ```python
 conn = flame.connect("127.0.0.1:8080")
-ssn = conn.create_session(application="pi", slots=1)
+ssn = conn.create_session(application="pi", resreq={"cpu": 1, "mem": "1g"})
 ```
 
 ### Run sample tasks

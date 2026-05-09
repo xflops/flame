@@ -31,13 +31,15 @@ message SessionStatus {
 
 message SessionSpec {
   string application = 2;
-  uint32 slots = 3;
+  // Field number 3 (slots) reserved — removed in slots-cleanup refactor; do not reuse.
+  reserved 3;
+  reserved "slots";
   optional bytes common_data = 4;
   uint32 min_instances = 5;  // Minimum number of instances (default: 0)
   optional uint32 max_instances = 6;  // Maximum number of instances (null means unlimited)
   uint32 batch_size = 7;  // Number of executors per batch for gang scheduling (default: 1)
   uint32 priority = 8;  // Session priority (default: 0 = lowest)
-  optional ResourceRequirement resreq = 9;  // Explicit resource request (mutually exclusive with slots)
+  optional ResourceRequirement resreq = 9;  // Explicit resource request; if absent, server applies cluster default
 }
 
 message Session {
@@ -127,7 +129,9 @@ message Application {
 message ExecutorSpec {
   string node = 1;
   ResourceRequirement resreq = 2;
-  uint32 slots = 3;
+  // Field number 3 (slots) reserved — removed in slots-cleanup refactor; do not reuse.
+  reserved 3;
+  reserved "slots";
   Shim shim = 4;  // Supported shim type reported by executor
 }
 

@@ -67,7 +67,6 @@ pub struct ApplicationDao {
 pub struct SessionDao {
     pub id: SessionID,
     pub application: String,
-    pub slots: i64,
     pub version: u32,
 
     pub common_data: Option<Vec<u8>>,
@@ -128,7 +127,6 @@ pub struct ExecutorDao {
     pub resreq_memory: i64,
     pub resreq_gpu: i64,
 
-    pub slots: i64,
     pub shim: i32,
 
     pub task_id: Option<TaskID>,
@@ -154,7 +152,6 @@ impl TryFrom<&SessionDao> for Session {
         Ok(Self {
             id: ssn.id.clone(),
             application: ssn.application.clone(),
-            slots: ssn.slots as u32,
             version: ssn.version,
             common_data: ssn.common_data.clone().map(Bytes::from),
             creation_time: DateTime::<Utc>::from_timestamp(ssn.creation_time, 0)
@@ -368,7 +365,6 @@ impl TryFrom<&ExecutorDao> for Executor {
                 memory: dao.resreq_memory as u64,
                 gpu: dao.resreq_gpu as i32,
             },
-            slots: dao.slots as u32,
             shim: Shim::try_from(dao.shim).unwrap_or_default(),
             task_id: dao.task_id,
             ssn_id: dao.ssn_id.clone(),
@@ -395,7 +391,6 @@ impl From<&Executor> for ExecutorDao {
             resreq_cpu: exec.resreq.cpu as i64,
             resreq_memory: exec.resreq.memory as i64,
             resreq_gpu: exec.resreq.gpu as i64,
-            slots: exec.slots as i64,
             shim: i32::from(exec.shim),
             task_id: exec.task_id,
             ssn_id: exec.ssn_id.clone(),

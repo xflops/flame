@@ -141,7 +141,6 @@ class SessionAttributes:
     """Attributes for creating a session."""
 
     application: str
-    slots: int = 0
     id: Optional[str] = None
     common_data: Any = None
     min_instances: int = 0

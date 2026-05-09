@@ -36,14 +36,14 @@ def test_enums_and_flame_error():
 
 def test_dataclass_defaults_and_instantiation():
     t = Event(code=1)
-    sa = SessionAttributes(application="app", slots=2)
+    sa = SessionAttributes(application="app")
     ap_schema = ApplicationSchema()
     ap_attrs = ApplicationAttributes()
     dt = datetime.now(timezone.utc)
     task = Task(id="tid", session_id="sid", state=TaskState.PENDING, creation_time=dt)
     app = Application(id="aid", name="n", state=ApplicationState.ENABLED, creation_time=dt)
     assert t.code == 1
-    assert sa.application == "app" and sa.slots == 2
+    assert sa.application == "app"
     assert ap_schema.input is None
     assert ap_attrs.image is None
     assert task.input is None
@@ -120,7 +120,6 @@ def test_session_attributes_with_resreq():
     rr = ResourceRequirement(cpu=4, memory=8 * 1024**3, gpu=1)
     sa = SessionAttributes(application="test-app", resreq=rr)
     assert sa.application == "test-app"
-    assert sa.slots == 0  # default when resreq is used
     assert sa.resreq is not None
     assert sa.resreq.cpu == 4
     assert sa.resreq.memory == 8 * 1024**3
@@ -128,10 +127,13 @@ def test_session_attributes_with_resreq():
 
 
 def test_session_attributes_without_resreq():
-    """Test SessionAttributes without resource requirements (uses slots)."""
-    sa = SessionAttributes(application="test-app", slots=4)
+    """Test SessionAttributes without resource requirements.
+
+    With slots fully removed, an unset `resreq` is the supported way to defer
+    to the server-side cluster default / hardcoded fallback.
+    """
+    sa = SessionAttributes(application="test-app")
     assert sa.application == "test-app"
-    assert sa.slots == 4
     assert sa.resreq is None
 
 
