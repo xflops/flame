@@ -1,4 +1,4 @@
-# Flame: A Distributed System for Agentic AI
+# Flame: A Distributed Engine for AI
 
 [![license](https://img.shields.io/github/license/xflops/flame)](http://github.com/xflops/flame)
 [![RepoSize](https://img.shields.io/github/repo-size/xflops/flame)](http://github.com/xflops/flame)
@@ -6,11 +6,11 @@
 [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/7299/badge)](https://bestpractices.coreinfrastructure.org/projects/7299)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/xflops/flame)
 
-Flame is a distributed system designed for Agentic AI, providing a comprehensive suite of mechanisms commonly required by various classes of Agentic AI workloads, including tools, Agent, and more. Built upon over a decade and a half of experience running diverse high-performance workloads at scale across multiple systems and platforms, Flame incorporates best-of-breed ideas and practices from the open source community.
+Flame is a distributed engine for AI, providing a comprehensive suite of mechanisms commonly required by various classes of AI workloads, including agents, reinforcement learning, and more. Built upon over a decade and a half of experience running diverse high-performance workloads at scale across multiple systems and platforms, Flame incorporates best-of-breed ideas and practices from the open source community.
 
 ## Motivation
 
-As Agentic AI become increasingly adopted for innovation, a common workload runtime is essential to accelerate these elastic workloads through the following key aspects:
+As AI workloads become increasingly adopted for innovation, a common runtime is essential to accelerate these elastic workloads through the following key aspects:
 
 * **Scale**: Unlike applications running on a single node, Flame scales workloads across multiple nodes to maximize performance acceleration while ensuring fair resource sharing across multiple tenants and sessions.
 * **Performance**: Elastic workloads typically involve tens of thousands of short tasks. Flame leverages cutting-edge features to improve roundtrip times and throughput in large-scale environments, while intelligently sharing runtime within sessions to minimize startup time.
