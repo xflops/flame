@@ -1,4 +1,4 @@
-# Flame: A distributed engine for AI
+# Flame: A Distributed Engine for AI
 
 [![license](https://img.shields.io/github/license/xflops/flame)](http://github.com/xflops/flame)
 [![RepoSize](https://img.shields.io/github/repo-size/xflops/flame)](http://github.com/xflops/flame)
@@ -10,7 +10,7 @@ Flame is a distributed engine for AI, providing a comprehensive suite of mechani
 
 ## Motivation
 
-As AI workloads become increasingly adopted for innovation, a common workload runtime is essential to accelerate these elastic workloads through the following key aspects:
+As AI workloads become increasingly adopted for innovation, a common runtime is essential to accelerate these elastic workloads through the following key aspects:
 
 * **Scale**: Unlike applications running on a single node, Flame scales workloads across multiple nodes to maximize performance acceleration while ensuring fair resource sharing across multiple tenants and sessions.
 * **Performance**: Elastic workloads typically involve tens of thousands of short tasks. Flame leverages cutting-edge features to improve roundtrip times and throughput in large-scale environments, while intelligently sharing runtime within sessions to minimize startup time.

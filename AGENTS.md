@@ -1,4 +1,4 @@
-# Flame – A distributed engine for AI
+# Flame: A Distributed Engine for AI
 
 Repo: https://github.com/xflops-io/flame
 
