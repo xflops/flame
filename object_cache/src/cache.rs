@@ -1285,7 +1285,11 @@ pub async fn run(cache_config: &FlameCache) -> Result<(), FlameError> {
     }
 
     builder
-        .add_service(FlightServiceServer::new(server))
+        .add_service(
+            FlightServiceServer::new(server)
+                .max_decoding_message_size(usize::MAX)
+                .max_encoding_message_size(usize::MAX),
+        )
         .serve(addr)
         .await
         .map_err(|e| FlameError::Internal(format!("Server error: {}", e)))?;

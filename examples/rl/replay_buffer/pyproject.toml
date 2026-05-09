@@ -1,0 +1,16 @@
+[project]
+name = "replay-buffer"
+version = "0.1.0"
+description = "Distributed Replay Buffer Example using Flame's patch_object API"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "gymnasium",
+]
+
+[dependency-groups]
+dev = ["flamepy"]
+
+[tool.setuptools]
+py-modules = ["main", "replay_buffer", "collector"]

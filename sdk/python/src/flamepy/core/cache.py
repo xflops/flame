@@ -265,16 +265,22 @@ def _normalize_endpoint(endpoint: str) -> str:
     return endpoint
 
 
+GRPC_OPTIONS = [
+    ("grpc.max_send_message_length", -1),
+    ("grpc.max_receive_message_length", -1),
+]
+
+
 def _create_flight_client(location: str, tls_config: Optional[FlameClientTls] = None) -> flight.FlightClient:
     if location.startswith("grpc+tls://"):
         if tls_config and tls_config.ca_file:
             with open(tls_config.ca_file, "rb") as f:
                 root_certs = f.read()
-            return flight.FlightClient(location, tls_root_certs=root_certs)
+            return flight.FlightClient(location, tls_root_certs=root_certs, generic_options=GRPC_OPTIONS)
         else:
-            return flight.FlightClient(location)
+            return flight.FlightClient(location, generic_options=GRPC_OPTIONS)
     else:
-        return flight.FlightClient(location)
+        return flight.FlightClient(location, generic_options=GRPC_OPTIONS)
 
 
 def _remove_stale_client(location: str) -> None:
