@@ -1,6 +1,8 @@
 import threading
 
 import bson
+import numpy as np
+import pyarrow as pa
 
 from flamepy.core.cache import (
     Object,
@@ -8,8 +10,16 @@ from flamepy.core.cache import (
     ObjectRef,
     _cache_lock,
     _deserialize_object,
+    _deserialize_object_data,
+    _MAGIC_PREFIX_LEN,
     _object_cache,
     _serialize_object,
+    _serialize_object_data,
+    _TYPE_ARROW_ARRAY,
+    _TYPE_ARROW_BATCH,
+    _TYPE_ARROW_TABLE,
+    _TYPE_CLOUDPICKLE,
+    _TYPE_NUMPY,
     delete_objects,
 )
 
@@ -40,6 +50,140 @@ class TestSerialization:
             batch = _serialize_object(original)
             result = _deserialize_object(batch)
             assert result == original
+
+
+class TestFastPathSerialization:
+    def test_numpy_array_uses_fast_path(self):
+        arr = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float64)
+        data = _serialize_object_data(arr)
+
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_NUMPY
+        result = _deserialize_object_data(data)
+        np.testing.assert_array_equal(result, arr)
+
+    def test_numpy_array_various_dtypes(self):
+        test_cases = [
+            np.array([1, 2, 3], dtype=np.int32),
+            np.array([1.5, 2.5, 3.5], dtype=np.float32),
+            np.array([1, 2, 3], dtype=np.int64),
+            np.array([[1, 2], [3, 4]], dtype=np.float64),
+            np.zeros((10, 10, 3), dtype=np.uint8),
+        ]
+
+        for original in test_cases:
+            data = _serialize_object_data(original)
+            assert data[:_MAGIC_PREFIX_LEN] == _TYPE_NUMPY
+            result = _deserialize_object_data(data)
+            np.testing.assert_array_equal(result, original)
+            assert result.dtype == original.dtype
+
+    def test_numpy_large_array_performance(self):
+        import time
+
+        large_arr = np.random.rand(1000, 1000)
+
+        start = time.perf_counter()
+        data = _serialize_object_data(large_arr)
+        serialize_time = time.perf_counter() - start
+
+        start = time.perf_counter()
+        result = _deserialize_object_data(data)
+        deserialize_time = time.perf_counter() - start
+
+        np.testing.assert_array_almost_equal(result, large_arr)
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_NUMPY
+        assert serialize_time < 0.5
+        assert deserialize_time < 0.5
+
+    def test_pyarrow_table_uses_fast_path(self):
+        table = pa.table({"col1": [1, 2, 3], "col2": ["a", "b", "c"]})
+        data = _serialize_object_data(table)
+
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_ARROW_TABLE
+        result = _deserialize_object_data(data)
+        assert result.equals(table)
+
+    def test_pyarrow_record_batch_uses_fast_path(self):
+        batch = pa.RecordBatch.from_pydict({"x": [1, 2, 3], "y": [4.0, 5.0, 6.0]})
+        data = _serialize_object_data(batch)
+
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_ARROW_BATCH
+        result = _deserialize_object_data(data)
+        assert result.equals(batch)
+
+    def test_pyarrow_array_uses_fast_path(self):
+        arr = pa.array([1, 2, 3, 4, 5])
+        data = _serialize_object_data(arr)
+
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_ARROW_ARRAY
+        result = _deserialize_object_data(data)
+        assert result.equals(arr)
+
+    def test_pyarrow_chunked_array_uses_cloudpickle(self):
+        chunked = pa.chunked_array([[1, 2], [3, 4]])
+        data = _serialize_object_data(chunked)
+
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_CLOUDPICKLE
+        result = _deserialize_object_data(data)
+        assert result.equals(chunked)
+
+    def test_dict_uses_cloudpickle(self):
+        obj = {"key": "value", "number": 42}
+        data = _serialize_object_data(obj)
+
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_CLOUDPICKLE
+        result = _deserialize_object_data(data)
+        assert result == obj
+
+    def test_list_uses_cloudpickle(self):
+        obj = [1, 2, 3, "mixed", {"nested": True}]
+        data = _serialize_object_data(obj)
+
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_CLOUDPICKLE
+        result = _deserialize_object_data(data)
+        assert result == obj
+
+    def test_full_roundtrip_via_record_batch(self):
+        test_cases = [
+            np.array([1.0, 2.0, 3.0]),
+            pa.table({"a": [1, 2, 3]}),
+            pa.array([10, 20, 30]),
+            {"python": "dict"},
+            [1, 2, 3],
+        ]
+
+        for original in test_cases:
+            batch = _serialize_object(original)
+            result = _deserialize_object(batch)
+
+            if isinstance(original, np.ndarray):
+                np.testing.assert_array_equal(result, original)
+            elif isinstance(original, (pa.Table, pa.Array)):
+                assert result.equals(original)
+            else:
+                assert result == original
+
+    def test_non_contiguous_numpy_array_uses_cloudpickle(self):
+        arr = np.array([[1, 2, 3], [4, 5, 6]])
+        non_contiguous = arr[:, ::2]
+        assert not non_contiguous.flags.c_contiguous
+        assert not non_contiguous.flags.f_contiguous
+
+        data = _serialize_object_data(non_contiguous)
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_CLOUDPICKLE
+
+        result = _deserialize_object_data(data)
+        np.testing.assert_array_equal(result, non_contiguous)
+
+    def test_fortran_contiguous_array_uses_fast_path(self):
+        arr = np.asfortranarray([[1, 2], [3, 4], [5, 6]])
+        assert arr.flags.f_contiguous
+
+        data = _serialize_object_data(arr)
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_NUMPY
+
+        result = _deserialize_object_data(data)
+        np.testing.assert_array_equal(result, arr)
 
 
 class TestClientSideCaching:

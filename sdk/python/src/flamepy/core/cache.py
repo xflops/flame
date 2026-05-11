@@ -17,7 +17,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import bson
 import cloudpickle
@@ -25,6 +25,28 @@ import pyarrow as pa
 import pyarrow.flight as flight
 
 from flamepy.core.types import FlameClientCache, FlameClientTls, FlameContext
+
+if TYPE_CHECKING:
+    import numpy as np
+
+# Magic prefix for fast-path serialization format identification.
+# Using "FLM" + version byte to avoid collision with pickle protocol headers.
+# Pickle protocols start with \x80 (protocol 2+) or opcodes like \x28, \x5d, etc.
+_MAGIC_PREFIX = b"FLM"
+_TYPE_CLOUDPICKLE = b"FLM\x00"
+_TYPE_NUMPY = b"FLM\x01"
+_TYPE_ARROW_TABLE = b"FLM\x02"
+_TYPE_ARROW_ARRAY = b"FLM\x03"
+_TYPE_ARROW_BATCH = b"FLM\x04"
+_MAGIC_PREFIX_LEN = len(_MAGIC_PREFIX) + 1  # 4 bytes total
+
+try:
+    import numpy as np
+
+    _HAS_NUMPY = True
+except ImportError:
+    np = None  # type: ignore[assignment]
+    _HAS_NUMPY = False
 
 logger = logging.getLogger(__name__)
 
@@ -195,19 +217,137 @@ class ObjectKey:
         return self.to_key() or self.to_prefix()
 
 
+def _serialize_numpy(arr: "np.ndarray") -> bytes:
+    """Serialize numpy array using Arrow's zero-copy tensor format."""
+    tensor = pa.Tensor.from_numpy(arr)
+    sink = pa.BufferOutputStream()
+    sink.write(_TYPE_NUMPY)
+    pa.ipc.write_tensor(tensor, sink)
+    return sink.getvalue().to_pybytes()
+
+
+def _deserialize_numpy(data: bytes) -> "np.ndarray":
+    """Deserialize numpy array from Arrow tensor format."""
+    reader = pa.BufferReader(data)
+    tensor = pa.ipc.read_tensor(reader)
+    return tensor.to_numpy()
+
+
+def _serialize_arrow_table(table: pa.Table) -> bytes:
+    """Serialize PyArrow Table using IPC stream format."""
+    sink = pa.BufferOutputStream()
+    sink.write(_TYPE_ARROW_TABLE)
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    return sink.getvalue().to_pybytes()
+
+
+def _deserialize_arrow_table(data: bytes) -> pa.Table:
+    """Deserialize PyArrow Table from IPC stream format."""
+    reader = pa.ipc.open_stream(pa.BufferReader(data))
+    return reader.read_all()
+
+
+def _serialize_arrow_batch(batch: pa.RecordBatch) -> bytes:
+    """Serialize PyArrow RecordBatch using IPC stream format."""
+    sink = pa.BufferOutputStream()
+    sink.write(_TYPE_ARROW_BATCH)
+    with pa.ipc.new_stream(sink, batch.schema) as writer:
+        writer.write_batch(batch)
+    return sink.getvalue().to_pybytes()
+
+
+def _deserialize_arrow_batch(data: bytes) -> pa.RecordBatch:
+    """Deserialize PyArrow RecordBatch from IPC stream format."""
+    reader = pa.ipc.open_stream(pa.BufferReader(data))
+    return reader.read_next_batch()
+
+
+def _serialize_arrow_array(arr: pa.Array) -> bytes:
+    """Serialize PyArrow Array by wrapping in a RecordBatch."""
+    batch = pa.RecordBatch.from_arrays([arr], names=["data"])
+    sink = pa.BufferOutputStream()
+    sink.write(_TYPE_ARROW_ARRAY)
+    with pa.ipc.new_stream(sink, batch.schema) as writer:
+        writer.write_batch(batch)
+    return sink.getvalue().to_pybytes()
+
+
+def _deserialize_arrow_array(data: bytes) -> pa.Array:
+    """Deserialize PyArrow Array from IPC stream format."""
+    reader = pa.ipc.open_stream(pa.BufferReader(data))
+    batch = reader.read_next_batch()
+    return batch.column(0)
+
+
+def _serialize_cloudpickle(obj: Any) -> bytes:
+    """Serialize using cloudpickle (fallback for arbitrary Python objects)."""
+    return _TYPE_CLOUDPICKLE + cloudpickle.dumps(obj, protocol=cloudpickle.DEFAULT_PROTOCOL)
+
+
+def _deserialize_cloudpickle(data: bytes) -> Any:
+    """Deserialize using cloudpickle."""
+    return cloudpickle.loads(data)
+
+
+def _serialize_object_data(obj: Any) -> bytes:
+    """Serialize object using the optimal format based on type.
+
+    Fast-path for numpy arrays and PyArrow types avoids cloudpickle overhead.
+    Falls back to cloudpickle for arbitrary Python objects.
+    """
+    if _HAS_NUMPY and isinstance(obj, np.ndarray):
+        if obj.flags.c_contiguous or obj.flags.f_contiguous:
+            return _serialize_numpy(obj)
+
+    if isinstance(obj, pa.Table):
+        return _serialize_arrow_table(obj)
+
+    if isinstance(obj, pa.RecordBatch):
+        return _serialize_arrow_batch(obj)
+
+    if isinstance(obj, pa.Array):
+        return _serialize_arrow_array(obj)
+
+    return _serialize_cloudpickle(obj)
+
+
+def _deserialize_object_data(data: bytes) -> Any:
+    """Deserialize object, detecting format from magic prefix."""
+    if len(data) < _MAGIC_PREFIX_LEN:
+        return cloudpickle.loads(data)
+
+    prefix = data[:_MAGIC_PREFIX_LEN]
+    payload = data[_MAGIC_PREFIX_LEN:]
+
+    if prefix == _TYPE_NUMPY:
+        if not _HAS_NUMPY:
+            raise ImportError("numpy is required to deserialize this object")
+        return _deserialize_numpy(payload)
+
+    if prefix == _TYPE_ARROW_TABLE:
+        return _deserialize_arrow_table(payload)
+
+    if prefix == _TYPE_ARROW_BATCH:
+        return _deserialize_arrow_batch(payload)
+
+    if prefix == _TYPE_ARROW_ARRAY:
+        return _deserialize_arrow_array(payload)
+
+    if prefix == _TYPE_CLOUDPICKLE:
+        return _deserialize_cloudpickle(payload)
+
+    return cloudpickle.loads(data)
+
+
 def _serialize_object(obj: Any) -> pa.RecordBatch:
     """Serialize a Python object to an Arrow RecordBatch.
 
-    Args:
-        obj: The object to serialize
-
-    Returns:
-        RecordBatch with schema {version: uint64, data: binary}
+    Uses fast-path serialization for numpy arrays and PyArrow types,
+    falling back to cloudpickle for arbitrary Python objects.
     """
-    # Serialize the object using cloudpickle
-    data_bytes = cloudpickle.dumps(obj, protocol=cloudpickle.DEFAULT_PROTOCOL)
+    data_bytes = _serialize_object_data(obj)
 
-    # Create Arrow schema
     schema = pa.schema(
         [
             pa.field("version", pa.uint64()),
@@ -215,30 +355,21 @@ def _serialize_object(obj: Any) -> pa.RecordBatch:
         ]
     )
 
-    # Create RecordBatch
     version_array = pa.array([0], type=pa.uint64())
     data_array = pa.array([data_bytes], type=pa.binary())
 
-    batch = pa.RecordBatch.from_arrays([version_array, data_array], schema=schema)
-
-    return batch
+    return pa.RecordBatch.from_arrays([version_array, data_array], schema=schema)
 
 
 def _deserialize_object(batch: pa.RecordBatch) -> Any:
     """Deserialize a Python object from an Arrow RecordBatch.
 
-    Args:
-        batch: RecordBatch with schema {version: uint64, data: binary}
-
-    Returns:
-        The deserialized object
+    Automatically detects the serialization format from the type marker.
     """
-    # Extract data from the batch
     data_array = batch.column("data")
     data_bytes = data_array[0].as_py()
 
-    # Deserialize using cloudpickle
-    return cloudpickle.loads(data_bytes)
+    return _deserialize_object_data(data_bytes)
 
 
 _client_pool: Dict[str, flight.FlightClient] = {}
