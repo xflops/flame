@@ -243,7 +243,7 @@ The important invariant is that patch-only rows are returned only when the clien
 
 **`sdk/python/src/flamepy/core/cache.py`**
 
-- Replace the cached `Object(version, data)` shape with a richer cache entry:
+- Replace the cached `Object(version, data)` shape with a richer `Object` cache entry:
 
 ```python
 @dataclass
@@ -252,11 +252,11 @@ class Patch:
     data: Any
 
 @dataclass
-class CachedObject:
+class Object:
     version: int
-    base: Any
+    data: Any
     patches: list[Patch]
-    materialized: dict[int | None, Any]
+    materialized: dict[Any, Any]
 ```
 
 - Request full or incremental data by choosing the effective request version.

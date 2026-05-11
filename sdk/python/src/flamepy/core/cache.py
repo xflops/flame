@@ -110,7 +110,7 @@ class Object:
     version: int
     data: Any
     patches: List[Patch] = field(default_factory=list)
-    materialized: Dict[Optional[Deserializer], Any] = field(default_factory=dict)
+    materialized: Dict[Any, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -119,6 +119,19 @@ class FetchResult:
     version: int
     base: Any = None
     patches: List[Patch] = field(default_factory=list)
+
+
+class _IdentityKey:
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any):
+        self.value = value
+
+    def __hash__(self) -> int:
+        return id(self.value)
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, _IdentityKey) and self.value is other.value
 
 
 # Client-side LRU cache with max size limit (O(1) operations using OrderedDict)
@@ -161,8 +174,19 @@ def _cache_remove_prefix(prefix: str) -> None:
             _object_cache.pop(key, None)
 
 
+def _materialized_cache_key(deserializer: Optional[Deserializer]) -> Any:
+    if deserializer is None:
+        return None
+
+    try:
+        hash(deserializer)
+    except TypeError:
+        return _IdentityKey(deserializer)
+    return deserializer
+
+
 def _materialize_object(obj: Object, deserializer: Optional[Deserializer] = None) -> Any:
-    materialized_key = deserializer
+    materialized_key = _materialized_cache_key(deserializer)
     if materialized_key in obj.materialized:
         return obj.materialized[materialized_key]
 
@@ -173,6 +197,31 @@ def _materialize_object(obj: Object, deserializer: Optional[Deserializer] = None
 
     obj.materialized[materialized_key] = data
     return data
+
+
+def _cache_apply_patches(
+    key: tuple,
+    expected_version: int,
+    new_version: int,
+    patches: List[Patch],
+) -> Optional[Object]:
+    """Apply patch rows only if the cache is still at the requested version."""
+    with _cache_lock:
+        cached = _object_cache.get(key)
+        if cached is None:
+            return None
+
+        if cached.version == expected_version:
+            if new_version <= cached.version:
+                return None
+            cached.patches.extend(patches)
+            cached.version = new_version
+            cached.materialized.clear()
+        elif cached.version < new_version:
+            return None
+
+        _object_cache.move_to_end(key)
+        return cached
 
 
 @dataclass(frozen=True)
@@ -695,7 +744,12 @@ def get_object(ref: ObjectRef, deserializer: Optional[Deserializer] = None) -> A
         )
         _cache_put(cache_key, cached)
     elif result.mode == FetchMode.PATCHES:
-        cached = _cache_get(cache_key)
+        cached = _cache_apply_patches(
+            cache_key,
+            expected_version=cached_version,
+            new_version=result.version,
+            patches=result.patches,
+        )
         if cached is None:
             full_result = _fetch_object_data(ref, 0)
             if full_result is None or full_result.mode != FetchMode.FULL:
@@ -705,11 +759,7 @@ def get_object(ref: ObjectRef, deserializer: Optional[Deserializer] = None) -> A
                 data=full_result.base,
                 patches=full_result.patches,
             )
-        else:
-            cached.patches.extend(result.patches)
-            cached.version = result.version
-            cached.materialized.clear()
-        _cache_put(cache_key, cached)
+            _cache_put(cache_key, cached)
     else:
         raise ValueError(f"Unexpected object fetch mode: {result.mode}")
 

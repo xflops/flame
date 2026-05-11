@@ -345,6 +345,57 @@ class TestClientSideCaching:
             assert cached.version == 3
             assert [patch.version for patch in cached.patches] == [2, 3]
 
+    def test_concurrent_patch_only_fetches_do_not_duplicate_patches(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        cache_key = ("grpc://host:9090", "app/session/obj-concurrent-patch")
+        cached_obj = Object(version=1, data=[1])
+
+        with _cache_lock:
+            _object_cache[cache_key] = cached_obj
+
+        barrier = threading.Barrier(2)
+
+        def mock_fetch_object_data(ref, cached_version):
+            assert cached_version == 1
+            barrier.wait(timeout=5)
+            return FetchResult(
+                mode=FetchMode.PATCHES,
+                version=2,
+                patches=[Patch(version=2, data=[2])],
+            )
+
+        monkeypatch.setattr(cache_module, "_fetch_object_data", mock_fetch_object_data)
+
+        def merge_lists(base_data, deltas):
+            result = list(base_data)
+            for delta in deltas:
+                result.extend(delta)
+            return result
+
+        ref = ObjectRef(endpoint="grpc://host:9090", key="app/session/obj-concurrent-patch", version=1)
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                results.append(cache_module.get_object(ref, deserializer=merge_lists))
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert results == [[1, 2], [1, 2]]
+        with _cache_lock:
+            cached = _object_cache[cache_key]
+            assert cached.version == 2
+            assert [patch.version for patch in cached.patches] == [2]
+
     def test_patch_only_response_without_cache_falls_back_to_full_fetch(self, monkeypatch):
         from flamepy.core import cache as cache_module
 
@@ -425,6 +476,46 @@ class TestClientSideCaching:
         assert fetch_calls["count"] == 2
         assert merger.calls == 1
         assert len(cached_obj.materialized) == 1
+
+    def test_not_modified_accepts_unhashable_callable_deserializer(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        cache_key = ("grpc://host:9090", "app/session/obj-unhashable")
+        cached_obj = Object(
+            version=2,
+            data=[1],
+            patches=[Patch(version=2, data=[2])],
+        )
+
+        with _cache_lock:
+            _object_cache[cache_key] = cached_obj
+
+        def mock_fetch_object_data(ref, cached_version):
+            assert cached_version == 2
+            return None
+
+        monkeypatch.setattr(cache_module, "_fetch_object_data", mock_fetch_object_data)
+
+        class UnhashableMerger:
+            def __init__(self):
+                self.calls = 0
+
+            def __eq__(self, other):
+                return self is other
+
+            def __call__(self, base_data, deltas):
+                self.calls += 1
+                result = list(base_data)
+                for delta in deltas:
+                    result.extend(delta)
+                return result
+
+        merger = UnhashableMerger()
+        ref = ObjectRef(endpoint="grpc://host:9090", key="app/session/obj-unhashable", version=2)
+
+        assert cache_module.get_object(ref, deserializer=merger) == [1, 2]
+        assert cache_module.get_object(ref, deserializer=merger) == [1, 2]
+        assert merger.calls == 1
 
     def test_version_zero_bypasses_cache(self, monkeypatch):
         from flamepy.core import cache as cache_module
