@@ -110,7 +110,7 @@ class Object:
     version: int
     data: Any
     patches: List[Patch] = field(default_factory=list)
-    materialized: Dict[Optional[int], Any] = field(default_factory=dict)
+    materialized: Dict[Optional[Deserializer], Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -162,7 +162,7 @@ def _cache_remove_prefix(prefix: str) -> None:
 
 
 def _materialize_object(obj: Object, deserializer: Optional[Deserializer] = None) -> Any:
-    materialized_key = None if deserializer is None else id(deserializer)
+    materialized_key = deserializer
     if materialized_key in obj.materialized:
         return obj.materialized[materialized_key]
 

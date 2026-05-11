@@ -244,7 +244,6 @@ impl Object {
             .map(|delta| delta.version)
             .max()
             .unwrap_or(self.version)
-            .max(self.version)
     }
 }
 
@@ -346,8 +345,8 @@ pub struct ObjectCache {
     objects: MutexPtr<HashMap<String, Object>>,
     metadata: MutexPtr<HashMap<String, ObjectMetadata>>,
     eviction_policy: EvictionPolicyPtr,
-    /// Per-key write locks to prevent concurrent PUT/PATCH race conditions
-    write_locks: MutexPtr<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-key locks coordinate concurrent PUT/PATCH writes with GET snapshots.
+    key_locks: MutexPtr<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
 }
 
 impl ObjectCache {
@@ -364,7 +363,7 @@ impl ObjectCache {
             objects: new_ptr(HashMap::new()),
             metadata: new_ptr(HashMap::new()),
             eviction_policy,
-            write_locks: new_ptr(HashMap::new()),
+            key_locks: new_ptr(HashMap::new()),
         })
     }
 
@@ -394,11 +393,11 @@ impl ObjectCache {
         Ok(())
     }
 
-    fn get_write_lock(&self, key: &str) -> Result<Arc<tokio::sync::Mutex<()>>, FlameError> {
-        let mut locks = lock_ptr!(self.write_locks)?;
+    fn get_key_lock(&self, key: &str) -> Result<Arc<tokio::sync::RwLock<()>>, FlameError> {
+        let mut locks = lock_ptr!(self.key_locks)?;
         Ok(locks
             .entry(key.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
             .clone())
     }
 
@@ -449,8 +448,8 @@ impl ObjectCache {
         let size = object.data.len() as u64;
 
         // Acquire per-key lock to prevent concurrent version increments
-        let write_lock = self.get_write_lock(&key_str)?;
-        let _guard = write_lock.lock().await;
+        let key_lock = self.get_key_lock(&key_str)?;
+        let _guard = key_lock.write().await;
 
         let version_from_memory = {
             let metadata = lock_ptr!(self.metadata)?;
@@ -539,8 +538,8 @@ impl ObjectCache {
         })?;
 
         // Acquire per-key lock to prevent concurrent version increments
-        let write_lock = self.get_write_lock(&key_str)?;
-        let _guard = write_lock.lock().await;
+        let key_lock = self.get_key_lock(&key_str)?;
+        let _guard = key_lock.write().await;
 
         self.eviction_policy.on_access(&key_str);
 
@@ -948,9 +947,9 @@ fn object_to_flight_data_vec(obj: &Object) -> Result<Vec<FlightData>, FlameError
     object_rows_to_flight_data_vec(rows)
 }
 
-fn object_patches_to_flight_data_vec(patches: &[Object]) -> Result<Vec<FlightData>, FlameError> {
+fn object_patches_to_flight_data_vec(patches: Vec<&Object>) -> Result<Vec<FlightData>, FlameError> {
     let rows = patches
-        .iter()
+        .into_iter()
         .map(|delta| (ObjectResponseKind::Patch, delta))
         .collect();
     object_rows_to_flight_data_vec(rows)
@@ -1079,11 +1078,11 @@ impl FlightService for FlightCacheServer {
 
         let key = ObjectKey::try_from(key_str.as_str())?;
 
-        let write_lock = self
+        let key_lock = self
             .cache
-            .get_write_lock(&key_str)
+            .get_key_lock(&key_str)
             .map_err(|e| Status::internal(format!("Lock error: {}", e)))?;
-        let _guard = write_lock.lock().await;
+        let _guard = key_lock.read().await;
 
         let object = self.cache.get(&key).await?;
         let server_version = object.current_version();
@@ -1115,11 +1114,10 @@ impl FlightService for FlightCacheServer {
                 server_version
             );
         } else if client_version != 0 && object.version <= client_version {
-            let needed_patches: Vec<Object> = object
+            let needed_patches: Vec<&Object> = object
                 .deltas
                 .iter()
                 .filter(|delta| delta.version > client_version)
-                .cloned()
                 .collect();
             let expected_patch_count = server_version.saturating_sub(client_version) as usize;
             let patch_suffix_is_contiguous = needed_patches.len() == expected_patch_count
@@ -1136,7 +1134,7 @@ impl FlightService for FlightCacheServer {
                     client_version,
                     server_version
                 );
-                let flight_data_vec = object_patches_to_flight_data_vec(&needed_patches)?;
+                let flight_data_vec = object_patches_to_flight_data_vec(needed_patches)?;
                 let stream = futures::stream::iter(flight_data_vec.into_iter().map(Ok));
                 return Ok(Response::new(Box::pin(stream)));
             }

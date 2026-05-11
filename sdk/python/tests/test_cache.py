@@ -383,7 +383,7 @@ class TestClientSideCaching:
             assert cached.version == 2
             assert [patch.data for patch in cached.patches] == [[2]]
 
-    def test_not_modified_reuses_materialized_deserializer_result(self, monkeypatch):
+    def test_not_modified_reuses_bound_method_materialized_result(self, monkeypatch):
         from flamepy.core import cache as cache_module
 
         cache_key = ("grpc://host:9090", "app/session/obj-not-modified")
@@ -397,7 +397,6 @@ class TestClientSideCaching:
             _object_cache[cache_key] = cached_obj
 
         fetch_calls = {"count": 0}
-        deserializer_calls = {"count": 0}
 
         def mock_fetch_object_data(ref, cached_version):
             fetch_calls["count"] += 1
@@ -406,19 +405,26 @@ class TestClientSideCaching:
 
         monkeypatch.setattr(cache_module, "_fetch_object_data", mock_fetch_object_data)
 
-        def merge_lists(base_data, deltas):
-            deserializer_calls["count"] += 1
-            result = list(base_data)
-            for delta in deltas:
-                result.extend(delta)
-            return result
+        class Merger:
+            def __init__(self):
+                self.calls = 0
+
+            def merge_lists(self, base_data, deltas):
+                self.calls += 1
+                result = list(base_data)
+                for delta in deltas:
+                    result.extend(delta)
+                return result
+
+        merger = Merger()
 
         ref = ObjectRef(endpoint="grpc://host:9090", key="app/session/obj-not-modified", version=2)
 
-        assert cache_module.get_object(ref, deserializer=merge_lists) == [1, 2]
-        assert cache_module.get_object(ref, deserializer=merge_lists) == [1, 2]
+        assert cache_module.get_object(ref, deserializer=merger.merge_lists) == [1, 2]
+        assert cache_module.get_object(ref, deserializer=merger.merge_lists) == [1, 2]
         assert fetch_calls["count"] == 2
-        assert deserializer_calls["count"] == 1
+        assert merger.calls == 1
+        assert len(cached_obj.materialized) == 1
 
     def test_version_zero_bypasses_cache(self, monkeypatch):
         from flamepy.core import cache as cache_module
