@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow::array::{BinaryArray, RecordBatch, UInt64Array};
+use arrow::array::{BinaryArray, RecordBatch, StringArray, UInt64Array};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::{
@@ -237,6 +237,15 @@ impl Object {
             deltas,
         }
     }
+
+    pub fn current_version(&self) -> u64 {
+        self.deltas
+            .iter()
+            .map(|delta| delta.version)
+            .max()
+            .unwrap_or(self.version)
+            .max(self.version)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -368,7 +377,7 @@ impl ObjectCache {
         for (key, object) in items {
             let key_str = key.to_key().expect("loaded key must have object_id");
             let size = object.data.len() as u64;
-            let version = object.version;
+            let version = object.current_version();
             let delta_count = object.deltas.len() as u64;
             let meta = self.create_metadata(key_str.clone(), version, size, delta_count);
 
@@ -454,7 +463,7 @@ impl ObjectCache {
                 .storage
                 .read_object(&key)
                 .await?
-                .map(|obj| obj.version)
+                .map(|obj| obj.current_version())
                 .unwrap_or(0),
         };
         let new_version = current_version + 1;
@@ -499,7 +508,7 @@ impl ObjectCache {
         if let Some(object) = self.storage.read_object(key).await? {
             let size = object.data.len() as u64;
             let delta_count = object.deltas.len() as u64;
-            let version = object.version;
+            let version = object.current_version();
 
             {
                 let mut objects = lock_ptr!(self.objects)?;
@@ -546,14 +555,15 @@ impl ObjectCache {
                 .storage
                 .read_object(key)
                 .await?
-                .map(|obj| obj.version)
+                .map(|obj| obj.current_version())
                 .ok_or_else(|| {
                     FlameError::NotFound(format!("object <{}> not found for patch", key_str))
                 })?,
         };
         let new_version = current_version + 1;
 
-        let mut meta = self.storage.patch_object(key, &delta).await?;
+        let versioned_delta = Object::new(new_version, delta.data);
+        let mut meta = self.storage.patch_object(key, &versioned_delta).await?;
         meta.endpoint = self.endpoint.to_uri();
         meta.version = new_version;
 
@@ -807,15 +817,46 @@ fn encode_schema(schema: &Schema) -> Result<Vec<u8>, FlameError> {
     Ok(encoded.ipc_message)
 }
 
+#[cfg(test)]
 fn get_object_schema() -> Schema {
     Schema::new(vec![
-        Field::new("version", DataType::UInt64, false),
-        Field::new("data", DataType::Binary, false),
+        Field::new(OBJECT_RESPONSE_FIELD_VERSION, DataType::UInt64, false),
+        Field::new(OBJECT_RESPONSE_FIELD_DATA, DataType::Binary, false),
     ])
+}
+
+const OBJECT_RESPONSE_FIELD_VERSION: &str = "version";
+const OBJECT_RESPONSE_FIELD_KIND: &str = "kind";
+const OBJECT_RESPONSE_FIELD_DATA: &str = "data";
+const OBJECT_RESPONSE_KIND_BASE: &str = "base";
+const OBJECT_RESPONSE_KIND_PATCH: &str = "patch";
+
+fn get_object_response_schema() -> Schema {
+    Schema::new(vec![
+        Field::new(OBJECT_RESPONSE_FIELD_VERSION, DataType::UInt64, false),
+        Field::new(OBJECT_RESPONSE_FIELD_KIND, DataType::Utf8, false),
+        Field::new(OBJECT_RESPONSE_FIELD_DATA, DataType::Binary, false),
+    ])
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ObjectResponseKind {
+    Base,
+    Patch,
+}
+
+impl ObjectResponseKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Base => OBJECT_RESPONSE_KIND_BASE,
+            Self::Patch => OBJECT_RESPONSE_KIND_PATCH,
+        }
+    }
 }
 
 // Helper function to create a RecordBatch from object data
 // Note: Only serializes version and data; deltas are stored separately
+#[cfg(test)]
 fn object_to_batch(object: &Object) -> Result<RecordBatch, FlameError> {
     let schema = get_object_schema();
 
@@ -856,7 +897,7 @@ fn batch_to_object(batch: &RecordBatch) -> Result<Object, FlameError> {
 }
 
 fn create_empty_flight_data() -> Result<Vec<FlightData>, FlameError> {
-    let schema = get_object_schema();
+    let schema = get_object_response_schema();
     let options = IpcWriteOptions::default();
     let data_gen = IpcDataGenerator::default();
     let mut dict_tracker = DictionaryTracker::new(false);
@@ -872,10 +913,52 @@ fn create_empty_flight_data() -> Result<Vec<FlightData>, FlameError> {
     }])
 }
 
+fn object_to_response_batch(
+    object: &Object,
+    kind: ObjectResponseKind,
+) -> Result<RecordBatch, FlameError> {
+    let schema = get_object_response_schema();
+
+    let version_array = UInt64Array::from(vec![object.version]);
+    let kind_array = StringArray::from(vec![kind.as_str()]);
+    let data_array = BinaryArray::from(vec![object.data.as_slice()]);
+
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(version_array),
+            Arc::new(kind_array),
+            Arc::new(data_array),
+        ],
+    )
+    .map_err(|e| FlameError::Internal(format!("Failed to create response RecordBatch: {}", e)))
+}
+
 /// Convert Object (with deltas) to FlightData stream
 /// Sends schema once, followed by base batch, then delta batches
 /// Uses ZSTD compression for ~54% faster encoding (Arrow 58+)
 fn object_to_flight_data_vec(obj: &Object) -> Result<Vec<FlightData>, FlameError> {
+    let mut rows = Vec::with_capacity(obj.deltas.len() + 1);
+    rows.push((ObjectResponseKind::Base, obj));
+    rows.extend(
+        obj.deltas
+            .iter()
+            .map(|delta| (ObjectResponseKind::Patch, delta)),
+    );
+    object_rows_to_flight_data_vec(rows)
+}
+
+fn object_patches_to_flight_data_vec(patches: &[Object]) -> Result<Vec<FlightData>, FlameError> {
+    let rows = patches
+        .iter()
+        .map(|delta| (ObjectResponseKind::Patch, delta))
+        .collect();
+    object_rows_to_flight_data_vec(rows)
+}
+
+fn object_rows_to_flight_data_vec(
+    rows: Vec<(ObjectResponseKind, &Object)>,
+) -> Result<Vec<FlightData>, FlameError> {
     let options = IpcWriteOptions::default()
         .try_with_compression(Some(CompressionType::ZSTD))
         .map_err(|e| FlameError::Internal(format!("Failed to set compression: {}", e)))?;
@@ -884,8 +967,7 @@ fn object_to_flight_data_vec(obj: &Object) -> Result<Vec<FlightData>, FlameError
     let mut dict_tracker = DictionaryTracker::new(false);
     let mut compression_ctx = CompressionContext::default();
 
-    let base_batch = object_to_batch(obj)?;
-    let schema = base_batch.schema();
+    let schema = Arc::new(get_object_response_schema());
 
     let mut all_flight_data = Vec::new();
 
@@ -901,21 +983,8 @@ fn object_to_flight_data_vec(obj: &Object) -> Result<Vec<FlightData>, FlameError
         data_body: vec![].into(),
     });
 
-    let (encoded_dicts, encoded_batch) = data_gen
-        .encode(
-            &base_batch,
-            &mut dict_tracker,
-            &options,
-            &mut compression_ctx,
-        )
-        .map_err(|e| FlameError::Internal(format!("Failed to encode base batch: {}", e)))?;
-    for dict_batch in encoded_dicts {
-        all_flight_data.push(dict_batch.into());
-    }
-    all_flight_data.push(encoded_batch.into());
-
-    for delta in &obj.deltas {
-        let delta_batch = object_to_batch(delta)?;
+    for (kind, object) in rows {
+        let delta_batch = object_to_response_batch(object, kind)?;
         let (encoded_dicts, encoded_batch) = data_gen
             .encode(
                 &delta_batch,
@@ -923,7 +992,7 @@ fn object_to_flight_data_vec(obj: &Object) -> Result<Vec<FlightData>, FlameError
                 &options,
                 &mut compression_ctx,
             )
-            .map_err(|e| FlameError::Internal(format!("Failed to encode delta batch: {}", e)))?;
+            .map_err(|e| FlameError::Internal(format!("Failed to encode response batch: {}", e)))?;
         for dict_batch in encoded_dicts {
             all_flight_data.push(dict_batch.into());
         }
@@ -1010,19 +1079,21 @@ impl FlightService for FlightCacheServer {
 
         let key = ObjectKey::try_from(key_str.as_str())?;
 
-        let (server_version, metadata_keys) = {
-            let metadata = lock_ptr!(self.cache.metadata)
-                .map_err(|e| Status::internal(format!("Lock error: {}", e)))?;
-            let version = metadata.get(&key_str).map(|m| m.version).unwrap_or(0);
-            let keys: Vec<String> = metadata.keys().cloned().collect();
-            (version, keys)
-        };
+        let write_lock = self
+            .cache
+            .get_write_lock(&key_str)
+            .map_err(|e| Status::internal(format!("Lock error: {}", e)))?;
+        let _guard = write_lock.lock().await;
+
+        let object = self.cache.get(&key).await?;
+        let server_version = object.current_version();
 
         tracing::debug!(
-            "do_get: key={}, server_version={}, metadata_keys_count={}",
+            "do_get: key={}, server_version={}, base_version={}, delta_count={}",
             key_str,
             server_version,
-            metadata_keys.len()
+            object.version,
+            object.deltas.len()
         );
 
         if client_version != 0 && server_version == client_version {
@@ -1036,7 +1107,47 @@ impl FlightService for FlightCacheServer {
             return Ok(Response::new(Box::pin(stream)));
         }
 
-        let object = self.cache.get(&key).await?;
+        if client_version > server_version {
+            tracing::warn!(
+                "do_get: key={}, client_version={} is greater than server_version={}, returning full object",
+                key_str,
+                client_version,
+                server_version
+            );
+        } else if client_version != 0 && object.version <= client_version {
+            let needed_patches: Vec<Object> = object
+                .deltas
+                .iter()
+                .filter(|delta| delta.version > client_version)
+                .cloned()
+                .collect();
+            let expected_patch_count = server_version.saturating_sub(client_version) as usize;
+            let patch_suffix_is_contiguous = needed_patches.len() == expected_patch_count
+                && needed_patches
+                    .iter()
+                    .enumerate()
+                    .all(|(idx, delta)| delta.version == client_version + idx as u64 + 1);
+
+            if patch_suffix_is_contiguous {
+                tracing::debug!(
+                    "do_get: key={}, patch_only_count={}, client_version={}, server_version={}",
+                    key_str,
+                    needed_patches.len(),
+                    client_version,
+                    server_version
+                );
+                let flight_data_vec = object_patches_to_flight_data_vec(&needed_patches)?;
+                let stream = futures::stream::iter(flight_data_vec.into_iter().map(Ok));
+                return Ok(Response::new(Box::pin(stream)));
+            }
+
+            tracing::debug!(
+                "do_get: key={}, patch suffix unavailable (client_version={}, server_version={}), returning full object",
+                key_str,
+                client_version,
+                server_version
+            );
+        }
 
         tracing::debug!(
             "do_get: key={}, base_size={}, delta_count={}",
@@ -1150,7 +1261,7 @@ impl FlightService for FlightCacheServer {
         &self,
         _request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        let schema = get_object_schema();
+        let schema = get_object_response_schema();
 
         let schema_result = SchemaResult {
             schema: Bytes::from(encode_schema(&schema)?),
@@ -1660,6 +1771,212 @@ mod tests {
 
             let retrieved2 = cache.get(&key).await.unwrap();
             assert_eq!(retrieved2.version, 1);
+        }
+    }
+
+    mod versioned_get {
+        use super::*;
+        use futures::StreamExt;
+        use std::path::Path;
+        use tempfile::tempdir;
+
+        async fn create_disk_test_server() -> (FlightCacheServer, tempfile::TempDir) {
+            let endpoint = test_endpoint();
+            let temp = tempdir().unwrap();
+            let storage =
+                Box::new(crate::storage::DiskStorage::new(temp.path().to_path_buf()).unwrap());
+            let cache = Arc::new(ObjectCache::new(endpoint, storage, None).unwrap());
+            (FlightCacheServer::new(cache), temp)
+        }
+
+        fn test_endpoint() -> CacheEndpoint {
+            CacheEndpoint {
+                scheme: "grpc".to_string(),
+                host: "localhost".to_string(),
+                port: 9090,
+            }
+        }
+
+        async fn create_disk_test_server_from_path(path: &Path) -> FlightCacheServer {
+            let storage = Box::new(crate::storage::DiskStorage::new(path.to_path_buf()).unwrap());
+            let cache = Arc::new(ObjectCache::new(test_endpoint(), storage, None).unwrap());
+            cache.load_from_storage().await.unwrap();
+            FlightCacheServer::new(cache)
+        }
+
+        async fn put_and_patch(server: &FlightCacheServer) -> ObjectMetadata {
+            let key = ObjectKey::from_path("app/session").unwrap();
+            let meta = server
+                .cache
+                .put(key, Object::new(0, b"base".to_vec()))
+                .await
+                .unwrap();
+            let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
+            server
+                .cache
+                .patch(&key, Object::new(0, b"patch-1".to_vec()))
+                .await
+                .unwrap();
+            server
+                .cache
+                .patch(&key, Object::new(0, b"patch-2".to_vec()))
+                .await
+                .unwrap()
+        }
+
+        async fn get_batches(server: &FlightCacheServer, ticket: &str) -> Vec<RecordBatch> {
+            let response = server
+                .do_get(Request::new(Ticket {
+                    ticket: Bytes::from(ticket.as_bytes().to_vec()),
+                }))
+                .await
+                .unwrap();
+            let mut stream = response.into_inner();
+            let mut schema: Option<Arc<Schema>> = None;
+            let mut batches = Vec::new();
+
+            while let Some(item) = stream.next().await {
+                let flight_data = item.unwrap();
+                if schema.is_none() && !flight_data.data_header.is_empty() {
+                    schema = Some(
+                        FlightCacheServer::extract_schema_from_flight_data(&flight_data).unwrap(),
+                    );
+                }
+                if !flight_data.data_body.is_empty() {
+                    let schema_ref = schema.as_ref().unwrap();
+                    batches.push(
+                        FlightCacheServer::decode_batch_from_flight_data(&flight_data, schema_ref)
+                            .unwrap(),
+                    );
+                }
+            }
+
+            batches
+        }
+
+        fn row_kind(batch: &RecordBatch) -> String {
+            batch
+                .column_by_name(OBJECT_RESPONSE_FIELD_KIND)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0)
+                .to_string()
+        }
+
+        fn row_version(batch: &RecordBatch) -> u64 {
+            batch
+                .column_by_name(OBJECT_RESPONSE_FIELD_VERSION)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0)
+        }
+
+        fn row_data(batch: &RecordBatch) -> Vec<u8> {
+            batch
+                .column_by_name(OBJECT_RESPONSE_FIELD_DATA)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(0)
+                .to_vec()
+        }
+
+        #[tokio::test]
+        async fn client_version_zero_returns_full_response() {
+            let (server, _temp) = create_disk_test_server().await;
+            let meta = put_and_patch(&server).await;
+
+            let batches = get_batches(&server, &format!("{}:0", meta.key)).await;
+
+            assert_eq!(batches.len(), 3);
+            assert_eq!(row_kind(&batches[0]), ObjectResponseKind::Base.as_str());
+            assert_eq!(row_kind(&batches[1]), ObjectResponseKind::Patch.as_str());
+            assert_eq!(row_kind(&batches[2]), ObjectResponseKind::Patch.as_str());
+            assert_eq!(row_version(&batches[0]), 1);
+            assert_eq!(row_version(&batches[1]), 2);
+            assert_eq!(row_version(&batches[2]), 3);
+        }
+
+        #[tokio::test]
+        async fn stale_client_version_returns_patch_only_response() {
+            let (server, _temp) = create_disk_test_server().await;
+            let meta = put_and_patch(&server).await;
+
+            let batches = get_batches(&server, &format!("{}:1", meta.key)).await;
+
+            assert_eq!(batches.len(), 2);
+            assert_eq!(row_kind(&batches[0]), ObjectResponseKind::Patch.as_str());
+            assert_eq!(row_kind(&batches[1]), ObjectResponseKind::Patch.as_str());
+            assert_eq!(row_version(&batches[0]), 2);
+            assert_eq!(row_version(&batches[1]), 3);
+        }
+
+        #[tokio::test]
+        async fn stale_client_version_after_reload_returns_patch_only_response() {
+            let (server, temp) = create_disk_test_server().await;
+            let meta = put_and_patch(&server).await;
+            let reloaded_server = create_disk_test_server_from_path(temp.path()).await;
+
+            let batches = get_batches(&reloaded_server, &format!("{}:1", meta.key)).await;
+
+            assert_eq!(batches.len(), 2);
+            assert_eq!(row_kind(&batches[0]), ObjectResponseKind::Patch.as_str());
+            assert_eq!(row_kind(&batches[1]), ObjectResponseKind::Patch.as_str());
+            assert_eq!(row_version(&batches[0]), 2);
+            assert_eq!(row_version(&batches[1]), 3);
+            assert_eq!(row_data(&batches[0]), b"patch-1".to_vec());
+            assert_eq!(row_data(&batches[1]), b"patch-2".to_vec());
+        }
+
+        #[tokio::test]
+        async fn client_version_before_updated_base_returns_full_response() {
+            let (server, _temp) = create_disk_test_server().await;
+            let meta = put_and_patch(&server).await;
+            let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
+            let updated_meta = server
+                .cache
+                .put(key, Object::new(0, b"updated-base".to_vec()))
+                .await
+                .unwrap();
+
+            let batches = get_batches(&server, &format!("{}:1", meta.key)).await;
+
+            assert_eq!(updated_meta.version, 4);
+            assert_eq!(batches.len(), 1);
+            assert_eq!(row_kind(&batches[0]), ObjectResponseKind::Base.as_str());
+            assert_eq!(row_version(&batches[0]), 4);
+            assert_eq!(row_data(&batches[0]), b"updated-base".to_vec());
+        }
+
+        #[tokio::test]
+        async fn client_version_ahead_of_server_returns_full_response() {
+            let (server, _temp) = create_disk_test_server().await;
+            let meta = put_and_patch(&server).await;
+
+            let batches = get_batches(&server, &format!("{}:99", meta.key)).await;
+
+            assert_eq!(batches.len(), 3);
+            assert_eq!(row_kind(&batches[0]), ObjectResponseKind::Base.as_str());
+            assert_eq!(row_kind(&batches[1]), ObjectResponseKind::Patch.as_str());
+            assert_eq!(row_kind(&batches[2]), ObjectResponseKind::Patch.as_str());
+            assert_eq!(row_version(&batches[0]), 1);
+            assert_eq!(row_version(&batches[1]), 2);
+            assert_eq!(row_version(&batches[2]), 3);
+        }
+
+        #[tokio::test]
+        async fn matching_client_version_returns_empty_response() {
+            let (server, _temp) = create_disk_test_server().await;
+            let meta = put_and_patch(&server).await;
+
+            let batches = get_batches(&server, &format!("{}:{}", meta.key, meta.version)).await;
+
+            assert!(batches.is_empty());
         }
     }
 

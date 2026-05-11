@@ -17,7 +17,11 @@ def run_distributed(
     num_collections: int = 20,
     steps_per_collection: int = 500,
     batch_size: int = 64,
+    merge_every: int | None = 5,
+    metrics_json: str | None = None,
+    force_full_get: bool = False,
 ):
+    import json
     import time
 
     from flamepy.runner import Runner
@@ -31,30 +35,43 @@ def run_distributed(
     print(f"  Steps per collection: {steps_per_collection}")
     print(f"  Iterations: {num_iterations}")
     print(f"  Batch size: {batch_size}")
+    print(f"  Merge every: {merge_every if merge_every else 'disabled'}")
+    print(f"  Force full get: {force_full_get}")
     print("\nStarting distributed collection...")
 
     start_time = time.time()
+    metrics = []
+    total_added = 0
 
     with Runner(f"replay-buffer-{env_name.lower()}") as rr:
-        buffer = ReplayBuffer(rr)
+        buffer = ReplayBuffer(rr, force_full_get=force_full_get)
         buffer_svc = rr.service(buffer, autoscale=False, warmup=1)
         collector = rr.service(Collector(env_name), autoscale=True)
 
         for iteration in range(num_iterations):
+            iteration_start = time.time()
             collect_futures = [
                 collector.collect(buffer, steps_per_collection)
                 for _ in range(num_collections)
             ]
             collect_results = rr.get(collect_futures)
+            collect_elapsed = time.time() - iteration_start
 
-            if iteration % 5 == 4:
+            merge_elapsed = 0.0
+            if merge_every and iteration % merge_every == merge_every - 1:
+                merge_start = time.time()
                 buffer_svc.merge().wait()
+                merge_elapsed = time.time() - merge_start
 
+            state_start = time.time()
             stats = buffer_svc.state().get()
+            state_elapsed = time.time() - state_start
             total_size = stats["size"]
             total_added = stats["total_added"]
             total_episodes = sum(r["episode_count"] for r in collect_results)
-            avg_reward = sum(r["avg_reward"] * r["episode_count"] for r in collect_results) / max(1, total_episodes)
+            avg_reward = sum(
+                r["avg_reward"] * r["episode_count"] for r in collect_results
+            ) / max(1, total_episodes)
 
             print(
                 f"Iteration {iteration:2d} | "
@@ -63,9 +80,29 @@ def run_distributed(
                 f"Avg Reward: {avg_reward:7.1f}"
             )
 
+            sample_elapsed = 0.0
+            sampled = 0
             if total_size >= batch_size:
+                sample_start = time.time()
                 batch = buffer_svc.sample(batch_size).get()
+                sample_elapsed = time.time() - sample_start
+                sampled = len(batch)
                 print(f"             | Sampled batch of {len(batch)} transitions")
+
+            metrics.append(
+                {
+                    "iteration": iteration,
+                    "collect_secs": collect_elapsed,
+                    "merge_secs": merge_elapsed,
+                    "state_secs": state_elapsed,
+                    "sample_secs": sample_elapsed,
+                    "buffer_size": total_size,
+                    "total_added": total_added,
+                    "total_episodes": total_episodes,
+                    "avg_reward": avg_reward,
+                    "sampled": sampled,
+                }
+            )
 
     elapsed = time.time() - start_time
     print("\n" + "=" * 60)
@@ -74,6 +111,30 @@ def run_distributed(
     print(f"  Total transitions: {total_added}")
     print(f"  Throughput: {total_added / elapsed:.1f} transitions/sec")
     print("=" * 60)
+
+    if metrics_json:
+        with open(metrics_json, "w") as f:
+            json.dump(
+                {
+                    "configuration": {
+                        "env": env_name,
+                        "iterations": num_iterations,
+                        "collections": num_collections,
+                        "steps_per_collection": steps_per_collection,
+                        "batch_size": batch_size,
+                        "merge_every": merge_every,
+                        "force_full_get": force_full_get,
+                    },
+                    "summary": {
+                        "total_time_secs": elapsed,
+                        "total_transitions": total_added,
+                        "throughput": total_added / elapsed,
+                    },
+                    "iterations": metrics,
+                },
+                f,
+                indent=2,
+            )
 
 
 def run_local(
@@ -187,8 +248,31 @@ def main():
     parser.add_argument(
         "--batch-size", type=int, default=64, help="Batch size for sampling"
     )
+    parser.add_argument(
+        "--metrics-json",
+        type=str,
+        default=None,
+        help="Write distributed-mode metrics to a JSON file",
+    )
+    parser.add_argument(
+        "--merge-every",
+        type=int,
+        default=5,
+        help="Merge replay-buffer patches every N iterations",
+    )
+    parser.add_argument(
+        "--no-merge",
+        action="store_true",
+        help="Disable replay-buffer patch merging",
+    )
+    parser.add_argument(
+        "--force-full-get",
+        action="store_true",
+        help="Force replay-buffer reads to request full objects with version 0",
+    )
 
     args = parser.parse_args()
+    merge_every = None if args.no_merge else args.merge_every
 
     if args.local:
         run_local(
@@ -204,6 +288,9 @@ def main():
             num_collections=args.collections,
             steps_per_collection=args.steps_per_collection,
             batch_size=args.batch_size,
+            merge_every=merge_every,
+            metrics_json=args.metrics_json,
+            force_full_get=args.force_full_get,
         )
 
 

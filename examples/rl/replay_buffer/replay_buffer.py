@@ -6,10 +6,12 @@ if TYPE_CHECKING:
 
 
 class ReplayBuffer:
-    def __init__(self, rr: "Runner"):
-        from flamepy.core import get_object, patch_object, update_object
+    def __init__(self, rr: "Runner", force_full_get: bool = False):
+        from flamepy.core import ObjectRef, get_object, patch_object, update_object
 
         self.buffer_ref = rr.put_object({"transitions": [], "total_added": 0})
+        self.force_full_get = force_full_get
+        self._object_ref = ObjectRef
         self._get_object = get_object
         self._update_object = update_object
         self._patch_object = patch_object
@@ -24,7 +26,10 @@ class ReplayBuffer:
         }
 
     def _fetch(self) -> dict:
-        return self._get_object(self.buffer_ref, deserializer=self._deserializer)
+        ref = self.buffer_ref
+        if self.force_full_get:
+            ref = self._object_ref(endpoint=ref.endpoint, key=ref.key, version=0)
+        return self._get_object(ref, deserializer=self._deserializer)
 
     def push(self, transitions: List[dict]) -> None:
         self._patch_object(self.buffer_ref, transitions)

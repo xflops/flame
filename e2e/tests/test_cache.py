@@ -14,6 +14,8 @@ limitations under the License.
 import time
 import uuid
 
+import flamepy.core.cache as cache_module
+import pyarrow.flight as flight
 import pytest
 from flamepy.core import FlameContext, ObjectRef, get_object, patch_object, put_object, update_object
 
@@ -98,6 +100,27 @@ def _raw_deserializer(base, deltas):
     return {"base": base, "deltas": deltas}
 
 
+def _remote_patch_without_local_cache_invalidation(ref: ObjectRef, delta):
+    """Patch through Flight directly to emulate another client process."""
+    batch = cache_module._serialize_object(delta)
+    client = cache_module._get_flight_client(ref.endpoint, cache_module._get_cache_tls_config())
+    descriptor = flight.FlightDescriptor.for_command(f"PATCH:{ref.key}".encode())
+    return cache_module._do_put_remote(client, descriptor, batch)
+
+
+def _remote_update_without_local_cache_invalidation(ref: ObjectRef, new_obj):
+    """Update through Flight directly to emulate another client process."""
+    batch = cache_module._serialize_object(new_obj)
+    client = cache_module._get_flight_client(ref.endpoint, cache_module._get_cache_tls_config())
+    descriptor = flight.FlightDescriptor.for_path(ref.key)
+    return cache_module._do_put_remote(client, descriptor, batch)
+
+
+def _cached_object(ref: ObjectRef):
+    with cache_module._cache_lock:
+        return cache_module._object_cache[(ref.endpoint, ref.key)]
+
+
 def test_patch_single_delta():
     """Test patching an object with a single delta."""
     key_prefix = "test-app/test-patch-001"
@@ -139,6 +162,78 @@ def test_patch_multiple_deltas():
     assert result["deltas"][0] == delta1
     assert result["deltas"][1] == delta2
     assert result["deltas"][2] == delta3
+
+
+def test_incremental_get_applies_remote_patch_only_response():
+    """Test a cached client applies only patches appended by another client."""
+    key_prefix = f"test-app/test-incremental-patch-{uuid.uuid4().hex[:8]}"
+    base_data = {"items": ["base"]}
+    delta_data = {"items": ["patch-1"]}
+
+    ref = put_object(key_prefix, base_data)
+    assert get_object(ref, deserializer=_raw_deserializer) == {"base": base_data, "deltas": []}
+
+    patched_ref = _remote_patch_without_local_cache_invalidation(ref, delta_data)
+    fetch_result = cache_module._fetch_object_data(ref, ref.version)
+
+    assert fetch_result.mode == cache_module.FetchMode.PATCHES
+    assert fetch_result.version == patched_ref.version
+    assert [patch.data for patch in fetch_result.patches] == [delta_data]
+
+    result = get_object(ref, deserializer=_raw_deserializer)
+    assert result == {"base": base_data, "deltas": [delta_data]}
+
+    cached = _cached_object(ref)
+    assert cached.version == patched_ref.version
+    assert [patch.data for patch in cached.patches] == [delta_data]
+
+
+def test_version_zero_forces_full_response_with_cached_object():
+    """Test version=0 gets the full base plus patches even with a local cache."""
+    key_prefix = f"test-app/test-incremental-full-{uuid.uuid4().hex[:8]}"
+    base_data = {"items": ["base"]}
+    delta_data = {"items": ["patch-1"]}
+
+    ref = put_object(key_prefix, base_data)
+    assert get_object(ref, deserializer=_raw_deserializer) == {"base": base_data, "deltas": []}
+    patched_ref = _remote_patch_without_local_cache_invalidation(ref, delta_data)
+
+    forced_ref = ObjectRef(endpoint=ref.endpoint, key=ref.key, version=0)
+    fetch_result = cache_module._fetch_object_data(forced_ref, 0)
+
+    assert fetch_result.mode == cache_module.FetchMode.FULL
+    assert fetch_result.version == patched_ref.version
+    assert fetch_result.base == base_data
+    assert [patch.data for patch in fetch_result.patches] == [delta_data]
+
+    result = get_object(forced_ref, deserializer=_raw_deserializer)
+    assert result == {"base": base_data, "deltas": [delta_data]}
+
+
+def test_incremental_get_falls_back_to_full_after_remote_update():
+    """Test stale cached base is replaced by a full response after update."""
+    key_prefix = f"test-app/test-incremental-update-{uuid.uuid4().hex[:8]}"
+    base_data = {"version": 1}
+    updated_data = {"version": 2}
+
+    ref = put_object(key_prefix, base_data)
+    assert get_object(ref, deserializer=_raw_deserializer) == {"base": base_data, "deltas": []}
+
+    updated_ref = _remote_update_without_local_cache_invalidation(ref, updated_data)
+    fetch_result = cache_module._fetch_object_data(ref, ref.version)
+
+    assert fetch_result.mode == cache_module.FetchMode.FULL
+    assert fetch_result.version == updated_ref.version
+    assert fetch_result.base == updated_data
+    assert fetch_result.patches == []
+
+    result = get_object(ref, deserializer=_raw_deserializer)
+    assert result == {"base": updated_data, "deltas": []}
+
+    cached = _cached_object(ref)
+    assert cached.version == updated_ref.version
+    assert cached.data == updated_data
+    assert cached.patches == []
 
 
 def test_patch_preserves_delta_order():

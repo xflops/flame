@@ -99,7 +99,7 @@ impl StorageEngine for DiskStorage {
                 return Ok(None);
             }
             let base = load_object_from_file(&object_path)?;
-            let deltas = read_deltas_sync(&delta_dir)?;
+            let deltas = read_deltas_sync(&delta_dir, base.version)?;
             Ok(Some(Object::with_deltas(base.version, base.data, deltas)))
         })
         .await
@@ -261,7 +261,7 @@ impl StorageEngine for DiskStorage {
 
                         let delta_dir = session_path.join(format!("{}.deltas", object_id));
                         let base = load_object_from_file(&object_path)?;
-                        let deltas = read_deltas_sync(&delta_dir)?;
+                        let deltas = read_deltas_sync(&delta_dir, base.version)?;
                         let object = Object::with_deltas(base.version, base.data, deltas);
 
                         results.push((key, object));
@@ -299,7 +299,7 @@ fn count_deltas_sync(delta_dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn read_deltas_sync(delta_dir: &Path) -> Result<Vec<Object>, FlameError> {
+fn read_deltas_sync(delta_dir: &Path, base_version: u64) -> Result<Vec<Object>, FlameError> {
     if !delta_dir.exists() {
         return Ok(Vec::new());
     }
@@ -317,10 +317,18 @@ fn read_deltas_sync(delta_dir: &Path) -> Result<Vec<Object>, FlameError> {
             .unwrap_or(u64::MAX)
     });
 
-    delta_files
+    let mut deltas: Vec<Object> = delta_files
         .into_par_iter()
         .map(|entry| load_object_from_file(&entry.path()))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (idx, delta) in deltas.iter_mut().enumerate() {
+        if delta.version == 0 {
+            delta.version = base_version + idx as u64 + 1;
+        }
+    }
+
+    Ok(deltas)
 }
 
 fn write_batch_to_file(path: &Path, batch: &RecordBatch) -> Result<(), FlameError> {
@@ -442,13 +450,38 @@ mod tests {
         let object = Object::new(1, vec![1, 2, 3]);
         storage.write_object(&key, &object).await.unwrap();
 
-        let delta = Object::new(0, vec![4, 5, 6]);
+        let delta = Object::new(2, vec![4, 5, 6]);
         let meta = storage.patch_object(&key, &delta).await.unwrap();
         assert_eq!(meta.delta_count, 1);
 
         let loaded = storage.read_object(&key).await.unwrap().unwrap();
         assert_eq!(loaded.deltas.len(), 1);
+        assert_eq!(loaded.deltas[0].version, 2);
         assert_eq!(loaded.deltas[0].data, vec![4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn test_disk_storage_synthesizes_old_zero_delta_versions() {
+        let temp_dir = tempdir().unwrap();
+        let storage = DiskStorage::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let key = test_key("test-app", "test-session", "obj1");
+        let object = Object::new(5, vec![1, 2, 3]);
+        storage.write_object(&key, &object).await.unwrap();
+
+        storage
+            .patch_object(&key, &Object::new(0, vec![4]))
+            .await
+            .unwrap();
+        storage
+            .patch_object(&key, &Object::new(0, vec![5]))
+            .await
+            .unwrap();
+
+        let loaded = storage.read_object(&key).await.unwrap().unwrap();
+        assert_eq!(loaded.deltas.len(), 2);
+        assert_eq!(loaded.deltas[0].version, 6);
+        assert_eq!(loaded.deltas[1].version, 7);
     }
 
     #[tokio::test]

@@ -11,9 +11,16 @@ from flamepy.core.cache import (
     _TYPE_ARROW_TABLE,
     _TYPE_CLOUDPICKLE,
     _TYPE_NUMPY,
+    OBJECT_FIELD_DATA,
+    OBJECT_FIELD_VERSION,
+    OBJECT_RESPONSE_FIELD_KIND,
+    FetchMode,
+    FetchResult,
     Object,
     ObjectKey,
     ObjectRef,
+    ObjectResponseKind,
+    Patch,
     _cache_lock,
     _deserialize_object,
     _deserialize_object_data,
@@ -195,6 +202,42 @@ class TestClientSideCaching:
         with _cache_lock:
             _object_cache.clear()
 
+    def _response_table(self, rows):
+        return pa.table(
+            {
+                OBJECT_FIELD_VERSION: pa.array([row[0] for row in rows], type=pa.uint64()),
+                OBJECT_RESPONSE_FIELD_KIND: pa.array(
+                    [row[1].value for row in rows],
+                    type=pa.string(),
+                ),
+                OBJECT_FIELD_DATA: pa.array(
+                    [_serialize_object_data(row[2]) for row in rows],
+                    type=pa.binary(),
+                ),
+            }
+        )
+
+    def _patch_fetch_client(self, monkeypatch, table):
+        from flamepy.core import cache as cache_module
+
+        class FakeReader:
+            def read_all(self):
+                return table
+
+        class FakeClient:
+            def do_get(self, ticket):
+                self.ticket = ticket
+                return FakeReader()
+
+        fake_client = FakeClient()
+        monkeypatch.setattr(cache_module, "_get_cache_tls_config", lambda: None)
+        monkeypatch.setattr(
+            cache_module,
+            "_get_flight_client",
+            lambda endpoint, tls_config: fake_client,
+        )
+        return fake_client
+
     def test_cache_hit_returns_cached_data(self, monkeypatch):
         from flamepy.core import cache as cache_module
 
@@ -207,7 +250,7 @@ class TestClientSideCaching:
 
         call_count = {"server": 0}
 
-        def mock_fetch_object_data(ref, cached_version, deserializer=None):
+        def mock_fetch_object_data(ref, cached_version):
             call_count["server"] += 1
             return None
 
@@ -224,8 +267,8 @@ class TestClientSideCaching:
 
         server_data = {"from": "server"}
 
-        def mock_fetch_object_data(ref, cached_version, deserializer=None):
-            return server_data, 1
+        def mock_fetch_object_data(ref, cached_version):
+            return FetchResult(mode=FetchMode.FULL, version=1, base=server_data)
 
         monkeypatch.setattr(cache_module, "_fetch_object_data", mock_fetch_object_data)
 
@@ -252,8 +295,8 @@ class TestClientSideCaching:
 
         new_data = {"new": "data"}
 
-        def mock_fetch_object_data(ref, cached_version, deserializer=None):
-            return new_data, 2
+        def mock_fetch_object_data(ref, cached_version):
+            return FetchResult(mode=FetchMode.FULL, version=2, base=new_data)
 
         monkeypatch.setattr(cache_module, "_fetch_object_data", mock_fetch_object_data)
 
@@ -264,6 +307,118 @@ class TestClientSideCaching:
         with _cache_lock:
             assert _object_cache[cache_key].version == 2
             assert _object_cache[cache_key].data == new_data
+
+    def test_patch_only_response_appends_to_cached_data(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        cache_key = ("grpc://host:9090", "app/session/obj-patch")
+        cached_obj = Object(version=1, data=[1])
+
+        with _cache_lock:
+            _object_cache[cache_key] = cached_obj
+
+        def mock_fetch_object_data(ref, cached_version):
+            assert cached_version == 1
+            return FetchResult(
+                mode=FetchMode.PATCHES,
+                version=3,
+                patches=[
+                    Patch(version=2, data=[2]),
+                    Patch(version=3, data=[3]),
+                ],
+            )
+
+        monkeypatch.setattr(cache_module, "_fetch_object_data", mock_fetch_object_data)
+
+        def merge_lists(base_data, deltas):
+            result = list(base_data)
+            for delta in deltas:
+                result.extend(delta)
+            return result
+
+        ref = ObjectRef(endpoint="grpc://host:9090", key="app/session/obj-patch", version=1)
+        result = cache_module.get_object(ref, deserializer=merge_lists)
+
+        assert result == [1, 2, 3]
+        with _cache_lock:
+            cached = _object_cache[cache_key]
+            assert cached.version == 3
+            assert [patch.version for patch in cached.patches] == [2, 3]
+
+    def test_patch_only_response_without_cache_falls_back_to_full_fetch(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        calls = []
+
+        def mock_fetch_object_data(ref, cached_version):
+            calls.append(cached_version)
+            if len(calls) == 1:
+                return FetchResult(
+                    mode=FetchMode.PATCHES,
+                    version=2,
+                    patches=[Patch(version=2, data=[2])],
+                )
+            return FetchResult(
+                mode=FetchMode.FULL,
+                version=2,
+                base=[1],
+                patches=[Patch(version=2, data=[2])],
+            )
+
+        monkeypatch.setattr(cache_module, "_fetch_object_data", mock_fetch_object_data)
+
+        def merge_lists(base_data, deltas):
+            result = list(base_data)
+            for delta in deltas:
+                result.extend(delta)
+            return result
+
+        ref = ObjectRef(endpoint="grpc://host:9090", key="app/session/obj-patch-miss", version=2)
+        result = cache_module.get_object(ref, deserializer=merge_lists)
+
+        assert calls == [0, 0]
+        assert result == [1, 2]
+        with _cache_lock:
+            cached = _object_cache[("grpc://host:9090", "app/session/obj-patch-miss")]
+            assert cached.version == 2
+            assert [patch.data for patch in cached.patches] == [[2]]
+
+    def test_not_modified_reuses_materialized_deserializer_result(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        cache_key = ("grpc://host:9090", "app/session/obj-not-modified")
+        cached_obj = Object(
+            version=2,
+            data=[1],
+            patches=[Patch(version=2, data=[2])],
+        )
+
+        with _cache_lock:
+            _object_cache[cache_key] = cached_obj
+
+        fetch_calls = {"count": 0}
+        deserializer_calls = {"count": 0}
+
+        def mock_fetch_object_data(ref, cached_version):
+            fetch_calls["count"] += 1
+            assert cached_version == 2
+            return None
+
+        monkeypatch.setattr(cache_module, "_fetch_object_data", mock_fetch_object_data)
+
+        def merge_lists(base_data, deltas):
+            deserializer_calls["count"] += 1
+            result = list(base_data)
+            for delta in deltas:
+                result.extend(delta)
+            return result
+
+        ref = ObjectRef(endpoint="grpc://host:9090", key="app/session/obj-not-modified", version=2)
+
+        assert cache_module.get_object(ref, deserializer=merge_lists) == [1, 2]
+        assert cache_module.get_object(ref, deserializer=merge_lists) == [1, 2]
+        assert fetch_calls["count"] == 2
+        assert deserializer_calls["count"] == 1
 
     def test_version_zero_bypasses_cache(self, monkeypatch):
         from flamepy.core import cache as cache_module
@@ -277,9 +432,9 @@ class TestClientSideCaching:
 
         server_data = {"fresh": "data"}
 
-        def mock_fetch_object_data(ref, cached_version, deserializer=None):
+        def mock_fetch_object_data(ref, cached_version):
             assert cached_version == 0
-            return server_data, 6
+            return FetchResult(mode=FetchMode.FULL, version=6, base=server_data)
 
         monkeypatch.setattr(cache_module, "_fetch_object_data", mock_fetch_object_data)
 
@@ -291,13 +446,16 @@ class TestClientSideCaching:
     def test_deserializer_combines_base_and_deltas(self, monkeypatch):
         from flamepy.core import cache as cache_module
 
-        def mock_fetch_object_data(ref, cached_version, deserializer=None):
-            base = [1, 2, 3]
-            delta1 = [4, 5]
-            delta2 = [6]
-            if deserializer is not None:
-                return deserializer(base, [delta1, delta2]), 1
-            return base, 1
+        def mock_fetch_object_data(ref, cached_version):
+            return FetchResult(
+                mode=FetchMode.FULL,
+                version=3,
+                base=[1, 2, 3],
+                patches=[
+                    Patch(version=2, data=[4, 5]),
+                    Patch(version=3, data=[6]),
+                ],
+            )
 
         monkeypatch.setattr(cache_module, "_fetch_object_data", mock_fetch_object_data)
 
@@ -312,14 +470,55 @@ class TestClientSideCaching:
 
         assert result == [1, 2, 3, 4, 5, 6]
 
+    def test_fetch_object_data_parses_full_response_rows(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        table = self._response_table(
+            [
+                (1, ObjectResponseKind.BASE, [1]),
+                (2, ObjectResponseKind.PATCH, [2]),
+                (3, ObjectResponseKind.PATCH, [3]),
+            ]
+        )
+        self._patch_fetch_client(monkeypatch, table)
+
+        result = cache_module._fetch_object_data(
+            ObjectRef(endpoint="grpc://host:9090", key="app/session/obj6", version=1),
+            0,
+        )
+
+        assert result.mode == FetchMode.FULL
+        assert result.version == 3
+        assert result.base == [1]
+        assert [patch.data for patch in result.patches] == [[2], [3]]
+
+    def test_fetch_object_data_rejects_base_after_patch(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        table = self._response_table(
+            [
+                (2, ObjectResponseKind.PATCH, [2]),
+                (1, ObjectResponseKind.BASE, [1]),
+            ]
+        )
+        self._patch_fetch_client(monkeypatch, table)
+
+        ref = ObjectRef(endpoint="grpc://host:9090", key="app/session/obj7", version=1)
+        try:
+            cache_module._fetch_object_data(ref, 1)
+        except ValueError as exc:
+            assert "base row" in str(exc)
+        else:
+            raise AssertionError("expected ValueError for malformed full response")
+
     def test_thread_safety(self, monkeypatch):
         from flamepy.core import cache as cache_module
 
         results = []
         errors = []
 
-        def mock_fetch_object_data(ref, cached_version, deserializer=None):
-            return {"thread": ref.key}, 1
+        def mock_fetch_object_data(ref, cached_version):
+            return FetchResult(mode=FetchMode.FULL, version=1, base={"thread": ref.key})
 
         monkeypatch.setattr(cache_module, "_fetch_object_data", mock_fetch_object_data)
 

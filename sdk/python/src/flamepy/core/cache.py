@@ -15,7 +15,8 @@ import logging
 import threading
 import uuid
 from collections import OrderedDict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
@@ -53,6 +54,19 @@ logger = logging.getLogger(__name__)
 Deserializer = Callable[[Any, List[Any]], Any]
 
 WILDCARD_SESSION = "*"
+OBJECT_FIELD_VERSION = "version"
+OBJECT_FIELD_DATA = "data"
+OBJECT_RESPONSE_FIELD_KIND = "kind"
+
+
+class FetchMode(str, Enum):
+    FULL = "full"
+    PATCHES = "patches"
+
+
+class ObjectResponseKind(str, Enum):
+    BASE = "base"
+    PATCH = "patch"
 
 
 @dataclass
@@ -80,15 +94,31 @@ class ObjectRef:
 
 
 @dataclass
-class Object:
-    """Cached object with version and deserialized data.
+class Patch:
+    version: int
+    data: Any
 
-    Note: Stores deserialized data to avoid repeated deserialization.
-    Different deserializers on the same cached object are not supported.
+
+@dataclass
+class Object:
+    """Cached object with base data, versioned patches, and materialized views.
+
+    The `data` field stores the base object to preserve the existing public
+    behavior where get_object(..., deserializer=None) returns only the base.
     """
 
     version: int
     data: Any
+    patches: List[Patch] = field(default_factory=list)
+    materialized: Dict[Optional[int], Any] = field(default_factory=dict)
+
+
+@dataclass
+class FetchResult:
+    mode: FetchMode
+    version: int
+    base: Any = None
+    patches: List[Patch] = field(default_factory=list)
 
 
 # Client-side LRU cache with max size limit (O(1) operations using OrderedDict)
@@ -129,6 +159,20 @@ def _cache_remove_prefix(prefix: str) -> None:
         keys_to_remove = [k for k in _object_cache if k[1].startswith(prefix)]
         for key in keys_to_remove:
             _object_cache.pop(key, None)
+
+
+def _materialize_object(obj: Object, deserializer: Optional[Deserializer] = None) -> Any:
+    materialized_key = None if deserializer is None else id(deserializer)
+    if materialized_key in obj.materialized:
+        return obj.materialized[materialized_key]
+
+    if deserializer is None:
+        data = obj.data
+    else:
+        data = deserializer(obj.data, [patch.data for patch in obj.patches])
+
+    obj.materialized[materialized_key] = data
+    return data
 
 
 @dataclass(frozen=True)
@@ -350,8 +394,8 @@ def _serialize_object(obj: Any) -> pa.RecordBatch:
 
     schema = pa.schema(
         [
-            pa.field("version", pa.uint64()),
-            pa.field("data", pa.binary()),
+            pa.field(OBJECT_FIELD_VERSION, pa.uint64()),
+            pa.field(OBJECT_FIELD_DATA, pa.binary()),
         ]
     )
 
@@ -366,7 +410,7 @@ def _deserialize_object(batch: pa.RecordBatch) -> Any:
 
     Automatically detects the serialization format from the type marker.
     """
-    data_array = batch.column("data")
+    data_array = batch.column(OBJECT_FIELD_DATA)
     data_bytes = data_array[0].as_py()
 
     return _deserialize_object_data(data_bytes)
@@ -632,25 +676,48 @@ def get_object(ref: ObjectRef, deserializer: Optional[Deserializer] = None) -> A
         cached_version = cached.version if cached else 0
 
     logger.debug(f"get_object: key={ref.key}, cached_version={cached_version}")
-    result = _fetch_object_data(ref, cached_version, deserializer)
+    result = _fetch_object_data(ref, cached_version)
 
     if result is None:
         if cached_version > 0:
             cached = _cache_get(cache_key)
             if cached is not None:
                 logger.debug(f"get_object: not_modified, returning cached for key={ref.key}")
-                return cached.data
+                return _materialize_object(cached, deserializer)
         logger.error(f"get_object: cache miss after not_modified! key={ref.key}, cached_version={cached_version}")
         raise ValueError(f"Object not found: {ref.key}")
 
-    data, version = result
-    _cache_put(cache_key, Object(version=version, data=data))
+    if result.mode == FetchMode.FULL:
+        cached = Object(
+            version=result.version,
+            data=result.base,
+            patches=result.patches,
+        )
+        _cache_put(cache_key, cached)
+    elif result.mode == FetchMode.PATCHES:
+        cached = _cache_get(cache_key)
+        if cached is None:
+            full_result = _fetch_object_data(ref, 0)
+            if full_result is None or full_result.mode != FetchMode.FULL:
+                raise ValueError(f"Object not found: {ref.key}")
+            cached = Object(
+                version=full_result.version,
+                data=full_result.base,
+                patches=full_result.patches,
+            )
+        else:
+            cached.patches.extend(result.patches)
+            cached.version = result.version
+            cached.materialized.clear()
+        _cache_put(cache_key, cached)
+    else:
+        raise ValueError(f"Unexpected object fetch mode: {result.mode}")
 
-    logger.debug(f"get_object: key={ref.key}, version={version}")
-    return data
+    logger.debug(f"get_object: key={ref.key}, version={cached.version}")
+    return _materialize_object(cached, deserializer)
 
 
-def _fetch_object_data(ref: ObjectRef, cached_version: int, deserializer: Optional[Deserializer] = None) -> Optional[tuple[Any, int]]:
+def _fetch_object_data(ref: ObjectRef, cached_version: int) -> Optional[FetchResult]:
     tls_config = _get_cache_tls_config()
     client = _get_flight_client(ref.endpoint, tls_config)
 
@@ -662,17 +729,61 @@ def _fetch_object_data(ref: ObjectRef, cached_version: int, deserializer: Option
     if table.num_rows == 0:
         return None
 
-    batches = table.to_batches()
-    base = _deserialize_object(batches[0])
-    version = batches[0].column("version")[0].as_py()
+    if OBJECT_RESPONSE_FIELD_KIND not in table.column_names:
+        batches = table.to_batches()
+        base = _deserialize_object(batches[0])
+        version = batches[0].column(OBJECT_FIELD_VERSION)[0].as_py()
+        patches = [
+            Patch(
+                version=batch.column(OBJECT_FIELD_VERSION)[0].as_py(),
+                data=_deserialize_object(batch),
+            )
+            for batch in batches[1:]
+        ]
+        return FetchResult(
+            mode=FetchMode.FULL,
+            version=max([version] + [patch.version for patch in patches]),
+            base=base,
+            patches=patches,
+        )
 
-    if deserializer is not None:
-        deltas = [_deserialize_object(batch) for batch in batches[1:]]
-        data = deserializer(base, deltas)
-    else:
-        data = base
+    versions = table.column(OBJECT_FIELD_VERSION)
+    kinds = table.column(OBJECT_RESPONSE_FIELD_KIND)
+    data_values = table.column(OBJECT_FIELD_DATA)
+    rows: list[tuple[int, ObjectResponseKind, Any]] = []
+    for idx in range(table.num_rows):
+        version = versions[idx].as_py()
+        kind_value = kinds[idx].as_py()
+        try:
+            kind = ObjectResponseKind(kind_value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid object response row kind: {kind_value}") from exc
+        data = _deserialize_object_data(data_values[idx].as_py())
+        rows.append((version, kind, data))
 
-    return data, version
+    base_rows = [row for row in rows if row[1] == ObjectResponseKind.BASE]
+    patch_rows = [row for row in rows if row[1] == ObjectResponseKind.PATCH]
+    max_version = max(row[0] for row in rows)
+    patch_versions = [row[0] for row in patch_rows]
+    if patch_versions != sorted(patch_versions) or len(patch_versions) != len(set(patch_versions)):
+        raise ValueError("Patch response rows must have unique increasing versions")
+
+    if base_rows:
+        first_base_index = next(idx for idx, row in enumerate(rows) if row[1] == ObjectResponseKind.BASE)
+        if len(base_rows) != 1 or first_base_index != 0:
+            raise ValueError("Full object response must start with exactly one base row")
+        patches = [Patch(version=row[0], data=row[2]) for row in patch_rows]
+        return FetchResult(
+            mode=FetchMode.FULL,
+            version=max_version,
+            base=base_rows[0][2],
+            patches=patches,
+        )
+
+    patches = [Patch(version=row[0], data=row[2]) for row in patch_rows]
+    if not patches:
+        return None
+    return FetchResult(mode=FetchMode.PATCHES, version=max_version, patches=patches)
 
 
 def update_object(ref: ObjectRef, new_obj: Any) -> "ObjectRef":
@@ -911,7 +1022,7 @@ def download_object(ref: ObjectRef, dest_path: str) -> None:
     try:
         with open(dest_path, "wb") as f:
             for batch in reader:
-                data_array = batch.column("data")
+                data_array = batch.column(OBJECT_FIELD_DATA)
                 for i in range(len(data_array)):
                     chunk = data_array[i].as_py()
                     if chunk:
