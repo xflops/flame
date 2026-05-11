@@ -11,6 +11,7 @@ from flamepy.core.cache import (
     _cache_lock,
     _deserialize_object,
     _deserialize_object_data,
+    _MAGIC_PREFIX_LEN,
     _object_cache,
     _serialize_object,
     _serialize_object_data,
@@ -56,7 +57,7 @@ class TestFastPathSerialization:
         arr = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float64)
         data = _serialize_object_data(arr)
 
-        assert data[0:1] == _TYPE_NUMPY
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_NUMPY
         result = _deserialize_object_data(data)
         np.testing.assert_array_equal(result, arr)
 
@@ -71,7 +72,7 @@ class TestFastPathSerialization:
 
         for original in test_cases:
             data = _serialize_object_data(original)
-            assert data[0:1] == _TYPE_NUMPY
+            assert data[:_MAGIC_PREFIX_LEN] == _TYPE_NUMPY
             result = _deserialize_object_data(data)
             np.testing.assert_array_equal(result, original)
             assert result.dtype == original.dtype
@@ -90,7 +91,7 @@ class TestFastPathSerialization:
         deserialize_time = time.perf_counter() - start
 
         np.testing.assert_array_almost_equal(result, large_arr)
-        assert data[0:1] == _TYPE_NUMPY
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_NUMPY
         assert serialize_time < 0.5
         assert deserialize_time < 0.5
 
@@ -98,7 +99,7 @@ class TestFastPathSerialization:
         table = pa.table({"col1": [1, 2, 3], "col2": ["a", "b", "c"]})
         data = _serialize_object_data(table)
 
-        assert data[0:1] == _TYPE_ARROW_TABLE
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_ARROW_TABLE
         result = _deserialize_object_data(data)
         assert result.equals(table)
 
@@ -106,7 +107,7 @@ class TestFastPathSerialization:
         batch = pa.RecordBatch.from_pydict({"x": [1, 2, 3], "y": [4.0, 5.0, 6.0]})
         data = _serialize_object_data(batch)
 
-        assert data[0:1] == _TYPE_ARROW_BATCH
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_ARROW_BATCH
         result = _deserialize_object_data(data)
         assert result.equals(batch)
 
@@ -114,7 +115,7 @@ class TestFastPathSerialization:
         arr = pa.array([1, 2, 3, 4, 5])
         data = _serialize_object_data(arr)
 
-        assert data[0:1] == _TYPE_ARROW_ARRAY
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_ARROW_ARRAY
         result = _deserialize_object_data(data)
         assert result.equals(arr)
 
@@ -122,7 +123,7 @@ class TestFastPathSerialization:
         chunked = pa.chunked_array([[1, 2], [3, 4]])
         data = _serialize_object_data(chunked)
 
-        assert data[0:1] == _TYPE_CLOUDPICKLE
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_CLOUDPICKLE
         result = _deserialize_object_data(data)
         assert result.equals(chunked)
 
@@ -130,7 +131,7 @@ class TestFastPathSerialization:
         obj = {"key": "value", "number": 42}
         data = _serialize_object_data(obj)
 
-        assert data[0:1] == _TYPE_CLOUDPICKLE
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_CLOUDPICKLE
         result = _deserialize_object_data(data)
         assert result == obj
 
@@ -138,7 +139,7 @@ class TestFastPathSerialization:
         obj = [1, 2, 3, "mixed", {"nested": True}]
         data = _serialize_object_data(obj)
 
-        assert data[0:1] == _TYPE_CLOUDPICKLE
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_CLOUDPICKLE
         result = _deserialize_object_data(data)
         assert result == obj
 
@@ -169,7 +170,7 @@ class TestFastPathSerialization:
         assert not non_contiguous.flags.f_contiguous
 
         data = _serialize_object_data(non_contiguous)
-        assert data[0:1] == _TYPE_CLOUDPICKLE
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_CLOUDPICKLE
 
         result = _deserialize_object_data(data)
         np.testing.assert_array_equal(result, non_contiguous)
@@ -179,7 +180,7 @@ class TestFastPathSerialization:
         assert arr.flags.f_contiguous
 
         data = _serialize_object_data(arr)
-        assert data[0:1] == _TYPE_NUMPY
+        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_NUMPY
 
         result = _deserialize_object_data(data)
         np.testing.assert_array_equal(result, arr)

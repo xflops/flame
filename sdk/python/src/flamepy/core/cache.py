@@ -11,15 +11,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import io
 import logging
-import struct
 import threading
 import uuid
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import bson
 import cloudpickle
@@ -31,15 +29,17 @@ from flamepy.core.types import FlameClientCache, FlameClientTls, FlameContext
 if TYPE_CHECKING:
     import numpy as np
 
-# Type markers for fast-path serialization (first byte of data)
-# Using bytes outside printable ASCII to avoid collision with pickle opcodes
-_TYPE_CLOUDPICKLE = b"\x00"  # Default: cloudpickle
-_TYPE_NUMPY = b"\x01"  # numpy array via Arrow tensor
-_TYPE_ARROW_TABLE = b"\x02"  # PyArrow Table via IPC
-_TYPE_ARROW_ARRAY = b"\x03"  # PyArrow Array via IPC
-_TYPE_ARROW_BATCH = b"\x04"  # PyArrow RecordBatch via IPC
+# Magic prefix for fast-path serialization format identification.
+# Using "FLM" + version byte to avoid collision with pickle protocol headers.
+# Pickle protocols start with \x80 (protocol 2+) or opcodes like \x28, \x5d, etc.
+_MAGIC_PREFIX = b"FLM"
+_TYPE_CLOUDPICKLE = b"FLM\x00"
+_TYPE_NUMPY = b"FLM\x01"
+_TYPE_ARROW_TABLE = b"FLM\x02"
+_TYPE_ARROW_ARRAY = b"FLM\x03"
+_TYPE_ARROW_BATCH = b"FLM\x04"
+_MAGIC_PREFIX_LEN = len(_MAGIC_PREFIX) + 1  # 4 bytes total
 
-# Try to import numpy (optional dependency)
 try:
     import numpy as np
 
@@ -221,8 +221,9 @@ def _serialize_numpy(arr: "np.ndarray") -> bytes:
     """Serialize numpy array using Arrow's zero-copy tensor format."""
     tensor = pa.Tensor.from_numpy(arr)
     sink = pa.BufferOutputStream()
+    sink.write(_TYPE_NUMPY)
     pa.ipc.write_tensor(tensor, sink)
-    return _TYPE_NUMPY + sink.getvalue().to_pybytes()
+    return sink.getvalue().to_pybytes()
 
 
 def _deserialize_numpy(data: bytes) -> "np.ndarray":
@@ -235,9 +236,10 @@ def _deserialize_numpy(data: bytes) -> "np.ndarray":
 def _serialize_arrow_table(table: pa.Table) -> bytes:
     """Serialize PyArrow Table using IPC stream format."""
     sink = pa.BufferOutputStream()
+    sink.write(_TYPE_ARROW_TABLE)
     with pa.ipc.new_stream(sink, table.schema) as writer:
         writer.write_table(table)
-    return _TYPE_ARROW_TABLE + sink.getvalue().to_pybytes()
+    return sink.getvalue().to_pybytes()
 
 
 def _deserialize_arrow_table(data: bytes) -> pa.Table:
@@ -249,9 +251,10 @@ def _deserialize_arrow_table(data: bytes) -> pa.Table:
 def _serialize_arrow_batch(batch: pa.RecordBatch) -> bytes:
     """Serialize PyArrow RecordBatch using IPC stream format."""
     sink = pa.BufferOutputStream()
+    sink.write(_TYPE_ARROW_BATCH)
     with pa.ipc.new_stream(sink, batch.schema) as writer:
         writer.write_batch(batch)
-    return _TYPE_ARROW_BATCH + sink.getvalue().to_pybytes()
+    return sink.getvalue().to_pybytes()
 
 
 def _deserialize_arrow_batch(data: bytes) -> pa.RecordBatch:
@@ -264,9 +267,10 @@ def _serialize_arrow_array(arr: pa.Array) -> bytes:
     """Serialize PyArrow Array by wrapping in a RecordBatch."""
     batch = pa.RecordBatch.from_arrays([arr], names=["data"])
     sink = pa.BufferOutputStream()
+    sink.write(_TYPE_ARROW_ARRAY)
     with pa.ipc.new_stream(sink, batch.schema) as writer:
         writer.write_batch(batch)
-    return _TYPE_ARROW_ARRAY + sink.getvalue().to_pybytes()
+    return sink.getvalue().to_pybytes()
 
 
 def _deserialize_arrow_array(data: bytes) -> pa.Array:
@@ -309,31 +313,30 @@ def _serialize_object_data(obj: Any) -> bytes:
 
 
 def _deserialize_object_data(data: bytes) -> Any:
-    """Deserialize object, detecting format from type marker byte."""
-    if len(data) == 0:
-        raise ValueError("Empty data cannot be deserialized")
+    """Deserialize object, detecting format from magic prefix."""
+    if len(data) < _MAGIC_PREFIX_LEN:
+        return cloudpickle.loads(data)
 
-    type_marker = data[0:1]
-    payload = data[1:]
+    prefix = data[:_MAGIC_PREFIX_LEN]
+    payload = data[_MAGIC_PREFIX_LEN:]
 
-    if type_marker == _TYPE_NUMPY:
+    if prefix == _TYPE_NUMPY:
         if not _HAS_NUMPY:
             raise ImportError("numpy is required to deserialize this object")
         return _deserialize_numpy(payload)
 
-    if type_marker == _TYPE_ARROW_TABLE:
+    if prefix == _TYPE_ARROW_TABLE:
         return _deserialize_arrow_table(payload)
 
-    if type_marker == _TYPE_ARROW_BATCH:
+    if prefix == _TYPE_ARROW_BATCH:
         return _deserialize_arrow_batch(payload)
 
-    if type_marker == _TYPE_ARROW_ARRAY:
+    if prefix == _TYPE_ARROW_ARRAY:
         return _deserialize_arrow_array(payload)
 
-    if type_marker == _TYPE_CLOUDPICKLE:
+    if prefix == _TYPE_CLOUDPICKLE:
         return _deserialize_cloudpickle(payload)
 
-    # Legacy format: no type marker, assume cloudpickle
     return cloudpickle.loads(data)
 
 
