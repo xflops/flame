@@ -1,5 +1,11 @@
 # Design: Enhance Fairshare for batch_size
 
+**Status: Deprecated** — the FairShare plugin has been removed from the scheduler as
+part of the slots-removal cleanup (Phase 1). This document is retained as a historical
+record of the design that motivated the batch-aware allocation behaviour, but the
+FairShare plugin no longer exists in the codebase. Equivalent fairness within a
+priority tier is now provided by `DRFPlugin` (see RFE433).
+
 **Status:** Draft  
 **Author:** Klaus Ma  
 **Created:** 2026-04-20  

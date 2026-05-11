@@ -192,13 +192,16 @@ mod tests {
             tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
                 id: ssn_1_id.clone(),
                 application: "flmtest".to_string(),
-                slots: 1,
                 common_data: None,
                 min_instances: 0,
                 max_instances: None,
                 batch_size: 1,
                 priority: 0,
-                resreq: None,
+                resreq: Some(common::apis::ResourceRequirement {
+                    cpu: 1,
+                    memory: 1024 * 1024 * 1024,
+                    gpu: 0,
+                }),
             }))?;
 
         for _ in 0..task_num {

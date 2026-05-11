@@ -93,7 +93,6 @@ struct TaskMetadata {
 struct SessionMetadata {
     pub id: String,
     pub application: String,
-    pub slots: u32,
     pub version: u32,
     pub state: i32,
     pub creation_time: i64,
@@ -174,7 +173,6 @@ struct ExecutorMetadata {
     pub resreq_memory: u64,
     #[serde(default)]
     pub resreq_gpu: i32,
-    pub slots: u32,
     pub shim: i32,
     pub task_id: Option<i64>,
     pub ssn_id: Option<String>,
@@ -766,7 +764,6 @@ impl FilesystemEngine {
         Ok(Session {
             id: meta.id.clone(),
             application: meta.application.clone(),
-            slots: meta.slots,
             version: meta.version,
             common_data,
             tasks: std::collections::HashMap::new(),
@@ -1018,7 +1015,6 @@ impl Engine for FilesystemEngine {
         let meta = SessionMetadata {
             id: attr.id.clone(),
             application: attr.application.clone(),
-            slots: attr.slots,
             version: 1,
             state: SessionState::Open as i32,
             creation_time: Utc::now().timestamp(),
@@ -1072,7 +1068,7 @@ impl Engine for FilesystemEngine {
                 let ssn = self.session_from_metadata(&meta)?;
 
                 // If spec provided, validate full session attributes (same as sqlite engine
-                // and in-memory cache). Only checking application/slots was insufficient:
+                // and in-memory cache). Only checking application was insufficient:
                 // a persisted session could have batch_size/min_instances/max_instances that
                 // differ from the client spec, leading to gang scheduling deadlocks (tasks
                 // never allocated) without a clear error.
@@ -1483,7 +1479,6 @@ impl Engine for FilesystemEngine {
             resreq_cpu: executor.resreq.cpu,
             resreq_memory: executor.resreq.memory,
             resreq_gpu: executor.resreq.gpu,
-            slots: executor.slots,
             shim: i32::from(executor.shim),
             task_id: executor.task_id,
             ssn_id: executor.ssn_id.clone(),
@@ -1513,7 +1508,6 @@ impl Engine for FilesystemEngine {
                     memory: meta.resreq_memory,
                     gpu: meta.resreq_gpu,
                 },
-                slots: meta.slots,
                 shim: Shim::try_from(meta.shim).unwrap_or_default(),
                 task_id: meta.task_id.map(|t| t as TaskID),
                 ssn_id: meta.ssn_id,
@@ -1534,7 +1528,6 @@ impl Engine for FilesystemEngine {
             resreq_cpu: executor.resreq.cpu,
             resreq_memory: executor.resreq.memory,
             resreq_gpu: executor.resreq.gpu,
-            slots: executor.slots,
             shim: i32::from(executor.shim),
             task_id: executor.task_id,
             ssn_id: executor.ssn_id.clone(),
@@ -1566,7 +1559,6 @@ impl Engine for FilesystemEngine {
                 memory: meta.resreq_memory,
                 gpu: meta.resreq_gpu,
             },
-            slots: meta.slots,
             shim: Shim::try_from(meta.shim).unwrap_or_default(),
             task_id: meta.task_id.map(|t| t as TaskID),
             ssn_id: meta.ssn_id,
@@ -1632,7 +1624,6 @@ impl Engine for FilesystemEngine {
                                 memory: meta.resreq_memory,
                                 gpu: meta.resreq_gpu,
                             },
-                            slots: meta.slots,
                             shim: Shim::try_from(meta.shim).unwrap_or_default(),
                             task_id: meta.task_id.map(|t| t as TaskID),
                             ssn_id: meta.ssn_id,
@@ -1843,7 +1834,6 @@ mod tests {
         let ssn_attr = SessionAttributes {
             id: "test-session".to_string(),
             application: "test-app".to_string(),
-            slots: 1,
             common_data: Some(Bytes::from("test data")),
             min_instances: 0,
             max_instances: None,
@@ -1910,7 +1900,6 @@ mod tests {
         let ssn_attr = SessionAttributes {
             id: "test-session".to_string(),
             application: "test-app".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,
@@ -2049,7 +2038,6 @@ mod tests {
         let ssn_attr = SessionAttributes {
             id: "test-session".to_string(),
             application: "test-app".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,
@@ -2094,7 +2082,6 @@ mod tests {
         let ssn_attr = SessionAttributes {
             id: "test-session".to_string(),
             application: "test-app".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,
@@ -2156,7 +2143,6 @@ mod tests {
         let ssn_attr = SessionAttributes {
             id: "test-session".to_string(),
             application: "test-app".to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,
@@ -2257,7 +2243,6 @@ mod tests {
                 memory: 1024,
                 gpu: 0,
             },
-            slots: 1,
             shim: Shim::Host,
             task_id: None,
             ssn_id: None,
@@ -2324,7 +2309,6 @@ mod tests {
                     memory: 1024,
                     gpu: 0,
                 },
-                slots: 1,
                 shim: Shim::Host,
                 task_id: None,
                 ssn_id: None,

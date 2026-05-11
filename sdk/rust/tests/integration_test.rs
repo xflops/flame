@@ -78,7 +78,6 @@ async fn test_create_session() -> Result<(), FlameError> {
     let ssn_attr = SessionAttributes {
         id: String::from("ssn-1-test-create-session"),
         application: FLAME_DEFAULT_APP.to_string(),
-        slots: 1,
         common_data: None,
         min_instances: 0,
         max_instances: None,
@@ -105,7 +104,6 @@ async fn test_create_multiple_sessions() -> Result<(), FlameError> {
         let ssn_attr = SessionAttributes {
             id: format!("ssn-1-test-create-multiple-sessions-{}", i),
             application: FLAME_DEFAULT_APP.to_string(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,
@@ -130,7 +128,6 @@ async fn test_create_session_with_tasks() -> Result<(), FlameError> {
     let ssn_attr = SessionAttributes {
         id: String::from("ssn-1-test-create-session-with-tasks"),
         application: FLAME_DEFAULT_APP.to_string(),
-        slots: 1,
         common_data: None,
         min_instances: 0,
         max_instances: None,
@@ -193,7 +190,6 @@ async fn test_create_multiple_sessions_with_tasks() -> Result<(), FlameError> {
     let ssn_1_attr = SessionAttributes {
         id: String::from("ssn-1-test-create-multiple-sessions-with-tasks"),
         application: FLAME_DEFAULT_APP.to_string(),
-        slots: 1,
         common_data: None,
         min_instances: 0,
         max_instances: None,
@@ -207,7 +203,6 @@ async fn test_create_multiple_sessions_with_tasks() -> Result<(), FlameError> {
     let ssn_2_attr = SessionAttributes {
         id: String::from("ssn-2-test-create-multiple-sessions-with-tasks"),
         application: FLAME_DEFAULT_APP.to_string(),
-        slots: 1,
         common_data: None,
         min_instances: 0,
         max_instances: None,
@@ -321,7 +316,6 @@ async fn test_batch_session() -> Result<(), FlameError> {
     let ssn_attr = SessionAttributes {
         id: String::from("ssn-batch-test"),
         application: FLAME_DEFAULT_APP.to_string(),
-        slots: 1,
         common_data: None,
         min_instances: 2, // Ensure batch_size executors are allocated
         max_instances: None,

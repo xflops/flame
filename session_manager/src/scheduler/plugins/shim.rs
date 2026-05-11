@@ -116,11 +116,7 @@ mod tests {
     use common::apis::{ExecutorState, ResourceRequirement, SessionState, Shim, TaskState};
 
     fn create_test_snapshot() -> SnapShot {
-        SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        })
+        SnapShot::new()
     }
 
     fn create_app_info(name: &str, shim: Shim) -> AppInfoPtr {
@@ -136,9 +132,13 @@ mod tests {
         Arc::new(SessionInfo {
             id: id.to_string(),
             application: app.to_string(),
-            slots: 1,
             tasks_status: [(TaskState::Pending, 1)].into_iter().collect(),
             state: SessionState::Open,
+            resreq: Some(ResourceRequirement {
+                cpu: 1,
+                memory: 1024,
+                gpu: 0,
+            }),
             ..Default::default()
         })
     }
@@ -152,7 +152,6 @@ mod tests {
                 memory: 1024,
                 gpu: 0,
             },
-            slots: 1,
             shim,
             state: ExecutorState::Idle,
             ..Default::default()

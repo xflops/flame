@@ -40,8 +40,6 @@ struct Cli {
     #[arg(long)]
     config: Option<String>,
     #[arg(short, long)]
-    slots: Option<u32>,
-    #[arg(short, long)]
     task_num: Option<i32>,
     /// The code to execute on worker nodes
     #[arg(short, long)]
@@ -63,7 +61,6 @@ fn parse_language(s: &str) -> Result<String, String> {
 }
 
 const DEFAULT_APP: &str = "flmexec";
-const DEFAULT_SLOTS: u32 = 1;
 const DEFAULT_TASK_NUM: i32 = 10;
 
 #[tokio::main]
@@ -73,7 +70,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let ctx = FlameContext::from_file(cli.config)?;
 
-    let slots = cli.slots.unwrap_or(DEFAULT_SLOTS);
     let task_num = cli.task_num.unwrap_or(DEFAULT_TASK_NUM);
 
     let current_ctx = ctx.get_current_context()?;
@@ -87,7 +83,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let ssn_attr = SessionAttributes {
         id: format!("{DEFAULT_APP}-{}", stdng::rand::short_name()),
         application: DEFAULT_APP.to_string(),
-        slots,
         common_data: None,
         min_instances: 0,
         max_instances: None,

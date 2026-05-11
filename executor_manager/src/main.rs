@@ -32,8 +32,6 @@ mod stream_handler;
 struct Cli {
     #[arg(long)]
     config: Option<String>,
-    #[arg(long)]
-    slots: Option<i32>,
 }
 
 #[tokio::main]

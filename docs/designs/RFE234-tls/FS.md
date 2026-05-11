@@ -49,7 +49,7 @@ The Session Manager and Object Cache can have **separate TLS configurations**, a
 cluster:
   name: flame
   endpoint: "https://flame-session-manager:8080"  # Use https:// for TLS
-  slot: "cpu=1,mem=2g"
+  resreq: "cpu=1,mem=2g"
   policy: priority
   storage: sqlite://flame.db
   
@@ -89,7 +89,7 @@ cache:
 | --------------------------------- | ------ | -------- | -------------------------------------------------------- |
 | `cluster.name`                    | string | Yes      | Cluster name                                             |
 | `cluster.endpoint`                | string | Yes      | Session Manager endpoint URL                             |
-| `cluster.slot`                    | string | No       | Default resource slot (e.g., "cpu=1,mem=2g")             |
+| `cluster.resreq`                  | string | No       | Default per-session resreq (e.g., "cpu=1,mem=2g")        |
 | `cluster.policy`                  | string | No       | Scheduling policy                                        |
 | `cluster.storage`                 | string | No       | Storage backend URL                                      |
 | `cluster.executors.shim`          | string | No       | Shim type: "host" or "wasm" (default: "host")            |
@@ -460,7 +460,7 @@ struct FlameExecutorsYaml {
 struct FlameClusterYaml {
     pub name: String,
     pub endpoint: String,
-    pub slot: Option<String>,
+    pub resreq: Option<String>,
     pub policy: Option<String>,
     pub storage: Option<String>,
     pub schedule_interval: Option<u64>,
@@ -512,7 +512,7 @@ pub struct FlameExecutors {
 pub struct FlameCluster {
     pub name: String,
     pub endpoint: String,
-    pub slot: ResourceRequirement,
+    pub resreq: Option<ResourceRequirement>,
     pub policy: String,
     pub storage: String,
     pub schedule_interval: u64,

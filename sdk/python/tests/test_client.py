@@ -90,7 +90,7 @@ def test_session_create_task_with_mocked_frontend(monkeypatch):
     fake_conn = DummyConnection()
     from flamepy.core.client import Session, SessionState
 
-    s = Session(connection=fake_conn, id="sess-1", application="app", slots=1, state=SessionState.OPEN, creation_time=datetime.now(timezone.utc), pending=0, running=0, succeed=0, failed=0, completion_time=None)
+    s = Session(connection=fake_conn, id="sess-1", application="app", state=SessionState.OPEN, creation_time=datetime.now(timezone.utc), pending=0, running=0, succeed=0, failed=0, completion_time=None)
 
     t = s.create_task(b"input")
     assert t.session_id == s.id

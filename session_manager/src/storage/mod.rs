@@ -21,9 +21,9 @@ use stdng::{lock_ptr, logs::TraceFn, trace_fn, MutexPtr};
 
 use common::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationPtr, CommonData, Event,
-    EventOwner, ExecutorID, ExecutorState, Node, NodePtr, ResourceRequirement, Session,
-    SessionAttributes, SessionID, SessionPtr, SessionState, Shim, Task, TaskGID, TaskID, TaskInput,
-    TaskOutput, TaskPtr, TaskResult, TaskState,
+    EventOwner, ExecutorID, ExecutorState, Node, NodePtr, Session, SessionAttributes, SessionID,
+    SessionPtr, SessionState, Shim, Task, TaskGID, TaskID, TaskInput, TaskOutput, TaskPtr,
+    TaskResult, TaskState,
 };
 use common::ctx::FlameClusterContext;
 use common::FlameError;
@@ -85,7 +85,7 @@ fn derive_events_path(storage_url: &str) -> String {
 
 impl Storage {
     pub fn snapshot(&self) -> Result<SnapShotPtr, FlameError> {
-        let res = SnapShot::new(self.context.cluster.slot.clone());
+        let res = SnapShot::new();
 
         {
             let node_map = lock_ptr!(self.nodes)?;
@@ -367,7 +367,6 @@ impl Storage {
                     id: exec.id.clone(),
                     node: exec.node.clone(),
                     resreq: exec.resreq.clone(),
-                    slots: exec.slots,
                     shim: exec.shim,
                     task_id: exec.task_id,
                     ssn_id: exec.ssn_id.clone(),
@@ -914,19 +913,20 @@ impl Storage {
         trace_fn!("Storage::create_executor");
         let ssn = self.get_session_ptr(ssn_id.clone())?;
 
-        let (resreq, slots) = {
+        let resreq = {
             let ssn = lock_ptr!(ssn)?;
-            (
-                ResourceRequirement::new(ssn.slots, &self.context.cluster.slot),
-                ssn.slots,
-            )
+            ssn.resreq.clone().ok_or_else(|| {
+                FlameError::InvalidState(format!(
+                    "session <{}> has no resreq; resolve_session_resreq must populate it",
+                    ssn_id
+                ))
+            })?
         };
 
         let e = Executor {
             id: Uuid::new_v4().to_string(),
             node: node_name.clone(),
             resreq,
-            slots,
             shim: Shim::default(),
             task_id: None,
             ssn_id: None,

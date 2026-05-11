@@ -174,7 +174,6 @@ pub fn validate_application_name(name: &str) -> Result<(), crate::FlameError> {
 pub struct SessionAttributes {
     pub id: SessionID,
     pub application: String,
-    pub slots: u32,
     pub common_data: Option<CommonData>,
     pub min_instances: u32,
     pub max_instances: Option<u32>,
@@ -188,7 +187,6 @@ impl Default for SessionAttributes {
         Self {
             id: String::new(),
             application: String::new(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,
@@ -215,7 +213,6 @@ pub struct SessionStatus {
 pub struct Session {
     pub id: SessionID,
     pub application: String,
-    pub slots: u32,
     pub version: u32,
     pub common_data: Option<CommonData>,
     pub tasks: HashMap<TaskID, TaskPtr>,
@@ -319,7 +316,6 @@ pub struct TaskContext {
 pub struct SessionContext {
     pub session_id: String,
     pub application: ApplicationContext,
-    pub slots: u32,
     pub common_data: Option<CommonData>,
 }
 
@@ -471,30 +467,54 @@ impl From<&String> for ResourceRequirement {
 }
 
 impl ResourceRequirement {
-    pub fn new(slots: u32, unit: &ResourceRequirement) -> Self {
+    /// Returns a new `ResourceRequirement` with each field scaled by `n`.
+    ///
+    /// `cpu` and `memory` are widened multiplications in `u64` (cast `n` to `u64`).
+    /// `gpu` uses `i32 * i32` (cast `n` to `i32`). Useful for deriving a session's
+    /// total resource demand from a per-task unit and a task count, e.g.
+    /// `unit.mul(slots)` for a session's per-executor allocation.
+    pub fn mul(&self, n: u32) -> Self {
         Self {
-            cpu: slots as u64 * unit.cpu,
-            memory: slots as u64 * unit.memory,
-            gpu: slots as i32 * unit.gpu,
+            cpu: self.cpu * (n as u64),
+            memory: self.memory * (n as u64),
+            gpu: self.gpu * (n as i32),
         }
     }
 
-    pub fn to_slots(&self, unit: &ResourceRequirement) -> u32 {
-        let cpu_slots = self.cpu.checked_div(unit.cpu).unwrap_or(u64::MAX);
+    /// Returns per-field minimum of `self` and `other`.
+    ///
+    /// Each field is reduced independently — the result is not necessarily equal
+    /// to either operand. Useful for clamping a demand to remaining cluster
+    /// capacity per resource dimension.
+    ///
+    /// Note: receiver is `self` (by value), not `&self`, to avoid Rust method
+    /// resolution preferring `Ord::min` (which `ResourceRequirement` derives via
+    /// `#[derive(Ord)]`). Trait methods that match the receiver type without
+    /// auto-ref win over inherent methods that need auto-ref, so `&self` here
+    /// would shadow this method behind `Ord::min`. The struct is small and
+    /// `Clone`, so consuming the receiver costs little.
+    pub fn min(self, other: &Self) -> Self {
+        Self {
+            cpu: self.cpu.min(other.cpu),
+            memory: self.memory.min(other.memory),
+            gpu: self.gpu.min(other.gpu),
+        }
+    }
 
-        let mem_slots = self.memory.checked_div(unit.memory).unwrap_or(u64::MAX);
-
-        let gpu_slots = if unit.gpu > 0 {
-            if self.gpu < 0 {
-                0
-            } else {
-                (self.gpu as u64) / (unit.gpu as u64)
-            }
-        } else {
-            u64::MAX
-        };
-
-        cpu_slots.min(mem_slots).min(gpu_slots) as u32
+    /// Returns per-field maximum of `self` and `other`.
+    ///
+    /// Each field is increased independently — the result is not necessarily
+    /// equal to either operand. Useful for enforcing a per-field floor (e.g.
+    /// `min_instances * unit`) on a demand value.
+    ///
+    /// Note: receiver is `self` (by value), not `&self`, for the same reason as
+    /// `min` — to avoid being shadowed by `Ord::max`.
+    pub fn max(self, other: &Self) -> Self {
+        Self {
+            cpu: self.cpu.max(other.cpu),
+            memory: self.memory.max(other.memory),
+            gpu: self.gpu.max(other.gpu),
+        }
     }
 
     pub(crate) fn parse_memory(s: &str) -> u64 {
@@ -511,10 +531,326 @@ impl ResourceRequirement {
             _ => s.parse::<u64>().unwrap_or(0),
         }
     }
+
+    /// Returns true iff cpu, memory, and gpu are all equal between self and other.
+    pub fn equal(&self, other: &Self) -> bool {
+        self.cpu == other.cpu && self.memory == other.memory && self.gpu == other.gpu
+    }
+
+    /// Returns true iff every field of self is `<=` the corresponding field of other.
+    /// Per-field semantics: the predicate must hold for cpu, memory, AND gpu simultaneously.
+    pub fn less_equal(&self, other: &Self) -> bool {
+        self.cpu <= other.cpu && self.memory <= other.memory && self.gpu <= other.gpu
+    }
+
+    /// Returns true iff every field of self is strictly `<` the corresponding field of other.
+    /// Per-field semantics: the predicate must hold for cpu, memory, AND gpu simultaneously.
+    pub fn less(&self, other: &Self) -> bool {
+        self.cpu < other.cpu && self.memory < other.memory && self.gpu < other.gpu
+    }
+
+    /// Returns true iff every field of self is `>=` the corresponding field of other.
+    /// Per-field semantics: the predicate must hold for cpu, memory, AND gpu simultaneously.
+    pub fn great_equal(&self, other: &Self) -> bool {
+        self.cpu >= other.cpu && self.memory >= other.memory && self.gpu >= other.gpu
+    }
+
+    /// Returns true iff every field of self is strictly `>` the corresponding field of other.
+    /// Per-field semantics: the predicate must hold for cpu, memory, AND gpu simultaneously.
+    pub fn great(&self, other: &Self) -> bool {
+        self.cpu > other.cpu && self.memory > other.memory && self.gpu > other.gpu
+    }
+
+    /// In-place addition of all three fields. Returns `&mut self` to allow chaining.
+    pub fn add(&mut self, other: &Self) -> &mut Self {
+        self.cpu += other.cpu;
+        self.memory += other.memory;
+        self.gpu += other.gpu;
+        self
+    }
+
+    /// In-place subtraction of all three fields. Returns `&mut self` to allow chaining.
+    ///
+    /// Returns `Err(FlameError::InvalidConfig)` when any field of self is `<` the
+    /// corresponding field of other (i.e. when `!self.great_equal(other)`), to avoid
+    /// underflow on `u64`/`i32` and to surface the misuse to callers. The error
+    /// message includes both operands' values to aid debugging.
+    pub fn sub(&mut self, other: &Self) -> Result<&mut Self, crate::FlameError> {
+        if !self.great_equal(other) {
+            return Err(crate::FlameError::InvalidConfig(format!(
+                "ResourceRequirement::sub underflow: self=(cpu={}, memory={}, gpu={}) < other=(cpu={}, memory={}, gpu={})",
+                self.cpu, self.memory, self.gpu, other.cpu, other.memory, other.gpu
+            )));
+        }
+        self.cpu -= other.cpu;
+        self.memory -= other.memory;
+        self.gpu -= other.gpu;
+        Ok(self)
+    }
 }
 
 impl fmt::Display for TaskGID {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}/{}", self.ssn_id, self.task_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rr(cpu: u64, memory: u64, gpu: i32) -> ResourceRequirement {
+        ResourceRequirement { cpu, memory, gpu }
+    }
+
+    #[test]
+    fn equal_true_when_all_fields_match() {
+        assert!(rr(1, 2, 3).equal(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn equal_false_when_cpu_differs() {
+        assert!(!rr(2, 2, 3).equal(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn equal_false_when_memory_differs() {
+        assert!(!rr(1, 4, 3).equal(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn equal_false_when_gpu_differs() {
+        assert!(!rr(1, 2, 5).equal(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn less_equal_true_when_strictly_less() {
+        assert!(rr(1, 2, 3).less_equal(&rr(2, 4, 5)));
+    }
+
+    #[test]
+    fn less_equal_true_when_equal() {
+        assert!(rr(1, 2, 3).less_equal(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn less_equal_false_when_one_field_greater() {
+        assert!(!rr(1, 5, 3).less_equal(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn less_equal_false_when_mixed_one_less_one_greater() {
+        // cpu less, gpu greater → must be false (per-field, all must be <=)
+        assert!(!rr(0, 2, 9).less_equal(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn less_true_when_strictly_less_in_all_fields() {
+        assert!(rr(1, 2, 3).less(&rr(2, 4, 5)));
+    }
+
+    #[test]
+    fn less_false_when_equal() {
+        assert!(!rr(1, 2, 3).less(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn less_false_when_one_field_equal() {
+        // cpu equal, others strictly less → must be false (strict on all)
+        assert!(!rr(1, 1, 1).less(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn great_equal_true_when_strictly_greater() {
+        assert!(rr(2, 4, 5).great_equal(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn great_equal_true_when_equal() {
+        assert!(rr(1, 2, 3).great_equal(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn great_equal_false_when_one_field_less() {
+        assert!(!rr(2, 1, 5).great_equal(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn great_equal_false_when_mixed_one_greater_one_less() {
+        assert!(!rr(2, 2, 1).great_equal(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn great_true_when_strictly_greater_in_all_fields() {
+        assert!(rr(2, 4, 5).great(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn great_false_when_equal() {
+        assert!(!rr(1, 2, 3).great(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn great_false_when_one_field_equal() {
+        // memory equal, others strictly greater → must be false (strict on all)
+        assert!(!rr(2, 2, 5).great(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn add_sums_all_three_fields() {
+        let mut a = rr(1, 2, 3);
+        let b = rr(4, 5, 6);
+        a.add(&b);
+        assert_eq!(a, rr(5, 7, 9));
+    }
+
+    #[test]
+    fn add_returns_mut_self_for_chaining() {
+        let mut a = rr(1, 1, 1);
+        let b = rr(2, 3, 4);
+        // Chain two adds; the second consumes the &mut self returned by the first.
+        a.add(&b).add(&b);
+        assert_eq!(a, rr(5, 7, 9));
+    }
+
+    #[test]
+    fn sub_success_when_all_fields_subtractable() {
+        let mut a = rr(10, 20, 30);
+        let b = rr(1, 2, 3);
+        let res = a.sub(&b);
+        assert!(res.is_ok());
+        assert_eq!(a, rr(9, 18, 27));
+    }
+
+    #[test]
+    fn sub_boundary_equal_operands_yields_zeros() {
+        let mut a = rr(5, 6, 7);
+        let b = rr(5, 6, 7);
+        let res = a.sub(&b);
+        assert!(res.is_ok());
+        assert_eq!(a, rr(0, 0, 0));
+    }
+
+    #[test]
+    fn sub_fails_when_cpu_would_underflow() {
+        let mut a = rr(0, 10, 10);
+        let b = rr(1, 1, 1);
+        let res = a.sub(&b);
+        assert!(matches!(res, Err(crate::FlameError::InvalidConfig(_))));
+        // self must remain unchanged on error.
+        assert_eq!(a, rr(0, 10, 10));
+    }
+
+    #[test]
+    fn sub_fails_when_memory_would_underflow() {
+        let mut a = rr(10, 0, 10);
+        let b = rr(1, 1, 1);
+        let res = a.sub(&b);
+        assert!(matches!(res, Err(crate::FlameError::InvalidConfig(_))));
+        assert_eq!(a, rr(10, 0, 10));
+    }
+
+    #[test]
+    fn sub_fails_when_gpu_would_underflow() {
+        let mut a = rr(10, 10, 0);
+        let b = rr(1, 1, 1);
+        let res = a.sub(&b);
+        assert!(matches!(res, Err(crate::FlameError::InvalidConfig(_))));
+        assert_eq!(a, rr(10, 10, 0));
+    }
+
+    #[test]
+    fn sub_fails_when_mixed_one_greater_one_less() {
+        // cpu greater, memory less → must fail (any field < other field is an error)
+        let mut a = rr(10, 0, 5);
+        let b = rr(1, 1, 1);
+        let res = a.sub(&b);
+        assert!(matches!(res, Err(crate::FlameError::InvalidConfig(_))));
+        assert_eq!(a, rr(10, 0, 5));
+    }
+
+    // ── mul ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mul_typical_scales_each_field() {
+        // (cpu=2, mem=1Gi, gpu=1) × 4 = (cpu=8, mem=4Gi, gpu=4)
+        let r = rr(2, 1024 * 1024 * 1024, 1);
+        assert_eq!(r.mul(4), rr(8, 4u64 * 1024 * 1024 * 1024, 4));
+    }
+
+    #[test]
+    fn mul_by_zero_yields_zeros() {
+        let r = rr(2, 1024 * 1024 * 1024, 1);
+        assert_eq!(r.mul(0), rr(0, 0, 0));
+    }
+
+    #[test]
+    fn mul_by_one_is_unchanged() {
+        let r = rr(2, 1024 * 1024 * 1024, 1);
+        assert_eq!(r.mul(1), r);
+    }
+
+    // ── min ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn min_per_field_mixed_picks_smaller_per_dimension() {
+        // (cpu:5, mem:10, gpu:1).min(cpu:8, mem:4, gpu:0) = (cpu:5, mem:4, gpu:0)
+        let a = rr(5, 10, 1);
+        let b = rr(8, 4, 0);
+        assert_eq!(a.min(&b), rr(5, 4, 0));
+    }
+
+    #[test]
+    fn min_with_self_is_self() {
+        let r = rr(3, 7, 2);
+        assert_eq!(r.clone().min(&r), r);
+    }
+
+    #[test]
+    fn min_is_symmetric() {
+        let a = rr(5, 10, 1);
+        let b = rr(8, 4, 0);
+        assert_eq!(a.clone().min(&b), b.clone().min(&a));
+    }
+
+    // ── max ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn max_per_field_mixed_picks_larger_per_dimension() {
+        // Mirror of min: (cpu:5, mem:10, gpu:1).max(cpu:8, mem:4, gpu:0) = (cpu:8, mem:10, gpu:1)
+        let a = rr(5, 10, 1);
+        let b = rr(8, 4, 0);
+        assert_eq!(a.max(&b), rr(8, 10, 1));
+    }
+
+    #[test]
+    fn max_with_self_is_self() {
+        let r = rr(3, 7, 2);
+        assert_eq!(r.clone().max(&r), r);
+    }
+
+    #[test]
+    fn max_is_symmetric() {
+        let a = rr(5, 10, 1);
+        let b = rr(8, 4, 0);
+        assert_eq!(a.clone().max(&b), b.clone().max(&a));
+    }
+
+    #[test]
+    fn sub_error_message_includes_both_operands() {
+        let mut a = rr(0, 10, 10);
+        let b = rr(1, 2, 3);
+        let err = a.sub(&b).unwrap_err();
+        let msg = match err {
+            crate::FlameError::InvalidConfig(m) => m,
+            other => panic!("expected InvalidConfig, got {:?}", other),
+        };
+        // self values
+        assert!(msg.contains("cpu=0"));
+        assert!(msg.contains("memory=10"));
+        // other values
+        assert!(msg.contains("cpu=1"));
+        assert!(msg.contains("memory=2"));
+        assert!(msg.contains("gpu=3"));
     }
 }

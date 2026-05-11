@@ -34,9 +34,54 @@ use self::rpc::{
 
 use rpc::flame::v1 as rpc;
 
+use common::apis::ResourceRequirement;
 use common::{apis, FlameError};
 
 use crate::apiserver::Flame;
+
+/// Hardcoded safety-net default `resreq` applied when a session spec supplies
+/// no explicit `resreq` AND `cluster.resreq` is unset.
+/// 1 CPU, 1 GiB memory, 0 GPU.
+///
+/// Production deployments should configure `cluster.resreq`
+/// explicitly so that defaults are auditable from the cluster config.
+const DEFAULT_FALLBACK_RESREQ: ResourceRequirement = ResourceRequirement {
+    cpu: 1,
+    memory: 1024 * 1024 * 1024, // 1 GiB
+    gpu: 0,
+};
+
+/// Resolve the effective `resreq` for a new session. With `slots` fully removed
+/// from the API, the resolution chain is:
+///
+/// 1. `explicit.is_some()` → use the client-supplied resreq verbatim.
+/// 2. `explicit.is_none() && cluster_default.is_some()` → apply the cluster
+///    default (`cluster.resreq` from `flame-cluster.yaml`) and
+///    log at `info`.
+/// 3. Otherwise → apply the hardcoded `DEFAULT_FALLBACK_RESREQ` and log at
+///    `info`. Production deployments should configure
+///    `cluster.resreq` so case 3 never fires.
+///
+/// Always returns a concrete `ResourceRequirement` — `SessionAttributes.resreq`
+/// is unconditionally populated by the time it leaves this function, which is
+/// the invariant the scheduler plugins rely on.
+fn resolve_session_resreq(
+    explicit: Option<ResourceRequirement>,
+    cluster_default: Option<&ResourceRequirement>,
+) -> ResourceRequirement {
+    if let Some(rr) = explicit {
+        return rr;
+    }
+    if let Some(default) = cluster_default {
+        tracing::info!("applying cluster.resreq default to session: {:?}", default);
+        return default.clone();
+    }
+    tracing::info!(
+        "no resreq supplied and no cluster default; applying hardcoded fallback: {:?}",
+        DEFAULT_FALLBACK_RESREQ
+    );
+    DEFAULT_FALLBACK_RESREQ
+}
 
 fn validate_working_directory(working_dir: &Option<String>) -> Result<(), FlameError> {
     if let Some(wd) = working_dir {
@@ -332,23 +377,25 @@ impl Frontend for Flame {
         )
         .map_err(Status::from)?;
 
+        let explicit = ssn_spec.resreq.map(apis::ResourceRequirement::from);
+        let resreq = resolve_session_resreq(explicit, self.cluster_default_resreq.as_ref());
+
         let attr = SessionAttributes {
             id: ssn_id,
             application: ssn_spec.application,
-            slots: ssn_spec.slots,
             common_data: ssn_spec.common_data.map(apis::CommonData::from),
             min_instances: ssn_spec.min_instances,
             max_instances: ssn_spec.max_instances,
             batch_size: ssn_spec.batch_size.max(1),
             priority: ssn_spec.priority,
-            resreq: ssn_spec.resreq.map(apis::ResourceRequirement::from),
+            resreq: Some(resreq),
         };
 
         tracing::debug!(
-            "Creating session with attributes: id={}, application={}, slots={}, min_instances={}, max_instances={:?}, batch_size={}, priority={}",
+            "Creating session with attributes: id={}, application={}, resreq={:?}, min_instances={}, max_instances={:?}, batch_size={}, priority={}",
             attr.id,
             attr.application,
-            attr.slots,
+            attr.resreq,
             attr.min_instances,
             attr.max_instances,
             attr.batch_size,
@@ -404,16 +451,18 @@ impl Frontend for Flame {
                 )
                 .map_err(Status::from)?;
 
+                let explicit = ssn_spec.resreq.map(apis::ResourceRequirement::from);
+                let resreq = resolve_session_resreq(explicit, self.cluster_default_resreq.as_ref());
+
                 Some(SessionAttributes {
                     id: ssn_id.clone(),
                     application: ssn_spec.application,
-                    slots: ssn_spec.slots,
                     common_data: ssn_spec.common_data.map(apis::CommonData::from),
                     min_instances: ssn_spec.min_instances,
                     max_instances: ssn_spec.max_instances,
                     batch_size: ssn_spec.batch_size.max(1),
                     priority: ssn_spec.priority,
-                    resreq: ssn_spec.resreq.map(apis::ResourceRequirement::from),
+                    resreq: Some(resreq),
                 })
             }
             None => None,
@@ -575,5 +624,44 @@ impl Frontend for Flame {
             .map_err(Status::from)?;
 
         Ok(Response::new(task))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rr(cpu: u64, memory: u64, gpu: i32) -> ResourceRequirement {
+        ResourceRequirement { cpu, memory, gpu }
+    }
+
+    #[test]
+    fn explicit_resreq_returned_verbatim() {
+        let explicit = rr(2, 2 * 1024 * 1024 * 1024, 1);
+        let cluster_default = Some(rr(4, 8 * 1024 * 1024 * 1024, 0));
+        let res = resolve_session_resreq(Some(explicit.clone()), cluster_default.as_ref());
+        assert_eq!(
+            res, explicit,
+            "explicit resreq must be returned verbatim and override the cluster default"
+        );
+    }
+
+    #[test]
+    fn cluster_default_used_when_explicit_unset() {
+        let cluster_default = rr(4, 8 * 1024 * 1024 * 1024, 2);
+        let res = resolve_session_resreq(None, Some(&cluster_default));
+        assert_eq!(
+            res, cluster_default,
+            "should clone the cluster default when no explicit resreq is supplied"
+        );
+    }
+
+    #[test]
+    fn hardcoded_fallback_when_no_cluster_default() {
+        let res = resolve_session_resreq(None, None);
+        assert_eq!(
+            res, DEFAULT_FALLBACK_RESREQ,
+            "should yield the hardcoded fallback (cpu=1, mem=1GiB, gpu=0)"
+        );
     }
 }

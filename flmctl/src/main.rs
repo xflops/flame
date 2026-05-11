@@ -100,16 +100,15 @@ enum Commands {
         /// The name of Application
         #[arg(short, long)]
         app: String,
-        /// The slots requirements of each task
-        #[arg(short, long)]
-        slots: Option<u32>,
         /// Number of executors per batch for gang scheduling
         #[arg(short, long, default_value = "1")]
         batch_size: u32,
         /// Session priority (higher = more important, default: 0)
         #[arg(short = 'p', long, default_value = "0")]
         priority: u32,
-        /// Explicit resource request (format: "cpu=N,mem=SIZE,gpu=N")
+        /// Explicit resource request (format: "cpu=N,mem=SIZE,gpu=N").
+        /// If omitted, server applies `cluster.resreq` from
+        /// flame-cluster.yaml (or a hardcoded fallback when that is unset).
         #[arg(short, long)]
         resreq: Option<String>,
     },
@@ -159,11 +158,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(Commands::Close { session }) => close::run(&ctx, session).await?,
         Some(Commands::Create {
             app,
-            slots,
             batch_size,
             priority,
             resreq,
-        }) => create::run(&ctx, app, slots, batch_size, priority, resreq).await?,
+        }) => create::run(&ctx, app, batch_size, priority, resreq).await?,
         Some(Commands::View {
             application,
             session,

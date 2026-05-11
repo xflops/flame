@@ -68,7 +68,6 @@ def test_open_session_create_with_spec():
     spec = flamepy.SessionAttributes(
         id=session_id,
         application="flmtest-open-session",
-        slots=1,
         min_instances=0,
         max_instances=5,
     )
@@ -91,14 +90,12 @@ def test_open_session_existing_with_matching_spec():
     spec = flamepy.SessionAttributes(
         id=session_id,
         application="flmtest-open-session",
-        slots=1,
         min_instances=0,
         max_instances=10,
     )
     created_session = flamepy.create_session(
         application="flmtest-open-session",
         session_id=session_id,
-        slots=1,
         min_instances=0,
         max_instances=10,
     )
@@ -115,14 +112,17 @@ def test_open_session_existing_with_matching_spec():
 
 
 def test_open_session_existing_with_mismatched_spec():
-    """Test open_session raises error when spec doesn't match existing session."""
+    """Test open_session raises error when spec doesn't match existing session.
+
+    After the slots-cleanup refactor, spec mismatches surface through other
+    SessionAttributes fields (here: `max_instances`).
+    """
     session_id = f"test-open-mismatch-{random_string(8)}"
 
     # Create session with specific spec
     flamepy.create_session(
         application="flmtest-open-session",
         session_id=session_id,
-        slots=1,
         min_instances=0,
         max_instances=10,
     )
@@ -131,16 +131,15 @@ def test_open_session_existing_with_mismatched_spec():
     mismatched_spec = flamepy.SessionAttributes(
         id=session_id,
         application="flmtest-open-session",
-        slots=2,  # Different slots
         min_instances=0,
-        max_instances=10,
+        max_instances=20,  # Different max_instances
     )
 
     with pytest.raises(Exception) as exc_info:
         flamepy.open_session(session_id, spec=mismatched_spec)
 
     # Verify error message mentions spec mismatch
-    assert "spec mismatch" in str(exc_info.value).lower() or "slots" in str(exc_info.value).lower()
+    assert "spec mismatch" in str(exc_info.value).lower() or "max_instances" in str(exc_info.value).lower()
 
     # Clean up
     flamepy.close_session(session_id)
@@ -164,7 +163,6 @@ def test_open_session_idempotent():
     spec = flamepy.SessionAttributes(
         id=session_id,
         application="flmtest-open-session",
-        slots=1,
         min_instances=0,
         max_instances=5,
     )

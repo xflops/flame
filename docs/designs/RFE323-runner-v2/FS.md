@@ -160,10 +160,15 @@ The `SessionSpec` message in the RPC API (`rpc/protos/types.proto`) needs to inc
 ```protobuf
 message SessionSpec {
   string application = 2;
-  uint32 slots = 3;
+  // Field number 3 (slots) reserved — removed in the slots-cleanup refactor; do not reuse.
+  reserved 3;
+  reserved "slots";
   optional bytes common_data = 4;
   uint32 min_instances = 5;
   optional uint32 max_instances = 6;  // NULL means unlimited
+  uint32 batch_size = 7;
+  uint32 priority = 8;
+  optional ResourceRequirement resreq = 9;
 }
 ```
 
@@ -176,9 +181,9 @@ message SessionSpec {
 6. **Session Manager**: Validates that `min_instances <= max_instances` (if max_instances is not None)
 7. **Session Manager**: Inserts session into database table with `min_instances` and effective `max_instances` columns
 8. **Session Manager**: Creates internal `Session` struct and returns (executor allocation is asynchronous)
-9. **Scheduler Loop** (runs every ~1 second): Checks if sessions are underused via FairShare plugin
-10. **Scheduler**: If underused (including when `allocated < min_instances`), allocates executors via AllocateAction
-11. **Scheduler**: Continues until session reaches `deserved` allocation (which is >= min_instances * slots)
+9. **Scheduler Loop** (runs every ~1 second): Checks if sessions are underused via the active scheduler plugin (DRF / Priority — the original FairShare plugin has been removed).
+10. **Scheduler**: If underused (including when `allocated < min_instances` of `ssn.resreq`), allocates executors via AllocateAction.
+11. **Scheduler**: Continues until session reaches its per-resource `deserved` allocation (which is `>= min_instances × ssn.resreq` per resource).
 
 **Session Loading Flow (Recovery after restart):**
 1. **Session Manager**: Loads sessions from database (e.g., after session manager restart)
@@ -232,11 +237,11 @@ No changes required. The executor manager continues to handle executor lifecycle
 - Implement validation in session creation to ensure `min_instances <= max_instances`
 - Implement fallback logic: if `SessionSpec.max_instances` is None, use `Application.max_instances`
 - Persist `min_instances` and `max_instances` in session table for durability
-- Update fairshare scheduler plugin to:
+- Update the active scheduler plugin (DRF / Priority — the original FairShare plugin has been removed) to:
   - Respect session's `min_instances` and `max_instances`
-  - Ensure `desired >= min_instances * slots` (minimum guarantee)
+  - Ensure `desired >= min_instances × ssn.resreq` per resource (minimum guarantee)
   - Cap allocation at `max_instances` (already includes app limit from creation)
-  - Update `SSNInfo` struct with new fields
+  - Update the plugin's per-session state struct with the new fields
 - Update `AllocateAction` scheduler action to:
   - Add explicit `max_instances` check before creating executors
   - Prevent over-allocation when multiple executors are created in one scheduler cycle
@@ -305,9 +310,8 @@ No changes required. The executor manager continues to handle executor lifecycle
      - Map `min_instances` from i64 to u32
      - Map `max_instances` from Option<i64> to Option<u32>
    - Update INSERT query in `sqlite.rs` (around line 384):
-     - Current: `INSERT INTO sessions (id, application, slots, common_data, creation_time, state)`
-     - Updated: `INSERT INTO sessions (id, application, slots, common_data, creation_time, state, min_instances, max_instances)`
-     - Add `.bind(min_instances)` and `.bind(max_instances)` to query
+     - Add `min_instances` and `max_instances` to the column list and add `.bind(min_instances)` / `.bind(max_instances)` to the query
+     - (Per-task resources are persisted via the `resreq_cpu` / `resreq_memory` / `resreq_gpu` columns added by the slots-cleanup refactor; this RFE does not change that.)
    - Update SELECT queries to include new columns (SQLx should handle this automatically via `SessionDao`)
    
    **c. Internal Session Struct (`common/src/apis.rs`):**
@@ -341,34 +345,34 @@ No changes required. The executor manager continues to handle executor lifecycle
    - Update `From<&Session> for SessionInfo` implementation to populate these fields
    
   **g. Scheduler Plugins (`session_manager/src/scheduler/plugins/`):**
-  - Update `fairshare.rs` plugin:
-    - Update `SSNInfo` struct to include `min_instances` and `max_instances` fields
-    - In `setup()` method (around line 127-146):
+  - Update the active distribution plugin (DRF / Priority — the original FairShare plugin has been removed):
+    - Extend the per-session state struct to include `min_instances` and `max_instances`
+    - In `setup()`:
       - Read `session.min_instances` and `session.max_instances` from `SessionInfo`
       - Note: `session.max_instances` already includes application limit (applied during session creation)
-      - Cap desired executors: `desired = desired.min((session.max_instances * ssn.slots) as f64)` if max_instances is Some
-      - Ensure minimum allocation: `desired = desired.max((session.min_instances * ssn.slots) as f64)`
-     - During the fairshare loop (calculating deserved from remaining slots):
-       - Initialize `deserved = min_instances * slots` (guarantee minimum)
-       - Only sessions with `deserved < desired` participate in fairshare distribution
-       - When distributing slots, cap each session's deserved by its `desired` value
-       - This ensures `min_instances <= deserved <= desired <= max_instances` for all sessions
-     - Update `is_underused()` method to check if `allocated < deserved`
-       - Note: deserved is already guaranteed to be >= min_instances from the calculation above
+      - Cap desired resources per-field: `desired = desired.min(&ssn.resreq.mul(max_instances))` if `max_instances` is Some
+      - Ensure minimum allocation per-field: `desired = desired.max(&ssn.resreq.mul(min_instances))`
+     - During the distribution loop (per-resource accounting):
+       - Initialize `deserved = ssn.resreq.mul(min_instances)` (guarantee minimum)
+       - Only sessions with `deserved < desired` participate in distribution
+       - When distributing remaining capacity, cap each session's deserved by its `desired` value (per-field)
+       - This ensures `ssn.resreq × min_instances <= deserved <= desired <= ssn.resreq × max_instances` per resource
+     - Update `is_underused()` to check if `allocated` is below `deserved` in any resource dimension
+       - Note: deserved is already guaranteed to be `>= ssn.resreq × min_instances` from the calculation above
    
    **h. Scheduler (`session_manager/src/scheduler/`):**
    - Read `min_instances` and `max_instances` from `Session` struct and pass to `SessionInfo`
    - Executor allocation happens asynchronously in the scheduler loop (not immediately on session creation):
      - **Scheduler Loop**: Runs periodically (every `schedule_interval` ms, typically 1000ms)
      - **AllocateAction** (`scheduler/actions/allocate.rs`): Executed as part of scheduler actions
-       - Gets all open sessions, orders them by fairshare plugin's `ssn_order_fn`
+       - Gets all open sessions, orders them by the scheduler plugins' `ssn_order_fn` (PriorityPlugin → DRFPlugin → GangPlugin)
        - For each session, checks `plugins.is_underused(ssn)`
        - **NEW**: Add explicit `max_instances` check by counting actual executors from snapshot
          - This prevents over-allocation when multiple executors are created in one cycle
-         - Fairshare's cached `allocated` count doesn't update within a cycle
+         - The plugin's cached `allocated` count doesn't update within a cycle
        - If underused and below `max_instances`, allocates executors
        - Calls `ctx.create_executor(node, ssn)` to actually create executor
-   - Delegate allocation decisions to scheduler plugins (fairshare)
+   - Delegate allocation decisions to the scheduler plugins (PriorityPlugin / DRFPlugin / GangPlugin)
    - Plugins respect both `min_instances` (guaranteed) and `max_instances` (limit)
    - Note: Sessions with `min_instances > 0` will be allocated executors in the first scheduler cycle (within ~1 second)
 
@@ -439,7 +443,7 @@ The enhancement spans multiple layers from SDK to session manager to executors:
                  ▼ Asynchronous executor allocation (scheduler loop ~1s)
 ┌──────────────────────────────────────────────────────────┐
 │       Scheduler Loop (Rust)                              │
-│  - FairShare: calculate deserved (>= min_instances)      │
+│  - Priority / DRF: calculate deserved (>= min_instances) │
 │  - AllocateAction: check is_underused() for sessions     │
 │  - Create executors until allocated >= deserved          │
 │  - Respect max_instances limit                           │
@@ -462,7 +466,7 @@ The enhancement spans multiple layers from SDK to session manager to executors:
 4. **Scheduler Loop** (asynchronous executor allocation):
    - Session created → stored in database
    - Scheduler loop (every ~1 second) creates snapshot
-   - FairShare plugin calculates deserved (>= min_instances * slots)
+   - The active distribution plugin (DRF / Priority — the original FairShare plugin has been removed) calculates `deserved` per resource (>= `ssn.resreq × min_instances`)
    - AllocateAction checks is_underused() for each session
    - If underused, creates executors via ctx.create_executor()
    - Process repeats until session reaches deserved allocation
@@ -544,12 +548,12 @@ The enhancement spans multiple layers from SDK to session manager to executors:
       - Executes scheduling actions (AllocateAction, DispatchAction, etc.)
   - **AllocateAction** (`actions/allocate.rs`):
     - Gets all open sessions from snapshot
-    - Orders sessions by fairshare priority
+    - Orders sessions by the scheduler plugins' `ssn_order_fn` (Priority → DRF → Gang)
     - For each session:
-      - Checks `plugins.is_underused(ssn)` - returns true if `allocated < deserved`
+      - Checks `plugins.is_underused(ssn)` - returns true if `allocated < deserved` in any resource dimension
       - **NEW**: Explicit `max_instances` check - counts actual executors from snapshot to prevent over-allocation
       - If underused and below max_instances, finds available nodes and calls `ctx.create_executor(node, ssn)`
-    - Sessions with `min_instances > 0` will have `deserved >= min_instances * slots`
+    - Sessions with `min_instances > 0` will have `deserved >= ssn.resreq × min_instances` per resource
     - Therefore, they will be allocated executors until reaching at least `min_instances`
     - Sessions will not exceed `max_instances` even when multiple executors are allocated in one cycle
   - **Context** (`ctx.rs`):
@@ -557,22 +561,22 @@ The enhancement spans multiple layers from SDK to session manager to executors:
     - Delegates allocation decisions to plugins
     - Calls controller to actually create executors
 
-**9. FairShare Plugin (Scheduler)**
-- **Location**: `session_manager/src/scheduler/plugins/fairshare.rs`
+**9. Distribution Plugin (Scheduler)**
+- **Location**: `session_manager/src/scheduler/plugins/priority.rs` and `drf.rs` (the original `fairshare.rs` has been removed)
 - **Responsibilities**:
   - **setup()**: Called at the start of each scheduler cycle
-    - Calculates `desired` for each session based on pending/running tasks
-    - Caps desired by session's `max_instances` (already includes app limit from creation)
-    - Initializes `deserved = min_instances * slots` (guaranteed minimum)
-    - Distributes remaining cluster resources fairly across sessions
-    - Ensures: `min_instances * slots <= deserved <= desired <= max_instances * slots`
+    - Calculates `desired` (a `ResourceRequirement`) for each session based on pending/running tasks and `ssn.resreq`
+    - Caps desired by session's `max_instances` (already includes app limit from creation): `desired = desired.min(&ssn.resreq.mul(max_instances))`
+    - Initializes `deserved = ssn.resreq.mul(min_instances)` (guaranteed minimum)
+    - Distributes remaining cluster capacity per-resource across sessions
+    - Ensures per-field: `ssn.resreq × min_instances <= deserved <= desired <= ssn.resreq × max_instances`
   - **is_underused()**: Called by AllocateAction for each session
-    - Returns true if `allocated < deserved`
+    - Returns true if `allocated` is below `deserved` in any resource dimension
     - This ensures sessions reach their guaranteed `min_instances`
     - And get fair share of resources beyond that
-  - **is_allocatable()**: Checks if node has capacity for session's slots
-  - **ssn_order_fn()**: Orders sessions by fairshare priority
-  - Update `SSNInfo` struct to include `min_instances` and `max_instances`
+  - **is_allocatable()**: Checks if a node has capacity to host one more executor of `ssn.resreq`
+  - **ssn_order_fn()**: Orders sessions by priority (RFE413) then dominant share (RFE433)
+  - The per-session state struct includes `min_instances` and `max_instances`
 
 ### Data Structures
 
@@ -614,12 +618,14 @@ class FlameRunpyService(FlameService):
 
 **Session Table Schema (Database):**
 
-Current sessions table schema (from existing migrations):
+Current sessions table schema (after the slots-cleanup refactor; the `slots` column was removed and replaced with `resreq_cpu` / `resreq_memory` / `resreq_gpu`):
 ```sql
 CREATE TABLE IF NOT EXISTS sessions (
     id              TEXT PRIMARY KEY,
     application     TEXT NOT NULL,
-    slots           INTEGER NOT NULL,
+    resreq_cpu      INTEGER NOT NULL DEFAULT 0,
+    resreq_memory   INTEGER NOT NULL DEFAULT 0,
+    resreq_gpu      INTEGER NOT NULL DEFAULT 0,
     common_data     BLOB,
     creation_time   INTEGER NOT NULL,
     completion_time INTEGER,
@@ -640,20 +646,22 @@ ADD COLUMN max_instances INTEGER;  -- NULL means unlimited
 
 -- Updated schema after migration:
 -- sessions table will have:
---   id, application, slots, common_data, 
+--   id, application, resreq_cpu, resreq_memory, resreq_gpu, common_data,
 --   creation_time, completion_time, state, version,
 --   min_instances, max_instances
 ```
 
 **SessionDao Struct (Rust - storage layer):**
 
-Current SessionDao in `session_manager/src/storage/engine/types.rs`:
+Current SessionDao in `session_manager/src/storage/engine/types.rs` (after the slots-cleanup refactor; `slots: i64` was removed and replaced with `resreq_cpu` / `resreq_memory` / `resreq_gpu`):
 ```rust
 #[derive(Clone, FromRow, Debug)]
 pub struct SessionDao {
     pub id: SessionID,
     pub application: String,
-    pub slots: i64,
+    pub resreq_cpu: i64,
+    pub resreq_memory: i64,
+    pub resreq_gpu: i64,
     pub version: u32,
     pub common_data: Option<Vec<u8>>,
     pub creation_time: i64,
@@ -668,7 +676,9 @@ pub struct SessionDao {
 pub struct SessionDao {
     pub id: SessionID,
     pub application: String,
-    pub slots: i64,
+    pub resreq_cpu: i64,
+    pub resreq_memory: i64,
+    pub resreq_gpu: i64,
     pub version: u32,
     pub common_data: Option<Vec<u8>>,
     pub creation_time: i64,
@@ -688,7 +698,11 @@ impl TryFrom<&SessionDao> for Session {
         Ok(Self {
             id: ssn.id.clone(),
             application: ssn.application.clone(),
-            slots: ssn.slots as u32,
+            resreq: Some(ResourceRequirement {
+                cpu: ssn.resreq_cpu as u64,
+                memory: ssn.resreq_memory as u64,
+                gpu: ssn.resreq_gpu as i32,
+            }),
             version: ssn.version,
             common_data: ssn.common_data.clone().map(Bytes::from),
             creation_time: DateTime::<Utc>::from_timestamp(ssn.creation_time, 0)
@@ -714,12 +728,12 @@ impl TryFrom<&SessionDao> for Session {
 
 **Internal Session Struct (Rust - runtime):**
 
-Current Session in `common/src/apis.rs`:
+Current Session in `common/src/apis.rs` (after the slots-cleanup refactor; `slots: u32` was replaced with `resreq: Option<ResourceRequirement>`):
 ```rust
 pub struct Session {
     pub id: SessionID,
     pub application: String,
-    pub slots: u32,
+    pub resreq: Option<ResourceRequirement>,
     pub version: u32,
     pub common_data: Option<CommonData>,
     pub tasks: HashMap<TaskID, TaskPtr>,
@@ -736,7 +750,7 @@ pub struct Session {
 pub struct Session {
     pub id: SessionID,
     pub application: String,
-    pub slots: u32,
+    pub resreq: Option<ResourceRequirement>,
     pub version: u32,
     pub common_data: Option<CommonData>,
     pub tasks: HashMap<TaskID, TaskPtr>,
@@ -752,12 +766,12 @@ pub struct Session {
 
 **SessionInfo Struct (Scheduler Snapshot Model):**
 
-Current SessionInfo in `session_manager/src/model/mod.rs`:
+Current SessionInfo in `session_manager/src/model/mod.rs` (after the slots-cleanup refactor; `slots: u32` was replaced with `resreq: Option<ResourceRequirement>`):
 ```rust
 pub struct SessionInfo {
     pub id: SessionID,
     pub application: String,
-    pub slots: u32,
+    pub resreq: Option<ResourceRequirement>,
     pub tasks_status: HashMap<TaskState, i32>,
     pub creation_time: DateTime<Utc>,
     pub completion_time: Option<DateTime<Utc>>,
@@ -770,7 +784,7 @@ pub struct SessionInfo {
 pub struct SessionInfo {
     pub id: SessionID,
     pub application: String,
-    pub slots: u32,
+    pub resreq: Option<ResourceRequirement>,
     pub tasks_status: HashMap<TaskState, i32>,
     pub creation_time: DateTime<Utc>,
     pub completion_time: Option<DateTime<Utc>>,
@@ -788,7 +802,7 @@ impl From<&Session> for SessionInfo {
         Self {
             id: session.id.clone(),
             application: session.application.clone(),
-            slots: session.slots,
+            resreq: session.resreq.clone(),
             tasks_status: calculate_tasks_status(&session.tasks_index),
             creation_time: session.creation_time,
             completion_time: session.completion_time,
@@ -800,27 +814,15 @@ impl From<&Session> for SessionInfo {
 }
 ```
 
-**FairShare SSNInfo Struct:**
+**Distribution-plugin per-session state struct:**
 
-Current SSNInfo in `session_manager/src/scheduler/plugins/fairshare.rs`:
+The original FairShare plugin has been removed. The active distribution plugin (DRF / Priority) tracks per-session state as a `ResourceRequirement` (cpu / memory / gpu) rather than a scalar slot count. Conceptually:
 ```rust
-struct SSNInfo {
+struct SsnState {
     pub id: SessionID,
-    pub slots: u32,
-    pub desired: f64,
-    pub deserved: f64,
-    pub allocated: f64,
-}
-```
-
-**Updated SSNInfo Struct:**
-```rust
-struct SSNInfo {
-    pub id: SessionID,
-    pub slots: u32,
-    pub desired: f64,
-    pub deserved: f64,
-    pub allocated: f64,
+    pub desired:   ResourceRequirement,
+    pub deserved:  ResourceRequirement,
+    pub allocated: ResourceRequirement,
     pub min_instances: u32,          // New field
     pub max_instances: Option<u32>,  // New field (effective max after considering app limit)
 }
@@ -833,10 +835,15 @@ The `SessionSpec` message in `rpc/protos/types.proto` needs to be updated to inc
 ```protobuf
 message SessionSpec {
   string application = 2;
-  uint32 slots = 3;
+  // Field number 3 (slots) reserved — removed in the slots-cleanup refactor; do not reuse.
+  reserved 3;
+  reserved "slots";
   optional bytes common_data = 4;
   uint32 min_instances = 5;  // Minimum number of instances (default: 0)
   optional uint32 max_instances = 6;  // Maximum number of instances (null means unlimited)
+  uint32 batch_size = 7;
+  uint32 priority = 8;
+  optional ResourceRequirement resreq = 9;
 }
 ```
 
@@ -1051,14 +1058,17 @@ fn create_session(request: CreateSessionRequest) -> Result<Session> {
     session_spec.max_instances = effective_max_instances.map(|v| v as u32);
     
     // MODIFIED: Step 5 - Update INSERT query to include new columns
+    let resreq = session_spec.resreq.clone().unwrap_or_default();
     db.execute(
-        "INSERT INTO sessions (id, application, slots, common_data, 
-                               min_instances, max_instances, ...) 
-         VALUES (?, ?, ?, ?, ?, ?, ...)",
+        "INSERT INTO sessions (id, application, resreq_cpu, resreq_memory, resreq_gpu, common_data,
+                               min_instances, max_instances, ...)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ...)",
         params![
             &session_id,
             &session_spec.application,
-            session_spec.slots as i64,
+            resreq.cpu as i64,
+            resreq.memory as i64,
+            resreq.gpu as i64,
             &session_spec.common_data,
             session_spec.min_instances as i64,  // NEW
             session_spec.max_instances.map(|v| v as i64),  // NEW
@@ -1079,80 +1089,75 @@ fn create_session(request: CreateSessionRequest) -> Result<Session> {
 }
 ```
 
-**Algorithm 5: FairShare Plugin Enhancement**
+**Algorithm 5: Distribution Plugin Enhancement**
 
-**Context**: The existing FairShare plugin (`session_manager/src/scheduler/plugins/fairshare.rs`) calculates how many executors each session deserves. This shows the NEW/MODIFIED logic for min/max instances.
+**Context**: The original FairShare plugin has been removed. The distribution work is now done by the priority plugin (`session_manager/src/scheduler/plugins/priority.rs`) and the DRF plugin (`drf.rs`), which compute `desired` per resource based on `ssn.resreq` rather than a scalar slot count. This shows the NEW/MODIFIED logic for min/max instances.
 
 **Changes Required in `setup()` method**:
 
 ```rust
-// In fairshare.rs setup() method
+// In priority.rs setup() method (or DRF setup, same idea)
 fn setup(&mut self, ss: &SnapShot) -> Result<(), FlameError> {
     // ... existing code: load sessions, apps, calculate base desired from tasks ...
-    
+
     for ssn in open_ssns.values() {
-        // Existing: Calculate desired from pending/running tasks
-        let mut desired = calculate_desired_from_tasks(ssn);
-        
-        if let Some(app) = apps.get(&ssn.application) {
-            // NEW: Cap desired by session's max_instances
-            // Note: ssn.max_instances already includes app limit (from session creation)
-            if let Some(max_instances) = ssn.max_instances {
-                desired = desired.min((max_instances * ssn.slots) as f64);
-            }
-            
-            // NEW: Ensure desired is at least min_instances
-            let min_allocation = (ssn.min_instances * ssn.slots) as f64;
-            desired = desired.max(min_allocation);
-            
-            // MODIFIED: Store SSNInfo with new fields
-            self.ssn_map.insert(
-                ssn.id.clone(),
-                SSNInfo {
-                    id: ssn.id.clone(),
-                    desired,
-                    deserved: min_allocation,  // NEW: Initialize to min_instances
-                    slots: ssn.slots,
-                    min_instances: ssn.min_instances,  // NEW field
-                    max_instances: ssn.max_instances,  // NEW field
-                    allocated: 0.0,
-                },
-            );
+        // Existing: Calculate per-resource desired from pending/running tasks.
+        // per_task is the session's per-executor resreq (resolve_session_resreq guarantees it is Some).
+        let per_task = ssn.resreq.clone().expect("ssn.resreq populated by resolve_session_resreq");
+        let mut desired: ResourceRequirement = calculate_desired_from_tasks(ssn, &per_task);
+
+        // NEW: Cap desired by session's max_instances (per-field).
+        // Note: ssn.max_instances already includes app limit (from session creation).
+        if let Some(max_instances) = ssn.max_instances {
+            desired = desired.min(&per_task.mul(max_instances));
         }
+
+        // NEW: Ensure desired is at least min_instances × per_task (per-field).
+        let min_allocation = per_task.mul(ssn.min_instances);
+        desired = desired.max(&min_allocation);
+
+        // MODIFIED: Store per-session state with new fields and ResourceRequirement-typed values.
+        self.ssn_state.insert(
+            ssn.id.clone(),
+            SsnState {
+                id: ssn.id.clone(),
+                desired,
+                deserved: min_allocation,                       // NEW: Initialize to min_instances × per_task
+                allocated: ResourceRequirement::default(),
+                min_instances: ssn.min_instances,               // NEW field
+                max_instances: ssn.max_instances,               // NEW field
+            },
+        );
     }
-    
-    // ... existing code: calculate allocated from executors ...
-    
-    // NEW: Reserve slots for guaranteed minimums before fair distribution
-    let mut remaining_slots = total_cluster_slots;
-    for ssn in self.ssn_map.values() {
-        let min_allocation = (ssn.min_instances * ssn.slots) as f64;
-        remaining_slots -= min_allocation;
+
+    // ... existing code: initialise allocated from bound executors ...
+
+    // NEW: Reserve cluster capacity for guaranteed minimums before any further distribution.
+    let mut remaining = total_cluster_capacity;
+    for ssn in self.ssn_state.values() {
+        remaining.sub(&ssn.deserved).ok();
     }
-    
-    // Existing: Distribute remaining_slots fairly
-    // (existing fair distribution loop works as-is, but now respects 
-    //  deserved >= min_instances from initialization above)
-    // ...
-    
+
+    // Existing: Distribute the remaining cluster capacity among needy sessions.
+
     Ok(())
 }
 ```
 
-**SSNInfo struct update** (in `fairshare.rs`):
+**Per-session state struct update**:
 
 ```rust
-struct SSNInfo {
-    // ... existing fields ...
-    min_instances: u32,      // NEW
+struct SsnState {
+    // ... existing per-resource fields (desired / deserved / allocated as ResourceRequirement) ...
+    min_instances: u32,          // NEW
     max_instances: Option<u32>,  // NEW
 }
 ```
 
-**Note**: The existing fair distribution loop works unchanged, because:
-- `deserved` starts at `min_instances` (guaranteed)
-- `desired` is capped by `max_instances`
-- Fair distribution only gives more if `deserved < desired`
+**Note**: The existing distribution loop works unchanged, because:
+- `deserved` starts at `min_instances × per_task` (guaranteed)
+- `desired` is capped by `max_instances × per_task`
+- Distribution only gives more if `deserved < desired` in some resource dimension
 
 **Algorithm 6: AllocateAction Enhancement (Scheduler Loop)**
 
@@ -1168,10 +1173,11 @@ if !ctx.is_underused(&ssn)? {
 
 // NEW: Add this check before pipeline check
 // Explicit max_instances check (safety guard)
-// Note: The fairshare plugin caches allocated count from snapshot
-// at the start of the cycle. Within a single cycle, if we allocate
-// multiple executors, the cached count doesn't update. To prevent
-// over-allocation, we count actual executors from the current snapshot.
+// Note: The active distribution plugin caches allocated count from
+// the snapshot at the start of the cycle. Within a single cycle, if we
+// allocate multiple executors, the cached count doesn't update. To
+// prevent over-allocation, we count actual executors from the current
+// snapshot.
 if let Some(max_instances) = ssn.max_instances {
     let current_executors = ss.find_executors_by_session(&ssn.id)?;
     let current_count = current_executors.len();
@@ -1189,13 +1195,13 @@ if let Some(max_instances) = ssn.max_instances {
 
 **Key Points:**
 - Runs periodically in scheduler loop (every ~1 second)
-- Uses fairshare plugin's `is_underused()` to determine if session needs more executors
-- For sessions with `min_instances > 0`, `is_underused()` returns true until `allocated >= min_instances * slots`
+- Uses the active distribution plugin's `is_underused()` to determine if session needs more executors
+- For sessions with `min_instances > 0`, `is_underused()` returns true until `allocated >= min_instances × ssn.resreq` per resource
 - **Explicit max_instances check**: Counts actual executors from snapshot to prevent over-allocation (Step 5)
-  - This is needed because fairshare's cached `allocated` count doesn't update within a single scheduler cycle
+  - This is needed because the plugin's cached `allocated` count doesn't update within a single scheduler cycle
   - Prevents allocating beyond `max_instances` when creating multiple executors in one cycle
 - Creates one executor per iteration, then re-evaluates
-- Sessions are processed in fairshare priority order
+- Sessions are processed in priority order (PriorityPlugin → DRFPlugin → GangPlugin)
 
 ### System Considerations
 
@@ -1208,8 +1214,8 @@ if let Some(max_instances) = ssn.max_instances {
 **Scalability:**
 - **Autoscaling**: Services can scale from 0 to unlimited instances based on workload
 - **Single Instance**: Services that require coordination can use autoscale=False
-- **Executor Allocation**: Session manager dynamically allocates executors via fairshare plugin
-- **Fair Sharing**: FairShare plugin ensures fair allocation across sessions while respecting individual session limits
+- **Executor Allocation**: Session manager dynamically allocates executors via the priority/DRF plugin chain
+- **Fair Sharing**: DRFPlugin (with PriorityPlugin ordering on top) ensures fair multi-resource allocation across sessions while respecting individual session limits
 - **Minimum Guarantee**: Sessions with `min_instances > 0` are guaranteed that many executors
 - **Maximum Limit**: Session's `max_instances` serves as the effective limit (includes application's limit as fallback during creation)
 - **Limitation**: No scale-down mechanism (min_instances remain allocated)
@@ -1461,7 +1467,7 @@ with Runner("image-processor") as runner:
 - Session manager: `session_manager/src/manager.rs`
 - Scheduler: `session_manager/src/scheduler/` (main scheduler logic)
 - AllocateAction: `session_manager/src/scheduler/actions/allocate.rs` (add max_instances check)
-- FairShare plugin: `session_manager/src/scheduler/plugins/fairshare.rs`
+- Distribution plugins: `session_manager/src/scheduler/plugins/priority.rs` and `drf.rs` (the original `fairshare.rs` has been removed)
 - Plugin interface: `session_manager/src/scheduler/plugins/mod.rs`
 
 **Common:**

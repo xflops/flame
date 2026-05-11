@@ -94,10 +94,10 @@ impl Session {
                 self.id, self.application, attr.application
             )));
         }
-        if self.slots != attr.slots {
+        if self.resreq != attr.resreq {
             return Err(FlameError::InvalidConfig(format!(
-                "session <{}> spec mismatch: slots differs (expected {}, got {})",
-                self.id, self.slots, attr.slots
+                "session <{}> spec mismatch: resreq differs (expected {:?}, got {:?})",
+                self.id, self.resreq, attr.resreq
             )));
         }
         if self.min_instances != attr.min_instances {

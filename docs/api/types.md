@@ -105,22 +105,27 @@ Session configuration.
 ```protobuf
 message SessionSpec {
   string application = 2;
-  uint32 slots = 3;
+  // Field number 3 (slots) reserved — removed in the slots-cleanup refactor; do not reuse.
+  reserved 3;
+  reserved "slots";
   optional bytes common_data = 4;
   uint32 min_instances = 5;
   optional uint32 max_instances = 6;
   uint32 batch_size = 7;
+  uint32 priority = 8;
+  optional ResourceRequirement resreq = 9;
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `application` | string | Name of the application to run |
-| `slots` | uint32 | Number of task slots per executor |
 | `common_data` | bytes | Data shared across all tasks (optional) |
 | `min_instances` | uint32 | Minimum executor instances (default: 0) |
 | `max_instances` | uint32 | Maximum executor instances (optional, unlimited if not set) |
 | `batch_size` | uint32 | Executors per batch for gang scheduling (default: 1) |
+| `priority` | uint32 | Session priority; higher = more important (default: 0) |
+| `resreq` | ResourceRequirement | Per-task resource request (optional); when absent, the server applies `cluster.resreq`, with a hardcoded `cpu=1,mem=1g,gpu=0` fallback. |
 
 ### SessionStatus
 
@@ -396,7 +401,9 @@ Executor specification.
 message ExecutorSpec {
   string node = 1;
   ResourceRequirement resreq = 2;
-  uint32 slots = 3;
+  // Field number 3 (slots) reserved — removed in the slots-cleanup refactor; do not reuse.
+  reserved 3;
+  reserved "slots";
   Shim shim = 4;
 }
 ```
@@ -404,8 +411,7 @@ message ExecutorSpec {
 | Field | Type | Description |
 |-------|------|-------------|
 | `node` | string | Node hosting this executor |
-| `resreq` | ResourceRequirement | Resource requirements |
-| `slots` | uint32 | Number of task slots |
+| `resreq` | ResourceRequirement | Resource requirements (cpu, memory, gpu) |
 | `shim` | Shim | Supported shim type |
 
 ### ExecutorStatus

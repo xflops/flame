@@ -134,7 +134,6 @@ class RunnerService:
         stateful: bool = False,
         autoscale: bool = True,
         warmup: int = 0,
-        slots: int = 1,
         resreq: Optional[ResourceRequirement] = None,
     ):
         """Initialize a RunnerService.
@@ -152,12 +151,10 @@ class RunnerService:
             autoscale: If True, create instances dynamically based on pending tasks (min=0, max=None).
                       If False, create exactly one instance (min=1, max=1).
             warmup: Number of instances to pre-create at session start. Only used when autoscale=True.
-            slots: Number of slots per session (default: 1). Ignored if resreq is provided.
-            resreq: Explicit resource requirements. Mutually exclusive with slots.
+            resreq: Optional explicit resource requirements. When omitted, the
+                    server applies cluster.resource_requirement (or a hardcoded
+                    fallback when that is unset).
         """
-        if slots != 1 and resreq is not None:
-            raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "slots and resreq are mutually exclusive")
-
         self._app = app
         self._execution_object = execution_object
         self._function_wrapper = None  # For callable functions
@@ -193,7 +190,6 @@ class RunnerService:
             id=session_id,
             application=app,
             common_data=common_data_bytes,
-            slots=slots if resreq is None else 0,
             min_instances=runner_context.min_instances,
             max_instances=runner_context.max_instances,
             batch_size=1,
@@ -543,7 +539,6 @@ class Runner:
         stateful: Optional[bool] = None,
         autoscale: Optional[bool] = None,
         warmup: int = 0,
-        slots: int = 1,
         resreq: Optional[ResourceRequirement] = None,
     ) -> RunnerService:
         """Create a RunnerService for the given execution object.
@@ -558,15 +553,15 @@ class Runner:
                       If None, use default based on execution_object type.
             warmup: Number of instances to pre-create at session start. Only used when autoscale=True.
                    When set, min_instances is set to this value for warmup. Default: 0.
-            slots: Number of slots per session (default: 1). Ignored if resreq is provided.
-            resreq: Explicit resource requirements. Mutually exclusive with slots.
+            resreq: Optional explicit resource requirements. When omitted, the
+                    server applies cluster.resource_requirement (or a hardcoded
+                    fallback when that is unset).
 
         Returns:
             A RunnerService instance
 
         Raises:
             ValueError: If stateful=True is set for a class (only instances can be stateful)
-            FlameError: If both slots and resreq are specified
         """
         is_function = callable(execution_object) and not inspect.isclass(execution_object)
         is_class = inspect.isclass(execution_object)
@@ -591,7 +586,6 @@ class Runner:
             stateful=stateful,
             autoscale=autoscale,
             warmup=warmup,
-            slots=slots,
             resreq=resreq,
         )
         self._services.append(runner_service)

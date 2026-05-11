@@ -57,13 +57,17 @@ This limitation prevents Flame from efficiently supporting distributed workloads
 ```protobuf
 message SessionSpec {
   string application = 2;
-  uint32 slots = 3;
+  // Field number 3 (slots) reserved — removed in the slots-cleanup refactor; do not reuse.
+  reserved 3;
+  reserved "slots";
   optional bytes common_data = 4;
   uint32 min_instances = 5;
   optional uint32 max_instances = 6;
-  
+
   // NEW: Batch configuration
   uint32 batch_size = 7;  // Number of executors per batch (default: 1)
+  uint32 priority = 8;
+  optional ResourceRequirement resreq = 9;
 }
 
 message ExecutorStatus {
@@ -103,7 +107,7 @@ message LaunchTaskResponse {
 # Create a session with batch_size=4 for multi-node inference
 flmctl create session \
   --application llm-inference \
-  --slots 8 \
+  --resreq cpu=8,mem=32g,gpu=1 \
   --batch-size 4 \
   --min-instances 4 \
   --max-instances 8
@@ -115,8 +119,8 @@ flmctl create session \
 # List sessions showing batch configuration
 flmctl list -s
 
- ID              State   App           Slots  Batch  Pending  Running  Succeed  Failed
- inference-001   Open    llm-inference 8      4      8        4        12       0
+ ID              State   App           Resources                  Batch  Pending  Running  Succeed  Failed
+ inference-001   Open    llm-inference cpu=8,mem=32g,gpu=1        4      8        4        12       0
 ```
 
 ### Scope
@@ -141,9 +145,9 @@ flmctl list -s
 ### Feature Interaction
 
 **Related Features:**
-- `slots`: Existing parallelism parameter (resource requirement per executor)
+- `resreq`: Per-executor resource request (replaces the deprecated `slots` field)
 - `min_instances` / `max_instances`: Executor count bounds (must be multiples of `batch_size`)
-- Fair share scheduling: Allocation calculation considers batch boundaries
+- Distribution scheduling (DRF + Priority): Allocation calculation considers batch boundaries (the original FairShare plugin has been removed)
 
 **Updates Required:**
 - `Plugin trait`: Add `is_ready()`, `on_pipeline_executor()`, `on_discard_executor()` methods
@@ -192,7 +196,7 @@ Actions use Statement to accumulate allocations. Statement calls Plugin trait ca
 │  │                                                                   │  │
 │  │  plugins: HashMap<String, PluginPtr>                              │  │
 │  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐    │  │
-│  │  │   FairShare     │  │   ShimPlugin    │  │   GangPlugin    │    │  │
+│  │  │ Priority + DRF  │  │   ShimPlugin    │  │   GangPlugin    │    │  │
 │  │  │  (Plugin trait) │  │  (Plugin trait) │  │  (Plugin trait) │    │  │
 │  │  │                 │  │                 │  │                 │    │  │
 │  │  │ - is_underused  │  │ - is_available  │  │ - is_underused  │    │  │
@@ -406,24 +410,24 @@ impl Plugin for GangPlugin {
 
 **4. Context (session_manager/src/scheduler/ctx.rs)**
 
-Extended with `is_ready()`, `reserve_slot()`, `release_slot()`:
+Extended with `is_ready()` and per-resource reserve/release helpers:
 
 ```rust
 impl Context {
     // ... existing methods unchanged ...
-    
+
     pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
         self.plugins.is_ready(ssn)
     }
-    
-    /// Reserve a slot on node for session (in-memory, no executor created)
-    pub fn reserve_slot(&self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Result<(), FlameError> {
-        self.snapshot.reserve_slot(node, ssn)
+
+    /// Reserve one executor's worth of `ssn.resreq` on the node (in-memory, no executor created)
+    pub fn reserve(&self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Result<(), FlameError> {
+        self.snapshot.reserve(node, ssn)
     }
-    
-    /// Release a reserved slot on node
-    pub fn release_slot(&self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Result<(), FlameError> {
-        self.snapshot.release_slot(node, ssn)
+
+    /// Release a previously reserved executor's worth of `ssn.resreq`
+    pub fn release(&self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Result<(), FlameError> {
+        self.snapshot.release(node, ssn)
     }
 }
 ```
@@ -454,8 +458,8 @@ impl Statement {
     /// Reserve resources for an executor (in-memory only, no actual creation)
     /// Calls on_pipeline_executor callback - GangPlugin tracks pipelined count
     pub fn pipeline(&mut self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Result<(), FlameError> {
-        // Reserve resources on node in snapshot
-        self.ctx.snapshot.reserve_slot(node, ssn)?;
+        // Reserve `ssn.resreq` resources on node in snapshot
+        self.ctx.snapshot.reserve(node, ssn)?;
         
         // Notify plugins via callback (GangPlugin increments pipelined count)
         self.ctx.plugins.on_pipeline_executor(node.clone(), ssn.clone())?;
@@ -482,8 +486,8 @@ impl Statement {
     pub fn discard(self) -> Result<(), FlameError> {
         // Reverse order to properly unwind
         for op in self.operations.into_iter().rev() {
-            // Release resources on node
-            self.ctx.snapshot.release_slot(&op.node, &op.ssn)?;
+            // Release `ssn.resreq` resources on node
+            self.ctx.snapshot.release(&op.node, &op.ssn)?;
             
             // Notify plugins via callback (GangPlugin decrements pipelined count)
             self.ctx.plugins.on_discard_executor(op.node, op.ssn)?;
@@ -517,11 +521,11 @@ impl Statement {
 pub struct SessionAttributes {
     pub id: SessionID,
     pub application: String,
-    pub slots: u32,
     pub common_data: Option<CommonData>,
     pub min_instances: u32,
     pub max_instances: Option<u32>,
     pub batch_size: u32,  // NEW: default 1
+    pub resreq: Option<ResourceRequirement>,
 }
 
 impl Default for SessionAttributes {
@@ -529,11 +533,11 @@ impl Default for SessionAttributes {
         Self {
             id: String::new(),
             application: String::new(),
-            slots: 1,
             common_data: None,
             min_instances: 0,
             max_instances: None,
             batch_size: 1,  // NEW: default to 1 for backward compatibility
+            resreq: None,
         }
     }
 }
@@ -591,7 +595,6 @@ impl Session {
 pub struct SessionInfo {
     pub id: SessionID,
     pub application: String,
-    pub slots: u32,
     pub tasks_status: HashMap<TaskState, i32>,
     pub creation_time: DateTime<Utc>,
     pub completion_time: Option<DateTime<Utc>>,
@@ -599,6 +602,7 @@ pub struct SessionInfo {
     pub min_instances: u32,
     pub max_instances: Option<u32>,
     pub batch_size: u32,  // NEW
+    pub resreq: Option<ResourceRequirement>,
 }
 ```
 
@@ -611,7 +615,6 @@ pub struct Executor {
     pub id: ExecutorID,
     pub node: String,
     pub resreq: ResourceRequirement,
-    pub slots: u32,
     pub shim: Shim,
     pub task_id: Option<TaskID>,
     pub ssn_id: Option<SessionID>,
@@ -777,11 +780,11 @@ ALTER TABLE executors ADD COLUMN batch_index INTEGER;
 **Description:** Run a large language model that requires 4 GPUs across 4 nodes using tensor parallelism.
 
 **Workflow:**
-1. Register application `llm-inference` with 8 slots (GPUs) per node
-2. Create session with `batch_size=4`, `min_instances=4`
-3. Submit inference requests (4 tasks per request, one per node)
-4. Each executor gets its dedicated task based on `batch_index`
-5. All 4 tasks process the same request in parallel
+1. Register application `llm-inference` whose nodes provide 8 GPUs each.
+2. Create session with `batch_size=4`, `min_instances=4`, and a per-task `resreq` requesting 1 GPU.
+3. Submit inference requests (4 tasks per request, one per node).
+4. Each executor gets its dedicated task based on `batch_index`.
+5. All 4 tasks process the same request in parallel.
 
 **Example:**
 
@@ -790,7 +793,7 @@ ALTER TABLE executors ADD COLUMN batch_index INTEGER;
 session = flame.open_session(
     session_id="inference-001",
     application="llm-inference",
-    slots=8,
+    resreq={"cpu": 4, "memory": "16g", "gpu": 1},
     batch_size=4,
     min_instances=4,
 )
@@ -858,17 +861,17 @@ for worker_id in range(8):
 | Callback | Used By | Purpose |
 |----------|---------|---------|
 | `setup` | All | Initialize plugin state |
-| `ssn_order_fn` | FairShare | Session priority ordering |
-| `node_order_fn` | FairShare | Node priority ordering |
-| `is_underused` | FairShare, Gang | Session needs more resources |
-| `is_preemptible` | FairShare | Session can be preempted |
-| `is_available` | FairShare, Shim | Executor compatible with session |
-| `is_allocatable` | FairShare | Node can host session |
-| `is_reclaimable` | FairShare | Executor can be reclaimed |
+| `ssn_order_fn` | Priority, DRF | Session priority/dominant-share ordering |
+| `node_order_fn` | DRF | Node priority ordering |
+| `is_underused` | Priority, DRF, Gang | Session needs more resources |
+| `is_preemptible` | Priority, DRF | Session can be preempted |
+| `is_available` | DRF, Shim | Executor compatible with session |
+| `is_allocatable` | DRF | Node can host session |
+| `is_reclaimable` | Priority, DRF | Executor can be reclaimed |
 | `is_ready` | Gang | **NEW**: Session ready for batch commit |
-| `on_create_executor` | FairShare, Gang | Track new executor |
-| `on_session_bind` | FairShare, Gang | Track session binding |
-| `on_session_unbind` | FairShare, Gang | Track session unbinding |
+| `on_create_executor` | Priority, DRF, Gang | Track new executor |
+| `on_session_bind` | Priority, DRF, Gang | Track session binding |
+| `on_session_unbind` | Priority, DRF, Gang | Track session unbinding |
 | `on_pipeline_executor` | Gang | **NEW**: Track pipelined (reserved) executor |
 | `on_discard_executor` | Gang | **NEW**: Track discarded executor |
 

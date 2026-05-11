@@ -21,7 +21,7 @@ use clap::Parser;
 use comfy_table::presets::NOTHING;
 use comfy_table::Table;
 use flame_rs::apis::FlameError;
-use flame_rs::client::{Session, SessionAttributes, Task, TaskInformer};
+use flame_rs::client::{ResourceRequirement, Session, SessionAttributes, Task, TaskInformer};
 use futures::future::try_join_all;
 use indicatif::HumanCount;
 use stdng::{lock_ptr, new_ptr, MutexPtr};
@@ -40,9 +40,6 @@ struct Cli {
     #[arg(long)]
     /// The flame configuration file
     config: Option<String>,
-    #[arg(short, long, default_value = "1")]
-    /// The number of slots to use
-    slots: u32,
     /// The number of tasks to run
     #[arg(short, long, default_value = "10")]
     task_num: i32,
@@ -61,6 +58,11 @@ struct Cli {
     /// Session priority (higher value = higher priority, default: 0 = lowest)
     #[arg(short = 'P', long, default_value = "0")]
     priority: u32,
+    /// Explicit resource request (format: "cpu=N,mem=SIZE,gpu=N").
+    /// If omitted, server applies `cluster.resreq` (or a
+    /// hardcoded fallback when that is unset).
+    #[arg(short, long)]
+    resreq: Option<String>,
 }
 
 const DEFAULT_APP: &str = "flmping";
@@ -72,7 +74,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let ctx = FlameContext::from_file(cli.config)?;
 
-    let slots = cli.slots;
+    // `resreq` is optional. When `None`, the server fills it from
+    // `cluster.resreq` (or a hardcoded fallback).
+    let resreq = cli
+        .resreq
+        .as_ref()
+        .map(|s| ResourceRequirement::from(s.as_str()));
     let task_num = cli.task_num;
     let memory = match cli.memory {
         Some(s) => Some(Byte::parse_str(&s, true)?.as_u64()),
@@ -91,13 +98,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let ssn_attr = SessionAttributes {
         id: format!("{DEFAULT_APP}-{}", stdng::rand::short_name()),
         application: DEFAULT_APP.to_string(),
-        slots,
         common_data: cli.common_data.map(|s| s.into()),
         min_instances: 0,
         max_instances: None,
         batch_size: 1,
         priority: cli.priority,
-        resreq: None,
+        resreq,
     };
     let ssn = conn.create_session(&ssn_attr).await?;
     let ssn_creation_end_time = Instant::now();

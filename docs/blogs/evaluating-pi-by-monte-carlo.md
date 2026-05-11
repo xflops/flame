@@ -93,12 +93,13 @@ To submit tasks to Flame, the client need to connect to the Flame cluster by the
 let conn = flame::connect("http://127.0.0.1:8080").await?;
 ```
 
-After connected to Flame cluster, `flame::Connection` is used to create `Session` for tasks as follow; `flame::SessionAttributes` provides the information on how to create a session, e.g. which application to run, how many slots are used.
+After connected to Flame cluster, `flame::Connection` is used to create `Session` for tasks as follow; `flame::SessionAttributes` provides the information on how to create a session — e.g. which application to run, and the per-task `resreq` (cpu / memory / gpu).
 
 ```rust
     let attr = SessionAttributes {
         application: app,
-        slots,
+        resreq: Some(ResourceRequirement { cpu: 1, memory: 1 * 1024 * 1024 * 1024, gpu: 0 }),
+        ..Default::default()
     };
 
     let ssn = conn.create_session(&attr).await?;
@@ -197,14 +198,14 @@ sys     0m1.286s
 
 ```shell
 [klausm@hpc-cloud02 flame]$ ./target/debug/flmctl list
-ID        State     App            Slots     Pending   Running   Succeed   Failed    Created   
-7         Open      pi             1         8955      6         1039      0         02:01:48  
-1         Closed    pi             1         0         0         100       0         01:55:58  
-2         Closed    pi             1         0         0         10000     0         01:56:24  
-3         Closed    pi             1         0         0         10000     0         01:56:48  
-4         Closed    pi             1         0         0         1000      0         01:57:13  
-5         Closed    pi             1         0         0         100       0         01:57:38  
-6         Closed    pi             1         0         0         10000     0         01:58:22  
+ID        State     App            Resources                  Priority  Pending   Running   Succeed   Failed    Created
+7         Open      pi             cpu=1,mem=1g,gpu=0         0         8955      6         1039      0         02:01:48
+1         Closed    pi             cpu=1,mem=1g,gpu=0         0         0         0         100       0         01:55:58
+2         Closed    pi             cpu=1,mem=1g,gpu=0         0         0         0         10000     0         01:56:24
+3         Closed    pi             cpu=1,mem=1g,gpu=0         0         0         0         10000     0         01:56:48
+4         Closed    pi             cpu=1,mem=1g,gpu=0         0         0         0         1000      0         01:57:13
+5         Closed    pi             cpu=1,mem=1g,gpu=0         0         0         0         100       0         01:57:38
+6         Closed    pi             cpu=1,mem=1g,gpu=0         0         0         0         10000     0         01:58:22
 ```
 
 ## Reference

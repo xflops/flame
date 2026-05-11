@@ -138,7 +138,6 @@ mod tests {
         Arc::new(SessionInfo {
             id: id.to_string(),
             application: "test-app".to_string(),
-            slots: 1,
             tasks_status: HashMap::from([(TaskState::Pending, 1)]),
             creation_time: Utc::now(),
             completion_time: None,
@@ -147,7 +146,11 @@ mod tests {
             max_instances: None,
             batch_size,
             priority: 0,
-            resreq: None,
+            resreq: Some(ResourceRequirement {
+                cpu: 1,
+                memory: 1024,
+                gpu: 0,
+            }),
         })
     }
 
@@ -160,7 +163,6 @@ mod tests {
                 memory: 1024,
                 gpu: 0,
             },
-            slots: 1,
             shim: Shim::Host,
             task_id: None,
             ssn_id: ssn_id.map(|s| s.to_string()),
@@ -183,11 +185,7 @@ mod tests {
 
     #[test]
     fn test_is_fulfilled_batch_size_1() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
+        let ss = SnapShot::new();
 
         let ssn = create_test_session("ssn-1", 1);
         ss.add_session(ssn.clone()).unwrap();
@@ -207,11 +205,7 @@ mod tests {
 
     #[test]
     fn test_is_fulfilled_batch_size_2() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
+        let ss = SnapShot::new();
 
         let ssn = create_test_session("ssn-1", 2);
         ss.add_session(ssn.clone()).unwrap();
@@ -235,11 +229,7 @@ mod tests {
 
     #[test]
     fn test_is_fulfilled_with_allocated() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
+        let ss = SnapShot::new();
 
         let ssn = create_test_session("ssn-1", 2);
         ss.add_session(ssn.clone()).unwrap();
@@ -262,11 +252,7 @@ mod tests {
 
     #[test]
     fn test_is_ready_batch_size_1() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
+        let ss = SnapShot::new();
 
         let ssn = create_test_session("ssn-1", 1);
         ss.add_session(ssn.clone()).unwrap();
@@ -286,11 +272,7 @@ mod tests {
 
     #[test]
     fn test_is_ready_batch_size_2() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
+        let ss = SnapShot::new();
 
         let ssn = create_test_session("ssn-1", 2);
         ss.add_session(ssn.clone()).unwrap();
@@ -314,11 +296,7 @@ mod tests {
 
     #[test]
     fn test_is_ready_with_allocated() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
+        let ss = SnapShot::new();
 
         let ssn = create_test_session("ssn-1", 2);
         ss.add_session(ssn.clone()).unwrap();
@@ -341,11 +319,7 @@ mod tests {
 
     #[test]
     fn test_on_pipeline_and_discard() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
+        let ss = SnapShot::new();
 
         let ssn = create_test_session("ssn-1", 2);
         ss.add_session(ssn.clone()).unwrap();
@@ -375,11 +349,7 @@ mod tests {
 
     #[test]
     fn test_on_bind_and_unbind() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
+        let ss = SnapShot::new();
 
         let ssn = create_test_session("ssn-1", 2);
         ss.add_session(ssn.clone()).unwrap();

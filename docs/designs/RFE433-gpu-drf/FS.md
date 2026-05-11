@@ -11,29 +11,22 @@
 
 ### Background
 
-The Flame scheduler currently supports **fairshare scheduling** with CPU and memory resources. The fairshare policy distributes cluster resources proportionally across sessions based on their demand, converting multi-dimensional resources (CPU, memory) into abstract "slots" for allocation.
+The Flame scheduler historically supported **fairshare scheduling** with CPU and memory resources. The fairshare policy distributed cluster resources proportionally across sessions based on their demand, originally converting multi-dimensional resources (CPU, memory) into an abstract "slot" count. (The fairshare plugin and the `slots` field have since been removed; sessions now describe per-task resources exclusively via `ResourceRequirement` — see RFE413 for the priority/DRF scheduler that replaced fairshare.)
 
-However, when integrating Flame with AI/ML frameworks like SGLang, vLLM, and PyTorch, GPU resources are essential. The current scheduler has several limitations:
+However, when integrating Flame with AI/ML frameworks like SGLang, vLLM, and PyTorch, GPU resources are essential. The original scheduler had several limitations:
 
-1. **No GPU field in Rust types**: The `ResourceRequirement` proto includes a `gpu` field, but it's not used in the Rust implementation.
-2. **Slot calculation ignores GPU**: The `to_slots()` method only considers CPU and memory.
-3. **No multi-resource fairness**: When resources are heterogeneous (some sessions need GPUs, others don't), simple slot-based fairshare can lead to unfair allocation.
+1. **No GPU field in Rust types**: The `ResourceRequirement` proto included a `gpu` field, but it was not used in the Rust implementation.
+2. **No GPU in resource accounting**: CPU and memory were tracked, GPU was not.
+3. **No multi-resource fairness**: When resources are heterogeneous (some sessions need GPUs, others don't), simple proportional fairshare can lead to unfair allocation.
 
 ### Current Limitations
 
 ```rust
-// common/src/apis/types.rs - CURRENT
+// common/src/apis/types.rs - BEFORE this RFE
 pub struct ResourceRequirement {
     pub cpu: u64,
     pub memory: u64,
     // gpu field MISSING - proto has it, Rust doesn't
-}
-
-impl ResourceRequirement {
-    pub fn to_slots(&self, unit: &ResourceRequirement) -> u32 {
-        // Only considers CPU and memory
-        (self.cpu / unit.cpu).min(self.memory / unit.memory) as u32
-    }
 }
 ```
 
@@ -42,19 +35,18 @@ impl ResourceRequirement {
 ```
 Cluster: 64 CPUs, 256GB memory, 8 GPUs
 
-Session A (LLM inference): needs 4 CPUs, 16GB, 1 GPU per slot
-Session B (data preprocessing): needs 2 CPUs, 8GB, 0 GPUs per slot
+Session A (LLM inference):      resreq=(cpu=4,  mem=16GB, gpu=1) per task
+Session B (data preprocessing): resreq=(cpu=2,  mem=8GB,  gpu=0) per task
 
-Current behavior:
-  Slots calculated from CPU/memory only
-  Session B can consume all slots, leaving no GPUs for Session A
-  GPU resources are invisible to the scheduler
+Before this RFE:
+  GPU was invisible to the scheduler
+  Session B could consume all the CPU/memory, leaving no GPUs for Session A
 ```
 
 ### Objectives
 
 1. **GPU resource tracking**: Add GPU field to `ResourceRequirement` in Rust and propagate through the system.
-2. **GPU-aware slot calculation**: Include GPU in `to_slots()` so GPU-bound workloads get correct slot counts.
+2. **GPU-aware accounting**: Include GPU in all per-resource accounting.
 3. **Executor GPU reporting**: ExecutorManager detects and reports GPU capacity to SessionManager.
 4. **DRF scheduling policy**: Implement Dominant Resource Fairness for multi-resource environments where different sessions have different dominant resources.
 5. **SDK support**: Update Python and Rust SDKs to accept GPU requirements.
@@ -65,25 +57,29 @@ Current behavior:
 
 ### Configuration
 
-**Cluster unit configuration:**
+**Cluster default `resreq`:**
 
-The slot unit is configured as a string in the existing format, extended with `gpu`:
+The cluster-level field `resreq` provides the **default `resreq`** when a client creates a session without specifying one. (Earlier drafts of this RFE also discussed a separate `cluster.slot` field; that field has since been removed along with the rest of the slots concept.)
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `cpu` | integer | `1` | CPU cores per slot |
-| `mem` / `memory` | size string | `2g` | Memory per slot (supports k/m/g suffixes) |
-| `gpu` | integer | `0` | GPUs per slot (0 = no GPU requirement) |
+| `cpu` | integer | `1` | CPU cores |
+| `mem` / `memory` | size string | `1g` | Memory (supports k/m/g suffixes) |
+| `gpu` | integer | `0` | GPUs |
 
-**Format:** `"cpu=<n>,mem=<size>,gpu=<n>"` or `"cpu=<n>,memory=<size>,gpu=<n>"`
+**Format:** `"cpu=<n>,mem=<size>,gpu=<n>"` or `"cpu=<n>,memory=<size>,gpu=<n>"`.
+
+- This field is **optional** and acts as the **default `resreq`** when the client does not specify one.
+- If `cluster.resreq` is **unset** AND the client's `resreq` is None, the system falls back to the hardcoded default **`cpu=1,mem=1g,gpu=0`** (no error).
 
 ```yaml
 # flame-cluster.yaml
+cluster:
+  resreq: "cpu=4,mem=16g,gpu=1"   # default resreq when client omits it
 scheduler:
-  slot: "cpu=4,mem=16g,gpu=1"   # NEW: gpu added to existing format
   policies:
     - priority
-    - drf              # NEW: Use DRF instead of fairshare
+    - drf              # NEW: Dominant Resource Fairness
     - gang
 ```
 
@@ -91,10 +87,9 @@ scheduler:
 
 | Configuration | Description |
 |---------------|-------------|
-| `"cpu=1,mem=2g"` | Current default (no GPU, backward compatible) |
-| `"cpu=4,memory=16g,gpu=1"` | 1 GPU per slot for inference (using `memory`) |
-| `"cpu=8,mem=32g,gpu=2"` | 2 GPUs per slot for training (using `mem`) |
-| `"cpu=2,mem=8g"` | CPU-only workloads (gpu=0 implicit) |
+| `"cpu=1,mem=2g"` | CPU-only default (gpu=0 implicit) |
+| `"cpu=4,memory=16g,gpu=1"` | 1 GPU per executor for inference (using `memory`) |
+| `"cpu=8,mem=32g,gpu=2"` | 2 GPUs per executor for training (using `mem`) |
 
 **Note:** Both `mem` and `memory` are accepted as the memory key, but use only one per definition.
 
@@ -102,7 +97,6 @@ scheduler:
 
 | Policy | Description |
 |--------|-------------|
-| `fairshare` | Existing slot-based proportional allocation (GPU-aware in V1) |
 | `drf` | NEW: Dominant Resource Fairness for multi-resource environments |
 
 ### API
@@ -119,12 +113,14 @@ message ResourceRequirement {
 }
 ```
 
-**SessionSpec: Add `resreq` field (mutually exclusive with `slots`):**
+**SessionSpec: Add `resreq` field:**
 
 ```protobuf
 message SessionSpec {
   string application = 2;
-  uint32 slots = 3;                      // Abstract slot count (uses cluster unit)
+  // Field number 3 (slots) reserved — removed in the slots-cleanup refactor; do not reuse.
+  reserved 3;
+  reserved "slots";
   optional bytes common_data = 4;
   uint32 min_instances = 5;
   optional uint32 max_instances = 6;
@@ -134,51 +130,37 @@ message SessionSpec {
 }
 ```
 
-**Mutual Exclusion:** A session specifies resource needs via ONE of:
-- `slots` - Abstract units multiplied by cluster's `slot` config (e.g., slots=4 with unit "cpu=2,mem=8g,gpu=1" → 8 cpu, 32g mem, 4 gpu)
-- `resreq` - Explicit resource requirements (e.g., cpu=16, memory=64g, gpu=4)
+**Resource specification:** A session describes its per-task resource needs exclusively via `resreq` (e.g., cpu=16, memory=64g, gpu=4). If `resreq` is omitted, the server applies `cluster.resreq`; if neither is set, the hardcoded fallback `cpu=1,mem=1g,gpu=0` is used.
 
-| Field | When to Use |
-|-------|-------------|
-| `slots` | Simple case; let cluster config define resource-per-slot |
-| `resreq` | Fine-grained control; specify exact cpu/mem/gpu needed |
-
-**Validation Rules:**
+**Resolution Rules:**
 
 | Condition | Result |
 |-----------|--------|
-| `slots > 0` AND `resreq` is set | Error: "slots and resreq are mutually exclusive" |
-| `slots = 0` AND `resreq` is None | Error: "must specify either slots or resreq" |
-| `slots > 0` AND `resreq` is None | Valid: use slots × cluster unit |
-| `slots = 0` AND `resreq` is set | Valid: use explicit resreq |
+| `resreq` is set | Use explicit resreq |
+| `resreq` is None AND `cluster.resreq` set | Use `cluster.resreq` as the session's `resreq` |
+| `resreq` is None AND `cluster.resreq` unset | Fall back to hardcoded default `cpu=1,mem=1g,gpu=0` |
+
+This three-case chain is implemented by `resolve_session_resreq` in `session_manager/src/apiserver/frontend.rs`.
+
+**Default resolution:** Default resolution happens server-side in the session manager; SDKs/CLIs do not need to know the cluster default. This means all SDKs/CLIs benefit from the new behavior without per-language changes.
 
 ### CLI
 
 **Modified command: `flmctl create`**
 
 ```bash
-# Option 1: Use slots (existing)
-flmctl create --app <APPLICATION> --slots <SLOTS> [--priority <PRIORITY>]
-
-# Option 2: Use explicit resources (NEW)
-flmctl create --app <APPLICATION> --resreq <RESREQ> [--priority <PRIORITY>]
+flmctl create --app <APPLICATION> [--resreq <RESREQ>] [--priority <PRIORITY>]
 ```
 
 **New flag:**
 
 | Flag | Short | Type | Default | Description |
 |------|-------|------|---------|-------------|
-| `--resreq` | `-r` | `string` | `None` | Explicit resource request (format: "cpu=N,mem=SIZE,gpu=N" or "cpu=N,memory=SIZE,gpu=N") |
-
-**Mutual exclusion:** `--slots` and `--resreq` cannot be used together.
+| `--resreq` | `-r` | `string` | `None` | Explicit resource request (format: "cpu=N,mem=SIZE,gpu=N" or "cpu=N,memory=SIZE,gpu=N"). When omitted, the server applies `cluster.resreq`. |
 
 **Usage examples:**
 
 ```bash
-# Using slots (cluster unit: cpu=4,mem=16g,gpu=1)
-flmctl create --app llm-inference --slots 4
-# Results in: cpu=16, mem=64g, gpu=4
-
 # Using explicit resources (mem)
 flmctl create --app llm-inference --resreq "cpu=16,mem=64g,gpu=4"
 
@@ -188,9 +170,8 @@ flmctl create --app llm-inference --resreq "cpu=16,memory=64g,gpu=4"
 # CPU-only workload with explicit resources
 flmctl create --app data-preprocess --resreq "cpu=8,mem=32g"
 
-# Error: cannot use both
-flmctl create --app myapp --slots 4 --resreq "cpu=8,mem=16g"
-# Error: slots and resreq are mutually exclusive
+# No --resreq: server applies cluster.resreq, or the hardcoded fallback
+flmctl create --app myapp
 ```
 
 **Node listing (`flmctl list -n`):**
@@ -206,13 +187,7 @@ node-002     Ready   64      256Gi       0     60               240Gi           
 **Python SDK (`flamepy.core`):**
 
 ```python
-# Option 1: Use slots (existing)
-session = flame.create_session(
-    application="llm-inference",
-    slots=4,
-)
-
-# Option 2: Use explicit resources (NEW) - both "mem" and "memory" accepted
+# Using explicit resources - both "mem" and "memory" accepted
 session = flame.create_session(
     application="llm-inference",
     resreq={"cpu": 16, "mem": "64g", "gpu": 4},
@@ -223,13 +198,8 @@ session = flame.create_session(
     resreq={"cpu": 16, "memory": "64g", "gpu": 4},
 )
 
-# Error: cannot use both
-session = flame.create_session(
-    application="llm-inference",
-    slots=4,
-    resreq={"cpu": 16, "memory": "64g", "gpu": 4},
-)
-# Raises: FlameError("slots and resreq are mutually exclusive")
+# Omitting resreq lets the server apply cluster.resreq (or the fallback)
+session = flame.create_session(application="llm-inference")
 ```
 
 **Python SDK (`flamepy.runner`):**
@@ -237,32 +207,18 @@ session = flame.create_session(
 ```python
 from flamepy.runner import Runner, RunnerService
 
-# RunnerService - slots/resreq configured here (creates session internally)
-
-# Option 1: Use slots (existing, default slots=1)
-service = RunnerService(
-    app="llm-inference",
-    execution_object=my_model,
-    slots=4,  # NEW parameter
-)
-
-# Option 2: Use explicit resources (NEW)
+# RunnerService - resreq configured here (creates session internally)
 service = RunnerService(
     app="llm-inference",
     execution_object=my_model,
     resreq={"cpu": 16, "memory": "64g", "gpu": 4},
 )
 
-# Runner.service() also supports slots/resreq
+# Runner.service() also supports resreq
 runner = Runner(application="llm-inference")
 service = runner.service(
     my_model,
-    slots=4,  # NEW parameter
-)
-# OR
-service = runner.service(
-    my_model,
-    resreq={"cpu": 8, "memory": "32g", "gpu": 2},  # NEW parameter
+    resreq={"cpu": 8, "memory": "32g", "gpu": 2},
 )
 ```
 
@@ -271,13 +227,6 @@ service = runner.service(
 ```python
 from flamepy.agent import AgentClient
 
-# Option 1: Use slots (existing)
-agent = AgentClient(
-    application="llm-agent",
-    slots=2,
-)
-
-# Option 2: Use explicit resources (NEW)
 agent = AgentClient(
     application="llm-agent",
     resreq={"cpu": 8, "memory": "32g", "gpu": 2},
@@ -289,20 +238,12 @@ agent = AgentClient(
 ```rust
 use flame_sdk::{Client, SessionAttributes, ResourceRequirement};
 
-// Option 1: Use slots
 let session = client.create_session(SessionAttributes {
     application: "llm-inference".to_string(),
-    slots: Some(4),
-    ..Default::default()
-}).await?;
-
-// Option 2: Use explicit resources
-let session = client.create_session(SessionAttributes {
-    application: "llm-inference".to_string(),
-    resreq: Some(ResourceRequirement { 
-        cpu: 16, 
-        memory: 64 * 1024 * 1024 * 1024, 
-        gpu: 4 
+    resreq: Some(ResourceRequirement {
+        cpu: 16,
+        memory: 64 * 1024 * 1024 * 1024,
+        gpu: 4,
     }),
     ..Default::default()
 }).await?;
@@ -315,7 +256,6 @@ let session = client.create_session(SessionAttributes {
 @dataclass
 class SessionAttributes:
     application: str
-    slots: Optional[int] = None           # Use slots OR resreq, not both
     resreq: Optional[ResourceRequirement] = None  # NEW
     id: Optional[str] = None
     common_data: Any = None
@@ -336,7 +276,6 @@ class ResourceRequirement:  # NEW
 // sdk/rust/src/types.rs
 pub struct SessionAttributes {
     pub application: String,
-    pub slots: Option<u32>,              // Use slots OR resreq, not both
     pub resreq: Option<ResourceRequirement>,  // NEW
     pub id: Option<String>,
     pub common_data: Option<Vec<u8>>,
@@ -351,8 +290,9 @@ pub struct SessionAttributes {
 **In Scope:**
 
 - `gpu` field implementation in Rust `ResourceRequirement`
-- GPU-aware `to_slots()` and `new()` methods
-- `resreq` field in `SessionSpec` (mutually exclusive with `slots`)
+- GPU-aware per-resource accounting
+- `resreq` field in `SessionSpec` as the sole way to specify per-task resources
+- `cluster.resreq` field as default for `resreq` (with hardcoded fallback `cpu=1,mem=1g,gpu=0`)
 - Executor GPU detection and reporting
 - Node GPU capacity tracking
 - DRF scheduler plugin with dominant share calculation
@@ -380,7 +320,6 @@ pub struct SessionAttributes {
 
 | Feature | Interaction |
 |---------|-------------|
-| **FairShare (RFE400/RFE408)** | GPU added to slot calculation; fairshare becomes GPU-aware |
 | **PriorityPlugin (RFE413)** | Orthogonal; priority ordering applies to GPU sessions equally |
 | **GangPlugin (RFE400)** | Orthogonal; batch constraints apply to GPU sessions |
 
@@ -391,10 +330,9 @@ pub struct SessionAttributes {
 | `common/src/apis/types.rs` | Add `gpu: i32` to `ResourceRequirement` |
 | `common/src/apis/from_rpc.rs` | Include GPU in proto conversion |
 | `common/src/apis/to_rpc.rs` | Include GPU in proto conversion |
-| `common/src/ctx.rs` | Add `gpu` to cluster slot configuration |
+| `common/src/ctx.rs` | Add cluster `resreq` field (parsed from the string format above) |
 | `session_manager/src/model/mod.rs` | Add `gpu` to `NodeInfo`, `ExecutorInfo` |
-| `session_manager/src/storage/` | Add `gpu` columns to tables (see migration below) |
-| `session_manager/src/scheduler/plugins/fairshare.rs` | Update `NInfo` for GPU tracking |
+| `session_manager/src/storage/` | Add `gpu` columns to tables (see migration below); resolve default `resreq` from `cluster.resreq` (or hardcoded `cpu=1,mem=1g,gpu=0`) when client `resreq` is absent during session creation |
 | `session_manager/src/scheduler/plugins/drf.rs` | **NEW** DRF plugin |
 | `executor_manager/src/stream_handler.rs` | GPU detection in node reporting |
 
@@ -419,28 +357,26 @@ pub struct SessionAttributes {
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
 │  │                          PluginManager                              │    │
 │  │                                                                     │    │
-│  │  ┌──────────────┐  ┌───────────────┐  ┌──────────────┐  ┌────────┐  │    │
-│  │  │ PriorityPlug │  │   DRFPlugin   │  │  FairShare   │  │  Gang  │  │    │
-│  │  │              │  │    (NEW)      │  │ (GPU-aware)  │  │        │  │    │
-│  │  │              │  │               │  │              │  │        │  │    │
-│  │  │ ssn_order:   │  │ ssn_order:    │  │ ssn_order:   │  │  (no   │  │    │
-│  │  │  by priority │  │  by dominant  │  │  by alloc/   │  │  order)│  │    │
-│  │  │              │  │  share        │  │  deserved    │  │        │  │    │
-│  │  │              │  │               │  │              │  │        │  │    │
-│  │  │ is_underused:│  │ is_underused: │  │ is_underused:│  │        │  │    │
-│  │  │  priority    │  │  any resource │  │  slots < des │  │        │  │    │
-│  │  │  blocking    │  │  below desire │  │              │  │        │  │    │
-│  │  └──────────────┘  └───────────────┘  └──────────────┘  └────────┘  │    │
+│  │  ┌──────────────┐  ┌───────────────┐  ┌────────┐                    │    │
+│  │  │ PriorityPlug │  │   DRFPlugin   │  │  Gang  │                    │    │
+│  │  │              │  │    (NEW)      │  │        │                    │    │
+│  │  │ ssn_order:   │  │ ssn_order:    │  │  (no   │                    │    │
+│  │  │  by priority │  │  by dominant  │  │  order)│                    │    │
+│  │  │              │  │  share        │  │        │                    │    │
+│  │  │ is_underused:│  │ is_underused: │  │        │                    │    │
+│  │  │  priority    │  │  any resource │  │        │                    │    │
+│  │  │  blocking    │  │  below desire │  │        │                    │    │
+│  │  └──────────────┘  └───────────────┘  └────────┘                    │    │
 │  │                                                                     │    │
-│  │  Policy selection: [priority, drf, gang] OR [priority, fairshare, gang] │
+│  │  Policy selection: [priority, drf, gang]                            │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
 │  │                        Resource Tracking                            │    │
 │  │                                                                     │    │
-│  │   Node: { cpu: 64, memory: 256GB, gpu: 8 }                          │    │
-│  │   Executor: { resreq: { cpu: 4, memory: 16GB, gpu: 1 }, slots: 1 }  │    │
-│  │   Session: { slots: 4 } OR { resreq: { cpu: 16, mem: 64GB, gpu: 4 }}│    │
+│  │   Node:     { cpu: 64, memory: 256GB, gpu: 8 }                      │    │
+│  │   Executor: { resreq: { cpu: 4, memory: 16GB, gpu: 1 } }            │    │
+│  │   Session:  { resreq: { cpu: 16, memory: 64GB, gpu: 4 } }           │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -467,42 +403,9 @@ pub struct ResourceRequirement {
     pub memory: u64,
     pub gpu: i32,  // NEW: Number of GPUs (i32 for proto compatibility)
 }
-
-impl ResourceRequirement {
-    /// Create resource requirement for N slots using the unit definition.
-    pub fn new(slots: u32, unit: &ResourceRequirement) -> Self {
-        Self {
-            cpu: slots as u64 * unit.cpu,
-            memory: slots as u64 * unit.memory,
-            gpu: slots as i32 * unit.gpu,
-        }
-    }
-
-    /// Calculate how many complete slots fit in these resources.
-    /// Returns the minimum across all resource dimensions.
-    pub fn to_slots(&self, unit: &ResourceRequirement) -> u32 {
-        let cpu_slots = if unit.cpu > 0 { 
-            self.cpu / unit.cpu 
-        } else { 
-            u64::MAX 
-        };
-        
-        let mem_slots = if unit.memory > 0 { 
-            self.memory / unit.memory 
-        } else { 
-            u64::MAX 
-        };
-        
-        let gpu_slots = if unit.gpu > 0 { 
-            (self.gpu / unit.gpu) as u64 
-        } else { 
-            u64::MAX  // No GPU requirement = unlimited GPU slots
-        };
-        
-        cpu_slots.min(mem_slots).min(gpu_slots) as u32
-    }
-}
 ```
+
+Per-resource arithmetic (`add`, `sub`, `min`, `max`, `mul`, `great_equal`) is implemented in the same file and is what the scheduler uses for all resource accounting.
 
 #### 2. Proto Conversions
 
@@ -796,11 +699,6 @@ const PLUGIN_REGISTRY: &[PluginInfo] = &[
         configurable: true,
     },
     PluginInfo {
-        name: "fairshare",
-        constructor: FairShare::new_ptr,
-        configurable: true,
-    },
-    PluginInfo {
         name: "drf",  // NEW
         constructor: DRFPlugin::new_ptr,
         configurable: true,
@@ -818,36 +716,98 @@ const PLUGIN_REGISTRY: &[PluginInfo] = &[
 ];
 ```
 
-#### 6. FairShare GPU Updates
+#### 6. Cluster Default Resreq Resolution
 
-**`session_manager/src/scheduler/plugins/fairshare.rs`:**
+This sub-component implements the resolution chain spelled out in §2 (Resolution Rules table) for the `cluster.resreq` field. Resolution lives **server-side** in the session manager (at the apiserver boundary where `SessionSpec` arrives from the wire) so there is a single source of truth for default selection: SDKs and CLIs need no changes, and behavior is uniform regardless of which client populated the request. The string format is parsed by `impl From<&String> for ResourceRequirement` in `common/src/apis/types.rs`, which accepts both `mem` and `memory` keys.
 
-The existing FairShare plugin needs GPU-aware updates:
+**`common/src/ctx.rs`:**
 
 ```rust
-// NInfo struct - add GPU tracking
-struct NInfo {
-    pub allocatable: u32,  // slots (existing)
-    pub allocated: f64,    // slots (existing)
-    pub gpu_allocatable: i32,  // NEW: total GPUs on node
-    pub gpu_allocated: i32,    // NEW: GPUs currently allocated
+// FlameClusterYaml (serde layer): hold the optional default-resreq string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FlameClusterYaml {
+    pub name: String,
+    pub endpoint: String,
+    pub resreq: Option<String>,  // cluster-wide default resreq
+    pub policies: Option<Vec<String>>,
+    // ... existing fields unchanged ...
 }
 
-// is_allocatable - check GPU capacity
-fn is_allocatable(&self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Option<bool> {
-    let node_info = self.nodes.get(&node.name)?;
-    let ssn_info = self.ssns.get(&ssn.id)?;
-    
-    // Check slot capacity (existing)
-    let slot_ok = node_info.allocated + ssn_info.slots as f64 <= node_info.allocatable as f64;
-    
-    // Check GPU capacity (NEW)
-    let gpu_needed = ssn_info.slots as i32 * self.unit.gpu;
-    let gpu_ok = node_info.gpu_allocated + gpu_needed <= node_info.gpu_allocatable;
-    
-    Some(slot_ok && gpu_ok)
+// FlameCluster (runtime struct): parsed value, or None if unset.
+#[derive(Debug, Clone)]
+pub struct FlameCluster {
+    pub name: String,
+    pub endpoint: String,
+    pub resreq: Option<ResourceRequirement>,
+    // ... existing fields unchanged ...
 }
 ```
+
+**`session_manager/src/apiserver/frontend.rs`:**
+
+The three-case resolution chain is implemented as a small helper called from `Frontend::create_session`, immediately after `SessionSpec` is unpacked from the gRPC request and before the `SessionAttributes` is built. The helper always returns a concrete `ResourceRequirement` (never `None`), so downstream layers — scheduler plugins included — can rely on `ssn.resreq` always being populated.
+
+```rust
+// Hardcoded safety-net fallback when neither client nor cluster specifies anything.
+// 1 CPU, 1 GiB memory, 0 GPU.
+const DEFAULT_FALLBACK_RESREQ: ResourceRequirement = ResourceRequirement {
+    cpu: 1,
+    memory: 1024 * 1024 * 1024,
+    gpu: 0,
+};
+
+/// Resolve the effective ResourceRequirement for a new session.
+///
+/// Implements the chain documented in §2 Resolution Rules:
+///   1. explicit (client) resreq is set                                          -> use it
+///   2. explicit is None AND cluster.resreq set                    -> use cluster default
+///   3. explicit is None AND cluster.resreq unset                  -> hardcoded fallback
+fn resolve_session_resreq(
+    explicit: Option<ResourceRequirement>,
+    cluster_default: Option<&ResourceRequirement>,
+) -> ResourceRequirement {
+    if let Some(rr) = explicit {
+        return rr;
+    }
+    if let Some(default) = cluster_default {
+        tracing::info!(
+            "applying cluster.resreq default to session: {:?}",
+            default
+        );
+        return default.clone();
+    }
+    tracing::info!(
+        "no resreq supplied and no cluster default; applying hardcoded fallback: {:?}",
+        DEFAULT_FALLBACK_RESREQ
+    );
+    DEFAULT_FALLBACK_RESREQ
+}
+```
+
+Call site inside `Frontend::create_session`:
+
+```rust
+let explicit = ssn_spec.resreq.map(apis::ResourceRequirement::from);
+let resreq = resolve_session_resreq(explicit, self.cluster_default_resreq.as_ref());
+
+let attr = SessionAttributes {
+    id: ssn_id,
+    application: ssn_spec.application,
+    common_data: ssn_spec.common_data.map(apis::CommonData::from),
+    min_instances: ssn_spec.min_instances,
+    max_instances: ssn_spec.max_instances,
+    batch_size: ssn_spec.batch_size.max(1),
+    priority: ssn_spec.priority,
+    resreq: Some(resreq),  // always populated by resolver
+};
+```
+
+**Notes:**
+
+- The resreq parser (`impl From<&String> for ResourceRequirement` in `common/src/apis/types.rs`) accepts both `mem` and `memory` keys.
+- If `cluster.resreq` is malformed at startup, `ResourceRequirement::from` logs the parse error and the cluster fails to start with a clear `InvalidConfig`.
+- The hardcoded `DEFAULT_FALLBACK_RESREQ` (cpu=1, memory=1 GiB, gpu=0) is a safety net only; production deployments should set `cluster.resreq` explicitly so that defaults are auditable from the cluster config.
+- An `info`-level tracing log is emitted whenever case 2 or case 3 fires, so operators can observe which sessions ran with implicit defaults rather than client-supplied resources.
 
 ### Data Structures
 
@@ -884,23 +844,24 @@ For session s with allocation A = (cpu, memory, gpu):
 Allocation order: Pick session with smallest dominant_share
 ```
 
-#### GPU-Aware Slot Calculation
+#### Node Fit Calculation (per-resource)
 
 ```
-Given resources R = (cpu, memory, gpu) and unit U = (u_cpu, u_mem, u_gpu):
+Given a node's allocatable A = (cpu, memory, gpu) and a session's per-task R = (cpu, memory, gpu):
 
-slots = min(
-  R.cpu / U.cpu,      // if U.cpu > 0, else infinity
-  R.memory / U.memory, // if U.memory > 0, else infinity
-  R.gpu / U.gpu       // if U.gpu > 0, else infinity
+# How many full executors of the session can fit on this node:
+fit = min(
+  A.cpu / R.cpu,       // if R.cpu > 0, else infinity
+  A.memory / R.memory, // if R.memory > 0, else infinity
+  A.gpu / R.gpu        // if R.gpu > 0, else infinity
 )
 
 Example:
-  Node: cpu=64, memory=256GB, gpu=8
-  Unit: cpu=4, memory=16GB, gpu=1
-  
-  Slots = min(64/4, 256/16, 8/1) = min(16, 16, 8) = 8
-  
+  Node:     cpu=64, memory=256GB, gpu=8
+  Per-task: cpu=4,  memory=16GB,  gpu=1
+
+  fit = min(64/4, 256/16, 8/1) = min(16, 16, 8) = 8
+
   GPU is the limiting factor (dominant resource for this node)
 ```
 
@@ -977,54 +938,65 @@ ALTER TABLE node ADD COLUMN allocatable_gpu INTEGER NOT NULL DEFAULT 0;
 **Description:** Deploy LLM inference with GPU requirements.
 
 ```bash
-# Create GPU inference session
-flmctl create --app llm-inference --slots 4
-
-# Cluster unit configured as: cpu=4, memory=16GB, gpu=1
-# Session requests 4 slots = 16 CPUs, 64GB memory, 4 GPUs
+# Create GPU inference session with explicit per-task resreq
+flmctl create --app llm-inference --resreq cpu=4,mem=16g,gpu=1
 ```
 
 **Workflow:**
-1. Session requests 4 slots
-2. Scheduler calculates resources: 4 slots × (4 cpu, 16GB, 1 gpu) = (16 cpu, 64GB, 4 gpu)
-3. Scheduler finds nodes with sufficient GPU capacity
-4. Allocates executors on GPU nodes
+1. Session requests per-task `cpu=4, mem=16GB, gpu=1` (one GPU per executor).
+2. Scheduler finds nodes with sufficient GPU capacity.
+3. Allocates executors on GPU nodes; each task uses 1 GPU.
 
-**Outcome:** Session gets 4 executors, each with 1 GPU.
+**Outcome:** Session executors land on GPU nodes; each task uses 1 GPU.
 
 ---
 
-**Example 2: Mixed GPU and CPU Workloads**
+**Example 2: Cluster Default `resreq` (no client-supplied `resreq`)**
+
+**Description:** Client omits `resreq`; the cluster default applies.
+
+```bash
+# Cluster config: cluster.resreq: "cpu=2,mem=8g"
+flmctl create --app data-preprocess
+# No --resreq → server resolves resreq = cpu=2, mem=8g, gpu=0
+```
+
+**Workflow:**
+1. Client sends SessionSpec with no `resreq`.
+2. Session manager resolves the default server-side from `cluster.resreq`.
+3. If `cluster.resreq` is unset, the hardcoded fallback `cpu=1,mem=1g,gpu=0` is used instead.
+
+**Outcome:** Session is created with the cluster's default resource requirement; SDKs/CLIs require no changes.
+
+---
+
+**Example 3: Mixed GPU and CPU Workloads**
 
 **Description:** Fair sharing between GPU and CPU sessions.
 
 ```bash
 # GPU inference session
-flmctl create --app llm-inference --slots 4  # needs GPUs
+flmctl create --app llm-inference --resreq cpu=4,mem=16g,gpu=1
 
-# CPU preprocessing session  
-flmctl create --app data-preprocess --slots 8  # no GPUs needed
+# CPU preprocessing session
+flmctl create --app data-preprocess --resreq cpu=4,mem=4g
 ```
 
 ```
 Cluster: cpu=64, memory=256GB, gpu=8
-Unit: cpu=4, memory=16GB, gpu=1
 
 With DRF:
-  llm-inference: dominant resource = GPU
-    Share: gpu=4/8 = 50%
-  
-  data-preprocess: dominant resource = CPU
-    Share: cpu=32/64 = 50%
-  
+  llm-inference (per-task cpu=4, mem=16GB, gpu=1): dominant resource = GPU
+  data-preprocess (per-task cpu=4, mem=4GB, gpu=0): dominant resource = CPU
+
 DRF equalizes dominant shares:
-  Both sessions get 50% of their dominant resource
+  Both sessions converge toward equal share of their dominant resource
   GPU session doesn't starve CPU session and vice versa
 ```
 
 ---
 
-**Example 3: GPU-Only Node Scheduling**
+**Example 4: GPU-Only Node Scheduling**
 
 **Description:** Schedule GPU workloads only on GPU-capable nodes.
 
@@ -1033,38 +1005,34 @@ Nodes:
   node-001: cpu=64, memory=256GB, gpu=8  (GPU node)
   node-002: cpu=64, memory=256GB, gpu=0  (CPU-only node)
 
-Session: slots=2, unit=(cpu=4, mem=16GB, gpu=1)
+Session per-task resreq: (cpu=4, mem=16GB, gpu=1)
 
 Scheduling:
-  node-001: to_slots() = min(16, 16, 8) = 8 slots available
-  node-002: to_slots() = min(16, 16, ∞) = 16 slots available
-            BUT: session needs gpu=1, node has gpu=0
+  node-001: fit = min(64/4, 256/16, 8/1) = min(16, 16, 8) = 8 executors
+  node-002: gpu requirement is 1 but node has gpu=0
             → is_allocatable() = false
-  
+
 Result: Session scheduled only on node-001
 ```
 
 ### Advanced Use Cases
 
-**Example 4: DRF with Heterogeneous Demands**
+**Example 5: DRF with Heterogeneous Demands**
 
 ```
 Cluster: cpu=100, memory=100GB, gpu=10
 
-Session A (GPU-heavy): demands (1 cpu, 4GB, 2 gpu) per task
-Session B (CPU-heavy): demands (4 cpu, 1GB, 0 gpu) per task
-
-Without DRF (slot-based):
-  Sessions compete for slots, GPU might be wasted
+Session A (GPU-heavy): per-task (1 cpu, 4GB,  2 gpu)
+Session B (CPU-heavy): per-task (4 cpu, 1GB,  0 gpu)
 
 With DRF:
   A's dominant resource: GPU (2/10 = 20% per task)
   B's dominant resource: CPU (4/100 = 4% per task)
-  
+
   DRF allocates so that max shares are equal:
   A gets 25 tasks: gpu_share = 50/10 = 50%
   B gets 12.5 tasks: cpu_share = 50/100 = 50%
-  
+
   Both sessions have equal dominant share (50%)
 ```
 
@@ -1094,18 +1062,17 @@ With DRF:
 | `common/src/apis/types.rs` | ResourceRequirement — add `gpu` field |
 | `common/src/apis/from_rpc.rs` | Proto conversion — include GPU |
 | `common/src/apis/to_rpc.rs` | Proto conversion — include GPU |
-| `common/src/ctx.rs` | Cluster config — add `slot.gpu` |
+| `common/src/ctx.rs` | Cluster config — add `cluster.resreq` |
 | `rpc/protos/types.proto` | SessionSpec — add `resreq` field |
 | `executor_manager/src/stream_handler.rs` | GPU detection |
 | `session_manager/src/model/mod.rs` | NodeInfo, ExecutorInfo — add GPU |
 | `session_manager/src/storage/` | SQLite schema — add GPU columns |
 | `session_manager/src/scheduler/plugins/drf.rs` | **NEW** DRF plugin |
 | `session_manager/src/scheduler/plugins/mod.rs` | Plugin registration |
-| `session_manager/src/scheduler/plugins/fairshare.rs` | Update NInfo for GPU |
 | `flmctl/src/create.rs` | Add `--resreq` flag |
 | `sdk/python/src/flamepy/core/types.py` | Add `ResourceRequirement`, update `SessionAttributes` |
 | `sdk/python/src/flamepy/core/client.py` | Add `resreq` parameter |
-| `sdk/python/src/flamepy/runner/runner.py` | Add `slots`/`resreq` parameters to `RunnerService` and `Runner.service()` |
+| `sdk/python/src/flamepy/runner/runner.py` | Add `resreq` parameter to `RunnerService` and `Runner.service()` |
 | `sdk/python/src/flamepy/agent/client.py` | Add `resreq` parameter to `AgentClient` |
 | `sdk/rust/src/types.rs` | Add `resreq` to `SessionAttributes` |
 

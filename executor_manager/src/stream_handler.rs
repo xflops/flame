@@ -401,7 +401,6 @@ mod tests {
             id: "test-exec".to_string(),
             node: "test-node".to_string(),
             resreq: ResourceRequirement::default(),
-            slots: 1,
             session: None,
             task: None,
             context: None,

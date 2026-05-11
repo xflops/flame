@@ -196,13 +196,12 @@ impl From<&Session> for rpc::Session {
             }),
             spec: Some(rpc::SessionSpec {
                 application: ssn.application.clone(),
-                slots: ssn.slots,
                 common_data: ssn.common_data.clone().map(CommonData::into),
                 min_instances: ssn.min_instances,
                 max_instances: ssn.max_instances,
                 batch_size: ssn.batch_size,
                 priority: ssn.priority,
-                resreq: None,
+                resreq: ssn.resreq.clone().map(rpc::ResourceRequirement::from),
             }),
             status: Some(status),
         }

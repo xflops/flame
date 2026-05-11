@@ -99,7 +99,6 @@ mod tests {
             id: id.to_string(),
             node: "test-node".to_string(),
             resreq: ResourceRequirement::default(),
-            slots: 1,
             shim: Shim::Host,
             task_id: None,
             ssn_id: None,
@@ -129,7 +128,7 @@ mod tests {
                 name: "test".to_string(),
                 endpoint: "http://localhost:8080".to_string(),
                 storage: url,
-                slot: ResourceRequirement::default(),
+                resreq: None,
                 policies: vec!["priority".to_string(), "gang".to_string()],
                 schedule_interval: 1000,
                 executors: FlameExecutors {

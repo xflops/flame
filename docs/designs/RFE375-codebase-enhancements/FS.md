@@ -377,7 +377,7 @@ message Session {
   /** Unique identifier and name for the session */
   Metadata metadata = 1;
   
-  /** Session configuration including application, slots, and instance limits */
+  /** Session configuration including application, resource request, and instance limits */
   SessionSpec spec = 2;
   
   /** Current session state and task statistics */
@@ -390,10 +390,11 @@ message Session {
 message SessionSpec {
   /** Name of the application to run (must be pre-registered) */
   string application = 2;
-  
-  /** Number of task slots per executor instance */
-  uint32 slots = 3;
-  
+
+  /** Field number 3 (slots) reserved — removed in the slots-cleanup refactor; do not reuse. */
+  reserved 3;
+  reserved "slots";
+
   /** Data shared across all tasks in this session (optional) */
   optional bytes common_data = 4;
   

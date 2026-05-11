@@ -20,7 +20,6 @@ use stdng::{lock_ptr, new_ptr, MutexPtr};
 
 use crate::model::{ExecutorInfoPtr, NodeInfo, NodeInfoPtr, SessionInfo, SessionInfoPtr, SnapShot};
 use crate::scheduler::plugins::drf::DRFPlugin;
-use crate::scheduler::plugins::fairshare::FairShare;
 use crate::scheduler::plugins::gang::GangPlugin;
 use crate::scheduler::plugins::priority::PriorityPlugin;
 use crate::scheduler::plugins::shim::ShimPlugin;
@@ -29,7 +28,6 @@ use crate::scheduler::Context;
 use common::FlameError;
 
 mod drf;
-mod fairshare;
 mod gang;
 mod priority;
 mod shim;
@@ -129,11 +127,6 @@ const PLUGIN_REGISTRY: &[PluginInfo] = &[
         configurable: true,
     },
     PluginInfo {
-        name: "fairshare",
-        constructor: FairShare::new_ptr,
-        configurable: true,
-    },
-    PluginInfo {
         name: "drf",
         constructor: DRFPlugin::new_ptr,
         configurable: true,
@@ -201,14 +194,14 @@ impl PluginManager {
     /// Returns whether the session is underused (needs more executors).
     ///
     /// Uses "first non-`None` wins" ordering, identical to `ssn_order_fn`.
-    /// Plugins are consulted in registration order (Priority → FairShare → Shim → Gang).
+    /// Plugins are consulted in registration order (Priority → DRF → Gang → Shim).
     /// The first plugin that returns `Some(result)` wins; `None` means "no opinion, ask the
     /// next plugin".  If no plugin has an opinion, the session is considered NOT underused.
     ///
     /// This gives `PriorityPlugin` (registered first) full authority:
     /// - `Some(false)` → blocked; no further plugins consulted.
-    /// - `Some(true)` → underused; overrides any FairShare veto.
-    /// - `None` → defer to FairShare for proportional underuse check.
+    /// - `Some(true)` → underused; overrides any downstream-plugin veto.
+    /// - `None` → defer to the next plugin in the chain for additional underuse checks.
     pub fn is_underused(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
         let plugins = lock_ptr!(self.plugins)?;
         for (_, plugin) in plugins.iter() {
@@ -503,120 +496,26 @@ impl collections::Cmp<SessionInfoPtr> for SsnOrderFn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ExecutorInfo, SessionInfo};
+    use crate::model::ExecutorInfo;
     use chrono::Utc;
-    use common::apis::{ExecutorState, ResourceRequirement, SessionState, Shim, TaskState};
-    use std::collections::HashMap;
+    use common::apis::{ExecutorState, ResourceRequirement, Shim};
 
-    /// Create a test session with the given parameters.
-    fn create_test_session(id: &str, slots: u32) -> SessionInfoPtr {
-        Arc::new(SessionInfo {
-            id: id.to_string(),
-            application: "test-app".to_string(),
-            slots,
-            tasks_status: HashMap::from([(TaskState::Pending, 1)]),
-            creation_time: Utc::now(),
-            completion_time: None,
-            state: SessionState::Open,
-            min_instances: 0,
-            max_instances: None,
-            batch_size: 1,
-            priority: 0,
-            resreq: None,
-        })
-    }
-
-    /// Create a test executor with the given parameters.
-    fn create_test_executor(id: &str, slots: u32) -> ExecutorInfoPtr {
+    /// Create a test executor sized by `n` units (1 unit = (cpu:1, memory:1024, gpu:0)).
+    fn create_test_executor(id: &str, n: u32) -> ExecutorInfoPtr {
         Arc::new(ExecutorInfo {
             id: id.to_string(),
             node: "test-node".to_string(),
             resreq: ResourceRequirement {
-                cpu: 1,
-                memory: 1024,
+                cpu: u64::from(n),
+                memory: u64::from(n) * 1024,
                 gpu: 0,
             },
-            slots,
             shim: Shim::Host,
             task_id: None,
             ssn_id: None,
             creation_time: Utc::now(),
             state: ExecutorState::Idle,
         })
-    }
-
-    fn default_policies() -> Vec<String> {
-        common::ctx::DEFAULT_POLICIES
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-    }
-
-    /// Test that is_available returns true when slots match.
-    #[test]
-    fn test_is_available_slots_match() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
-        let pm = PluginManager::setup(&ss, &default_policies()).unwrap();
-
-        let ssn = create_test_session("ssn-1", 2);
-        let exec = create_test_executor("exec-1", 2);
-
-        assert!(
-            pm.is_available(&exec, &ssn).unwrap(),
-            "Executor with matching slots should be available"
-        );
-    }
-
-    /// Test that is_available returns false when slots don't match.
-    #[test]
-    fn test_is_available_slots_mismatch() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
-        let pm = PluginManager::setup(&ss, &default_policies()).unwrap();
-
-        let ssn = create_test_session("ssn-1", 2);
-        let exec = create_test_executor("exec-1", 4);
-
-        assert!(
-            !pm.is_available(&exec, &ssn).unwrap(),
-            "Executor with mismatched slots should not be available"
-        );
-    }
-
-    /// Test find_available_executors filters correctly based on slots.
-    #[test]
-    fn test_find_available_executors_filters_by_slots() {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
-        let pm = PluginManager::setup(&ss, &default_policies()).unwrap();
-
-        let ssn = create_test_session("ssn-1", 2);
-
-        let executors = [
-            create_test_executor("exec-1", 2),
-            create_test_executor("exec-2", 4),
-            create_test_executor("exec-3", 2),
-            create_test_executor("exec-4", 1),
-        ];
-
-        let available: Vec<_> = executors
-            .iter()
-            .filter(|e| pm.is_available(e, &ssn).unwrap())
-            .collect();
-
-        assert_eq!(available.len(), 2, "Should have 2 available executors");
-        assert!(available.iter().any(|e| e.id == "exec-1"));
-        assert!(available.iter().any(|e| e.id == "exec-3"));
     }
 
     /// Test that SnapShot filtering works correctly for different executor states.

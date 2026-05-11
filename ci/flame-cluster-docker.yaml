@@ -2,10 +2,9 @@
 cluster:
   name: flame
   endpoint: "https://flame-session-manager:8080"
-  slot: "cpu=1,mem=1g"
+  resreq: "cpu=1,mem=1g"
   policies:
     - priority
-    - fairshare
     - gang
   storage: fs://data/
   schedule_interval: 500           # Scheduler loop interval in milliseconds (default: 500)

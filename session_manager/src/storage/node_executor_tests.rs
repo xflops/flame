@@ -140,7 +140,6 @@ mod tests {
                 memory: 4096,
                 gpu: 0,
             },
-            slots: 2,
             shim: Shim::Host,
             task_id: None,
             ssn_id: None,
@@ -157,7 +156,6 @@ mod tests {
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.node, "test-node-exec");
-        assert_eq!(retrieved.slots, 2);
 
         // Update executor state
         let updated = tokio_test::block_on(
@@ -220,7 +218,6 @@ mod tests {
                     memory: 4096,
                     gpu: 0,
                 },
-                slots: 2,
                 shim: Shim::Host,
                 task_id: None,
                 ssn_id: None,
@@ -277,7 +274,6 @@ mod tests {
                 memory: 4096,
                 gpu: 0,
             },
-            slots: 2,
             shim: Shim::Host,
             task_id: None,
             ssn_id: None,

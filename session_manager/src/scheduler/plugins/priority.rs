@@ -14,7 +14,7 @@ limitations under the License.
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use common::apis::{SessionID, TaskState};
+use common::apis::{ResourceRequirement, SessionID, TaskState};
 use common::FlameError;
 
 use crate::model::{
@@ -28,11 +28,13 @@ use crate::scheduler::plugins::{Plugin, PluginPtr};
 /// # Behavior
 ///
 /// - Higher `priority` value = higher scheduling priority.
-/// - Sessions with the same priority use FairShare ordering (tiebreaker for `ssn_order_fn`)
-///   and creation_time ascending order (tiebreaker for the `setup()` distribution loop).
-/// - `setup()` distributes the cluster's `total_slots` across open sessions in
-///   `(priority desc, creation_time asc)` order, capping per-session demand at the
-///   remaining cluster capacity. This guarantees `Σ ssn_desired ≤ total_slots`.
+/// - Sessions with the same priority defer ordering to downstream plugins
+///   (tiebreaker for `ssn_order_fn`) and creation_time ascending order
+///   (tiebreaker for the `setup()` distribution loop).
+/// - `setup()` distributes the cluster's total `ResourceRequirement` across open
+///   sessions in `(priority desc, creation_time asc)` order, capping per-session
+///   demand per-field at the remaining cluster capacity. This guarantees
+///   `Σ ssn_desired ≤ total` per resource dimension.
 /// - Sessions at the highest needy priority tier remain underused until their
 ///   priority-distributed share (`ssn_desired`) is filled.
 /// - All sessions at a lower priority than `max_needy_priority` are hard-blocked
@@ -41,9 +43,9 @@ use crate::scheduler::plugins::{Plugin, PluginPtr};
 /// # Interaction with PluginManager
 ///
 /// `PluginManager::is_underused` uses "first non-`None` wins" ordering. Because
-/// PriorityPlugin is registered first, its opinion is always definitive. FairShare is
-/// consulted only when PriorityPlugin returns `None` (satisfied sessions where desired
-/// is already met).
+/// PriorityPlugin is registered first, its opinion is always definitive. Downstream
+/// deferral plugins are consulted only when PriorityPlugin returns `None` (satisfied
+/// sessions where desired is already met).
 ///
 /// # Stale Data
 ///
@@ -56,12 +58,20 @@ pub struct PriorityPlugin {
     /// Priority for each open session, keyed by session ID.
     /// Populated in `setup()`.
     ssn_priority: HashMap<SessionID, u32>,
-    /// Per-session priority-distributed share. Populated in `setup()` step 2 from the
-    /// `total_slots` distribution loop. Read-only thereafter for the cycle.
-    ssn_desired: HashMap<SessionID, f64>,
-    /// Executor slots currently allocated per session.
-    /// Initialised from the snapshot in `setup()`; updated via callbacks.
-    ssn_allocated: HashMap<SessionID, f64>,
+    /// Per-session priority-distributed share, expressed as a `ResourceRequirement`
+    /// (cpu/memory/gpu). Populated in `setup()` step 2 from the cluster-capacity
+    /// distribution loop. Read-only thereafter for the cycle.
+    ssn_desired: HashMap<SessionID, ResourceRequirement>,
+    /// Executor resources currently allocated per session, expressed as a
+    /// `ResourceRequirement`. Initialised from the snapshot in `setup()`; updated
+    /// via callbacks.
+    ssn_allocated: HashMap<SessionID, ResourceRequirement>,
+    /// Per-executor effective resource requirement for each session, cached in
+    /// `setup()` so callbacks can adjust `ssn_allocated` without re-deriving from
+    /// the snapshot. After the slots-cleanup refactor, every open session's
+    /// `resreq` is guaranteed to be populated by `resolve_session_resreq` in
+    /// `apiserver::frontend`, so this is simply a clone of `ssn.resreq`.
+    ssn_unit: HashMap<SessionID, ResourceRequirement>,
 }
 
 impl PriorityPlugin {
@@ -71,32 +81,43 @@ impl PriorityPlugin {
             ssn_priority: HashMap::new(),
             ssn_desired: HashMap::new(),
             ssn_allocated: HashMap::new(),
+            ssn_unit: HashMap::new(),
         })
     }
 }
 
-/// Per-session task-driven demand ceiling, in slots.
+/// Per-session task-driven demand ceiling, expressed as a `ResourceRequirement`.
 ///
 /// Sums pending + running task counts, rounds the total down to whole batches,
-/// multiplies by `slots`, then clamps to `[min_instances * slots, max_instances * slots]`.
-/// This is the same formula used by the previous (uncapped) implementation; the
-/// only behavioural change in this RFE is that the cluster-capacity cap moves into
-/// `setup()` and is applied *after* this per-session ceiling.
-fn compute_demand(ssn: &SessionInfo) -> f64 {
-    let mut task_count = 0.0_f64;
+/// multiplies by the per-executor resreq (`per_task`), then clamps to
+/// `[min_instances * per_task, max_instances * per_task]` per-field. Algorithm
+/// preserved verbatim from the slot-based version; the only change is that
+/// scaling is now per-resource (`per_task.mul(N)`) and clamping is per-field
+/// (`min` / `max` helpers on `ResourceRequirement`).
+///
+/// `per_task` is the session's effective per-executor resreq, which after the
+/// slots-cleanup refactor is always `ssn.resreq` (server-populated).
+fn compute_demand(ssn: &SessionInfo, per_task: &ResourceRequirement) -> ResourceRequirement {
+    let mut task_count: u32 = 0;
     for state in [TaskState::Pending, TaskState::Running] {
         if let Some(c) = ssn.tasks_status.get(&state) {
-            task_count += *c as f64;
+            // tasks_status counts are non-negative; clamp to 0 if anything weird.
+            task_count = task_count.saturating_add((*c).max(0) as u32);
         }
     }
-    let batch_size = ssn.batch_size.max(1) as f64;
-    let batched = (task_count / batch_size).floor() * batch_size;
-    let mut demand = batched * ssn.slots as f64;
+    let batch_size = ssn.batch_size.max(1);
+    // Integer floor: for non-negative counts (task_count: u32), `/` is floor.
+    let batched = (task_count / batch_size) * batch_size;
+
+    let mut demand = per_task.mul(batched);
 
     if let Some(max_i) = ssn.max_instances {
-        demand = demand.min((max_i * ssn.slots) as f64);
+        // Per-field clamp from above.
+        demand = demand.min(&per_task.mul(max_i));
     }
-    demand.max((ssn.min_instances * ssn.slots) as f64)
+    let floor = per_task.mul(ssn.min_instances);
+    // Per-field clamp from below.
+    demand.max(&floor)
 }
 
 impl Plugin for PriorityPlugin {
@@ -108,20 +129,20 @@ impl Plugin for PriorityPlugin {
     ///
     /// Three-step algorithm executed once per scheduling cycle:
     ///
-    /// 1. Sum `total_slots` from the snapshot's nodes.
+    /// 1. Sum cluster capacity (`ResourceRequirement`) from the snapshot's nodes.
     /// 2. Sort open sessions by `(priority desc, creation_time asc)` and walk them in
-    ///    order, granting each session `min(compute_demand(ssn), remaining)` slots
-    ///    and decrementing `remaining`. The result is `ssn_desired[id]`.
-    ///    `max_needy_priority` is updated in the same pass for any session with
-    ///    pending tasks.
-    /// 3. Initialise `ssn_allocated[id]` from currently-bound executors.
+    ///    order, granting each session `min(compute_demand(ssn, per_task), remaining)`
+    ///    per-field and decrementing `remaining`. The result is `ssn_desired[id]`,
+    ///    a `ResourceRequirement`. `max_needy_priority` is updated in the same pass
+    ///    for any session with pending tasks. The session's per-executor effective
+    ///    `per_task` resreq (always `ssn.resreq` after the slots-cleanup refactor)
+    ///    is cached in `ssn_unit` for use by the lifecycle callbacks.
+    /// 3. Initialise `ssn_allocated[id]` from currently-bound executors using each
+    ///    executor's `resreq`.
     ///
     /// Invariants enforced (FS.md §3 *Invariants*):
-    /// - `Σ ssn_desired ≤ total_slots` — each grant is capped at `remaining`,
-    ///   which starts at `total_slots` and is monotonically decremented.
-    /// - Equality holds when aggregate demand exceeds cluster capacity (capacity
-    ///   binds): higher-priority and earlier sessions saturate first, later ones
-    ///   absorb the residual until the cluster is exhausted.
+    /// - `Σ ssn_desired ≤ total` per-field — each grant is capped at `remaining`,
+    ///   which starts at `total` and is monotonically decremented.
     /// - Within a priority tier, earlier-created sessions are filled before later
     ///   ones (`creation_time ascending` is the secondary sort key).
     /// - `ssn_allocated` runtime updates remain handled by the executor / session
@@ -130,18 +151,20 @@ impl Plugin for PriorityPlugin {
         self.ssn_priority.clear();
         self.ssn_desired.clear();
         self.ssn_allocated.clear();
+        self.ssn_unit.clear();
         self.max_needy_priority = 0;
 
-        // ── Step 1: total_slots ──────────────────────────────────────────────
+        // ── Step 1: total cluster capacity (per-resource) ────────────────────
         // Cluster's physical scheduling capacity, taken from the same snapshot
-        // every plugin sees this cycle.
-        let total_slots: f64 = ss
-            .find_nodes(ALL_NODE)?
-            .values()
-            .map(|n| n.allocatable.to_slots(&ss.unit) as f64)
-            .sum();
+        // every plugin sees this cycle. Sum each ResourceRequirement field
+        // independently (cpu, memory, gpu) so the priority distribution can
+        // clamp per-resource rather than via a derived slot count.
+        let mut total = ResourceRequirement::default();
+        for n in ss.find_nodes(ALL_NODE)?.values() {
+            total.add(&n.allocatable);
+        }
 
-        // ── Step 2: distribute total_slots by (priority desc, creation_time asc) ─
+        // ── Step 2: distribute `total` by (priority desc, creation_time asc) ─
         // Hash iteration is non-deterministic; collect and sort explicitly so that
         // earlier-created sessions within a priority tier are filled first.
         let open_ssns = ss.find_sessions(OPEN_SESSION)?;
@@ -152,16 +175,33 @@ impl Plugin for PriorityPlugin {
                 .then(a.creation_time.cmp(&b.creation_time)) // earlier first
         });
 
-        let mut remaining = total_slots;
+        let mut remaining = total.clone();
         for ssn in &sessions {
             self.ssn_priority.insert(ssn.id.clone(), ssn.priority);
 
-            let demand = compute_demand(ssn);
-            let granted = demand.min(remaining.max(0.0));
+            // Per-task / per-executor effective resreq. After the slots-cleanup
+            // refactor, `resolve_session_resreq` in `apiserver::frontend` always
+            // fills this in (explicit → cluster default → hardcoded fallback),
+            // so the `expect` documents the post-condition.
+            let per_task = ssn
+                .resreq
+                .clone()
+                .expect("SessionInfo.resreq must be populated by resolve_session_resreq");
 
-            self.ssn_desired.insert(ssn.id.clone(), granted);
-            self.ssn_allocated.insert(ssn.id.clone(), 0.0);
-            remaining -= granted;
+            let demand = compute_demand(ssn, &per_task);
+            // Per-field min — guaranteed `granted ≤ remaining` per resource.
+            let granted = demand.min(&remaining);
+
+            self.ssn_desired.insert(ssn.id.clone(), granted.clone());
+            self.ssn_allocated
+                .insert(ssn.id.clone(), ResourceRequirement::default());
+            self.ssn_unit.insert(ssn.id.clone(), per_task);
+
+            // `granted = remaining.min(demand)` per-field, so `granted ≤ remaining`
+            // always holds in every dimension; sub() cannot underflow here.
+            remaining
+                .sub(&granted)
+                .expect("granted ≤ remaining by construction (per-field min)");
 
             // A session is "needy" if it has pending tasks — it can benefit from
             // more executors. Used by is_underused() to block strictly lower tiers.
@@ -177,19 +217,22 @@ impl Plugin for PriorityPlugin {
 
         // ── Step 3: ssn_allocated initial counts from bound executors ────────
         // Runtime updates after this point flow through the on_executor_* /
-        // on_session_* callbacks (unchanged by this RFE).
+        // on_session_* callbacks. Use the executor's `resreq` directly — it is
+        // the source of truth for what resources are actually consumed.
         let executors = ss.find_executors(ALL_EXECUTOR)?;
         for exe in executors.values() {
             if let Some(ref ssn_id) = exe.ssn_id {
                 if let Some(alloc) = self.ssn_allocated.get_mut(ssn_id) {
-                    *alloc += exe.slots as f64;
+                    alloc.add(&exe.resreq);
                 }
             }
         }
 
         tracing::debug!(
-            "[PriorityPlugin] setup: total_slots={}, max_needy_priority={}, tracked_sessions={}",
-            total_slots,
+            "[PriorityPlugin] setup: total=(cpu={}, memory={}, gpu={}), max_needy_priority={}, tracked_sessions={}",
+            total.cpu,
+            total.memory,
+            total.gpu,
             self.max_needy_priority,
             self.ssn_priority.len()
         );
@@ -198,7 +241,7 @@ impl Plugin for PriorityPlugin {
     }
 
     /// Returns ordering based on priority (descending). Returns `None` when
-    /// priorities are equal, deferring tiebreaking to FairShare.
+    /// priorities are equal, deferring tiebreaking to the next plugin in the chain.
     fn ssn_order_fn(&self, s1: &SessionInfo, s2: &SessionInfo) -> Option<Ordering> {
         let p1 = self.ssn_priority.get(&s1.id).copied().unwrap_or(0);
         let p2 = self.ssn_priority.get(&s2.id).copied().unwrap_or(0);
@@ -208,7 +251,8 @@ impl Plugin for PriorityPlugin {
             // p2.cmp(&p1) reverses the natural ascending order.
             Some(p2.cmp(&p1))
         } else {
-            // Equal priority: no opinion; defer to FairShare for ratio-based tiebreaking.
+            // Equal priority: no opinion; defer to the next plugin in the chain
+            // for additional tiebreaking.
             None
         }
     }
@@ -219,10 +263,11 @@ impl Plugin for PriorityPlugin {
     ///   needy session.
     /// - `priority >= max_needy_priority` and `allocated < desired` → `Some(true)`: session
     ///   still has unmet, priority-distributed demand; keep allocating.
-    /// - `priority >= max_needy_priority` and demand satisfied → `None`: defer to FairShare.
+    /// - `priority >= max_needy_priority` and demand satisfied → `None`: defer to the next
+    ///   plugin in the chain.
     ///
     /// Because `PluginManager::is_underused` uses "first non-`None` wins", the `Some(true)`
-    /// path overrides FairShare's conservative `deserved`-based veto for high-priority sessions.
+    /// path overrides any downstream-plugin veto for high-priority sessions.
     fn is_underused(&self, ssn: &SessionInfoPtr) -> Option<bool> {
         let priority = self.ssn_priority.get(&ssn.id).copied()?;
 
@@ -235,58 +280,107 @@ impl Plugin for PriorityPlugin {
         }
 
         // At or above the highest needy priority: check whether this session still
-        // has unmet demand (allocated < desired).
-        let desired = self.ssn_desired.get(&ssn.id).copied().unwrap_or(0.0);
-        let allocated = self.ssn_allocated.get(&ssn.id).copied().unwrap_or(0.0);
+        // has unmet demand. With ResourceRequirement semantics, "unmet" means
+        // `allocated < desired` in *any* dimension (i.e. `!allocated.great_equal(desired)`).
+        // Demand of zero (default) is treated as "no demand → defer to the next plugin".
+        let desired = self.ssn_desired.get(&ssn.id)?;
+        let allocated = self.ssn_allocated.get(&ssn.id)?;
+        let zero = ResourceRequirement::default();
 
-        if desired > 0.0 && allocated < desired {
+        if !desired.equal(&zero) && !allocated.great_equal(desired) {
             tracing::debug!(
-                "[PriorityPlugin] Session <{}> (priority={}) underused: allocated={} < desired={}",
+                "[PriorityPlugin] Session <{}> (priority={}) underused: \
+                allocated=(cpu={}, memory={}, gpu={}) < desired=(cpu={}, memory={}, gpu={})",
                 ssn.id,
                 priority,
-                allocated,
-                desired
+                allocated.cpu,
+                allocated.memory,
+                allocated.gpu,
+                desired.cpu,
+                desired.memory,
+                desired.gpu,
             );
             Some(true)
         } else {
-            // Demand satisfied or no demand: let FairShare decide.
+            // Demand satisfied (per-field) or no demand: defer to the next plugin in the chain.
             None
         }
     }
 
     fn on_executor_allocate(&mut self, _node: NodeInfoPtr, ssn: SessionInfoPtr) {
+        let unit = match self.ssn_unit.get(&ssn.id) {
+            Some(u) => u.clone(),
+            None => return,
+        };
         if let Some(alloc) = self.ssn_allocated.get_mut(&ssn.id) {
-            *alloc += ssn.slots as f64;
+            alloc.add(&unit);
         }
     }
 
     fn on_executor_unallocate(&mut self, _node: NodeInfoPtr, ssn: SessionInfoPtr) {
+        let unit = match self.ssn_unit.get(&ssn.id) {
+            Some(u) => u.clone(),
+            None => return,
+        };
         if let Some(alloc) = self.ssn_allocated.get_mut(&ssn.id) {
-            *alloc -= ssn.slots as f64;
+            // Defensive: if we'd underflow (shouldn't happen given the lifecycle),
+            // log a warning and leave the counter alone rather than panic.
+            if let Err(e) = alloc.sub(&unit) {
+                tracing::warn!(
+                    "[PriorityPlugin] sub underflow on unallocate for ssn <{}>: {e}",
+                    ssn.id
+                );
+            }
         }
     }
 
     fn on_executor_pipeline(&mut self, _exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
+        let unit = match self.ssn_unit.get(&ssn.id) {
+            Some(u) => u.clone(),
+            None => return,
+        };
         if let Some(alloc) = self.ssn_allocated.get_mut(&ssn.id) {
-            *alloc += ssn.slots as f64;
+            alloc.add(&unit);
         }
     }
 
     fn on_executor_discard(&mut self, _exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
+        let unit = match self.ssn_unit.get(&ssn.id) {
+            Some(u) => u.clone(),
+            None => return,
+        };
         if let Some(alloc) = self.ssn_allocated.get_mut(&ssn.id) {
-            *alloc -= ssn.slots as f64;
+            if let Err(e) = alloc.sub(&unit) {
+                tracing::warn!(
+                    "[PriorityPlugin] sub underflow on discard for ssn <{}>: {e}",
+                    ssn.id
+                );
+            }
         }
     }
 
     fn on_session_bind(&mut self, ssn: SessionInfoPtr) {
+        let unit = match self.ssn_unit.get(&ssn.id) {
+            Some(u) => u.clone(),
+            None => return,
+        };
         if let Some(alloc) = self.ssn_allocated.get_mut(&ssn.id) {
-            *alloc += ssn.slots as f64;
+            alloc.add(&unit);
         }
     }
 
     fn on_session_unbind(&mut self, ssn: SessionInfoPtr) {
+        let unit = match self.ssn_unit.get(&ssn.id) {
+            Some(u) => u.clone(),
+            None => return,
+        };
         if let Some(alloc) = self.ssn_allocated.get_mut(&ssn.id) {
-            *alloc -= ssn.slots as f64;
+            if let Err(e) = alloc.sub(&unit) {
+                tracing::warn!(
+                    "[PriorityPlugin] sub underflow on unbind for ssn <{}>: {e}",
+                    ssn.id
+                );
+            }
         }
     }
 }
@@ -308,13 +402,32 @@ mod tests {
             ssn_priority: HashMap::new(),
             ssn_desired: HashMap::new(),
             ssn_allocated: HashMap::new(),
+            ssn_unit: HashMap::new(),
         }
+    }
+
+    /// Convenience: build a `ResourceRequirement` from cpu/memory/gpu fields.
+    fn rr(cpu: u64, memory: u64, gpu: i32) -> ResourceRequirement {
+        ResourceRequirement { cpu, memory, gpu }
+    }
+
+    /// Cluster "unit" used by the tests below: `(cpu:1, memory:1024, gpu:0)`.
+    /// Pre-cleanup the tests scaled by a slot count and let the plugin derive
+    /// per-task resreq via `ss.unit × ssn.slots`. Post-cleanup the plugin
+    /// requires every session to carry an explicit resreq — sessions in these
+    /// tests now embed `slots_to_rr(slots)` directly via `create_test_session_full`.
+    fn slots_to_rr(slots: u64) -> ResourceRequirement {
+        rr(slots, slots * 1024, 0)
     }
 
     fn create_test_session(id: &str, priority: u32, pending: i32) -> Arc<SessionInfo> {
         create_test_session_full(id, priority, pending, 0, 1, 1, 0, None, Utc::now())
     }
 
+    /// Build a `SessionInfo` for tests. `slots` is preserved as an arg purely to
+    /// keep call-site test math readable — it is converted into an explicit
+    /// `resreq = slots_to_rr(slots)` on the way in, which is what the plugin
+    /// now operates on.
     #[allow(clippy::too_many_arguments)]
     fn create_test_session_full(
         id: &str,
@@ -337,7 +450,6 @@ mod tests {
         Arc::new(SessionInfo {
             id: id.to_string(),
             application: "test-app".to_string(),
-            slots,
             tasks_status,
             creation_time,
             completion_time: None,
@@ -346,7 +458,7 @@ mod tests {
             max_instances,
             batch_size,
             priority,
-            resreq: None,
+            resreq: Some(slots_to_rr(slots.into())),
         })
     }
 
@@ -370,7 +482,7 @@ mod tests {
             memory: 1024,
             gpu: 0,
         };
-        let ss = SnapShot::new(unit.clone());
+        let ss = SnapShot::new();
         ss.add_application(create_test_app("test-app")).unwrap();
         for ssn in sessions {
             ss.add_session(ssn).unwrap();
@@ -392,11 +504,7 @@ mod tests {
     /// Snapshot with no node — total_slots = 0. Use only for tests that don't
     /// rely on the cluster-capacity cap (e.g. blocking semantics).
     fn create_snapshot(sessions: Vec<Arc<SessionInfo>>) -> SnapShot {
-        let ss = SnapShot::new(ResourceRequirement {
-            cpu: 1,
-            memory: 1024,
-            gpu: 0,
-        });
+        let ss = SnapShot::new();
         ss.add_application(create_test_app("test-app")).unwrap();
         for ssn in sessions {
             ss.add_session(ssn).unwrap();
@@ -411,15 +519,17 @@ mod tests {
         total_slots: u32,
     ) -> SnapShot {
         let ss = create_snapshot_with_capacity(sessions, total_slots);
+        // setup() reads `exe.resreq` to initialise `ssn_allocated`. Test intent:
+        // "an executor consuming `slots`-worth of resources is initialised for the
+        // session" → set `resreq = slots × unit = (cpu:slots, memory:slots*1024, gpu:0)`.
         let exec = Arc::new(ExecutorInfo {
             id: "exec-1".to_string(),
             node: "node-1".to_string(),
             resreq: ResourceRequirement {
-                cpu: 1,
-                memory: 1024,
+                cpu: u64::from(slots),
+                memory: u64::from(slots) * 1024,
                 gpu: 0,
             },
-            slots,
             shim: Shim::Host,
             task_id: None,
             ssn_id: Some(exec_ssn_id.to_string()),
@@ -449,11 +559,12 @@ mod tests {
     #[test]
     fn test_setup_distribution_case1_cluster_has_slack() {
         // FS.md §3 Example Walkthrough Case 1.
-        // total_slots=22, three sessions, all batch_size=1.
-        //   A: priority=100, slots=2, pending=4 → demand=8,  granted=8,  remaining=14
-        //   B: priority=100, slots=2, pending=3 → demand=6,  granted=6,  remaining=8
-        //   C: priority=10,  slots=4, pending=5 → demand=20, granted=8,  remaining=0
-        // Σ ssn_desired = 22 = total_slots.
+        // Cluster capacity: total_slots=22 with unit=(1,1024,0) → total=(22,22*1024,0).
+        // Three sessions, all batch_size=1, resreq=None so per_task = slots × unit.
+        //   A: priority=100, slots=2, pending=4 → demand=(8,8192,0),  granted=(8,8192,0),  remaining=(14,14336,0)
+        //   B: priority=100, slots=2, pending=3 → demand=(6,6144,0),  granted=(6,6144,0),  remaining=(8,8192,0)
+        //   C: priority=10,  slots=4, pending=5 → demand=(20,20480,0), granted=(8,8192,0),  remaining=(0,0,0)
+        // Σ ssn_desired = (22,22*1024,0) = total.
         let t0 = Utc::now();
         let t1 = t0 + Duration::seconds(1);
         let t2 = t0 + Duration::seconds(2);
@@ -466,22 +577,24 @@ mod tests {
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        assert_eq!(plugin.ssn_desired.get("A").copied(), Some(8.0));
-        assert_eq!(plugin.ssn_desired.get("B").copied(), Some(6.0));
-        assert_eq!(plugin.ssn_desired.get("C").copied(), Some(8.0));
-        let total: f64 = plugin.ssn_desired.values().sum();
-        assert_eq!(total, 22.0);
+        assert_eq!(plugin.ssn_desired.get("A"), Some(&slots_to_rr(8)));
+        assert_eq!(plugin.ssn_desired.get("B"), Some(&slots_to_rr(6)));
+        assert_eq!(plugin.ssn_desired.get("C"), Some(&slots_to_rr(8)));
+        let cpu_sum: u64 = plugin.ssn_desired.values().map(|r| r.cpu).sum();
+        let mem_sum: u64 = plugin.ssn_desired.values().map(|r| r.memory).sum();
+        assert_eq!(cpu_sum, 22);
+        assert_eq!(mem_sum, 22 * 1024);
         assert_eq!(plugin.max_needy_priority, 100);
     }
 
     #[test]
     fn test_setup_distribution_case2_cluster_contended() {
         // FS.md §3 Example Walkthrough Case 2.
-        // total_slots=4, same sessions as Case 1.
-        //   A: granted=min(8,4)=4 → remaining=0
-        //   B: granted=min(6,0)=0
-        //   C: granted=min(20,0)=0
-        // Σ ssn_desired = 4 = total_slots.
+        // Cluster capacity: total_slots=4 with unit=(1,1024,0) → total=(4,4096,0).
+        // Same sessions as Case 1.
+        //   A: demand=(8,8192,0); granted = demand.min(remaining=(4,4096,0)) = (4,4096,0); remaining=(0,0,0)
+        //   B: granted = demand.min((0,0,0)) = (0,0,0)
+        //   C: granted = demand.min((0,0,0)) = (0,0,0)
         let t0 = Utc::now();
         let t1 = t0 + Duration::seconds(1);
         let t2 = t0 + Duration::seconds(2);
@@ -494,11 +607,11 @@ mod tests {
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        assert_eq!(plugin.ssn_desired.get("A").copied(), Some(4.0));
-        assert_eq!(plugin.ssn_desired.get("B").copied(), Some(0.0));
-        assert_eq!(plugin.ssn_desired.get("C").copied(), Some(0.0));
-        let total: f64 = plugin.ssn_desired.values().sum();
-        assert_eq!(total, 4.0);
+        assert_eq!(plugin.ssn_desired.get("A"), Some(&slots_to_rr(4)));
+        assert_eq!(plugin.ssn_desired.get("B"), Some(&slots_to_rr(0)));
+        assert_eq!(plugin.ssn_desired.get("C"), Some(&slots_to_rr(0)));
+        let cpu_sum: u64 = plugin.ssn_desired.values().map(|r| r.cpu).sum();
+        assert_eq!(cpu_sum, 4);
         assert_eq!(plugin.max_needy_priority, 100);
     }
 
@@ -528,8 +641,8 @@ mod tests {
 
         // Earlier session (a-late-id, t_early) is filled first → gets full demand=4.
         // Later session (z-early-id, t_late) absorbs the residual → gets 1.
-        assert_eq!(plugin.ssn_desired.get("a-late-id").copied(), Some(4.0));
-        assert_eq!(plugin.ssn_desired.get("z-early-id").copied(), Some(1.0));
+        assert_eq!(plugin.ssn_desired.get("a-late-id"), Some(&slots_to_rr(4)));
+        assert_eq!(plugin.ssn_desired.get("z-early-id"), Some(&slots_to_rr(1)));
     }
 
     #[test]
@@ -546,14 +659,15 @@ mod tests {
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        assert_eq!(plugin.ssn_desired.get("z-id").copied(), Some(4.0));
-        assert_eq!(plugin.ssn_desired.get("a-id").copied(), Some(1.0));
+        assert_eq!(plugin.ssn_desired.get("z-id"), Some(&slots_to_rr(4)));
+        assert_eq!(plugin.ssn_desired.get("a-id"), Some(&slots_to_rr(1)));
     }
 
     #[test]
     fn test_setup_sum_desired_never_exceeds_total_slots() {
         // Regression test for the over-allocation bug: many high-demand sessions on
-        // a small cluster must not collectively exceed total_slots.
+        // a small cluster must not collectively exceed cluster capacity per-resource.
+        // With unit=(1,1024,0), total cluster capacity = (cpu:22, memory:22*1024, gpu:0).
         let total_slots: u32 = 22;
         let mut sessions = Vec::new();
         let base = Utc::now();
@@ -578,33 +692,49 @@ mod tests {
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        let sum: f64 = plugin.ssn_desired.values().sum();
+        // Per-field sum across sessions; must not exceed per-field cluster capacity.
+        let cpu_sum: u64 = plugin.ssn_desired.values().map(|r| r.cpu).sum();
+        let mem_sum: u64 = plugin.ssn_desired.values().map(|r| r.memory).sum();
+        let gpu_sum: i32 = plugin.ssn_desired.values().map(|r| r.gpu).sum();
+        let total_cpu = u64::from(total_slots);
+        let total_mem = u64::from(total_slots) * 1024;
         assert!(
-            sum <= total_slots as f64,
-            "Σ ssn_desired ({sum}) must not exceed total_slots ({total_slots})"
+            cpu_sum <= total_cpu,
+            "Σ cpu ({cpu_sum}) must not exceed total cpu ({total_cpu})"
         );
-        // With aggregate demand far exceeding capacity, equality must hold.
-        assert_eq!(sum, total_slots as f64);
+        assert!(
+            mem_sum <= total_mem,
+            "Σ memory ({mem_sum}) must not exceed total memory ({total_mem})"
+        );
+        // With aggregate demand far exceeding capacity, equality must hold per-field.
+        assert_eq!(cpu_sum, total_cpu);
+        assert_eq!(mem_sum, total_mem);
+        // gpu unit is 0 → all gpu demands are zero.
+        assert_eq!(gpu_sum, 0);
     }
 
     #[test]
     fn test_setup_compute_demand_batch_aligned_and_capped() {
         // Reach into compute_demand via a single-session snapshot.
-        // pending=5, running=1, batch_size=2, slots=3, total_slots large enough
-        // not to bind. task_count=6, batched=floor(6/2)*2=6, demand=6*3=18.
+        // pending=5, running=1, batch_size=2, slots=3, cluster large enough not to bind.
+        // task_count=6, batched=floor(6/2)*2=6, per_task=(3,3*1024,0), demand=6×per_task=(18,18*1024,0).
         let ssn = create_test_session_full("s", 0, 5, 1, 3, 2, 0, None, Utc::now());
         let ss = create_snapshot_with_capacity(vec![ssn], 100);
 
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        assert_eq!(plugin.ssn_desired.get("s").copied(), Some(18.0));
-        assert_eq!(plugin.ssn_allocated.get("s").copied(), Some(0.0));
+        assert_eq!(plugin.ssn_desired.get("s"), Some(&slots_to_rr(18)));
+        assert_eq!(
+            plugin.ssn_allocated.get("s"),
+            Some(&ResourceRequirement::default())
+        );
     }
 
     #[test]
     fn test_setup_compute_demand_respects_max_instances() {
-        // pending=10, slots=1, max_instances=4 → per-session demand capped at 4.
+        // pending=10, slots=1, max_instances=4 → per-session demand capped at
+        // max_instances × per_task = 4 × (1,1024,0) = (4,4096,0).
         // Cluster has plenty of slack so the per-session cap binds, not capacity.
         let ssn = create_test_session_full("s", 0, 10, 0, 1, 1, 0, Some(4), Utc::now());
         let ss = create_snapshot_with_capacity(vec![ssn], 100);
@@ -612,31 +742,35 @@ mod tests {
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        assert_eq!(plugin.ssn_desired.get("s").copied(), Some(4.0));
+        assert_eq!(plugin.ssn_desired.get("s"), Some(&slots_to_rr(4)));
     }
 
     #[test]
     fn test_setup_compute_demand_respects_min_instances() {
-        // pending=0, min_instances=2, slots=3 → per-session demand floored at 6.
+        // pending=0, min_instances=2, slots=3 → per-session demand floored at
+        // min_instances × per_task = 2 × (3,3*1024,0) = (6,6*1024,0).
         let ssn = create_test_session_full("s", 0, 0, 0, 3, 1, 2, None, Utc::now());
         let ss = create_snapshot_with_capacity(vec![ssn], 100);
 
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        assert_eq!(plugin.ssn_desired.get("s").copied(), Some(6.0));
+        assert_eq!(plugin.ssn_desired.get("s"), Some(&slots_to_rr(6)));
     }
 
     #[test]
     fn test_setup_allocated_counts_existing_executors() {
-        // Session with 1 executor (slots=2) already bound.
+        // Session with 1 executor (slots=2 worth of resources) already bound.
+        // The executor's resreq is `2 × unit = (cpu:2, memory:2048, gpu:0)`
+        // (see create_snapshot_with_executor); setup() now reads `resreq` directly,
+        // so the resulting allocated counter is the executor's resreq itself.
         let ssn = create_test_session_full("s", 0, 4, 0, 2, 1, 0, None, Utc::now());
         let ss = create_snapshot_with_executor(vec![ssn], "s", 2, 100);
 
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        assert_eq!(plugin.ssn_allocated.get("s").copied(), Some(2.0));
+        assert_eq!(plugin.ssn_allocated.get("s"), Some(&slots_to_rr(2)));
     }
 
     #[test]
@@ -665,14 +799,18 @@ mod tests {
 
     #[test]
     fn test_setup_zero_total_slots_grants_zero() {
-        // No nodes registered → total_slots=0; every session gets ssn_desired=0.
+        // No nodes registered → total cluster capacity is zero per-field; every
+        // session gets ssn_desired = ResourceRequirement::default().
         let ssn = create_test_session_full("s", 100, 5, 0, 1, 1, 0, None, Utc::now());
         let ss = create_snapshot(vec![ssn]);
 
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        assert_eq!(plugin.ssn_desired.get("s").copied(), Some(0.0));
+        assert_eq!(
+            plugin.ssn_desired.get("s"),
+            Some(&ResourceRequirement::default())
+        );
     }
 
     // ── ssn_order_fn() tests ─────────────────────────────────────────────────
@@ -738,21 +876,24 @@ mod tests {
 
     #[test]
     fn test_is_underused_high_priority_fully_allocated_defers() {
-        // Session at max priority but already fully allocated → None (defer to FairShare)
-        let ssn_high = create_test_session("ssn-high", 100, 4); // desired=4
+        // Session at max priority but already fully allocated → None
+        // (defer to the next plugin in the chain).
+        // ssn-high has slots=1 (default), pending=4 → desired = (4,4*1024,0).
+        // Initial executor contributes (1,1024,0) of allocated → still underused.
+        let ssn_high = create_test_session("ssn-high", 100, 4);
         let ssn_low = create_test_session("ssn-low", 10, 4);
         let ss = create_snapshot_with_executor(vec![ssn_high.clone(), ssn_low], "ssn-high", 1, 100);
 
-        // Setup gives allocated=1 for ssn-high. desired=4, so still underused.
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
         assert_eq!(plugin.is_underused(&ssn_high), Some(true));
 
-        // Manually drive allocated to full desired (4).
+        // Manually drive allocated to equal desired (per-field).
+        let desired = plugin.ssn_desired.get("ssn-high").cloned().unwrap();
         if let Some(a) = plugin.ssn_allocated.get_mut("ssn-high") {
-            *a = 4.0;
+            *a = desired;
         }
-        // Now allocated == desired → None (defers to FairShare)
+        // Now allocated == desired → None (defers to the next plugin in the chain)
         assert_eq!(plugin.is_underused(&ssn_high), None);
     }
 
@@ -786,12 +927,17 @@ mod tests {
 
     #[test]
     fn test_on_executor_allocate_increments_allocated() {
+        // After setup, ssn_unit["s"] = slots × unit = 2 × (1,1024,0) = (cpu:2, memory:2048, gpu:0).
+        // on_executor_allocate adds that resreq to the allocated counter.
         let ssn = create_test_session_full("s", 0, 4, 0, 2, 1, 0, None, Utc::now());
         let ss = create_snapshot_with_capacity(vec![ssn.clone()], 100);
 
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
-        assert_eq!(plugin.ssn_allocated.get("s").copied(), Some(0.0));
+        assert_eq!(
+            plugin.ssn_allocated.get("s"),
+            Some(&ResourceRequirement::default())
+        );
 
         let node = Arc::new(NodeInfo {
             name: "n".to_string(),
@@ -799,17 +945,20 @@ mod tests {
             state: NodeState::Ready,
         });
         plugin.on_executor_allocate(node, ssn.clone());
-        assert_eq!(plugin.ssn_allocated.get("s").copied(), Some(2.0));
+        assert_eq!(plugin.ssn_allocated.get("s"), Some(&slots_to_rr(2)));
     }
 
     #[test]
     fn test_on_executor_unallocate_decrements_allocated() {
+        // After setup with one bound executor consuming (cpu:2, memory:2048, gpu:0),
+        // ssn_allocated["s"] = (2,2048,0). Unallocate subtracts ssn_unit (also
+        // (2,2048,0) here), so we end at the zero ResourceRequirement.
         let ssn = create_test_session_full("s", 0, 4, 0, 2, 1, 0, None, Utc::now());
         let ss = create_snapshot_with_executor(vec![ssn.clone()], "s", 2, 100);
 
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
-        assert_eq!(plugin.ssn_allocated.get("s").copied(), Some(2.0));
+        assert_eq!(plugin.ssn_allocated.get("s"), Some(&slots_to_rr(2)));
 
         let node = Arc::new(NodeInfo {
             name: "n".to_string(),
@@ -817,6 +966,9 @@ mod tests {
             state: NodeState::Ready,
         });
         plugin.on_executor_unallocate(node, ssn.clone());
-        assert_eq!(plugin.ssn_allocated.get("s").copied(), Some(0.0));
+        assert_eq!(
+            plugin.ssn_allocated.get("s"),
+            Some(&ResourceRequirement::default())
+        );
     }
 }

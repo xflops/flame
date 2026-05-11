@@ -20,19 +20,10 @@ use flame_rs::client::{ResourceRequirement, SessionAttributes};
 pub async fn run(
     ctx: &FlameContext,
     app: &str,
-    slots: &Option<u32>,
     batch_size: &u32,
     priority: &u32,
     resreq_str: &Option<String>,
 ) -> Result<(), Box<dyn Error>> {
-    if slots.is_some() && resreq_str.is_some() {
-        return Err("slots and resreq are mutually exclusive".into());
-    }
-
-    if slots.is_none() && resreq_str.is_none() {
-        return Err("must specify either --slots or --resreq".into());
-    }
-
     let current_ctx = ctx.get_current_context()?;
     let conn = flame::client::connect_with_tls(
         &current_ctx.cluster.endpoint,
@@ -40,6 +31,8 @@ pub async fn run(
     )
     .await?;
 
+    // `resreq` is optional now — when omitted, the server applies
+    // `cluster.resreq` or a hardcoded fallback.
     let resreq = resreq_str
         .as_ref()
         .map(|s| ResourceRequirement::from(s.as_str()));
@@ -47,7 +40,6 @@ pub async fn run(
     let attr = SessionAttributes {
         id: format!("{app}-{}", stdng::rand::short_name()),
         application: app.to_owned(),
-        slots: slots.unwrap_or(0),
         common_data: None,
         min_instances: 0,
         max_instances: None,

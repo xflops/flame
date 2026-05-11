@@ -41,10 +41,10 @@ impl ConfigGenerator {
 cluster:
   name: flame
   endpoint: "http://127.0.0.1:8080"
-  slot: "cpu=1,mem=2g"
+  resreq: "cpu=1,mem=2g"
   policies:
     - priority
-    - fairshare
+    - drf
     - gang
   storage: "fs://{prefix}/data"
   executors:

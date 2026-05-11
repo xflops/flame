@@ -20,7 +20,7 @@ use serde_json::Value;
 use flame_rs::apis::{FlameContext, FlameError, TaskState};
 use flame_rs::client::{self, NodeState};
 
-use crate::utils::format_memory;
+use crate::utils::{format_memory, format_resreq};
 
 pub async fn run(
     ctx: &FlameContext,
@@ -99,6 +99,7 @@ fn view_session_table(session: &client::Session) -> Result<(), Box<dyn Error>> {
     table.add_row(vec!["Session:", &session.id.to_string()]);
     table.add_row(vec!["Application:", &session.application.to_string()]);
     table.add_row(vec!["State:", &session.state.to_string()]);
+    table.add_row(vec!["Resources:", &format_resreq(&session.resreq)]);
     table.add_row(vec![
         "Creation Time:",
         &session.creation_time.format("%T").to_string(),

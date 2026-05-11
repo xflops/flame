@@ -114,10 +114,10 @@ impl Connection {
     ///     Some(SessionAttributes {
     ///         id: "my-session-id".to_string(),
     ///         application: "my-app".to_string(),
-    ///         slots: 1,
     ///         common_data: None,
     ///         min_instances: 0,
     ///         max_instances: Some(10),
+    ///         resreq: None, // server will apply cluster.resreq
     ///     })
     /// ).await?;
     /// ```
@@ -163,7 +163,7 @@ def open_session(
             "my-session-id",
             spec=SessionAttributes(
                 application="my-app",
-                slots=1,
+                resreq=ResourceRequirement(cpu=1, memory="1g"),
                 min_instances=0,
                 max_instances=10,
             )
@@ -204,7 +204,7 @@ class Connection:
 
 When comparing specs, the following fields are checked for equality:
 - `application` (required match)
-- `slots` (required match)
+- `resreq` (required match)
 - `min_instances` (required match)
 - `max_instances` (required match)
 
@@ -484,14 +484,17 @@ No other interface changes required. The enhancement is fully contained within t
           attr: SessionAttributes,
       ) -> Result<Session, FlameError> {
           let common_data: Option<Vec<u8>> = attr.common_data.map(Bytes::into);
-          let sql = r#"INSERT INTO sessions (id, application, slots, common_data, creation_time, state, min_instances, max_instances)
-              VALUES (?, (SELECT name FROM applications WHERE name=? AND state=?), ?, ?, ?, ?, ?, ?)
+          let sql = r#"INSERT INTO sessions (id, application, resreq_cpu, resreq_memory, resreq_gpu, common_data, creation_time, state, min_instances, max_instances)
+              VALUES (?, (SELECT name FROM applications WHERE name=? AND state=?), ?, ?, ?, ?, ?, ?, ?, ?)
               RETURNING *"#;
+          let resreq = attr.resreq.clone().unwrap_or_default();
           let ssn: SessionDao = sqlx::query_as(sql)
               .bind(attr.id.clone())
               .bind(attr.application)
               .bind(ApplicationState::Enabled as i32)
-              .bind(attr.slots)
+              .bind(resreq.cpu as i64)
+              .bind(resreq.memory as i64)
+              .bind(resreq.gpu as i64)
               .bind(common_data)
               .bind(Utc::now().timestamp())
               .bind(SessionState::Open as i32)
@@ -512,10 +515,10 @@ No other interface changes required. The enhancement is fully contained within t
                   session.id, session.application, attr.application
               )));
           }
-          if session.slots != attr.slots {
+          if session.resreq != attr.resreq {
               return Err(FlameError::InvalidConfig(format!(
-                  "session <{}> spec mismatch: slots differs (expected {}, got {})",
-                  session.id, session.slots, attr.slots
+                  "session <{}> spec mismatch: resreq differs (expected {:?}, got {:?})",
+                  session.id, session.resreq, attr.resreq
               )));
           }
           if session.min_instances != attr.min_instances {
@@ -622,10 +625,10 @@ No other interface changes required. The enhancement is fully contained within t
       ) -> Result<Session, FlameError> {
           let session_spec = spec.map(|attrs| SessionSpec {
               application: attrs.application.clone(),
-              slots: attrs.slots,
               common_data: attrs.common_data.clone().map(CommonData::into),
               min_instances: attrs.min_instances,
               max_instances: attrs.max_instances,
+              resreq: attrs.resreq.clone().map(rpc::ResourceRequirement::from),
           });
 
           let open_ssn_req = OpenSessionRequest {
@@ -682,10 +685,10 @@ No other interface changes required. The enhancement is fully contained within t
       if spec is not None:
           session_spec = SessionSpec(
               application=spec.application,
-              slots=spec.slots,
               common_data=spec.common_data,
               min_instances=spec.min_instances,
               max_instances=spec.max_instances,
+              resreq=spec.resreq.to_pb() if spec.resreq else None,
           )
       request = OpenSessionRequest(session_id=session_id, session=session_spec)
       # ...
@@ -711,10 +714,15 @@ message OpenSessionRequest {
 ```protobuf
 message SessionSpec {
   string application = 2;
-  uint32 slots = 3;
+  // Field number 3 (slots) reserved — removed in the slots-cleanup refactor; do not reuse.
+  reserved 3;
+  reserved "slots";
   optional bytes common_data = 4;
   uint32 min_instances = 5;
   optional uint32 max_instances = 6;
+  uint32 batch_size = 7;
+  uint32 priority = 8;
+  optional ResourceRequirement resreq = 9;
 }
 ```
 
@@ -761,7 +769,7 @@ impl SqliteEngine {
 
     /// Compare specs - returns error if mismatch
     fn compare_specs(session: &Session, attr: &SessionAttributes) -> Result<(), FlameError> {
-        // Compare application, slots, min_instances, max_instances
+        // Compare application, resreq, min_instances, max_instances
         // Return FlameError::InvalidConfig on mismatch
     }
 }
@@ -934,7 +942,7 @@ session = open_session(
     "my-app-session-001",
     spec=SessionAttributes(
         application="my-app",
-        slots=1,
+        resreq=ResourceRequirement(cpu=1, memory="1g"),
         min_instances=0,
         max_instances=10
     )
@@ -945,7 +953,7 @@ session2 = open_session(
     "my-app-session-001",
     spec=SessionAttributes(
         application="my-app",
-        slots=1,
+        resreq=ResourceRequirement(cpu=1, memory="1g"),
         min_instances=0,
         max_instances=10
     )
@@ -965,28 +973,28 @@ assert session.id == session2.id
 **Description:** User accidentally tries to open a session with different configuration.
 
 **Step-by-step workflow:**
-1. Session "my-session" exists with `slots=1`
-2. User calls `open_session("my-session", spec=SessionSpec(slots=2))`
+1. Session "my-session" exists with `resreq=cpu=1,mem=1g`
+2. User calls `open_session("my-session", spec=SessionAttributes(resreq=cpu=2,mem=1g))`
 3. Session manager detects spec mismatch
 4. User receives clear error message
 
 **Code Example:**
 
 ```python
-from flamepy import open_session, SessionAttributes, FlameError
+from flamepy import open_session, SessionAttributes, ResourceRequirement, FlameError
 
-# Session exists with slots=1
+# Session exists with resreq=cpu=1,mem=1g
 try:
     session = open_session(
         "existing-session",
         spec=SessionAttributes(
             application="my-app",
-            slots=2  # Mismatch!
+            resreq=ResourceRequirement(cpu=2, memory="1g")  # Mismatch!
         )
     )
 except FlameError as e:
     print(f"Error: {e.message}")
-    # Output: "session <existing-session> spec mismatch: slots mismatch: expected 1, got 2"
+    # Output: "session <existing-session> spec mismatch: resreq differs (expected ..., got ...)"
 ```
 
 **Expected outcome:**

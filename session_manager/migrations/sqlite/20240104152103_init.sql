@@ -1,7 +1,6 @@
 CREATE TABLE IF NOT EXISTS sessions (
     id              TEXT PRIMARY KEY,
     application     TEXT NOT NULL,
-    slots           INTEGER NOT NULL,
 
     common_data     BLOB,
 

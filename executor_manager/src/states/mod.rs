@@ -85,7 +85,6 @@ mod tests {
             id: id.to_string(),
             node: "test-node".to_string(),
             resreq: ResourceRequirement::default(),
-            slots: 1,
             shim: Shim::Host,
             session: None,
             task: None,
