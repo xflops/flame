@@ -71,7 +71,7 @@ uv run main.py --local
 
 ## Performance Comparison
 
-Run the baseline and incremental cases on the same cluster, code revision, and workload shape. The baseline forces every replay-buffer read to request version `0`, so the cache returns the full base object plus all patches and the example keeps the default merge cadence of every 5 iterations. The incremental case uses the cached nonzero version after the first read, disables merge by default, and applies only newly seen patch batches to the buffer service's local materialized buffer.
+Run the baseline and incremental cases on the same cluster, code revision, and workload shape. The baseline forces every replay-buffer read to request version `0`, so the cache returns the full base object plus all patches and the example keeps the default merge cadence of every 5 iterations. The incremental case uses the cached nonzero version after the first read, disables merge by default, and each buffer service instance applies only newly seen patch batches to its own local materialized buffer.
 
 ```shell
 docker compose exec -it flame-console /bin/bash

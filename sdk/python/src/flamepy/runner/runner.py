@@ -148,9 +148,11 @@ class RunnerService:
                              will be used instead of auto-generating one.
             stateful: If True, persist the execution object state back to flame-cache
                      after each task. If False, do not persist state.
-            autoscale: If True, create instances dynamically based on pending tasks (min=0, max=None).
-                      If False, create exactly one instance (min=1, max=1).
-            warmup: Number of instances to pre-create at session start. Only used when autoscale=True.
+            autoscale: If True, create instances dynamically based on pending tasks
+                      (min=warmup or 0, max=None). If False, create a fixed number
+                      of instances (min=max=warmup or 1).
+            warmup: Number of instances to pre-create at session start. When
+                    autoscale=False, this sets the fixed instance count.
             resreq: Optional explicit resource requirements. When omitted, the
                     server applies cluster.resource_requirement (or a hardcoded
                     fallback when that is unset).
@@ -548,11 +550,12 @@ class Runner:
             stateful: If True, persist the execution object state back to flame-cache
                      after each task. If False, do not persist state. If None, use default
                      based on execution_object type (default: False for all types).
-            autoscale: If True, create instances dynamically based on pending tasks (min=0, max=None).
-                      If False, create exactly one instance (min=1, max=1).
+            autoscale: If True, create instances dynamically based on pending tasks
+                      (min=warmup or 0, max=None). If False, create a fixed number
+                      of instances (min=max=warmup or 1).
                       If None, use default based on execution_object type.
-            warmup: Number of instances to pre-create at session start. Only used when autoscale=True.
-                   When set, min_instances is set to this value for warmup. Default: 0.
+            warmup: Number of instances to pre-create at session start. When
+                   autoscale=False, this sets the fixed instance count. Default: 0.
             resreq: Optional explicit resource requirements. When omitted, the
                     server applies cluster.resource_requirement (or a hardcoded
                     fallback when that is unset).
