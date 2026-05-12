@@ -32,7 +32,8 @@ with Runner("replay-buffer") as rr:
 - `ReplayBuffer` holds an `ObjectRef` pointing to shared data in Flame cache
 - When pickled as parameter, collectors get the same `ObjectRef`
 - `buffer.push()` calls `patch_object` - writes directly to cache
-- `get_object` with deserializer consolidates patches when reading
+- `get_object` returns only new patch batches after the buffer service has a local cache entry
+- The buffer service deserializer merges only newly seen patch batches into its local materialized buffer
 
 ## Usage
 
@@ -61,13 +62,13 @@ uv run main.py --local
 | `--steps-per-collection` | Steps per collection task | 500 |
 | `--batch-size` | Sample batch size | 64 |
 | `--metrics-json` | Write distributed-mode metrics to a JSON file | Off |
-| `--merge-every` | Merge replay-buffer patches every N iterations | 5 |
-| `--no-merge` | Disable patch merging to stress patch-only reads | Off |
+| `--merge-every` | Override replay-buffer patch merge cadence | Auto |
+| `--no-merge` | Disable patch merging, including forced-full runs | Off |
 | `--force-full-get` | Force replay-buffer reads to request full objects with version 0 | Off |
 
 ## Performance Comparison
 
-Run the baseline and incremental cases on the same cluster, code revision, and workload shape. The baseline forces every replay-buffer read to request version `0`, so the cache returns the full base object plus all patches. The incremental case uses the cached nonzero version after the first read, so the cache can return only new patches when the base is still valid.
+Run the baseline and incremental cases on the same cluster, code revision, and workload shape. The baseline forces every replay-buffer read to request version `0`, so the cache returns the full base object plus all patches and the example keeps the default merge cadence of every 5 iterations. The incremental case uses the cached nonzero version after the first read, disables merge by default, and applies only newly seen patch batches to the buffer service's local materialized buffer.
 
 ```shell
 docker compose exec -it flame-console /bin/bash
@@ -84,6 +85,13 @@ uv run main.py \
 
 uv run main.py \
   --metrics-json /tmp/replay-buffer-metrics/incremental.json \
+  --iterations 50 \
+  --collections 20 \
+  --steps-per-collection 500 \
+  --batch-size 64
+
+uv run main.py \
+  --local \
   --iterations 50 \
   --collections 20 \
   --steps-per-collection 500 \
@@ -128,7 +136,23 @@ print(
 PY
 ```
 
-For a stronger patch-only signal, repeat both runs with `--no-merge`. That keeps a long patch history and should make the forced-full baseline pay for old patches on every read, while the incremental run downloads only the patch suffix after the cached version.
+This default comparison intentionally keeps merge enabled for the forced-full baseline and disabled for incremental reads. Use `--merge-every` only when you want to override that policy.
+
+Example result from a 500,000-transition run after disabling merge for the incremental case:
+
+| Mode | Total Time | Throughput |
+|------|------------|------------|
+| Local baseline | 2.24s | 223,376.4 transitions/sec |
+| Incremental reads | 6.58s | 76,016.1 transitions/sec |
+| Forced full reads | 71.84s | 6,959.5 transitions/sec |
+
+| Comparison | Runtime | Throughput |
+|------------|---------|------------|
+| Incremental vs forced full | 90.8% lower | 10.9x higher |
+| Local vs incremental distributed | 66.0% lower | 2.9x higher |
+| Local vs forced full | 96.9% lower | 32.1x higher |
+
+The local baseline remains faster than incremental distributed reads because it avoids Flame service, scheduler, network, and cache overhead. Exact numbers depend on cluster size, cache placement, and environment stepping cost, so compare runs from the same cluster and workload shape.
 
 ## Example Output
 
@@ -139,23 +163,25 @@ Distributed Replay Buffer (patch_object)
 
 Configuration:
   Environment: CartPole-v1
-  Collections per iteration: 4
-  Steps per collection: 100
-  Iterations: 10
-  Batch size: 32
+  Collections per iteration: 20
+  Steps per collection: 500
+  Iterations: 50
+  Batch size: 64
+  Merge every: disabled
+  Force full get: False
 
 Starting distributed collection...
-Iteration  0 | Buffer:    400 | Total added:    400 | Avg Reward:    22.5
-             | Sampled batch of 32 transitions
-Iteration  1 | Buffer:    800 | Total added:    800 | Avg Reward:    21.8
-             | Sampled batch of 32 transitions
+Iteration  0 | Buffer:  10000 | Total added:  10000 | Avg Reward:    21.4
+             | Sampled batch of 64 transitions
+Iteration  1 | Buffer:  20000 | Total added:  20000 | Avg Reward:    22.0
+             | Sampled batch of 64 transitions
 ...
 
 ============================================================
 Collection Complete!
-  Total time: 2.45s
-  Total transitions: 4000
-  Throughput: 1632.7 transitions/sec
+  Total time: 6.58s
+  Total transitions: 500000
+  Throughput: 76016.1 transitions/sec
 ============================================================
 ```
 

@@ -10,6 +10,20 @@ Use --local flag for local mode without a Flame cluster.
 from collector import Collector
 from replay_buffer import ReplayBuffer
 
+DEFAULT_FULL_GET_MERGE_EVERY = 5
+
+
+def _resolve_merge_every(
+    force_full_get: bool,
+    requested_merge_every: int | None,
+    no_merge: bool,
+) -> int | None:
+    if no_merge:
+        return None
+    if requested_merge_every is not None:
+        return requested_merge_every
+    return DEFAULT_FULL_GET_MERGE_EVERY if force_full_get else None
+
 
 def run_distributed(
     env_name: str = "CartPole-v1",
@@ -17,7 +31,7 @@ def run_distributed(
     num_collections: int = 20,
     steps_per_collection: int = 500,
     batch_size: int = 64,
-    merge_every: int | None = 5,
+    merge_every: int | None = None,
     metrics_json: str | None = None,
     force_full_get: bool = False,
 ):
@@ -257,8 +271,11 @@ def main():
     parser.add_argument(
         "--merge-every",
         type=int,
-        default=5,
-        help="Merge replay-buffer patches every N iterations",
+        default=None,
+        help=(
+            "Merge replay-buffer patches every N iterations. "
+            "By default this is 5 for --force-full-get and disabled for incremental reads."
+        ),
     )
     parser.add_argument(
         "--no-merge",
@@ -272,7 +289,11 @@ def main():
     )
 
     args = parser.parse_args()
-    merge_every = None if args.no_merge else args.merge_every
+    merge_every = _resolve_merge_every(
+        force_full_get=args.force_full_get,
+        requested_merge_every=args.merge_every,
+        no_merge=args.no_merge,
+    )
 
     if args.local:
         run_local(

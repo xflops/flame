@@ -59,9 +59,11 @@ No production CLI changes are required for incremental object retrieval.
 Replay-buffer performance evaluation should add example-only flags to `examples/rl/replay_buffer/main.py`:
 
 - `--metrics-json <path>`: write per-iteration performance metrics.
-- `--merge-every <n>`: configure compaction cadence.
-- `--no-merge`: stress patch-only reads by keeping a long patch history.
+- `--merge-every <n>`: override compaction cadence.
+- `--no-merge`: disable compaction, including forced-full baseline runs.
 - `--force-full-get`: force replay-buffer reads to send request version `0` for baseline measurement.
+
+The replay-buffer example should use mode-aware merge defaults: forced-full baseline runs keep merge enabled every 5 iterations, while normal incremental runs disable merge so the benchmark measures patch-only get plus incremental local materialization.
 
 These flags should exit with the existing process status semantics: nonzero on uncaught workload failure, zero when all configured iterations complete.
 
@@ -156,14 +158,14 @@ Patch-only responses require a valid local cached base. flamepy enforces this by
 - Cross-process client cache sharing.
 - Client cache persistence to disk.
 - Arbitrary patch compaction policy changes beyond returning a full response when history cannot bridge.
-- Incremental deserializer/reducer APIs. Existing deserializers still receive base plus the full cached patch list.
+- Public incremental deserializer/reducer APIs. Existing deserializers still receive base plus the full cached patch list.
 - Optimistic write conflict detection.
 
 **Limitations:**
 
 - Patch-only retrieval only helps clients that already have a valid local cache entry.
 - If the base object is replaced or compacted past the client version, the server must send a full response.
-- Existing deserializers still define how base plus patches become user data. Incremental fetch reduces network and repeated deserialization of old patch payloads; it does not automatically make every deserializer incrementally composable.
+- Existing deserializers still define how base plus patches become user data. Incremental fetch reduces network and repeated deserialization of old patch payloads; it does not automatically make every deserializer incrementally composable. The replay-buffer example uses a stateful deserializer to apply only newly seen patch batches to its service-local materialized buffer.
 
 ### Feature Interaction
 
@@ -180,6 +182,7 @@ Patch-only responses require a valid local cached base. flamepy enforces this by
 - `object_cache/src/storage/disk.rs`: persist server-assigned patch versions and reconstruct current version from base plus patch history.
 - `sdk/python/src/flamepy/core/cache.py`: cache base, versioned patches, and materialized outputs; send request version `0` for full fetches and cached nonzero current versions for incremental reads.
 - `sdk/python/tests/test_cache.py` and E2E cache tests: add full, patch-only, not-modified, and update-after-cache coverage.
+- `examples/rl/replay_buffer/replay_buffer.py`: use a stateful deserializer so `state()` and `sample()` merge only newly seen patch batches into the service-local materialized buffer.
 - `examples/rl/replay_buffer/main.py`: add benchmark flags and metrics export for the performance evaluation.
 
 **Integration Points:**
@@ -265,11 +268,18 @@ class Object:
 - On patch-only response, require a cached entry, append patches, update `version`, and invalidate materialized values.
 - On not-modified, return the materialized cached result.
 
-Materialization:
+Generic materialization:
 
 - `deserializer is None`: return the base object, preserving the public API behavior.
 - `deserializer is not None`: compute `deserializer(base, [patch.data for patch in patches])`.
 - Cache materialized values by deserializer identity within the process. New patches invalidate those values.
+
+Replay-buffer materialization:
+
+- Keep the public `get_object(..., deserializer=...)` contract unchanged.
+- Make `ReplayBuffer._deserializer` stateful within the buffer service process.
+- Reset the service-local materialized buffer when the base object changes or patch history shrinks.
+- Otherwise apply only `deltas[previous_patch_count:]` to the already materialized buffer, then record the new patch count.
 
 Mutations:
 
@@ -370,6 +380,23 @@ if response.patches:
   return materialize(cached, deserializer)
 ```
 
+**Replay-buffer `_deserializer`:**
+
+```text
+if no materialized buffer
+   or base object changed
+   or cached patch count > len(deltas):
+  materialized = copy(base)
+  applied_patch_count = 0
+
+for patch_batch in deltas[applied_patch_count:]:
+  materialized.transitions.extend(patch_batch)
+  materialized.total_added += len(patch_batch)
+
+applied_patch_count = len(deltas)
+return materialized
+```
+
 ### System Considerations
 
 **Performance:**
@@ -398,7 +425,7 @@ Returning a full response is the safety mechanism. If the server cannot prove th
 
 **Resource Usage:**
 
-Client memory may increase because flamepy stores base and deserialized patches instead of only one materialized value. Keep the existing LRU entry limit and count each object entry once. Future work can add byte-based client cache limits.
+Client memory may increase because flamepy stores base and deserialized patches instead of only one materialized value. The replay-buffer service also keeps one materialized buffer so `state()` and `sample()` avoid replaying old patch batches. Keep the existing LRU entry limit and count each object entry once. Future work can add byte-based client cache limits.
 
 **Security:**
 
@@ -464,6 +491,7 @@ Version requirements:
 - `version=0` bypasses cache and requests full response.
 - Materialized cache invalidates after new patches.
 - Existing `deserializer=None` behavior still returns base object only.
+- Replay-buffer deserializer applies only newly seen patch batches and resets after base replacement or patch-history shrink.
 
 #### E2E Tests
 
@@ -546,22 +574,22 @@ uv run main.py --force-full-get --iterations 50 --collections 20 --steps-per-col
 uv run main.py --iterations 50 --collections 20 --steps-per-collection 500 --batch-size 64
 ```
 
-The first run forces request version `0` on replay-buffer reads. The second run uses normal nonzero cached versions after the first full fetch. This isolates the proposed `get_object` behavior without a runtime switch.
+The first run forces request version `0` on replay-buffer reads and keeps merge enabled every 5 iterations by default. The second run uses normal nonzero cached versions after the first full fetch and disables merge by default. This isolates the proposed `get_object` behavior without a runtime switch while preserving compaction for the forced-full baseline.
 
 Add a replay-buffer benchmark mode before collecting final numbers:
 
 - `--metrics-json <path>`: write per-iteration metrics.
-- `--merge-every <n>`: make the current hard-coded merge interval configurable.
-- `--no-merge`: stress the patch-only path by keeping a long patch history.
+- `--merge-every <n>`: override the automatic merge policy.
+- `--no-merge`: disable merge, including for forced-full runs.
 - `--force-full-get`: force replay-buffer reads to send request version `0` for baseline measurement.
 
 Run at least these cases:
 
 | Case | Purpose |
 |------|---------|
-| Default merge every 5 iterations | Measures realistic current example behavior. |
-| No merge | Maximizes accumulated patches and should show largest read-path improvement. |
-| Merge every iteration | Confirms no regression when full responses are naturally small. |
+| Forced full with default merge every 5 iterations | Baseline that bounds repeated full-read cost with compaction. |
+| Incremental with merge disabled | Measures patch-only get plus incremental local materialization. |
+| Explicit `--merge-every 1` override | Confirms no regression when full responses are naturally small. |
 
 Secondary comparison: keep the collector work and iteration shape identical, then compare the patch-based replay buffer with a controlled non-patch variant:
 
