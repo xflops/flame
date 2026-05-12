@@ -539,42 +539,42 @@ impl ObjectCache {
         let key_lock = self.get_key_lock(&key_str)?;
         let _guard = key_lock.write().await;
 
-        self.eviction_policy.on_access(&key_str);
-
-        let version_from_memory = {
-            let metadata = lock_ptr!(self.metadata)?;
-            metadata.get(&key_str).map(|m| m.version)
+        let current_object = {
+            let objects = lock_ptr!(self.objects)?;
+            objects.get(&key_str).cloned()
         };
 
-        let current_version = match version_from_memory {
-            Some(v) => v,
-            None => self
-                .storage
-                .read_object(key)
-                .await?
-                .map(|obj| obj.current_version())
-                .ok_or_else(|| {
-                    FlameError::NotFound(format!("object <{}> not found for patch", key_str))
-                })?,
+        let current_object = match current_object {
+            Some(object) => object,
+            None => self.storage.read_object(key).await?.ok_or_else(|| {
+                FlameError::NotFound(format!("object <{}> not found for patch", key_str))
+            })?,
         };
+        let current_version = current_object.current_version();
         let new_version = current_version + 1;
 
         let versioned_delta = Object::new(new_version, delta.data);
         let mut meta = self.storage.patch_object(key, &versioned_delta).await?;
+
+        let mut patched_object = current_object;
+        patched_object.deltas.push(versioned_delta);
+        let size = patched_object.data.len() as u64;
+
         meta.endpoint = self.endpoint.to_uri();
         meta.version = new_version;
-
-        {
-            let mut metadata = lock_ptr!(self.metadata)?;
-            metadata.insert(key_str.clone(), meta.clone());
-        }
+        meta.size = size;
+        meta.delta_count = patched_object.deltas.len() as u64;
 
         {
             let mut objects = lock_ptr!(self.objects)?;
-            if objects.remove(&key_str).is_some() {
-                self.eviction_policy.on_remove(&key_str);
-            }
+            let mut metadata = lock_ptr!(self.metadata)?;
+
+            objects.insert(key_str.clone(), patched_object);
+            metadata.insert(key_str.clone(), meta.clone());
         }
+
+        self.eviction_policy.on_add(&key_str, size);
+        self.run_eviction()?;
 
         tracing::debug!(
             "Object patch: {} (version={}, delta_count={})",
@@ -1637,6 +1637,35 @@ mod tests {
             let retrieved = cache.get(&key).await.unwrap();
             assert_eq!(retrieved.version, 1);
             assert_eq!(retrieved.data, vec![1, 2, 3]);
+        }
+
+        #[tokio::test]
+        async fn patch_keeps_object_readable_with_none_storage() {
+            let cache = create_test_cache().await;
+
+            let key = ObjectKey::from_path("app/session").unwrap();
+            let meta = cache
+                .put(key, Object::new(0, b"base".to_vec()))
+                .await
+                .unwrap();
+            let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
+
+            let patch_meta = cache
+                .patch(&key, Object::new(0, b"patch".to_vec()))
+                .await
+                .unwrap();
+
+            assert_eq!(patch_meta.version, 2);
+            assert_eq!(patch_meta.size, 4);
+            assert_eq!(patch_meta.delta_count, 1);
+
+            let object = cache.get(&key).await.unwrap();
+            assert_eq!(object.version, 1);
+            assert_eq!(object.current_version(), 2);
+            assert_eq!(object.data, b"base".to_vec());
+            assert_eq!(object.deltas.len(), 1);
+            assert_eq!(object.deltas[0].version, 2);
+            assert_eq!(object.deltas[0].data, b"patch".to_vec());
         }
 
         #[tokio::test]
