@@ -99,7 +99,13 @@ docker compose down
 ## Python SDK Usage
 
 ```python
-from flamepy.core.cache import put_object, get_object, update_object, patch_object, ObjectRef
+from flamepy.core.cache import (
+    ObjectRef,
+    get_object,
+    patch_object,
+    put_object,
+    update_object,
+)
 
 # Put an object (returns ObjectRef with version=1)
 ref = put_object("app/session", my_data)
