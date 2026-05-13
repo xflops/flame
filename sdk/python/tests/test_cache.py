@@ -1029,3 +1029,8 @@ class TestObjectKey:
         assert not session.matches_key("myapp/session2/obj1")
         assert exact.matches_key("myapp/session/obj1")
         assert not exact.matches_key("myapp/session/obj2")
+        assert not all_sessions.matches_key("myapp")
+        assert not all_sessions.matches_key("myapp/session")
+        assert not all_sessions.matches_key("myapp/session/obj1/extra")
+        assert not session.matches_key("myapp/session")
+        assert not session.matches_key("myapp/session/obj1/extra")

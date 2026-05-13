@@ -575,10 +575,17 @@ mod tests {
             .write_object(&key2, &Object::new(2, vec![4, 5, 6]))
             .await
             .unwrap();
+        storage
+            .patch_object(&key1, &Object::new(0, vec![7]))
+            .await
+            .unwrap();
+        let key1_delta_dir = storage.delta_dir(&key1);
+        assert!(key1_delta_dir.exists());
 
         storage.delete_objects(&key1).await.unwrap();
 
         assert!(storage.read_object(&key1).await.unwrap().is_none());
+        assert!(!key1_delta_dir.exists());
         assert!(storage.read_object(&key2).await.unwrap().is_some());
     }
 

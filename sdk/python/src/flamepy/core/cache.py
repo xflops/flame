@@ -325,16 +325,20 @@ class ObjectKey:
 
     def matches_key(self, key: str) -> bool:
         """Return True if this prefix/full ObjectKey matches a full object key."""
-        try:
-            object_key = ObjectKey.from_key(key)
-        except ValueError:
-            return False
-
         if self.is_all_sessions():
-            return object_key.app_name == self.app_name
+            prefix = f"{self.app_name}/"
+            if not key.startswith(prefix):
+                return False
+            suffix = key[len(prefix) :]
+            session_id, separator, object_id = suffix.partition("/")
+            return bool(session_id and separator and object_id) and "/" not in object_id
         if self.object_id is None:
-            return object_key.app_name == self.app_name and object_key.session_id == self.session_id
-        return object_key == self
+            prefix = f"{self.app_name}/{self.session_id}/"
+            if not key.startswith(prefix):
+                return False
+            object_id = key[len(prefix) :]
+            return bool(object_id) and "/" not in object_id
+        return key == self.to_key()
 
     def __str__(self) -> str:
         return self.to_key() or self.to_prefix()
