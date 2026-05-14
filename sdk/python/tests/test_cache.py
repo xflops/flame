@@ -642,6 +642,43 @@ class TestClientSideCaching:
         assert len(results) == 10
 
 
+class TestPutObject:
+    def test_local_storage_ref_uses_cacheable_version(self, monkeypatch, tmp_path):
+        from flamepy.core import cache as cache_module
+        from flamepy.core.types import FlameClientCache
+
+        class MockLocation:
+            uri = "grpc://local-cache:9090"
+
+        class MockEndpoint:
+            locations = [MockLocation()]
+
+        class MockFlightInfo:
+            endpoints = [MockEndpoint()]
+
+        class MockFlightClient:
+            def get_flight_info(self, descriptor):
+                return MockFlightInfo()
+
+        class MockContext:
+            cache = FlameClientCache(
+                endpoint="grpc://host:9090",
+                storage=str(tmp_path),
+            )
+
+        monkeypatch.setattr(cache_module, "FlameContext", lambda: MockContext())
+        monkeypatch.setattr(
+            cache_module,
+            "_get_flight_client",
+            lambda endpoint, tls=None: MockFlightClient(),
+        )
+
+        ref = cache_module.put_object("app/session", {"value": 1})
+
+        assert ref.endpoint == "grpc://local-cache:9090"
+        assert ref.version == 1
+
+
 class TestDeleteObjects:
     def setup_method(self):
         with _cache_lock:

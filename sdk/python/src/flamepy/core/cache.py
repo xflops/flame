@@ -721,7 +721,7 @@ def put_object(key_prefix: str, obj: Any) -> "ObjectRef":
             endpoint_str = cache_endpoint
 
         logger.debug(f"put_object local_storage: key={key}, endpoint={endpoint_str}")
-        return ObjectRef(endpoint=endpoint_str, key=key, version=0)
+        return ObjectRef(endpoint=endpoint_str, key=key, version=1)
     else:
         client = _get_flight_client(cache_endpoint, cache_tls)
         upload_descriptor = flight.FlightDescriptor.for_path(object_key.to_prefix())

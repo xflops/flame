@@ -1,0 +1,21 @@
+[project]
+name = "torchrl-dqn"
+version = "0.1.0"
+description = "TorchRL DQN Example using Flame Runner and patch_object replay buffer"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "gymnasium",
+    "tensordict",
+    "torch",
+    "torchrl",
+]
+
+[project.optional-dependencies]
+box2d = ["gymnasium[box2d]"]
+
+[dependency-groups]
+dev = ["flamepy"]
+
+[tool.setuptools]
+py-modules = ["main", "model", "collector", "replay_buffer"]
