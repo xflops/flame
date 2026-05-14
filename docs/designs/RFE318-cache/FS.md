@@ -203,7 +203,7 @@ To manage disk usage, the cache implements a Least Recently Used (LRU) eviction 
 - ObjectRef structure updates
 - Key-based storage organization (`ssn_id/object_id`)
 - Support for both public IP and localhost binding
-- Implementation updates for common data in both RL and agent modules
+- Implementation updates for common data in both RL and service modules
 
 **Out of Scope:**
 - Version checking and conflict resolution (version always 0 for now)
@@ -651,4 +651,4 @@ The special session_id value `*` (constant: `WILDCARD_SESSION`) indicates all se
 - FlameClusterContext: `common/src/ctx.rs`
 - ObjectRef definition: `sdk/python/src/flamepy/core/cache.py`
 - RL module usage: `sdk/python/src/flamepy/rl/runner.py`
-- Agent module usage: `sdk/python/src/flamepy/agent/instance.py`
+- Service module usage: `sdk/python/src/flamepy/service/instance.py`

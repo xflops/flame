@@ -46,7 +46,7 @@ class FlameInstance(FlameService):
     def context(self) -> Any:
         """Get the current agent context.
 
-        For agent module: use stored ObjectRef to get from cache, then deserialize.
+        For service module: use stored ObjectRef to get from cache, then deserialize.
         """
         if self._object_ref is None:
             return None
@@ -107,7 +107,7 @@ class FlameInstance(FlameService):
             logger.warning("No entrypoint function defined")
             return None
 
-        # For agent module: receive bytes from core API, deserialize with cloudpickle
+        # For service module: receive bytes from core API, deserialize with cloudpickle
         input_data = None
         if context.input is not None:
             input_data = cloudpickle.loads(context.input)
@@ -120,7 +120,7 @@ class FlameInstance(FlameService):
 
         logger.debug(f"on_task_invoke: {res}")
 
-        # For agent module: serialize output with cloudpickle, return bytes
+        # For service module: serialize output with cloudpickle, return bytes
         if res is None:
             return None
         return TaskOutput(cloudpickle.dumps(res, protocol=cloudpickle.DEFAULT_PROTOCOL))

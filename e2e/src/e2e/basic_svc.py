@@ -88,7 +88,7 @@ class BasicTestService(flamepy.FlameService):
         # Update common data if requested
         # Note: Since update_common_data() was removed from SessionContext,
         # we can't update it directly. This test service stores the update locally
-        # but it won't persist across tasks. For production use, use agent module.
+        # but it won't persist across tasks. For production use, use service module.
         updated_context = None
         if request and request.update_common_data and self._session_context is not None:
             logger.info(f"Updating common data (local only): {request.input}")

@@ -1,8 +1,6 @@
-import flamepy
-from flamepy.agent import Agent
+from flamepy.service import Session
 from openai import OpenAI
 import os
-import json
 
 tools = [
     {
@@ -41,7 +39,7 @@ def send_messages(messages):
 
 
 def main():
-    agent = Agent("flmexec")
+    session = Session("flmexec")
 
     # 1. Ask DeepSeek to generate a script
     messages = [
@@ -64,7 +62,7 @@ def main():
 
     # 3. Call the tool to run the script and get the result for DeepSeek to see
     input = tool.function.arguments.encode("utf-8")
-    result = agent.invoke(input)
+    result = session.invoke(input)
 
     # 4. Ask DeepSeek to summarize the result
     messages.append(
@@ -73,7 +71,7 @@ def main():
     message = send_messages(messages)
     print(f"Model>\t {message.content}")
 
-    agent.close()
+    session.close()
 
 
 if __name__ == "__main__":

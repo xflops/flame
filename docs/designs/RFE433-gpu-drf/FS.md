@@ -222,13 +222,13 @@ service = runner.service(
 )
 ```
 
-**Python SDK (`flamepy.agent`):**
+**Python SDK (`flamepy.service`):**
 
 ```python
-from flamepy.agent import AgentClient
+from flamepy.service import Session
 
-agent = AgentClient(
-    application="llm-agent",
+session = Session(
+    name="llm-agent",
     resreq={"cpu": 8, "memory": "32g", "gpu": 2},
 )
 ```
@@ -298,7 +298,7 @@ pub struct SessionAttributes {
 - DRF scheduler plugin with dominant share calculation
 - SQLite storage for GPU fields
 - CLI `--resreq` flag
-- Python SDK updates (`flamepy.core`, `flamepy.runner`, `flamepy.agent`)
+- Python SDK updates (`flamepy.core`, `flamepy.runner`, `flamepy.service`)
 - Rust SDK updates
 
 **Out of Scope:**
@@ -1073,7 +1073,5 @@ With DRF:
 | `sdk/python/src/flamepy/core/types.py` | Add `ResourceRequirement`, update `SessionAttributes` |
 | `sdk/python/src/flamepy/core/client.py` | Add `resreq` parameter |
 | `sdk/python/src/flamepy/runner/runner.py` | Add `resreq` parameter to `RunnerService` and `Runner.service()` |
-| `sdk/python/src/flamepy/agent/client.py` | Add `resreq` parameter to `AgentClient` |
+| `sdk/python/src/flamepy/service/client.py` | Add `resreq` parameter to `Session` |
 | `sdk/rust/src/types.rs` | Add `resreq` to `SessionAttributes` |
-
-

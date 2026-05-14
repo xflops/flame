@@ -24,8 +24,7 @@ from agents import (
     set_default_openai_api,
 )
 
-import flamepy
-from flamepy import agent
+from flamepy import service
 from apis import MyContext, Question, Answer, MyCustomSession
 
 logger = logging.getLogger(__name__)
@@ -40,7 +39,7 @@ enable_verbose_stdout_logging()
 set_default_openai_api("chat_completions")
 
 # Creat a FlameInstance
-ins = agent.FlameInstance()
+ins = service.FlameInstance()
 
 
 class Location(TypedDict):
@@ -85,9 +84,9 @@ async def my_agent(q: Question) -> Answer:
 
         logger.info(f"Update context: {ctx}")
         ins.update_context(ctx)
-        logger.info(f"Update context done")
+        logger.info("Update context done")
     else:
-        logger.info(f"Run agent without session")
+        logger.info("Run agent without session")
         result = await Runner.run(agent, q.question)
 
     return Answer(answer=result.final_output)

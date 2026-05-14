@@ -11,11 +11,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from flamepy import agent
+from flamepy import service
 
 from e2e.api import TestContext, TestRequest, TestResponse
 
-instance = agent.FlameInstance()
+instance = service.FlameInstance()
 
 
 @instance.entrypoint

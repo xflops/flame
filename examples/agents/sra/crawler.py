@@ -1,7 +1,6 @@
 import markitdown
 import qdrant_client
-import flamepy
-from flamepy import agent
+from flamepy import service
 import requests
 import io
 import uuid
@@ -11,7 +10,7 @@ from qdrant_client.models import VectorParams, Distance, PointStruct
 from apis import WebPage, Answer
 from embed import EmbeddingClient
 
-ins = agent.FlameInstance()
+ins = service.FlameInstance()
 
 headers = {"User-Agent": "Xflops Crawler 1.0", "From": "support@xflops.io"}
 
