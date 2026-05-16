@@ -14,7 +14,6 @@ mod apis;
 
 use byte_unit::Byte;
 use gethostname::gethostname;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use flame_rs::{self as flame, apis::FlameError};
@@ -32,7 +31,7 @@ async fn ping(input: Option<PingRequest>) -> Result<PingResponse, FlameError> {
     };
 
     if let Some(duration) = input.duration {
-        thread::sleep(Duration::from_millis(duration));
+        ::tokio::time::sleep(Duration::from_millis(duration)).await;
     }
 
     let end_time = Instant::now();

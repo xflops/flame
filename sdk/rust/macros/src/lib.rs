@@ -136,12 +136,12 @@ fn expand_flame_message(input: syn::DeriveInput) -> Result<TokenStream2> {
             ) -> ::std::result::Result<#crate_path::__private::bytes::Bytes, #crate_path::apis::FlameError> {
                 #crate_path::__private::serde_json::to_vec(self)
                     .map(#crate_path::__private::bytes::Bytes::from)
-                    .map_err(|err| #crate_path::apis::FlameError::InvalidConfig(err.to_string()))
+                    .map_err(|err| #crate_path::apis::FlameError::Internal(err.to_string()))
             }
 
             fn decode(bytes: &[u8]) -> ::std::result::Result<Self, #crate_path::apis::FlameError> {
                 #crate_path::__private::serde_json::from_slice(bytes)
-                    .map_err(|err| #crate_path::apis::FlameError::Internal(err.to_string()))
+                    .map_err(|err| #crate_path::apis::FlameError::InvalidConfig(err.to_string()))
             }
         }
     })
@@ -309,7 +309,7 @@ fn expand_instance(args: MacroArgs, mut item: ItemImpl) -> Result<TokenStream2> 
         }
     }
 
-    entrypoint_methods.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    entrypoint_methods.sort_by_key(|a| a.to_string());
     entrypoint_methods.dedup_by(|a, b| a == b);
 
     let entrypoint_ident = match entrypoint_methods.as_slice() {

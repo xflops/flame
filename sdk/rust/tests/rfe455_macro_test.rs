@@ -151,3 +151,10 @@ async fn required_macro_input_reports_missing_task_input() {
 
     assert!(err.to_string().contains("missing task input"));
 }
+
+#[test]
+fn flame_message_decode_errors_are_invalid_config() {
+    let err = EchoRequest::decode(b"{").unwrap_err();
+
+    assert!(matches!(err, FlameError::InvalidConfig(_)));
+}

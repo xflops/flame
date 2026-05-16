@@ -541,18 +541,29 @@ struct ModelService {
 #[flame_rs::instance]
 impl ModelService {
     async fn enter(&self, _instance: FlameInstance) -> Result<(), FlameError> {
-        *self.assets.lock().unwrap() = Some(load_assets()?);
+        let mut assets = self.assets.lock().map_err(|_| {
+            FlameError::Internal("model assets lock poisoned".to_string())
+        })?;
+        *assets = Some(load_assets()?);
         Ok(())
     }
 
     #[flame_rs::entrypoint]
     async fn generate(&self, req: GenerationRequest) -> Result<GenerationResponse, FlameError> {
-        let assets = self.assets.lock().unwrap();
-        run_generation(assets.as_ref().unwrap(), req)
+        let assets = self.assets.lock().map_err(|_| {
+            FlameError::Internal("model assets lock poisoned".to_string())
+        })?;
+        let assets = assets.as_ref().ok_or_else(|| {
+            FlameError::Internal("model assets are not loaded".to_string())
+        })?;
+        run_generation(assets, req)
     }
 
     async fn leave(&self) -> Result<(), FlameError> {
-        *self.assets.lock().unwrap() = None;
+        let mut assets = self.assets.lock().map_err(|_| {
+            FlameError::Internal("model assets lock poisoned".to_string())
+        })?;
+        *assets = None;
         Ok(())
     }
 }
