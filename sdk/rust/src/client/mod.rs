@@ -46,7 +46,7 @@ use crate::message::{self, FromTaskOutput, IntoCommonData, IntoTaskInput};
 
 type FlameClient = FlameFrontendClient<Channel>;
 type TaskHandleFuture<O> =
-    Pin<Box<dyn Future<Output = Result<Option<O>, FlameError>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<TaskResult<O>, FlameError>> + Send + 'static>>;
 
 /// Connect to a Flame service without TLS (plaintext).
 ///
@@ -432,6 +432,16 @@ pub struct TaskHandle<O> {
     future: TaskHandleFuture<O>,
 }
 
+#[derive(Clone, Debug)]
+pub struct TaskResult<O> {
+    pub task_id: TaskID,
+    pub session_id: SessionID,
+    pub state: TaskState,
+    pub output: Option<O>,
+    pub error_code: Option<i32>,
+    pub error_message: Option<String>,
+}
+
 impl Task {
     pub fn is_completed(&self) -> bool {
         self.state.is_terminal()
@@ -447,6 +457,48 @@ impl Task {
 
     pub fn is_cancelled(&self) -> bool {
         self.state == TaskState::Cancelled
+    }
+}
+
+impl<O> TaskResult<O> {
+    pub fn is_succeed(&self) -> bool {
+        self.state == TaskState::Succeed
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.state == TaskState::Failed
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state == TaskState::Cancelled
+    }
+}
+
+impl<O> TaskResult<O>
+where
+    O: FromTaskOutput,
+{
+    pub fn from_task(task: Task) -> Result<Self, FlameError> {
+        let is_succeed = task.is_succeed();
+        let (error_code, error_message) = if is_succeed {
+            (None, None)
+        } else {
+            (task_error_code(&task), task_error_message(&task))
+        };
+        let output = if is_succeed {
+            O::from_task_output(task.output)?
+        } else {
+            None
+        };
+
+        Ok(Self {
+            task_id: task.id,
+            session_id: task.ssn_id,
+            state: task.state,
+            output,
+            error_code,
+            error_message,
+        })
     }
 }
 
@@ -700,7 +752,12 @@ impl Session {
         I: IntoTaskInput,
         O: FromTaskOutput + Send + 'static,
     {
-        self.run(input).await?.await
+        let result = self.run::<_, O>(input).await?.await?;
+        if result.is_succeed() {
+            Ok(result.output)
+        } else {
+            Err(task_result_error(&result))
+        }
     }
 
     pub async fn run<I, O>(&self, input: I) -> Result<TaskHandle<O>, FlameError>
@@ -713,14 +770,10 @@ impl Session {
         let session_id = session.id.clone();
         let task_id = task.id;
         let future_task_id = task_id.clone();
+
         let future = Box::pin(async move {
             let task = session.wait_task(session_id, future_task_id).await?;
-
-            if !task.is_succeed() {
-                return Err(task_terminal_error(&task));
-            }
-
-            O::from_task_output(task.output)
+            TaskResult::from_task(task)
         });
 
         Ok(TaskHandle { task_id, future })
@@ -896,30 +949,43 @@ impl<O> TaskHandle<O> {
 impl<O> Unpin for TaskHandle<O> {}
 
 impl<O> Future for TaskHandle<O> {
-    type Output = Result<Option<O>, FlameError>;
+    type Output = Result<TaskResult<O>, FlameError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.get_mut().future.as_mut().poll(cx)
     }
 }
 
-fn task_terminal_error(task: &Task) -> FlameError {
-    let messages = task
+fn task_error_code(task: &Task) -> Option<i32> {
+    task.events.last().map(|event| event.code)
+}
+
+fn task_error_message(task: &Task) -> Option<String> {
+    let message = task
         .events
         .iter()
         .filter_map(|event| event.message.as_deref())
         .collect::<Vec<_>>()
         .join("; ");
 
-    let details = if messages.is_empty() {
-        String::new()
+    if message.is_empty() {
+        None
     } else {
-        format!(": {messages}")
+        Some(message)
+    }
+}
+
+fn task_result_error<O>(result: &TaskResult<O>) -> FlameError {
+    let details = match (result.error_code, result.error_message.as_deref()) {
+        (Some(code), Some(message)) => format!(": code <{}>, {}", code, message),
+        (Some(code), None) => format!(": code <{}>", code),
+        (None, Some(message)) => format!(": {}", message),
+        (None, None) => String::new(),
     };
 
     FlameError::Internal(format!(
         "task <{}> in session <{}> finished with state <{}>{}",
-        task.id, task.ssn_id, task.state, details
+        result.task_id, result.session_id, result.state, details
     ))
 }
 
@@ -1276,6 +1342,17 @@ mod tests {
         }
     }
 
+    fn test_task(id: &str, state: TaskState) -> Task {
+        Task {
+            id: id.to_string(),
+            ssn_id: "ssn-1".to_string(),
+            state,
+            input: None,
+            output: None,
+            events: Vec::new(),
+        }
+    }
+
     #[test]
     fn session_options_generate_default_attributes() {
         let attrs = SessionOptions::new("model-app")
@@ -1315,14 +1392,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_handle_is_awaitable() {
-        let handle: TaskHandle<()> = TaskHandle {
+    async fn task_handle_await_returns_task_result() {
+        let payload = TestCommonData {
+            value: "done".to_string(),
+        };
+        let mut task = test_task("task-1", TaskState::Succeed);
+        task.output = Some(payload.encode().unwrap());
+        let handle = TaskHandle {
             task_id: "task-1".to_string(),
-            future: Box::pin(async { Ok(Some(())) }),
+            future: Box::pin(async move { TaskResult::<TestCommonData>::from_task(task) }),
         };
 
         assert_eq!(handle.id(), "task-1");
-        assert_eq!(handle.await.unwrap(), Some(()));
+        let result = handle.await.unwrap();
+        assert_eq!(result.task_id, "task-1");
+        assert_eq!(result.session_id, "ssn-1");
+        assert!(result.is_succeed());
+        assert_eq!(result.output.unwrap().value, "done");
+        assert_eq!(result.error_code, None);
+        assert_eq!(result.error_message, None);
+    }
+
+    #[test]
+    fn task_result_records_failed_task_error_details() {
+        let mut task = test_task("task-2", TaskState::Failed);
+        task.events.push(Event {
+            code: 42,
+            message: Some("remote failure".to_string()),
+            creation_time: Utc.with_ymd_and_hms(2026, 5, 8, 10, 0, 0).unwrap(),
+        });
+
+        let result = TaskResult::<TestCommonData>::from_task(task).unwrap();
+
+        assert_eq!(result.task_id, "task-2");
+        assert_eq!(result.session_id, "ssn-1");
+        assert!(result.is_failed());
+        assert!(result.output.is_none());
+        assert_eq!(result.error_code, Some(42));
+        assert_eq!(result.error_message.as_deref(), Some("remote failure"));
     }
 
     /// Regression test for `Session::try_from` creation_time parsing.

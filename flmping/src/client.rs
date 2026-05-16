@@ -26,7 +26,7 @@ use serde_derive::{Deserialize, Serialize};
 
 use crate::apis::{PingRequest, PingResponse};
 
-use flame::client::{Session, SessionOptions};
+use flame::client::{Session, SessionOptions, TaskResult};
 use flame_rs::{self as flame};
 
 #[derive(Parser)]
@@ -115,19 +115,14 @@ async fn run_tasks(
     task_num: i32,
     duration: Option<u64>,
     memory: Option<u64>,
-) -> Result<(u128, Vec<(String, Option<PingResponse>)>), Box<dyn Error>> {
+) -> Result<(u128, Vec<TaskResult<PingResponse>>), Box<dyn Error>> {
     let input = PingRequest { duration, memory };
     let start = Instant::now();
 
     let handles = try_join_all((0..task_num).map(|_| ssn.run::<_, PingResponse>(&input))).await?;
-    let task_ids = handles
-        .iter()
-        .map(|handle| handle.id().clone())
-        .collect::<Vec<_>>();
-    let outputs = try_join_all(handles).await?;
-    let outputs = task_ids.into_iter().zip(outputs).collect();
+    let tasks = try_join_all(handles).await?;
 
-    Ok((start.elapsed().as_millis(), outputs))
+    Ok((start.elapsed().as_millis(), tasks))
 }
 
 async fn run_perf_mode(
@@ -136,8 +131,9 @@ async fn run_perf_mode(
     duration: Option<u64>,
     memory: Option<u64>,
 ) -> Result<(), Box<dyn Error>> {
-    let (duration_ms, outputs) = run_tasks(ssn, task_num, duration, memory).await?;
-    print_perf_summary(outputs.len() as u32, task_num, duration_ms);
+    let (duration_ms, tasks) = run_tasks(ssn, task_num, duration, memory).await?;
+    let succeeded = tasks.iter().filter(|task| task.is_succeed()).count() as u32;
+    print_perf_summary(succeeded, task_num, duration_ms);
 
     Ok(())
 }
@@ -148,8 +144,8 @@ async fn run_output_mode(
     duration: Option<u64>,
     memory: Option<u64>,
 ) -> Result<(), Box<dyn Error>> {
-    let (duration_ms, outputs) = run_tasks(ssn, task_num, duration, memory).await?;
-    print_outputs(ssn, outputs);
+    let (duration_ms, tasks) = run_tasks(ssn, task_num, duration, memory).await?;
+    print_outputs(tasks)?;
 
     println!(
         "\n\n<{}> tasks was completed in <{} ms>.\n",
@@ -160,23 +156,39 @@ async fn run_output_mode(
     Ok(())
 }
 
-fn print_outputs(ssn: &Session, outputs: Vec<(String, Option<PingResponse>)>) {
+fn print_outputs(tasks: Vec<TaskResult<PingResponse>>) -> Result<(), Box<dyn Error>> {
     let mut table = Table::new();
 
     table
         .load_preset(NOTHING)
         .set_header(vec!["Session", "Task", "State", "Output"]);
 
-    for (task_id, output) in outputs {
+    for task in tasks {
+        let output = if task.is_succeed() {
+            task.output.map(|output| output.message).unwrap_or_default()
+        } else {
+            format_task_error(&task)
+        };
+
         table.add_row(vec![
-            ssn.id.to_string(),
-            task_id,
-            "Succeed".to_string(),
-            output.map(|output| output.message).unwrap_or_default(),
+            task.session_id,
+            task.task_id,
+            task.state.to_string(),
+            output,
         ]);
     }
 
     println!("{table}");
+    Ok(())
+}
+
+fn format_task_error(task: &TaskResult<PingResponse>) -> String {
+    match (task.error_code, task.error_message.as_deref()) {
+        (Some(code), Some(message)) => format!("code <{}>: {}", code, message),
+        (Some(code), None) => format!("code <{}>", code),
+        (None, Some(message)) => message.to_string(),
+        (None, None) => String::new(),
+    }
 }
 
 fn print_perf_summary(succeeded: u32, task_num: i32, duration_ms: u128) {

@@ -16,7 +16,7 @@ pub mod client;
 pub mod message;
 pub mod service;
 
-pub use client::{Connection, Session, SessionOptions, TaskHandle};
+pub use client::{Connection, Session, SessionOptions, TaskHandle, TaskResult};
 pub use message::{FlameMessage, FromTaskOutput, IntoCommonData, IntoTaskInput};
 
 #[cfg(feature = "macros")]
