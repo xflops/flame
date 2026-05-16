@@ -35,9 +35,6 @@ use flame_rs::{self as flame};
 #[command(version = "0.5.0")]
 #[command(about = "Flame Ping", long_about = None)]
 struct Cli {
-    #[arg(long)]
-    /// The flame configuration file
-    config: Option<String>,
     /// The number of tasks to run
     #[arg(short, long, default_value = "10")]
     task_num: i32,
@@ -81,8 +78,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
-    let conn = flame::connect_with_config(cli.config).await?;
-
     let ssn_creation_start_time = Instant::now();
     let mut options = SessionOptions::new(DEFAULT_APP).priority(cli.priority);
     if let Some(resreq) = cli.resreq.as_deref() {
@@ -91,7 +86,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Some(common_data) = cli.common_data {
         options = options.common_data(&PingCommonData { value: common_data })?;
     }
-    let ssn = conn.create_session_with(options).await?;
+    let ssn = flame::create_session(options).await?;
     let ssn_creation_end_time = Instant::now();
 
     let ssn_creation_time = ssn_creation_end_time
