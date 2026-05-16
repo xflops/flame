@@ -65,9 +65,7 @@ impl flame::service::FlameService for FlmexecService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    flame::apis::init_logger()?;
-
-    flame::service::run(FlmexecService {}).await?;
+    flame::run(FlmexecService {}).await?;
 
     tracing::debug!("FlmexecService was stopped.");
 

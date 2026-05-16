@@ -242,7 +242,8 @@ pub fn init_logger() -> Result<(), FlameError> {
         .with_ansi(false)
         // .with_thread_ids(true)
         // .with_process_ids(true)
-        .init();
+        .try_init()
+        .ok();
 
     Ok(())
 }

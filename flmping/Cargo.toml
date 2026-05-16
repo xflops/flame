@@ -6,16 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-flame-rs = { path = "../sdk/rust" }
-stdng = { path = "../stdng" }
+flame-rs = { path = "../sdk/rust", features = ["macros"] }
 
 tokio = { workspace = true }
-tonic = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-chrono = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 serde_derive = { workspace = true }
 
 futures = { workspace = true }

@@ -14,69 +14,42 @@ mod apis;
 
 use byte_unit::Byte;
 use gethostname::gethostname;
-use std::thread;
 use std::time::{Duration, Instant};
 
-use flame_rs::{
-    self as flame,
-    apis::{FlameError, TaskOutput},
-    service::{SessionContext, TaskContext},
-};
+use flame_rs::{self as flame, apis::FlameError};
 
 use self::apis::{PingRequest, PingResponse};
 
-#[derive(Clone)]
-pub struct FlmpingService {}
+#[flame::entrypoint]
+async fn ping(input: Option<PingRequest>) -> Result<PingResponse, FlameError> {
+    let start_time = Instant::now();
+    let input = input.unwrap_or_default();
 
-#[tonic::async_trait]
-impl flame::service::FlameService for FlmpingService {
-    async fn on_session_enter(&self, _: SessionContext) -> Result<(), FlameError> {
-        Ok(())
+    let mem = match input.memory {
+        Some(memory) => vec![0; memory as usize].into_boxed_slice(),
+        None => Box::new([]),
+    };
+
+    if let Some(duration) = input.duration {
+        ::tokio::time::sleep(Duration::from_millis(duration)).await;
     }
 
-    async fn on_task_invoke(&self, ctx: TaskContext) -> Result<Option<TaskOutput>, FlameError> {
-        let start_time = Instant::now();
+    let end_time = Instant::now();
+    let duration = end_time.duration_since(start_time).as_millis();
 
-        let input = ctx
-            .input
-            .clone()
-            .map(|input| input.try_into())
-            .unwrap_or(Result::Ok(PingRequest::default()))?;
+    let mem_size = Byte::from_u64(mem.len() as u64).to_string();
 
-        let mem = match input.memory {
-            Some(memory) => vec![0; memory as usize].into_boxed_slice(),
-            None => Box::new([]),
-        };
-
-        if let Some(duration) = input.duration {
-            thread::sleep(Duration::from_millis(duration));
-        }
-
-        let end_time = Instant::now();
-        let duration = end_time.duration_since(start_time).as_millis();
-
-        let mem_size = Byte::from_u64(mem.len() as u64).to_string();
-
-        let output = PingResponse {
-            message: format!(
-                "Completed on <{}> in <{duration}> milliseconds with <{mem_size}> memory",
-                gethostname().to_string_lossy(),
-            ),
-        };
-
-        Ok(Some(output.try_into()?))
-    }
-
-    async fn on_session_leave(&self) -> Result<(), FlameError> {
-        Ok(())
-    }
+    Ok(PingResponse {
+        message: format!(
+            "Completed on <{}> in <{duration}> milliseconds with <{mem_size}> memory",
+            gethostname().to_string_lossy(),
+        ),
+    })
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    flame::apis::init_logger()?;
-
-    flame::service::run(FlmpingService {}).await?;
+    flame::run(ping).await?;
 
     tracing::debug!("FlmpingService was stopped.");
 

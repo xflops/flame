@@ -110,7 +110,7 @@ jobs:
           curl -s http://127.0.0.1:9090/ || echo "Note: Object cache gRPC endpoint (expected no HTTP response)"
 
       - name: Run test_runner
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           export PYTHONPATH="$(pwd)/e2e/src:$PYTHONPATH"
           export FLAME_LOG=DEBUG

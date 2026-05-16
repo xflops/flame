@@ -11,6 +11,7 @@ readme = "../../README.md"
 
 [dependencies]
 stdng = { path = "../../stdng" }
+flame-rs-macros = { path = "macros", optional = true }
 
 tower = { workspace = true }
 prost = { workspace = true, features = ["derive"] }
@@ -38,3 +39,7 @@ serde_derive = { workspace = true }
 [build-dependencies]
 tonic-build = { workspace = true }
 tonic-prost-build = { workspace = true }
+
+[features]
+default = []
+macros = ["dep:flame-rs-macros"]
