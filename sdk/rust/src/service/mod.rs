@@ -26,27 +26,66 @@ use tonic::{Request, Response, Status};
 use self::rpc::instance_server::{Instance, InstanceServer};
 use crate::apis::flame::v1 as rpc;
 
-use crate::apis::{CommonData, FlameError, TaskInput, TaskOutput};
+use crate::apis::{ApplicationID, CommonData, FlameError, TaskInput, TaskOutput};
+
+pub use tonic::async_trait;
+
+pub mod message {
+    pub use crate::message::*;
+}
 
 #[cfg(unix)]
 const FLAME_INSTANCE_ENDPOINT: &str = "FLAME_INSTANCE_ENDPOINT";
 
+#[derive(Clone, Debug)]
 pub struct ApplicationContext {
     pub name: String,
     pub image: Option<String>,
     pub command: Option<String>,
 }
 
+#[derive(Clone, Debug)]
 pub struct SessionContext {
     pub session_id: String,
     pub application: ApplicationContext,
     pub common_data: Option<CommonData>,
 }
 
+#[derive(Clone, Debug)]
 pub struct TaskContext {
     pub task_id: String,
     pub session_id: String,
     pub input: Option<TaskInput>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FlameInstance {
+    session: SessionContext,
+}
+
+impl FlameInstance {
+    pub fn new(session: SessionContext) -> Self {
+        Self { session }
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session.session_id
+    }
+
+    pub fn application(&self) -> &ApplicationContext {
+        &self.session.application
+    }
+
+    pub fn application_name(&self) -> &ApplicationID {
+        &self.session.application.name
+    }
+
+    pub fn common_data<T>(&self) -> Result<Option<T>, FlameError>
+    where
+        T: crate::message::FlameMessage,
+    {
+        crate::message::decode_common_data(self.session.common_data.as_ref())
+    }
 }
 
 #[tonic::async_trait]

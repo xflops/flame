@@ -10,12 +10,12 @@ members = [
     "executor_manager",
     "rpc",
     "sdk/rust",
+    "sdk/rust/macros",
     "examples/pi/rust",
     "cri",
     "stdng",
     "object_cache",
 ]
-
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.14", features = ["tls-ring"] }
@@ -64,6 +64,10 @@ tempfile = "3"
 comfy-table = "7"
 jsonschema = "0.33"
 gethostname = "1"
+proc-macro2 = "1"
+proc-macro-crate = "3"
+quote = "1"
+syn = { version = "2", features = ["full"] }
 
 # Arrow ecosystem (v58 for tonic 0.14 compatibility)
 arrow = "58"

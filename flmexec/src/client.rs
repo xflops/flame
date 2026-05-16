@@ -14,15 +14,15 @@ limitations under the License.
 use futures::future::try_join_all;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use chrono::Local;
 use clap::Parser;
 use indicatif::HumanCount;
 use serde_derive::{Deserialize, Serialize};
 
 use flame_rs as flame;
-use flame_rs::apis::{FlameContext, FlameError};
-use flame_rs::client::{SessionAttributes, Task, TaskInformer};
+use flame_rs::apis::FlameError;
+use flame_rs::client::{SessionOptions, Task, TaskInformer};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Script {
@@ -68,37 +68,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     flame::apis::init_logger()?;
     let cli = Cli::parse();
 
-    let ctx = FlameContext::from_file(cli.config)?;
-
     let task_num = cli.task_num.unwrap_or(DEFAULT_TASK_NUM);
 
-    let current_ctx = ctx.get_current_context()?;
-    let conn = flame::client::connect_with_tls(
-        &current_ctx.cluster.endpoint,
-        current_ctx.cluster.tls.as_ref(),
-    )
-    .await?;
+    let conn = flame::connect_with_config(cli.config).await?;
 
-    let ssn_creation_start_time = Local::now();
-    let ssn_attr = SessionAttributes {
-        id: format!("{DEFAULT_APP}-{}", stdng::rand::short_name()),
-        application: DEFAULT_APP.to_string(),
-        common_data: None,
-        min_instances: 0,
-        max_instances: None,
-        batch_size: 1,
-        priority: 0,
-        resreq: None,
-    };
-    let ssn = conn.create_session(&ssn_attr).await?;
-    let ssn_creation_end_time = Local::now();
+    let ssn_creation_start_time = Instant::now();
+    let ssn = conn
+        .create_session_with(SessionOptions::new(DEFAULT_APP))
+        .await?;
 
-    let ssn_creation_time =
-        ssn_creation_end_time.timestamp_millis() - ssn_creation_start_time.timestamp_millis();
+    let ssn_creation_time = ssn_creation_start_time.elapsed().as_millis();
     println!("Session <{}> was created in <{ssn_creation_time} ms>, start to run <{}> tasks in the session:\n", ssn.id, HumanCount(task_num as u64));
 
     let mut tasks = vec![];
-    let tasks_creations_start_time = Local::now();
+    let tasks_creations_start_time = Instant::now();
 
     let info = Arc::new(Mutex::new(ExecInfo {}));
 
@@ -115,10 +98,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     try_join_all(tasks).await?;
-    let tasks_creation_end_time = Local::now();
-
-    let tasks_creation_time =
-        tasks_creation_end_time.timestamp_millis() - tasks_creations_start_time.timestamp_millis();
+    let tasks_creation_time = tasks_creations_start_time.elapsed().as_millis();
 
     println!(
         "\n\n<{}> tasks was completed in <{} ms>.\n",

@@ -1,0 +1,17 @@
+[package]
+name = "flame-rs-macros"
+version = "0.5.0"
+edition = "2021"
+
+description = "Proc macros for the Flame Rust SDK"
+repository = "https://github.com/xflops/flame"
+license-file = "../../../LICENSE"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro-crate = { workspace = true }
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }

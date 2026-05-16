@@ -1828,6 +1828,7 @@ dependencies = [
  "bincode",
  "bytes",
  "chrono",
+ "flame-rs-macros",
  "futures",
  "prost 0.14.3",
  "serde",
@@ -1849,6 +1850,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "flame-rs-macros"
+version = "0.5.0"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1959,7 +1970,6 @@ dependencies = [
 name = "flmexec"
 version = "0.5.0"
 dependencies = [
- "chrono",
  "clap",
  "flame-rs",
  "futures",
@@ -1981,7 +1991,6 @@ name = "flmping"
 version = "0.5.0"
 dependencies = [
  "byte-unit",
- "chrono",
  "clap",
  "comfy-table",
  "flame-rs",
@@ -1990,12 +1999,8 @@ dependencies = [
  "indicatif",
  "serde",
  "serde_derive",
- "serde_json",
- "stdng",
  "tokio",
- "tonic",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
