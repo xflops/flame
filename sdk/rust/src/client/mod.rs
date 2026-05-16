@@ -45,7 +45,9 @@ use crate::apis::{
 use crate::message::{self, FromTaskOutput, IntoCommonData, IntoTaskInput};
 
 type FlameClient = FlameFrontendClient<Channel>;
-type TaskHandleFuture<O> =
+type TaskHandleInner<O> =
+    Pin<Box<dyn Future<Output = Result<Option<O>, FlameError>> + Send + 'static>>;
+type TaskFutureInner<O> =
     Pin<Box<dyn Future<Output = Result<TaskResult<O>, FlameError>> + Send + 'static>>;
 
 /// Connect to a Flame service without TLS (plaintext).
@@ -429,7 +431,12 @@ pub trait TaskInformer: Send + Sync + 'static {
 
 pub struct TaskHandle<O> {
     task_id: TaskID,
-    future: TaskHandleFuture<O>,
+    future: TaskHandleInner<O>,
+}
+
+pub struct TaskFuture<O> {
+    task_id: TaskID,
+    future: TaskFutureInner<O>,
 }
 
 #[derive(Clone, Debug)]
@@ -747,20 +754,15 @@ impl Connection {
 }
 
 impl Session {
-    pub async fn invoke<I, O>(&self, input: I) -> Result<Option<O>, FlameError>
+    pub async fn invoke<I, O>(&self, input: I) -> Result<TaskHandle<O>, FlameError>
     where
         I: IntoTaskInput,
         O: FromTaskOutput + Send + 'static,
     {
-        let result = self.run::<_, O>(input).await?.await?;
-        if result.is_succeed() {
-            Ok(result.output)
-        } else {
-            Err(task_result_error(&result))
-        }
+        self.run(input).await.map(TaskHandle::from)
     }
 
-    pub async fn run<I, O>(&self, input: I) -> Result<TaskHandle<O>, FlameError>
+    pub async fn run<I, O>(&self, input: I) -> Result<TaskFuture<O>, FlameError>
     where
         I: IntoTaskInput,
         O: FromTaskOutput + Send + 'static,
@@ -776,7 +778,7 @@ impl Session {
             TaskResult::from_task(task)
         });
 
-        Ok(TaskHandle { task_id, future })
+        Ok(TaskFuture { task_id, future })
     }
 
     pub fn common_data<T>(&self) -> Result<Option<T>, FlameError>
@@ -949,6 +951,41 @@ impl<O> TaskHandle<O> {
 impl<O> Unpin for TaskHandle<O> {}
 
 impl<O> Future for TaskHandle<O> {
+    type Output = Result<Option<O>, FlameError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().future.as_mut().poll(cx)
+    }
+}
+
+impl<O> From<TaskFuture<O>> for TaskHandle<O>
+where
+    O: Send + 'static,
+{
+    fn from(task_future: TaskFuture<O>) -> Self {
+        let task_id = task_future.id().clone();
+        let future = Box::pin(async move {
+            let result = task_future.await?;
+            if result.is_succeed() {
+                Ok(result.output)
+            } else {
+                Err(task_result_error(&result))
+            }
+        });
+
+        Self { task_id, future }
+    }
+}
+
+impl<O> TaskFuture<O> {
+    pub fn id(&self) -> &TaskID {
+        &self.task_id
+    }
+}
+
+impl<O> Unpin for TaskFuture<O> {}
+
+impl<O> Future for TaskFuture<O> {
     type Output = Result<TaskResult<O>, FlameError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -1392,25 +1429,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_handle_await_returns_task_result() {
+    async fn task_future_await_returns_task_result() {
         let payload = TestCommonData {
             value: "done".to_string(),
         };
         let mut task = test_task("task-1", TaskState::Succeed);
         task.output = Some(payload.encode().unwrap());
-        let handle = TaskHandle {
+        let task_future = TaskFuture {
             task_id: "task-1".to_string(),
             future: Box::pin(async move { TaskResult::<TestCommonData>::from_task(task) }),
         };
 
-        assert_eq!(handle.id(), "task-1");
-        let result = handle.await.unwrap();
+        assert_eq!(task_future.id(), "task-1");
+        let result = task_future.await.unwrap();
         assert_eq!(result.task_id, "task-1");
         assert_eq!(result.session_id, "ssn-1");
         assert!(result.is_succeed());
         assert_eq!(result.output.unwrap().value, "done");
         assert_eq!(result.error_code, None);
         assert_eq!(result.error_message, None);
+    }
+
+    #[tokio::test]
+    async fn task_handle_await_returns_success_output() {
+        let payload = TestCommonData {
+            value: "done".to_string(),
+        };
+        let mut task = test_task("task-1", TaskState::Succeed);
+        task.output = Some(payload.encode().unwrap());
+        let task_future = TaskFuture {
+            task_id: "task-1".to_string(),
+            future: Box::pin(async move { TaskResult::<TestCommonData>::from_task(task) }),
+        };
+
+        let handle = TaskHandle::from(task_future);
+
+        assert_eq!(handle.id(), "task-1");
+        let output = handle.await.unwrap().unwrap();
+        assert_eq!(output.value, "done");
+    }
+
+    #[tokio::test]
+    async fn task_handle_await_returns_error_for_failed_task() {
+        let mut task = test_task("task-2", TaskState::Failed);
+        task.events.push(Event {
+            code: 42,
+            message: Some("remote failure".to_string()),
+            creation_time: Utc.with_ymd_and_hms(2026, 5, 8, 10, 0, 0).unwrap(),
+        });
+        let task_future = TaskFuture {
+            task_id: "task-2".to_string(),
+            future: Box::pin(async move { TaskResult::<TestCommonData>::from_task(task) }),
+        };
+
+        let err = TaskHandle::from(task_future).await.unwrap_err();
+
+        assert!(err.to_string().contains("task <task-2>"));
+        assert!(err.to_string().contains("code <42>"));
+        assert!(err.to_string().contains("remote failure"));
     }
 
     #[test]

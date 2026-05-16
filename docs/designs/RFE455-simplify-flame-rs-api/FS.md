@@ -155,7 +155,8 @@ The low-level Rust client remains available under `flame_rs::client`. RFE455 add
 
 ```rust
 let ssn = flame_rs::create_session("model-app").await?;
-let output: Option<GenerationResponse> = ssn.invoke(&request).await?;
+let handle = ssn.invoke(&request).await?;
+let output: Option<GenerationResponse> = handle.await?;
 ssn.close().await?;
 ```
 
@@ -278,7 +279,7 @@ impl Session {
     pub async fn invoke<I, O>(
         &self,
         input: I,
-    ) -> Result<Option<O>, FlameError>
+    ) -> Result<TaskHandle<O>, FlameError>
     where
         I: IntoTaskInput,
         O: FromTaskOutput + Send + 'static;
@@ -286,7 +287,7 @@ impl Session {
     pub async fn run<I, O>(
         &self,
         input: I,
-    ) -> Result<TaskHandle<O>, FlameError>
+    ) -> Result<TaskFuture<O>, FlameError>
     where
         I: IntoTaskInput,
         O: FromTaskOutput + Send + 'static;
@@ -297,12 +298,19 @@ impl Session {
 }
 ```
 
-`invoke(...)` is the Rust equivalent of FlamePy's `ssn.invoke(...)`: it creates a task, watches it to completion, and returns the typed output. It hides the current `TaskInformer` boilerplate for one-shot calls.
+`invoke(...)` creates a task and returns a `TaskHandle<O>`. Awaiting the handle waits for terminal task state, returns decoded output when the task succeeds, and returns `FlameError` when the task fails, is cancelled, or the output cannot be decoded.
 
-`run(...)` starts a task and returns a handle for parallel invocation:
+`run(...)` starts a task and returns a richer future for parallel invocation:
 
 ```rust
 pub struct TaskHandle<O> {
+    task_id: TaskID,
+    future: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<O>, FlameError>> + Send + 'static>,
+    >,
+}
+
+pub struct TaskFuture<O> {
     task_id: TaskID,
     future: std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<TaskResult<O>, FlameError>> + Send + 'static>,
@@ -323,11 +331,19 @@ impl<O> TaskHandle<O> {
 }
 
 impl<O> std::future::Future for TaskHandle<O> {
+    type Output = Result<Option<O>, FlameError>;
+}
+
+impl<O> TaskFuture<O> {
+    pub fn id(&self) -> &TaskID;
+}
+
+impl<O> std::future::Future for TaskFuture<O> {
     type Output = Result<TaskResult<O>, FlameError>;
 }
 ```
 
-`TaskHandle` is directly awaitable. Awaiting the handle waits for terminal task state and returns a `TaskResult<O>` containing the task ID, session ID, terminal state, decoded output on success, and error code/message on failure or cancellation. Transport, watch, and decode failures still return `FlameError`. `invoke(...)` remains the typed one-shot API that unwraps successful output and returns a `FlameError` for failed or cancelled task states. Dropping a handle does not cancel the remote task in the MVP.
+`TaskFuture` is directly awaitable. Awaiting it waits for terminal task state and returns a `TaskResult<O>` containing the task ID, session ID, terminal state, decoded output on success, and error code/message on failure or cancellation. Transport, watch, and decode failures still return `FlameError`. Dropping a handle or future does not cancel the remote task in the MVP.
 
 Input conversion is explicit and shared by `invoke(...)` and `run(...)`:
 
@@ -385,12 +401,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let response: Option<GenerationResponse> = ssn
+    let handle = ssn
         .invoke(&GenerationRequest {
             prompt: "Hello".to_string(),
             sample_len: 64,
         })
         .await?;
+    let response: Option<GenerationResponse> = handle.await?;
 
     println!("{response:?}");
     ssn.close().await?;
@@ -749,7 +766,7 @@ Existing HostShim / GrpcShim / Executor flow
   - Add default-context helpers: `connect`, `connect_with_context`, `connect_with_config`, `create_session`, `open_session`, and `open_or_create_session`.
   - Add connection-level `create_session_with` and `open_or_create_session_with` for reused connections.
   - Add high-level `Session::invoke`, `Session::run`, and typed common-data accessors.
-  - Add generic `TaskHandle<O>` and `TaskResult<O>`.
+  - Add generic `TaskHandle<O>`, `TaskFuture<O>`, and `TaskResult<O>`.
 
 - `sdk/rust/src/message.rs`
   - Define `FlameMessage`, `IntoTaskInput`, `FromTaskOutput`, and `IntoCommonData`.
@@ -802,6 +819,13 @@ pub struct Session {
 pub struct TaskHandle<O> {
     task_id: TaskID,
     future: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<O>, FlameError>> + Send + 'static>,
+    >,
+}
+
+pub struct TaskFuture<O> {
+    task_id: TaskID,
+    future: std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<TaskResult<O>, FlameError>> + Send + 'static>,
     >,
 }
@@ -816,7 +840,7 @@ pub struct TaskResult<O> {
 }
 ```
 
-`TaskHandle` stores the created task ID plus an internal future that owns the cloned `Session` needed to watch the remote task to completion. Awaiting it returns `TaskResult<O>` so parallel callers receive typed output and task lifecycle metadata together. Dropping a handle does not cancel the remote task in the MVP. Explicit cancellation can be designed separately if the frontend protocol grows that operation.
+`TaskHandle` stores the created task ID plus an internal future that maps successful terminal state to decoded output and failed terminal state to `FlameError`. `TaskFuture` stores the same task ID plus the richer future that returns `TaskResult<O>` so parallel callers receive typed output and task lifecycle metadata together. Dropping a handle or future does not cancel the remote task in the MVP. Explicit cancellation can be designed separately if the frontend protocol grows that operation.
 
 Generated services use a small wrapper:
 
@@ -989,7 +1013,7 @@ Synchronous client invocation:
 2. Call existing `Session::create_task(input)`.
 3. Watch the task to terminal state through an internal one-shot informer, or factor the current stream loop into a private helper that returns the final `Task`.
 4. For `run(...)`, convert the terminal task into `TaskResult<O>` with decoded output on success and error code/message on failure.
-5. For `invoke(...)`, unwrap successful `TaskResult<O>::output` and map terminal failure states into `FlameError` with task ID and event details.
+5. For `invoke(...)`, wrap the `TaskFuture<O>` in `TaskHandle<O>` and map awaited `TaskResult<O>` to either successful decoded output or `FlameError`.
 
 Typed message client invocation:
 
@@ -1107,7 +1131,8 @@ Workflow:
 1. Build a `SessionOptions` value or pass the application name directly.
 2. Call `flame_rs::create_session(...)`.
 3. Call `ssn.invoke(...)` for typed `FlameMessage` request/response data.
-4. Close the session.
+4. Await the returned `TaskHandle` to get decoded output or `FlameError`.
+5. Close the session.
 
 Expected outcome:
 
@@ -1125,13 +1150,13 @@ Workflow:
 
 1. Create or open a session once.
 2. Call `ssn.run::<_, ResponseType>(...)` for each request.
-3. Await each `TaskHandle<ResponseType>` as capacity becomes available and inspect the returned `TaskResult<ResponseType>`.
+3. Await each `TaskFuture<ResponseType>` as capacity becomes available and inspect the returned `TaskResult<ResponseType>`.
 
 Expected outcome:
 
 - Client code can express FlamePy's `ssn.run(...)` pattern with explicit Rust async handles.
 - Callers receive task ID, session ID, state, decoded output, and failure details in one result value.
-- The handle API leaves room for future cancellation without changing the one-shot `invoke(...)` method.
+- The future API leaves room for future cancellation without changing the one-shot `invoke(...)` method.
 
 **Example 3: Simple Typed Service**
 
@@ -1202,7 +1227,9 @@ Expected outcome:
   - `IntoTaskInput` implementations encode `FlameMessage` inputs and optional absence
   - `IntoTaskInput for ()` produces absent task input
   - `TaskHandle::id()` returns the created task ID
-  - `TaskHandle<O>` implements `Future<Output = Result<TaskResult<O>, FlameError>>`
+  - `TaskFuture::id()` returns the created task ID
+  - `TaskHandle<O>` implements `Future<Output = Result<Option<O>, FlameError>>`
+  - `TaskFuture<O>` implements `Future<Output = Result<TaskResult<O>, FlameError>>`
   - `TaskResult<O>` carries task ID, session ID, terminal state, decoded successful output, and failed task error code/message
 
 - Unit tests for shared `message` helpers:
