@@ -120,12 +120,12 @@ async fn run_tasks(
     let start = Instant::now();
 
     let handles = try_join_all((0..task_num).map(|_| ssn.run::<_, PingResponse>(&input))).await?;
-    let outputs = try_join_all(handles.into_iter().map(|handle| async move {
-        let task_id = handle.id().clone();
-        let output = handle.await?;
-        Ok::<_, flame::apis::FlameError>((task_id, output))
-    }))
-    .await?;
+    let task_ids = handles
+        .iter()
+        .map(|handle| handle.id().clone())
+        .collect::<Vec<_>>();
+    let outputs = try_join_all(handles).await?;
+    let outputs = task_ids.into_iter().zip(outputs).collect();
 
     Ok((start.elapsed().as_millis(), outputs))
 }

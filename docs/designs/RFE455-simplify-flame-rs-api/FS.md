@@ -419,8 +419,7 @@ let handles = futures::future::try_join_all(
 )
 .await?;
 
-for handle in handles {
-    let response = handle.await?;
+for response in futures::future::try_join_all(handles).await? {
     println!("{response:?}");
 }
 ```
