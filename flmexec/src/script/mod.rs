@@ -13,10 +13,20 @@ limitations under the License.
 
 mod lang;
 
+use std::collections::HashMap;
+
 use flame_rs::apis::FlameError;
 
 use crate::api::Script;
 use lang::{python::PythonScript, shell::ShellScript};
+
+#[derive(Debug, Clone)]
+pub struct ScriptRuntime {
+    pub entrypoint: String,
+    pub work_dir: String,
+    pub input: Option<Vec<u8>>,
+    pub env: HashMap<String, String>,
+}
 
 pub trait ScriptEngine {
     fn run(&self) -> Result<Option<Vec<u8>>, FlameError>;

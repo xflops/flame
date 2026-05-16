@@ -11,21 +11,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
-
+use flame_rs::FlameMessage;
 use serde_derive::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, FlameMessage)]
 pub struct Script {
     pub language: String,
     pub code: String,
     pub input: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScriptRuntime {
-    pub entrypoint: String,
-    pub work_dir: String,
-    pub input: Option<Vec<u8>>,
-    pub env: HashMap<String, String>,
+#[derive(Debug, Clone, Serialize, Deserialize, FlameMessage)]
+pub struct ScriptOutput {
+    pub data: Vec<u8>,
 }

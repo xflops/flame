@@ -25,8 +25,8 @@ use rand::Rng;
 use flame_rs::apis::FlameError;
 use stdng::trace_fn;
 
-use crate::api::{Script, ScriptRuntime};
-use crate::script::ScriptEngine;
+use crate::api::Script;
+use crate::script::{ScriptEngine, ScriptRuntime};
 
 const DEFAULT_ENTRYPOINT: &str = "main.py";
 
