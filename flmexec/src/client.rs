@@ -11,25 +11,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod api;
+
+use api::{Script, ScriptOutput};
 use futures::future::try_join_all;
 use std::error::Error;
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use clap::Parser;
 use indicatif::HumanCount;
-use serde_derive::{Deserialize, Serialize};
 
 use flame_rs as flame;
-use flame_rs::apis::FlameError;
-use flame_rs::client::{SessionOptions, Task, TaskInformer};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Script {
-    language: String,
-    code: String,
-    input: Option<Vec<u8>>,
-}
+use flame_rs::client::SessionOptions;
 
 #[derive(Parser)]
 #[command(name = "flmexec")]
@@ -37,8 +30,6 @@ struct Script {
 #[command(version = "0.5.0")]
 #[command(about = "Flame Executor CLI", long_about = None)]
 struct Cli {
-    #[arg(long)]
-    config: Option<String>,
     #[arg(short, long)]
     task_num: Option<i32>,
     /// The code to execute on worker nodes
@@ -70,20 +61,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let task_num = cli.task_num.unwrap_or(DEFAULT_TASK_NUM);
 
-    let conn = flame::connect_with_config(cli.config).await?;
-
     let ssn_creation_start_time = Instant::now();
-    let ssn = conn
-        .create_session_with(SessionOptions::new(DEFAULT_APP))
-        .await?;
+    let ssn = flame::create_session(SessionOptions::new(DEFAULT_APP)).await?;
 
     let ssn_creation_time = ssn_creation_start_time.elapsed().as_millis();
     println!("Session <{}> was created in <{ssn_creation_time} ms>, start to run <{}> tasks in the session:\n", ssn.id, HumanCount(task_num as u64));
 
-    let mut tasks = vec![];
     let tasks_creations_start_time = Instant::now();
-
-    let info = Arc::new(Mutex::new(ExecInfo {}));
 
     let script = Script {
         language: cli.language.clone(),
@@ -91,13 +75,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         input: cli.input.clone(),
     };
 
-    let input = serde_json::to_string(&script)?;
+    let handles =
+        try_join_all((0..task_num).map(|_| ssn.invoke::<_, ScriptOutput>(&script))).await?;
+    let task_ids = handles
+        .iter()
+        .map(|handle| handle.id().clone())
+        .collect::<Vec<_>>();
+    let outputs = try_join_all(handles).await?;
 
-    for _ in 0..task_num {
-        tasks.push(ssn.run_task(Some(input.clone().into()), info.clone()));
+    for (task_id, output) in task_ids.into_iter().zip(outputs) {
+        println!(
+            "Task {:<10}: {:?}",
+            task_id,
+            output.map(|output| output.data).unwrap_or_default()
+        );
     }
 
-    try_join_all(tasks).await?;
     let tasks_creation_time = tasks_creations_start_time.elapsed().as_millis();
 
     println!(
@@ -109,22 +102,4 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ssn.close().await?;
 
     Ok(())
-}
-
-struct ExecInfo {}
-
-impl TaskInformer for ExecInfo {
-    fn on_update(&mut self, task: Task) {
-        if task.is_completed() {
-            println!(
-                "Task {:<10}: {:?}",
-                task.id,
-                task.output.unwrap_or_default()
-            );
-        }
-    }
-
-    fn on_error(&mut self, e: FlameError) {
-        println!("Got an error: {e}")
-    }
 }

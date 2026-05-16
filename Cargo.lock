@@ -1977,13 +1977,9 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_derive",
- "serde_json",
  "stdng",
- "tempfile",
  "tokio",
- "tonic",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
