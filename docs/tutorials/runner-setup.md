@@ -225,5 +225,6 @@ Pickle or import errors: keep service functions and classes importable from the 
 ## See Also
 
 - [Local Development](local-development.md)
+- [Python SDK](../sdk/python.md)
 - [Python SDK README](../../sdk/python/README.md)
 - [Runner implementation](../../sdk/python/src/flamepy/runner/runner.py)

@@ -161,6 +161,8 @@ For more details, see the [flmadm README](flmadm/README.md).
 ## Documentation
 
 * [API Reference](docs/api/index.md)
+* [SDKs](docs/sdk/index.md): [Rust SDK](docs/sdk/rust.md), [Python SDK](docs/sdk/python.md)
+* [Rust API Tutorial](docs/tutorials/rust-api.md)
 * [Local Development](docs/tutorials/local-development.md)
 * [Runner Setup Guide](docs/tutorials/runner-setup.md)
 * [Design Documents](docs/designs/)

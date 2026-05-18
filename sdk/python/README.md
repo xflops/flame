@@ -2,6 +2,8 @@
 
 Python SDK for the Flame, a distributed system for Agentic AI.
 
+For the user guide, see [Flame Python SDK](../../docs/sdk/python.md). For the detailed API surface, see [API.md](docs/API.md).
+
 ## Installation
 
 ```bash
@@ -124,7 +126,7 @@ mypy flamepy/
 
 ### Requirements
 
-- Python >= 3.8
+- Python >= 3.9
 - setuptools >= 61.0 (for building from source)
 
 ### Troubleshooting
@@ -144,4 +146,4 @@ If you encounter issues with the package name showing as "UNKNOWN":
 3. Use `--no-build-isolation` flag when installing:
    ```bash
    python3 -m pip install . --user --no-build-isolation
-   ``` 
+   ```

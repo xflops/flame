@@ -18,6 +18,7 @@ Flame exposes three gRPC services:
 - [Frontend Service](frontend.md) - For client SDK developers
 - [Backend Service](backend.md) - For executor/node developers
 - [Instance Service](shim.md) - For application shim developers
+- [SDK Guides](../sdk/index.md) - For application developers using Rust or Python
 
 ## Package
 
@@ -61,6 +62,8 @@ gRPC status codes are used for error reporting:
 ## Related Documentation
 
 - [Flame README](../../README.md)
+- [Rust SDK](../sdk/rust.md)
+- [Python SDK](../sdk/python.md)
 - [Local Development](../tutorials/local-development.md)
 - [Runner Setup Guide](../tutorials/runner-setup.md)
-- [Python SDK](../../sdk/python/README.md)
+- [Python SDK README](../../sdk/python/README.md)
