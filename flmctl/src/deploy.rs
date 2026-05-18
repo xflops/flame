@@ -29,6 +29,8 @@ use url::Url;
 use artifact::{prepare_application, PreparedApplication};
 use detect::{detect_application, DetectedApplication};
 
+use crate::utils::format_duration;
+
 #[derive(Debug, Clone, Args)]
 pub struct Options {
     /// Application name.
@@ -416,6 +418,12 @@ fn print_result(output: &str, result: &DeployResult) -> Result<(), FlameError> {
             println!("Input Kind: {}", result.input_kind);
             println!("Installer: {}", result.installer);
             println!("Command: {}", result.command);
+            if let Some(delay_release) = result.application.spec.delay_release {
+                println!(
+                    "Delay Release: {}",
+                    format_duration(Duration::seconds(delay_release))
+                );
+            }
             if !result.arguments.is_empty() {
                 println!("Arguments: {}", result.arguments.join(" "));
             }

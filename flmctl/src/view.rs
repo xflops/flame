@@ -20,7 +20,7 @@ use serde_json::Value;
 use flame_rs::apis::{FlameContext, FlameError, TaskState};
 use flame_rs::client::{self, NodeState};
 
-use crate::utils::{format_memory, format_resreq};
+use crate::utils::{format_memory, format_optional_duration, format_resreq};
 
 pub async fn run(
     ctx: &FlameContext,
@@ -195,7 +195,7 @@ async fn view_application(
     println!(
         "{:<15}{}",
         "Delay Release:",
-        application.attributes.delay_release.unwrap_or_default()
+        format_optional_duration(&application.attributes.delay_release)
     );
 
     println!("{:<15}", "Schema:");

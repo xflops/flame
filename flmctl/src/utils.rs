@@ -11,6 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use chrono::Duration;
 use flame_rs::client::ResourceRequirement;
 
 /// Formats a byte count into a human-readable string with appropriate unit suffix.
@@ -46,6 +47,44 @@ pub fn format_resreq(r: &Option<ResourceRequirement>) -> String {
     }
 }
 
+/// Formats a duration as compact CLI output such as `45s` or `1h 5m`.
+pub fn format_duration(duration: Duration) -> String {
+    let seconds_raw = duration.num_seconds();
+    let sign = if seconds_raw < 0 { "-" } else { "" };
+    let mut seconds = seconds_raw.unsigned_abs();
+
+    let days = seconds / 86_400;
+    seconds %= 86_400;
+    let hours = seconds / 3_600;
+    seconds %= 3_600;
+    let minutes = seconds / 60;
+    seconds %= 60;
+
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+    if seconds > 0 || parts.is_empty() {
+        parts.push(format!("{seconds}s"));
+    }
+
+    format!("{sign}{}", parts.join(" "))
+}
+
+/// Formats an optional duration, using `-` for unset values.
+pub fn format_optional_duration(duration: &Option<Duration>) -> String {
+    match duration {
+        Some(duration) => format_duration(*duration),
+        None => "-".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,5 +112,38 @@ mod tests {
             gpu: 0,
         };
         assert_eq!(format_resreq(&Some(rr)), "cpu=0,mem=0B,gpu=0");
+    }
+
+    #[test]
+    fn format_duration_seconds() {
+        assert_eq!(format_duration(Duration::seconds(60)), "1m");
+    }
+
+    #[test]
+    fn format_duration_compound_values() {
+        assert_eq!(
+            format_duration(Duration::seconds(86_400 + 3_600 + 120 + 3)),
+            "1d 1h 2m 3s"
+        );
+    }
+
+    #[test]
+    fn format_duration_zero() {
+        assert_eq!(format_duration(Duration::zero()), "0s");
+    }
+
+    #[test]
+    fn format_duration_negative() {
+        assert_eq!(format_duration(Duration::seconds(-65)), "-1m 5s");
+    }
+
+    #[test]
+    fn format_optional_duration_some() {
+        assert_eq!(format_optional_duration(&Some(Duration::seconds(60))), "1m");
+    }
+
+    #[test]
+    fn format_optional_duration_none_renders_dash() {
+        assert_eq!(format_optional_duration(&None), "-");
     }
 }
