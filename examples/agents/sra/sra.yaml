@@ -3,7 +3,7 @@ metadata:
   name: crawler
 spec:
   working_directory: /opt/examples/agents/sra/
-  tags:
+  labels:
     - Tool
   environments:
     SILICONFLOW_API_KEY: sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
@@ -20,7 +20,7 @@ metadata:
 spec:
   working_directory: /opt/examples/agents/sra/
   max_instances: 1
-  tags:
+  labels:
     - Agent
   environments:
     DEEPSEEK_API_KEY: sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx

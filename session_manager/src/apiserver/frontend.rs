@@ -25,11 +25,11 @@ use tonic::{Request, Response, Status};
 use self::rpc::frontend_server::Frontend;
 use self::rpc::{
     ApplicationList, CloseSessionRequest, CreateSessionRequest, CreateTaskRequest,
-    DeleteSessionRequest, DeleteTaskRequest, ExecutorList, GetApplicationRequest, GetNodeRequest,
-    GetNodeResponse, GetSessionRequest, GetTaskRequest, ListApplicationRequest,
-    ListExecutorRequest, ListNodesRequest, ListSessionRequest, ListTaskRequest, NodeList,
-    OpenSessionRequest, RegisterApplicationRequest, Session, SessionList, Task,
-    UnregisterApplicationRequest, UpdateApplicationRequest, WatchTaskRequest,
+    DeleteSessionRequest, ExecutorList, GetApplicationRequest, GetNodeRequest, GetNodeResponse,
+    GetSessionRequest, GetTaskRequest, ListApplicationRequest, ListExecutorRequest,
+    ListNodesRequest, ListSessionRequest, ListTaskRequest, NodeList, OpenSessionRequest,
+    RegisterApplicationRequest, Session, SessionList, Task, UnregisterApplicationRequest,
+    UpdateApplicationRequest, WatchTaskRequest,
 };
 
 use rpc::flame::v1 as rpc;
@@ -550,13 +550,6 @@ impl Frontend for Flame {
 
         Ok(Response::new(task))
     }
-    async fn delete_task(
-        &self,
-        _: Request<DeleteTaskRequest>,
-    ) -> Result<Response<rpc::Task>, Status> {
-        todo!()
-    }
-
     async fn watch_task(
         &self,
         req: Request<WatchTaskRequest>,

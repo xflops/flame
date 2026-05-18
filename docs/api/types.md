@@ -598,6 +598,6 @@ message ResourceRequirement {
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `cpu` | uint64 | CPU units (millicores) |
+| `cpu` | uint64 | Logical CPU units |
 | `memory` | uint64 | Memory in bytes |
 | `gpu` | int32 | Number of GPUs |

@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 use chrono::Duration;
 use clap::Args;
+use common::net::host_for_uri;
 use flame_rs as flame;
 use flame_rs::apis::{FlameContext, FlameError, Shim};
 use flame_rs::client::{ApplicationAttributes, ApplicationSchema};
@@ -370,7 +371,7 @@ fn normalize_cache_endpoint(raw: &str) -> Result<String, FlameError> {
         .host_str()
         .ok_or_else(|| FlameError::InvalidConfig("cache endpoint missing host".to_string()))?;
     let port = parsed.port().unwrap_or(9090);
-    Ok(format!("{}://{}:{}", scheme, host, port))
+    Ok(format!("{}://{}:{}", scheme, host_for_uri(host), port))
 }
 
 fn object_url(cache_endpoint: &str, key: &str) -> String {
@@ -463,6 +464,12 @@ mod tests {
             object_url(&endpoint, "app/pkg/app.tar.gz"),
             "grpc://cache:9090/app/pkg/app.tar.gz"
         );
+    }
+
+    #[test]
+    fn normalizes_ipv6_cache_endpoint() {
+        let endpoint = normalize_cache_endpoint("grpc://[2001:db8::1]").unwrap();
+        assert_eq!(endpoint, "grpc://[2001:db8::1]:9090");
     }
 
     #[test]

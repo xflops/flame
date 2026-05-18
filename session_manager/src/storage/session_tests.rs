@@ -14,7 +14,7 @@ limitations under the License.
 #[cfg(test)]
 mod tests {
     use crate::storage;
-    use common::apis::{ResourceRequirement, SessionAttributes, SessionState};
+    use common::apis::{ResourceRequirement, SessionAttributes, SessionState, TaskState};
     use common::ctx::{FlameCluster, FlameClusterContext};
 
     fn test_context() -> FlameClusterContext {
@@ -206,6 +206,59 @@ mod tests {
 
             let ssn = storage.get_session("verify-close-ssn".to_string()).unwrap();
             assert_eq!(ssn.status.state, SessionState::Closed);
+        }
+
+        #[tokio::test]
+        async fn close_cancels_pending_tasks_in_cache() {
+            let ctx = test_context();
+            let storage = storage::new_ptr(&ctx).await.unwrap();
+
+            let attr = create_session_attr("close-cancel-pending-ssn");
+            storage.create_session(attr).await.unwrap();
+            let task = storage
+                .create_task("close-cancel-pending-ssn".to_string(), None)
+                .await
+                .unwrap();
+
+            storage
+                .close_session("close-cancel-pending-ssn".to_string())
+                .await
+                .unwrap();
+
+            let task = storage
+                .get_task("close-cancel-pending-ssn".to_string(), task.id)
+                .unwrap();
+            assert_eq!(task.state, TaskState::Cancelled);
+            assert!(task.completion_time.is_some());
+        }
+
+        #[tokio::test]
+        async fn close_rejects_running_tasks_without_mutating_session() {
+            let ctx = test_context();
+            let storage = storage::new_ptr(&ctx).await.unwrap();
+
+            let attr = create_session_attr("close-running-ssn");
+            storage.create_session(attr).await.unwrap();
+            let task = storage
+                .create_task("close-running-ssn".to_string(), None)
+                .await
+                .unwrap();
+            let ssn_ptr = storage
+                .get_session_ptr("close-running-ssn".to_string())
+                .unwrap();
+            let task_ptr = storage.get_task_ptr(task.gid()).unwrap();
+            storage
+                .update_task_state(ssn_ptr, task_ptr, TaskState::Running, None)
+                .await
+                .unwrap();
+
+            let result = storage.close_session("close-running-ssn".to_string()).await;
+            assert!(result.is_err());
+
+            let ssn = storage
+                .get_session("close-running-ssn".to_string())
+                .unwrap();
+            assert_eq!(ssn.status.state, SessionState::Open);
         }
     }
 

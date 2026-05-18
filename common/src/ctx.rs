@@ -55,7 +55,7 @@ struct FlameClusterYaml {
     pub endpoint: String,
     /// Cluster-wide default `resreq` for sessions that supply no explicit
     /// `resreq`. String form `"cpu=2,mem=4g,gpu=1"` parsed by
-    /// `impl From<&String> for ResourceRequirement`.
+    /// `ResourceRequirement::parse`.
     pub resreq: Option<String>,
     pub policies: Option<Vec<String>>,
     pub storage: Option<String>,
@@ -301,6 +301,11 @@ fn convert_to_binary_units(s: &str) -> String {
     // Convert SI units to binary units (case-insensitive)
     let unit_upper = unit_part.to_uppercase();
     let binary_unit = match unit_upper.as_str() {
+        "GI" | "GIB" => "GiB",
+        "MI" | "MIB" => "MiB",
+        "KI" | "KIB" => "KiB",
+        "TI" | "TIB" => "TiB",
+        "PI" | "PIB" => "PiB",
         "G" | "GB" => "GiB",
         "M" | "MB" => "MiB",
         "K" | "KB" => "KiB",
@@ -392,7 +397,11 @@ impl TryFrom<FlameClusterYaml> for FlameCluster {
         Ok(FlameCluster {
             name: cluster.name,
             endpoint: cluster.endpoint,
-            resreq: cluster.resreq.as_ref().map(ResourceRequirement::from),
+            resreq: cluster
+                .resreq
+                .as_deref()
+                .map(ResourceRequirement::parse)
+                .transpose()?,
             policies: cluster
                 .policies
                 .unwrap_or_else(|| DEFAULT_POLICIES.iter().map(|s| s.to_string()).collect()),
@@ -697,6 +706,23 @@ cache:
     }
 
     #[test]
+    fn test_parse_memory_size_binary_suffix_without_b() {
+        assert_eq!(parse_memory_size("1Gi").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_size("512Mi").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_memory_size("1024Ki").unwrap(), 1024 * 1024);
+        assert_eq!(parse_memory_size("2Ti").unwrap(), 2 * 1024_u64.pow(4));
+        assert_eq!(parse_memory_size("1Pi").unwrap(), 1024_u64.pow(5));
+    }
+
+    #[test]
+    fn test_parse_memory_size_terabytes_and_petabytes() {
+        assert_eq!(parse_memory_size("1T").unwrap(), 1024_u64.pow(4));
+        assert_eq!(parse_memory_size("1TB").unwrap(), 1024_u64.pow(4));
+        assert_eq!(parse_memory_size("2P").unwrap(), 2 * 1024_u64.pow(5));
+        assert_eq!(parse_memory_size("2PB").unwrap(), 2 * 1024_u64.pow(5));
+    }
+
+    #[test]
     fn test_parse_memory_size_megabytes_uppercase() {
         // Test uppercase M unit
         assert_eq!(parse_memory_size("512M").unwrap(), 512 * 1024 * 1024);
@@ -964,6 +990,25 @@ cluster:
         assert!(ctx.cluster.resreq.is_none());
 
         Ok(())
+    }
+
+    #[test]
+    fn cluster_yaml_with_invalid_resreq_fails() {
+        let context_string = r#"---
+cluster:
+  name: flame
+  endpoint: "http://flame-session-manager:8080"
+  resreq: "cpu=two,mem=4g"
+  executors:
+    shim: host
+        "#;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
+        fs::write(&tmp_file, context_string).unwrap();
+
+        let result = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()));
+        assert!(result.is_err());
     }
 
     #[test]

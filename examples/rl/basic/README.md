@@ -75,8 +75,8 @@ Log into the flame-console and run the example:
 
 ```shell
 $ docker compose exec -it flame-console /bin/bash
-root@container:/# cd /opt/examples/rl
-root@container:/opt/examples/rl# uv run main.py
+root@container:/# cd /opt/examples/rl/basic
+root@container:/opt/examples/rl/basic# uv run main.py
 ```
 
 ### Command Line Options
@@ -117,7 +117,7 @@ uv run main.py --plot
 ### Distributed Training (MuJoCo Ant)
 
 ```shell
-root@container:/opt/examples/rl# uv run main.py --env ant --iterations 20
+root@container:/opt/examples/rl/basic# uv run main.py --env ant --iterations 20
 ============================================================
 Distributed REINFORCE on Ant-v5 using Flame Runner
 ============================================================
@@ -147,7 +147,7 @@ Training Complete!
 ### Local Training
 
 ```shell
-root@container:/opt/examples/rl# uv run main.py --env ant --iterations 20 --local
+root@container:/opt/examples/rl/basic# uv run main.py --env ant --iterations 20 --local
 ============================================================
 Local REINFORCE on Ant-v5
 ============================================================

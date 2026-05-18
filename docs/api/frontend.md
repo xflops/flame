@@ -30,7 +30,6 @@ service Frontend {
 
   // Task Operations
   rpc CreateTask(CreateTaskRequest) returns (Task) {}
-  rpc DeleteTask(DeleteTaskRequest) returns (Task) {}
   rpc GetTask(GetTaskRequest) returns (Task) {}
   rpc WatchTask(WatchTaskRequest) returns (stream Task) {}
   rpc ListTask(ListTaskRequest) returns (stream Task) {}
@@ -72,6 +71,19 @@ Removes an application registration.
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | Name of the application to unregister |
+
+**Response:** [Result](types.md#result)
+
+### UpdateApplication
+
+Updates an existing application registration.
+
+**Request:** `UpdateApplicationRequest`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Name of the application to update |
+| `application` | [ApplicationSpec](types.md#applicationspec) | Replacement application specification |
 
 **Response:** [Result](types.md#result)
 
@@ -122,6 +134,18 @@ session = flamepy.create_session(
     batch_size=1
 )
 ```
+
+### DeleteSession
+
+Deletes a session and its persisted task records.
+
+**Request:** `DeleteSessionRequest`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | string | Session ID to delete |
+
+**Response:** [Session](types.md#session)
 
 ### OpenSession
 

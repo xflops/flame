@@ -32,7 +32,7 @@ pub fn format_memory(bytes: u64) -> String {
 /// Returns `"-"` when no requirement is set so list/view output stays aligned
 /// with the rest of the CLI's "missing value" convention. Otherwise renders as
 /// `cpu=N,mem=Xunit,gpu=N` (no spaces) — matching the syntax accepted by
-/// `ResourceRequirement::from(&String)` so the printed value can be re-used
+/// `ResourceRequirement::parse` so the printed value can be re-used
 /// verbatim with `flmctl create -s --resreq ...`.
 pub fn format_resreq(r: &Option<ResourceRequirement>) -> String {
     match r {

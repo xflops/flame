@@ -31,6 +31,7 @@ use common::apis::{
     Application, Node, ResourceRequirement, Session, SessionContext, Shim, TaskContext, TaskResult,
 };
 use common::ctx::FlameClusterContext;
+use common::net::host_for_uri;
 use common::FlameError;
 
 const DEFAULT_PORT: u16 = 8080;
@@ -52,7 +53,7 @@ impl BackendClient {
         let endpoint = format!(
             "{}://{}:{port}",
             url.scheme(),
-            url.host_str().unwrap_or("localhost")
+            host_for_uri(url.host_str().unwrap_or("localhost"))
         );
 
         tracing::info!("Connecting to flame backend at {}", endpoint);
@@ -306,5 +307,16 @@ impl BackendClient {
             .map_err(FlameError::from)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_for_uri_brackets_ipv6() {
+        assert_eq!(host_for_uri("2001:db8::1"), "[2001:db8::1]");
+        assert_eq!(host_for_uri("localhost"), "localhost");
     }
 }

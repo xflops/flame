@@ -73,8 +73,6 @@ pub trait Engine: Send + Sync + 'static {
 
     async fn retry_task(&self, gid: TaskGID) -> Result<Task, FlameError>;
 
-    async fn delete_task(&self, gid: TaskGID) -> Result<Task, FlameError>;
-
     async fn update_task_state(
         &self,
         gid: TaskGID,

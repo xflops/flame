@@ -112,10 +112,10 @@ impl Instance for ShimService {
         tracing::debug!("ShimService::on_session_enter");
 
         let req = req.into_inner();
-        let resp = self
-            .service
-            .on_session_enter(SessionContext::from(req))
-            .await;
+        let resp = match SessionContext::try_from(req) {
+            Ok(ctx) => self.service.on_session_enter(ctx).await,
+            Err(e) => Err(e),
+        };
 
         match resp {
             Ok(_) => Ok(Response::new(rpc::Result {
@@ -208,13 +208,22 @@ impl From<rpc::ApplicationContext> for ApplicationContext {
     }
 }
 
-impl From<rpc::SessionContext> for SessionContext {
-    fn from(ctx: rpc::SessionContext) -> Self {
-        SessionContext {
+impl TryFrom<rpc::SessionContext> for SessionContext {
+    type Error = FlameError;
+
+    fn try_from(ctx: rpc::SessionContext) -> Result<Self, Self::Error> {
+        let application = ctx
+            .application
+            .map(ApplicationContext::from)
+            .ok_or_else(|| {
+                FlameError::InvalidConfig("session context missing application".to_string())
+            })?;
+
+        Ok(SessionContext {
             session_id: ctx.session_id.clone(),
-            application: ctx.application.map(ApplicationContext::from).unwrap(),
+            application,
             common_data: ctx.common_data.map(|data| data.into()),
-        }
+        })
     }
 }
 
@@ -225,5 +234,21 @@ impl From<rpc::TaskContext> for TaskContext {
             session_id: ctx.session_id.clone(),
             input: ctx.input.map(|data| data.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_context_requires_application() {
+        let ctx = rpc::SessionContext {
+            session_id: "ssn-1".to_string(),
+            application: None,
+            common_data: None,
+        };
+
+        assert!(SessionContext::try_from(ctx).is_err());
     }
 }

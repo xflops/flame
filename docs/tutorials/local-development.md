@@ -64,7 +64,7 @@ FLAME_HOME=/tmp/flame-dev \
 Verify the cluster:
 
 ```bash
-/tmp/flame-dev/bin/flmctl list application
+/tmp/flame-dev/bin/flmctl list -a
 ```
 
 The built-in applications should include `flmping`, `flmexec`, and `flmrun`.
@@ -201,7 +201,7 @@ If services do not start, inspect the matching log file first. Common issues are
 
 If a Python client cannot connect, verify `FLAME_ENDPOINT` and `FLAME_CACHE_ENDPOINT`, then confirm the corresponding services are listening on ports `8080` and `9090`.
 
-If Runner fails to find the `flmrun` template, check that the session manager is running and that `flmctl list application` shows `flmrun`.
+If Runner fails to find the `flmrun` template, check that the session manager is running and that `flmctl list -a` shows `flmrun`.
 
 ## Cleanup
 

@@ -58,7 +58,11 @@ pub fn run(config: InstallConfig) -> Result<()> {
 
         // Phase 4: Installation
         println!("\n═══ Phase 4: Installation ═══");
-        let artifacts = crate::types::BuildArtifacts::from_source_dir(&src_dir, "release")?;
+        let artifacts = crate::types::BuildArtifacts::from_source_dir_for_profiles(
+            &src_dir,
+            "release",
+            &config.profiles,
+        )?;
         install_components(&artifacts, &src_dir, &paths, &config)?;
     }
 

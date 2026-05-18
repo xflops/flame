@@ -109,19 +109,34 @@ class ResourceRequirement:
     @classmethod
     def from_string(cls, s: str) -> "ResourceRequirement":
         """Parse resource requirements from string format: cpu=N,mem=SIZE,gpu=N"""
+        if not s.strip():
+            raise ValueError("resource requirement cannot be empty")
+
         cpu = 0
         memory = 0
         gpu = 0
         for part in s.split(","):
-            key, _, value = part.partition("=")
+            part = part.strip()
+            if not part:
+                raise ValueError(f"invalid empty resource requirement entry in {s!r}")
+
+            key, sep, value = part.partition("=")
+            if not sep or "=" in value:
+                raise ValueError(f"invalid resource requirement entry {part!r}, expected key=value")
+
             key = key.strip().lower()
             value = value.strip()
+            if not value:
+                raise ValueError(f"missing value for resource requirement key {key!r}")
+
             if key == "cpu":
                 cpu = int(value)
             elif key in ("mem", "memory"):
                 memory = cls._parse_memory(value)
             elif key == "gpu":
                 gpu = int(value)
+            else:
+                raise ValueError(f"unknown resource requirement key {key!r}")
         return cls(cpu=cpu, memory=memory, gpu=gpu)
 
     @staticmethod
@@ -130,9 +145,31 @@ class ResourceRequirement:
         s = s.lower().strip()
         if not s:
             return 0
-        multipliers = {"k": 1024, "m": 1024**2, "g": 1024**3}
-        if s[-1] in multipliers:
-            return int(s[:-1]) * multipliers[s[-1]]
+        multipliers = {
+            "k": 1024,
+            "kb": 1024,
+            "ki": 1024,
+            "kib": 1024,
+            "m": 1024**2,
+            "mb": 1024**2,
+            "mi": 1024**2,
+            "mib": 1024**2,
+            "g": 1024**3,
+            "gb": 1024**3,
+            "gi": 1024**3,
+            "gib": 1024**3,
+            "t": 1024**4,
+            "tb": 1024**4,
+            "ti": 1024**4,
+            "tib": 1024**4,
+            "p": 1024**5,
+            "pb": 1024**5,
+            "pi": 1024**5,
+            "pib": 1024**5,
+        }
+        for suffix, multiplier in sorted(multipliers.items(), key=lambda item: len(item[0]), reverse=True):
+            if s.endswith(suffix):
+                return int(s[: -len(suffix)]) * multiplier
         return int(s)
 
 

@@ -302,6 +302,34 @@ class TestGrpcErrorMapping:
 
 
 class TestApplicationConversion:
+    def test_register_application_raises_on_failed_result(self):
+        from flamepy.proto.types_pb2 import Result as ResultProto
+
+        class Frontend:
+            def RegisterApplication(self, req):  # noqa: N802
+                return ResultProto(return_code=-1, message="registration rejected")
+
+        conn = client.Connection("http://unused", DummyChannel("unused"), Frontend())
+        try:
+            with pytest.raises(FlameError, match="registration rejected"):
+                conn.register_application("app", ApplicationAttributes())
+        finally:
+            conn.close()
+
+    def test_unregister_application_raises_on_failed_result(self):
+        from flamepy.proto.types_pb2 import Result as ResultProto
+
+        class Frontend:
+            def UnregisterApplication(self, req):  # noqa: N802
+                return ResultProto(return_code=-1, message="unregistration rejected")
+
+        conn = client.Connection("http://unused", DummyChannel("unused"), Frontend())
+        try:
+            with pytest.raises(FlameError, match="unregistration rejected"):
+                conn.unregister_application("app")
+        finally:
+            conn.close()
+
     def test_list_applications_preserves_absent_optional_fields(self):
         from flamepy.proto.types_pb2 import Application as ApplicationProto
         from flamepy.proto.types_pb2 import ApplicationList, ApplicationStatus, Metadata
@@ -490,6 +518,18 @@ def test_resource_requirement_from_string_memory_variants():
     rr_g = ResourceRequirement.from_string("mem=8g")
     assert rr_g.memory == 8 * 1024**3
 
+    # Binary suffixes printed by flmctl
+    rr_gi = ResourceRequirement.from_string("mem=8Gi")
+    assert rr_gi.memory == 8 * 1024**3
+    rr_tb = ResourceRequirement.from_string("mem=2TB")
+    assert rr_tb.memory == 2 * 1024**4
+    rr_ti = ResourceRequirement.from_string("mem=2Ti")
+    assert rr_ti.memory == 2 * 1024**4
+    rr_pb = ResourceRequirement.from_string("mem=1PB")
+    assert rr_pb.memory == 1024**5
+    rr_pi = ResourceRequirement.from_string("mem=1Pi")
+    assert rr_pi.memory == 1024**5
+
     # Plain bytes
     rr_bytes = ResourceRequirement.from_string("memory=1048576")
     assert rr_bytes.memory == 1048576
@@ -501,6 +541,13 @@ def test_resource_requirement_from_string_with_spaces():
     assert rr.cpu == 2
     assert rr.memory == 4 * 1024**3
     assert rr.gpu == 1
+
+
+@pytest.mark.parametrize("value", ["cpu=abc", "mem=bogus", "gpu=", "foo=1", "cpu=1,"])
+def test_resource_requirement_from_string_rejects_malformed_input(value):
+    """Malformed resource requirements should not silently become zeroes."""
+    with pytest.raises(ValueError):
+        ResourceRequirement.from_string(value)
 
 
 def test_resource_requirement_parse_memory_empty():

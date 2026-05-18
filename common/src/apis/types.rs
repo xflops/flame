@@ -444,29 +444,79 @@ impl From<&str> for ResourceRequirement {
 
 impl From<&String> for ResourceRequirement {
     fn from(s: &String) -> Self {
-        let parts = s.split(',');
-        let mut cpu = 0;
-        let mut memory = 0;
-        let mut gpu = 0;
-        for p in parts {
-            let mut parts = p.split('=').map(|s| s.trim());
-            let key = parts.next();
-            let value = parts.next();
-            match (key, value) {
-                (Some("cpu"), Some(value)) => cpu = value.parse::<u64>().unwrap_or(0),
-                (Some("memory"), Some(value)) => memory = Self::parse_memory(value),
-                (Some("mem"), Some(value)) => memory = Self::parse_memory(value),
-                (Some("gpu"), Some(value)) => gpu = value.parse::<i32>().unwrap_or(0),
-                _ => {
-                    tracing::error!("Invalid resource requirement: {s}");
-                }
-            }
-        }
-        Self { cpu, memory, gpu }
+        Self::parse(s).unwrap_or_else(|e| {
+            tracing::error!("Invalid resource requirement <{}>: {}", s, e);
+            Self::default()
+        })
     }
 }
 
 impl ResourceRequirement {
+    pub fn parse(s: &str) -> Result<Self, crate::FlameError> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(crate::FlameError::InvalidConfig(
+                "resource requirement cannot be empty".to_string(),
+            ));
+        }
+
+        let mut cpu = 0;
+        let mut memory = 0;
+        let mut gpu = 0;
+        for part in s.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(crate::FlameError::InvalidConfig(format!(
+                    "invalid empty resource requirement entry in '{s}'"
+                )));
+            }
+
+            let (key, value) = part.split_once('=').ok_or_else(|| {
+                crate::FlameError::InvalidConfig(format!(
+                    "invalid resource requirement entry '{part}', expected key=value"
+                ))
+            })?;
+            if value.contains('=') {
+                return Err(crate::FlameError::InvalidConfig(format!(
+                    "invalid resource requirement entry '{part}', expected one '='"
+                )));
+            }
+
+            let key = key.trim().to_ascii_lowercase();
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(crate::FlameError::InvalidConfig(format!(
+                    "missing value for resource requirement key '{key}'"
+                )));
+            }
+
+            match key.as_str() {
+                "cpu" => {
+                    cpu = value.parse::<u64>().map_err(|e| {
+                        crate::FlameError::InvalidConfig(format!(
+                            "invalid cpu resource value '{value}': {e}"
+                        ))
+                    })?
+                }
+                "memory" | "mem" => memory = Self::parse_memory_result(value)?,
+                "gpu" => {
+                    gpu = value.parse::<i32>().map_err(|e| {
+                        crate::FlameError::InvalidConfig(format!(
+                            "invalid gpu resource value '{value}': {e}"
+                        ))
+                    })?
+                }
+                _ => {
+                    return Err(crate::FlameError::InvalidConfig(format!(
+                        "unknown resource requirement key '{key}'"
+                    )))
+                }
+            }
+        }
+
+        Ok(Self { cpu, memory, gpu })
+    }
+
     /// Returns a new `ResourceRequirement` with each field scaled by `n`.
     ///
     /// `cpu` and `memory` are widened multiplications in `u64` (cast `n` to `u64`).
@@ -517,19 +567,8 @@ impl ResourceRequirement {
         }
     }
 
-    pub(crate) fn parse_memory(s: &str) -> u64 {
-        if s.is_empty() {
-            return 0;
-        }
-        let s = s.to_lowercase();
-        let v = s[..s.len() - 1].parse::<u64>().unwrap_or(0);
-        let unit = s[s.len() - 1..].to_string();
-        match unit.as_str() {
-            "k" => v * 1024,
-            "m" => v * 1024 * 1024,
-            "g" => v * 1024 * 1024 * 1024,
-            _ => s.parse::<u64>().unwrap_or(0),
-        }
+    fn parse_memory_result(s: &str) -> Result<u64, crate::FlameError> {
+        crate::ctx::parse_memory_size(s)
     }
 
     /// Returns true iff cpu, memory, and gpu are all equal between self and other.

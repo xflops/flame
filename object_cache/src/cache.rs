@@ -31,6 +31,7 @@ use arrow_flight::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use bytesize::ByteSize;
+use common::net::host_for_uri;
 use futures::Stream;
 use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 use regex::Regex;
@@ -276,7 +277,12 @@ impl CacheEndpoint {
             "grpcs" => "grpc+tls",
             other => other,
         };
-        format!("{}://{}:{}", client_scheme, self.host, self.port)
+        format!(
+            "{}://{}:{}",
+            client_scheme,
+            host_for_uri(&self.host),
+            self.port
+        )
     }
 
     fn get_host(cache_config: &FlameCache) -> Result<String, FlameError> {
@@ -1556,6 +1562,16 @@ mod tests {
                 port: 443,
             };
             assert_eq!(endpoint.to_uri(), "grpc+tls://example.com:443");
+        }
+
+        #[test]
+        fn to_uri_brackets_ipv6_hosts() {
+            let endpoint = CacheEndpoint {
+                scheme: "grpc".to_string(),
+                host: "2001:db8::1".to_string(),
+                port: 9090,
+            };
+            assert_eq!(endpoint.to_uri(), "grpc://[2001:db8::1]:9090");
         }
 
         #[test]

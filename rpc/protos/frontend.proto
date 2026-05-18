@@ -34,7 +34,6 @@ service Frontend {
   rpc ListSession (ListSessionRequest) returns (SessionList) {}
 
   rpc CreateTask (CreateTaskRequest) returns (Task) {}
-  rpc DeleteTask (DeleteTaskRequest) returns (Task) {}
 
   rpc GetTask (GetTaskRequest) returns (Task) {}
   rpc WatchTask (WatchTaskRequest) returns (stream Task) {}
@@ -109,11 +108,6 @@ message ListSessionRequest {
 
 message CreateTaskRequest {
   TaskSpec task = 1;
-}
-
-message DeleteTaskRequest {
-  string task_id = 1;
-  string session_id = 2;
 }
 
 message GetTaskRequest {

@@ -30,8 +30,7 @@ The Pi example demonstrates how to use the `flamepy.Runner` API to perform a dis
 
 ### Files
 
-- **`pi.py`**: Contains the `estimate_batch()` function, which calculates the number of points inside the quarter circle for a given batch size.
-- **`main.py`**: Drives the distributed estimation. Orchestrates the batches, submits them to the Flame cluster, collects results, and prints the final estimate.
+- **`main.py`**: Contains the batch estimator and distributed orchestration. It submits batches to the Flame cluster, collects results, and prints the final estimate.
 - **`pyproject.toml`**: Defines the package and dependencies, including `flamepy`.
 - **`README.md`**: This file; explains the motivation, approach, usage, and output of the example.
 
@@ -40,7 +39,7 @@ The Pi example demonstrates how to use the `flamepy.Runner` API to perform a dis
 This example highlights:
 - How to apply distributed computing to classic numerical problems.
 - The minimal code changes required to scale a standard Python function with Flame Runner.
-- Clear separation between batch logic (in `pi.py`) and distributed orchestration (in `main.py`).
+- How to keep a small Runner example self-contained in one script.
 
 This approach easily adapts to other Monte Carlo or embarrassingly parallel workloads—just replace the batch logic!
 
@@ -65,7 +64,7 @@ Step 2: log in to flame-console and run the pi example
 [klausm@flm-worker flame]$ docker compose exec -it flame-console /bin/bash
 root@0e24c41da5f5:/# cd /opt/examples/pi/python/
 root@0e24c41da5f5:/opt/examples/pi/python# ls
-README.md  __pycache__  main.py  pi.py  pyproject.toml  uv.lock
+README.md  main.py  pyproject.toml
 ```
 
 Step 3: pi example output
@@ -91,7 +90,7 @@ Results:
 ============================================================
 
 root@0e24c41da5f5:/opt/examples/pi/python# flmctl list -s
- ID  State  App  Slots  Pending  Running  Succeed  Failed  Created 
+ ID  State  App  Resources  Priority  Pending  Running  Succeed  Failed  Created
 
 root@0e24c41da5f5:/opt/examples/pi/python# flmctl list -a
  Name     State    Tags  Created   Shim  Command                              

@@ -249,7 +249,7 @@ metadata:
   name: crawler
 spec:
   working_directory: /opt/examples/agents/sra/
-  tags:
+  labels:
     - Tool
   environments:
     SILICONFLOW_API_KEY: sk-xxxxxxxxxxxxxxxxx
@@ -266,7 +266,7 @@ metadata:
 spec:
   working_directory: /opt/examples/agents/sra/
   max_instances: 1
-  tags:
+  labels:
     - Agent
   environments:
     DEEPSEEK_API_KEY: sk-xxxxxxxxxxxxxxxxx
@@ -454,7 +454,7 @@ The client demonstrates:
 
 1. **Deploy the applications** using Flame:
    ```bash
-   flmctl create -f sra.yaml
+   flmctl register -f sra.yaml
    ```
 
 2. **Ensure infrastructure is running**:

@@ -34,6 +34,10 @@ use self::api::{
 
 #[derive(Default)]
 struct BasedService {
+    // Flame serializes enter/task/leave callbacks for one service instance. The
+    // Mutex is still useful because the Rust service macro exposes hooks as
+    // `&self`; it provides safe interior mutability for loading and clearing the
+    // model without requiring the public hook API to take `&mut self`.
     model: Mutex<Option<ModelBundle>>,
 }
 

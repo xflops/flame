@@ -35,7 +35,8 @@ pub async fn run(
     // `cluster.resreq` or a hardcoded fallback.
     let resreq = resreq_str
         .as_ref()
-        .map(|s| ResourceRequirement::from(s.as_str()));
+        .map(|s| ResourceRequirement::parse(s.as_str()))
+        .transpose()?;
 
     let attr = SessionAttributes {
         id: format!("{app}-{}", stdng::rand::short_name()),

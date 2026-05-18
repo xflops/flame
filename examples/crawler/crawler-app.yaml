@@ -8,4 +8,4 @@ spec:
   arguments:
     - run
     - crawler.py
-    - api.py
+    - apis.py

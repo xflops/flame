@@ -261,10 +261,6 @@ impl Engine for NoneEngine {
         Err(FlameError::NotFound(format!("task <{}>", gid)))
     }
 
-    async fn delete_task(&self, gid: TaskGID) -> Result<Task, FlameError> {
-        Err(FlameError::NotFound(format!("task <{}>", gid)))
-    }
-
     async fn update_task_state(
         &self,
         gid: TaskGID,
