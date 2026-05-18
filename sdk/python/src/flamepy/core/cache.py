@@ -1101,7 +1101,14 @@ def download_object(ref: ObjectRef, dest_path: str) -> None:
         with open(dest_path, "wb") as f:
             for batch in reader:
                 data_array = batch.column(OBJECT_FIELD_DATA)
+                kind_array = None
+                if hasattr(batch, "schema") and OBJECT_RESPONSE_FIELD_KIND in batch.schema.names:
+                    kind_array = batch.column(OBJECT_RESPONSE_FIELD_KIND)
                 for i in range(len(data_array)):
+                    if kind_array is not None:
+                        kind = kind_array[i].as_py()
+                        if kind != ObjectResponseKind.BASE.value:
+                            raise ValueError(f"download_object expected base rows only, got {kind!r} row")
                     chunk = data_array[i].as_py()
                     if chunk:
                         f.write(chunk)

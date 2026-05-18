@@ -547,9 +547,23 @@ impl CacheEndpoint {
         let host = parsed
             .host_str()
             .ok_or_else(|| FlameError::InvalidConfig("cache endpoint missing host".to_string()))?
+            .trim_start_matches('[')
+            .trim_end_matches(']')
             .to_string();
         let port = parsed.port().unwrap_or(DEFAULT_CACHE_PORT);
         Ok(Self { scheme, host, port })
+    }
+
+    fn uri_host(&self) -> String {
+        host_for_uri(&self.host)
+    }
+}
+
+fn host_for_uri(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
     }
 }
 
@@ -608,9 +622,9 @@ async fn connect_cache(
     tls: Option<&FlameClientTls>,
 ) -> Result<Channel, FlameError> {
     let transport_endpoint = if endpoint.scheme == "grpcs" {
-        format!("https://{}:{}", endpoint.host, endpoint.port)
+        format!("https://{}:{}", endpoint.uri_host(), endpoint.port)
     } else {
-        format!("http://{}:{}", endpoint.host, endpoint.port)
+        format!("http://{}:{}", endpoint.uri_host(), endpoint.port)
     };
 
     let mut builder = Channel::from_shared(transport_endpoint)
@@ -898,6 +912,13 @@ mod tests {
         assert_eq!(endpoint.scheme, "grpcs");
         assert_eq!(endpoint.host, "cache.example.com");
         assert_eq!(endpoint.port, 9443);
+    }
+
+    #[test]
+    fn cache_endpoint_brackets_ipv6_for_uri() {
+        let endpoint = CacheEndpoint::parse("grpc://[2001:db8::1]:9090").unwrap();
+        assert_eq!(endpoint.host, "2001:db8::1");
+        assert_eq!(endpoint.uri_host(), "[2001:db8::1]");
     }
 
     #[test]

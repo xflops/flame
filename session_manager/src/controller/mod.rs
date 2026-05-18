@@ -325,6 +325,9 @@ impl Controller {
         trace_fn!("Controller::close_session");
         let session = self.storage.close_session(id.clone()).await?;
         let _ = self.notifier.tasks.notify(&id, 0);
+        for task_id in session.tasks.keys() {
+            let _ = self.notifier.tasks.notify(&id, *task_id);
+        }
         Ok(session)
     }
 

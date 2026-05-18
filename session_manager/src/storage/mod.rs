@@ -470,19 +470,63 @@ impl Storage {
                 .ok_or(FlameError::NotFound(format!("session <{}>", id)))?
         };
 
-        let result_ssn = {
-            let mut ssn = lock_ptr!(ssn_ptr)?;
-            ssn.status.state = SessionState::Closed;
-            ssn.completion_time = Some(Utc::now());
-            ssn.version += 1;
-            ssn.clone()
-        };
-
-        if let Err(e) = self.engine.close_session(id.clone()).await {
-            if !matches!(e, FlameError::NotFound(_)) {
-                return Err(e);
+        {
+            let ssn = lock_ptr!(ssn_ptr)?;
+            if ssn
+                .tasks_index
+                .get(&TaskState::Running)
+                .is_some_and(|tasks| !tasks.is_empty())
+            {
+                return Err(FlameError::Storage(
+                    "Cannot close session with running tasks".to_string(),
+                ));
             }
         }
+
+        let persisted_ssn = match self.engine.close_session(id.clone()).await {
+            Ok(ssn) => Some(ssn),
+            Err(FlameError::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+
+        let completion_time = persisted_ssn
+            .as_ref()
+            .and_then(|ssn| ssn.completion_time)
+            .unwrap_or_else(Utc::now);
+
+        let result_ssn = {
+            let mut ssn = lock_ptr!(ssn_ptr)?;
+            ssn.status.state = persisted_ssn
+                .as_ref()
+                .map(|ssn| ssn.status.state)
+                .unwrap_or(SessionState::Closed);
+            ssn.completion_time = Some(completion_time);
+            ssn.version = persisted_ssn
+                .as_ref()
+                .map(|ssn| ssn.version)
+                .unwrap_or(ssn.version + 1);
+
+            let pending_tasks = ssn
+                .tasks_index
+                .get(&TaskState::Pending)
+                .map(|tasks| tasks.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+
+            for task_ptr in pending_tasks {
+                let task = {
+                    let task = lock_ptr!(task_ptr)?;
+                    Task {
+                        state: TaskState::Cancelled,
+                        version: task.version + 1,
+                        completion_time: Some(completion_time),
+                        ..task.clone()
+                    }
+                };
+                ssn.update_task(&task)?;
+            }
+
+            ssn.clone()
+        };
 
         self.evict_sessions()?;
 

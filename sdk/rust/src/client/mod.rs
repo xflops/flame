@@ -246,20 +246,114 @@ pub struct ResourceRequirement {
 }
 
 impl ResourceRequirement {
-    /// Parse memory string like "16g" into bytes.
-    fn parse_memory(s: &str) -> u64 {
+    pub fn parse(s: &str) -> Result<Self, FlameError> {
+        let s = s.trim();
         if s.is_empty() {
-            return 0;
+            return Err(FlameError::InvalidConfig(
+                "resource requirement cannot be empty".to_string(),
+            ));
         }
-        let s = s.to_lowercase();
-        let v = s[..s.len() - 1].parse::<u64>().unwrap_or(0);
-        let unit = s[s.len() - 1..].to_string();
-        match unit.as_str() {
-            "k" => v * 1024,
-            "m" => v * 1024 * 1024,
-            "g" => v * 1024 * 1024 * 1024,
-            _ => s.parse::<u64>().unwrap_or(0),
+
+        let mut cpu = 0;
+        let mut memory = 0;
+        let mut gpu = 0;
+        for part in s.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(FlameError::InvalidConfig(format!(
+                    "invalid empty resource requirement entry in '{s}'"
+                )));
+            }
+
+            let (key, value) = part.split_once('=').ok_or_else(|| {
+                FlameError::InvalidConfig(format!(
+                    "invalid resource requirement entry '{part}', expected key=value"
+                ))
+            })?;
+            if value.contains('=') {
+                return Err(FlameError::InvalidConfig(format!(
+                    "invalid resource requirement entry '{part}', expected one '='"
+                )));
+            }
+
+            let key = key.trim().to_ascii_lowercase();
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(FlameError::InvalidConfig(format!(
+                    "missing value for resource requirement key '{key}'"
+                )));
+            }
+
+            match key.as_str() {
+                "cpu" => {
+                    cpu = value.parse::<u64>().map_err(|e| {
+                        FlameError::InvalidConfig(format!(
+                            "invalid cpu resource value '{value}': {e}"
+                        ))
+                    })?
+                }
+                "memory" | "mem" => memory = Self::parse_memory_result(value)?,
+                "gpu" => {
+                    gpu = value.parse::<i32>().map_err(|e| {
+                        FlameError::InvalidConfig(format!(
+                            "invalid gpu resource value '{value}': {e}"
+                        ))
+                    })?
+                }
+                _ => {
+                    return Err(FlameError::InvalidConfig(format!(
+                        "unknown resource requirement key '{key}'"
+                    )))
+                }
+            }
         }
+
+        Ok(Self { cpu, memory, gpu })
+    }
+
+    fn parse_memory_result(s: &str) -> Result<u64, FlameError> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(FlameError::InvalidConfig(
+                "empty memory size string".to_string(),
+            ));
+        }
+
+        let lower = s.to_ascii_lowercase();
+        let (number, multiplier) = if let Some(number) = lower.strip_suffix("gib") {
+            (number, 1024 * 1024 * 1024)
+        } else if let Some(number) = lower.strip_suffix("gi") {
+            (number, 1024 * 1024 * 1024)
+        } else if let Some(number) = lower.strip_suffix("gb") {
+            (number, 1024 * 1024 * 1024)
+        } else if let Some(number) = lower.strip_suffix('g') {
+            (number, 1024 * 1024 * 1024)
+        } else if let Some(number) = lower.strip_suffix("mib") {
+            (number, 1024 * 1024)
+        } else if let Some(number) = lower.strip_suffix("mi") {
+            (number, 1024 * 1024)
+        } else if let Some(number) = lower.strip_suffix("mb") {
+            (number, 1024 * 1024)
+        } else if let Some(number) = lower.strip_suffix('m') {
+            (number, 1024 * 1024)
+        } else if let Some(number) = lower.strip_suffix("kib") {
+            (number, 1024)
+        } else if let Some(number) = lower.strip_suffix("ki") {
+            (number, 1024)
+        } else if let Some(number) = lower.strip_suffix("kb") {
+            (number, 1024)
+        } else if let Some(number) = lower.strip_suffix('k') {
+            (number, 1024)
+        } else if let Some(number) = lower.strip_suffix('b') {
+            (number, 1)
+        } else {
+            (lower.as_str(), 1)
+        };
+
+        number
+            .parse::<u64>()
+            .map(|value| value * multiplier)
+            .map_err(|e| FlameError::InvalidConfig(format!("invalid memory size '{s}': {e}")))
     }
 }
 
@@ -277,25 +371,10 @@ impl From<String> for ResourceRequirement {
 
 impl From<&String> for ResourceRequirement {
     fn from(s: &String) -> Self {
-        let parts = s.split(',');
-        let mut cpu = 0;
-        let mut memory = 0;
-        let mut gpu = 0;
-        for p in parts {
-            let mut parts = p.split('=').map(|s| s.trim());
-            let key = parts.next();
-            let value = parts.next();
-            match (key, value) {
-                (Some("cpu"), Some(value)) => cpu = value.parse::<u64>().unwrap_or(0),
-                (Some("memory"), Some(value)) => memory = Self::parse_memory(value),
-                (Some("mem"), Some(value)) => memory = Self::parse_memory(value),
-                (Some("gpu"), Some(value)) => gpu = value.parse::<i32>().unwrap_or(0),
-                _ => {
-                    tracing::error!("Invalid resource requirement: {s}");
-                }
-            }
-        }
-        Self { cpu, memory, gpu }
+        Self::parse(s).unwrap_or_else(|e| {
+            tracing::error!("Invalid resource requirement <{}>: {}", s, e);
+            Self::default()
+        })
     }
 }
 
@@ -1407,6 +1486,22 @@ mod tests {
         assert_eq!(attrs.priority, 7);
         let resreq = attrs.resreq.unwrap();
         assert_eq!(resreq.cpu, 4);
+        assert_eq!(resreq.memory, 16 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn resource_requirement_parse_rejects_malformed_input() {
+        for input in ["cpu=abc", "mem=bogus", "gpu=", "foo=1", "cpu=1,"] {
+            assert!(
+                ResourceRequirement::parse(input).is_err(),
+                "expected invalid resreq to fail: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_requirement_parse_accepts_binary_memory_suffixes() {
+        let resreq = ResourceRequirement::parse("cpu=1,mem=16Gi,gpu=0").unwrap();
         assert_eq!(resreq.memory, 16 * 1024 * 1024 * 1024);
     }
 

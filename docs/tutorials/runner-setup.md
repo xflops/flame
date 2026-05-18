@@ -212,7 +212,7 @@ Runner derives the registered application's `working_directory` from the `flmrun
 
 ## Troubleshooting
 
-`Failed to get application template 'flmrun'`: confirm the session manager is running and `flmrun` appears in `flmctl list application`.
+`Failed to get application template 'flmrun'`: confirm the session manager is running and `flmrun` appears in `flmctl list -a`.
 
 `Storage not configured`: configure `cache.endpoint` or `package.storage`. In a local setup, `cache.endpoint: "grpc://127.0.0.1:9090"` is enough.
 

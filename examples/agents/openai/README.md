@@ -1,11 +1,11 @@
 # OpenAI Agent Example
 
-This example demonstrates how to use the [Flame](https://github.com/xflops/flame) SDK to deploy an AI agent powered by the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python).
+This example demonstrates how to use the [Flame](https://github.com/xflops-io/flame) SDK to deploy an AI agent powered by the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python).
 
 ## Requirements
 
 - Python 3.12+
-- [FlamePy](https://github.com/xflops/flame) (`flamepy`) >= 0.5.0
+- [FlamePy](https://github.com/xflops-io/flame) (`flamepy`) >= 0.5.0
 - [openai](https://pypi.org/project/openai/) >= 2.8.1
 - [openai-agents](https://pypi.org/project/openai-agents/) >= 0.6.1
 
@@ -58,13 +58,13 @@ flmctl register -f openai-agent.yaml
 ### 3. Run the Client
 
 ```bash
-uv run client.py apis.py
+uv run client.py -m "What is the weather like in Seattle?"
 ```
 
 ## Example Output
 
 ```bash
-# uv run client.py apis.py 
+# uv run client.py -m "What is the weather like in Seattle?"
 Using CPython 3.12.3 interpreter at: /usr/bin/python3.12
 Creating virtual environment at: .venv
 Downloading setuptools (1.1MiB)
@@ -86,7 +86,7 @@ Hello! I'm your AI weather forecaster assistant. I'm here to provide you with we
 
 ## References
 
-- [Flame Documentation](https://github.com/xflops/flame)
+- [Flame Documentation](https://github.com/xflops-io/flame)
 - [OpenAI Python Library](https://github.com/openai/openai-python)
 - [OpenAI Agents SDK](https://github.com/openai/openai-agents-python)
 

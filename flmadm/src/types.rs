@@ -187,9 +187,26 @@ pub struct BuildArtifacts {
 impl BuildArtifacts {
     /// Find build artifacts in a source directory
     pub fn from_source_dir(src_dir: &Path, profile: &str) -> anyhow::Result<Self> {
+        let artifacts = Self::build_paths(src_dir, profile);
+        artifacts.validate_all()?;
+        Ok(artifacts)
+    }
+
+    /// Find only the build artifacts required by the selected install profiles.
+    pub fn from_source_dir_for_profiles(
+        src_dir: &Path,
+        profile: &str,
+        profiles: &[InstallProfile],
+    ) -> anyhow::Result<Self> {
+        let artifacts = Self::build_paths(src_dir, profile);
+        artifacts.validate_profiles(profiles)?;
+        Ok(artifacts)
+    }
+
+    fn build_paths(src_dir: &Path, profile: &str) -> Self {
         let target_dir = src_dir.join("target").join(profile);
 
-        let artifacts = Self {
+        Self {
             session_manager: target_dir.join("flame-session-manager"),
             executor_manager: target_dir.join("flame-executor-manager"),
             object_cache: target_dir.join("flame-object-cache"),
@@ -199,26 +216,46 @@ impl BuildArtifacts {
             flmping_service: target_dir.join("flmping-service"),
             flmexec: target_dir.join("flmexec"),
             flmexec_service: target_dir.join("flmexec-service"),
-        };
+        }
+    }
 
-        // Verify all artifacts exist
-        for (name, path) in [
-            ("flame-session-manager", &artifacts.session_manager),
-            ("flame-executor-manager", &artifacts.executor_manager),
-            ("flame-object-cache", &artifacts.object_cache),
-            ("flmctl", &artifacts.flmctl),
-            ("flmadm", &artifacts.flmadm),
-            ("flmping", &artifacts.flmping),
-            ("flmping-service", &artifacts.flmping_service),
-            ("flmexec", &artifacts.flmexec),
-            ("flmexec-service", &artifacts.flmexec_service),
-        ] {
+    fn entries(&self) -> [(&'static str, &Path); 9] {
+        [
+            ("flame-session-manager", &self.session_manager),
+            ("flame-executor-manager", &self.executor_manager),
+            ("flame-object-cache", &self.object_cache),
+            ("flmctl", &self.flmctl),
+            ("flmadm", &self.flmadm),
+            ("flmping", &self.flmping),
+            ("flmping-service", &self.flmping_service),
+            ("flmexec", &self.flmexec),
+            ("flmexec-service", &self.flmexec_service),
+        ]
+    }
+
+    fn validate_all(&self) -> anyhow::Result<()> {
+        for (name, path) in self.entries() {
             if !path.exists() {
                 anyhow::bail!("Build artifact not found: {} at {:?}", name, path);
             }
         }
 
-        Ok(artifacts)
+        Ok(())
+    }
+
+    fn validate_profiles(&self, profiles: &[InstallProfile]) -> anyhow::Result<()> {
+        let required_components = profiles
+            .iter()
+            .flat_map(InstallProfile::components)
+            .collect::<Vec<_>>();
+
+        for (name, path) in self.entries() {
+            if required_components.contains(&&name) && !path.exists() {
+                anyhow::bail!("Build artifact not found: {} at {:?}", name, path);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -231,6 +268,7 @@ pub mod exit_codes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::tempdir;
 
     mod install_profile {
@@ -430,6 +468,49 @@ mod tests {
         fn exit_codes() {
             assert_eq!(exit_codes::SUCCESS, 0);
             assert_eq!(exit_codes::INSTALL_FAILURE, 3);
+        }
+    }
+
+    mod build_artifacts {
+        use super::*;
+
+        fn touch(path: &Path) {
+            fs::write(path, b"binary").unwrap();
+        }
+
+        #[test]
+        fn validates_only_selected_profile_binaries() {
+            let tmp = tempdir().unwrap();
+            let target = tmp.path().join("target/release");
+            fs::create_dir_all(&target).unwrap();
+            touch(&target.join("flmctl"));
+            touch(&target.join("flmping"));
+            touch(&target.join("flmexec"));
+
+            let artifacts = BuildArtifacts::from_source_dir_for_profiles(
+                tmp.path(),
+                "release",
+                &[InstallProfile::Client],
+            );
+
+            assert!(artifacts.is_ok());
+            assert!(BuildArtifacts::from_source_dir(tmp.path(), "release").is_err());
+        }
+
+        #[test]
+        fn fails_when_selected_profile_binary_is_missing() {
+            let tmp = tempdir().unwrap();
+            let target = tmp.path().join("target/release");
+            fs::create_dir_all(&target).unwrap();
+            touch(&target.join("flmctl"));
+
+            let artifacts = BuildArtifacts::from_source_dir_for_profiles(
+                tmp.path(),
+                "release",
+                &[InstallProfile::Worker],
+            );
+
+            assert!(artifacts.is_err());
         }
     }
 

@@ -977,6 +977,36 @@ class TestUploadDownloadObject:
         assert dest_file.exists()
         assert dest_file.read_bytes() == test_content
 
+    def test_download_object_rejects_patch_rows(self, monkeypatch, tmp_path):
+        from flamepy.core import cache as cache_module
+
+        dest_file = tmp_path / "downloaded.tar.gz"
+        batch = pa.RecordBatch.from_arrays(
+            [
+                pa.array([1], type=pa.uint64()),
+                pa.array([ObjectResponseKind.PATCH.value], type=pa.string()),
+                pa.array([b"patch content"], type=pa.binary()),
+            ],
+            names=[OBJECT_FIELD_VERSION, OBJECT_RESPONSE_FIELD_KIND, OBJECT_FIELD_DATA],
+        )
+
+        class MockReader:
+            def __iter__(self):
+                return iter([batch])
+
+        class MockFlightClient:
+            def do_get(self, ticket):
+                return MockReader()
+
+        monkeypatch.setattr(cache_module, "_get_cache_tls_config", lambda: None)
+        monkeypatch.setattr(cache_module, "_get_flight_client", lambda ep, tls=None: MockFlightClient())
+
+        ref = ObjectRef(endpoint="grpc://host:9090", key="myapp/pkg/test.tar.gz", version=0)
+        with pytest.raises(ValueError, match="expected base rows only"):
+            cache_module.download_object(ref, str(dest_file))
+
+        assert not dest_file.exists()
+
     def test_download_object_not_found(self, monkeypatch, tmp_path):
         import pytest
 

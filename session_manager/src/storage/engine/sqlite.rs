@@ -204,10 +204,11 @@ impl SqliteEngine {
             ),
             None => (None, None, None),
         };
-        let sql = r#"INSERT INTO sessions (id, application, common_data, creation_time, state, min_instances, max_instances, priority, resreq_cpu, resreq_memory, resreq_gpu)
+        let sql = r#"INSERT INTO sessions (id, application, common_data, creation_time, state, min_instances, max_instances, batch_size, priority, resreq_cpu, resreq_memory, resreq_gpu)
             VALUES (
                 ?,
                 (SELECT name FROM applications WHERE name=? AND state=?),
+                ?,
                 ?,
                 ?,
                 ?,
@@ -228,6 +229,7 @@ impl SqliteEngine {
             .bind(SessionState::Open as i32)
             .bind(attr.min_instances as i64)
             .bind(attr.max_instances.map(|v| v as i64))
+            .bind(attr.batch_size.max(1) as i64)
             .bind(attr.priority as i64)
             .bind(resreq_cpu)
             .bind(resreq_memory)
@@ -664,28 +666,6 @@ impl Engine for SqliteEngine {
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
         let sql = r#"SELECT * FROM tasks WHERE id=? AND ssn_id=?"#;
-        let task: TaskDao = sqlx::query_as(sql)
-            .bind(gid.task_id)
-            .bind(gid.ssn_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        task.try_into()
-    }
-
-    async fn delete_task(&self, gid: TaskGID) -> Result<Task, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let sql = r#"DELETE tasks WHERE id=? AND ssn_id=? RETURNING *"#;
         let task: TaskDao = sqlx::query_as(sql)
             .bind(gid.task_id)
             .bind(gid.ssn_id)
@@ -1175,6 +1155,35 @@ mod tests {
     use common::apis::ApplicationState;
 
     use super::*;
+
+    #[test]
+    fn test_create_session_persists_batch_size() -> Result<(), FlameError> {
+        let url = common::temp_sqlite_url("flame_test_create_session_persists_batch_size");
+        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
+
+        for (name, attr) in common::default_applications() {
+            tokio_test::block_on(storage.register_application(name.clone(), attr))?;
+        }
+
+        let ssn_id = format!("ssn-batch-{}", Utc::now().timestamp());
+        let ssn = tokio_test::block_on(storage.create_session(SessionAttributes {
+            id: ssn_id.clone(),
+            application: "flmexec".to_string(),
+            common_data: None,
+            min_instances: 2,
+            max_instances: Some(4),
+            batch_size: 2,
+            priority: 0,
+            resreq: None,
+        }))?;
+
+        assert_eq!(ssn.batch_size, 2);
+
+        let ssn = tokio_test::block_on(storage.get_session(ssn_id))?;
+        assert_eq!(ssn.batch_size, 2);
+
+        Ok(())
+    }
 
     fn test_get_task_with_events() -> Result<(), FlameError> {
         let url = common::temp_sqlite_url("flame_test_get_task_with_events");

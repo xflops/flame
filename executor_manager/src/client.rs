@@ -52,7 +52,7 @@ impl BackendClient {
         let endpoint = format!(
             "{}://{}:{port}",
             url.scheme(),
-            url.host_str().unwrap_or("localhost")
+            host_for_uri(url.host_str().unwrap_or("localhost"))
         );
 
         tracing::info!("Connecting to flame backend at {}", endpoint);
@@ -306,5 +306,24 @@ impl BackendClient {
             .map_err(FlameError::from)?;
 
         Ok(())
+    }
+}
+
+fn host_for_uri(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_for_uri_brackets_ipv6() {
+        assert_eq!(host_for_uri("2001:db8::1"), "[2001:db8::1]");
+        assert_eq!(host_for_uri("localhost"), "localhost");
     }
 }

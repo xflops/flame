@@ -276,7 +276,12 @@ impl CacheEndpoint {
             "grpcs" => "grpc+tls",
             other => other,
         };
-        format!("{}://{}:{}", client_scheme, self.host, self.port)
+        format!(
+            "{}://{}:{}",
+            client_scheme,
+            host_for_uri(&self.host),
+            self.port
+        )
     }
 
     fn get_host(cache_config: &FlameCache) -> Result<String, FlameError> {
@@ -304,6 +309,14 @@ impl CacheEndpoint {
             )))?
             .ip()
             .to_string())
+    }
+}
+
+fn host_for_uri(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
     }
 }
 
@@ -1556,6 +1569,16 @@ mod tests {
                 port: 443,
             };
             assert_eq!(endpoint.to_uri(), "grpc+tls://example.com:443");
+        }
+
+        #[test]
+        fn to_uri_brackets_ipv6_hosts() {
+            let endpoint = CacheEndpoint {
+                scheme: "grpc".to_string(),
+                host: "2001:db8::1".to_string(),
+                port: 9090,
+            };
+            assert_eq!(endpoint.to_uri(), "grpc://[2001:db8::1]:9090");
         }
 
         #[test]

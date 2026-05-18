@@ -103,6 +103,12 @@ def _application_from_proto(app) -> Application:
     )
 
 
+def _raise_for_result(response, operation: str) -> None:
+    if response.return_code != 0:
+        message = response.message or f"{operation} failed with return_code {response.return_code}"
+        raise FlameError(FlameErrorCode.INTERNAL, message)
+
+
 def connect(addr: str, tls_config: Optional[FlameClientTls] = None) -> "Connection":
     """Connect to the Flame service.
 
@@ -354,7 +360,8 @@ class Connection:
         request = RegisterApplicationRequest(name=name, application=app_spec)
 
         try:
-            self._frontend.RegisterApplication(request)
+            response = self._frontend.RegisterApplication(request)
+            _raise_for_result(response, "register application")
         except grpc.RpcError as e:
             raise FlameError(
                 FlameErrorCode.INTERNAL,
@@ -366,7 +373,8 @@ class Connection:
         request = UnregisterApplicationRequest(name=name)
 
         try:
-            self._frontend.UnregisterApplication(request)
+            response = self._frontend.UnregisterApplication(request)
+            _raise_for_result(response, "unregister application")
         except grpc.RpcError as e:
             raise FlameError(
                 FlameErrorCode.INTERNAL,

@@ -1,10 +1,10 @@
 # Flame: A Distributed Engine for AI
 
-[![license](https://img.shields.io/github/license/xflops/flame)](http://github.com/xflops/flame)
-[![RepoSize](https://img.shields.io/github/repo-size/xflops/flame)](http://github.com/xflops/flame)
-[![Release](https://img.shields.io/github/release/xflops/flame)](https://github.com/xflops/flame/releases)
+[![license](https://img.shields.io/github/license/xflops-io/flame)](http://github.com/xflops-io/flame)
+[![RepoSize](https://img.shields.io/github/repo-size/xflops-io/flame)](http://github.com/xflops-io/flame)
+[![Release](https://img.shields.io/github/release/xflops-io/flame)](https://github.com/xflops-io/flame/releases)
 [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/7299/badge)](https://bestpractices.coreinfrastructure.org/projects/7299)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/xflops/flame)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/xflops-io/flame)
 
 Flame is a distributed engine for AI, providing a comprehensive suite of mechanisms commonly required by various classes of AI workloads, including agents, reinforcement learning, and more. Built upon over a decade and a half of experience running diverse high-performance workloads at scale across multiple systems and platforms, Flame incorporates best-of-breed ideas and practices from the open source community.
 
@@ -35,8 +35,8 @@ Throughput:      9124.09 tasks/sec
 ============================================================
 
 root@06383dd94875:/# flmctl list -s
- ID              State   App      Slots  Priority  Pending  Running  Succeed  Failed  Created
- flmping-1N1sIX  Closed  flmping  1      0         0        0        30000    0       18:11:26
+ ID              State   App      Resources             Priority  Pending  Running  Succeed  Failed  Created
+ flmping-1N1sIX  Closed  flmping  cpu=1,mem=1Gi,gpu=0  0         0        0        30000    0       18:11:26
 ```
 
 ## Architecture Overview
@@ -127,8 +127,8 @@ You can check session status using `flmctl`. Explore more examples [here](exampl
 
 ```shell
 $ flmctl list -s
- ID              State   App      Slots  Priority  Pending  Running  Succeed  Failed  Created
- flmping-Sf4R2o  Closed  flmping  1      0         0        0        10       0       13:33:30
+ ID              State   App      Resources             Priority  Pending  Running  Succeed  Failed  Created
+ flmping-Sf4R2o  Closed  flmping  cpu=1,mem=1Gi,gpu=0  0         0        0        10       0       13:33:30
 ```
 
 ## CLI Tools
@@ -180,4 +180,4 @@ This project is licensed under the terms specified in the [LICENSE](LICENSE) fil
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=xflops/flame&type=timeline&legend=top-left)](https://www.star-history.com/#xflops/flame&type=timeline&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=xflops-io/flame&type=timeline&legend=top-left)](https://www.star-history.com/#xflops-io/flame&type=timeline&legend=top-left)

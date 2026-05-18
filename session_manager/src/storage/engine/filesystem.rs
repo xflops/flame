@@ -1272,17 +1272,6 @@ impl Engine for FilesystemEngine {
         self.task_from_metadata(&gid.ssn_id, &meta)
     }
 
-    async fn delete_task(&self, gid: TaskGID) -> Result<Task, FlameError> {
-        // In append-only filesystem architecture, physical deletion is not supported.
-        // The task data remains in the append-only files (inputs.bin, outputs.bin).
-        // Callers should use close_session + delete_session to clean up entire sessions.
-        Err(FlameError::Storage(format!(
-            "Task deletion not supported in filesystem storage engine (task {}/{}). \
-             Use session deletion to clean up completed sessions.",
-            gid.ssn_id, gid.task_id
-        )))
-    }
-
     async fn update_task_state(
         &self,
         gid: TaskGID,

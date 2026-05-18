@@ -39,6 +39,16 @@ mod tests {
     }
 
     #[test]
+    fn test_resreq_parse_rejects_malformed_input() {
+        for input in ["cpu=abc", "mem=bogus", "gpu=", "foo=1", "cpu=1,"] {
+            assert!(
+                ResourceRequirement::parse(input).is_err(),
+                "expected invalid resreq to fail: {input}"
+            );
+        }
+    }
+
+    #[test]
     fn test_shim_default() {
         let shim = Shim::default();
         assert_eq!(shim, Shim::Host);
