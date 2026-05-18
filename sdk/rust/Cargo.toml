@@ -7,7 +7,7 @@ build = "build.rs"
 description = "The Rust SDK of Flame"
 repository = "https://github.com/xflops/flame"
 license-file = "../../LICENSE"
-readme = "../../README.md"
+readme = "README.md"
 
 [dependencies]
 stdng = { path = "../../stdng" }
