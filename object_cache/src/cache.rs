@@ -31,6 +31,7 @@ use arrow_flight::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use bytesize::ByteSize;
+use common::net::host_for_uri;
 use futures::Stream;
 use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 use regex::Regex;
@@ -309,14 +310,6 @@ impl CacheEndpoint {
             )))?
             .ip()
             .to_string())
-    }
-}
-
-fn host_for_uri(host: &str) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
     }
 }
 

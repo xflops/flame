@@ -29,6 +29,7 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::{Action, FlightClient, FlightDescriptor, Ticket};
 use bson::{doc, Bson, Document};
 use bytes::Bytes;
+use common::net::host_for_uri;
 use futures::{stream, TryStreamExt};
 use serde_derive::{Deserialize, Serialize as DeriveSerialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -556,14 +557,6 @@ impl CacheEndpoint {
 
     fn uri_host(&self) -> String {
         host_for_uri(&self.host)
-    }
-}
-
-fn host_for_uri(host: &str) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
     }
 }
 

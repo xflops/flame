@@ -31,6 +31,7 @@ use common::apis::{
     Application, Node, ResourceRequirement, Session, SessionContext, Shim, TaskContext, TaskResult,
 };
 use common::ctx::FlameClusterContext;
+use common::net::host_for_uri;
 use common::FlameError;
 
 const DEFAULT_PORT: u16 = 8080;
@@ -306,14 +307,6 @@ impl BackendClient {
             .map_err(FlameError::from)?;
 
         Ok(())
-    }
-}
-
-fn host_for_uri(host: &str) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
     }
 }
 

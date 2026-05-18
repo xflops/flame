@@ -710,6 +710,16 @@ cache:
         assert_eq!(parse_memory_size("1Gi").unwrap(), 1024 * 1024 * 1024);
         assert_eq!(parse_memory_size("512Mi").unwrap(), 512 * 1024 * 1024);
         assert_eq!(parse_memory_size("1024Ki").unwrap(), 1024 * 1024);
+        assert_eq!(parse_memory_size("2Ti").unwrap(), 2 * 1024_u64.pow(4));
+        assert_eq!(parse_memory_size("1Pi").unwrap(), 1024_u64.pow(5));
+    }
+
+    #[test]
+    fn test_parse_memory_size_terabytes_and_petabytes() {
+        assert_eq!(parse_memory_size("1T").unwrap(), 1024_u64.pow(4));
+        assert_eq!(parse_memory_size("1TB").unwrap(), 1024_u64.pow(4));
+        assert_eq!(parse_memory_size("2P").unwrap(), 2 * 1024_u64.pow(5));
+        assert_eq!(parse_memory_size("2PB").unwrap(), 2 * 1024_u64.pow(5));
     }
 
     #[test]

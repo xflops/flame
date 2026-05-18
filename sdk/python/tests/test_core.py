@@ -521,6 +521,14 @@ def test_resource_requirement_from_string_memory_variants():
     # Binary suffixes printed by flmctl
     rr_gi = ResourceRequirement.from_string("mem=8Gi")
     assert rr_gi.memory == 8 * 1024**3
+    rr_tb = ResourceRequirement.from_string("mem=2TB")
+    assert rr_tb.memory == 2 * 1024**4
+    rr_ti = ResourceRequirement.from_string("mem=2Ti")
+    assert rr_ti.memory == 2 * 1024**4
+    rr_pb = ResourceRequirement.from_string("mem=1PB")
+    assert rr_pb.memory == 1024**5
+    rr_pi = ResourceRequirement.from_string("mem=1Pi")
+    assert rr_pi.memory == 1024**5
 
     # Plain bytes
     rr_bytes = ResourceRequirement.from_string("memory=1048576")

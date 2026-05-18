@@ -158,6 +158,14 @@ class ResourceRequirement:
             "gb": 1024**3,
             "gi": 1024**3,
             "gib": 1024**3,
+            "t": 1024**4,
+            "tb": 1024**4,
+            "ti": 1024**4,
+            "tib": 1024**4,
+            "p": 1024**5,
+            "pb": 1024**5,
+            "pi": 1024**5,
+            "pib": 1024**5,
         }
         for suffix, multiplier in sorted(multipliers.items(), key=lambda item: len(item[0]), reverse=True):
             if s.endswith(suffix):

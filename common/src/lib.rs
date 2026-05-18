@@ -13,6 +13,7 @@ limitations under the License.
 
 pub mod apis;
 pub mod ctx;
+pub mod net;
 pub mod pprof;
 pub mod storage;
 

@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 use chrono::Duration;
 use clap::Args;
+use common::net::host_for_uri;
 use flame_rs as flame;
 use flame_rs::apis::{FlameContext, FlameError, Shim};
 use flame_rs::client::{ApplicationAttributes, ApplicationSchema};
@@ -375,14 +376,6 @@ fn normalize_cache_endpoint(raw: &str) -> Result<String, FlameError> {
 
 fn object_url(cache_endpoint: &str, key: &str) -> String {
     format!("{}/{}", cache_endpoint.trim_end_matches('/'), key)
-}
-
-fn host_for_uri(host: &str) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    }
 }
 
 fn render_application(name: &str, attributes: &ApplicationAttributes) -> RenderedApplication {

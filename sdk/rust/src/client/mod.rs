@@ -319,31 +319,53 @@ impl ResourceRequirement {
             ));
         }
 
+        const KIB: u64 = 1024;
+        const MIB: u64 = KIB * 1024;
+        const GIB: u64 = MIB * 1024;
+        const TIB: u64 = GIB * 1024;
+        const PIB: u64 = TIB * 1024;
+
         let lower = s.to_ascii_lowercase();
-        let (number, multiplier) = if let Some(number) = lower.strip_suffix("gib") {
-            (number, 1024 * 1024 * 1024)
+        let (number, multiplier) = if let Some(number) = lower.strip_suffix("pib") {
+            (number, PIB)
+        } else if let Some(number) = lower.strip_suffix("pi") {
+            (number, PIB)
+        } else if let Some(number) = lower.strip_suffix("pb") {
+            (number, PIB)
+        } else if let Some(number) = lower.strip_suffix('p') {
+            (number, PIB)
+        } else if let Some(number) = lower.strip_suffix("tib") {
+            (number, TIB)
+        } else if let Some(number) = lower.strip_suffix("ti") {
+            (number, TIB)
+        } else if let Some(number) = lower.strip_suffix("tb") {
+            (number, TIB)
+        } else if let Some(number) = lower.strip_suffix('t') {
+            (number, TIB)
+        } else if let Some(number) = lower.strip_suffix("gib") {
+            (number, GIB)
         } else if let Some(number) = lower.strip_suffix("gi") {
-            (number, 1024 * 1024 * 1024)
+            (number, GIB)
         } else if let Some(number) = lower.strip_suffix("gb") {
-            (number, 1024 * 1024 * 1024)
+            (number, GIB)
         } else if let Some(number) = lower.strip_suffix('g') {
-            (number, 1024 * 1024 * 1024)
+            (number, GIB)
         } else if let Some(number) = lower.strip_suffix("mib") {
-            (number, 1024 * 1024)
+            (number, MIB)
         } else if let Some(number) = lower.strip_suffix("mi") {
-            (number, 1024 * 1024)
+            (number, MIB)
         } else if let Some(number) = lower.strip_suffix("mb") {
-            (number, 1024 * 1024)
+            (number, MIB)
         } else if let Some(number) = lower.strip_suffix('m') {
-            (number, 1024 * 1024)
+            (number, MIB)
         } else if let Some(number) = lower.strip_suffix("kib") {
-            (number, 1024)
+            (number, KIB)
         } else if let Some(number) = lower.strip_suffix("ki") {
-            (number, 1024)
+            (number, KIB)
         } else if let Some(number) = lower.strip_suffix("kb") {
-            (number, 1024)
+            (number, KIB)
         } else if let Some(number) = lower.strip_suffix('k') {
-            (number, 1024)
+            (number, KIB)
         } else if let Some(number) = lower.strip_suffix('b') {
             (number, 1)
         } else {
@@ -1501,8 +1523,16 @@ mod tests {
 
     #[test]
     fn resource_requirement_parse_accepts_binary_memory_suffixes() {
-        let resreq = ResourceRequirement::parse("cpu=1,mem=16Gi,gpu=0").unwrap();
-        assert_eq!(resreq.memory, 16 * 1024 * 1024 * 1024);
+        for (input, expected) in [
+            ("cpu=1,mem=16Gi,gpu=0", 16 * 1024_u64.pow(3)),
+            ("mem=2T", 2 * 1024_u64.pow(4)),
+            ("mem=2Ti", 2 * 1024_u64.pow(4)),
+            ("mem=1PB", 1024_u64.pow(5)),
+            ("mem=1Pi", 1024_u64.pow(5)),
+        ] {
+            let resreq = ResourceRequirement::parse(input).unwrap();
+            assert_eq!(resreq.memory, expected, "input: {input}");
+        }
     }
 
     #[test]
