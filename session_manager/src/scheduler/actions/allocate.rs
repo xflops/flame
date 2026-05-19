@@ -16,7 +16,7 @@ use std::sync::Arc;
 use stdng::collections::{BinaryHeap, Cmp};
 use stdng::{logs::TraceFn, trace_fn};
 
-use crate::model::{open_ready_session, ALL_NODE, UNBINDING_EXECUTOR, VOID_EXECUTOR};
+use crate::model::{ALL_NODE, READY_SESSION, UNBINDING_EXECUTOR, VOID_EXECUTOR};
 use crate::scheduler::actions::{Action, ActionPtr};
 use crate::scheduler::plugins::node_order_fn;
 use crate::scheduler::plugins::ssn_order_fn;
@@ -42,7 +42,7 @@ impl Action for AllocateAction {
         ss.debug()?;
 
         let mut open_ssns = BinaryHeap::new(ssn_order_fn(ctx));
-        let ssn_list = ss.find_sessions(open_ready_session(ctx.session_retry_limits()))?;
+        let ssn_list = ss.find_sessions(READY_SESSION)?;
         for ssn in ssn_list.values() {
             open_ssns.push(ssn.clone());
         }

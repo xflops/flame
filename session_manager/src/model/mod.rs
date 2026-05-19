@@ -28,17 +28,19 @@ use common::apis::{
     Application, ExecutorID, ExecutorState, Node, NodeState, ResourceRequirement, Session,
     SessionID, SessionState, Shim, Task, TaskID, TaskState,
 };
-use common::FlameError;
+use common::{ctx::DEFAULT_SESSION_RETRY_LIMITS, FlameError};
 use rpc::flame::v1 as rpc;
 
 pub type SessionInfoPtr = Arc<SessionInfo>;
 pub type ExecutorInfoPtr = Arc<ExecutorInfo>;
 pub type NodeInfoPtr = Arc<NodeInfo>;
 pub type AppInfoPtr = Arc<AppInfo>;
-pub type SessionPredicate = Arc<dyn Fn(&SessionInfo) -> bool + Send + Sync>;
+pub type SessionPredicate = fn(&SessionInfo, u32) -> bool;
 
 #[derive(Clone)]
 pub struct SnapShot {
+    pub session_retry_limits: u32,
+
     pub applications: MutexPtr<HashMap<String, AppInfoPtr>>,
 
     pub sessions: MutexPtr<HashMap<SessionID, SessionInfoPtr>>,
@@ -60,7 +62,12 @@ impl Default for SnapShot {
 
 impl SnapShot {
     pub fn new() -> Self {
+        Self::new_with_session_retry_limits(DEFAULT_SESSION_RETRY_LIMITS)
+    }
+
+    pub fn new_with_session_retry_limits(session_retry_limits: u32) -> Self {
         SnapShot {
+            session_retry_limits,
             applications: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             ssn_index: Arc::new(Mutex::new(HashMap::new())),
@@ -290,11 +297,8 @@ impl SessionFilter {
     }
 
     /// Adds an in-memory predicate filter.
-    pub fn with_predicate(
-        mut self,
-        predicate: impl Fn(&SessionInfo) -> bool + Send + Sync + 'static,
-    ) -> Self {
-        self.predicate = Some(Arc::new(predicate));
+    pub const fn with_predicate(mut self, predicate: SessionPredicate) -> Self {
+        self.predicate = Some(predicate);
         self
     }
 }
@@ -306,13 +310,10 @@ impl Default for SessionFilter {
 }
 
 pub const OPEN_SESSION: Option<SessionFilter> = Some(SessionFilter::by_state(SessionState::Open));
-
-pub fn open_ready_session(retry_limits: u32) -> Option<SessionFilter> {
-    Some(
-        SessionFilter::by_state(SessionState::Open)
-            .with_predicate(move |ssn| ssn.is_ready(retry_limits)),
-    )
-}
+pub const READY_SESSION: Option<SessionFilter> = Some(
+    SessionFilter::by_state(SessionState::Open)
+        .with_predicate(|ssn, retry_limits| ssn.is_ready(retry_limits)),
+);
 
 /// Filter for listing executors.
 /// All fields are Option:
@@ -601,7 +602,7 @@ impl SnapShot {
             None => filtered,
             Some(predicate) => filtered
                 .into_iter()
-                .filter(|ssn| predicate(ssn.as_ref()))
+                .filter(|ssn| predicate(ssn.as_ref(), self.session_retry_limits))
                 .collect(),
         };
 
@@ -1097,8 +1098,8 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_find_sessions_by_predicate() {
-        let ss = SnapShot::new();
+    fn test_snapshot_find_ready_sessions() {
+        let ss = SnapShot::new_with_session_retry_limits(2);
 
         let ready_open = create_test_session("ssn-ready", Some(slots_rr(2)), SessionState::Open);
         let mut not_ready_open =
@@ -1113,11 +1114,7 @@ mod tests {
         ss.add_session(Arc::new(not_ready_open)).unwrap();
         ss.add_session(closed_ready.clone()).unwrap();
 
-        let ready_ssns = ss
-            .find_sessions(Some(
-                SessionFilter::by_state(SessionState::Open).with_predicate(|ssn| ssn.is_ready(2)),
-            ))
-            .unwrap();
+        let ready_ssns = ss.find_sessions(READY_SESSION).unwrap();
 
         assert_eq!(ready_ssns.len(), 1);
         assert!(ready_ssns.contains_key("ssn-ready"));

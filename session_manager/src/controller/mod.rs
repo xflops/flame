@@ -114,10 +114,6 @@ impl Controller {
         &self.storage
     }
 
-    pub fn session_retry_limits(&self) -> u32 {
-        self.storage.session_retry_limits()
-    }
-
     // ========================================================================
     // Node Management
     // ========================================================================
@@ -1149,10 +1145,10 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn bind_success_resets_retry_count() {
+        async fn bind_success_keeps_retry_count() {
             let storage = create_test_storage_with_retry_limits(2).await;
             let controller = new_ptr(storage.clone());
-            let ssn_id = format!("retry-reset-{}", Uuid::new_v4());
+            let ssn_id = format!("retry-keep-{}", Uuid::new_v4());
             let executor_id = create_binding_executor(&controller, &ssn_id).await;
 
             fail_binding(&controller, &executor_id).await.unwrap();
@@ -1177,10 +1173,41 @@ mod tests {
                 .unwrap();
 
             let session = controller.get_session(ssn_id).unwrap();
-            assert_eq!(session.retry_count, 0);
+            assert_eq!(session.retry_count, 1);
             assert_eq!(
                 controller.get_executor(executor_id).unwrap().state,
                 ExecutorState::Bound
+            );
+        }
+
+        #[tokio::test]
+        async fn bind_success_requires_attached_session() {
+            let storage = create_test_storage_with_retry_limits(2).await;
+            let controller = new_ptr(storage.clone());
+            let ssn_id = format!("missing-session-{}", Uuid::new_v4());
+            let executor_id = create_binding_executor(&controller, &ssn_id).await;
+
+            {
+                let executor = storage.get_executor_ptr(executor_id.clone()).unwrap();
+                let mut executor = lock_ptr!(executor).unwrap();
+                executor.ssn_id = None;
+            }
+
+            let err = controller
+                .bind_executor_completed(
+                    executor_id.clone(),
+                    Some(FlameResult {
+                        return_code: BIND_RESULT_OK,
+                        message: None,
+                    }),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, FlameError::InvalidState(_)));
+            assert_eq!(
+                controller.get_executor(executor_id).unwrap().state,
+                ExecutorState::Binding
             );
         }
     }

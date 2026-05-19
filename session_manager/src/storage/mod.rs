@@ -89,7 +89,7 @@ impl Storage {
     }
 
     pub fn snapshot(&self) -> Result<SnapShotPtr, FlameError> {
-        let res = SnapShot::new();
+        let res = SnapShot::new_with_session_retry_limits(self.session_retry_limits());
 
         {
             let node_map = lock_ptr!(self.nodes)?;

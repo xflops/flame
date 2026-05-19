@@ -17,7 +17,7 @@ use stdng::{logs::TraceFn, trace_fn};
 use crate::client::BackendClient;
 use crate::executor::Executor;
 use crate::states::State;
-use common::apis::ExecutorState;
+use common::apis::{ExecutorState, TaskResult, TaskState};
 use common::FlameError;
 
 #[derive(Clone)]
@@ -46,7 +46,23 @@ impl State for BoundState {
                         ))?;
                 let task_result = {
                     let mut shim = shim_ptr.lock().await;
-                    shim.on_task_invoke(&task_ctx).await?
+                    match shim.on_task_invoke(&task_ctx).await {
+                        Ok(task_result) => task_result,
+                        Err(e) => {
+                            tracing::error!(
+                                "Task <{}/{}> failed during shim invocation on executor <{}>: {}",
+                                task_ctx.session_id,
+                                task_ctx.task_id,
+                                self.executor.id,
+                                e
+                            );
+                            TaskResult {
+                                state: TaskState::Failed,
+                                output: None,
+                                message: Some(e.to_string()),
+                            }
+                        }
+                    }
                 };
 
                 self.client

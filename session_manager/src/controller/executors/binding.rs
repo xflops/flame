@@ -30,10 +30,16 @@ pub struct BindingState {
 
 impl BindingState {
     async fn bind_session_success(&self) -> Result<(), FlameError> {
-        let ssn_id = self.bound_session_id()?;
-        let ssn_ptr = self.storage.get_session_ptr(ssn_id)?;
-        let mut ssn = lock_ptr!(ssn_ptr)?;
-        ssn.retry_count = 0;
+        let ssn_id = {
+            let e = lock_ptr!(self.executor)?;
+            e.ssn_id.clone().ok_or_else(|| {
+                FlameError::InvalidState(format!(
+                    "Executor <{}> has no bound session on successful bind completion",
+                    e.id
+                ))
+            })?
+        };
+        self.storage.get_session_ptr(ssn_id)?;
 
         let mut e = lock_ptr!(self.executor)?;
         e.state = ExecutorState::Bound;
@@ -42,15 +48,10 @@ impl BindingState {
     }
 
     async fn bind_session_failed(&self, result: &FlameResult) -> Result<(), FlameError> {
-        let (executor_id, node, ssn_id) = {
-            let e = lock_ptr!(self.executor)?;
-            let ssn_id = self.bound_session_id_from_executor(&e)?;
-            (e.id.clone(), e.node.clone(), ssn_id)
-        };
+        let executor = { lock_ptr!(self.executor)?.clone() };
 
-        self.record_bind_failure(&ssn_id, &executor_id, &node, result)
-            .await?;
-        self.increment_session_retry_count(&ssn_id).await?;
+        self.record_bind_failure(&executor, result).await?;
+        self.increment_session_retry_count(&executor).await?;
 
         let mut e = lock_ptr!(self.executor)?;
         e.state = ExecutorState::Unbinding;
@@ -60,23 +61,15 @@ impl BindingState {
         Ok(())
     }
 
-    fn bound_session_id(&self) -> Result<String, FlameError> {
-        let e = lock_ptr!(self.executor)?;
-        self.bound_session_id_from_executor(&e)
-    }
-
-    fn bound_session_id_from_executor(
+    async fn increment_session_retry_count(
         &self,
         executor: &crate::model::Executor,
-    ) -> Result<String, FlameError> {
-        executor.ssn_id.clone().ok_or_else(|| {
+    ) -> Result<(), FlameError> {
+        let ssn_id = executor.ssn_id.clone().ok_or_else(|| {
             FlameError::InvalidState(format!("Executor <{}> has no bound session", executor.id))
-        })
-    }
-
-    async fn increment_session_retry_count(&self, ssn_id: &str) -> Result<(), FlameError> {
+        })?;
         let retry_limit = self.storage.session_retry_limits();
-        let ssn_ptr = self.storage.get_session_ptr(ssn_id.to_string())?;
+        let ssn_ptr = self.storage.get_session_ptr(ssn_id.clone())?;
         let (retry_count, crossed_retry_limit) = {
             let mut ssn = lock_ptr!(ssn_ptr)?;
             let previous_retry_count = ssn.retry_count;
@@ -88,7 +81,7 @@ impl BindingState {
         };
 
         if crossed_retry_limit {
-            self.record_retry_limit_reached(ssn_id, retry_count, retry_limit)
+            self.record_retry_limit_reached(&ssn_id, retry_count, retry_limit)
                 .await?;
         }
 
@@ -97,22 +90,23 @@ impl BindingState {
 
     async fn record_bind_failure(
         &self,
-        ssn_id: &str,
-        executor_id: &str,
-        node: &str,
+        executor: &crate::model::Executor,
         result: &FlameResult,
     ) -> Result<(), FlameError> {
+        let ssn_id = executor.ssn_id.clone().ok_or_else(|| {
+            FlameError::InvalidState(format!("Executor <{}> has no bound session", executor.id))
+        })?;
         let detail = result.message.clone().unwrap_or_default();
 
         self.storage
             .record_event(
-                EventOwner::session(ssn_id.to_string()),
+                EventOwner::session(ssn_id),
                 Event {
                     code: SESSION_BIND_FAILED,
                     message: Some(format!(
                         "Executor <{}> on node <{}> failed to bind session with return_code <{}>: {}",
-                        executor_id,
-                        node,
+                        executor.id,
+                        executor.node,
                         result.return_code,
                         detail
                     )),
