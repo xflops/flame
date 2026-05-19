@@ -24,7 +24,10 @@ use rayon::prelude::*;
 
 use common::FlameError;
 
-use crate::cache::{Object, ObjectKey, ObjectMetadata};
+use crate::cache::{
+    Object, ObjectKey, ObjectMetadata, ObjectPayload, CACHE_FORMAT_ARROW_TABLE,
+    CACHE_FORMAT_METADATA_KEY, CACHE_VERSION_METADATA_KEY,
+};
 
 use super::StorageEngine;
 
@@ -78,8 +81,7 @@ impl StorageEngine for DiskStorage {
 
         tokio::task::spawn_blocking(move || {
             fs::create_dir_all(&session_dir)?;
-            let batch = object_to_batch(&object_clone)?;
-            write_batch_to_file(&object_path, &batch)?;
+            write_object_to_file(&object_path, &object_clone)?;
             if delta_dir.exists() {
                 fs::remove_dir_all(&delta_dir)?;
             }
@@ -100,7 +102,11 @@ impl StorageEngine for DiskStorage {
             }
             let base = load_object_from_file(&object_path)?;
             let deltas = read_deltas_sync(&delta_dir, base.version)?;
-            Ok(Some(Object::with_deltas(base.version, base.data, deltas)))
+            Ok(Some(Object::with_payload(
+                base.version,
+                base.payload,
+                deltas,
+            )))
         })
         .await
         .map_err(|e| FlameError::Internal(format!("Task join error: {}", e)))?
@@ -280,7 +286,7 @@ impl StorageEngine for DiskStorage {
                         let delta_dir = session_path.join(format!("{}.deltas", object_id));
                         let base = load_object_from_file(&object_path)?;
                         let deltas = read_deltas_sync(&delta_dir, base.version)?;
-                        let object = Object::with_deltas(base.version, base.data, deltas);
+                        let object = Object::with_payload(base.version, base.payload, deltas);
 
                         results.push((key, object));
                     }
@@ -364,20 +370,63 @@ fn validate_delta_versions(deltas: &[Object], base_version: u64) -> Result<(), F
     Ok(())
 }
 
+fn write_object_to_file(path: &Path, object: &Object) -> Result<(), FlameError> {
+    match &object.payload {
+        ObjectPayload::Opaque(_) => {
+            let batch = object_to_batch(object)?;
+            write_batch_to_file(path, &batch)
+        }
+        ObjectPayload::ArrowTable { schema, batches } => {
+            let file = fs::File::create(path)?;
+            let schema = schema_with_cache_metadata(schema.as_ref(), object.version);
+            let batches = batches
+                .iter()
+                .map(|batch| batch_with_schema(batch, schema.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+            write_batches_to_writer(file, schema, &batches)
+        }
+    }
+}
+
+fn schema_with_cache_metadata(schema: &Schema, version: u64) -> Arc<Schema> {
+    let mut metadata = schema.metadata().clone();
+    metadata.insert(
+        CACHE_FORMAT_METADATA_KEY.to_string(),
+        CACHE_FORMAT_ARROW_TABLE.to_string(),
+    );
+    metadata.insert(CACHE_VERSION_METADATA_KEY.to_string(), version.to_string());
+    Arc::new(schema.clone().with_metadata(metadata))
+}
+
+fn batch_with_schema(batch: &RecordBatch, schema: Arc<Schema>) -> Result<RecordBatch, FlameError> {
+    RecordBatch::try_new(schema, batch.columns().to_vec())
+        .map_err(|e| FlameError::Internal(format!("Failed to attach schema metadata: {}", e)))
+}
+
 fn write_batch_to_file(path: &Path, batch: &RecordBatch) -> Result<(), FlameError> {
     let file = fs::File::create(path)?;
-    write_batch_to_writer(file, batch)
+    write_batches_to_writer(file, batch.schema(), std::slice::from_ref(batch))
 }
 
 fn write_batch_to_writer(file: fs::File, batch: &RecordBatch) -> Result<(), FlameError> {
+    write_batches_to_writer(file, batch.schema(), std::slice::from_ref(batch))
+}
+
+fn write_batches_to_writer(
+    file: fs::File,
+    schema: Arc<Schema>,
+    batches: &[RecordBatch],
+) -> Result<(), FlameError> {
     let options = IpcWriteOptions::default()
         .try_with_compression(Some(CompressionType::ZSTD))
         .map_err(|e| FlameError::Internal(format!("Failed to set compression: {}", e)))?;
-    let mut writer = FileWriter::try_new_with_options(file, &batch.schema(), options)
+    let mut writer = FileWriter::try_new_with_options(file, schema.as_ref(), options)
         .map_err(|e| FlameError::Internal(format!("Failed to create writer: {}", e)))?;
-    writer
-        .write(batch)
-        .map_err(|e| FlameError::Internal(format!("Failed to write batch: {}", e)))?;
+    for batch in batches {
+        writer
+            .write(batch)
+            .map_err(|e| FlameError::Internal(format!("Failed to write batch: {}", e)))?;
+    }
     writer
         .finish()
         .map_err(|e| FlameError::Internal(format!("Failed to finish writer: {}", e)))?;
@@ -388,7 +437,7 @@ fn object_to_batch(object: &Object) -> Result<RecordBatch, FlameError> {
     let schema = get_object_schema();
 
     let version_array = UInt64Array::from(vec![object.version]);
-    let data_array = BinaryArray::from(vec![object.data.as_slice()]);
+    let data_array = BinaryArray::from(vec![object.opaque_data()?]);
 
     RecordBatch::try_new(
         Arc::new(schema),
@@ -407,17 +456,35 @@ fn load_object_from_file(path: &Path) -> Result<Object, FlameError> {
     })?;
     let reader = FileReader::try_new(file, None)
         .map_err(|e| FlameError::Internal(format!("Failed to create reader: {}", e)))?;
+    let schema = reader.schema();
 
     // SAFETY: Skipping validation is safe because all data was written by this service
     let reader = unsafe { reader.with_skip_validation(true) };
 
-    let batch = reader
+    let batches = reader
         .into_iter()
-        .next()
-        .ok_or_else(|| FlameError::Internal("No batches in file".to_string()))?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|e| FlameError::Internal(format!("Failed to read batch: {}", e)))?;
 
-    batch_to_object(&batch)
+    if schema
+        .metadata()
+        .get(CACHE_FORMAT_METADATA_KEY)
+        .map(|format| format == CACHE_FORMAT_ARROW_TABLE)
+        .unwrap_or(false)
+    {
+        let version = schema
+            .metadata()
+            .get(crate::cache::CACHE_VERSION_METADATA_KEY)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        return Ok(Object::new_arrow_table(version, schema, batches));
+    }
+
+    let batch = batches
+        .first()
+        .ok_or_else(|| FlameError::Internal("No batches in file".to_string()))?;
+
+    batch_to_object(batch)
 }
 
 fn batch_to_object(batch: &RecordBatch) -> Result<Object, FlameError> {
@@ -447,6 +514,7 @@ fn batch_to_object(batch: &RecordBatch) -> Result<Object, FlameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Int32Array, StringArray};
     use tempfile::tempdir;
 
     fn test_key(app: &str, session: &str, object: &str) -> ObjectKey {
@@ -470,8 +538,55 @@ mod tests {
         assert!(result.is_some());
         let loaded = result.unwrap();
         assert_eq!(loaded.version, 1);
-        assert_eq!(loaded.data, vec![1, 2, 3, 4, 5]);
+        assert_eq!(loaded.opaque_data().unwrap(), &[1, 2, 3, 4, 5]);
         assert!(loaded.deltas.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_disk_storage_write_read_native_arrow_table() {
+        let temp_dir = tempdir().unwrap();
+        let storage = DiskStorage::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let schema = Arc::new(
+            Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("label", DataType::Utf8, false),
+            ])
+            .with_metadata(
+                [(
+                    CACHE_FORMAT_METADATA_KEY.to_string(),
+                    CACHE_FORMAT_ARROW_TABLE.to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        let key = test_key("test-app", "test-session", "native");
+        let object = Object::new_arrow_table(7, schema, vec![batch]);
+
+        storage.write_object(&key, &object).await.unwrap();
+
+        let loaded = storage.read_object(&key).await.unwrap().unwrap();
+        assert_eq!(loaded.version, 7);
+        match loaded.payload {
+            ObjectPayload::ArrowTable { schema, batches } => {
+                assert_eq!(
+                    schema.metadata().get(CACHE_FORMAT_METADATA_KEY).unwrap(),
+                    CACHE_FORMAT_ARROW_TABLE
+                );
+                assert_eq!(batches.len(), 1);
+                assert_eq!(batches[0].num_rows(), 3);
+            }
+            ObjectPayload::Opaque(_) => panic!("expected native Arrow payload"),
+        }
     }
 
     #[tokio::test]
@@ -490,7 +605,7 @@ mod tests {
         let loaded = storage.read_object(&key).await.unwrap().unwrap();
         assert_eq!(loaded.deltas.len(), 1);
         assert_eq!(loaded.deltas[0].version, 2);
-        assert_eq!(loaded.deltas[0].data, vec![4, 5, 6]);
+        assert_eq!(loaded.deltas[0].opaque_data().unwrap(), &[4, 5, 6]);
     }
 
     #[tokio::test]

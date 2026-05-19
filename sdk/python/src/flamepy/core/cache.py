@@ -41,6 +41,17 @@ _TYPE_ARROW_ARRAY = b"FLM\x03"
 _TYPE_ARROW_BATCH = b"FLM\x04"
 _MAGIC_PREFIX_LEN = len(_MAGIC_PREFIX) + 1  # 4 bytes total
 
+CACHE_FORMAT_METADATA_KEY = b"flame.cache.format"
+CACHE_VERSION_METADATA_KEY = b"flame.cache.version"
+CACHE_LOGICAL_TYPE_METADATA_KEY = b"flame.cache.logical_type"
+CACHE_FORMAT_OPAQUE = b"opaque-v1"
+CACHE_FORMAT_ARROW_TABLE = b"arrow-table-v1"
+LOGICAL_TYPE_PYARROW_TABLE = "pyarrow.table"
+LOGICAL_TYPE_PYARROW_RECORD_BATCH = "pyarrow.record_batch"
+LOGICAL_TYPE_PANDAS_DATAFRAME = "pandas.dataframe"
+LOGICAL_TYPE_POLARS_DATAFRAME = "polars.dataframe"
+LOGICAL_TYPE_DATASET = "dataset"
+
 try:
     import numpy as np
 
@@ -48,6 +59,22 @@ try:
 except ImportError:
     np = None  # type: ignore[assignment]
     _HAS_NUMPY = False
+
+try:
+    import pandas as pd
+
+    _HAS_PANDAS = True
+except ImportError:
+    pd = None  # type: ignore[assignment]
+    _HAS_PANDAS = False
+
+try:
+    import polars as pl
+
+    _HAS_POLARS = True
+except ImportError:
+    pl = None  # type: ignore[assignment]
+    _HAS_POLARS = False
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +146,13 @@ class FetchResult:
     version: int
     base: Any = None
     patches: List[Patch] = field(default_factory=list)
+
+
+@dataclass
+class CachePayload:
+    schema: pa.Schema
+    batches: List[pa.RecordBatch]
+    native_arrow: bool
 
 
 class _IdentityKey:
@@ -417,6 +451,131 @@ def _deserialize_cloudpickle(data: bytes) -> Any:
     return cloudpickle.loads(data)
 
 
+def _cache_metadata_value(schema: pa.Schema, key: bytes) -> Optional[bytes]:
+    metadata = schema.metadata or {}
+    return metadata.get(key)
+
+
+def _is_native_arrow_schema(schema: pa.Schema) -> bool:
+    return _cache_metadata_value(schema, CACHE_FORMAT_METADATA_KEY) == CACHE_FORMAT_ARROW_TABLE
+
+
+def _cache_schema_version(schema: pa.Schema) -> int:
+    value = _cache_metadata_value(schema, CACHE_VERSION_METADATA_KEY)
+    if value is None:
+        return 0
+    try:
+        return int(value.decode("utf-8"))
+    except ValueError:
+        return 0
+
+
+def _schema_with_cache_metadata(schema: pa.Schema, logical_type: str, version: int = 0) -> pa.Schema:
+    metadata = dict(schema.metadata or {})
+    metadata[CACHE_FORMAT_METADATA_KEY] = CACHE_FORMAT_ARROW_TABLE
+    metadata[CACHE_VERSION_METADATA_KEY] = str(version).encode("utf-8")
+    metadata[CACHE_LOGICAL_TYPE_METADATA_KEY] = logical_type.encode("utf-8")
+    return schema.with_metadata(metadata)
+
+
+def _strip_cache_metadata(schema: pa.Schema) -> pa.Schema:
+    metadata = {key: value for key, value in (schema.metadata or {}).items() if not key.startswith(b"flame.cache.")}
+    return schema.with_metadata(metadata or None)
+
+
+def _table_with_cache_metadata(table: pa.Table, logical_type: str, version: int = 0) -> pa.Table:
+    return table.replace_schema_metadata(_schema_with_cache_metadata(table.schema, logical_type, version).metadata)
+
+
+def _batch_with_cache_metadata(batch: pa.RecordBatch, logical_type: str, version: int = 0) -> pa.RecordBatch:
+    schema = _schema_with_cache_metadata(batch.schema, logical_type, version)
+    return pa.RecordBatch.from_arrays(
+        [batch.column(i) for i in range(batch.num_columns)],
+        schema=schema,
+    )
+
+
+def _prepare_native_arrow_payload(obj: Any) -> Optional[CachePayload]:
+    """Convert supported tabular payloads to native Arrow batches."""
+    logical_type: Optional[str] = None
+    table: Optional[pa.Table] = None
+    batch: Optional[pa.RecordBatch] = None
+
+    if isinstance(obj, pa.Table):
+        logical_type = LOGICAL_TYPE_PYARROW_TABLE
+        table = obj
+    elif isinstance(obj, pa.RecordBatch):
+        logical_type = LOGICAL_TYPE_PYARROW_RECORD_BATCH
+        batch = obj
+    elif _HAS_PANDAS and isinstance(obj, pd.DataFrame):
+        logical_type = LOGICAL_TYPE_PANDAS_DATAFRAME
+        table = pa.Table.from_pandas(obj)
+    elif _HAS_POLARS and isinstance(obj, pl.DataFrame):
+        logical_type = LOGICAL_TYPE_POLARS_DATAFRAME
+        table = obj.to_arrow()
+    elif _HAS_POLARS and isinstance(obj, pl.LazyFrame):
+        logical_type = LOGICAL_TYPE_POLARS_DATAFRAME
+        table = obj.collect().to_arrow()
+    elif hasattr(obj, "to_arrow"):
+        try:
+            arrow_obj = obj.to_arrow()
+        except TypeError:
+            arrow_obj = None
+        if isinstance(arrow_obj, pa.Table):
+            logical_type = LOGICAL_TYPE_DATASET
+            table = arrow_obj
+        elif isinstance(arrow_obj, pa.RecordBatch):
+            logical_type = LOGICAL_TYPE_DATASET
+            batch = arrow_obj
+
+    if batch is not None and logical_type is not None:
+        batch = _batch_with_cache_metadata(batch, logical_type)
+        return CachePayload(schema=batch.schema, batches=[batch], native_arrow=True)
+
+    if table is not None and logical_type is not None:
+        table = _table_with_cache_metadata(table, logical_type)
+        batches = table.to_batches()
+        if not batches:
+            batches = [
+                pa.RecordBatch.from_arrays(
+                    [table.column(i).combine_chunks() for i in range(table.num_columns)],
+                    schema=table.schema,
+                )
+            ]
+        return CachePayload(schema=table.schema, batches=batches, native_arrow=True)
+
+    return None
+
+
+def _prepare_cache_payload(obj: Any) -> CachePayload:
+    native_payload = _prepare_native_arrow_payload(obj)
+    if native_payload is not None:
+        return native_payload
+    batch = _serialize_object(obj)
+    return CachePayload(schema=batch.schema, batches=[batch], native_arrow=False)
+
+
+def _deserialize_native_arrow_table(table: pa.Table) -> Any:
+    metadata = table.schema.metadata or {}
+    logical_type = metadata.get(CACHE_LOGICAL_TYPE_METADATA_KEY, LOGICAL_TYPE_PYARROW_TABLE.encode("utf-8")).decode("utf-8")
+    user_schema = _strip_cache_metadata(table.schema)
+    table = table.replace_schema_metadata(user_schema.metadata)
+
+    if logical_type == LOGICAL_TYPE_PYARROW_RECORD_BATCH:
+        batches = table.to_batches()
+        if len(batches) == 1:
+            return batches[0]
+        return table
+
+    if logical_type == LOGICAL_TYPE_PANDAS_DATAFRAME and _HAS_PANDAS:
+        return table.to_pandas()
+
+    if logical_type == LOGICAL_TYPE_POLARS_DATAFRAME and _HAS_POLARS:
+        return pl.from_arrow(table)
+
+    return table
+
+
 def _serialize_object_data(obj: Any) -> bytes:
     """Serialize object using the optimal format based on type.
 
@@ -579,13 +738,20 @@ def _get_flight_client_with_retry(endpoint: str, tls_config: Optional[FlameClien
     return _get_flight_client(endpoint, tls_config)
 
 
-def _do_put_remote(client: flight.FlightClient, descriptor: flight.FlightDescriptor, batch: pa.RecordBatch) -> "ObjectRef":
+def _do_put_remote_batches(
+    client: flight.FlightClient,
+    descriptor: flight.FlightDescriptor,
+    schema: pa.Schema,
+    batches: List[pa.RecordBatch],
+    options: Optional[flight.FlightCallOptions] = None,
+) -> "ObjectRef":
     """Perform a remote do_put operation and read the result metadata.
 
     Args:
         client: Arrow Flight client
         descriptor: Flight descriptor for the put operation
-        batch: RecordBatch to upload
+        schema: Arrow schema to upload
+        batches: RecordBatches to upload
 
     Returns:
         ObjectRef received from the server
@@ -593,10 +759,13 @@ def _do_put_remote(client: flight.FlightClient, descriptor: flight.FlightDescrip
     Raises:
         ValueError: If metadata cannot be read from server
     """
-    writer, reader = client.do_put(descriptor, batch.schema)
+    if options is None:
+        writer, reader = client.do_put(descriptor, schema)
+    else:
+        writer, reader = client.do_put(descriptor, schema, options)
 
-    # Write batch
-    writer.write_batch(batch)
+    for batch in batches:
+        writer.write_batch(batch)
 
     # Signal we're done writing
     writer.done_writing()
@@ -623,6 +792,10 @@ def _do_put_remote(client: flight.FlightClient, descriptor: flight.FlightDescrip
     # If we get here, no PutResult was received
     writer.close()
     raise ValueError("No result metadata received from cache server")
+
+
+def _do_put_remote(client: flight.FlightClient, descriptor: flight.FlightDescriptor, batch: pa.RecordBatch) -> "ObjectRef":
+    return _do_put_remote_batches(client, descriptor, batch.schema, [batch])
 
 
 def _get_cache_tls_config() -> Optional[FlameClientTls]:
@@ -683,7 +856,7 @@ def put_object(key_prefix: str, obj: Any) -> "ObjectRef":
     if not cache_endpoint:
         raise ValueError("Cache endpoint not configured")
 
-    batch = _serialize_object(obj)
+    payload = _prepare_cache_payload(obj)
 
     storage_path: Optional[Path] = None
     use_local_storage = False
@@ -706,8 +879,9 @@ def put_object(key_prefix: str, obj: Any) -> "ObjectRef":
         app_session_dir.mkdir(parents=True, exist_ok=True)
 
         object_path = app_session_dir / f"{object_key_with_id.object_id}.arrow"
-        writer = pa.ipc.new_file(object_path, batch.schema)
-        writer.write_batch(batch)
+        writer = pa.ipc.new_file(object_path, payload.schema)
+        for batch in payload.batches:
+            writer.write_batch(batch)
         writer.close()
 
         client = _get_flight_client(cache_endpoint, cache_tls)
@@ -725,7 +899,7 @@ def put_object(key_prefix: str, obj: Any) -> "ObjectRef":
     else:
         client = _get_flight_client(cache_endpoint, cache_tls)
         upload_descriptor = flight.FlightDescriptor.for_path(object_key.to_prefix())
-        ref = _do_put_remote(client, upload_descriptor, batch)
+        ref = _do_put_remote_batches(client, upload_descriptor, payload.schema, payload.batches)
         logger.debug(f"put_object remote: key={ref.key}, version={ref.version}")
         return ref
 
@@ -810,6 +984,13 @@ def _fetch_object_data(ref: ObjectRef, cached_version: int) -> Optional[FetchRes
     reader = client.do_get(ticket)
 
     table = reader.read_all()
+    if _is_native_arrow_schema(table.schema):
+        return FetchResult(
+            mode=FetchMode.FULL,
+            version=_cache_schema_version(table.schema),
+            base=_deserialize_native_arrow_table(table),
+        )
+
     if table.num_rows == 0:
         return None
 
@@ -887,13 +1068,13 @@ def update_object(ref: ObjectRef, new_obj: Any) -> "ObjectRef":
     """
     ObjectKey.from_key(ref.key)
 
-    batch = _serialize_object(new_obj)
+    payload = _prepare_cache_payload(new_obj)
 
     tls_config = _get_cache_tls_config()
     client = _get_flight_client(ref.endpoint, tls_config)
 
     upload_descriptor = flight.FlightDescriptor.for_path(ref.key)
-    new_ref = _do_put_remote(client, upload_descriptor, batch)
+    new_ref = _do_put_remote_batches(client, upload_descriptor, payload.schema, payload.batches)
 
     _cache_remove((ref.endpoint, ref.key))
 

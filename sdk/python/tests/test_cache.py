@@ -25,7 +25,9 @@ from flamepy.core.cache import (
     _cache_lock,
     _deserialize_object,
     _deserialize_object_data,
+    _is_native_arrow_schema,
     _object_cache,
+    _prepare_cache_payload,
     _serialize_object,
     _serialize_object_data,
     delete_objects,
@@ -111,6 +113,15 @@ class TestFastPathSerialization:
         result = _deserialize_object_data(data)
         assert result.equals(table)
 
+    def test_pyarrow_table_uses_native_cache_payload(self):
+        table = pa.table({"col1": [1, 2, 3], "col2": ["a", "b", "c"]})
+        payload = _prepare_cache_payload(table)
+
+        assert payload.native_arrow is True
+        assert _is_native_arrow_schema(payload.schema)
+        assert payload.batches
+        assert payload.schema.metadata[b"flame.cache.logical_type"] == b"pyarrow.table"
+
     def test_pyarrow_record_batch_uses_fast_path(self):
         batch = pa.RecordBatch.from_pydict({"x": [1, 2, 3], "y": [4.0, 5.0, 6.0]})
         data = _serialize_object_data(batch)
@@ -118,6 +129,33 @@ class TestFastPathSerialization:
         assert data[:_MAGIC_PREFIX_LEN] == _TYPE_ARROW_BATCH
         result = _deserialize_object_data(data)
         assert result.equals(batch)
+
+    def test_pyarrow_record_batch_uses_native_cache_payload(self):
+        batch = pa.RecordBatch.from_pydict({"x": [1, 2, 3], "y": [4.0, 5.0, 6.0]})
+        payload = _prepare_cache_payload(batch)
+
+        assert payload.native_arrow is True
+        assert _is_native_arrow_schema(payload.schema)
+        assert payload.batches[0].to_pydict() == batch.to_pydict()
+        assert payload.schema.metadata[b"flame.cache.logical_type"] == b"pyarrow.record_batch"
+
+    def test_pandas_dataframe_uses_native_cache_payload_when_available(self):
+        pd = pytest.importorskip("pandas")
+        dataframe = pd.DataFrame({"col1": [1, 2, 3], "col2": ["a", "b", "c"]})
+        payload = _prepare_cache_payload(dataframe)
+
+        assert payload.native_arrow is True
+        assert _is_native_arrow_schema(payload.schema)
+        assert payload.schema.metadata[b"flame.cache.logical_type"] == b"pandas.dataframe"
+
+    def test_polars_dataframe_uses_native_cache_payload_when_available(self):
+        pl = pytest.importorskip("polars")
+        dataframe = pl.DataFrame({"col1": [1, 2, 3], "col2": ["a", "b", "c"]})
+        payload = _prepare_cache_payload(dataframe)
+
+        assert payload.native_arrow is True
+        assert _is_native_arrow_schema(payload.schema)
+        assert payload.schema.metadata[b"flame.cache.logical_type"] == b"polars.dataframe"
 
     def test_pyarrow_array_uses_fast_path(self):
         arr = pa.array([1, 2, 3, 4, 5])
@@ -590,6 +628,30 @@ class TestClientSideCaching:
         assert result.base == [1]
         assert [patch.data for patch in result.patches] == [[2], [3]]
 
+    def test_fetch_object_data_parses_native_arrow_table(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        table = pa.table({"x": [1, 2, 3], "y": ["a", "b", "c"]})
+        table = table.replace_schema_metadata(
+            {
+                b"flame.cache.format": b"arrow-table-v1",
+                b"flame.cache.version": b"7",
+                b"flame.cache.logical_type": b"pyarrow.table",
+            }
+        )
+        self._patch_fetch_client(monkeypatch, table)
+
+        result = cache_module._fetch_object_data(
+            ObjectRef(endpoint="grpc://host:9090", key="app/session/native-table", version=1),
+            0,
+        )
+
+        assert result.mode == FetchMode.FULL
+        assert result.version == 7
+        assert isinstance(result.base, pa.Table)
+        assert result.base.to_pydict() == {"x": [1, 2, 3], "y": ["a", "b", "c"]}
+        assert b"flame.cache.format" not in (result.base.schema.metadata or {})
+
     def test_fetch_object_data_rejects_base_after_patch(self, monkeypatch):
         from flamepy.core import cache as cache_module
 
@@ -643,6 +705,52 @@ class TestClientSideCaching:
 
 
 class TestPutObject:
+    def test_remote_put_sends_native_arrow_payload(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+        from flamepy.core.types import FlameClientCache
+
+        captured = {"schema": None, "batches": []}
+
+        class MockWriter:
+            def write_batch(self, batch):
+                captured["batches"].append(batch)
+
+            def done_writing(self):
+                pass
+
+            def close(self):
+                pass
+
+        class MockReader:
+            def __init__(self):
+                self._read_count = 0
+
+            def read(self):
+                if self._read_count == 0:
+                    self._read_count += 1
+                    return bson.encode({"endpoint": "grpc://host:9090", "key": "app/session/native", "version": 1})
+                return None
+
+        class MockFlightClient:
+            def do_put(self, descriptor, schema):
+                captured["schema"] = schema
+                return MockWriter(), MockReader()
+
+        class MockContext:
+            cache = FlameClientCache(endpoint="grpc://host:9090")
+
+        monkeypatch.setattr(cache_module, "_context_cache", None)
+        monkeypatch.setattr(cache_module, "FlameContext", lambda: MockContext())
+        monkeypatch.setattr(cache_module, "_get_flight_client", lambda ep, tls=None: MockFlightClient())
+
+        ref = cache_module.put_object("app/session", pa.table({"x": [1, 2, 3]}))
+
+        assert ref.key == "app/session/native"
+        assert captured["schema"].metadata[b"flame.cache.format"] == b"arrow-table-v1"
+        assert captured["schema"].metadata[b"flame.cache.logical_type"] == b"pyarrow.table"
+        assert len(captured["batches"]) == 1
+        assert captured["batches"][0].to_pydict() == {"x": [1, 2, 3]}
+
     def test_local_storage_ref_uses_cacheable_version(self, monkeypatch, tmp_path):
         from flamepy.core import cache as cache_module
         from flamepy.core.types import FlameClientCache
@@ -666,6 +774,7 @@ class TestPutObject:
                 storage=str(tmp_path),
             )
 
+        monkeypatch.setattr(cache_module, "_context_cache", None)
         monkeypatch.setattr(cache_module, "FlameContext", lambda: MockContext())
         monkeypatch.setattr(
             cache_module,

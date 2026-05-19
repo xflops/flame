@@ -209,36 +209,107 @@ impl From<&ObjectKey> for String {
     }
 }
 
-/// Object with optional delta support
-/// Per HLD: deltas field is empty for delta objects themselves
-/// Note: This struct is immutable after construction - use with_deltas() to create
-/// a new Object with deltas populated rather than mutating an existing one.
+pub const CACHE_FORMAT_METADATA_KEY: &str = "flame.cache.format";
+pub const CACHE_VERSION_METADATA_KEY: &str = "flame.cache.version";
+pub const CACHE_FORMAT_ARROW_TABLE: &str = "arrow-table-v1";
+
+/// Native payload stored by object cache.
+///
+/// Opaque payloads preserve the original `version/data` cache behavior.
+/// Arrow table payloads keep their original schema and batches so DataFrame
+/// payloads do not get hidden inside a binary cell.
+#[derive(Debug, Clone)]
+pub enum ObjectPayload {
+    Opaque(Vec<u8>),
+    ArrowTable {
+        schema: Arc<Schema>,
+        batches: Vec<RecordBatch>,
+    },
+}
+
+impl ObjectPayload {
+    pub fn size_bytes(&self) -> u64 {
+        match self {
+            Self::Opaque(data) => data.len() as u64,
+            Self::ArrowTable { batches, .. } => batches
+                .iter()
+                .map(|batch| batch.get_array_memory_size() as u64)
+                .sum(),
+        }
+    }
+
+    pub fn is_arrow_table(&self) -> bool {
+        matches!(self, Self::ArrowTable { .. })
+    }
+}
+
+/// Object with optional delta support.
+/// Deltas are currently opaque payloads; native tabular patch/merge semantics
+/// are intentionally left out of RFE318 item 3.
 #[derive(Debug, Clone)]
 pub struct Object {
     pub version: u64,
-    pub data: Vec<u8>,
+    pub payload: ObjectPayload,
     pub deltas: Vec<Object>,
 }
 
 impl Object {
-    /// Create a new Object with no deltas
+    /// Create a new opaque Object with no deltas.
     pub fn new(version: u64, data: Vec<u8>) -> Self {
         Self {
             version,
-            data,
+            payload: ObjectPayload::Opaque(data),
             deltas: Vec::new(),
         }
     }
 
-    /// Create a new Object with deltas
-    /// This is the preferred way to create an Object with deltas rather than
-    /// mutating an existing Object's deltas field.
+    /// Create a native Arrow table Object with no deltas.
+    pub fn new_arrow_table(version: u64, schema: Arc<Schema>, batches: Vec<RecordBatch>) -> Self {
+        Self {
+            version,
+            payload: ObjectPayload::ArrowTable { schema, batches },
+            deltas: Vec::new(),
+        }
+    }
+
+    /// Create a new opaque Object with deltas.
+    #[cfg(test)]
     pub fn with_deltas(version: u64, data: Vec<u8>, deltas: Vec<Object>) -> Self {
         Self {
             version,
-            data,
+            payload: ObjectPayload::Opaque(data),
             deltas,
         }
+    }
+
+    pub fn with_payload(version: u64, payload: ObjectPayload, deltas: Vec<Object>) -> Self {
+        Self {
+            version,
+            payload,
+            deltas,
+        }
+    }
+
+    pub fn opaque_data(&self) -> Result<&[u8], FlameError> {
+        match &self.payload {
+            ObjectPayload::Opaque(data) => Ok(data),
+            ObjectPayload::ArrowTable { .. } => Err(FlameError::InvalidState(
+                "expected opaque object payload".to_string(),
+            )),
+        }
+    }
+
+    pub fn into_opaque_data(self) -> Result<Vec<u8>, FlameError> {
+        match self.payload {
+            ObjectPayload::Opaque(data) => Ok(data),
+            ObjectPayload::ArrowTable { .. } => Err(FlameError::InvalidState(
+                "expected opaque object payload".to_string(),
+            )),
+        }
+    }
+
+    pub fn is_arrow_table(&self) -> bool {
+        self.payload.is_arrow_table()
     }
 
     pub fn current_version(&self) -> u64 {
@@ -248,7 +319,7 @@ impl Object {
     }
 
     pub fn size_bytes(&self) -> u64 {
-        self.data.len() as u64 + self.deltas.iter().map(Object::size_bytes).sum::<u64>()
+        self.payload.size_bytes() + self.deltas.iter().map(Object::size_bytes).sum::<u64>()
     }
 }
 
@@ -476,7 +547,8 @@ impl ObjectCache {
         };
         let new_version = current_version + 1;
 
-        let versioned_object = Object::new(new_version, object.data);
+        let versioned_payload = version_payload(object.payload, new_version)?;
+        let versioned_object = Object::with_payload(new_version, versioned_payload, Vec::new());
         let size = versioned_object.size_bytes();
 
         self.storage.write_object(&key, &versioned_object).await?;
@@ -565,7 +637,7 @@ impl ObjectCache {
         let current_version = current_object.current_version();
         let new_version = current_version + 1;
 
-        let versioned_delta = Object::new(new_version, delta.data);
+        let versioned_delta = Object::new(new_version, delta.into_opaque_data()?);
         let mut meta = self.storage.patch_object(key, &versioned_delta).await?;
 
         let mut patched_object = current_object;
@@ -696,7 +768,16 @@ impl FlightCacheServer {
 
     async fn collect_batches_from_stream(
         mut stream: Streaming<FlightData>,
-    ) -> Result<(String, Option<String>, Option<String>, Vec<RecordBatch>), FlameError> {
+    ) -> Result<
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Arc<Schema>,
+            Vec<RecordBatch>,
+        ),
+        FlameError,
+    > {
         let mut batches = Vec::new();
         let mut session_id: Option<String> = None;
         let mut object_id: Option<String> = None;
@@ -764,8 +845,10 @@ impl FlightCacheServer {
                 "key must be provided in descriptor path or command".to_string(),
             )
         })?;
+        let schema =
+            schema.ok_or_else(|| FlameError::InvalidState("No schema received".to_string()))?;
 
-        Ok((session_id, object_id, command, batches))
+        Ok((session_id, object_id, command, schema, batches))
     }
 
     fn combine_batches(batches: Vec<RecordBatch>) -> Result<RecordBatch, FlameError> {
@@ -848,6 +931,43 @@ fn get_object_response_schema() -> Schema {
     ])
 }
 
+pub fn is_native_arrow_schema(schema: &Schema) -> bool {
+    schema
+        .metadata()
+        .get(CACHE_FORMAT_METADATA_KEY)
+        .map(|format| format == CACHE_FORMAT_ARROW_TABLE)
+        .unwrap_or(false)
+}
+
+fn arrow_schema_with_cache_metadata(schema: &Schema, version: u64) -> Arc<Schema> {
+    let mut metadata = schema.metadata().clone();
+    metadata.insert(
+        CACHE_FORMAT_METADATA_KEY.to_string(),
+        CACHE_FORMAT_ARROW_TABLE.to_string(),
+    );
+    metadata.insert(CACHE_VERSION_METADATA_KEY.to_string(), version.to_string());
+    Arc::new(schema.clone().with_metadata(metadata))
+}
+
+fn batch_with_schema(batch: &RecordBatch, schema: Arc<Schema>) -> Result<RecordBatch, FlameError> {
+    RecordBatch::try_new(schema, batch.columns().to_vec())
+        .map_err(|e| FlameError::Internal(format!("Failed to attach schema metadata: {}", e)))
+}
+
+fn version_payload(payload: ObjectPayload, version: u64) -> Result<ObjectPayload, FlameError> {
+    match payload {
+        ObjectPayload::Opaque(data) => Ok(ObjectPayload::Opaque(data)),
+        ObjectPayload::ArrowTable { schema, batches } => {
+            let schema = arrow_schema_with_cache_metadata(schema.as_ref(), version);
+            let batches = batches
+                .iter()
+                .map(|batch| batch_with_schema(batch, schema.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ObjectPayload::ArrowTable { schema, batches })
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ObjectResponseKind {
     Base,
@@ -870,7 +990,7 @@ fn object_to_batch(object: &Object) -> Result<RecordBatch, FlameError> {
     let schema = get_object_schema();
 
     let version_array = UInt64Array::from(vec![object.version]);
-    let data_array = BinaryArray::from(vec![object.data.as_slice()]);
+    let data_array = BinaryArray::from(vec![object.opaque_data()?]);
 
     RecordBatch::try_new(
         Arc::new(schema),
@@ -933,7 +1053,7 @@ fn object_to_response_batch(
 
     let version_array = UInt64Array::from(vec![object.version]);
     let kind_array = StringArray::from(vec![kind.as_str()]);
-    let data_array = BinaryArray::from(vec![object.data.as_slice()]);
+    let data_array = BinaryArray::from(vec![object.opaque_data()?]);
 
     RecordBatch::try_new(
         Arc::new(schema),
@@ -971,6 +1091,27 @@ fn object_patches_to_flight_data_vec(patches: Vec<&Object>) -> Result<Vec<Flight
 fn object_rows_to_flight_data_vec(
     rows: Vec<(ObjectResponseKind, &Object)>,
 ) -> Result<Vec<FlightData>, FlameError> {
+    let schema = Arc::new(get_object_response_schema());
+    let batches = rows
+        .into_iter()
+        .map(|(kind, object)| object_to_response_batch(object, kind))
+        .collect::<Result<Vec<_>, _>>()?;
+    record_batches_to_flight_data_vec(schema, &batches)
+}
+
+fn object_to_native_flight_data_vec(obj: &Object) -> Result<Vec<FlightData>, FlameError> {
+    match &obj.payload {
+        ObjectPayload::ArrowTable { schema, batches } => {
+            record_batches_to_flight_data_vec(schema.clone(), batches)
+        }
+        ObjectPayload::Opaque(_) => object_to_flight_data_vec(obj),
+    }
+}
+
+fn record_batches_to_flight_data_vec(
+    schema: Arc<Schema>,
+    batches: &[RecordBatch],
+) -> Result<Vec<FlightData>, FlameError> {
     let options = IpcWriteOptions::default()
         .try_with_compression(Some(CompressionType::ZSTD))
         .map_err(|e| FlameError::Internal(format!("Failed to set compression: {}", e)))?;
@@ -978,8 +1119,6 @@ fn object_rows_to_flight_data_vec(
     let data_gen = IpcDataGenerator::default();
     let mut dict_tracker = DictionaryTracker::new(false);
     let mut compression_ctx = CompressionContext::default();
-
-    let schema = Arc::new(get_object_response_schema());
 
     let mut all_flight_data = Vec::new();
 
@@ -995,15 +1134,9 @@ fn object_rows_to_flight_data_vec(
         data_body: vec![].into(),
     });
 
-    for (kind, object) in rows {
-        let delta_batch = object_to_response_batch(object, kind)?;
+    for batch in batches {
         let (encoded_dicts, encoded_batch) = data_gen
-            .encode(
-                &delta_batch,
-                &mut dict_tracker,
-                &options,
-                &mut compression_ctx,
-            )
+            .encode(batch, &mut dict_tracker, &options, &mut compression_ctx)
             .map_err(|e| FlameError::Internal(format!("Failed to encode response batch: {}", e)))?;
         for dict_batch in encoded_dicts {
             all_flight_data.push(dict_batch.into());
@@ -1051,10 +1184,22 @@ impl FlightService for FlightCacheServer {
             app_metadata: Bytes::new(),
         };
 
-        // Return empty schema - schema will be discovered from FlightData
-        // This avoids compatibility issues with schema encoding between Rust and Python
+        let schema = if let Ok(object_key) = ObjectKey::try_from(key.as_str()) {
+            match self.cache.get(&object_key).await {
+                Ok(object) => match object.payload {
+                    ObjectPayload::ArrowTable { schema, .. } => {
+                        Bytes::from(encode_schema(&schema)?)
+                    }
+                    ObjectPayload::Opaque(_) => Bytes::new(),
+                },
+                Err(_) => Bytes::new(),
+            }
+        } else {
+            Bytes::new()
+        };
+
         let flight_info = FlightInfo {
-            schema: Bytes::new(),
+            schema,
             flight_descriptor: Some(FlightDescriptor {
                 r#type: descriptor.r#type,
                 cmd: descriptor.cmd,
@@ -1126,7 +1271,24 @@ impl FlightService for FlightCacheServer {
                 client_version,
                 server_version
             );
-        } else if client_version != 0 && object.version <= client_version {
+        }
+
+        if object.is_arrow_table() {
+            tracing::debug!(
+                "do_get: key={}, native_arrow_rows={}, server_version={}",
+                key_str,
+                object.size_bytes(),
+                server_version
+            );
+            let flight_data_vec = object_to_native_flight_data_vec(&object)?;
+            let stream = futures::stream::iter(flight_data_vec.into_iter().map(Ok));
+            return Ok(Response::new(Box::pin(stream)));
+        }
+
+        if client_version != 0
+            && client_version <= server_version
+            && object.version <= client_version
+        {
             let needed_patches: Vec<&Object> = object
                 .deltas
                 .iter()
@@ -1163,7 +1325,7 @@ impl FlightService for FlightCacheServer {
         tracing::debug!(
             "do_get: key={}, base_size={}, delta_count={}",
             key_str,
-            object.data.len(),
+            object.size_bytes(),
             object.deltas.len()
         );
 
@@ -1179,7 +1341,7 @@ impl FlightService for FlightCacheServer {
     ) -> Result<Response<Self::DoPutStream>, Status> {
         let stream = request.into_inner();
 
-        let (key_or_prefix, object_id, command, batches) =
+        let (key_or_prefix, object_id, command, schema, batches) =
             Self::collect_batches_from_stream(stream).await?;
         tracing::debug!(
             "do_put: key_or_prefix={}, object_id={:?}, command={:?}, batch_count={}",
@@ -1189,10 +1351,9 @@ impl FlightService for FlightCacheServer {
             batches.len()
         );
 
-        let combined_batch = Self::combine_batches(batches)?;
-        let object = batch_to_object(&combined_batch)?;
-
         let metadata = if command.as_deref() == Some("PATCH") {
+            let combined_batch = Self::combine_batches(batches)?;
+            let object = batch_to_object(&combined_batch)?;
             let key_str = match object_id {
                 Some(oid) => format!("{}/{}", key_or_prefix, oid),
                 None => key_or_prefix,
@@ -1201,6 +1362,12 @@ impl FlightService for FlightCacheServer {
             let key = ObjectKey::try_from(key_str.as_str())?;
             self.cache.patch(&key, object).await?
         } else {
+            let object = if is_native_arrow_schema(schema.as_ref()) {
+                Object::new_arrow_table(0, schema, batches)
+            } else {
+                let combined_batch = Self::combine_batches(batches)?;
+                batch_to_object(&combined_batch)?
+            };
             let key = ObjectKey::from_path(&key_or_prefix)?;
             let key = match object_id {
                 Some(oid) => {
@@ -1422,6 +1589,7 @@ pub async fn run(cache_config: &FlameCache) -> Result<(), FlameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Int32Array;
 
     mod validation {
         use super::*;
@@ -1507,7 +1675,7 @@ mod tests {
         fn new_creates_object_without_deltas() {
             let obj = Object::new(1, vec![1, 2, 3]);
             assert_eq!(obj.version, 1);
-            assert_eq!(obj.data, vec![1, 2, 3]);
+            assert_eq!(obj.opaque_data().unwrap(), &[1, 2, 3]);
             assert!(obj.deltas.is_empty());
         }
 
@@ -1518,10 +1686,10 @@ mod tests {
             let obj = Object::with_deltas(0, vec![1, 2, 3], vec![delta1.clone(), delta2.clone()]);
 
             assert_eq!(obj.version, 0);
-            assert_eq!(obj.data, vec![1, 2, 3]);
+            assert_eq!(obj.opaque_data().unwrap(), &[1, 2, 3]);
             assert_eq!(obj.deltas.len(), 2);
-            assert_eq!(obj.deltas[0].data, vec![4, 5]);
-            assert_eq!(obj.deltas[1].data, vec![6, 7]);
+            assert_eq!(obj.deltas[0].opaque_data().unwrap(), &[4, 5]);
+            assert_eq!(obj.deltas[1].opaque_data().unwrap(), &[6, 7]);
         }
 
         #[test]
@@ -1537,7 +1705,32 @@ mod tests {
             let obj = Object::new(42, vec![10, 20, 30]);
             let cloned = obj.clone();
             assert_eq!(cloned.version, obj.version);
-            assert_eq!(cloned.data, obj.data);
+            assert_eq!(cloned.opaque_data().unwrap(), obj.opaque_data().unwrap());
+        }
+
+        #[test]
+        fn new_arrow_table_creates_native_payload() {
+            let schema = Arc::new(
+                Schema::new(vec![Field::new("id", DataType::Int32, false)]).with_metadata(
+                    [(
+                        CACHE_FORMAT_METADATA_KEY.to_string(),
+                        CACHE_FORMAT_ARROW_TABLE.to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            );
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap();
+            let obj = Object::new_arrow_table(3, schema, vec![batch]);
+
+            assert!(obj.is_arrow_table());
+            assert_eq!(obj.version, 3);
+            assert_eq!(obj.current_version(), 3);
+            assert!(obj.opaque_data().is_err());
         }
     }
 
@@ -1616,7 +1809,10 @@ mod tests {
 
             let recovered = batch_to_object(&batch).unwrap();
             assert_eq!(recovered.version, original.version);
-            assert_eq!(recovered.data, original.data);
+            assert_eq!(
+                recovered.opaque_data().unwrap(),
+                original.opaque_data().unwrap()
+            );
             assert!(recovered.deltas.is_empty());
         }
 
@@ -1626,7 +1822,7 @@ mod tests {
             let batch = object_to_batch(&obj).unwrap();
             let recovered = batch_to_object(&batch).unwrap();
             assert_eq!(recovered.version, 0);
-            assert!(recovered.data.is_empty());
+            assert!(recovered.opaque_data().unwrap().is_empty());
         }
 
         #[test]
@@ -1636,7 +1832,7 @@ mod tests {
             let batch = object_to_batch(&obj).unwrap();
             let recovered = batch_to_object(&batch).unwrap();
             assert_eq!(recovered.version, 999);
-            assert_eq!(recovered.data, large_data);
+            assert_eq!(recovered.opaque_data().unwrap(), large_data.as_slice());
         }
 
         #[test]
@@ -1652,7 +1848,7 @@ mod tests {
 
             let recovered = batch_to_object(&batch).unwrap();
             assert_eq!(recovered.version, 0);
-            assert_eq!(recovered.data, b"abcdefghi");
+            assert_eq!(recovered.opaque_data().unwrap(), b"abcdefghi");
         }
 
         #[test]
@@ -1705,7 +1901,47 @@ mod tests {
             let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
             let retrieved = cache.get(&key).await.unwrap();
             assert_eq!(retrieved.version, 1);
-            assert_eq!(retrieved.data, vec![1, 2, 3]);
+            assert_eq!(retrieved.opaque_data().unwrap(), &[1, 2, 3]);
+        }
+
+        #[tokio::test]
+        async fn put_and_get_native_arrow_table() {
+            let cache = create_test_cache().await;
+            let schema = Arc::new(
+                Schema::new(vec![Field::new("id", DataType::Int32, false)]).with_metadata(
+                    [(
+                        CACHE_FORMAT_METADATA_KEY.to_string(),
+                        CACHE_FORMAT_ARROW_TABLE.to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            );
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap();
+            let obj = Object::new_arrow_table(0, schema, vec![batch]);
+
+            let key = ObjectKey::from_path("test-app/native-session").unwrap();
+            let meta = cache.put(key, obj).await.unwrap();
+            assert_eq!(meta.version, 1);
+
+            let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
+            let retrieved = cache.get(&key).await.unwrap();
+            assert_eq!(retrieved.version, 1);
+            match retrieved.payload {
+                ObjectPayload::ArrowTable { schema, batches } => {
+                    assert_eq!(
+                        schema.metadata().get(CACHE_VERSION_METADATA_KEY).unwrap(),
+                        "1"
+                    );
+                    assert_eq!(batches.len(), 1);
+                    assert_eq!(batches[0].num_rows(), 3);
+                }
+                ObjectPayload::Opaque(_) => panic!("expected native Arrow payload"),
+            }
         }
 
         #[tokio::test]
@@ -1731,10 +1967,10 @@ mod tests {
             let object = cache.get(&key).await.unwrap();
             assert_eq!(object.version, 1);
             assert_eq!(object.current_version(), 2);
-            assert_eq!(object.data, b"base".to_vec());
+            assert_eq!(object.opaque_data().unwrap(), b"base");
             assert_eq!(object.deltas.len(), 1);
             assert_eq!(object.deltas[0].version, 2);
-            assert_eq!(object.deltas[0].data, b"patch".to_vec());
+            assert_eq!(object.deltas[0].opaque_data().unwrap(), b"patch");
         }
 
         #[tokio::test]
@@ -2124,6 +2360,56 @@ mod tests {
             let batches = get_batches(&server, &format!("{}:{}", meta.key, meta.version)).await;
 
             assert!(batches.is_empty());
+        }
+
+        #[tokio::test]
+        async fn native_arrow_object_returns_original_schema_batches() {
+            let (server, _temp) = create_disk_test_server().await;
+            let schema = Arc::new(
+                Schema::new(vec![
+                    Field::new("id", DataType::Int32, false),
+                    Field::new("label", DataType::Utf8, false),
+                ])
+                .with_metadata(
+                    [(
+                        CACHE_FORMAT_METADATA_KEY.to_string(),
+                        CACHE_FORMAT_ARROW_TABLE.to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            );
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                ],
+            )
+            .unwrap();
+            let meta = server
+                .cache
+                .put(
+                    ObjectKey::from_path("app/native").unwrap(),
+                    Object::new_arrow_table(0, schema, vec![batch]),
+                )
+                .await
+                .unwrap();
+
+            let batches = get_batches(&server, &format!("{}:0", meta.key)).await;
+
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].schema().field(0).name(), "id");
+            assert_eq!(batches[0].schema().field(1).name(), "label");
+            assert_eq!(
+                batches[0]
+                    .schema()
+                    .metadata()
+                    .get(CACHE_FORMAT_METADATA_KEY)
+                    .unwrap(),
+                CACHE_FORMAT_ARROW_TABLE
+            );
+            assert_eq!(batches[0].num_rows(), 3);
         }
     }
 

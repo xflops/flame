@@ -1,5 +1,20 @@
 # Object Cache Implementation Status
 
+## ✅ Implemented: Native DataSet/DataFrame Direct Cache Path
+
+Issue #318 item 3 is implemented for tabular payloads that can be represented as Arrow data directly in object cache, instead of wrapping them as pickled objects or Arrow IPC bytes inside the opaque `{version, data}` row.
+
+Scope:
+- Detect PyArrow tables/batches, pandas DataFrames, polars DataFrames, and adapter-backed Dataset-like objects in FlamePy without adding mandatory pandas/polars/datasets dependencies.
+- Stream and persist native tabular payloads as Arrow schemas and record batches with reserved `flame.cache.*` schema metadata.
+- Preserve the existing opaque object path, existing `ObjectRef` shape, and legacy `version/data` cache files.
+- Keep native tabular patch/merge semantics out of scope for this item.
+
+Verification:
+- Rust object-cache unit coverage includes native Arrow payload storage, reload, and Flight `do_get` schema/batch streaming.
+- Python unit coverage includes native payload classification, direct remote `do_put` schema emission, and native Arrow `do_get` parsing.
+- E2E tests were added for native Arrow table put/get and update paths.
+
 ## Migration from Naive Cache
 
 ✅ **Completed**: The naive HTTP-based cache in `flame-executor-manager` has been removed. The following changes were made:
@@ -15,7 +30,7 @@ The object cache is now provided as an embedded library within the `flame-execut
 ### Core Implementation
 - ✅ Rust Arrow Flight server implemented (`object_cache/src/cache.rs`)
 - ✅ Disk persistence using Arrow IPC format
-- ✅ Key-based storage organization (`session_id/object_id`)
+- ✅ Key-based storage organization (`app_name/session_id/object_id`)
 - ✅ In-memory index with HashMap
 - ✅ Object loading from disk on startup
 - ✅ Configuration support (flame-cluster.yaml with storage path)

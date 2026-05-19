@@ -15,6 +15,7 @@ import time
 import uuid
 
 import flamepy.core.cache as cache_module
+import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
 from flamepy.core import FlameContext, ObjectRef, get_object, patch_object, put_object, update_object
@@ -35,6 +36,38 @@ def test_cache_put_and_get():
 
     result = get_object(ref)
     assert result == test_data
+
+
+def test_cache_put_and_get_native_arrow_table():
+    """Test that Arrow tables round-trip through the native cache path."""
+    key_prefix = f"test-app/test-native-arrow-{uuid.uuid4().hex[:8]}"
+    table = pa.table({"col1": [1, 2, 3], "col2": ["a", "b", "c"]})
+
+    ref = put_object(key_prefix, table)
+
+    assert ref.version == 1
+
+    result = get_object(ref)
+    assert isinstance(result, pa.Table)
+    assert result.to_pydict() == table.to_pydict()
+    assert b"flame.cache.format" not in (result.schema.metadata or {})
+
+
+def test_cache_native_arrow_table_update():
+    """Test that native Arrow table updates rewrite the base object."""
+    key_prefix = f"test-app/test-native-arrow-update-{uuid.uuid4().hex[:8]}"
+    table = pa.table({"value": [1, 2, 3]})
+    updated = pa.table({"value": [4, 5], "label": ["x", "y"]})
+
+    ref = put_object(key_prefix, table)
+    updated_ref = update_object(ref, updated)
+
+    assert updated_ref.key == ref.key
+    assert updated_ref.version == ref.version + 1
+
+    result = get_object(updated_ref)
+    assert isinstance(result, pa.Table)
+    assert result.to_pydict() == updated.to_pydict()
 
 
 def test_cache_update():

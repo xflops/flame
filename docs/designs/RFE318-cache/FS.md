@@ -21,6 +21,7 @@ This design aims to improve the object cache implementation by leveraging Apache
 4. **Scalability**: Support both local and remote cache access patterns to enable distributed caching scenarios.
 5. **Standardization**: Use Arrow Flight as the communication protocol, which is a standard for high-performance data services.
 6. **Incremental Updates**: Support `patch` operation for appending delta data to objects, enabling efficient distributed operations with multiple clients.
+7. **Native Tabular Payloads**: Store DataSet/DataFrame-style payloads directly as Arrow data instead of wrapping them as pickled or opaque IPC bytes.
 
 ## 2. Function Specification
 
@@ -97,12 +98,12 @@ The cache server implements the Arrow Flight protocol with the following operati
    - Behavior: Persists data to disk using Arrow IPC, returns ObjectRef
 
 2. **do_get**: Retrieve an object from the cache
-   - Request: Ticket containing key (`ssn_id/object_id`)
+   - Request: Ticket containing key (`app_name/session_id/object_id`) and optional cached version suffix
    - Response: Streaming FlightData containing RecordBatch with object data
    - Behavior: Reads base object and all deltas from disk, returns combined data
 
 3. **get_flight_info**: Get metadata about a flight
-   - Request: FlightDescriptor with path (`{session_id}/{object_id}`)
+   - Request: FlightDescriptor with path (`{app_name}/{session_id}/{object_id}`)
    - Response: FlightInfo with schema information
 
 4. **list_flights**: List all cached objects
@@ -116,6 +117,110 @@ The cache server implements the Arrow Flight protocol with the following operati
      - `{app}/{session}` - delete all objects in a specific session
      - `{app}/*` - delete all objects across all sessions of an application (wildcard)
    - **PATCH**: Append delta data to an existing object (new)
+
+### Native DataSet/DataFrame Cache Path
+
+Issue #318 item 3 scopes the next cache enhancement to: **For DataSet/DataFrame, put to cache directly**. In this design, "DataSet/DataFrame" means tabular Python payloads that can be represented losslessly as Arrow batches without cloudpickle:
+
+- `pyarrow.Table`
+- `pyarrow.RecordBatch`
+- `pandas.DataFrame` when pandas is installed
+- `polars.DataFrame` and collected `polars.LazyFrame` when polars is installed
+- Dataset-like objects that expose an Arrow table through `to_arrow()`, `__arrow_c_stream__`, or an adapter registered by FlamePy
+
+The current Python fast path avoids cloudpickle for PyArrow tables, but it still serializes the table into Arrow IPC bytes and stores those bytes in the opaque `{version, data}` cache row. The direct tabular path must avoid that wrapper. The cache should stream and persist the original Arrow schema and record batches as the cached object payload.
+
+**Public API Behavior:**
+
+- `put_object(key_prefix, obj)` remains the entry point. It classifies the payload before writing:
+  - Tabular payloads use the native Arrow path.
+  - All other objects use the existing opaque object path.
+- `get_object(ref)` returns the original logical object type when the required optional dependency is installed:
+  - PyArrow inputs return `pyarrow.Table` or `pyarrow.RecordBatch`.
+  - pandas inputs return `pandas.DataFrame`.
+  - polars inputs return `polars.DataFrame`.
+  - Generic Dataset inputs return the registered adapter output; if no adapter is available, they return `pyarrow.Table`.
+- If a consumer does not have the optional library needed to reconstruct the original type, FlamePy returns `pyarrow.Table` rather than failing for pandas/polars-compatible payloads. Adapter-backed Dataset types may raise `ImportError` if the adapter cannot be loaded.
+- `ObjectRef` remains `{endpoint, key, version}`. Payload type is cache metadata, not part of the reference.
+- `update_object(ref, new_obj)` supports the same payload classification as `put_object`; updating a direct tabular object rewrites the base Arrow object and clears deltas.
+- `patch_object(ref, delta)` stays on the existing opaque delta path in the first implementation. Native tabular append/merge semantics are intentionally out of scope for this item.
+
+**Payload Metadata:**
+
+The cache reserves `flame.cache.*` schema metadata keys for native payloads:
+
+| Key | Value |
+|-----|-------|
+| `flame.cache.format` | `opaque-v1` or `arrow-table-v1` |
+| `flame.cache.version` | Current object version as decimal text |
+| `flame.cache.logical_type` | `pyarrow.table`, `pyarrow.record_batch`, `pandas.dataframe`, `polars.dataframe`, or adapter name |
+| `flame.cache.adapter` | Optional adapter identifier for Dataset-like objects |
+
+User-provided Arrow schema metadata must be preserved. When user metadata collides with `flame.cache.*`, the cache-owned value wins for transport and persistence.
+
+**Flight Protocol Behavior:**
+
+- Native tabular `do_put` requests carry an Arrow schema with `flame.cache.format=arrow-table-v1` and stream the table's record batches directly.
+- Opaque object `do_put` requests keep using the current wrapper schema with `version` and `data` fields.
+- Native tabular `do_get` responses stream the stored Arrow schema and batches directly. They do not wrap rows in the opaque response schema.
+- Opaque object `do_get` responses keep using the response schema with `version`, `kind`, and `data` fields so existing patch and incremental-read behavior remains unchanged.
+- `get_flight_info` should return the native table schema for tabular objects when the object is known. For opaque objects it may keep returning an empty schema for backward compatibility.
+
+**Storage Behavior:**
+
+- Opaque objects remain compatible with existing files that use the `version/data` Arrow IPC schema.
+- Native tabular objects are stored as Arrow IPC files using the original table schema plus the reserved cache metadata.
+- Storage paths and object keys do not change:
+  - `{storage_path}/{app_name}/{session_id}/{object_id}.arrow`
+  - ObjectRef key: `{app_name}/{session_id}/{object_id}`
+- Cache loading must detect both formats:
+  - `flame.cache.format=arrow-table-v1` means native tabular object.
+  - Existing `version/data` files without metadata are legacy opaque objects.
+- Size accounting for eviction should use stored IPC file size when available, falling back to Arrow buffer sizes for in-memory-only storage.
+
+**Implementation Shape:**
+
+Rust cache objects should model payload type explicitly instead of assuming every object is a byte vector:
+
+```rust
+pub enum ObjectPayload {
+    Opaque(Vec<u8>),
+    ArrowTable {
+        schema: Arc<Schema>,
+        batches: Vec<RecordBatch>,
+        logical_type: Option<String>,
+        adapter: Option<String>,
+    },
+}
+
+pub struct Object {
+    pub version: u64,
+    pub payload: ObjectPayload,
+    pub deltas: Vec<Object>,
+}
+```
+
+The existing `Object { version, data, deltas }` representation remains the legacy opaque representation during migration. New server code should convert legacy data into `ObjectPayload::Opaque` at load boundaries so the rest of the cache can dispatch by payload kind.
+
+**Python Payload Classification:**
+
+FlamePy should classify tabular payloads without adding mandatory pandas, polars, or datasets dependencies:
+
+1. Check exact PyArrow types first (`pa.Table`, `pa.RecordBatch`, `pa.RecordBatchReader`).
+2. Check optional pandas/polars types only when those modules are importable.
+3. Check adapter registry entries for Dataset-like objects.
+4. Check Arrow protocol methods such as `__arrow_c_stream__` or `to_arrow()`.
+5. Fall back to the existing opaque object serializer.
+
+The classifier should be conservative: if conversion to `pyarrow.Table` is lossy or ambiguous, use the opaque path.
+
+**Out of Scope for Item 3:**
+
+- Designing row-level tabular patch/merge semantics.
+- Distributed Dataset partition placement or cache-side query execution.
+- Changing `ObjectRef`.
+- Making pandas, polars, or datasets required dependencies.
+- Migrating existing opaque objects that contain pickled DataFrames.
 
 
 ### Patch Operation Semantics
@@ -161,8 +266,8 @@ The ObjectRef structure is updated to include:
 @dataclass
 class ObjectRef:
     endpoint: str      # The endpoint of cache server (e.g., "grpc://127.0.0.1:9090")
-    key: str          # The key of object (e.g., "ssn_id/object_id")
-    version: int      # Version number (always 0 for now)
+    key: str          # The key of object (e.g., "app/session/object")
+    version: int      # Server-managed version; 0 forces a fresh read
 ```
 
 **Error Handling:**
@@ -199,22 +304,25 @@ To manage disk usage, the cache implements a Least Recently Used (LRU) eviction 
 - Arrow Flight server implementation
 - Arrow IPC persistence to disk
 - Python SDK integration with Arrow Flight client
+- Native Arrow storage and transport for DataSet/DataFrame-style payloads
 - Local and remote cache access patterns
 - ObjectRef structure updates
-- Key-based storage organization (`ssn_id/object_id`)
+- Key-based storage organization (`app_name/session_id/object_id`)
 - Support for both public IP and localhost binding
 - Implementation updates for common data in both RL and service modules
 
 **Out of Scope:**
-- Version checking and conflict resolution (version always 0 for now)
+- Client-side version conflict resolution
 - Distributed cache coordination
 - Cache replication
 - Authentication and authorization
 - Cache size limits and quotas
 - Cache statistics and monitoring (beyond basic logging)
+- Native tabular patch/merge semantics
+- Requiring pandas, polars, or datasets as core SDK dependencies
 
 **Limitations:**
-- Version is always 0; no version conflict detection
+- Object versions are server-managed; clients do not perform conflict resolution
 - No automatic cache cleanup or eviction
 - Single-node cache server (no distributed coordination)
 - No authentication/authorization mechanisms
@@ -235,6 +343,8 @@ To manage disk usage, the cache implements a Least Recently Used (LRU) eviction 
 4. **Python SDK cache.py**: Replace HTTP-based implementation with Arrow Flight client
 5. **RL Module**: Update to use new ObjectRef structure
 6. **Agent Module**: Update to use new ObjectRef structure
+7. **Python SDK tabular payload classifier**: Detect PyArrow, pandas, polars, and Dataset-like objects that can be represented as Arrow tables.
+8. **Rust cache payload model**: Distinguish opaque and native Arrow table payloads in storage, Flight responses, and metadata.
 
 **Integration Points:**
 - Arrow Flight server integrates with gRPC/tonic
@@ -279,8 +389,9 @@ The flame-object-cache component is a standalone Rust service that implements an
          └──► Disk Storage
               (Arrow IPC files)
               /storage_path/
-                └── ssn_id/
-                    └── object_id.arrow
+                └── app_name/
+                    └── session_id/
+                        └── object_id.arrow
 ```
 
 ### Components
@@ -321,9 +432,20 @@ The flame-object-cache component is a standalone Rust service that implements an
 
 **Object (Rust):**
 ```rust
+pub enum ObjectPayload {
+    Opaque(Vec<u8>),
+    ArrowTable {
+        schema: Arc<Schema>,
+        batches: Vec<RecordBatch>,
+        logical_type: Option<String>,
+        adapter: Option<String>,
+    },
+}
+
 pub struct Object {
     pub version: u64,
-    pub data: Vec<u8>,
+    pub payload: ObjectPayload,
+    pub deltas: Vec<Object>,
 }
 ```
 
@@ -365,15 +487,15 @@ class ObjectKey:
 @dataclass
 class ObjectRef:
     endpoint: str    # Cache server endpoint
-    key: str        # "ssn_id/object_id"
-    version: int    # Always 0 for now
+    key: str        # "app/session/object"
+    version: int    # Server-managed version; 0 forces a fresh read
 ```
 
 **ObjectMetadata (Rust):**
 ```rust
 pub struct ObjectMetadata {
     pub endpoint: String,
-    pub key: String,        // New field: "ssn_id/object_id"
+    pub key: String,        // "app/session/object"
     pub version: u64,
     pub size: u64,
 }
@@ -388,8 +510,9 @@ pub struct ObjectMetadata {
 - Wildcard key format: `{app_name}/*` (for delete operations across all sessions)
 
 **Arrow IPC File Format:**
-- Each object stored as a single RecordBatch in Arrow IPC file
-- Schema: `{version: UInt64, data: Binary}`
+- Opaque objects are stored as a single RecordBatch in Arrow IPC file
+- Opaque schema: `{version: UInt64, data: Binary}`
+- Native tabular objects are stored as Arrow IPC files with their original Arrow schema and reserved `flame.cache.*` schema metadata
 - File naming: `{object_id}.arrow`
 
 
@@ -405,24 +528,34 @@ pub struct ObjectMetadata {
 
 **do_put Algorithm:**
 1. Receive FlightData stream with RecordBatch
-2. Extract session_id from app_metadata
-3. Generate unique object_id (UUID)
-4. Construct key: `{session_id}/{object_id}`
-5. Create session directory if it doesn't exist
-6. Write RecordBatch to Arrow IPC file: `{storage_path}/{session_id}/{object_id}.arrow`
-7. Update in-memory index: `HashMap<key, ObjectMetadata>`
-8. Construct ObjectRef: `{endpoint, key, version: 0}` (using public endpoint from ObjectCache)
-9. Serialize ObjectRef to BSON
-10. Return PutResult with ObjectRef in app_metadata
+2. Extract key prefix and optional object ID from the Flight descriptor
+3. Inspect schema metadata:
+   - `flame.cache.format=arrow-table-v1`: collect batches as native tabular payload
+   - No native metadata: decode the legacy opaque `{version, data}` payload
+4. Generate unique object_id (UUID) when the descriptor only contains a prefix
+5. Construct key: `{app_name}/{session_id}/{object_id}`
+6. Create session directory if it doesn't exist
+7. Write payload to Arrow IPC file:
+   - Opaque: `{version, data}` wrapper schema
+   - Native tabular: original schema and record batches
+8. Update in-memory index: `HashMap<key, ObjectMetadata>`
+9. Construct ObjectRef: `{endpoint, key, version}` (using public endpoint from ObjectCache)
+10. Serialize ObjectRef to BSON
+11. Return PutResult with ObjectRef in app_metadata
 
 **do_get Algorithm:**
 1. Extract key from Ticket
 2. Parse key to get session_id and object_id
 3. Check in-memory index for key
-4. If found, read Arrow IPC file: `{storage_path}/{session_id}/{object_id}.arrow`
-5. Deserialize RecordBatch from file
-6. Convert RecordBatch to FlightData
-7. Stream FlightData to client
+4. If found, read Arrow IPC file: `{storage_path}/{app_name}/{session_id}/{object_id}.arrow`
+5. Detect stored payload kind
+6. Opaque payload:
+   - Deserialize object wrapper and optional deltas
+   - Convert response rows to FlightData using `{version, kind, data}`
+7. Native tabular payload:
+   - Stream original schema and record batches directly
+   - Preserve user metadata and reserved cache metadata
+8. Stream FlightData to client
 
 **list_flights Algorithm:**
 1. Get cache service's public endpoint from ObjectCache (obtained during server construction from flame-cluster.yaml)
@@ -431,25 +564,28 @@ pub struct ObjectMetadata {
    - List all `.arrow` files
    - For each file:
      - Extract object_id from filename
-     - Construct key: `{session_id}/{object_id}`
+     - Construct key: `{app_name}/{session_id}/{object_id}`
      - Create FlightInfo with key as ticket and cache service's public endpoint
      - Stream FlightInfo to client
 
 **Python SDK put_object Algorithm:**
-1. Check if `cache.storage` is set
-2. If set:
-   - Serialize object to RecordBatch
+1. Classify the payload:
+   - Native tabular: convert to Arrow schema and record batches with `flame.cache.format=arrow-table-v1`
+   - Opaque: serialize to RecordBatch with `{version, data}`
+2. Check if `cache.storage` is set
+3. If set:
+   - Write payload to local Arrow IPC storage using the selected format
    - Generate object_id (UUID)
-   - Write to local storage: `{cache.storage}/{session_id}/{object_id}.arrow`
+   - Write to local storage: `{cache.storage}/{app_name}/{session_id}/{object_id}.arrow`
    - Connect to cache server using `cache.endpoint`
-   - Get flight info using FlightDescriptor with path `{session_id}/{object_id}`
-   - Construct ObjectRef with cache server's endpoint from FlightInfo, key `{session_id}/{object_id}`, and version 0
-3. If not set:
+   - Get flight info using FlightDescriptor with path `{app_name}/{session_id}/{object_id}`
+   - Construct ObjectRef with cache server's endpoint from FlightInfo, key `{app_name}/{session_id}/{object_id}`, and server version from cache metadata
+4. If not set:
    - Check if `cache.endpoint` is set, else raise exception
    - Connect to remote cache server via endpoint
-   - Call do_put to upload object
+   - Call do_put to upload the selected payload format
    - Extract ObjectRef from PutResult app_metadata
-4. Return ObjectRef
+5. Return ObjectRef
 
 **Key Construction:**
 - Format: `{app_name}/{session_id}/{object_id}`
@@ -543,13 +679,13 @@ The special session_id value `*` (constant: `WILDCARD_SESSION`) indicates all se
 **Example 1: Python SDK Client Uploading Object to Remote Cache**
 - Description: A Python SDK client uploads an object to a remote cache server
 - Step-by-step workflow:
-  1. Client calls `put_object(session_id="sess123", obj=my_data)`
+  1. Client calls `put_object("app/sess123", my_data)`
   2. SDK checks `cache.storage` - not set
   3. SDK checks `cache.endpoint` - set to "grpc://cache.example.com:9090"
-  4. SDK serializes object to RecordBatch
+  4. SDK classifies the payload and serializes it as opaque or native tabular Arrow data
   5. SDK connects to cache server via Arrow Flight
-  6. SDK calls do_put with RecordBatch and session_id in metadata
-  7. Cache server generates object_id, creates session directory, writes Arrow IPC file
+  6. SDK calls do_put with FlightDescriptor path `app/sess123`
+  7. Cache server generates object_id, creates session directory, writes Arrow IPC file under `app/sess123`
   8. Cache server returns ObjectRef in PutResult
   9. SDK deserializes ObjectRef and returns to client
 - Expected outcome: Object is stored on cache server, client receives ObjectRef
@@ -557,21 +693,21 @@ The special session_id value `*` (constant: `WILDCARD_SESSION`) indicates all se
 **Example 2: Python SDK Client Uploading Object to Local Cache**
 - Description: A Python SDK client uploads an object using local storage
 - Step-by-step workflow:
-  1. Client calls `put_object(session_id="sess123", obj=my_data)`
+  1. Client calls `put_object("app/sess123", my_data)`
   2. SDK checks `cache.storage` - set to "/tmp/flame_cache"
-  3. SDK serializes object to RecordBatch
+  3. SDK classifies the payload and prepares opaque or native tabular Arrow data
   4. SDK generates object_id (UUID)
-  5. SDK writes RecordBatch to `/tmp/flame_cache/sess123/{object_id}.arrow`
+  5. SDK writes RecordBatch to `/tmp/flame_cache/app/sess123/{object_id}.arrow`
   6. SDK connects to cache server using `cache.endpoint`
-  7. SDK gets flight info using FlightDescriptor with path `sess123/{object_id}`
-  8. SDK constructs ObjectRef with cache server's endpoint from FlightInfo, key `sess123/{object_id}`, and version 0
+  7. SDK gets flight info using FlightDescriptor with path `app/sess123/{object_id}`
+  8. SDK constructs ObjectRef with cache server's endpoint from FlightInfo, key `app/sess123/{object_id}`, and server version from cache metadata
   9. SDK returns ObjectRef to client
 - Expected outcome: Object is stored locally, client receives ObjectRef with remote endpoint from FlightInfo
 
 **Example 3: Retrieving Cached Object**
 - Description: A client retrieves a previously cached object
 - Step-by-step workflow:
-  1. Client has ObjectRef: `{endpoint: "grpc://cache.example.com:9090", key: "sess123/obj456", version: 0}`
+  1. Client has ObjectRef: `{endpoint: "grpc://cache.example.com:9090", key: "app/sess123/obj456", version: 1}`
   2. Client calls `get_object(ref)`
   3. SDK connects to cache server using ref.endpoint
   4. SDK calls do_get with ticket = ref.key
@@ -590,7 +726,7 @@ The special session_id value `*` (constant: `WILDCARD_SESSION`) indicates all se
   3. SDK serializes new object to RecordBatch
   4. SDK calls do_put with same key (overwrites existing)
   5. Cache server writes new data to existing Arrow IPC file
-  6. Cache server updates metadata (version remains 0)
+  6. Cache server updates metadata and increments the object version
   7. Cache server returns updated ObjectRef
   8. SDK returns ObjectRef to client
 - Expected outcome: Object is updated, same ObjectRef returned
@@ -607,9 +743,22 @@ The special session_id value `*` (constant: `WILDCARD_SESSION`) indicates all se
   7. Client receives list of all cached objects with their keys and endpoints
 - Expected outcome: Complete list of all cached objects with their keys and cache service endpoints
 
+**Example 6: Native DataFrame Upload and Retrieval**
+- Description: A Python SDK client stores a DataFrame without wrapping it in pickled bytes
+- Step-by-step workflow:
+  1. Client calls `put_object("app/sess123", dataframe)`
+  2. SDK recognizes the DataFrame as a tabular payload and converts it to `pyarrow.Table`
+  3. SDK adds reserved schema metadata such as `flame.cache.format=arrow-table-v1` and `flame.cache.logical_type=pandas.dataframe`
+  4. SDK streams the table batches directly with Arrow Flight `do_put`
+  5. Cache server persists the original Arrow schema and batches in `{storage_path}/app/sess123/{object_id}.arrow`
+  6. Client calls `get_object(ref)`
+  7. Cache server streams the table schema and batches directly with Arrow Flight `do_get`
+  8. SDK reconstructs the original DataFrame type when the dependency is available, otherwise returns `pyarrow.Table`
+- Expected outcome: Tabular data avoids cloudpickle and avoids the opaque `{version, data}` wrapper.
+
 ### Advanced Use Cases
 
-**Example 6: RL Module Using Cache for RunnerContext**
+**Example 7: RL Module Using Cache for RunnerContext**
 - Description: RL module stores RunnerContext in cache for remote execution
 - Step-by-step workflow:
   1. RL module creates RunnerService with execution object
@@ -623,7 +772,7 @@ The special session_id value `*` (constant: `WILDCARD_SESSION`) indicates all se
   9. Remote executor deserializes and uses RunnerContext
 - Expected outcome: RunnerContext is cached and accessible to remote executors
 
-**Example 7: Cache Server Restart Recovery**
+**Example 8: Cache Server Restart Recovery**
 - Description: Cache server restarts and recovers persisted objects
 - Step-by-step workflow:
   1. Cache server starts up
