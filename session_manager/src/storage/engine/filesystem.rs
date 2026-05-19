@@ -778,6 +778,7 @@ impl FilesystemEngine {
             batch_size: meta.batch_size.max(1),
             priority: meta.priority,
             resreq,
+            retry_count: 0,
         })
     }
 

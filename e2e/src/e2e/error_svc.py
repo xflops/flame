@@ -12,6 +12,7 @@ limitations under the License.
 """
 
 import logging
+import os
 from typing import Optional
 
 import flamepy
@@ -29,6 +30,8 @@ class ErrorTestService(flamepy.FlameService):
     def on_session_enter(self, context: flamepy.SessionContext):
         """Handle session enter and store context."""
         logger.info(f"Session entered: session_id={context.session_id}")
+        if os.getenv("FLAME_E2E_FAIL_ON_SESSION_ENTER") == "1":
+            raise RuntimeError("intentional session enter failure")
         self._session_context = context
 
     def on_task_invoke(self, context: flamepy.TaskContext) -> Optional[flamepy.TaskOutput]:

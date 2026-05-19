@@ -35,6 +35,7 @@ pub type SessionInfoPtr = Arc<SessionInfo>;
 pub type ExecutorInfoPtr = Arc<ExecutorInfo>;
 pub type NodeInfoPtr = Arc<NodeInfo>;
 pub type AppInfoPtr = Arc<AppInfo>;
+pub type SessionPredicate = Arc<dyn Fn(&SessionInfo) -> bool + Send + Sync>;
 
 #[derive(Clone)]
 pub struct SnapShot {
@@ -132,6 +133,13 @@ pub struct SessionInfo {
     pub batch_size: u32,
     pub priority: u32,
     pub resreq: Option<ResourceRequirement>,
+    pub retry_count: u32,
+}
+
+impl SessionInfo {
+    pub fn is_ready(&self, retry_limits: u32) -> bool {
+        self.retry_count < retry_limits
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -235,6 +243,7 @@ impl From<&Session> for SessionInfo {
             batch_size: ssn.batch_size.max(1),
             priority: ssn.priority,
             resreq: ssn.resreq.clone(),
+            retry_count: ssn.retry_count,
         }
     }
 }
@@ -248,6 +257,8 @@ pub struct SessionFilter {
     pub state: Option<SessionState>,
     /// Filter by session IDs
     pub ids: Option<Vec<SessionID>>,
+    /// Additional in-memory predicate filter.
+    pub predicate: Option<SessionPredicate>,
 }
 
 impl SessionFilter {
@@ -256,6 +267,7 @@ impl SessionFilter {
         Self {
             state: None,
             ids: None,
+            predicate: None,
         }
     }
 
@@ -264,6 +276,7 @@ impl SessionFilter {
         Self {
             state: Some(state),
             ids: None,
+            predicate: None,
         }
     }
 
@@ -272,7 +285,17 @@ impl SessionFilter {
         Self {
             state: None,
             ids: Some(ids),
+            predicate: None,
         }
+    }
+
+    /// Adds an in-memory predicate filter.
+    pub fn with_predicate(
+        mut self,
+        predicate: impl Fn(&SessionInfo) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.predicate = Some(Arc::new(predicate));
+        self
     }
 }
 
@@ -283,6 +306,13 @@ impl Default for SessionFilter {
 }
 
 pub const OPEN_SESSION: Option<SessionFilter> = Some(SessionFilter::by_state(SessionState::Open));
+
+pub fn open_ready_session(retry_limits: u32) -> Option<SessionFilter> {
+    Some(
+        SessionFilter::by_state(SessionState::Open)
+            .with_predicate(move |ssn| ssn.is_ready(retry_limits)),
+    )
+}
 
 /// Filter for listing executors.
 /// All fields are Option:
@@ -564,6 +594,14 @@ impl SnapShot {
             Some(ref ids) => candidates
                 .into_iter()
                 .filter(|ssn| ids.contains(&ssn.id))
+                .collect(),
+        };
+
+        let filtered: Vec<SessionInfoPtr> = match filter.predicate {
+            None => filtered,
+            Some(predicate) => filtered
+                .into_iter()
+                .filter(|ssn| predicate(ssn.as_ref()))
                 .collect(),
         };
 
@@ -950,7 +988,35 @@ mod tests {
             batch_size: 1,
             priority: 0,
             resreq,
+            retry_count: 0,
         })
+    }
+
+    #[test]
+    fn session_info_ready_uses_retry_limit() {
+        let mut session = create_test_session("ssn-ready", Some(unit_rr()), SessionState::Open)
+            .as_ref()
+            .clone();
+
+        session.retry_count = 1;
+        assert!(session.is_ready(2));
+
+        session.retry_count = 2;
+        assert!(!session.is_ready(2));
+    }
+
+    #[test]
+    fn session_info_from_session_copies_retry_count() {
+        let session = Session {
+            id: "ssn-1".to_string(),
+            application: "test-app".to_string(),
+            retry_count: 7,
+            ..Default::default()
+        };
+
+        let info = SessionInfo::from(&session);
+
+        assert_eq!(info.retry_count, 7);
     }
 
     /// Default per-slot unit kept for backward-compatible test scaffolding.
@@ -1028,6 +1094,33 @@ mod tests {
         // Find all sessions
         let all_ssns = ss.find_sessions(None).unwrap();
         assert_eq!(all_ssns.len(), 3);
+    }
+
+    #[test]
+    fn test_snapshot_find_sessions_by_predicate() {
+        let ss = SnapShot::new();
+
+        let ready_open = create_test_session("ssn-ready", Some(slots_rr(2)), SessionState::Open);
+        let mut not_ready_open =
+            create_test_session("ssn-not-ready", Some(slots_rr(2)), SessionState::Open)
+                .as_ref()
+                .clone();
+        not_ready_open.retry_count = 2;
+        let closed_ready =
+            create_test_session("ssn-closed-ready", Some(slots_rr(2)), SessionState::Closed);
+
+        ss.add_session(ready_open.clone()).unwrap();
+        ss.add_session(Arc::new(not_ready_open)).unwrap();
+        ss.add_session(closed_ready.clone()).unwrap();
+
+        let ready_ssns = ss
+            .find_sessions(Some(
+                SessionFilter::by_state(SessionState::Open).with_predicate(|ssn| ssn.is_ready(2)),
+            ))
+            .unwrap();
+
+        assert_eq!(ready_ssns.len(), 1);
+        assert!(ready_ssns.contains_key("ssn-ready"));
     }
 
     /// Test that update_executor_state correctly updates the exec_index.

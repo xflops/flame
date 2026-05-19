@@ -356,6 +356,7 @@ mod tests {
 
         let mut src_file = tokio::fs::File::create(&src_path).await.unwrap();
         src_file.write_all(b"test content").await.unwrap();
+        src_file.sync_all().await.unwrap();
         drop(src_file);
 
         let registry = DownloaderRegistry::new();

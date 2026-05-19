@@ -195,6 +195,41 @@ class TestSessionOperations:
         )
         assert session.common_data() == b"test-data"
 
+    def test_get_session_preserves_events(self):
+        from flamepy.proto.types_pb2 import Event as EventProto
+        from flamepy.proto.types_pb2 import Metadata, SessionSpec, SessionStatus
+        from flamepy.proto.types_pb2 import Session as SessionProto
+
+        event_time = int(time.time() * 1000)
+
+        class DummyFrontendWithSession:
+            def GetSession(self, req):  # noqa: N802
+                return SessionProto(
+                    metadata=Metadata(id=req.session_id),
+                    spec=SessionSpec(application="test-app"),
+                    status=SessionStatus(
+                        state=SessionState.OPEN,
+                        creation_time=event_time,
+                        events=[
+                            EventProto(
+                                code=1001,
+                                message="failed to bind session",
+                                creation_time=event_time,
+                            )
+                        ],
+                    ),
+                )
+
+        connection = client.Connection("http://localhost:1234", DummyChannel("http://localhost:1234"), DummyFrontendWithSession())
+        try:
+            session = connection.get_session("sess-events")
+        finally:
+            connection.close()
+
+        assert len(session.events) == 1
+        assert session.events[0].code == 1001
+        assert session.events[0].message == "failed to bind session"
+
     def test_session_get_task_preserves_empty_optional_bytes(self):
         from flamepy.core.client import Session, SessionState
         from flamepy.proto.types_pb2 import Metadata, Task, TaskSpec, TaskStatus

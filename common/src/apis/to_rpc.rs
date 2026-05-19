@@ -94,6 +94,15 @@ impl From<Event> for rpc::Event {
     }
 }
 
+impl From<FlameResult> for rpc::Result {
+    fn from(result: FlameResult) -> Self {
+        Self {
+            return_code: result.return_code,
+            message: result.message,
+        }
+    }
+}
+
 impl From<TaskContext> for rpc::TaskContext {
     fn from(ctx: TaskContext) -> Self {
         Self {

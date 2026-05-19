@@ -31,7 +31,7 @@ use ::rpc::flame::v1 as rpc;
 use crate::apiserver::Flame;
 use crate::controller::ControllerPtr;
 use crate::model::Executor;
-use common::apis::{ExecutorState, Node, Shim, TaskResult};
+use common::apis::{ExecutorState, FlameResult, Node, Shim, TaskResult};
 use common::FlameError;
 
 /// Timeout for heartbeat in seconds. If no heartbeat is received within this
@@ -403,7 +403,7 @@ impl Backend for Flame {
         let req = req.into_inner();
 
         self.controller
-            .bind_session_completed(req.executor_id)
+            .bind_executor_completed(req.executor_id, req.result.map(FlameResult::from))
             .await?;
 
         Ok(Response::new(rpc::Result::default()))

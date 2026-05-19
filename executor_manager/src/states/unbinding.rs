@@ -32,17 +32,14 @@ impl State for UnbindingState {
         trace_fn!("UnbindingState::execute");
 
         self.client.unbind_executor(&self.executor.clone()).await?;
-        let shim_ptr = &mut self
-            .executor
-            .shim_instance
-            .clone()
-            .ok_or(FlameError::InvalidState(
-                "no shim instance in unbinding state".to_string(),
-            ))?;
-
-        {
+        if let Some(shim_ptr) = self.executor.shim_instance.clone() {
             let mut shim = shim_ptr.lock().await;
             shim.on_session_leave().await?;
+        } else {
+            tracing::debug!(
+                "Executor <{}> has no shim instance during unbinding; skip on_session_leave",
+                self.executor.id
+            );
         }
 
         self.client

@@ -60,15 +60,7 @@ async fn view_task(
     println!("{:<15}{}", "Application:", session.application);
     println!("{:<15}{}", "State:", task.state);
     println!("{:<15}", "Events:");
-
-    for event in task.events {
-        println!(
-            "  {}: {} ({})",
-            event.creation_time.format("%H:%M:%S%.3f"),
-            event.message.unwrap_or_default(),
-            event.code
-        );
-    }
+    print!("{}", format_events(&task.events));
 
     Ok(())
 }
@@ -121,7 +113,25 @@ fn view_session_table(session: &client::Session) -> Result<(), Box<dyn Error>> {
     ]);
 
     println!("{table}");
+
+    println!("{:<15}", "Events:");
+    print!("{}", format_events(&session.events));
+
     Ok(())
+}
+
+fn format_events(events: &[client::Event]) -> String {
+    events
+        .iter()
+        .map(|event| {
+            format!(
+                "  {}: {} ({})\n",
+                event.creation_time.format("%H:%M:%S%.3f"),
+                event.message.clone().unwrap_or_default(),
+                event.code
+            )
+        })
+        .collect()
 }
 
 fn view_session_json(session: &client::Session) -> Result<(), Box<dyn Error>> {
@@ -245,5 +255,27 @@ fn get_type(schema: Option<String>) -> Result<String, FlameError> {
             Ok(schema_type.to_string().trim_matches('\"').to_string())
         }
         None => Ok("-".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use flame_rs::client::Event;
+
+    #[test]
+    fn format_events_includes_session_event_details() {
+        let event = Event {
+            code: 1001,
+            message: Some("bind failed".to_string()),
+            creation_time: chrono::Utc.with_ymd_and_hms(2026, 5, 8, 10, 1, 2).unwrap(),
+        };
+
+        let formatted = format_events(&[event]);
+
+        assert!(formatted.contains("10:01:02.000"));
+        assert!(formatted.contains("bind failed"));
+        assert!(formatted.contains("(1001)"));
     }
 }

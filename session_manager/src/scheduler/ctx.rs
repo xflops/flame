@@ -54,6 +54,10 @@ impl Context {
         self.plugins.is_underused(ssn)
     }
 
+    pub fn session_retry_limits(&self) -> u32 {
+        self.controller.session_retry_limits()
+    }
+
     pub fn is_preemptible(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
         self.plugins.is_preemptible(ssn)
     }

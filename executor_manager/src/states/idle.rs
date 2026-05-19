@@ -21,11 +21,11 @@ use crate::client::BackendClient;
 use crate::executor::Executor;
 use crate::shims;
 use crate::states::State;
-use common::apis::ExecutorState;
+use common::apis::{
+    ExecutorState, FlameResult, BIND_RESULT_APPLICATION_INSTALL_FAILED, BIND_RESULT_OK,
+    BIND_RESULT_ON_SESSION_ENTER_FAILED, BIND_RESULT_SHIM_CREATE_FAILED,
+};
 use common::FlameError;
-
-const ON_SESSION_ENTER_MAX_RETRIES: u32 = 5;
-const ON_SESSION_ENTER_RETRY_DELAY_SECS: u64 = 5;
 
 pub struct IdleState {
     pub client: BackendClient,
@@ -88,54 +88,57 @@ impl State for IdleState {
             &ssn.session_id.clone()
         );
 
-        let env_vars = self.app_manager.install(&ssn.application).await?;
-
-        let shim_ptr = shims::new(&self.executor.clone(), &ssn.application, &env_vars).await?;
-
-        let mut last_error: Option<FlameError> = None;
-        for attempt in 1..=ON_SESSION_ENTER_MAX_RETRIES {
-            let mut shim = shim_ptr.lock().await;
-            match shim.on_session_enter(&ssn).await {
-                Ok(()) => {
-                    tracing::debug!("Shim on_session_enter completed on attempt {}.", attempt);
-                    last_error = None;
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "on_session_enter failed on attempt {}/{}: {}",
-                        attempt,
-                        ON_SESSION_ENTER_MAX_RETRIES,
-                        e
-                    );
-                    last_error = Some(e);
-
-                    if attempt < ON_SESSION_ENTER_MAX_RETRIES {
-                        let delay = (attempt * attempt) as u64 * ON_SESSION_ENTER_RETRY_DELAY_SECS;
-                        tracing::debug!("Retrying in {} seconds...", delay);
-                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                    }
-                }
+        let env_vars = match self.app_manager.install(&ssn.application).await {
+            Ok(env_vars) => env_vars,
+            Err(e) => {
+                self.bind_executor_failed(
+                    BIND_RESULT_APPLICATION_INSTALL_FAILED,
+                    format!("application installation failed: {e}"),
+                    &ssn,
+                    None,
+                )
+                .await?;
+                return Ok(self.executor.clone());
             }
-        }
+        };
 
-        if let Some(e) = last_error {
-            tracing::warn!(
-                "Executor <{}> failed to enter session <{}>: {}, transitioning to unbinding state",
-                &self.executor.id,
-                &ssn.session_id,
-                e
-            );
+        let shim_ptr = match shims::new(&self.executor.clone(), &ssn.application, &env_vars).await {
+            Ok(shim_ptr) => shim_ptr,
+            Err(e) => {
+                self.bind_executor_failed(
+                    BIND_RESULT_SHIM_CREATE_FAILED,
+                    format!("shim creation failed: {e}"),
+                    &ssn,
+                    None,
+                )
+                .await?;
+                return Ok(self.executor.clone());
+            }
+        };
 
-            self.executor.session = Some(ssn.clone());
-            self.executor.shim_instance = Some(shim_ptr.clone());
-            self.executor.state = ExecutorState::Unbinding;
-
+        let enter_result = {
+            let mut shim = shim_ptr.lock().await;
+            shim.on_session_enter(&ssn).await
+        };
+        if let Err(e) = enter_result {
+            self.bind_executor_failed(
+                BIND_RESULT_ON_SESSION_ENTER_FAILED,
+                format!("on_session_enter failed: {e}"),
+                &ssn,
+                Some(shim_ptr.clone()),
+            )
+            .await?;
             return Ok(self.executor.clone());
         }
 
         self.client
-            .bind_executor_completed(&self.executor.clone())
+            .bind_executor_completed(
+                &self.executor.clone(),
+                Some(FlameResult {
+                    return_code: BIND_RESULT_OK,
+                    message: None,
+                }),
+            )
             .await?;
 
         self.executor.shim_instance = Some(shim_ptr.clone());
@@ -149,5 +152,35 @@ impl State for IdleState {
         );
 
         Ok(self.executor.clone())
+    }
+}
+
+impl IdleState {
+    async fn bind_executor_failed(
+        &mut self,
+        return_code: i32,
+        message: String,
+        ssn: &common::apis::SessionContext,
+        shim_ptr: Option<shims::ShimPtr>,
+    ) -> Result<(), FlameError> {
+        tracing::warn!(
+            "Executor <{}> failed to bind session <{}>: {}",
+            self.executor.id,
+            ssn.session_id,
+            message
+        );
+        self.client
+            .bind_executor_completed(
+                &self.executor.clone(),
+                Some(FlameResult {
+                    return_code,
+                    message: Some(message),
+                }),
+            )
+            .await?;
+        self.executor.session = Some(ssn.clone());
+        self.executor.shim_instance = shim_ptr;
+        self.executor.state = ExecutorState::Unbinding;
+        Ok(())
     }
 }
