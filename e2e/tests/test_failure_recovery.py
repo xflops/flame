@@ -34,6 +34,7 @@ from tests.utils import random_string
 FLM_TEST_SVC_APP = "flme2e-svc"
 FLM_ERROR_SVC_APP = "flme2e-error-svc"
 FLM_ENTER_FAILURE_APP = "flme2e-enter-failure-svc"
+ENTER_FAILURE_SERVICE_ENTRYPOINT = "import flamepy; from e2e.error_svc import EnterFailureTestService; flamepy.run(EnterFailureTestService())"
 TASK_FAILED_EVENT_CODE = int(TaskState.FAILED)
 SESSION_BIND_FAILED_EVENT_CODE = 1001
 
@@ -102,9 +103,8 @@ def setup_test_env():
             environments={
                 "FLAME_LOG_LEVEL": "DEBUG",
                 "PYTHONPATH": "/opt/e2e/src",
-                "FLAME_E2E_FAIL_ON_SESSION_ENTER": "1",
             },
-            arguments=["src/e2e/error_svc.py"],
+            arguments=["-c", ENTER_FAILURE_SERVICE_ENTRYPOINT],
             installer="python",
         ),
     )
