@@ -174,6 +174,7 @@ impl TryFrom<&SessionDao> for Session {
             batch_size: ssn.batch_size.max(1) as u32,
             priority: ssn.priority as u32,
             resreq,
+            retry_count: 0,
         })
     }
 }

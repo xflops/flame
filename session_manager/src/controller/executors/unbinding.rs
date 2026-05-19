@@ -16,7 +16,7 @@ use crate::storage::StoragePtr;
 use stdng::{lock_ptr, logs::TraceFn, trace_fn, MutexPtr};
 
 use crate::model::ExecutorPtr;
-use common::apis::{ExecutorState, SessionPtr, Task, TaskPtr, TaskResult, TaskState};
+use common::apis::{ExecutorState, FlameResult, SessionPtr, Task, TaskPtr, TaskResult, TaskState};
 use common::FlameError;
 
 pub struct UnbindingState {
@@ -58,7 +58,7 @@ impl States for UnbindingState {
         ))
     }
 
-    async fn bind_session_completed(&self) -> Result<(), FlameError> {
+    async fn bind_session_completed(&self, _result: Option<FlameResult>) -> Result<(), FlameError> {
         trace_fn!("UnbindingState::bind_session_completed");
 
         Err(FlameError::InvalidState(
@@ -71,6 +71,8 @@ impl States for UnbindingState {
 
         let mut e = lock_ptr!(self.executor)?;
         e.state = ExecutorState::Unbinding;
+        e.ssn_id = None;
+        e.task_id = None;
 
         Ok(())
     }

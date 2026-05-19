@@ -14,7 +14,7 @@ limitations under the License.
 use stdng::{lock_ptr, logs::TraceFn, trace_fn};
 
 use crate::model::ExecutorPtr;
-use common::apis::{ExecutorState, SessionPtr, Task, TaskPtr, TaskResult, TaskState};
+use common::apis::{ExecutorState, FlameResult, SessionPtr, Task, TaskPtr, TaskResult, TaskState};
 use common::FlameError;
 
 use crate::controller::executors::States;
@@ -51,7 +51,7 @@ impl States for BoundState {
         Err(FlameError::InvalidState("Executor is bound".to_string()))
     }
 
-    async fn bind_session_completed(&self) -> Result<(), FlameError> {
+    async fn bind_session_completed(&self, _result: Option<FlameResult>) -> Result<(), FlameError> {
         trace_fn!("BoundState::bind_session_completed");
 
         Err(FlameError::InvalidState("Executor is bound".to_string()))

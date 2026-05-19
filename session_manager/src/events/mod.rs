@@ -204,7 +204,21 @@ mod tests {
         manager.remove_events(session_id.clone()).unwrap();
 
         let result = manager.find_events(owner);
-        assert!(result.is_err() || result.unwrap().is_empty());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_fs_event_manager_find_nonexistent_session() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = FsEventManager::new(temp_dir.path().to_str().unwrap()).unwrap();
+
+        let events = manager
+            .find_events(EventOwner {
+                session_id: "missing-session".to_string(),
+                task_id: 0,
+            })
+            .unwrap();
+        assert!(events.is_empty());
     }
 
     #[test]

@@ -84,8 +84,12 @@ fn derive_events_path(storage_url: &str) -> String {
 }
 
 impl Storage {
+    pub fn session_retry_limits(&self) -> u32 {
+        self.context.cluster.recovery.session.retry_limits
+    }
+
     pub fn snapshot(&self) -> Result<SnapShotPtr, FlameError> {
-        let res = SnapShot::new();
+        let res = SnapShot::new_with_session_retry_limits(self.session_retry_limits());
 
         {
             let node_map = lock_ptr!(self.nodes)?;
@@ -536,7 +540,11 @@ impl Storage {
     pub fn get_session(&self, id: SessionID) -> Result<Session, FlameError> {
         let ssn_ptr = self.get_session_ptr(id)?;
         let ssn = lock_ptr!(ssn_ptr)?;
-        Ok(ssn.clone())
+        let mut ssn = ssn.clone();
+        ssn.events = self
+            .event_manager
+            .find_events(EventOwner::session(ssn.id.clone()))?;
+        Ok(ssn)
     }
 
     pub fn get_session_ptr(&self, id: SessionID) -> Result<SessionPtr, FlameError> {
@@ -637,7 +645,11 @@ impl Storage {
 
         for ssn in ssn_map.deref().values() {
             let ssn = lock_ptr!(ssn)?;
-            ssn_list.push(ssn.clone());
+            let mut ssn = ssn.clone();
+            ssn.events = self
+                .event_manager
+                .find_events(EventOwner::session(ssn.id.clone()))?;
+            ssn_list.push(ssn);
         }
 
         Ok(ssn_list)

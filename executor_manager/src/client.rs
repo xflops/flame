@@ -28,7 +28,8 @@ use ::rpc::flame::v1::{
 
 use crate::executor::Executor;
 use common::apis::{
-    Application, Node, ResourceRequirement, Session, SessionContext, Shim, TaskContext, TaskResult,
+    Application, FlameResult, Node, ResourceRequirement, Session, SessionContext, Shim,
+    TaskContext, TaskResult,
 };
 use common::ctx::FlameClusterContext;
 use common::net::host_for_uri;
@@ -222,9 +223,14 @@ impl BackendClient {
         }
     }
 
-    pub async fn bind_executor_completed(&mut self, exe: &Executor) -> Result<(), FlameError> {
+    pub async fn bind_executor_completed(
+        &mut self,
+        exe: &Executor,
+        result: Option<FlameResult>,
+    ) -> Result<(), FlameError> {
         let req = BindExecutorCompletedRequest {
             executor_id: exe.id.clone(),
+            result: result.map(rpc::Result::from),
         };
 
         self.client

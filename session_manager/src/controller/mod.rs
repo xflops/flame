@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use common::apis::{
     Application, ApplicationAttributes, ApplicationID, CommonData, Event, EventOwner, ExecutorID,
-    ExecutorState, Node, NodeState, Session, SessionAttributes, SessionID, SessionPtr,
+    ExecutorState, FlameResult, Node, NodeState, Session, SessionAttributes, SessionID, SessionPtr,
     SessionState, Task, TaskGID, TaskID, TaskInput, TaskPtr, TaskResult, TaskState,
 };
 
@@ -535,8 +535,16 @@ impl Controller {
             }
         };
 
-        let ssn_ptr = self.storage.get_session_ptr(ssn_id)?;
+        let ssn_ptr = match self.storage.get_session_ptr(ssn_id.clone()) {
+            Ok(ssn_ptr) => ssn_ptr,
+            Err(FlameError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
         let ssn = lock_ptr!(ssn_ptr)?;
+        if ssn.status.state == SessionState::Closed {
+            return Ok(None);
+        }
 
         Ok(Some((*ssn).clone()))
     }
@@ -572,13 +580,17 @@ impl Controller {
         Ok(())
     }
 
-    pub async fn bind_session_completed(&self, id: ExecutorID) -> Result<(), FlameError> {
+    pub async fn bind_session_completed(
+        &self,
+        id: ExecutorID,
+        result: Option<FlameResult>,
+    ) -> Result<(), FlameError> {
         trace_fn!("Controller::bind_session_completed");
 
         let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
 
-        state.bind_session_completed().await?;
+        state.bind_session_completed(result).await?;
 
         let executor = {
             let exe = lock_ptr!(exe_ptr)?;
@@ -599,6 +611,15 @@ impl Controller {
         }
 
         Ok(())
+    }
+
+    pub async fn bind_executor_completed(
+        &self,
+        id: ExecutorID,
+        result: Option<FlameResult>,
+    ) -> Result<(), FlameError> {
+        trace_fn!("Controller::bind_executor_completed");
+        self.bind_session_completed(id, result).await
     }
 
     pub async fn launch_task(&self, id: ExecutorID) -> Result<Option<Task>, FlameError> {
@@ -904,12 +925,22 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::apis::{Node, NodeInfo, NodeState, ResourceRequirement, Shim};
-    use common::ctx::{FlameCluster, FlameClusterContext, FlameExecutors, FlameLimits};
+    use common::apis::{
+        Node, NodeInfo, NodeState, ResourceRequirement, Shim, BIND_RESULT_OK, SESSION_BIND_FAILED,
+        SESSION_RETRY_LIMIT_REACHED,
+    };
+    use common::ctx::{
+        FlameCluster, FlameClusterContext, FlameExecutors, FlameLimits, FlameRecovery,
+        FlameSessionRecovery,
+    };
     use tokio::sync::mpsc;
 
     /// Creates a test storage with a unique SQLite database.
     async fn create_test_storage() -> StoragePtr {
+        create_test_storage_with_retry_limits(common::ctx::DEFAULT_SESSION_RETRY_LIMITS).await
+    }
+
+    async fn create_test_storage_with_retry_limits(retry_limits: u32) -> StoragePtr {
         let unique_id = format!(
             "{}_{:?}",
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
@@ -935,6 +966,9 @@ mod tests {
                 limits: FlameLimits {
                     max_sessions: None,
                     max_executors: 10,
+                },
+                recovery: FlameRecovery {
+                    session: FlameSessionRecovery { retry_limits },
                 },
                 pprof: None,
             },
@@ -966,9 +1000,291 @@ mod tests {
         }
     }
 
+    fn create_test_application() -> ApplicationAttributes {
+        ApplicationAttributes {
+            shim: Shim::default(),
+            ..Default::default()
+        }
+    }
+
+    fn create_test_session_attr(id: &str) -> SessionAttributes {
+        SessionAttributes {
+            id: id.to_string(),
+            application: "test-app".to_string(),
+            common_data: None,
+            min_instances: 0,
+            max_instances: None,
+            batch_size: 1,
+            priority: 0,
+            resreq: Some(ResourceRequirement {
+                cpu: 1,
+                memory: 1024,
+                gpu: 0,
+            }),
+        }
+    }
+
+    async fn create_binding_executor(controller: &ControllerPtr, ssn_id: &str) -> String {
+        controller
+            .register_application("test-app".to_string(), create_test_application())
+            .await
+            .unwrap();
+        controller
+            .storage()
+            .register_node(&create_test_node("bind-node"))
+            .await
+            .unwrap();
+        controller
+            .create_session(create_test_session_attr(ssn_id))
+            .await
+            .unwrap();
+        let executor = controller
+            .create_executor("bind-node".to_string(), ssn_id.to_string())
+            .await
+            .unwrap();
+        controller.register_executor(&executor).await.unwrap();
+        controller
+            .bind_session(executor.id.clone(), ssn_id.to_string())
+            .await
+            .unwrap();
+        executor.id
+    }
+
     // ========================================================================
     // Controller::register_node Tests
     // ========================================================================
+
+    mod bind_session_failed_tests {
+        use super::*;
+        use uuid::Uuid;
+
+        async fn fail_binding(
+            controller: &ControllerPtr,
+            executor_id: &str,
+        ) -> Result<(), FlameError> {
+            controller
+                .bind_executor_completed(
+                    executor_id.to_string(),
+                    Some(FlameResult {
+                        return_code: common::apis::BIND_RESULT_ON_SESSION_ENTER_FAILED,
+                        message: Some("on_session_enter failed: boom".to_string()),
+                    }),
+                )
+                .await
+        }
+
+        #[tokio::test]
+        async fn records_failure_event_and_moves_executor_to_unbinding() {
+            let storage = create_test_storage_with_retry_limits(2).await;
+            let controller = new_ptr(storage.clone());
+            let ssn_id = format!("bind-failed-{}", Uuid::new_v4());
+            let executor_id = create_binding_executor(&controller, &ssn_id).await;
+
+            fail_binding(&controller, &executor_id).await.unwrap();
+
+            let executor = controller.get_executor(executor_id).unwrap();
+            assert_eq!(executor.state, ExecutorState::Unbinding);
+            assert_eq!(executor.ssn_id, None);
+            assert_eq!(executor.task_id, None);
+
+            let session = controller.get_session(ssn_id).unwrap();
+            assert_eq!(session.retry_count, 1);
+            assert_eq!(
+                session
+                    .events
+                    .iter()
+                    .filter(|event| event.code == SESSION_BIND_FAILED)
+                    .count(),
+                1
+            );
+            assert!(session.events.iter().any(|event| event
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("on_session_enter failed: boom"))));
+        }
+
+        #[tokio::test]
+        async fn records_retry_limit_once_and_allows_count_to_exceed_limit() {
+            let storage = create_test_storage_with_retry_limits(2).await;
+            let controller = new_ptr(storage.clone());
+            let ssn_id = format!("retry-limit-{}", Uuid::new_v4());
+            let executor_id = create_binding_executor(&controller, &ssn_id).await;
+
+            fail_binding(&controller, &executor_id).await.unwrap();
+            controller
+                .unbind_executor_completed(executor_id.clone())
+                .await
+                .unwrap();
+            controller
+                .bind_session(executor_id.clone(), ssn_id.clone())
+                .await
+                .unwrap();
+
+            fail_binding(&controller, &executor_id).await.unwrap();
+            controller
+                .unbind_executor_completed(executor_id.clone())
+                .await
+                .unwrap();
+            controller
+                .bind_session(executor_id.clone(), ssn_id.clone())
+                .await
+                .unwrap();
+
+            fail_binding(&controller, &executor_id).await.unwrap();
+
+            let session = controller.get_session(ssn_id).unwrap();
+            assert_eq!(session.retry_count, 3);
+            assert_eq!(
+                session
+                    .events
+                    .iter()
+                    .filter(|event| event.code == SESSION_BIND_FAILED)
+                    .count(),
+                3
+            );
+            assert_eq!(
+                session
+                    .events
+                    .iter()
+                    .filter(|event| event.code == SESSION_RETRY_LIMIT_REACHED)
+                    .count(),
+                1
+            );
+        }
+
+        #[tokio::test]
+        async fn bind_success_keeps_retry_count() {
+            let storage = create_test_storage_with_retry_limits(2).await;
+            let controller = new_ptr(storage.clone());
+            let ssn_id = format!("retry-keep-{}", Uuid::new_v4());
+            let executor_id = create_binding_executor(&controller, &ssn_id).await;
+
+            fail_binding(&controller, &executor_id).await.unwrap();
+            controller
+                .unbind_executor_completed(executor_id.clone())
+                .await
+                .unwrap();
+            controller
+                .bind_session(executor_id.clone(), ssn_id.clone())
+                .await
+                .unwrap();
+
+            controller
+                .bind_executor_completed(
+                    executor_id.clone(),
+                    Some(FlameResult {
+                        return_code: BIND_RESULT_OK,
+                        message: None,
+                    }),
+                )
+                .await
+                .unwrap();
+
+            let session = controller.get_session(ssn_id).unwrap();
+            assert_eq!(session.retry_count, 1);
+            assert_eq!(
+                controller.get_executor(executor_id).unwrap().state,
+                ExecutorState::Bound
+            );
+        }
+
+        #[tokio::test]
+        async fn bind_success_requires_attached_session() {
+            let storage = create_test_storage_with_retry_limits(2).await;
+            let controller = new_ptr(storage.clone());
+            let ssn_id = format!("missing-session-{}", Uuid::new_v4());
+            let executor_id = create_binding_executor(&controller, &ssn_id).await;
+
+            {
+                let executor = storage.get_executor_ptr(executor_id.clone()).unwrap();
+                let mut executor = lock_ptr!(executor).unwrap();
+                executor.ssn_id = None;
+            }
+
+            let err = controller
+                .bind_executor_completed(
+                    executor_id.clone(),
+                    Some(FlameResult {
+                        return_code: BIND_RESULT_OK,
+                        message: None,
+                    }),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, FlameError::InvalidState(_)));
+            assert_eq!(
+                controller.get_executor(executor_id).unwrap().state,
+                ExecutorState::Binding
+            );
+        }
+    }
+
+    mod wait_for_session_tests {
+        use super::*;
+        use uuid::Uuid;
+
+        #[tokio::test]
+        async fn returns_none_when_assigned_session_is_closed() {
+            let storage = create_test_storage().await;
+            let controller = new_ptr(storage);
+            let ssn_id = format!("closed-session-{}", Uuid::new_v4());
+            let executor_id = create_binding_executor(&controller, &ssn_id).await;
+
+            controller.close_session(ssn_id.clone()).await.unwrap();
+
+            let session = controller
+                .wait_for_session(executor_id.clone())
+                .await
+                .unwrap();
+            assert!(session.is_none());
+
+            let executor = controller.get_executor(executor_id.clone()).unwrap();
+            assert_eq!(executor.state, ExecutorState::Binding);
+            assert_eq!(executor.ssn_id, Some(ssn_id));
+
+            controller
+                .unregister_executor(executor_id.clone())
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                controller.get_executor(executor_id).unwrap_err(),
+                FlameError::NotFound(_)
+            ));
+        }
+
+        #[tokio::test]
+        async fn returns_none_when_assigned_session_is_missing() {
+            let storage = create_test_storage().await;
+            let controller = new_ptr(storage);
+            let ssn_id = format!("missing-session-{}", Uuid::new_v4());
+            let executor_id = create_binding_executor(&controller, &ssn_id).await;
+
+            controller.close_session(ssn_id.clone()).await.unwrap();
+            controller.delete_session(ssn_id.clone()).await.unwrap();
+
+            let session = controller
+                .wait_for_session(executor_id.clone())
+                .await
+                .unwrap();
+            assert!(session.is_none());
+
+            let executor = controller.get_executor(executor_id.clone()).unwrap();
+            assert_eq!(executor.state, ExecutorState::Binding);
+            assert_eq!(executor.ssn_id, Some(ssn_id));
+
+            controller
+                .unregister_executor(executor_id.clone())
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                controller.get_executor(executor_id).unwrap_err(),
+                FlameError::NotFound(_)
+            ));
+        }
+    }
 
     mod register_node_tests {
         use super::*;

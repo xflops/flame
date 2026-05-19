@@ -79,8 +79,7 @@ mod tests {
     use common::apis::{
         Application, ApplicationAttributes, Node, NodeInfo, NodeState, ResourceRequirement, Shim,
     };
-    use common::ctx::FlameCluster;
-    use common::ctx::FlameClusterContext;
+    use common::ctx::{FlameCluster, FlameClusterContext, FlameRecovery, FlameSessionRecovery};
     use common::FlameError;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -133,6 +132,10 @@ mod tests {
 
     impl TestEnv {
         pub fn new() -> Result<Self, FlameError> {
+            Self::new_with_retry_limit(common::ctx::DEFAULT_SESSION_RETRY_LIMITS)
+        }
+
+        pub fn new_with_retry_limit(retry_limits: u32) -> Result<Self, FlameError> {
             let filter = tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("h2=error".parse()?)
                 .add_directive("hyper_util=error".parse()?)
@@ -150,6 +153,9 @@ mod tests {
             let config = FlameClusterContext {
                 cluster: FlameCluster {
                     storage: format!("sqlite:///{url}"),
+                    recovery: FlameRecovery {
+                        session: FlameSessionRecovery { retry_limits },
+                    },
                     ..Default::default()
                 },
                 ..Default::default()
@@ -270,6 +276,67 @@ mod tests {
             tokio_test::block_on(action.execute(&mut ctx))?;
         }
         assert_eq!(plugins_ptr, Arc::as_ptr(&ctx.plugins));
+        Ok(())
+    }
+
+    #[test]
+    fn test_scheduler_skips_not_ready_session() -> Result<(), FlameError> {
+        let env = TestEnv::new_with_retry_limit(1)?;
+        let controller = env.controller.clone();
+
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        tokio_test::block_on(
+            controller
+                .storage()
+                .register_node(&new_test_node("node_1".to_string())),
+        )?;
+
+        let ssn_id = format!("not-ready-{}", Uuid::new_v4());
+        tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+            id: ssn_id.clone(),
+            application: "flmtest".to_string(),
+            common_data: None,
+            min_instances: 0,
+            max_instances: None,
+            batch_size: 1,
+            priority: 0,
+            resreq: Some(common::apis::ResourceRequirement {
+                cpu: 1,
+                memory: 1024 * 1024 * 1024,
+                gpu: 0,
+            }),
+        }))?;
+        tokio_test::block_on(controller.create_task(ssn_id.clone(), None))?;
+
+        {
+            let ssn_ptr = controller.storage().get_session_ptr(ssn_id.clone())?;
+            let mut ssn = stdng::lock_ptr!(ssn_ptr)?;
+            ssn.retry_count = 1;
+        }
+
+        let executor =
+            tokio_test::block_on(controller.create_executor("node_1".to_string(), ssn_id.clone()))?;
+        tokio_test::block_on(controller.register_executor(&executor))?;
+
+        let default_policies: Vec<String> = common::ctx::DEFAULT_POLICIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut ctx = Context::new(controller.clone(), &default_policies)?;
+
+        let dispatch = DispatchAction::new_ptr();
+        tokio_test::block_on(dispatch.execute(&mut ctx))?;
+
+        let alloc = AllocateAction::new_ptr();
+        tokio_test::block_on(alloc.execute(&mut ctx))?;
+
+        let executors = controller.list_executor()?;
+        assert_eq!(executors.len(), 1);
+        assert_eq!(executors[0].state, common::apis::ExecutorState::Idle);
+        assert_eq!(executors[0].ssn_id, None);
+
         Ok(())
     }
 }

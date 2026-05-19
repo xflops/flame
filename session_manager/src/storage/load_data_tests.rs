@@ -39,6 +39,7 @@ mod tests {
                     max_sessions: None,
                     max_executors: 10,
                 },
+                recovery: Default::default(),
                 pprof: None,
             },
             cache: None,

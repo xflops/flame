@@ -21,6 +21,10 @@ impl Session {
         self.status.state == SessionState::Closed
     }
 
+    pub fn is_ready(&self, retry_limits: u32) -> bool {
+        self.retry_count < retry_limits
+    }
+
     pub fn update_task(&mut self, task: &Task) -> Result<(), FlameError> {
         let task_ptr = TaskPtr::new(task.clone().into());
 
@@ -125,5 +129,29 @@ impl Session {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_ready_uses_transient_retry_count() {
+        assert!(Session {
+            retry_count: 1,
+            ..Default::default()
+        }
+        .is_ready(2));
+        assert!(!Session {
+            retry_count: 2,
+            ..Default::default()
+        }
+        .is_ready(2));
+        assert!(!Session {
+            retry_count: 3,
+            ..Default::default()
+        }
+        .is_ready(2));
     }
 }

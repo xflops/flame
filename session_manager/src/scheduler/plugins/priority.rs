@@ -459,6 +459,7 @@ mod tests {
             batch_size,
             priority,
             resreq: Some(slots_to_rr(slots.into())),
+            retry_count: 0,
         })
     }
 

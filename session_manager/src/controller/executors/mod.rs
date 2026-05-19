@@ -20,7 +20,7 @@ use crate::controller::executors::{
 use crate::storage::StoragePtr;
 
 use crate::model::ExecutorPtr;
-use common::apis::{ExecutorState, SessionPtr, Task, TaskPtr, TaskResult};
+use common::apis::{ExecutorState, FlameResult, SessionPtr, Task, TaskPtr, TaskResult};
 use common::FlameError;
 use stdng::{lock_ptr, new_ptr, MutexPtr};
 
@@ -71,7 +71,7 @@ pub trait States: Send + Sync + 'static {
     async fn unregister_executor(&self) -> Result<(), FlameError>;
 
     async fn bind_session(&self, ssn: SessionPtr) -> Result<(), FlameError>;
-    async fn bind_session_completed(&self) -> Result<(), FlameError>;
+    async fn bind_session_completed(&self, result: Option<FlameResult>) -> Result<(), FlameError>;
 
     async fn unbind_executor(&self) -> Result<(), FlameError>;
     async fn unbind_executor_completed(&self) -> Result<(), FlameError>;
@@ -91,7 +91,7 @@ mod tests {
     use super::*;
     use crate::model::Executor;
     use chrono::Utc;
-    use common::apis::{ResourceRequirement, Shim};
+    use common::apis::{ApplicationAttributes, ResourceRequirement, SessionAttributes, Shim};
     use common::ctx::{FlameCluster, FlameClusterContext, FlameExecutors, FlameLimits};
 
     fn create_test_executor(id: &str, state: ExecutorState) -> ExecutorPtr {
@@ -139,12 +139,47 @@ mod tests {
                     max_sessions: None,
                     max_executors: 10,
                 },
+                recovery: Default::default(),
                 pprof: None,
             },
             cache: None,
         };
 
         crate::storage::new_ptr(&ctx).await.unwrap()
+    }
+
+    fn unique_test_id(prefix: &str) -> String {
+        format!(
+            "{}-{}-{:?}",
+            prefix,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::thread::current().id()
+        )
+    }
+
+    async fn create_stored_test_session(storage: &StoragePtr) -> (String, SessionPtr) {
+        let ssn_id = unique_test_id("ssn");
+        let app_name = unique_test_id("app");
+        storage
+            .register_application(
+                app_name.clone(),
+                ApplicationAttributes {
+                    shim: Shim::default(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .create_session(SessionAttributes {
+                id: ssn_id.clone(),
+                application: app_name,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ssn_ptr = storage.get_session_ptr(ssn_id.clone()).unwrap();
+        (ssn_id, ssn_ptr)
     }
 
     mod void_state_tests {
@@ -218,7 +253,7 @@ mod tests {
                 executor: exe_ptr.clone(),
             };
 
-            let result = state.bind_session_completed().await;
+            let result = state.bind_session_completed(None).await;
 
             assert!(result.is_err());
             assert!(matches!(result, Err(FlameError::InvalidState(_))));
@@ -350,7 +385,7 @@ mod tests {
                 executor: exe_ptr.clone(),
             };
 
-            let result = state.bind_session_completed().await;
+            let result = state.bind_session_completed(None).await;
 
             assert!(result.is_err());
             assert!(matches!(result, Err(FlameError::InvalidState(_))));
@@ -394,16 +429,79 @@ mod tests {
         async fn test_bind_session_completed_transitions_to_bound() {
             let exe_ptr = create_test_executor("exe-1", ExecutorState::Binding);
             let storage = create_mock_storage().await;
+            let (ssn_id, _) = create_stored_test_session(&storage).await;
+            {
+                let mut exe = lock_ptr!(exe_ptr).unwrap();
+                exe.ssn_id = Some(ssn_id);
+            }
 
             let state = BindingState {
                 storage,
                 executor: exe_ptr.clone(),
             };
 
-            let result = state.bind_session_completed().await;
+            let result = state.bind_session_completed(None).await;
 
             assert!(result.is_ok());
             assert_eq!(get_state(&exe_ptr).unwrap(), ExecutorState::Bound);
+        }
+
+        #[tokio::test]
+        async fn test_successful_bind_session_completed_without_session_fails() {
+            let exe_ptr = create_test_executor("exe-1", ExecutorState::Binding);
+            let storage = create_mock_storage().await;
+
+            let state = BindingState {
+                storage,
+                executor: exe_ptr.clone(),
+            };
+
+            let result = state.bind_session_completed(None).await;
+
+            assert!(result.is_err());
+            assert!(matches!(result, Err(FlameError::InvalidState(_))));
+            assert_eq!(get_state(&exe_ptr).unwrap(), ExecutorState::Binding);
+        }
+
+        #[tokio::test]
+        async fn test_failed_bind_session_completed_transitions_to_unbinding() {
+            let exe_ptr = create_test_executor("exe-1", ExecutorState::Binding);
+            let storage = create_mock_storage().await;
+            let (ssn_id, _) = create_stored_test_session(&storage).await;
+            {
+                let mut exe = lock_ptr!(exe_ptr).unwrap();
+                exe.ssn_id = Some(ssn_id.clone());
+                exe.task_id = Some(1);
+            }
+
+            let state = BindingState {
+                storage: storage.clone(),
+                executor: exe_ptr.clone(),
+            };
+
+            let result = state
+                .bind_session_completed(Some(FlameResult {
+                    return_code: common::apis::BIND_RESULT_ON_SESSION_ENTER_FAILED,
+                    message: Some("enter failed".to_string()),
+                }))
+                .await;
+
+            assert!(result.is_ok());
+            let exe = lock_ptr!(exe_ptr).unwrap();
+            assert_eq!(exe.state, ExecutorState::Unbinding);
+            assert_eq!(exe.ssn_id, None);
+            assert_eq!(exe.task_id, None);
+
+            let session = storage.get_session(ssn_id).unwrap();
+            assert_eq!(session.retry_count, 1);
+            assert_eq!(
+                session
+                    .events
+                    .iter()
+                    .filter(|event| event.code == common::apis::SESSION_BIND_FAILED)
+                    .count(),
+                1
+            );
         }
 
         #[tokio::test]
@@ -457,8 +555,13 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_unregister_executor_fails() {
+        async fn test_unregister_executor_transitions_to_released() {
             let exe_ptr = create_test_executor("exe-1", ExecutorState::Binding);
+            {
+                let mut exe = lock_ptr!(exe_ptr).unwrap();
+                exe.ssn_id = Some("ssn-1".to_string());
+                exe.task_id = Some(1);
+            }
             let state = BindingState {
                 storage: create_mock_storage().await,
                 executor: exe_ptr.clone(),
@@ -466,8 +569,11 @@ mod tests {
 
             let result = state.unregister_executor().await;
 
-            assert!(result.is_err());
-            assert!(matches!(result, Err(FlameError::InvalidState(_))));
+            assert!(result.is_ok());
+            let exe = lock_ptr!(exe_ptr).unwrap();
+            assert_eq!(exe.state, ExecutorState::Released);
+            assert_eq!(exe.ssn_id, None);
+            assert_eq!(exe.task_id, None);
         }
 
         #[tokio::test]
@@ -585,7 +691,7 @@ mod tests {
                 executor: exe_ptr.clone(),
             };
 
-            let result = state.bind_session_completed().await;
+            let result = state.bind_session_completed(None).await;
 
             assert!(result.is_err());
             assert!(matches!(result, Err(FlameError::InvalidState(_))));
@@ -716,7 +822,7 @@ mod tests {
                 executor: exe_ptr.clone(),
             };
 
-            let result = state.bind_session_completed().await;
+            let result = state.bind_session_completed(None).await;
 
             assert!(result.is_err());
             assert!(matches!(result, Err(FlameError::InvalidState(_))));
@@ -809,7 +915,7 @@ mod tests {
                 executor: exe_ptr.clone(),
             };
 
-            let result = state.bind_session_completed().await;
+            let result = state.bind_session_completed(None).await;
 
             assert!(result.is_err());
             assert!(matches!(result, Err(FlameError::InvalidState(_))));
@@ -983,19 +1089,15 @@ mod tests {
                 storage: storage.clone(),
                 executor: exe_ptr.clone(),
             };
-            let ssn = common::apis::Session {
-                id: "ssn-1".to_string(),
-                ..Default::default()
-            };
-            let ssn_ptr = new_ptr(ssn);
-            idle_state.bind_session(ssn_ptr.clone()).await.unwrap();
+            let (_, ssn_ptr) = create_stored_test_session(&storage).await;
+            idle_state.bind_session(ssn_ptr).await.unwrap();
             assert_eq!(get_state(&exe_ptr).unwrap(), ExecutorState::Binding);
 
             let binding_state = BindingState {
                 storage: storage.clone(),
                 executor: exe_ptr.clone(),
             };
-            binding_state.bind_session_completed().await.unwrap();
+            binding_state.bind_session_completed(None).await.unwrap();
             assert_eq!(get_state(&exe_ptr).unwrap(), ExecutorState::Bound);
 
             let bound_state = BoundState {

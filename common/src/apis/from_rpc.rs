@@ -82,6 +82,15 @@ impl From<rpc::Event> for Event {
     }
 }
 
+impl From<rpc::Result> for FlameResult {
+    fn from(result: rpc::Result) -> Self {
+        Self {
+            return_code: result.return_code,
+            message: result.message,
+        }
+    }
+}
+
 impl TryFrom<rpc::Task> for TaskContext {
     type Error = FlameError;
 

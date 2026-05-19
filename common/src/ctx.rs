@@ -32,6 +32,7 @@ const DEFAULT_FLAME_ENDPOINT: &str = "http://127.0.0.1:8080";
 pub const DEFAULT_POLICIES: &[&str] = &["priority", "drf", "gang"];
 const DEFAULT_STORAGE: &str = "sqlite://flame.db";
 const DEFAULT_MAX_EXECUTORS_PER_NODE: u32 = 128;
+pub const DEFAULT_SESSION_RETRY_LIMITS: u32 = 5;
 const DEFAULT_SCHEDULE_INTERVAL: u64 = 100;
 const DEFAULT_SHIM: &str = "host";
 const DEFAULT_FLAME_CACHE_ENDPOINT: &str = "http://127.0.0.1:9090";
@@ -69,6 +70,18 @@ struct FlameClusterYaml {
     pub limits: Option<FlameLimitsYaml>,
     /// pprof profiling configuration
     pub pprof: Option<FlamePprofYaml>,
+    /// Recovery configuration
+    pub recovery: Option<FlameRecoveryYaml>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FlameRecoveryYaml {
+    pub session: Option<FlameSessionRecoveryYaml>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FlameSessionRecoveryYaml {
+    pub retry_limits: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +161,7 @@ pub struct FlameCluster {
     pub executors: FlameExecutors,
     pub tls: Option<FlameTls>,
     pub limits: FlameLimits,
+    pub recovery: FlameRecovery,
     pub pprof: Option<FlamePprof>,
 }
 
@@ -160,6 +174,16 @@ pub struct FlameExecutors {
 pub struct FlameLimits {
     pub max_sessions: Option<usize>,
     pub max_executors: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FlameRecovery {
+    pub session: FlameSessionRecovery,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlameSessionRecovery {
+    pub retry_limits: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -393,6 +417,10 @@ impl TryFrom<FlameClusterYaml> for FlameCluster {
         let limits = cluster.limits.map(FlameLimits::from).unwrap_or_default();
 
         let pprof = cluster.pprof.map(FlamePprof::from);
+        let recovery = cluster
+            .recovery
+            .map(FlameRecovery::from)
+            .unwrap_or_default();
 
         Ok(FlameCluster {
             name: cluster.name,
@@ -412,8 +440,36 @@ impl TryFrom<FlameClusterYaml> for FlameCluster {
             executors,
             tls,
             limits,
+            recovery,
             pprof,
         })
+    }
+}
+
+impl From<FlameRecoveryYaml> for FlameRecovery {
+    fn from(yaml: FlameRecoveryYaml) -> Self {
+        FlameRecovery {
+            session: yaml
+                .session
+                .map(FlameSessionRecovery::from)
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl From<FlameSessionRecoveryYaml> for FlameSessionRecovery {
+    fn from(yaml: FlameSessionRecoveryYaml) -> Self {
+        FlameSessionRecovery {
+            retry_limits: yaml.retry_limits.unwrap_or(DEFAULT_SESSION_RETRY_LIMITS),
+        }
+    }
+}
+
+impl Default for FlameSessionRecovery {
+    fn default() -> Self {
+        FlameSessionRecovery {
+            retry_limits: DEFAULT_SESSION_RETRY_LIMITS,
+        }
     }
 }
 
@@ -464,6 +520,7 @@ impl Default for FlameCluster {
             executors: FlameExecutors::default(),
             tls: None,
             limits: FlameLimits::default(),
+            recovery: FlameRecovery::default(),
             pprof: None,
         }
     }
@@ -575,6 +632,29 @@ cluster:
         assert_eq!(ctx.cluster.storage, "sqlite://flame.db");
         assert_eq!(ctx.cluster.executors.shim, Shim::Host);
         assert_eq!(ctx.cluster.limits.max_executors, 10);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_flame_context_with_session_recovery_retry_limits() -> Result<(), FlameError> {
+        let context_string = r#"---
+cluster:
+  name: flame
+  endpoint: "http://flame-session-manager:8080"
+  recovery:
+    session:
+      retry_limits: 2
+        "#;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
+
+        fs::write(&tmp_file, context_string).map_err(|e| FlameError::Internal(e.to_string()))?;
+
+        let ctx = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()))?;
+
+        assert_eq!(ctx.cluster.recovery.session.retry_limits, 2);
 
         Ok(())
     }

@@ -151,6 +151,7 @@ mod tests {
                 memory: 1024,
                 gpu: 0,
             }),
+            retry_count: 0,
         })
     }
 

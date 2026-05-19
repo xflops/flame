@@ -20,6 +20,7 @@ This module tests:
 - Recovery after failures
 """
 
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import flamepy
@@ -28,10 +29,14 @@ from flamepy import TaskState
 
 from e2e.api import TestRequest
 from e2e.helpers import FAIL_INPUT, invoke_task, serialize_request
+from tests.utils import random_string
 
 FLM_TEST_SVC_APP = "flme2e-svc"
 FLM_ERROR_SVC_APP = "flme2e-error-svc"
+FLM_ENTER_FAILURE_APP = "flme2e-enter-failure-svc"
+ENTER_FAILURE_SERVICE_ENTRYPOINT = "import flamepy; from e2e.error_svc import EnterFailureTestService; flamepy.run(EnterFailureTestService())"
 TASK_FAILED_EVENT_CODE = int(TaskState.FAILED)
+SESSION_BIND_FAILED_EVENT_CODE = 1001
 
 
 def _wait_for_terminal_task(session, task_id):
@@ -46,6 +51,21 @@ def _create_failing_basic_task(session):
     task_update = _wait_for_terminal_task(session, task.id)
     assert task_update.state == TaskState.FAILED
     return task_update
+
+
+def _wait_for_session_event(session_id, event_code, timeout_seconds=60):
+    deadline = time.monotonic() + timeout_seconds
+    last_events = []
+
+    while time.monotonic() < deadline:
+        session = flamepy.get_session(session_id)
+        last_events = session.events
+        matched_events = [event for event in last_events if event.code == event_code]
+        if matched_events:
+            return session, matched_events
+        time.sleep(0.5)
+
+    pytest.fail(f"Session {session_id} did not record event {event_code}; last events: {[(e.code, e.message) for e in last_events]}")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -75,12 +95,26 @@ def setup_test_env():
         ),
     )
 
+    flamepy.register_application(
+        FLM_ENTER_FAILURE_APP,
+        flamepy.ApplicationAttributes(
+            command="python3",
+            working_directory="/opt/e2e",
+            environments={
+                "FLAME_LOG_LEVEL": "DEBUG",
+                "PYTHONPATH": "/opt/e2e/src",
+            },
+            arguments=["-c", ENTER_FAILURE_SERVICE_ENTRYPOINT],
+            installer="python",
+        ),
+    )
+
     yield
 
     # Clean up sessions owned by this module before unregistering.
     sessions = flamepy.list_sessions()
     for sess in sessions:
-        if sess.application not in {FLM_TEST_SVC_APP, FLM_ERROR_SVC_APP}:
+        if sess.application not in {FLM_TEST_SVC_APP, FLM_ERROR_SVC_APP, FLM_ENTER_FAILURE_APP}:
             continue
         try:
             flamepy.close_session(sess.id)
@@ -89,6 +123,7 @@ def setup_test_env():
 
     flamepy.unregister_application(FLM_TEST_SVC_APP)
     flamepy.unregister_application(FLM_ERROR_SVC_APP)
+    flamepy.unregister_application(FLM_ENTER_FAILURE_APP)
 
 
 # =============================================================================
@@ -161,6 +196,41 @@ class TestTaskFailure:
 
         finally:
             session.close()
+
+
+# =============================================================================
+# Session Bind Failure Tests
+# =============================================================================
+
+
+class TestSessionBindFailureRecovery:
+    """Tests for session bind failure recovery."""
+
+    def test_on_session_enter_failure_records_session_event(self):
+        """Test that on_session_enter failure is reported as a session event."""
+        session_id = f"test-enter-failure-{random_string(8)}"
+        session = flamepy.create_session(
+            application=FLM_ENTER_FAILURE_APP,
+            session_id=session_id,
+            common_data=None,
+            max_instances=1,
+        )
+
+        try:
+            session.create_task(b"trigger session bind")
+
+            current_session, bind_failed_events = _wait_for_session_event(
+                session_id,
+                SESSION_BIND_FAILED_EVENT_CODE,
+            )
+
+            assert current_session.state == flamepy.SessionState.OPEN
+            event_messages = [event.message or "" for event in bind_failed_events]
+            assert any("failed to bind session" in message for message in event_messages)
+            assert any("intentional session enter failure" in message for message in event_messages)
+
+        finally:
+            flamepy.close_session(session_id)
 
 
 # =============================================================================

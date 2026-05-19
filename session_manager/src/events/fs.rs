@@ -167,9 +167,9 @@ impl EventManager for FsEventManager {
 
     fn find_events(&self, owner: EventOwner) -> Result<Vec<Event>, FlameError> {
         let mut event_storage = lock_ptr!(self.event_storage)?;
-        let storage = event_storage
-            .get_mut(&owner.session_id)
-            .ok_or(FlameError::Internal("Event storage not found".to_string()))?;
+        let Some(storage) = event_storage.get_mut(&owner.session_id) else {
+            return Ok(vec![]);
+        };
 
         let events = lock_ptr!(self.events)?;
         let event_daos = events

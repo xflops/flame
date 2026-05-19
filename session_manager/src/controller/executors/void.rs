@@ -16,7 +16,7 @@ use crate::storage::StoragePtr;
 use stdng::{lock_ptr, logs::TraceFn, trace_fn, MutexPtr};
 
 use crate::model::ExecutorPtr;
-use common::apis::{ExecutorState, SessionPtr, Task, TaskPtr, TaskResult};
+use common::apis::{ExecutorState, FlameResult, SessionPtr, Task, TaskPtr, TaskResult};
 use common::FlameError;
 
 pub struct VoidState {
@@ -52,7 +52,7 @@ impl States for VoidState {
         Err(FlameError::InvalidState("Executor is void".to_string()))
     }
 
-    async fn bind_session_completed(&self) -> Result<(), FlameError> {
+    async fn bind_session_completed(&self, _result: Option<FlameResult>) -> Result<(), FlameError> {
         trace_fn!("VoidState::bind_session_completed");
 
         Err(FlameError::InvalidState("Executor is void".to_string()))

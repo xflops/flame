@@ -54,6 +54,7 @@ message BindExecutorResponse {
 
 message BindExecutorCompletedRequest {
   string executor_id = 1;
+  optional Result result = 2;
 }
 
 message UnbindExecutorRequest {

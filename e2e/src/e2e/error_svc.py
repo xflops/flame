@@ -47,5 +47,14 @@ class ErrorTestService(flamepy.FlameService):
         self._session_context = None
 
 
+class EnterFailureTestService(ErrorTestService):
+    """Service that raises an exception in on_session_enter for bind failure tests."""
+
+    def on_session_enter(self, context: flamepy.SessionContext):
+        """Handle session enter by raising an exception."""
+        logger.info(f"Failing session enter: session_id={context.session_id}")
+        raise RuntimeError("intentional session enter failure")
+
+
 if __name__ == "__main__":
     flamepy.run(ErrorTestService())

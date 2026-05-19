@@ -16,7 +16,7 @@ use std::sync::Arc;
 use stdng::collections::{BinaryHeap, Cmp};
 use stdng::{logs::TraceFn, trace_fn};
 
-use crate::model::{BOUND_EXECUTOR, IDLE_EXECUTOR, OPEN_SESSION};
+use crate::model::{BOUND_EXECUTOR, IDLE_EXECUTOR, READY_SESSION};
 use crate::scheduler::actions::{Action, ActionPtr};
 use crate::scheduler::ctx::Context;
 use crate::scheduler::plugins::ssn_order_fn;
@@ -38,7 +38,7 @@ impl Action for ShuffleAction {
         let ss = ctx.snapshot.clone();
 
         let mut underused = BinaryHeap::new(ssn_order_fn(ctx));
-        let open_ssns = ss.find_sessions(OPEN_SESSION)?;
+        let open_ssns = ss.find_sessions(READY_SESSION)?;
         for ssn in open_ssns.values() {
             if ctx.is_underused(ssn)? {
                 underused.push(ssn.clone());

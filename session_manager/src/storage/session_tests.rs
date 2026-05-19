@@ -14,7 +14,10 @@ limitations under the License.
 #[cfg(test)]
 mod tests {
     use crate::storage;
-    use common::apis::{ResourceRequirement, SessionAttributes, SessionState, TaskState};
+    use chrono::Utc;
+    use common::apis::{
+        Event, EventOwner, ResourceRequirement, SessionAttributes, SessionState, TaskState,
+    };
     use common::ctx::{FlameCluster, FlameClusterContext};
 
     fn test_context() -> FlameClusterContext {
@@ -124,6 +127,32 @@ mod tests {
             let ssn_ptr = storage.get_session_ptr("ptr-test-ssn".to_string()).unwrap();
             let ssn = stdng::lock_ptr!(ssn_ptr).unwrap();
             assert_eq!(ssn.id, "ptr-test-ssn");
+        }
+
+        #[tokio::test]
+        async fn includes_session_events() {
+            let ctx = test_context();
+            let storage = storage::new_ptr(&ctx).await.unwrap();
+
+            let attr = create_session_attr("event-test-ssn");
+            storage.create_session(attr).await.unwrap();
+            storage
+                .record_event(
+                    EventOwner::session("event-test-ssn".to_string()),
+                    Event {
+                        code: 1001,
+                        message: Some("bind failed".to_string()),
+                        creation_time: Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let ssn = storage.get_session("event-test-ssn".to_string()).unwrap();
+
+            assert_eq!(ssn.events.len(), 1);
+            assert_eq!(ssn.events[0].code, 1001);
+            assert_eq!(ssn.events[0].message.as_deref(), Some("bind failed"));
         }
     }
 
@@ -371,6 +400,39 @@ mod tests {
 
             assert_eq!(open_count, 1);
             assert_eq!(closed_count, 1);
+        }
+
+        #[tokio::test]
+        async fn includes_session_events() {
+            let ctx = test_context();
+            let storage = storage::new_ptr(&ctx).await.unwrap();
+
+            let attr = create_session_attr("list-event-ssn");
+            storage.create_session(attr).await.unwrap();
+            storage
+                .record_event(
+                    EventOwner::session("list-event-ssn".to_string()),
+                    Event {
+                        code: 1002,
+                        message: Some("retry limit reached".to_string()),
+                        creation_time: Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let sessions = storage.list_session().unwrap();
+            let session = sessions
+                .iter()
+                .find(|session| session.id == "list-event-ssn")
+                .expect("session should be listed");
+
+            assert_eq!(session.events.len(), 1);
+            assert_eq!(session.events[0].code, 1002);
+            assert_eq!(
+                session.events[0].message.as_deref(),
+                Some("retry limit reached")
+            );
         }
     }
 }

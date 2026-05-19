@@ -169,7 +169,27 @@ pub fn start(client: BackendClient, executor: ExecutorPtr, app_manager: Arc<Appl
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Failed to execute: {e}");
+                    let session_id = exec
+                        .session
+                        .as_ref()
+                        .map(|session| session.session_id.as_str());
+                    let application = exec
+                        .session
+                        .as_ref()
+                        .map(|session| session.application.name.as_str());
+                    let task_id = exec.task.as_ref().map(|task| task.task_id.as_str());
+                    let task_session_id = exec.task.as_ref().map(|task| task.session_id.as_str());
+                    tracing::error!(
+                        executor_id = %exec.id,
+                        node = %exec.node,
+                        state = %exec.state,
+                        session_id = ?session_id,
+                        application = ?application,
+                        task_session_id = ?task_session_id,
+                        task_id = ?task_id,
+                        error = %e,
+                        "Failed to execute executor state"
+                    );
                 }
             }
         }

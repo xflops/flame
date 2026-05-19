@@ -106,6 +106,15 @@ jobs:
           echo "=== Check flmctl connectivity ==="
           flmctl list -a || echo "Warning: Could not list applications"
           echo ""
+          echo "=== Flame nodes ==="
+          flmctl list -n || echo "Warning: Could not list nodes"
+          echo ""
+          echo "=== Flame node details ==="
+          for node in $(flmctl list -n 2>/dev/null | awk 'NR > 1 {print $1}'); do
+            echo "--- Node: $node ---"
+            flmctl view -n "$node" || echo "Warning: Could not view node $node"
+          done
+          echo ""
           echo "=== Verify object cache is accessible ==="
           curl -s http://127.0.0.1:9090/ || echo "Note: Object cache gRPC endpoint (expected no HTTP response)"
 

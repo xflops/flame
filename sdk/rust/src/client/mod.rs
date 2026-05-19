@@ -1678,6 +1678,47 @@ mod tests {
         assert_eq!(parsed.creation_time, expected);
     }
 
+    #[test]
+    fn session_try_from_extracts_events() {
+        let when = Utc.with_ymd_and_hms(2026, 5, 8, 10, 0, 0).unwrap();
+        let rpc_session = rpc::Session {
+            metadata: Some(rpc::Metadata {
+                id: "ssn-1".to_string(),
+                name: String::new(),
+            }),
+            spec: Some(rpc::SessionSpec {
+                application: "app".to_string(),
+                common_data: None,
+                min_instances: 0,
+                max_instances: None,
+                batch_size: 1,
+                priority: 0,
+                resreq: None,
+            }),
+            status: Some(rpc::SessionStatus {
+                state: rpc::SessionState::Open as i32,
+                creation_time: when.timestamp_millis(),
+                completion_time: None,
+                pending: 0,
+                running: 0,
+                succeed: 0,
+                failed: 0,
+                cancelled: 0,
+                events: vec![rpc::Event {
+                    code: 1001,
+                    message: Some("bind failed".to_string()),
+                    creation_time: when.timestamp_millis(),
+                }],
+            }),
+        };
+
+        let parsed = Session::try_from(&rpc_session).expect("Session::try_from should succeed");
+
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].code, 1001);
+        assert_eq!(parsed.events[0].message.as_deref(), Some("bind failed"));
+    }
+
     /// Verifies that `From<rpc::ResourceRequirement> for ResourceRequirement`
     /// preserves all fields when converting from the wire type into the SDK type.
     #[test]

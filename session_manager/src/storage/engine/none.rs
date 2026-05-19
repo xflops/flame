@@ -200,6 +200,7 @@ impl Engine for NoneEngine {
             tasks: HashMap::new(),
             tasks_index: HashMap::new(),
             events: vec![],
+            retry_count: 0,
         })
     }
 

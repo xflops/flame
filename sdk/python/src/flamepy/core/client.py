@@ -79,6 +79,17 @@ def _schema_from_application_spec(spec: ApplicationSpec) -> Optional[Application
     )
 
 
+def _events_from_proto(events) -> List[Event]:
+    return [
+        Event(
+            code=event.code,
+            message=event.message,
+            creation_time=datetime.fromtimestamp(event.creation_time / 1000, tz=timezone.utc),
+        )
+        for event in events
+    ]
+
+
 def _application_from_proto(app) -> Application:
     spec = app.spec
     environments = {env.name: env.value for env in spec.environments}
@@ -453,6 +464,7 @@ class Connection:
                 failed=response.status.failed,
                 completion_time=(datetime.fromtimestamp(response.status.completion_time / 1000, tz=timezone.utc) if response.status.HasField("completion_time") else None),
                 common_data=common_data_bytes,
+                events=_events_from_proto(response.status.events),
             )
             return session
         except grpc.RpcError as e:
@@ -483,6 +495,7 @@ class Connection:
                         failed=session.status.failed,
                         completion_time=(datetime.fromtimestamp(session.status.completion_time / 1000, tz=timezone.utc) if session.status.HasField("completion_time") else None),
                         common_data=common_data_bytes,
+                        events=_events_from_proto(session.status.events),
                     )
                 )
 
@@ -539,6 +552,7 @@ class Connection:
                 failed=response.status.failed,
                 completion_time=(datetime.fromtimestamp(response.status.completion_time / 1000, tz=timezone.utc) if response.status.HasField("completion_time") else None),
                 common_data=common_data_bytes,
+                events=_events_from_proto(response.status.events),
             )
 
         except grpc.RpcError as e:
@@ -566,6 +580,7 @@ class Connection:
                 failed=response.status.failed,
                 completion_time=(datetime.fromtimestamp(response.status.completion_time / 1000, tz=timezone.utc) if response.status.HasField("completion_time") else None),
                 common_data=common_data_bytes,
+                events=_events_from_proto(response.status.events),
             )
 
         except grpc.RpcError as e:
@@ -593,6 +608,7 @@ class Connection:
                 failed=response.status.failed,
                 completion_time=(datetime.fromtimestamp(response.status.completion_time / 1000, tz=timezone.utc) if response.status.HasField("completion_time") else None),
                 common_data=common_data_bytes,
+                events=_events_from_proto(response.status.events),
             )
 
         except grpc.RpcError as e:
@@ -611,6 +627,7 @@ class Session:
     succeed: int = 0
     failed: int = 0
     completion_time: Optional[datetime] = None
+    events: Optional[List[Event]] = None
     _common_data: Optional[bytes] = None
     """Client for session-specific operations."""
 
@@ -627,6 +644,7 @@ class Session:
         failed: int,
         completion_time: Optional[datetime],
         common_data: Optional[bytes] = None,
+        events: Optional[List[Event]] = None,
     ):
         self.connection = connection
         self.id = id
@@ -640,6 +658,7 @@ class Session:
         self.completion_time = completion_time
         self.mutex = threading.Lock()
         self._common_data = common_data
+        self.events = events or []
 
     def common_data(self) -> Optional[bytes]:
         """Get the common data of Session as bytes."""
@@ -669,14 +688,7 @@ class Session:
                 creation_time=datetime.fromtimestamp(response.status.creation_time / 1000, tz=timezone.utc),
                 input=input_data,
                 completion_time=(datetime.fromtimestamp(response.status.completion_time / 1000, tz=timezone.utc) if response.status.HasField("completion_time") else None),
-                events=[
-                    Event(
-                        code=event.code,
-                        message=event.message,
-                        creation_time=datetime.fromtimestamp(event.creation_time / 1000, tz=timezone.utc),
-                    )
-                    for event in response.status.events
-                ],
+                events=_events_from_proto(response.status.events),
             )
 
         except grpc.RpcError as e:
@@ -697,14 +709,7 @@ class Session:
                 input=response.spec.input if response.spec.HasField("input") else None,
                 output=response.spec.output if response.spec.HasField("output") else None,
                 completion_time=(datetime.fromtimestamp(response.status.completion_time / 1000, tz=timezone.utc) if response.status.HasField("completion_time") else None),
-                events=[
-                    Event(
-                        code=event.code,
-                        message=event.message,
-                        creation_time=datetime.fromtimestamp(event.creation_time / 1000, tz=timezone.utc),
-                    )
-                    for event in response.status.events
-                ],
+                events=_events_from_proto(response.status.events),
             )
 
         except grpc.RpcError as e:
@@ -823,14 +828,7 @@ def _task_from_proto(response, session_id: str) -> Task:
         input=response.spec.input if response.spec.HasField("input") else None,
         output=response.spec.output if response.spec.HasField("output") else None,
         completion_time=(datetime.fromtimestamp(response.status.completion_time / 1000, tz=timezone.utc) if response.status.HasField("completion_time") else None),
-        events=[
-            Event(
-                code=event.code,
-                message=event.message,
-                creation_time=datetime.fromtimestamp(event.creation_time / 1000, tz=timezone.utc),
-            )
-            for event in response.status.events
-        ],
+        events=_events_from_proto(response.status.events),
     )
 
 

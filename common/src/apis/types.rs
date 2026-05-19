@@ -21,6 +21,14 @@ use stdng::MutexPtr;
 
 pub const DEFAULT_MAX_INSTANCES: u32 = 1_000_000;
 pub const DEFAULT_DELAY_RELEASE: Duration = Duration::seconds(60);
+pub const BIND_RESULT_OK: i32 = 0;
+pub const BIND_RESULT_APPLICATION_INSTALL_FAILED: i32 = 10;
+pub const BIND_RESULT_SHIM_CREATE_FAILED: i32 = 11;
+pub const BIND_RESULT_ON_SESSION_ENTER_FAILED: i32 = 12;
+pub const BIND_RESULT_UNKNOWN_FAILED: i32 = 19;
+pub const SESSION_EVENT_TASK_ID: i64 = 0;
+pub const SESSION_BIND_FAILED: i32 = 1001;
+pub const SESSION_RETRY_LIMIT_REACHED: i32 = 1002;
 
 pub type SessionID = String;
 pub type TaskID = i64;
@@ -42,11 +50,26 @@ pub struct EventOwner {
     pub session_id: SessionID,
 }
 
+impl EventOwner {
+    pub fn session(session_id: SessionID) -> Self {
+        Self {
+            session_id,
+            task_id: SESSION_EVENT_TASK_ID,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Event {
     pub code: i32,
     pub message: Option<String>,
     pub creation_time: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FlameResult {
+    pub return_code: i32,
+    pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -226,6 +249,7 @@ pub struct Session {
     pub batch_size: u32,
     pub priority: u32,
     pub resreq: Option<ResourceRequirement>,
+    pub retry_count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, strum_macros::Display)]
@@ -733,6 +757,21 @@ mod tests {
     fn great_false_when_one_field_equal() {
         // memory equal, others strictly greater → must be false (strict on all)
         assert!(!rr(2, 2, 5).great(&rr(1, 2, 3)));
+    }
+
+    #[test]
+    fn flame_result_converts_to_and_from_rpc_result() {
+        let result = FlameResult {
+            return_code: 12,
+            message: Some("bind failed".to_string()),
+        };
+
+        let rpc_result: rpc::flame::v1::Result = result.clone().into();
+        assert_eq!(rpc_result.return_code, 12);
+        assert_eq!(rpc_result.message.as_deref(), Some("bind failed"));
+
+        let parsed = FlameResult::from(rpc_result);
+        assert_eq!(parsed, result);
     }
 
     #[test]
