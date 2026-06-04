@@ -301,39 +301,8 @@ check_manifest_platforms() {
     local image="$1"
     local manifest_file="$2"
 
-    python3 - "$image" "$manifest_file" "$EXPECTED_PLATFORMS" <<'PY'
-import json
-import sys
-
-image = sys.argv[1]
-manifest_file = sys.argv[2]
-expected = set(sys.argv[3].split())
-
-with open(manifest_file) as f:
-    data = json.load(f)
-
-if isinstance(data, list):
-    data = data[0] if data else {}
-
-platforms = set()
-for manifest in data.get("manifests", []):
-    platform = manifest.get("platform", {})
-    os_name = platform.get("os")
-    arch = platform.get("architecture")
-    if os_name and arch:
-        platforms.add(f"{os_name}/{arch}")
-
-if not platforms and data.get("os") and data.get("architecture"):
-    platforms.add(f"{data['os']}/{data['architecture']}")
-
-if not platforms and data.get("Os") and data.get("Architecture"):
-    platforms.add(f"{data['Os']}/{data['Architecture']}")
-
-missing = expected - platforms
-print(f"{image}: platforms={','.join(sorted(platforms)) or 'unknown'}")
-if missing:
-    raise SystemExit(f"{image}: missing expected platforms {','.join(sorted(missing))}")
-PY
+    python3 "$ROOT_DIR/ci/release/check-image-platforms.py" \
+        "$image" "$EXPECTED_PLATFORMS" <"$manifest_file"
 }
 
 inspect_image_manifest() {

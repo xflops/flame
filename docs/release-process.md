@@ -291,7 +291,8 @@ make release-images-inspect
 make release-images-push
 ```
 
-Verify the registry exposes both architectures:
+Verify the registry exposes every platform listed in `RELEASE_IMAGE_PLATFORMS`
+for all four images:
 
 ```shell
 make release-images-verify

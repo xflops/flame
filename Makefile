@@ -232,11 +232,18 @@ release-images: require-release-image-tag ## Build, inspect, and push release im
 	$(MAKE) release-images-inspect
 	$(MAKE) release-images-push
 
-release-images-verify: require-release-image-tag ## Verify remote release image manifests
-	$(CONTAINER_CLI) manifest inspect "docker://$(IMAGE_REGISTRY)/flame-session-manager:$(DOCKER_TAG)"
-	$(CONTAINER_CLI) manifest inspect "docker://$(IMAGE_REGISTRY)/flame-object-cache:$(DOCKER_TAG)"
-	$(CONTAINER_CLI) manifest inspect "docker://$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)"
-	$(CONTAINER_CLI) manifest inspect "docker://$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)"
+release-images-verify: require-release-image-tag ## Verify remote release image manifests include expected platforms
+	@set -eu; \
+	expected_platforms="$(RELEASE_IMAGE_PLATFORMS)"; \
+	check_image() { \
+		image="$$1"; \
+		echo "$(CONTAINER_CLI) manifest inspect $$image"; \
+		$(CONTAINER_CLI) manifest inspect "$$image" | python3 ci/release/check-image-platforms.py "$$image" "$$expected_platforms"; \
+	}; \
+	check_image "$(IMAGE_REGISTRY)/flame-session-manager:$(DOCKER_TAG)"; \
+	check_image "$(IMAGE_REGISTRY)/flame-object-cache:$(DOCKER_TAG)"; \
+	check_image "$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)"; \
+	check_image "$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)"
 
 release-images-pull-bases: ## Pull release base images with the detected container CLI
 	@set -eu; \
