@@ -260,7 +260,7 @@ run_package_checks() {
     log "uv run Python SDK runner tests"
     (
         cd "$ROOT_DIR/sdk/python"
-        uv run -n pytest tests/test_runner_e2e.py tests/test_runner.py -q
+        uv run -n --extra dev pytest tests/test_runner_e2e.py tests/test_runner.py -q
     )
 
     log "uv run Python SDK version import"

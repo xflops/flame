@@ -16,6 +16,7 @@ export STDNG_VERSION=0.1.8
 export DOCKER_TAG="${RELEASE_TAG}"
 export RELEASE_BRANCH=release-0.6
 export IMAGE_REGISTRY=docker.io/xflops
+export RUST_BUILDER_IMAGE=docker.io/library/rust:1.95
 export RELEASE_NOTES_FILE=/tmp/flame-${RELEASE_TAG}-notes.md
 ```
 
@@ -251,12 +252,16 @@ only after the versioned tag has been pushed and verified.
 Use either Podman or Docker Buildx. Both paths must publish a multi-arch tag
 that contains `linux/amd64` and `linux/arm64`.
 
+Set `RUST_BUILDER_IMAGE` to the Rust builder image used by the release
+Dockerfiles. Do not use `rust:latest` for release validation because it can drift
+from the image build inputs.
+
 Podman prerequisites:
 
 ```shell
 podman info
 podman login --get-login docker.io || podman login docker.io
-podman run --rm --platform linux/amd64 docker.io/library/rust:1.95 rustc -vV
+podman run --rm --platform linux/amd64 "${RUST_BUILDER_IMAGE}" rustc -vV
 ```
 
 If the amd64 Rust smoke test fails under emulation, do not publish a stable
@@ -407,12 +412,12 @@ the affected platform before rebuilding. Use the matching tool for the selected
 build path:
 
 ```shell
-podman pull --platform linux/amd64 docker.io/library/rust:1.95
-podman pull --platform linux/arm64 docker.io/library/rust:1.95
+podman pull --platform linux/amd64 "${RUST_BUILDER_IMAGE}"
+podman pull --platform linux/arm64 "${RUST_BUILDER_IMAGE}"
 podman pull --platform linux/amd64 docker.io/library/ubuntu:24.04
 podman pull --platform linux/arm64 docker.io/library/ubuntu:24.04
-docker pull --platform linux/amd64 docker.io/library/rust:1.95
-docker pull --platform linux/arm64 docker.io/library/rust:1.95
+docker pull --platform linux/amd64 "${RUST_BUILDER_IMAGE}"
+docker pull --platform linux/arm64 "${RUST_BUILDER_IMAGE}"
 docker pull --platform linux/amd64 docker.io/library/ubuntu:24.04
 docker pull --platform linux/arm64 docker.io/library/ubuntu:24.04
 ```
