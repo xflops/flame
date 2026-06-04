@@ -1,10 +1,7 @@
-# Detect OS and set container runtime
-UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Darwin)
-    CONTAINER_RUNTIME ?= podman
-else
-    CONTAINER_RUNTIME ?= docker
-endif
+# Detect a Docker-compatible container CLI.
+DETECTED_CONTAINER_CLI := $(shell if command -v podman >/dev/null 2>&1; then echo podman; elif command -v docker >/dev/null 2>&1; then echo docker; else echo docker; fi)
+CONTAINER_CLI ?= $(DETECTED_CONTAINER_CLI)
+CONTAINER_RUNTIME ?= $(CONTAINER_CLI)
 
 # Docker image configuration
 DOCKER_REGISTRY ?= xflops
@@ -21,6 +18,13 @@ CONSOLE_IMAGE = $(DOCKER_REGISTRY)/flame-console
 FSM_DOCKERFILE = docker/Dockerfile.fsm
 FEM_DOCKERFILE = docker/Dockerfile.fem
 CONSOLE_DOCKERFILE = docker/Dockerfile.console
+
+# Release image configuration
+IMAGE_REGISTRY ?= docker.io/$(DOCKER_REGISTRY)
+DOCKER_TAG ?= $(RELEASE_TAG)
+RELEASE_IMAGE_PLATFORMS ?= linux/amd64,linux/arm64
+RUST_BUILDER_IMAGE ?= docker.io/library/rust:1.95
+UBUNTU_BASE_IMAGE ?= docker.io/library/ubuntu:24.04
 
 # Installation configuration
 INSTALL_PREFIX ?= /tmp/flame-dev
@@ -170,6 +174,64 @@ docker-release: init docker-build docker-push ## Build and push all images for r
 
 release-sanity: ## Run non-publishing release sanity checks
 	ci/release/sanity.sh
+
+.PHONY: release-images release-images-build release-images-inspect release-images-push release-images-pull-bases release-images-check-cli release-images-login release-images-verify require-release-image-tag
+
+require-release-image-tag:
+	@test -n "$(DOCKER_TAG)" || (echo "DOCKER_TAG must be set, for example DOCKER_TAG=v0.6.0" >&2; exit 1)
+
+release-images-check-cli: ## Check the detected container CLI and amd64 Rust builder image
+	$(CONTAINER_CLI) info
+	$(CONTAINER_CLI) run --rm --platform linux/amd64 "$(RUST_BUILDER_IMAGE)" rustc -vV
+
+release-images-login: ## Log in to Docker Hub with the detected container CLI
+	$(CONTAINER_CLI) login docker.io
+
+release-images-build: require-release-image-tag ## Build local multi-arch release image manifests
+	@set -eu; \
+	platforms=$$(printf '%s' "$(RELEASE_IMAGE_PLATFORMS)" | tr ',' ' '); \
+	build_image() { \
+		image="$$1"; \
+		dockerfile="$$2"; \
+		for platform in $$platforms; do \
+			echo "$(CONTAINER_CLI) build --platform $$platform --manifest $(IMAGE_REGISTRY)/$$image:$(DOCKER_TAG) -f $$dockerfile ."; \
+			$(CONTAINER_CLI) build --platform "$$platform" --manifest "$(IMAGE_REGISTRY)/$$image:$(DOCKER_TAG)" -f "$$dockerfile" .; \
+		done; \
+	}; \
+	build_image flame-session-manager docker/Dockerfile.fsm; \
+	build_image flame-object-cache docker/Dockerfile.foc; \
+	build_image flame-executor-manager docker/Dockerfile.fem; \
+	build_image flame-console docker/Dockerfile.console
+
+release-images-inspect: require-release-image-tag ## Inspect local release image manifests
+	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-session-manager:$(DOCKER_TAG)"
+	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-object-cache:$(DOCKER_TAG)"
+	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)"
+	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)"
+
+release-images-push: require-release-image-tag ## Push release manifest lists
+	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-session-manager:$(DOCKER_TAG)" "docker://$(IMAGE_REGISTRY)/flame-session-manager:$(DOCKER_TAG)"
+	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-object-cache:$(DOCKER_TAG)" "docker://$(IMAGE_REGISTRY)/flame-object-cache:$(DOCKER_TAG)"
+	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)" "docker://$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)"
+	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)" "docker://$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)"
+
+release-images: require-release-image-tag ## Build, inspect, and push release image manifests
+	$(MAKE) release-images-build
+	$(MAKE) release-images-inspect
+	$(MAKE) release-images-push
+
+release-images-verify: require-release-image-tag ## Verify remote release image manifests
+	$(CONTAINER_CLI) manifest inspect "docker://$(IMAGE_REGISTRY)/flame-session-manager:$(DOCKER_TAG)"
+	$(CONTAINER_CLI) manifest inspect "docker://$(IMAGE_REGISTRY)/flame-object-cache:$(DOCKER_TAG)"
+	$(CONTAINER_CLI) manifest inspect "docker://$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)"
+	$(CONTAINER_CLI) manifest inspect "docker://$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)"
+
+release-images-pull-bases: ## Pull release base images with the detected container CLI
+	@set -eu; \
+	for platform in $$(printf '%s' "$(RELEASE_IMAGE_PLATFORMS)" | tr ',' ' '); do \
+		$(CONTAINER_CLI) pull --platform "$$platform" "$(RUST_BUILDER_IMAGE)"; \
+		$(CONTAINER_CLI) pull --platform "$$platform" "$(UBUNTU_BASE_IMAGE)"; \
+	done
 
 ci-image: update_protos ## Build images for CI (without version tags)
 	$(CONTAINER_RUNTIME) build -t $(FSM_IMAGE) -f $(FSM_DOCKERFILE) .
