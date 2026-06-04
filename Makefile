@@ -34,11 +34,25 @@ E2E_SYSTEM_PROFILE ?= all
 E2E_SYSTEM_PYTEST_ARGS ?=
 
 # Default target
-.PHONY: help build build-release docker-build docker-push docker-release docker-clean release-sanity update_protos init sdk-go-build sdk-go-test sdk-go-clean e2e e2e-py e2e-py-docker e2e-py-local e2e-py-system-docker e2e-py-system-local e2e-py-system-stress e2e-py-system-longevity e2e-py-system-runner e2e-local e2e-rs format format-rust format-python install install-dev uninstall uninstall-dev start-services stop-services
+.PHONY: help build build-release init update_protos
+.PHONY: install install-dev uninstall uninstall-dev start-services stop-services
+.PHONY: sdk-python sdk-python-generate sdk-python-test sdk-python-clean
+.PHONY: format format-rust format-python format-e2e
+.PHONY: e2e e2e-local e2e-py e2e-py-docker e2e-py-local e2e-rs
+.PHONY: e2e-py-system-docker e2e-py-system-local e2e-py-system-stress
+.PHONY: e2e-py-system-longevity e2e-py-system-runner
+.PHONY: docker-build docker-build-fsm docker-build-fem docker-build-console
+.PHONY: docker-push docker-push-fsm docker-push-fem docker-push-console
+.PHONY: docker-release release-sanity ci-image
+.PHONY: release-images release-images-build release-images-inspect release-images-push
+.PHONY: release-images-pull-bases release-images-check-cli release-images-login
+.PHONY: release-images-verify require-release-image-tag
+.PHONY: docker-clean docker-clean-all docker-run-fsm docker-run-fem docker-run-console
+.PHONY: docker-images docker-logs docker-release-legacy
 
 help: ## Show this help message
 	@echo "Available targets:"
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@grep -hE '^[[:alnum:]_.-]+:.*## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*## "}; {printf "\033[36m%-32s\033[0m %s\n", $$1, $$2}'
 
 build: update_protos ## Build the Rust project
 	cargo build
@@ -174,8 +188,6 @@ docker-release: init docker-build docker-push ## Build and push all images for r
 
 release-sanity: ## Run non-publishing release sanity checks
 	ci/release/sanity.sh
-
-.PHONY: release-images release-images-build release-images-inspect release-images-push release-images-pull-bases release-images-check-cli release-images-login release-images-verify require-release-image-tag
 
 require-release-image-tag:
 	@test -n "$(DOCKER_TAG)" || (echo "DOCKER_TAG must be set, for example DOCKER_TAG=v0.6.0" >&2; exit 1)
