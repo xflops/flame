@@ -144,11 +144,17 @@ cargo package --manifest-path sdk/rust/macros/Cargo.toml --allow-dirty
 cargo package --manifest-path sdk/rust/Cargo.toml --allow-dirty --features macros
 ```
 
+If `flame-rs` depends on a `flame-rs-macros` version that has not been
+published yet, the final `flame-rs` package verification will fail while
+resolving registry dependencies. In that case, publish and verify
+`flame-rs-macros` first, then rerun the full `flame-rs` package command before
+publishing `flame-rs`.
+
 Python package verification:
 
 ```shell
 cd sdk/python
-uv run -n pytest tests/test_runner_e2e.py tests/test_runner.py -q
+uv run -n --extra dev pytest tests/test_runner_e2e.py tests/test_runner.py -q
 uv run -n python -c 'import flamepy; print(flamepy.__version__)'
 uv build --out-dir /tmp/flamepy-${PYTHON_VERSION}-dist
 cd -
@@ -250,7 +256,15 @@ Podman prerequisites:
 ```shell
 podman info
 podman login --get-login docker.io || podman login docker.io
+podman run --rm --platform linux/amd64 docker.io/library/rust:1.95 rustc -vV
 ```
+
+If the amd64 Rust smoke test fails under emulation, do not publish a stable
+arm64-only tag by default. Use a Podman farm or remote Podman connection with a
+native amd64 builder, or document the Docker release as blocked. If the release
+owner explicitly narrows the Docker scope to an arm64-first publish, push only
+the versioned arm64 tags, leave `latest` untouched, and record the missing
+amd64/multi-arch artifacts as a release gap.
 
 With Podman, build both platforms into each manifest:
 
@@ -365,6 +379,28 @@ make release-sanity
 
 Set `RELEASE_SANITY_COMPOSE_DOWN=0` only when you need to inspect the compose
 cluster after a failed run.
+
+The compose smoke uses the TLS settings in `ci/flame-cluster.yaml` and
+`ci/flame.yaml`. If `ci/certs` does not already contain release-test
+certificates, generate them before running the compose sanity check:
+
+```shell
+ci/generate-certs.sh --output ci/certs \
+  --san-list localhost,127.0.0.1,flame-session-manager,flame-object-cache \
+  --ip-range 172.20.0.0/24
+```
+
+For an explicitly scoped arm64-first Docker release, keep the compose smoke
+versioned-tag-only and set the expected platform list:
+
+```shell
+RELEASE_SANITY_EXPECTED_PLATFORMS=linux/arm64 \
+RELEASE_SANITY_LOCAL_CHECKS=0 \
+RELEASE_SANITY_PACKAGE_CHECKS=0 \
+RELEASE_SANITY_REMOTE_CHECKS=1 \
+RELEASE_SANITY_COMPOSE_E2E=1 \
+make release-sanity
+```
 
 If Docker Hub times out while pulling base images, retry the base image pull for
 the affected platform before rebuilding. Use the matching tool for the selected
