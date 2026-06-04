@@ -251,11 +251,11 @@ Do not move `latest` for release candidates. For stable releases, move `latest`
 only after the versioned tag has been pushed and verified.
 
 Build release images with manifest lists. The Makefile detects a
-Docker-compatible `CONTAINER_CLI` from the host, preferring `podman` when
-`podman info` succeeds and falling back to `docker` when Docker is installed.
-Set `CONTAINER_CLI=docker` or `CONTAINER_CLI=podman` when you need to override
-that choice. The selected CLI must support `build --manifest` and
-`manifest inspect/push` for the release image targets.
+Docker-compatible `CONTAINER_CLI` from the host, preferring a usable Docker
+daemon and falling back to Podman when Docker is unavailable. Set
+`CONTAINER_CLI=docker` or `CONTAINER_CLI=podman` when you need to override that
+choice. The selected CLI must support `build --manifest` and `manifest inspect/push`
+for the release image targets.
 
 Set `RUST_BUILDER_IMAGE` to the Rust builder image used by the release
 Dockerfiles. Do not use `rust:latest` for release validation because it can drift

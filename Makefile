@@ -1,6 +1,10 @@
 # Detect a usable Docker-compatible container CLI.
-DETECTED_CONTAINER_CLI := $(shell if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then echo podman; elif command -v docker >/dev/null 2>&1; then echo docker; elif command -v podman >/dev/null 2>&1; then echo podman; else echo docker; fi)
+DETECTED_CONTAINER_CLI := $(shell if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then echo docker; elif command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then echo podman; elif command -v docker >/dev/null 2>&1; then echo docker; elif command -v podman >/dev/null 2>&1; then echo podman; else echo docker; fi)
+ifdef CONTAINER_RUNTIME
+CONTAINER_CLI ?= $(CONTAINER_RUNTIME)
+else
 CONTAINER_CLI ?= $(DETECTED_CONTAINER_CLI)
+endif
 CONTAINER_RUNTIME ?= $(CONTAINER_CLI)
 
 # Docker image configuration
@@ -128,13 +132,13 @@ e2e-py: ## Run Python E2E tests (use e2e-py-docker for docker compose or e2e-py-
 	@echo "Use 'make e2e-py-docker' for docker compose tests or 'make e2e-py-local' for local cluster tests"
 
 e2e-py-docker: ## Run Python E2E tests with docker compose
-	$(CONTAINER_RUNTIME) compose exec -w /opt/e2e flame-console bash -c "source /usr/local/flame/sbin/flmenv.sh && PYTHONPATH=/opt/e2e/src:\$$PYTHONPATH python3 -m pytest -vv --durations=0 ."
+	$(CONTAINER_CLI) compose exec -w /opt/e2e flame-console bash -c "source /usr/local/flame/sbin/flmenv.sh && PYTHONPATH=/opt/e2e/src:\$$PYTHONPATH python3 -m pytest -vv --durations=0 ."
 
 e2e-py-local: ## Run Python E2E tests against local cluster (requires flamepy installed via pip)
 	cd e2e && PYTHONPATH="$(CURDIR)/e2e/src:$$PYTHONPATH" FLAME_ENDPOINT=$(FLAME_ENDPOINT) pytest -vv --durations=0 .
 
 e2e-py-system-docker: ## Run opt-in Python system tests with docker compose (E2E_SYSTEM_PROFILE=all|stress|longevity|runner)
-	$(CONTAINER_RUNTIME) compose exec -w /opt/e2e flame-console bash -c "source /usr/local/flame/sbin/flmenv.sh && FLAME_E2E_SYSTEM_TESTS=$(E2E_SYSTEM_PROFILE) PYTHONPATH=/opt/e2e/src:\$$PYTHONPATH python3 -m pytest -vv --durations=0 tests/test_system.py $(E2E_SYSTEM_PYTEST_ARGS)"
+	$(CONTAINER_CLI) compose exec -w /opt/e2e flame-console bash -c "source /usr/local/flame/sbin/flmenv.sh && FLAME_E2E_SYSTEM_TESTS=$(E2E_SYSTEM_PROFILE) PYTHONPATH=/opt/e2e/src:\$$PYTHONPATH python3 -m pytest -vv --durations=0 tests/test_system.py $(E2E_SYSTEM_PYTEST_ARGS)"
 
 e2e-py-system-local: ## Run opt-in Python system tests against local cluster (E2E_SYSTEM_PROFILE=all|stress|longevity|runner)
 	cd e2e && FLAME_E2E_SYSTEM_TESTS=$(E2E_SYSTEM_PROFILE) PYTHONPATH="$(CURDIR)/e2e/src:$$PYTHONPATH" FLAME_ENDPOINT=$(FLAME_ENDPOINT) pytest -vv --durations=0 tests/test_system.py $(E2E_SYSTEM_PYTEST_ARGS)
@@ -157,29 +161,29 @@ e2e-local: e2e-py-local e2e-rs ## Run all E2E tests against local cluster
 
 # Docker build targets
 docker-build-fsm: update_protos ## Build session manager Docker image
-	$(CONTAINER_RUNTIME) build -t $(FSM_IMAGE):$(FSM_TAG) -f $(FSM_DOCKERFILE) .
-	$(CONTAINER_RUNTIME) tag $(FSM_IMAGE):$(FSM_TAG) $(FSM_IMAGE):latest
+	$(CONTAINER_CLI) build -t $(FSM_IMAGE):$(FSM_TAG) -f $(FSM_DOCKERFILE) .
+	$(CONTAINER_CLI) tag $(FSM_IMAGE):$(FSM_TAG) $(FSM_IMAGE):latest
 
 docker-build-fem: update_protos ## Build executor manager Docker image
-	$(CONTAINER_RUNTIME) build -t $(FEM_IMAGE):$(FEM_TAG) -f $(FEM_DOCKERFILE) .
-	$(CONTAINER_RUNTIME) tag $(FEM_IMAGE):$(FEM_TAG) $(FEM_IMAGE):latest
+	$(CONTAINER_CLI) build -t $(FEM_IMAGE):$(FEM_TAG) -f $(FEM_DOCKERFILE) .
+	$(CONTAINER_CLI) tag $(FEM_IMAGE):$(FEM_TAG) $(FEM_IMAGE):latest
 
 docker-build-console: update_protos ## Build console Docker image
-	$(CONTAINER_RUNTIME) build -t $(CONSOLE_IMAGE):$(CONSOLE_TAG) -f $(CONSOLE_DOCKERFILE) .
+	$(CONTAINER_CLI) build -t $(CONSOLE_IMAGE):$(CONSOLE_TAG) -f $(CONSOLE_DOCKERFILE) .
 
 docker-build: docker-build-fsm docker-build-fem docker-build-console ## Build all Docker images
 
 # Docker push targets
 docker-push-fsm: docker-build-fsm ## Push session manager Docker image
-	$(CONTAINER_RUNTIME) push $(FSM_IMAGE):$(FSM_TAG)
-	$(CONTAINER_RUNTIME) push $(FSM_IMAGE):latest
+	$(CONTAINER_CLI) push $(FSM_IMAGE):$(FSM_TAG)
+	$(CONTAINER_CLI) push $(FSM_IMAGE):latest
 
 docker-push-fem: docker-build-fem ## Push executor manager Docker image
-	$(CONTAINER_RUNTIME) push $(FEM_IMAGE):$(FEM_TAG)
-	$(CONTAINER_RUNTIME) push $(FEM_IMAGE):latest
+	$(CONTAINER_CLI) push $(FEM_IMAGE):$(FEM_TAG)
+	$(CONTAINER_CLI) push $(FEM_IMAGE):latest
 
 docker-push-console: docker-build-console ## Push console Docker image
-	$(CONTAINER_RUNTIME) push $(CONSOLE_IMAGE):$(CONSOLE_TAG)
+	$(CONTAINER_CLI) push $(CONSOLE_IMAGE):$(CONSOLE_TAG)
 
 docker-push: docker-push-fsm docker-push-fem docker-push-console ## Push all Docker images
 
@@ -253,37 +257,37 @@ release-images-pull-bases: ## Pull release base images with the detected contain
 	done
 
 ci-image: update_protos ## Build images for CI (without version tags)
-	$(CONTAINER_RUNTIME) build -t $(FSM_IMAGE) -f $(FSM_DOCKERFILE) .
-	$(CONTAINER_RUNTIME) build -t $(FEM_IMAGE) -f $(FEM_DOCKERFILE) .
-	$(CONTAINER_RUNTIME) build -t $(CONSOLE_IMAGE) -f $(CONSOLE_DOCKERFILE) .
+	$(CONTAINER_CLI) build -t $(FSM_IMAGE) -f $(FSM_DOCKERFILE) .
+	$(CONTAINER_CLI) build -t $(FEM_IMAGE) -f $(FEM_DOCKERFILE) .
+	$(CONTAINER_CLI) build -t $(CONSOLE_IMAGE) -f $(CONSOLE_DOCKERFILE) .
 
 # Cleanup targets
 docker-clean: ## Remove all flame Docker images
-	$(CONTAINER_RUNTIME) rmi $(FSM_IMAGE):$(FSM_TAG) $(FSM_IMAGE):latest 2>/dev/null || true
-	$(CONTAINER_RUNTIME) rmi $(FEM_IMAGE):$(FEM_TAG) $(FEM_IMAGE):latest 2>/dev/null || true
-	$(CONTAINER_RUNTIME) rmi $(CONSOLE_IMAGE):$(CONSOLE_TAG) 2>/dev/null || true
+	$(CONTAINER_CLI) rmi $(FSM_IMAGE):$(FSM_TAG) $(FSM_IMAGE):latest 2>/dev/null || true
+	$(CONTAINER_CLI) rmi $(FEM_IMAGE):$(FEM_TAG) $(FEM_IMAGE):latest 2>/dev/null || true
+	$(CONTAINER_CLI) rmi $(CONSOLE_IMAGE):$(CONSOLE_TAG) 2>/dev/null || true
 
 docker-clean-all: ## Remove all Docker images and containers (use with caution)
-	$(CONTAINER_RUNTIME) system prune -a -f
+	$(CONTAINER_CLI) system prune -a -f
 
 # Development targets
 docker-run-fsm: docker-build-fsm ## Run session manager container
-	$(CONTAINER_RUNTIME) run --rm -it $(FSM_IMAGE):latest
+	$(CONTAINER_CLI) run --rm -it $(FSM_IMAGE):latest
 
 docker-run-fem: docker-build-fem ## Run executor manager container
-	$(CONTAINER_RUNTIME) run --rm -it $(FEM_IMAGE):latest
+	$(CONTAINER_CLI) run --rm -it $(FEM_IMAGE):latest
 
 docker-run-console: docker-build-console ## Run console container
-	$(CONTAINER_RUNTIME) run --rm -it $(CONSOLE_IMAGE):latest
+	$(CONTAINER_CLI) run --rm -it $(CONSOLE_IMAGE):latest
 
 # Utility targets
 docker-images: ## List all flame Docker images
-	$(CONTAINER_RUNTIME) images | grep $(DOCKER_REGISTRY)/flame
+	$(CONTAINER_CLI) images | grep $(DOCKER_REGISTRY)/flame
 
 docker-logs: ## Show logs for running flame containers
-	$(CONTAINER_RUNTIME) ps | grep flame | awk '{print $$1}' | xargs -I {} $(CONTAINER_RUNTIME) logs {}
+	$(CONTAINER_CLI) ps | grep flame | awk '{print $$1}' | xargs -I {} $(CONTAINER_CLI) logs {}
 
 # Legacy targets for backward compatibility
 docker-release-legacy: init ## Legacy release target (original implementation)
-	$(CONTAINER_RUNTIME) build -t $(FSM_IMAGE):$(FSM_TAG) -f $(FSM_DOCKERFILE) .
-	$(CONTAINER_RUNTIME) build -t $(FEM_IMAGE):$(FEM_TAG) -f $(FEM_DOCKERFILE) .
+	$(CONTAINER_CLI) build -t $(FSM_IMAGE):$(FSM_TAG) -f $(FSM_DOCKERFILE) .
+	$(CONTAINER_CLI) build -t $(FEM_IMAGE):$(FEM_TAG) -f $(FEM_DOCKERFILE) .
