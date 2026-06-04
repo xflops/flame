@@ -19,7 +19,7 @@ export IMAGE_REGISTRY=docker.io/xflops
 export RELEASE_IMAGE_PLATFORMS=linux/amd64,linux/arm64
 export RUST_BUILDER_IMAGE=docker.io/library/rust:1.95
 export UBUNTU_BASE_IMAGE=docker.io/library/ubuntu:24.04
-# Optional override; Makefile auto-detects podman first, then docker.
+# Optional override; Makefile auto-detects usable podman first, then docker.
 # export CONTAINER_CLI=podman
 export RELEASE_NOTES_FILE=/tmp/flame-${RELEASE_TAG}-notes.md
 ```
@@ -251,11 +251,11 @@ Do not move `latest` for release candidates. For stable releases, move `latest`
 only after the versioned tag has been pushed and verified.
 
 Build release images with manifest lists. The Makefile detects a
-Docker-compatible `CONTAINER_CLI` from the host, preferring `podman` when it is
-installed and falling back to `docker`. Set `CONTAINER_CLI=docker` or
-`CONTAINER_CLI=podman` when you need to override that choice. The selected CLI
-must support `build --manifest` and `manifest inspect/push` for the release
-image targets.
+Docker-compatible `CONTAINER_CLI` from the host, preferring `podman` when
+`podman info` succeeds and falling back to `docker` when Docker is installed.
+Set `CONTAINER_CLI=docker` or `CONTAINER_CLI=podman` when you need to override
+that choice. The selected CLI must support `build --manifest` and
+`manifest inspect/push` for the release image targets.
 
 Set `RUST_BUILDER_IMAGE` to the Rust builder image used by the release
 Dockerfiles. Do not use `rust:latest` for release validation because it can drift

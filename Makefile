@@ -1,5 +1,5 @@
-# Detect a Docker-compatible container CLI.
-DETECTED_CONTAINER_CLI := $(shell if command -v podman >/dev/null 2>&1; then echo podman; elif command -v docker >/dev/null 2>&1; then echo docker; else echo docker; fi)
+# Detect a usable Docker-compatible container CLI.
+DETECTED_CONTAINER_CLI := $(shell if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then echo podman; elif command -v docker >/dev/null 2>&1; then echo docker; elif command -v podman >/dev/null 2>&1; then echo podman; else echo docker; fi)
 CONTAINER_CLI ?= $(DETECTED_CONTAINER_CLI)
 CONTAINER_RUNTIME ?= $(CONTAINER_CLI)
 
