@@ -77,13 +77,21 @@ impl Context {
     /// Allocation-side batch readiness (e.g. Gang: pipelined + allocated executors form full
     /// batches). Reflects in-memory plugin state, including `Statement` ops earlier in this
     /// same cycle (typically pipeline/allocate before commit).
-    pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
+    ///
+    /// Returns `true` when the batch is complete (gang) or after the first pipeline/allocate
+    /// op in a no-gang cycle.  Returns `false` before any op has been attempted, or when gang
+    /// reports the batch is still incomplete.
+    pub fn is_ready(&self, ssn: &SessionInfoPtr) -> bool {
         self.plugins.is_ready(ssn)
     }
 
     /// Binding-side batch readiness (e.g. Gang: bound + on-session executors form full batches).
-    /// After Dispatch commits binds, this can be true so Allocate skips provisioning.
-    pub fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
+    /// After Dispatch commits binds, this can be `true` so Allocate skips provisioning.
+    ///
+    /// Returns `true` when the batch is fulfilled (gang) or after the first bind op in a
+    /// no-gang cycle.  Returns `false` before any bind has been attempted, or when gang
+    /// reports the batch is still incomplete.
+    pub fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> bool {
         self.plugins.is_fulfilled(ssn)
     }
 

@@ -202,14 +202,12 @@ impl Future for WaitForSvcSocketFuture {
 
 #[cfg(test)]
 mod tests {
+    use super::super::SHIMS_TEST_LOCK;
     use super::*;
     use common::apis::{ApplicationContext, Shim as ShimType};
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Mutex;
     use tempfile::tempdir;
-
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn setup_test_env(temp: &tempfile::TempDir) -> PathBuf {
         let socket_dir = temp.path().join("sockets");
@@ -237,7 +235,7 @@ mod tests {
 
     #[test]
     fn test_grpc_shim_new() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = SHIMS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().unwrap();
         setup_test_env(&temp);
         let work_dir = create_test_work_dir("exec-grpc-test", &temp);
@@ -251,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_grpc_shim_endpoint() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = SHIMS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().unwrap();
         setup_test_env(&temp);
         let work_dir = create_test_work_dir("exec-endpoint-test", &temp);
@@ -263,7 +261,7 @@ mod tests {
 
     #[test]
     fn test_grpc_shim_close_without_connection() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = SHIMS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().unwrap();
         setup_test_env(&temp);
         let work_dir = create_test_work_dir("exec-close-test", &temp);
@@ -285,7 +283,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_on_session_enter_without_connection() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = SHIMS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().unwrap();
         setup_test_env(&temp);
         let work_dir = create_test_work_dir("exec-session-test", &temp);
@@ -318,7 +316,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_on_task_invoke_without_connection() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = SHIMS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().unwrap();
         setup_test_env(&temp);
         let work_dir = create_test_work_dir("exec-task-test", &temp);
@@ -341,7 +339,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_on_session_leave_without_connection() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = SHIMS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().unwrap();
         setup_test_env(&temp);
         let work_dir = create_test_work_dir("exec-leave-test", &temp);

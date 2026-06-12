@@ -65,6 +65,21 @@ impl Action for DispatchAction {
                 continue;
             }
 
+            // Skip sessions that already have enough executors committed (or in-flight from a
+            // previous cycle).  Without this guard a session whose executor is still running
+            // `on_session_enter` (Binding state, counted in Gang's `allocated`) would receive
+            // additional bindings every scheduling cycle.
+            //
+            // `is_fulfilled` returns true once the batch is satisfied (gang) or after the
+            // first bind this cycle (no gang), so this guard works uniformly for both cases.
+            if ctx.is_fulfilled(&ssn) {
+                tracing::debug!(
+                    "Session <{}> is already fulfilled (existing executors satisfy batch_size), skip dispatch.",
+                    ssn.id
+                );
+                continue;
+            }
+
             tracing::debug!(
                 "Session <{}> is underused, start to allocate resources.",
                 &ssn.id
@@ -75,13 +90,13 @@ impl Action for DispatchAction {
             for (_, exec) in idle_executors.iter() {
                 if ctx.is_available(exec, &ssn)? {
                     stmt.bind(exec, &ssn)?;
-                    if ctx.is_fulfilled(&ssn)? {
+                    if ctx.is_fulfilled(&ssn) {
                         break;
                     }
                 }
             }
 
-            if ctx.is_fulfilled(&ssn)? {
+            if ctx.is_fulfilled(&ssn) && !stmt.is_empty() {
                 tracing::debug!("Bind executor for session <{}>.", ssn.id);
                 let bound_ids = stmt.commit().await?;
                 for id in &bound_ids {
@@ -97,7 +112,7 @@ impl Action for DispatchAction {
                 continue;
             } else if !stmt.is_empty() {
                 tracing::debug!(
-                    "Discarding unfulfilled binding for session <{}>: no available idle executors",
+                    "Discarding unfulfilled binding for session <{}>: gang batch incomplete",
                     ssn.id
                 );
                 stmt.discard()?;

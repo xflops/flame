@@ -13,7 +13,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 
-use common::apis::SessionID;
+use common::apis::{SessionID, TaskState};
 use common::FlameError;
 
 use crate::model::{ExecutorInfoPtr, NodeInfoPtr, SessionInfoPtr, SnapShot};
@@ -21,6 +21,10 @@ use crate::scheduler::plugins::{Plugin, PluginPtr};
 
 struct GangState {
     batch_size: u32,
+    /// Number of incomplete (Pending + Running) tasks for this session, sampled once
+    /// per scheduling cycle in `setup()`.  Used to compute the allocation threshold:
+    /// `needed = div_ceil(incomplete_tasks, batch_size) * batch_size`.
+    incomplete_tasks: u32,
     allocated: u32,
     pipelined: u32,
     bound: u32,
@@ -53,10 +57,19 @@ impl Plugin for GangPlugin {
                 .map_err(|e| FlameError::Internal(format!("failed to lock sessions: {}", e)))?;
 
             for ssn in sessions.values() {
+                // Count tasks that have not yet completed (Pending + Running).
+                let mut incomplete_tasks: u32 = 0;
+                for state in [TaskState::Pending, TaskState::Running] {
+                    if let Some(c) = ssn.tasks_status.get(&state) {
+                        incomplete_tasks = incomplete_tasks.saturating_add((*c).max(0) as u32);
+                    }
+                }
+
                 self.ssn_state.insert(
                     ssn.id.clone(),
                     GangState {
                         batch_size: ssn.batch_size.max(1),
+                        incomplete_tasks,
                         allocated: 0,
                         pipelined: 0,
                         bound: 0,
@@ -77,16 +90,47 @@ impl Plugin for GangPlugin {
         Ok(())
     }
 
-    fn is_ready(&self, ssn: &SessionInfoPtr) -> Option<bool> {
-        let state = self.ssn_state.get(&ssn.id)?;
+    /// Returns `true` when the cumulative executor count meets the allocation demand
+    /// for this session's incomplete tasks.
+    ///
+    /// ```text
+    /// needed = div_ceil(incomplete_tasks, batch_size) * batch_size
+    /// total  = allocated + pipelined
+    /// ready  = needed == 0 || total >= needed
+    /// ```
+    ///
+    /// `needed` is the smallest multiple of `batch_size` ≥ `incomplete_tasks` (Pending +
+    /// Running), sampled once per cycle in `setup()`.  Semantics:
+    ///
+    /// - `batch_size=1`, 5 tasks: `needed=5`.  AllocateAction allocates until 5 executors
+    ///   exist, saturating all task slots in one scheduling cycle.
+    /// - `batch_size=2`, 5 tasks: `needed=6` (ceil(5/2)×2).  6 executors created (3 gangs);
+    ///   covers all 5 tasks with one executor left unbound until a new task arrives.
+    /// - Duplicate-prevention: `batch_size=1`, 1 task, 1 Binding executor in snapshot →
+    ///   `needed=1, total=1+0=1 → true` → pre-check skips → no second executor.
+    fn is_ready(&self, ssn: &SessionInfoPtr) -> bool {
+        let Some(state) = self.ssn_state.get(&ssn.id) else {
+            return false;
+        };
+        let needed = state.incomplete_tasks.div_ceil(state.batch_size) * state.batch_size;
         let total = state.allocated + state.pipelined;
-        Some(state.pipelined > 0 && total % state.batch_size == 0)
+        needed == 0 || (needed > 0 && total >= needed)
     }
 
-    fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> Option<bool> {
-        let state = self.ssn_state.get(&ssn.id)?;
+    /// Mirrors `is_ready` for the Dispatch path (bind instead of pipeline/allocate).
+    ///
+    /// ```text
+    /// needed = div_ceil(incomplete_tasks, batch_size) * batch_size
+    /// total  = allocated + bound
+    /// ready  = needed == 0 || total >= needed
+    /// ```
+    fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> bool {
+        let Some(state) = self.ssn_state.get(&ssn.id) else {
+            return false;
+        };
+        let needed = state.incomplete_tasks.div_ceil(state.batch_size) * state.batch_size;
         let total = state.allocated + state.bound;
-        Some(state.bound > 0 && total % state.batch_size == 0)
+        needed == 0 || (needed > 0 && total >= needed)
     }
 
     fn on_executor_allocate(&mut self, _node: NodeInfoPtr, ssn: SessionInfoPtr) {
@@ -134,11 +178,18 @@ mod tests {
     use common::apis::{ExecutorState, ResourceRequirement, SessionState, Shim, TaskState};
     use std::sync::Arc;
 
+    /// Build a test session with `batch_size.max(1)` pending tasks so that
+    /// `needed = (pending / batch_size) * batch_size == batch_size` for any
+    /// batch_size — i.e. exactly 1 complete batch is always the expected demand.
     fn create_test_session(id: &str, batch_size: u32) -> SessionInfoPtr {
+        create_test_session_with_pending(id, batch_size, batch_size.max(1) as i32)
+    }
+
+    fn create_test_session_with_pending(id: &str, batch_size: u32, pending: i32) -> SessionInfoPtr {
         Arc::new(SessionInfo {
             id: id.to_string(),
             application: "test-app".to_string(),
-            tasks_status: HashMap::from([(TaskState::Pending, 1)]),
+            tasks_status: HashMap::from([(TaskState::Pending, pending)]),
             creation_time: Utc::now(),
             completion_time: None,
             state: SessionState::Open,
@@ -196,12 +247,12 @@ mod tests {
         };
         plugin.setup(&ss).unwrap();
 
-        assert!(!plugin.is_fulfilled(&ssn).unwrap());
+        assert!(!plugin.is_fulfilled(&ssn));
 
         let node = create_test_node("node-1");
         plugin.on_session_bind(ssn.clone());
 
-        assert!(plugin.is_fulfilled(&ssn).unwrap());
+        assert!(plugin.is_fulfilled(&ssn));
     }
 
     #[test]
@@ -216,16 +267,16 @@ mod tests {
         };
         plugin.setup(&ss).unwrap();
 
-        assert!(!plugin.is_fulfilled(&ssn).unwrap());
+        assert!(!plugin.is_fulfilled(&ssn));
 
         let node = create_test_node("node-1");
         plugin.on_session_bind(ssn.clone());
 
-        assert!(!plugin.is_fulfilled(&ssn).unwrap());
+        assert!(!plugin.is_fulfilled(&ssn));
 
         plugin.on_session_bind(ssn.clone());
 
-        assert!(plugin.is_fulfilled(&ssn).unwrap());
+        assert!(plugin.is_fulfilled(&ssn));
     }
 
     #[test]
@@ -243,12 +294,12 @@ mod tests {
         };
         plugin.setup(&ss).unwrap();
 
-        assert!(!plugin.is_fulfilled(&ssn).unwrap());
+        assert!(!plugin.is_fulfilled(&ssn));
 
         let node = create_test_node("node-1");
         plugin.on_session_bind(ssn.clone());
 
-        assert!(plugin.is_fulfilled(&ssn).unwrap());
+        assert!(plugin.is_fulfilled(&ssn));
     }
 
     #[test]
@@ -263,12 +314,12 @@ mod tests {
         };
         plugin.setup(&ss).unwrap();
 
-        assert!(!plugin.is_ready(&ssn).unwrap());
+        assert!(!plugin.is_ready(&ssn));
 
         let node = create_test_node("node-1");
         plugin.on_executor_allocate(node, ssn.clone());
 
-        assert!(plugin.is_ready(&ssn).unwrap());
+        assert!(plugin.is_ready(&ssn));
     }
 
     #[test]
@@ -283,16 +334,16 @@ mod tests {
         };
         plugin.setup(&ss).unwrap();
 
-        assert!(!plugin.is_ready(&ssn).unwrap());
+        assert!(!plugin.is_ready(&ssn));
 
         let node = create_test_node("node-1");
         plugin.on_executor_allocate(node.clone(), ssn.clone());
 
-        assert!(!plugin.is_ready(&ssn).unwrap());
+        assert!(!plugin.is_ready(&ssn));
 
         plugin.on_executor_allocate(node, ssn.clone());
 
-        assert!(plugin.is_ready(&ssn).unwrap());
+        assert!(plugin.is_ready(&ssn));
     }
 
     #[test]
@@ -310,12 +361,12 @@ mod tests {
         };
         plugin.setup(&ss).unwrap();
 
-        assert!(!plugin.is_ready(&ssn).unwrap());
+        assert!(!plugin.is_ready(&ssn));
 
         let node = create_test_node("node-1");
         plugin.on_executor_allocate(node, ssn.clone());
 
-        assert!(plugin.is_ready(&ssn).unwrap());
+        assert!(plugin.is_ready(&ssn));
     }
 
     #[test]
@@ -333,19 +384,19 @@ mod tests {
         let exec = create_test_executor("exec-1", None);
         plugin.on_executor_pipeline(exec.clone(), ssn.clone());
 
-        assert!(!plugin.is_ready(&ssn).unwrap());
+        assert!(!plugin.is_ready(&ssn));
 
         plugin.on_executor_pipeline(exec.clone(), ssn.clone());
 
-        assert!(plugin.is_ready(&ssn).unwrap());
+        assert!(plugin.is_ready(&ssn));
 
         plugin.on_executor_discard(exec.clone(), ssn.clone());
 
-        assert!(!plugin.is_ready(&ssn).unwrap());
+        assert!(!plugin.is_ready(&ssn));
 
         plugin.on_executor_discard(exec, ssn.clone());
 
-        assert!(!plugin.is_ready(&ssn).unwrap());
+        assert!(!plugin.is_ready(&ssn));
     }
 
     #[test]
@@ -362,18 +413,135 @@ mod tests {
 
         plugin.on_session_bind(ssn.clone());
 
-        assert!(!plugin.is_fulfilled(&ssn).unwrap());
+        assert!(!plugin.is_fulfilled(&ssn));
 
         plugin.on_session_bind(ssn.clone());
 
-        assert!(plugin.is_fulfilled(&ssn).unwrap());
+        assert!(plugin.is_fulfilled(&ssn));
 
         plugin.on_session_unbind(ssn.clone());
 
-        assert!(!plugin.is_fulfilled(&ssn).unwrap());
+        assert!(!plugin.is_fulfilled(&ssn));
 
         plugin.on_session_unbind(ssn.clone());
 
-        assert!(!plugin.is_fulfilled(&ssn).unwrap());
+        assert!(!plugin.is_fulfilled(&ssn));
+    }
+
+    /// With batch_size=1 and 1 pending task, a Binding executor already in the snapshot
+    /// satisfies `needed=1`, so both `is_ready` and `is_fulfilled` return `Some(true)`.
+    /// This prevents AllocateAction / DispatchAction from creating a duplicate executor
+    /// while the existing one is still running `on_session_enter`.
+    #[test]
+    fn test_is_ready_and_fulfilled_with_binding_executor_batch_size_1() {
+        let ss = SnapShot::new();
+
+        // 1 pending task, batch_size=1 → needed = (1/1)*1 = 1
+        let ssn = create_test_session("ssn-1", 1);
+        ss.add_session(ssn.clone()).unwrap();
+
+        // Simulate a Binding executor: ssn_id is set (the scheduler bound it).
+        let exec = create_test_executor("exec-1", Some("ssn-1"));
+        ss.add_executor(exec).unwrap();
+
+        let mut plugin = GangPlugin {
+            ssn_state: HashMap::new(),
+        };
+        plugin.setup(&ss).unwrap();
+        // incomplete_tasks=1, needed=1, allocated=1
+        // is_ready:    total = 1 + 0 = 1 == needed(1)  → Some(true)
+        // is_fulfilled: total = 1 + 0 = 1 == needed(1) → Some(true)
+
+        assert!(
+            plugin.is_ready(&ssn),
+            "is_ready must be true: 1 task, 1 snapshot executor → demand satisfied"
+        );
+        assert!(
+            plugin.is_fulfilled(&ssn),
+            "is_fulfilled must be true: 1 task, 1 snapshot executor → demand satisfied"
+        );
+    }
+
+    /// With batch_size=2, a partial snapshot (1 of 2 needed executors) must not signal
+    /// "ready".  AllocateAction must add one more executor to complete the gang.
+    #[test]
+    fn test_is_ready_partial_batch_still_allocates() {
+        let ss = SnapShot::new();
+
+        // 2 pending tasks, batch_size=2 → needed = (2/2)*2 = 2
+        let ssn = create_test_session("ssn-1", 2);
+        ss.add_session(ssn.clone()).unwrap();
+
+        // Only 1 of 2 required executors is already in snapshot.
+        let exec = create_test_executor("exec-1", Some("ssn-1"));
+        ss.add_executor(exec).unwrap();
+
+        let mut plugin = GangPlugin {
+            ssn_state: HashMap::new(),
+        };
+        plugin.setup(&ss).unwrap();
+        // incomplete_tasks=2, needed=2, allocated=1
+        // total = 1+0 = 1 → 1 != 2 → not ready
+
+        assert!(
+            !plugin.is_ready(&ssn),
+            "is_ready must be false: only 1 of 2 needed executors allocated"
+        );
+        assert!(
+            !plugin.is_fulfilled(&ssn),
+            "is_fulfilled must be false: only 1 of 2 needed executors in snapshot"
+        );
+
+        // Allocate one more → total = 1+1 = 2 == needed(2) → ready
+        let node = create_test_node("node-1");
+        plugin.on_executor_allocate(node, ssn.clone());
+        assert!(
+            plugin.is_ready(&ssn),
+            "is_ready must be true once the 2nd executor completes the gang"
+        );
+    }
+
+    /// Regression for the "only 1 executor ever" bug with batch_size=1 and multiple tasks.
+    ///
+    /// With 3 pending tasks and 1 snapshot executor: `needed=3`, `total=1 ≠ 3 → Some(false)`.
+    /// AllocateAction's pre-check does NOT fire.  It then allocates executors until
+    /// `total == needed`, creating all 3 needed executors in one scheduling cycle.
+    #[test]
+    fn test_is_ready_batch_size_1_allocates_all_needed_executors() {
+        let ss = SnapShot::new();
+
+        // 3 pending tasks, batch_size=1 → needed = (3/1)*1 = 3
+        let ssn = create_test_session_with_pending("ssn-multi", 1, 3);
+        ss.add_session(ssn.clone()).unwrap();
+
+        // 1 executor already in snapshot (e.g. Binding from previous cycle).
+        let exec = create_test_executor("exec-1", Some("ssn-multi"));
+        ss.add_executor(exec).unwrap();
+
+        let mut plugin = GangPlugin {
+            ssn_state: HashMap::new(),
+        };
+        plugin.setup(&ss).unwrap();
+        // incomplete_tasks=3, needed=3, allocated=1 → total=1 → 1 != 3 → Some(false)
+
+        assert!(
+            !plugin.is_ready(&ssn),
+            "pre-check must not fire: need 3 executors, only 1 in snapshot"
+        );
+
+        // AllocateAction allocates executor 2 → total=1+1=2, still short.
+        let node = create_test_node("node-1");
+        plugin.on_executor_allocate(node.clone(), ssn.clone());
+        assert!(
+            !plugin.is_ready(&ssn),
+            "still not ready after 1 new allocation: total=2 ≠ needed=3"
+        );
+
+        // AllocateAction allocates executor 3 → total=1+2=3 == needed(3) → ready.
+        plugin.on_executor_allocate(node, ssn.clone());
+        assert!(
+            plugin.is_ready(&ssn),
+            "is_ready must be true once all 3 needed executors are allocated"
+        );
     }
 }

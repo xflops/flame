@@ -13,7 +13,7 @@ limitations under the License.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use stdng::collections;
 use stdng::{lock_ptr, new_ptr, MutexPtr};
@@ -90,12 +90,12 @@ pub trait Plugin: Send + Sync + 'static {
         None
     }
 
-    fn is_ready(&self, ssn: &SessionInfoPtr) -> Option<bool> {
-        None
+    fn is_ready(&self, ssn: &SessionInfoPtr) -> bool {
+        true
     }
 
-    fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> Option<bool> {
-        None
+    fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> bool {
+        true
     }
 
     // Events callbacks
@@ -153,6 +153,16 @@ pub fn configurable_policy_names() -> Vec<&'static str> {
 
 pub struct PluginManager {
     pub plugins: MutexPtr<Vec<(String, PluginPtr)>>,
+    /// True iff the gang plugin is in the loaded set for this cycle.
+    /// Controls which path is taken in `is_ready` / `is_fulfilled`.
+    gang_loaded: bool,
+    /// Per-session count of pipeline/allocate ops committed this cycle.
+    /// Only used when `gang_loaded == false` to implement the "1 op per
+    /// cycle is sufficient" rule without exposing this concern to callers.
+    no_gang_alloc_ops: Mutex<HashMap<String, u32>>,
+    /// Per-session count of bind ops committed this cycle.
+    /// Only used when `gang_loaded == false`.
+    no_gang_bind_ops: Mutex<HashMap<String, u32>>,
 }
 
 impl PluginManager {
@@ -161,13 +171,22 @@ impl PluginManager {
         enabled_policies: &[String],
     ) -> Result<PluginManagerPtr, FlameError> {
         let valid_names = configurable_policy_names();
+        let all_plugin_names: Vec<&str> = PLUGIN_REGISTRY.iter().map(|p| p.name).collect();
 
         for p in enabled_policies {
             if !valid_names.contains(&p.as_str()) {
-                return Err(FlameError::InvalidConfig(format!(
-                    "unknown policy: {}. available: {:?}",
-                    p, valid_names
-                )));
+                if all_plugin_names.contains(&p.as_str()) {
+                    // Plugin exists but is always-on (e.g. shim); listing it in policies is a no-op.
+                    tracing::info!(
+                        "Policy '{}' is always enabled and does not need to be listed explicitly; ignoring",
+                        p
+                    );
+                } else {
+                    return Err(FlameError::InvalidConfig(format!(
+                        "unknown policy: {}. configurable policies: {:?}",
+                        p, valid_names
+                    )));
+                }
             }
         }
 
@@ -186,8 +205,13 @@ impl PluginManager {
             plugin.setup(ss)?;
         }
 
+        let gang_loaded = plugins.iter().any(|(name, _)| name == "gang");
+
         Ok(Arc::new(PluginManager {
             plugins: new_ptr(plugins),
+            gang_loaded,
+            no_gang_alloc_ops: Mutex::new(HashMap::new()),
+            no_gang_bind_ops: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -290,12 +314,17 @@ impl PluginManager {
         node: NodeInfoPtr,
         ssn: SessionInfoPtr,
     ) -> Result<(), FlameError> {
+        if !self.gang_loaded {
+            let mut ops = self
+                .no_gang_alloc_ops
+                .lock()
+                .map_err(|e| FlameError::Internal(format!("no_gang_alloc_ops lock: {e}")))?;
+            *ops.entry(ssn.id.clone()).or_insert(0) += 1;
+        }
         let mut plugins = lock_ptr!(self.plugins)?;
-
         for (_, plugin) in plugins.iter_mut() {
             plugin.on_executor_allocate(node.clone(), ssn.clone());
         }
-
         Ok(())
     }
 
@@ -314,12 +343,17 @@ impl PluginManager {
     }
 
     pub fn on_session_bind(&self, ssn: SessionInfoPtr) -> Result<(), FlameError> {
+        if !self.gang_loaded {
+            let mut ops = self
+                .no_gang_bind_ops
+                .lock()
+                .map_err(|e| FlameError::Internal(format!("no_gang_bind_ops lock: {e}")))?;
+            *ops.entry(ssn.id.clone()).or_insert(0) += 1;
+        }
         let mut plugins = lock_ptr!(self.plugins)?;
-
         for (_, plugin) in plugins.iter_mut() {
             plugin.on_session_bind(ssn.clone());
         }
-
         Ok(())
     }
 
@@ -332,27 +366,56 @@ impl PluginManager {
         Ok(())
     }
 
-    /// True if every plugin that implements [`Plugin::is_ready`] reports readiness (no opinion
-    /// defaults to true). Counters are in-memory and advance when [`crate::scheduler::Statement`]
-    /// records `allocate` / `pipeline` without `discard`. Dispatch and Allocate share one
-    /// `PluginManager` per scheduling cycle.
-    pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
-        let plugins = lock_ptr!(self.plugins)?;
-
-        Ok(plugins
-            .iter()
-            .all(|(_, plugin)| plugin.is_ready(ssn).unwrap_or(true)))
+    /// Returns batch-allocation readiness for a session.
+    ///
+    /// **Without gang** (`gang_loaded == false`): returns `true` once at least one
+    /// pipeline/allocate op has been recorded for this session via `on_executor_pipeline` or
+    /// `on_executor_allocate`.  Before any op, returns `false`.  This lets callers use a
+    /// uniform `if is_ready() { break; }` in their allocation loops — the loop naturally
+    /// stops after the first op with no batch constraint.
+    ///
+    /// **With gang**: returns `true` only when ALL plugins return `true`; returns `false`
+    /// as soon as any plugin says the batch is incomplete.  Plugins that do not override
+    /// `is_ready` default to `true` (no opinion / do not block), so only opinionated
+    /// plugins (e.g. GangPlugin) can veto readiness.
+    ///
+    /// Counters advance when [`crate::scheduler::Statement`] records `pipeline`/`allocate`
+    /// without `discard`. Dispatch and Allocate share one `PluginManager` per cycle.
+    pub fn is_ready(&self, ssn: &SessionInfoPtr) -> bool {
+        if !self.gang_loaded {
+            let ops = self
+                .no_gang_alloc_ops
+                .lock()
+                .expect("no_gang_alloc_ops lock poisoned");
+            return *ops.get(&ssn.id).unwrap_or(&0) > 0;
+        }
+        let plugins = self.plugins.lock().expect("plugins lock poisoned");
+        plugins.iter().all(|(_, plugin)| plugin.is_ready(ssn))
     }
 
-    /// True if every plugin that implements [`Plugin::is_fulfilled`] reports fulfillment (no opinion
-    /// defaults to true). Updates when [`crate::scheduler::Statement`] records `bind`; after
-    /// Dispatch commits, Allocate uses this to skip redundant provisioning.
-    pub fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
-        let plugins = lock_ptr!(self.plugins)?;
-
-        Ok(plugins
-            .iter()
-            .all(|(_, plugin)| plugin.is_fulfilled(ssn).unwrap_or(true)))
+    /// Returns batch-binding fulfillment for a session.
+    ///
+    /// **Without gang** (`gang_loaded == false`): returns `true` once at least one bind op
+    /// has been recorded for this session via `on_session_bind`.  Before any bind, returns
+    /// `false`.  Callers can use `if is_fulfilled() { break/skip; }` uniformly.
+    ///
+    /// **With gang**: returns `true` only when ALL plugins return `true`; returns `false`
+    /// as soon as any plugin says the batch is incomplete.  Plugins that do not override
+    /// `is_fulfilled` default to `true` (no opinion / do not block), so only opinionated
+    /// plugins (e.g. GangPlugin) can veto fulfillment.
+    ///
+    /// Updates when [`crate::scheduler::Statement`] records `bind`; after Dispatch commits,
+    /// Allocate uses this to skip redundant provisioning.
+    pub fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> bool {
+        if !self.gang_loaded {
+            let ops = self
+                .no_gang_bind_ops
+                .lock()
+                .expect("no_gang_bind_ops lock poisoned");
+            return *ops.get(&ssn.id).unwrap_or(&0) > 0;
+        }
+        let plugins = self.plugins.lock().expect("plugins lock poisoned");
+        plugins.iter().all(|(_, plugin)| plugin.is_fulfilled(ssn))
     }
 
     pub fn on_executor_pipeline(
@@ -360,12 +423,17 @@ impl PluginManager {
         exec: ExecutorInfoPtr,
         ssn: SessionInfoPtr,
     ) -> Result<(), FlameError> {
+        if !self.gang_loaded {
+            let mut ops = self
+                .no_gang_alloc_ops
+                .lock()
+                .map_err(|e| FlameError::Internal(format!("no_gang_alloc_ops lock: {e}")))?;
+            *ops.entry(ssn.id.clone()).or_insert(0) += 1;
+        }
         let mut plugins = lock_ptr!(self.plugins)?;
-
         for (_, plugin) in plugins.iter_mut() {
             plugin.on_executor_pipeline(exec.clone(), ssn.clone());
         }
-
         Ok(())
     }
 
@@ -496,9 +564,12 @@ impl collections::Cmp<SessionInfoPtr> for SsnOrderFn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ExecutorInfo;
+    use crate::model::{ExecutorInfo, NodeInfo, SessionInfo, SnapShot};
     use chrono::Utc;
-    use common::apis::{ExecutorState, ResourceRequirement, Shim};
+    use common::apis::{
+        ExecutorState, NodeState, ResourceRequirement, SessionState, Shim, TaskState,
+    };
+    use std::collections::HashMap;
 
     /// Create a test executor sized by `n` units (1 unit = (cpu:1, memory:1024, gpu:0)).
     fn create_test_executor(id: &str, n: u32) -> ExecutorInfoPtr {
@@ -580,5 +651,186 @@ mod tests {
         // 3. The next cycle will pick up any changes
         //
         // This is a known limitation documented in the Plugin trait.
+    }
+
+    fn make_policies(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn make_session(id: &str, batch_size: u32) -> SessionInfoPtr {
+        Arc::new(SessionInfo {
+            id: id.to_string(),
+            application: "test-app".to_string(),
+            tasks_status: HashMap::from([(TaskState::Pending, batch_size.max(1) as i32)]),
+            creation_time: Utc::now(),
+            completion_time: None,
+            state: SessionState::Open,
+            min_instances: 0,
+            max_instances: None,
+            batch_size,
+            priority: 0,
+            resreq: Some(ResourceRequirement {
+                cpu: 1,
+                memory: 1024,
+                gpu: 0,
+            }),
+            retry_count: 0,
+        })
+    }
+
+    fn make_node(name: &str) -> Arc<NodeInfo> {
+        Arc::new(NodeInfo {
+            name: name.to_string(),
+            allocatable: ResourceRequirement {
+                cpu: 4,
+                memory: 8192,
+                gpu: 0,
+            },
+            state: NodeState::Ready,
+        })
+    }
+
+    /// Without gang, is_ready returns false before any op (no batch constraint active yet).
+    #[test]
+    fn test_is_ready_returns_false_without_gang() {
+        let ss = SnapShot::new();
+        let ssn = make_session("ssn-1", 1);
+        ss.add_session(ssn.clone()).unwrap();
+
+        let plugins = PluginManager::setup(&ss, &make_policies(&["priority"])).unwrap();
+        assert!(
+            !plugins.is_ready(&ssn),
+            "is_ready must be false before any op when gang plugin is not loaded"
+        );
+    }
+
+    /// Without gang, is_fulfilled returns false before any bind op.
+    #[test]
+    fn test_is_fulfilled_returns_false_without_gang() {
+        let ss = SnapShot::new();
+        let ssn = make_session("ssn-1", 1);
+        ss.add_session(ssn.clone()).unwrap();
+
+        let plugins = PluginManager::setup(&ss, &make_policies(&["priority"])).unwrap();
+        assert!(
+            !plugins.is_fulfilled(&ssn),
+            "is_fulfilled must be false when gang plugin is not loaded"
+        );
+    }
+
+    /// When gang is loaded, is_ready returns false before any allocation event because the
+    /// batch counter starts at 0.
+    #[test]
+    fn test_is_ready_returns_false_before_allocation_with_gang() {
+        let ss = SnapShot::new();
+        let ssn = make_session("ssn-1", 1);
+        ss.add_session(ssn.clone()).unwrap();
+
+        let plugins = PluginManager::setup(&ss, &make_policies(&["gang"])).unwrap();
+        assert!(
+            !plugins.is_ready(&ssn),
+            "is_ready must be false initially when gang is loaded"
+        );
+    }
+
+    /// After one on_executor_allocate event, gang batch_size=1 is satisfied → true.
+    #[test]
+    fn test_is_ready_returns_true_after_batch_filled_with_gang() {
+        let ss = SnapShot::new();
+        let ssn = make_session("ssn-1", 1);
+        ss.add_session(ssn.clone()).unwrap();
+
+        let plugins = PluginManager::setup(&ss, &make_policies(&["gang"])).unwrap();
+
+        let node = make_node("node-1");
+        plugins.on_executor_allocate(node, ssn.clone()).unwrap();
+
+        assert!(
+            plugins.is_ready(&ssn),
+            "is_ready must be true after one allocation with batch_size=1"
+        );
+    }
+
+    /// Gang batch_size=2: after one allocation is_ready is still false; true only after the
+    /// second allocation completes the batch.
+    #[test]
+    fn test_is_ready_batch_size_2_requires_two_allocations() {
+        let ss = SnapShot::new();
+        let ssn = make_session("ssn-1", 2);
+        ss.add_session(ssn.clone()).unwrap();
+
+        let plugins = PluginManager::setup(&ss, &make_policies(&["gang"])).unwrap();
+        let node = make_node("node-1");
+
+        assert!(!plugins.is_ready(&ssn));
+
+        plugins
+            .on_executor_allocate(node.clone(), ssn.clone())
+            .unwrap();
+        assert!(
+            !plugins.is_ready(&ssn),
+            "is_ready must still be false after only 1 of 2 required allocations"
+        );
+
+        plugins.on_executor_allocate(node, ssn.clone()).unwrap();
+        assert!(
+            plugins.is_ready(&ssn),
+            "is_ready must be true once the full batch of 2 is allocated"
+        );
+    }
+
+    /// When gang is loaded, is_fulfilled starts as false and becomes true after the batch of
+    /// on_session_bind events.
+    #[test]
+    fn test_is_fulfilled_false_then_true_with_gang() {
+        let ss = SnapShot::new();
+        let ssn = make_session("ssn-1", 1);
+        ss.add_session(ssn.clone()).unwrap();
+
+        let plugins = PluginManager::setup(&ss, &make_policies(&["gang"])).unwrap();
+
+        assert!(!plugins.is_fulfilled(&ssn));
+
+        plugins.on_session_bind(ssn.clone()).unwrap();
+        assert!(
+            plugins.is_fulfilled(&ssn),
+            "is_fulfilled must be true after one bind with batch_size=1"
+        );
+    }
+
+    /// With gang loaded, is_ready starts false (no ops yet).
+    /// Without gang, is_ready also starts false (no ops yet), and only becomes true after
+    /// the first pipeline/allocate op is recorded via on_executor_allocate.
+    #[test]
+    fn test_gang_loaded_iff_listed_in_policies() {
+        let ss = SnapShot::new();
+        let ssn = make_session("ssn-1", 1);
+        ss.add_session(ssn.clone()).unwrap();
+
+        // With gang: is_ready is false before any op (batch counter starts at 0).
+        let with_gang = PluginManager::setup(&ss, &make_policies(&["gang"])).unwrap();
+        assert!(
+            !with_gang.is_ready(&ssn),
+            "is_ready must be false before any op when gang is loaded"
+        );
+
+        // Without gang: is_ready is also false before any op.
+        let ss2 = SnapShot::new();
+        ss2.add_session(ssn.clone()).unwrap();
+        let without_gang = PluginManager::setup(&ss2, &make_policies(&["priority"])).unwrap();
+        assert!(
+            !without_gang.is_ready(&ssn),
+            "is_ready must be false before any op when gang is not loaded"
+        );
+
+        // Without gang: is_ready becomes true after the first pipeline op.
+        let node = make_node("node-1");
+        without_gang
+            .on_executor_allocate(node, ssn.clone())
+            .unwrap();
+        assert!(
+            without_gang.is_ready(&ssn),
+            "is_ready must be true after the first op with no gang constraint"
+        );
     }
 }
