@@ -21,7 +21,7 @@ RUN ./target/release/flmadm install \
 
 FROM ubuntu:24.04
 
-RUN apt-get update && apt-get install -y python3-pip git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y python3-pip git dumb-init && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/local/flame/work
 
@@ -30,4 +30,4 @@ COPY --from=builder /usr/local/flame /usr/local/flame
 
 ENV FLAME_HOME=/usr/local/flame
 
-ENTRYPOINT ["/usr/local/flame/bin/flame-executor-manager"]
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "/usr/local/flame/bin/flame-executor-manager"]
