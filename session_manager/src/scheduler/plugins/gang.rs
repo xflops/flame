@@ -154,6 +154,7 @@ impl Plugin for GangPlugin {
     fn on_session_bind(&mut self, ssn: SessionInfoPtr) {
         if let Some(state) = self.ssn_state.get_mut(&ssn.id) {
             state.bound += 1;
+            state.incomplete_tasks = state.incomplete_tasks.saturating_sub(1);
         }
     }
 
@@ -166,6 +167,7 @@ impl Plugin for GangPlugin {
     fn on_session_unbind(&mut self, ssn: SessionInfoPtr) {
         if let Some(state) = self.ssn_state.get_mut(&ssn.id) {
             state.bound = state.bound.saturating_sub(1);
+            state.incomplete_tasks = state.incomplete_tasks.saturating_add(1);
         }
     }
 }
