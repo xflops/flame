@@ -80,7 +80,6 @@ scheduler:
   policies:
     - priority
     - drf              # NEW: Dominant Resource Fairness
-    - gang
 ```
 
 **Examples:**
@@ -321,7 +320,7 @@ pub struct SessionAttributes {
 | Feature | Interaction |
 |---------|-------------|
 | **PriorityPlugin (RFE413)** | Orthogonal; priority ordering applies to GPU sessions equally |
-| **GangPlugin (RFE400)** | Orthogonal; batch constraints apply to GPU sessions |
+| **BatchPlugin (RFE400)** | Orthogonal; batch constraints apply to GPU sessions |
 
 **Required Updates:**
 
@@ -704,8 +703,8 @@ const PLUGIN_REGISTRY: &[PluginInfo] = &[
         configurable: true,
     },
     PluginInfo {
-        name: "gang",
-        constructor: GangPlugin::new_ptr,
+        name: "batch",
+        constructor: BatchPlugin::new_ptr,
         configurable: true,
     },
     PluginInfo {

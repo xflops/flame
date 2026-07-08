@@ -1071,7 +1071,7 @@ impl Engine for FilesystemEngine {
                 // If spec provided, validate full session attributes (same as sqlite engine
                 // and in-memory cache). Only checking application was insufficient:
                 // a persisted session could have batch_size/min_instances/max_instances that
-                // differ from the client spec, leading to gang scheduling deadlocks (tasks
+                // differ from the client spec, leading to batch scheduling deadlocks (tasks
                 // never allocated) without a clear error.
                 if let Some(ref attr) = spec {
                     ssn.validate_spec(attr)?;

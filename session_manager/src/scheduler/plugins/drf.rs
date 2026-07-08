@@ -252,7 +252,7 @@ impl Plugin for DRFPlugin {
     }
 
     fn on_executor_pipeline(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
-        // Idle executors already consume node resources. Allocate reserves them for Gang
+        // Idle executors already consume node resources. Allocate reserves them for Batch
         // fulfillment, while DRF assigns their session share when Dispatch binds them.
         if exec.state == ExecutorState::Idle {
             return;

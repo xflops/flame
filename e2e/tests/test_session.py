@@ -208,7 +208,7 @@ class TestResourceRequirements:
         session.close()
 
     def test_session_batch_size(self):
-        """Test creating session with batch_size for gang scheduling."""
+        """Test creating session with batch_size for batch scheduling."""
         session_id = f"test-batch-{random_string(8)}"
         session = flamepy.create_session(
             application=FLM_TEST_SVC_APP,

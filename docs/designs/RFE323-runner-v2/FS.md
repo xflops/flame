@@ -365,14 +365,14 @@ No changes required. The executor manager continues to handle executor lifecycle
    - Executor allocation happens asynchronously in the scheduler loop (not immediately on session creation):
      - **Scheduler Loop**: Runs periodically (every `schedule_interval` ms, typically 1000ms)
      - **AllocateAction** (`scheduler/actions/allocate.rs`): Executed as part of scheduler actions
-       - Gets all open sessions, orders them by the scheduler plugins' `ssn_order_fn` (PriorityPlugin → DRFPlugin → GangPlugin)
+       - Gets all open sessions, orders them by the scheduler plugins' `ssn_order_fn` (PriorityPlugin → DRFPlugin → BatchPlugin)
        - For each session, checks `plugins.is_underused(ssn)`
        - **NEW**: Add explicit `max_instances` check by counting actual executors from snapshot
          - This prevents over-allocation when multiple executors are created in one cycle
          - The plugin's cached `allocated` count doesn't update within a cycle
        - If underused and below `max_instances`, allocates executors
        - Calls `ctx.create_executor(node, ssn)` to actually create executor
-   - Delegate allocation decisions to the scheduler plugins (PriorityPlugin / DRFPlugin / GangPlugin)
+   - Delegate allocation decisions to the scheduler plugins (PriorityPlugin / DRFPlugin / BatchPlugin)
    - Plugins respect both `min_instances` (guaranteed) and `max_instances` (limit)
    - Note: Sessions with `min_instances > 0` will be allocated executors in the first scheduler cycle (within ~1 second)
 
@@ -548,7 +548,7 @@ The enhancement spans multiple layers from SDK to session manager to executors:
       - Executes scheduling actions (AllocateAction, DispatchAction, etc.)
   - **AllocateAction** (`actions/allocate.rs`):
     - Gets all open sessions from snapshot
-    - Orders sessions by the scheduler plugins' `ssn_order_fn` (Priority → DRF → Gang)
+    - Orders sessions by the scheduler plugins' `ssn_order_fn` (Priority → DRF → Batch)
     - For each session:
       - Checks `plugins.is_underused(ssn)` - returns true if `allocated < deserved` in any resource dimension
       - **NEW**: Explicit `max_instances` check - counts actual executors from snapshot to prevent over-allocation
@@ -1201,7 +1201,7 @@ if let Some(max_instances) = ssn.max_instances {
   - This is needed because the plugin's cached `allocated` count doesn't update within a single scheduler cycle
   - Prevents allocating beyond `max_instances` when creating multiple executors in one cycle
 - Creates one executor per iteration, then re-evaluates
-- Sessions are processed in priority order (PriorityPlugin → DRFPlugin → GangPlugin)
+- Sessions are processed in priority order (PriorityPlugin → DRFPlugin → BatchPlugin)
 
 ### System Considerations
 

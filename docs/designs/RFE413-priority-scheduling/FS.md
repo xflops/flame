@@ -56,7 +56,7 @@ Legacy proportional-share behavior (pre-PriorityPlugin):
 | ---------- | -------- | ------- | -------------------------------------------------------------------------------------------------- |
 | `priority` | `uint32` | `0`     | Session priority. Higher value = higher priority. Sessions with `priority = 0` use default priority. |
 
-**Scheduling policy**: Priority-based scheduling is always active when the `PriorityPlugin` is registered. No configuration flag is required to enable it; the plugin is registered by default alongside `DRFPlugin` and `GangPlugin`. When all sessions share the same priority, the priority dimension has no effect and ordering falls through to the downstream deferral plugins.
+**Scheduling policy**: Priority-based scheduling is always active when the `PriorityPlugin` is registered. No configuration flag is required to enable it; the plugin is registered by default alongside `DRFPlugin` and `BatchPlugin`. When all sessions share the same priority, the priority dimension has no effect and ordering falls through to the downstream deferral plugins.
 
 ### API
 
@@ -179,7 +179,7 @@ session = flame.open_session(
 | Feature | Interaction |
 | ------- | ----------- |
 | **DRF (RFE433)** | Priority ordering overlays DRF's dominant-resource fairness ordering. Within the same priority level, DRF determines per-session resource shares and session ordering by dominant resource fraction. |
-| **GangPlugin (RFE400)** | Orthogonal. `batch_size` constraints apply within a priority level independently of priority ordering. |
+| **BatchPlugin (RFE400)** | Orthogonal. `batch_size` constraints apply within a priority level independently of priority ordering. |
 | **AllocateAction** | Consults `ssn_order_fn` from all plugins; PriorityPlugin's ordering ensures high-priority sessions are processed before low-priority ones. |
 | **DispatchAction** | Consults `is_underused` from all plugins; PriorityPlugin blocks dispatch to lower-priority sessions when any higher-priority session is needy. |
 | **ShuffleAction** | Unchanged in V1. Priority-based preemption (reclaiming executors via ShuffleAction) is deferred. |
@@ -220,7 +220,7 @@ session = flame.open_session(
 │  │                          PluginManager                              │    │
 │  │                                                                     │    │
 │  │  ┌──────────────────┐  ┌───────────────────┐  ┌──────────────────┐  │    │
-│  │  │  PriorityPlugin  │  │    DRFPlugin      │  │   GangPlugin     │  │    │
+│  │  │  PriorityPlugin  │  │    DRFPlugin      │  │   BatchPlugin     │  │    │
 │  │  │                  │  │                   │  │                  │  │    │
 │  │  │ setup():         │  │ setup():          │  │ setup():         │  │    │
 │  │  │  read cluster    │  │  compute          │  │  track batch     │  │    │
@@ -647,11 +647,11 @@ pub fn ssn_order_fn(&self, s1: &SessionInfo, s2: &SessionInfo) -> Ordering {
 | ----- | ------ | --------------------- |
 | 1 | `PriorityPlugin` | Returns `Some(ord)` when priorities differ; `None` when equal |
 | 2 | `DRFPlugin` | Returns `Some(ord)` based on dominant resource share |
-| 3 | `GangPlugin` | Returns `None` (no ordering opinion) |
+| 3 | `BatchPlugin` | Returns `None` (no ordering opinion) |
 
 This chain ensures priority is the primary sort key, with DRF providing tiebreaking within a priority level.
 
-The `is_underused` aggregation rule is **ANY** (any plugin returning `Some(true)` makes a session underused). `PriorityPlugin` returns `Some(false)` for blocked lower-priority sessions, and `None` for sessions at or above the needy priority tier. The `None` return defers to DRF and GangPlugin, preserving all existing underuse logic for unblocked sessions.
+The `is_underused` aggregation rule is **ANY** (any plugin returning `Some(true)` makes a session underused). `PriorityPlugin` returns `Some(false)` for blocked lower-priority sessions, and `None` for sessions at or above the needy priority tier. The `None` return defers to DRF and BatchPlugin, preserving all existing underuse logic for unblocked sessions.
 
 #### 6. flmctl Changes
 
@@ -741,7 +741,7 @@ PriorityPlugin.ssn_order_fn(s1, s2):
   if p1 == p2 → return None          (defer to the next plugin in the chain)
 
 PluginManager chain (first non-None wins):
-  PriorityPlugin → DRFPlugin → GangPlugin → Ordering::Equal
+  PriorityPlugin → DRFPlugin → BatchPlugin → Ordering::Equal
 ```
 
 #### Priority-Aware Resource Distribution (PriorityPlugin.setup)
@@ -821,12 +821,12 @@ For each session in is_underused(ssn):
   if desired != ResourceRequirement::default() and !allocated.great_equal(&desired):
     return Some(true)    → overrides any downstream-plugin veto
   else:
-    return None          → let DRF and GangPlugin decide
+    return None          → let DRF and BatchPlugin decide
 
 Aggregation (ANY semantics):
-  is_underused(ssn) = PriorityPlugin OR DRFPlugin OR GangPlugin
+  is_underused(ssn) = PriorityPlugin OR DRFPlugin OR BatchPlugin
   If PriorityPlugin returns Some(false), session is not underused
-  regardless of what DRF/GangPlugin return.
+  regardless of what DRF/BatchPlugin return.
 ```
 
 **Why `pending > 0` as the "needy" criterion:**
@@ -969,7 +969,7 @@ The `ssn_priority` map grows linearly with the number of open sessions. Session 
 | `common/src/apis/types.rs` | Internal | Session and SessionAttributes structs |
 | `session_manager/src/model/mod.rs` | Internal | SessionInfo (scheduler snapshot type) |
 | `session_manager/src/scheduler/plugins/mod.rs` | Internal | Plugin trait, PluginManager, registration |
-| `session_manager/src/scheduler/plugins/gang.rs` | Internal | GangPlugin (unchanged; orthogonal) |
+| `session_manager/src/scheduler/plugins/batch.rs` | Internal | BatchPlugin (unchanged; orthogonal) |
 | SQLite | External | Session storage; `ALTER TABLE` for `priority` column |
 
 ---
@@ -1079,7 +1079,7 @@ PriorityPlugin: llm-inference (priority=100) is needy → max_needy_priority=100
   batch-work (priority=0) is blocked
 
 AllocateAction:
-  llm-inference: GangPlugin requires batches of 4 executors × cpu=4 = 16 CPU
+  llm-inference: BatchPlugin requires batches of 4 executors × cpu=4 = 16 CPU
   Statement pipelines 4 executors → is_ready() true → commit
   llm-inference gets 16 CPU in one complete batch
 
@@ -1113,7 +1113,7 @@ llm-inference pending=0, batch-work becomes eligible.
 | `session_manager/src/model/mod.rs` | SessionInfo — add `priority` field |
 | `session_manager/src/scheduler/plugins/ty.rs` | **NEW** PriorityPlugin implementation |
 | `session_manager/src/scheduler/plugins/mod.rs` | Plugin trait, PluginManager, registration order |
-| `session_manager/src/scheduler/plugins/gang.rs` | GangPlugin (unchanged) |
+| `session_manager/src/scheduler/plugins/batch.rs` | BatchPlugin (unchanged) |
 | `session_manager/src/scheduler/actions/allocate.rs` | AllocateAction (unchanged) |
 | `session_manager/src/scheduler/actions/dispatch.rs` | DispatchAction (unchanged) |
 | `session_manager/src/apiserver/frontend.rs` | Frontend — pass `priority` from proto to attributes |
@@ -1128,7 +1128,7 @@ llm-inference pending=0, batch-work becomes eligible.
 | -------- | --------- |
 | **Higher `priority` value = higher priority** | Consistent with Kubernetes `PriorityClass.value` and Volcano queue priority. Allows future expansion (e.g., system sessions at priority > 1000, user session–999). |
 | **PriorityPlugin as a separate plugin, not a modification of the proportional-share plugin** | Keeps the proportional-share / DRF plugin focused on resource fairness. Priority is an independent scheduling dimension that composes with, rather than replaces, the downstream distribution. |
-| **Plugin consultation order: Priority → DRF → Gang** | `ssn_order_fn` returns the first non-`None` result. PriorityPlugin gives a definitive answer when priorities differ; DRF breaks ties within a priority level; GangPlugin has no ordering opinion. This ensures priority is the primary sort key globally. |
+| **Plugin consultation order: Priority → DRF → Batch** | `ssn_order_fn` returns the first non-`None` result. PriorityPlugin gives a definitive answer when priorities differ; DRF breaks ties within a priority level; BatchPlugin has no ordering opinion. This ensures priority is the primary sort key globally. |
 | **Blocking via `is_underused = Some(false)`, not preemption** | V1 focuses on controlling new resource allocation. Preemption (reclaiming executors from running low-priority sessions) requires executor lifecycle management, session state coordination, and policy decisions about partial reclaim — deferred to a future RFE. |
 | **"Needy" criterion: `pending > 0`** | A session with no pending tasks cannot benefit from additional executors regardless of `allocated vs. deserved`. Using task backlog directly avoids dependency on the downstream plugin's internal `deserved` computation while correctly capturing whether the session needs more resources. |
 | **Default `priority = 0`** | Proto3 default for `uint32` is `0`. All existing sessions automatically start at the lowest priority without any migration or explicit opt-in. Clusters that don't use the priority feature are unaffected. |

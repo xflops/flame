@@ -17,7 +17,7 @@ priority tier is now provided by `DRFPlugin` (see RFE433).
 
 ### Background
 
-The `batch_size` feature (RFE400) introduced gang scheduling, enabling coordinated multi-executor workloads such as multi-node LLM inference with tensor parallelism. The Gang plugin ensures executors are committed in complete batches; however, the Fairshare plugin's resource distribution algorithm does not fully account for batch boundaries.
+The `batch_size` feature (RFE400) introduced gang scheduling, enabling coordinated multi-executor workloads such as multi-node LLM inference with tensor parallelism. The Batch plugin ensures executors are committed in complete batches; however, the Fairshare plugin's resource distribution algorithm does not fully account for batch boundaries.
 
 ### Current Limitations
 
@@ -25,7 +25,7 @@ The `batch_size` feature (RFE400) introduced gang scheduling, enabling coordinat
 
 2. **Inefficient `is_underused` check**: The current implementation (`allocated < deserved`) does not consider batch boundaries. A session with `allocated=4` and `deserved=6` appears "underused" by 2 slots, but those 2 slots cannot form a complete batch, leading to wasted scheduling cycles.
 
-3. **Fairshare-Gang plugin mismatch**: Fairshare calculates what a session "deserves" while Gang enforces batch atomicity at commit time. When Fairshare grants a non-batch-aligned allocation, Gang rejects partial batches, causing scheduling thrashing.
+3. **Fairshare-Batch plugin mismatch**: Fairshare calculates what a session "deserves" while Gang enforces batch atomicity at commit time. When Fairshare grants a non-batch-aligned allocation, Gang rejects partial batches, causing scheduling thrashing.
 
 ### Problem Example
 
@@ -43,7 +43,7 @@ Problem:
 - Session A with deserved=6 can only run 1 complete batch (4 executors)
 - 2 slots are "deserved" but can never be used (incomplete batch)
 - Allocate action keeps trying to allocate for Session A
-- Gang plugin's is_ready() blocks until a full batch is pipelined
+- Batch plugin's is_ready() blocks until a full batch is pipelined
 - Those 2 slots could have gone to Session B instead
 ```
 
@@ -98,7 +98,7 @@ No CLI changes are required. Validation errors are returned when invalid paramet
 
 **Out of Scope:**
 
-- Changes to Gang plugin (already handles batch atomicity correctly)
+- Changes to Batch plugin (already handles batch atomicity correctly)
 - New metrics or observability (may be added in follow-up work)
 
 **Limitations:**
@@ -110,8 +110,8 @@ No CLI changes are required. Validation errors are returned when invalid paramet
 
 **Related Features:**
 
-- **RFE400 (Batch Session)**: Introduced `batch_size` concept and Gang plugin
-- **Gang Plugin**: Enforces batch atomicity at allocation/binding time
+- **RFE400 (Batch Session)**: Introduced `batch_size` concept and Batch plugin
+- **Batch Plugin**: Enforces batch atomicity at allocation/binding time
 - **Allocate/Dispatch Actions**: Use Fairshare's `is_underused` to determine scheduling decisions
 
 **Required Updates:**
@@ -152,7 +152,7 @@ This enhancement modifies the Fairshare plugin's internal algorithm while mainta
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │                       PluginManager                             │    │
 │  │  ┌─────────────────────┐  ┌─────────────────────┐               │    │
-│  │  │   FairShare         │  │   GangPlugin        │               │    │
+│  │  │   FairShare         │  │   BatchPlugin        │               │    │
 │  │  │                     │  │                     │               │    │
 │  │  │ ENHANCED:           │  │ UNCHANGED:          │               │    │
 │  │  │ - setup() aligns    │  │ - is_ready()        │               │    │
@@ -529,7 +529,7 @@ Cluster: 10 slots
 | File                                                 | Description      |
 | ---------------------------------------------------- | ---------------- |
 | `session_manager/src/scheduler/plugins/fairshare.rs` | Fairshare plugin |
-| `session_manager/src/scheduler/plugins/gang.rs`      | Gang plugin      |
+| `session_manager/src/scheduler/plugins/batch.rs`      | Batch plugin      |
 | `session_manager/src/scheduler/plugins/mod.rs`       | Plugin trait     |
 | `session_manager/src/scheduler/actions/allocate.rs`  | Allocate action  |
 | `session_manager/src/scheduler/actions/dispatch.rs`  | Dispatch action  |
@@ -543,7 +543,7 @@ Cluster: 10 slots
 | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Batch-unit distribution**   | Distribute in batch units during the fair-share algorithm rather than aligning after distribution. This ensures fairness is calculated on usable resources.                               |
 | **Incomplete batch handling** | When cluster capacity cannot accommodate a full batch, those resources go to other sessions or remain unallocated. Allocating unusable resources wastes scheduling cycles.                |
-| **No Gang plugin changes**    | The Gang plugin already correctly enforces batch atomicity. This enhancement ensures Fairshare uses consistent batch boundaries.                                                          |
+| **No Batch plugin changes**    | The Batch plugin already correctly enforces batch atomicity. This enhancement ensures Fairshare uses consistent batch boundaries.                                                          |
 | **Greedy batch allocation**   | Sessions receive one batch unit at a time via priority queue. This ensures fairness across sessions with different batch sizes.                                                           |
 | **Frontend validation**       | Validate `min_instances` and `max_instances` at the API boundary rather than silently aligning them in the scheduler. This provides clear feedback to users about invalid configurations. |
 | **Validation rules**          | When `batch_size > 1`, `min_instances` must be 0 or a multiple of `batch_size`, and `max_instances` must be None or a multiple of `batch_size`.                                           |

@@ -50,7 +50,7 @@ impl FlameThread for ScheduleRunner {
             let mut ctx = Context::new(self.controller.clone(), policies)?;
 
             // Same `ctx` (and thus same in-memory `plugins`) for every action: Dispatch mutations
-            // are visible to Allocate (e.g. Gang `is_fulfilled` / `is_ready` after binds).
+            // are visible to Allocate (e.g. Batch `is_fulfilled` / `is_ready` after binds).
             for action in ctx.actions.clone() {
                 if let Err(e) = action.execute(&mut ctx).await {
                     tracing::error!("Failed to run scheduling: {e}");
@@ -376,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn test_priority_only_policy_abstains_from_allocation() -> Result<(), FlameError> {
+    fn test_priority_policy_uses_always_enabled_batch() -> Result<(), FlameError> {
         let env = TestEnv::new()?;
         let controller = env.controller.clone();
         let ssn_id = format!("priority-only-{}", Uuid::new_v4());
@@ -384,7 +384,7 @@ mod tests {
 
         let policies = vec!["priority".to_string()];
         let mut ctx = Context::new(controller.clone(), &policies)?;
-        assert!(ctx.is_fulfilled(
+        assert!(!ctx.is_fulfilled(
             ctx.snapshot
                 .find_sessions(OPEN_SESSION)?
                 .values()
@@ -393,12 +393,12 @@ mod tests {
         )?);
 
         tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
-        assert!(controller.list_executor()?.is_empty());
+        assert_eq!(controller.list_executor()?.len(), 3);
         Ok(())
     }
 
     #[test]
-    fn test_drf_only_policy_abstains_from_allocation() -> Result<(), FlameError> {
+    fn test_drf_policy_uses_always_enabled_batch() -> Result<(), FlameError> {
         let env = TestEnv::new()?;
         let controller = env.controller.clone();
         let ssn_id = format!("drf-only-{}", Uuid::new_v4());
@@ -407,18 +407,18 @@ mod tests {
         let policies = vec!["drf".to_string()];
         let mut ctx = Context::new(controller.clone(), &policies)?;
         tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
-        assert!(controller.list_executor()?.is_empty());
+        assert_eq!(controller.list_executor()?.len(), 3);
         Ok(())
     }
 
     #[test]
-    fn test_gang_allocates_for_all_incomplete_tasks() -> Result<(), FlameError> {
+    fn test_batch_allocates_for_all_incomplete_tasks() -> Result<(), FlameError> {
         let env = TestEnv::new()?;
         let controller = env.controller.clone();
-        let ssn_id = format!("gang-all-tasks-{}", Uuid::new_v4());
+        let ssn_id = format!("batch-all-tasks-{}", Uuid::new_v4());
         setup_test_session(&controller, &ssn_id, 1, None, 3)?;
 
-        let policies = vec!["priority".to_string(), "gang".to_string()];
+        let policies = vec!["priority".to_string()];
         let mut ctx = Context::new(controller.clone(), &policies)?;
         tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
 
@@ -427,13 +427,13 @@ mod tests {
     }
 
     #[test]
-    fn test_gang_allocation_respects_max_instances() -> Result<(), FlameError> {
+    fn test_batch_allocation_respects_max_instances() -> Result<(), FlameError> {
         let env = TestEnv::new()?;
         let controller = env.controller.clone();
-        let ssn_id = format!("gang-max-{}", Uuid::new_v4());
+        let ssn_id = format!("batch-max-{}", Uuid::new_v4());
         setup_test_session(&controller, &ssn_id, 2, Some(4), 8)?;
 
-        let policies = vec!["priority".to_string(), "gang".to_string()];
+        let policies = vec!["priority".to_string()];
         let mut ctx = Context::new(controller.clone(), &policies)?;
         tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
 
@@ -451,7 +451,7 @@ mod tests {
             tokio_test::block_on(controller.create_executor("node_1".to_string(), ssn_id.clone()))?;
         tokio_test::block_on(controller.register_executor(&executor))?;
 
-        let policies = vec!["priority".to_string(), "gang".to_string()];
+        let policies = vec!["priority".to_string()];
         let mut ctx = Context::new(controller.clone(), &policies)?;
         for action in ctx.actions.clone() {
             tokio_test::block_on(action.execute(&mut ctx))?;
@@ -475,7 +475,7 @@ mod tests {
         tokio_test::block_on(controller.register_executor(&executor))?;
         tokio_test::block_on(controller.bind_session(executor.id.clone(), ssn_id.clone()))?;
 
-        let policies = vec!["priority".to_string(), "gang".to_string()];
+        let policies = vec!["priority".to_string()];
         for _ in 0..2 {
             let mut ctx = Context::new(controller.clone(), &policies)?;
             let ssn = ctx

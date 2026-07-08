@@ -16,7 +16,7 @@ limitations under the License.
 //! This test creates 10 concurrent sessions, each running 1000 tasks,
 //! for a total of 10,000 tasks. The benchmark must complete within 10 minutes.
 //!
-//! Also includes gang scheduling tests to verify tasks don't start partially
+//! Also includes batch scheduling tests to verify tasks don't start partially
 //! when batch_size > 1 (all executors in a batch must be ready before tasks start).
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -199,11 +199,11 @@ const BATCH_SIZE: u32 = 2;
 const BATCH_TIMEOUT_SECS: u64 = 120;
 
 #[tokio::test]
-async fn benchmark_gang_scheduling_no_partial_start() -> Result<(), FlameError> {
+async fn benchmark_batch_scheduling_no_partial_start() -> Result<(), FlameError> {
     tracing_subscriber::fmt::try_init().ok();
 
     println!("\n============================================================");
-    println!("GANG SCHEDULING TEST: batch_size={}", BATCH_SIZE);
+    println!("BATCH SCHEDULING TEST: batch_size={}", BATCH_SIZE);
     println!("Verifying single task stays Pending until batch is complete...");
     println!("============================================================\n");
 
@@ -213,7 +213,7 @@ async fn benchmark_gang_scheduling_no_partial_start() -> Result<(), FlameError> 
     let conn = flame::client::connect_with_tls(FLAME_ADDR, Some(&tls_config)).await?;
 
     let ssn_attr = SessionAttributes {
-        id: format!("gang-test-{}", stdng::rand::short_name()),
+        id: format!("batch-test-{}", stdng::rand::short_name()),
         application: FLAME_APP.to_string(),
         common_data: None,
         min_instances: 0,
@@ -293,7 +293,7 @@ async fn benchmark_gang_scheduling_no_partial_start() -> Result<(), FlameError> 
     let duration = start.elapsed();
 
     println!("\n============================================================");
-    println!("GANG SCHEDULING RESULTS");
+    println!("BATCH SCHEDULING RESULTS");
     println!("============================================================");
     println!("Duration:              {:.2}s", duration.as_secs_f64());
     println!("Single task correctly stayed Pending until batch filled");
@@ -302,7 +302,7 @@ async fn benchmark_gang_scheduling_no_partial_start() -> Result<(), FlameError> 
 
     assert!(
         duration < Duration::from_secs(BATCH_TIMEOUT_SECS),
-        "Gang scheduling test exceeded {} second timeout: {:.2}s",
+        "Batch scheduling test exceeded {} second timeout: {:.2}s",
         BATCH_TIMEOUT_SECS,
         duration.as_secs_f64()
     );

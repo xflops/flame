@@ -19,28 +19,28 @@ use common::FlameError;
 use crate::model::{ExecutorInfoPtr, NodeInfoPtr, SessionInfoPtr, SnapShot};
 use crate::scheduler::plugins::{Plugin, PluginPtr};
 
-struct GangState {
+struct BatchState {
     batch_size: u32,
     allocated: u32,
     pipelined: u32,
     bound: u32,
 }
 
-pub struct GangPlugin {
-    ssn_state: HashMap<SessionID, GangState>,
+pub struct BatchPlugin {
+    ssn_state: HashMap<SessionID, BatchState>,
 }
 
-impl GangPlugin {
+impl BatchPlugin {
     pub fn new_ptr() -> PluginPtr {
-        Box::new(GangPlugin {
+        Box::new(BatchPlugin {
             ssn_state: HashMap::new(),
         })
     }
 }
 
-impl Plugin for GangPlugin {
+impl Plugin for BatchPlugin {
     fn name(&self) -> &'static str {
-        "gang"
+        "batch"
     }
 
     fn setup(&mut self, ss: &SnapShot) -> Result<(), FlameError> {
@@ -55,7 +55,7 @@ impl Plugin for GangPlugin {
             for ssn in sessions.values() {
                 self.ssn_state.insert(
                     ssn.id.clone(),
-                    GangState {
+                    BatchState {
                         batch_size: ssn.batch_size.max(1),
                         allocated: 0,
                         pipelined: 0,
@@ -225,7 +225,7 @@ mod tests {
         let ssn = create_test_session("ssn-1", 1);
         ss.add_session(ssn.clone()).unwrap();
 
-        let mut plugin = GangPlugin {
+        let mut plugin = BatchPlugin {
             ssn_state: HashMap::new(),
         };
         plugin.setup(&ss).unwrap();
@@ -245,7 +245,7 @@ mod tests {
         let ssn = create_test_session("ssn-1", 2);
         ss.add_session(ssn.clone()).unwrap();
 
-        let mut plugin = GangPlugin {
+        let mut plugin = BatchPlugin {
             ssn_state: HashMap::new(),
         };
         plugin.setup(&ss).unwrap();
@@ -272,7 +272,7 @@ mod tests {
         let exec = create_test_executor("exec-1", Some("ssn-1"));
         ss.add_executor(exec).unwrap();
 
-        let mut plugin = GangPlugin {
+        let mut plugin = BatchPlugin {
             ssn_state: HashMap::new(),
         };
         plugin.setup(&ss).unwrap();
@@ -292,7 +292,7 @@ mod tests {
         let ssn = create_test_session("ssn-1", 1);
         ss.add_session(ssn.clone()).unwrap();
 
-        let mut plugin = GangPlugin {
+        let mut plugin = BatchPlugin {
             ssn_state: HashMap::new(),
         };
         plugin.setup(&ss).unwrap();
@@ -311,7 +311,7 @@ mod tests {
         let ssn = create_test_session("ssn-1", 2);
         ss.add_session(ssn.clone()).unwrap();
 
-        let mut plugin = GangPlugin {
+        let mut plugin = BatchPlugin {
             ssn_state: HashMap::new(),
         };
         plugin.setup(&ss).unwrap();
@@ -337,7 +337,7 @@ mod tests {
         let exec = create_test_executor("exec-1", Some("ssn-1"));
         ss.add_executor(exec).unwrap();
 
-        let mut plugin = GangPlugin {
+        let mut plugin = BatchPlugin {
             ssn_state: HashMap::new(),
         };
         plugin.setup(&ss).unwrap();
@@ -356,7 +356,7 @@ mod tests {
         let ssn = create_test_session("ssn-1", 2);
         ss.add_session(ssn.clone()).unwrap();
 
-        let mut plugin = GangPlugin {
+        let mut plugin = BatchPlugin {
             ssn_state: HashMap::new(),
         };
         plugin.setup(&ss).unwrap();
@@ -386,7 +386,7 @@ mod tests {
         let ssn = create_test_session("ssn-1", 2);
         ss.add_session(ssn.clone()).unwrap();
 
-        let mut plugin = GangPlugin {
+        let mut plugin = BatchPlugin {
             ssn_state: HashMap::new(),
         };
         plugin.setup(&ss).unwrap();

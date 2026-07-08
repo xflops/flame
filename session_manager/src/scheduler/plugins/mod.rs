@@ -19,16 +19,16 @@ use stdng::collections;
 use stdng::{lock_ptr, new_ptr, MutexPtr};
 
 use crate::model::{ExecutorInfoPtr, NodeInfo, NodeInfoPtr, SessionInfo, SessionInfoPtr, SnapShot};
+use crate::scheduler::plugins::batch::BatchPlugin;
 use crate::scheduler::plugins::drf::DRFPlugin;
-use crate::scheduler::plugins::gang::GangPlugin;
 use crate::scheduler::plugins::priority::PriorityPlugin;
 use crate::scheduler::plugins::shim::ShimPlugin;
 use crate::scheduler::Context;
 
 use common::FlameError;
 
+mod batch;
 mod drf;
-mod gang;
 mod priority;
 mod shim;
 
@@ -132,9 +132,9 @@ const PLUGIN_REGISTRY: &[PluginInfo] = &[
         configurable: true,
     },
     PluginInfo {
-        name: "gang",
-        constructor: GangPlugin::new_ptr,
-        configurable: true,
+        name: "batch",
+        constructor: BatchPlugin::new_ptr,
+        configurable: false,
     },
     PluginInfo {
         name: "shim",
@@ -202,7 +202,7 @@ impl PluginManager {
     /// Returns whether the session is underused (needs more executors).
     ///
     /// Uses "first non-`None` wins" ordering, identical to `ssn_order_fn`.
-    /// Plugins are consulted in registration order (Priority → DRF → Gang → Shim).
+    /// Plugins are consulted in registration order (Priority → DRF → Batch → Shim).
     /// The first plugin that returns `Some(result)` wins; `None` means "no opinion, ask the
     /// next plugin".  If no plugin has an opinion, the session is considered NOT underused.
     ///
@@ -554,18 +554,38 @@ mod tests {
     }
 
     #[test]
-    fn test_readiness_defaults_true_without_plugin_opinion() {
+    fn test_batch_is_always_enabled() {
         let ss = SnapShot::new();
         let ssn = Arc::new(SessionInfo {
-            id: "ssn-no-gang".to_string(),
+            id: "ssn-always-batch".to_string(),
             resreq: Some(ResourceRequirement::default()),
             ..Default::default()
         });
         ss.add_session(ssn.clone()).unwrap();
 
         let plugins = PluginManager::setup(&ss, &["priority".to_string()]).unwrap();
+        let plugin_names = plugins
+            .plugins
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(plugin_names, vec!["priority", "batch", "shim"]);
         assert!(plugins.is_ready(&ssn).unwrap());
         assert!(plugins.is_fulfilled(&ssn).unwrap());
+    }
+
+    #[test]
+    fn test_explicit_batch_policy_is_accepted() {
+        let ss = SnapShot::new();
+        PluginManager::setup(&ss, &["batch".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn test_removed_gang_policy_is_rejected() {
+        let ss = SnapShot::new();
+        assert!(PluginManager::setup(&ss, &["gang".to_string()]).is_err());
     }
 
     #[test]

@@ -335,7 +335,7 @@ impl Plugin for PriorityPlugin {
     }
 
     fn on_executor_pipeline(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
-        // Idle executors are existing reusable supply. Allocate reserves them for Gang
+        // Idle executors are existing reusable supply. Allocate reserves them for Batch
         // fulfillment, but Priority accounts them only when Dispatch actually binds them.
         if exec.state == ExecutorState::Idle {
             return;

@@ -24,7 +24,6 @@ HELM_E2E_ARGS=(
     --set "global.imagePullPolicy=${IMAGE_PULL_POLICY}"
     --set "cluster.storage=${SESSION_MANAGER_STORAGE}"
     --set "cluster.policies[0]=drf"
-    --set "cluster.policies[1]=gang"
     --set sessionManager.persistence.enabled=false
     --set objectCache.persistence.enabled=false
     --set "objectCache.replicas=${OBJECT_CACHE_REPLICAS}"

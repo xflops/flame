@@ -151,15 +151,15 @@ flmctl list -s
 
 **Updates Required:**
 - `Plugin trait`: Add `is_ready()`, `on_pipeline_executor()`, `on_discard_executor()` methods
-- `GangPlugin`: New scheduler plugin implementing these methods for batch tracking
+- `BatchPlugin`: New scheduler plugin implementing these methods for batch tracking
 - `Statement`: New struct for accumulating pending allocations (pipeline/commit/discard)
-- `AllocateAction`: Use Statement pattern - action is NOT aware of GangPlugin
+- `AllocateAction`: Use Statement pattern - action is NOT aware of BatchPlugin
 - `Controller::launch_task()`: Batch-indexed task assignment
 - Storage schemas: Add `batch_size` to sessions, `batch_index` to executors
 
 **Design Principle: Actions Unaware of Gang Logic**
 
-Actions use Statement to accumulate allocations. Statement calls Plugin trait callbacks (`on_pipeline_executor`, `on_discard_executor`). GangPlugin implements these callbacks to track pipelined count. Actions only call `ctx.is_ready()` - they don't know about GangPlugin.
+Actions use Statement to accumulate allocations. Statement calls Plugin trait callbacks (`on_pipeline_executor`, `on_discard_executor`). BatchPlugin implements these callbacks to track pipelined count. Actions only call `ctx.is_ready()` - they don't know about BatchPlugin.
 
 **Compatibility:**
 - Fully backward compatible: `batch_size=1` (default) maintains existing behavior
@@ -196,7 +196,7 @@ Actions use Statement to accumulate allocations. Statement calls Plugin trait ca
 │  │                                                                   │  │
 │  │  plugins: HashMap<String, PluginPtr>                              │  │
 │  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐    │  │
-│  │  │ Priority + DRF  │  │   ShimPlugin    │  │   GangPlugin    │    │  │
+│  │  │ Priority + DRF  │  │   ShimPlugin    │  │   BatchPlugin    │    │  │
 │  │  │  (Plugin trait) │  │  (Plugin trait) │  │  (Plugin trait) │    │  │
 │  │  │                 │  │                 │  │                 │    │  │
 │  │  │ - is_underused  │  │ - is_available  │  │ - is_underused  │    │  │
@@ -255,7 +255,7 @@ Actions use Statement to accumulate allocations. Statement calls Plugin trait ca
 
 **Design Principle: Extend Existing Plugin Trait**
 
-The existing Plugin trait is extended with a single new method `is_ready()` for gang readiness checks. No other changes to the plugin machinery. GangPlugin implements this method alongside existing trait methods.
+The existing Plugin trait is extended with a single new method `is_ready()` for gang readiness checks. No other changes to the plugin machinery. BatchPlugin implements this method alongside existing trait methods.
 
 **1. Plugin Trait (session_manager/src/scheduler/plugins/mod.rs)**
 
@@ -323,23 +323,23 @@ impl PluginManager {
 }
 ```
 
-**3. GangPlugin (session_manager/src/scheduler/plugins/gang.rs)**
+**3. BatchPlugin (session_manager/src/scheduler/plugins/batch.rs)**
 
 Implements Plugin trait including `is_ready()`, `on_pipeline_executor()`, `on_discard_executor()`:
 
 ```rust
-pub struct GangPlugin {
-    ssn_state: HashMap<SessionID, GangState>,
+pub struct BatchPlugin {
+    ssn_state: HashMap<SessionID, BatchState>,
 }
 
-struct GangState {
+struct BatchState {
     batch_size: u32,
     allocated: u32,
     pipelined: u32,  // Count of reserved (but not committed) executors
     max_instances: Option<u32>,
 }
 
-impl Plugin for GangPlugin {
+impl Plugin for BatchPlugin {
     fn setup(&mut self, ss: &SnapShot) -> Result<(), FlameError> {
         self.ssn_state.clear();
         for ssn in ss.sessions.values() {
@@ -347,7 +347,7 @@ impl Plugin for GangPlugin {
                 .filter(|e| e.ssn_id.as_ref() == Some(&ssn.id))
                 .count() as u32;
             
-            self.ssn_state.insert(ssn.id.clone(), GangState {
+            self.ssn_state.insert(ssn.id.clone(), BatchState {
                 batch_size: ssn.batch_size.max(1),
                 allocated,
                 pipelined: 0,
@@ -434,7 +434,7 @@ impl Context {
 
 **5. Statement (session_manager/src/scheduler/statement.rs) - NEW**
 
-Statement accumulates pending allocations without committing them. It uses Plugin trait callbacks to notify plugins - actions are NOT aware of GangPlugin.
+Statement accumulates pending allocations without committing them. It uses Plugin trait callbacks to notify plugins - actions are NOT aware of BatchPlugin.
 
 ```rust
 pub struct Statement {
@@ -456,12 +456,12 @@ impl Statement {
     }
     
     /// Reserve resources for an executor (in-memory only, no actual creation)
-    /// Calls on_pipeline_executor callback - GangPlugin tracks pipelined count
+    /// Calls on_pipeline_executor callback - BatchPlugin tracks pipelined count
     pub fn pipeline(&mut self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Result<(), FlameError> {
         // Reserve `ssn.resreq` resources on node in snapshot
         self.ctx.snapshot.reserve(node, ssn)?;
         
-        // Notify plugins via callback (GangPlugin increments pipelined count)
+        // Notify plugins via callback (BatchPlugin increments pipelined count)
         self.ctx.plugins.on_pipeline_executor(node.clone(), ssn.clone())?;
         
         // Record operation for later commit/discard
@@ -482,14 +482,14 @@ impl Statement {
     }
     
     /// Discard all pending operations - release reserved resources
-    /// Calls on_discard_executor callback - GangPlugin decrements pipelined count
+    /// Calls on_discard_executor callback - BatchPlugin decrements pipelined count
     pub fn discard(self) -> Result<(), FlameError> {
         // Reverse order to properly unwind
         for op in self.operations.into_iter().rev() {
             // Release `ssn.resreq` resources on node
             self.ctx.snapshot.release(&op.node, &op.ssn)?;
             
-            // Notify plugins via callback (GangPlugin decrements pipelined count)
+            // Notify plugins via callback (BatchPlugin decrements pipelined count)
             self.ctx.plugins.on_discard_executor(op.node, op.ssn)?;
         }
         Ok(())
@@ -628,7 +628,7 @@ pub struct Executor {
 
 **Statement Pattern for Gang Scheduling:**
 
-The Statement pattern ensures executors are only created when a full batch can be scheduled. Actions use Statement without knowing about GangPlugin - all gang logic is in Plugin trait callbacks.
+The Statement pattern ensures executors are only created when a full batch can be scheduled. Actions use Statement without knowing about BatchPlugin - all gang logic is in Plugin trait callbacks.
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
@@ -643,31 +643,31 @@ The Statement pattern ensures executors are only created when a full batch can b
 │     │  stmt.pipeline(node, ssn)                               │    │
 │     │    → Reserves resources on node (in-memory)             │    │
 │     │    → Calls plugins.on_pipeline_executor()               │    │
-│     │      → GangPlugin increments pipelined count            │    │
+│     │      → BatchPlugin increments pipelined count            │    │
 │     │    → NO executor created yet                            │    │
 │     └─────────────────────────────────────────────────────────┘    │
 │                                                                    │
 │  3. Check Readiness (action doesn't know about gang)               │
 │     if ctx.is_ready(&ssn) {                                        │
 │         → plugins.is_ready() iterates all plugins                  │
-│         → GangPlugin checks: (allocated + pipelined) % batch == 0  │
+│         → BatchPlugin checks: (allocated + pipelined) % batch == 0  │
 │     }                                                              │
 │                                                                    │
 │  4a. READY → Commit All                                            │
 │      stmt.commit()                                                 │
 │        → for each op: create_executor()                            │
-│        → on_create_executor() → GangPlugin clears pipelined        │
+│        → on_create_executor() → BatchPlugin clears pipelined        │
 │                                                                    │
 │  4b. NOT READY → Discard All                                       │
 │      stmt.discard()                                                │
 │        → for each op (reverse): release resources                  │
 │        → Calls plugins.on_discard_executor()                       │
-│          → GangPlugin decrements pipelined count                   │
+│          → BatchPlugin decrements pipelined count                   │
 │                                                                    │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-**AllocateAction with Statement Pattern (no GangPlugin awareness):**
+**AllocateAction with Statement Pattern (no BatchPlugin awareness):**
 
 ```rust
 // session_manager/src/scheduler/actions/allocate.rs
@@ -692,7 +692,7 @@ async fn execute(&self, ctx: &mut Context) -> Result<(), FlameError> {
             // Reserve resources - plugins notified via on_pipeline_executor
             stmt.pipeline(node, &ssn)?;
             
-            // Check if ready - GangPlugin checks pipelined >= batch_size
+            // Check if ready - BatchPlugin checks pipelined >= batch_size
             if ctx.is_ready(&ssn)? {
                 // Commit: create all executors
                 stmt.commit().await?;
@@ -876,7 +876,7 @@ for worker_id in range(8):
 | `on_discard_executor` | Gang | **NEW**: Track discarded executor |
 
 **Implementation References:**
-- `session_manager/src/scheduler/plugins/gang.rs` - GangPlugin implementation
+- `session_manager/src/scheduler/plugins/batch.rs` - BatchPlugin implementation
 - `session_manager/src/scheduler/plugins/mod.rs` - Plugin trait and PluginManager
 - `common/src/apis/types.rs` - Session and Task definitions
 - `session_manager/src/scheduler/actions/` - Scheduler actions
@@ -886,7 +886,7 @@ for worker_id in range(8):
 
 ## Design Decisions
 
-1. **Extend Plugin trait with `is_ready`**: The existing Plugin trait is extended with a single `is_ready()` method. GangPlugin implements this to check if enough resources are pipelined for a complete batch.
+1. **Extend Plugin trait with `is_ready`**: The existing Plugin trait is extended with a single `is_ready()` method. BatchPlugin implements this to check if enough resources are pipelined for a complete batch.
 
 2. **Statement pattern for batch allocation**: Executors are NOT created until a full batch can be scheduled. The Statement accumulates pending allocations (pipeline), checks gang readiness via `is_ready()`, then either commits all (creates executors) or discards all (releases reservations).
 

@@ -101,7 +101,7 @@ enum Commands {
         /// The name of Application
         #[arg(short, long)]
         app: String,
-        /// Number of executors per batch for gang scheduling
+        /// Number of executors per batch for batch scheduling
         #[arg(short, long, default_value = "1")]
         batch_size: u32,
         /// Session priority (higher = more important, default: 0)

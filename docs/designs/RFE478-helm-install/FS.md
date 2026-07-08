@@ -102,7 +102,6 @@ cluster:
   policies:
     - priority
     - drf
-    - gang
   scheduleInterval: 100
   storage: "sqlite:///var/lib/flame/session/flame.db"
   executors:
@@ -212,7 +211,6 @@ cluster:
   policies:
     - priority
     - drf
-    - gang
   storage: "sqlite:///var/lib/flame/session/flame.db"
   schedule_interval: 100
   executors:

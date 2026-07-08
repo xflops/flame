@@ -24,7 +24,7 @@ use common::apis::ExecutorState;
 use common::FlameError;
 
 /// One scheduling cycle: a single `Context` (one [`PluginManager::setup`] on the current
-/// snapshot) is shared by Allocate → Dispatch → Shuffle. In-memory plugin counters (e.g. Gang)
+/// snapshot) is shared by Allocate → Dispatch → Shuffle. In-memory plugin counters (e.g. Batch)
 /// accumulate across those actions; do not re-run `setup` between them.
 pub struct Context {
     pub snapshot: SnapShotPtr,

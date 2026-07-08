@@ -107,7 +107,7 @@ message SessionSpec {
 | `common_data` | bytes | Data shared across all tasks (optional) |
 | `min_instances` | uint32 | Minimum executor instances (default: 0) |
 | `max_instances` | uint32 | Maximum executor instances (optional, unlimited if not set) |
-| `batch_size` | uint32 | Executors per batch for gang scheduling (default: 1) |
+| `batch_size` | uint32 | Executors per batch for batch scheduling (default: 1) |
 | `priority` | uint32 | Session priority; higher = more important (default: 0) |
 | `resreq` | ResourceRequirement | Per-task resource request (optional); when absent, the server applies `cluster.resreq`, with a hardcoded `cpu=1,mem=1g,gpu=0` fallback. |
 
