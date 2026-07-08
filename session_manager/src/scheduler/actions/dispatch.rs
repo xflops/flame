@@ -65,7 +65,7 @@ impl Action for DispatchAction {
                 continue;
             }
 
-            if ctx.is_ready(&ssn, false)? {
+            if ctx.is_ready(&ssn)? {
                 tracing::debug!("Session <{}> is already ready, skip dispatch.", ssn.id);
                 continue;
             }
@@ -80,13 +80,13 @@ impl Action for DispatchAction {
             for (_, exec) in idle_executors.iter() {
                 if ctx.is_available(exec, &ssn)? {
                     stmt.bind(exec, &ssn)?;
-                    if ctx.is_ready(&ssn, !stmt.is_empty())? {
+                    if ctx.is_ready(&ssn)? {
                         break;
                     }
                 }
             }
 
-            let ready = ctx.is_ready(&ssn, !stmt.is_empty())?;
+            let ready = ctx.is_ready(&ssn)?;
             if !stmt.is_empty() && ready {
                 tracing::debug!("Bind executor for session <{}>.", ssn.id);
                 let bound_ids = stmt.commit().await?;

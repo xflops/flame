@@ -116,7 +116,7 @@ impl Action for AllocateAction {
                 }
             }
 
-            if ctx.is_fulfilled(&ssn, false)? {
+            if ctx.is_fulfilled(&ssn)? {
                 tracing::debug!(
                     "Skip allocate resources for session <{}>: is_fulfilled=true",
                     ssn.id,
@@ -136,14 +136,14 @@ impl Action for AllocateAction {
 
             for exec in &pipelineable {
                 stmt.pipeline(exec, &ssn)?;
-                if ctx.is_fulfilled(&ssn, !stmt.is_empty())? {
+                if ctx.is_fulfilled(&ssn)? {
                     break;
                 }
             }
 
             'nodes: for node in nodes.iter() {
                 loop {
-                    if ctx.is_fulfilled(&ssn, !stmt.is_empty())? {
+                    if ctx.is_fulfilled(&ssn)? {
                         break 'nodes;
                     }
                     if !ctx.is_allocatable(node, &ssn)? {
@@ -153,7 +153,7 @@ impl Action for AllocateAction {
                 }
             }
 
-            let fulfilled = ctx.is_fulfilled(&ssn, !stmt.is_empty())?;
+            let fulfilled = ctx.is_fulfilled(&ssn)?;
             if !stmt.is_empty() && fulfilled {
                 let op_count = stmt.len();
                 let pipelined_ids = stmt.commit().await?;

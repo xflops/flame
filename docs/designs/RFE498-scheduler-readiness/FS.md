@@ -27,7 +27,6 @@ This design targets the tree after merged #508. It keeps `is_ready` / `is_fulfil
 
 | Problem | Symptom | Root cause |
 |---------|---------|------------|
-| Non-gang starvation | DRF-only or priority-only sessions never allocate or bind | No plugin returns a readiness opinion, but `PluginManager` collapses `None` to `true` before an operation is attempted. |
 | Gang under-provision | Only one executor is created for multiple incomplete tasks | Modulo readiness becomes true at every batch multiple instead of at the session's demand target. |
 | Duplicate dispatch/binding | Extra executors are selected while one is already in `Binding` | Dispatch has no ready pre-check, and old readiness requires a new bind in the current cycle. |
 | Duplicate allocation | An additional batch can be created after demand is already met | Old fulfillment requires a new pipeline/allocation operation before it can be true. |
@@ -35,7 +34,7 @@ This design targets the tree after merged #508. It keeps `is_ready` / `is_fulfil
 
 ### Objectives
 
-1. Fix #498 and the scheduler regressions described by #500.
+1. Fix #498 and the gang demand regressions described by #500 while treating an all-abstaining policy set as already satisfied.
 2. Preserve `Context::is_ready` for Dispatch and `Context::is_fulfilled` for Allocate.
 3. Keep `Option<bool>` inside plugins, while PluginManager and Context return a concrete `bool` after ignoring abstaining plugins.
 4. Reuse only `GangState.batch_size`, `allocated`, `pipelined`, and `bound`; derive task demand and caps from the supplied `SessionInfo`.
@@ -51,7 +50,7 @@ No new configuration is introduced.
 
 | Field | Role |
 |-------|------|
-| `cluster.policies` | Loading `gang` enables absolute batch readiness; without it, actions make one operation of progress per cycle. |
+| `cluster.policies` | Loading `gang` enables absolute batch readiness; if every configured plugin abstains, the action is already satisfied. |
 | `session.batch_size` | Gang batch width, normalized with `max(1)`. |
 | `session.max_instances` | Hard upper bound for gang allocation demand. |
 
@@ -63,11 +62,9 @@ No new method is added. The existing methods retain their names and delegate to 
 
 ```rust
 impl Context {
-    pub fn is_ready(&self, ssn: &SessionInfoPtr, has_progress: bool)
-        -> Result<bool, FlameError>;
+    pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError>;
 
-    pub fn is_fulfilled(&self, ssn: &SessionInfoPtr, has_progress: bool)
-        -> Result<bool, FlameError>;
+    pub fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError>;
 }
 ```
 
@@ -76,18 +73,17 @@ The existing `Plugin::is_ready` / `Plugin::is_fulfilled` methods remain optional
 | Plugin opinions | Context result |
 |-----------------|----------------|
 | One or more concrete opinions | `true` only when every concrete opinion is `true`; `None` opinions are ignored. |
-| Every plugin returns `None` | `has_progress`: false before the first Statement operation and true afterward. |
+| Every plugin returns `None` | `true`; no configured plugin requires more work from the action. |
 
-The `has_progress` fallback gives non-gang sessions one operation per action per cycle without adding PluginManager counters or exposing an optional Context result.
+This keeps abstention inside the Plugin API while exposing a simple boolean contract to Context and actions.
 
 ### Action contract
 
 **AllocateAction**
 
-1. Before creating a `Statement`, call `is_fulfilled(session, false)` and skip only when it returns true.
+1. Before creating a `Statement`, call `is_fulfilled(session)` and skip when it returns true.
 2. Consider existing Void and Idle executors before creating a new executor. Record selected reusable executors through the existing pipeline operation so Gang's existing `pipelined` field reflects them.
 3. After each operation:
-   - pass `!stmt.is_empty()` as `has_progress`;
    - stop when `is_fulfilled` returns true;
    - continue when it returns false.
 4. Commit a non-empty statement when fulfillment is true; discard a non-empty false statement as an incomplete gang batch.
@@ -95,10 +91,9 @@ The `has_progress` fallback gives non-gang sessions one operation per action per
 **DispatchAction**
 
 1. Runs after Allocate in the same `Context`.
-2. Before creating a `Statement`, call `is_ready(session, false)` and skip only when it returns true.
+2. Before creating a `Statement`, call `is_ready(session)` and skip when it returns true.
 3. Bind available idle executors.
 4. After each bind:
-   - pass `!stmt.is_empty()` as `has_progress`;
    - stop when `is_ready` returns true;
    - continue when it returns false.
 5. Commit a non-empty statement when readiness is true; discard a non-empty false statement as an incomplete gang batch.
@@ -109,15 +104,13 @@ All three actions share one `Context` and PluginManager for the cycle. Allocate'
 
 An Idle pipeline reservation updates Gang fulfillment only. Priority and DRF do not charge an Idle executor during Allocate because it already exists and consumes node resources; they assign its session share when Dispatch actually binds it. This prevents the reservation from making Dispatch incorrectly consider the session no longer underused.
 
-`Statement::is_empty()` supplies `has_progress`, distinguishing “no non-gang progress yet” from “one operation has been recorded.” No per-session non-gang counter is needed.
-
 ### Scope
 
 **In scope**
 
 - Keep optional opinions inside plugins and return resolved booleans from PluginManager and Context
 - Set the cycle order to Allocate → Dispatch → Shuffle
-- Update Allocate and Dispatch to pass existing Statement progress into the resolved boolean checks
+- Update Allocate and Dispatch to use the resolved boolean checks without a progress argument
 - Correct Gang formulas using existing state fields plus `SessionInfo`
 - Include reusable Void/Idle executors in Allocate's fulfillment calculation through existing Statement pipeline operations
 - Add Dispatch's pre-session `is_ready` guard
@@ -214,7 +207,7 @@ Allocate runs first and skips because `is_fulfilled` is satisfied by the snapsho
 
 ### UC2: Priority-only session
 
-Without a gang opinion, both Context methods return `has_progress`. Allocate records one fulfillment operation and commits; Dispatch then records one readiness operation and commits. The session makes one unit of progress per action per cycle.
+Priority does not own readiness or fulfillment, so it returns `None` for both. With no concrete plugin opinion, both Context methods return true and Allocate/Dispatch perform no operation. The default `priority + gang` configuration supplies Gang's concrete demand decision.
 
 ### UC3: Gang batch_size=1 with three tasks
 
@@ -240,9 +233,9 @@ needed = 4
 
 Allocate stops at four total associated/speculative executors. The fulfillment target itself prevents a fifth operation inside the loop.
 
-### UC6: Dispatch without gang
+### UC6: Dispatch with reusable Idle supply
 
-An idle executor has no session ID. Allocate first includes it as reusable supply rather than creating another executor. Dispatch then records one bind; with no plugin opinion, `has_progress=true` makes `is_ready` true, so the Statement commits and the executor transitions from `Idle` to `Binding`.
+With Gang enabled, an idle executor has no session ID. Allocate first includes it as reusable supply rather than creating another executor. Gang's fulfillment becomes true, and Dispatch then records one bind. Gang's readiness becomes true, so the Statement commits and the executor transitions from `Idle` to `Binding`.
 
 ---
 
@@ -263,16 +256,14 @@ An idle executor has no session ID. Allocate first includes it as reusable suppl
 
 ### PluginManager tests
 
-- No plugin opinion returns false with `has_progress=false` and true with `has_progress=true`
-- One `Some(false)` opinion returns false regardless of `has_progress`
+- No plugin opinion returns true
+- One `Some(false)` opinion returns false
 - All concrete opinions true returns true
 - Mixed true and false opinions return false
 
 ### Scheduler integration tests
 
-- DRF-only and priority-only sessions allocate an executor
-- Non-gang Allocate records at most one operation per session per cycle
-- Non-gang Dispatch binds one idle executor
+- DRF-only and priority-only sessions perform no allocation when every plugin abstains
 - Allocate does not create an executor when sufficient compatible Void/Idle supply already exists
 - Gang `batch_size=1` allocates one executor per incomplete task
 - Gang `batch_size=2` commits only complete batches
@@ -294,14 +285,14 @@ An idle executor has no session ID. Allocate first includes it as reusable suppl
 
 1. Start from merged #508, which establishes the pre-#500 implementation baseline.
 2. Restore the shared `SHIMS_TEST_LOCK`, `priority + gang` defaults, DRF opt-in configuration, and harmless explicit `shim` handling.
-3. Keep optional opinions in the Plugin trait; resolve them to boolean in existing PluginManager and Context methods using Statement progress when every plugin abstains.
+3. Keep optional opinions in the Plugin trait; resolve them to boolean in existing PluginManager and Context methods, returning true when every plugin abstains.
 4. Set and test the action sequence as Allocate → Dispatch → Shuffle, with one shared Context and PluginManager.
-5. Update Allocate to use boolean `is_fulfilled`, include Void/Idle supply, and pass Statement progress.
-6. Update Dispatch to use boolean `is_ready` and pass Statement progress.
+5. Update Allocate to use boolean `is_fulfilled` and include Void/Idle supply.
+6. Update Dispatch to use boolean `is_ready`.
 7. Replace Gang's modulo checks with the derived, max-capped absolute target using only existing fields.
 8. Close #498 only after the two-cycle Binding-stall integration test passes.
 
-**Compatibility:** No scheduler method or state field is added. Context continues to return boolean readiness/fulfillment; its existing methods accept Statement progress so PluginManager can resolve the all-plugins-abstain case without counters. The action order changes from the post-#508 baseline's Dispatch → Allocate → Shuffle to Allocate → Dispatch → Shuffle. An executor created by Allocate is not eligible for Dispatch until it registers and appears as Idle in a later cycle. Explicit policy lists remain valid. Clusters that relied on implicit DRF must add `drf` explicitly when the default returns to `priority + gang`.
+**Compatibility:** No scheduler method or state field is added. Context returns boolean readiness/fulfillment without a progress argument; an all-abstaining plugin set resolves to true. The action order changes from the post-#508 baseline's Dispatch → Allocate → Shuffle to Allocate → Dispatch → Shuffle. An executor created by Allocate is not eligible for Dispatch until it registers and appears as Idle in a later cycle. Explicit policy lists remain valid, but readiness-dependent work requires a policy such as Gang that supplies a concrete opinion. Clusters that relied on implicit DRF must add `drf` explicitly when the default returns to `priority + gang`.
 
 **Rollback:** Revert this replacement on top of #508. This restores the pre-#500 optional plugin API and modulo behavior without a data migration.
 
@@ -312,11 +303,11 @@ An idle executor has no session ID. Allocate first includes it as reusable suppl
 | File | Change |
 |------|--------|
 | `session_manager/src/scheduler/plugins/gang.rs` | Change formulas only; keep the existing struct fields and callbacks. |
-| `session_manager/src/scheduler/plugins/mod.rs` | Ignore abstaining plugins and resolve the all-`None` case from Statement progress; add no counter or field. |
+| `session_manager/src/scheduler/plugins/mod.rs` | Ignore abstaining plugins and resolve the all-`None` case to true; add no counter or field. |
 | `session_manager/src/scheduler/plugins/priority.rs`, `drf.rs` | Defer Idle-executor session accounting until Dispatch binds it. |
 | `session_manager/src/scheduler/ctx.rs` | Return resolved booleans from the existing methods. |
-| `session_manager/src/scheduler/actions/allocate.rs` | Use `is_fulfilled`, consume reusable Void/Idle supply first, and pass Statement progress for the no-opinion fallback. |
-| `session_manager/src/scheduler/actions/dispatch.rs` | Use `is_ready`, add the pre-check, and pass Statement progress for the no-opinion fallback. |
+| `session_manager/src/scheduler/actions/allocate.rs` | Use `is_fulfilled` and consume reusable Void/Idle supply first. |
+| `session_manager/src/scheduler/actions/dispatch.rs` | Use `is_ready` and add the pre-check. |
 | `common/src/ctx.rs`, `flmadm/src/managers/config.rs` | Restore `priority + gang` defaults and DRF opt-in. |
 | `executor_manager/src/shims/` | Restore the process-wide test lock. |
 

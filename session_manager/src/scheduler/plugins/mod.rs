@@ -341,8 +341,8 @@ impl PluginManager {
     }
 
     /// Returns the conjunction of plugin readiness opinions. Plugins returning `None` are skipped;
-    /// if every plugin abstains, the caller's in-Statement progress is the fallback.
-    pub fn is_ready(&self, ssn: &SessionInfoPtr, has_progress: bool) -> Result<bool, FlameError> {
+    /// if every plugin abstains, the session is considered ready.
+    pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
         let plugins = lock_ptr!(self.plugins)?;
         let mut result = None;
         for (_, plugin) in plugins.iter() {
@@ -350,16 +350,12 @@ impl PluginManager {
                 result = Some(result.unwrap_or(true) && ready);
             }
         }
-        Ok(result.unwrap_or(has_progress))
+        Ok(result.unwrap_or(true))
     }
 
     /// Returns the conjunction of plugin fulfillment opinions. Plugins returning `None` are
-    /// skipped; if every plugin abstains, the caller's in-Statement progress is the fallback.
-    pub fn is_fulfilled(
-        &self,
-        ssn: &SessionInfoPtr,
-        has_progress: bool,
-    ) -> Result<bool, FlameError> {
+    /// skipped; if every plugin abstains, the session is considered fulfilled.
+    pub fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
         let plugins = lock_ptr!(self.plugins)?;
         let mut result = None;
         for (_, plugin) in plugins.iter() {
@@ -367,7 +363,7 @@ impl PluginManager {
                 result = Some(result.unwrap_or(true) && fulfilled);
             }
         }
-        Ok(result.unwrap_or(has_progress))
+        Ok(result.unwrap_or(true))
     }
 
     pub fn on_executor_pipeline(
@@ -558,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn test_readiness_has_no_opinion_without_gang() {
+    fn test_readiness_defaults_true_without_plugin_opinion() {
         let ss = SnapShot::new();
         let ssn = Arc::new(SessionInfo {
             id: "ssn-no-gang".to_string(),
@@ -568,10 +564,8 @@ mod tests {
         ss.add_session(ssn.clone()).unwrap();
 
         let plugins = PluginManager::setup(&ss, &["priority".to_string()]).unwrap();
-        assert!(!plugins.is_ready(&ssn, false).unwrap());
-        assert!(plugins.is_ready(&ssn, true).unwrap());
-        assert!(!plugins.is_fulfilled(&ssn, false).unwrap());
-        assert!(plugins.is_fulfilled(&ssn, true).unwrap());
+        assert!(plugins.is_ready(&ssn).unwrap());
+        assert!(plugins.is_fulfilled(&ssn).unwrap());
     }
 
     #[test]

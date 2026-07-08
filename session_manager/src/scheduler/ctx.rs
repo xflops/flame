@@ -75,19 +75,15 @@ impl Context {
     }
 
     /// Dispatch-side readiness: enough executors are associated with the session or selected by
-    /// speculative bind operations. If no plugin has an opinion, `has_progress` is the result.
-    pub fn is_ready(&self, ssn: &SessionInfoPtr, has_progress: bool) -> Result<bool, FlameError> {
-        self.plugins.is_ready(ssn, has_progress)
+    /// speculative bind operations. If no plugin has an opinion, the session is considered ready.
+    pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
+        self.plugins.is_ready(ssn)
     }
 
     /// Allocate-side fulfillment: enough associated, reusable, or speculative executors exist
-    /// for the session. If no plugin has an opinion, `has_progress` is the result.
-    pub fn is_fulfilled(
-        &self,
-        ssn: &SessionInfoPtr,
-        has_progress: bool,
-    ) -> Result<bool, FlameError> {
-        self.plugins.is_fulfilled(ssn, has_progress)
+    /// for the session. If no plugin has an opinion, the session is considered fulfilled.
+    pub fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
+        self.plugins.is_fulfilled(ssn)
     }
 
     pub async fn bind_session(

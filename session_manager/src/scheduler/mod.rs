@@ -376,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn test_priority_only_policy_allocates_one_executor() -> Result<(), FlameError> {
+    fn test_priority_only_policy_abstains_from_allocation() -> Result<(), FlameError> {
         let env = TestEnv::new()?;
         let controller = env.controller.clone();
         let ssn_id = format!("priority-only-{}", Uuid::new_v4());
@@ -384,22 +384,21 @@ mod tests {
 
         let policies = vec!["priority".to_string()];
         let mut ctx = Context::new(controller.clone(), &policies)?;
-        assert!(!ctx.is_fulfilled(
+        assert!(ctx.is_fulfilled(
             ctx.snapshot
                 .find_sessions(OPEN_SESSION)?
                 .values()
                 .next()
                 .unwrap(),
-            false,
         )?);
 
         tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
-        assert_eq!(controller.list_executor()?.len(), 1);
+        assert!(controller.list_executor()?.is_empty());
         Ok(())
     }
 
     #[test]
-    fn test_drf_only_policy_allocates_one_executor() -> Result<(), FlameError> {
+    fn test_drf_only_policy_abstains_from_allocation() -> Result<(), FlameError> {
         let env = TestEnv::new()?;
         let controller = env.controller.clone();
         let ssn_id = format!("drf-only-{}", Uuid::new_v4());
@@ -408,8 +407,7 @@ mod tests {
         let policies = vec!["drf".to_string()];
         let mut ctx = Context::new(controller.clone(), &policies)?;
         tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
-
-        assert_eq!(controller.list_executor()?.len(), 1);
+        assert!(controller.list_executor()?.is_empty());
         Ok(())
     }
 
@@ -487,8 +485,8 @@ mod tests {
                 .next()
                 .cloned()
                 .expect("test session must exist");
-            assert!(ctx.is_fulfilled(&ssn, false)?);
-            assert!(ctx.is_ready(&ssn, false)?);
+            assert!(ctx.is_fulfilled(&ssn)?);
+            assert!(ctx.is_ready(&ssn)?);
             for action in ctx.actions.clone() {
                 tokio_test::block_on(action.execute(&mut ctx))?;
             }
