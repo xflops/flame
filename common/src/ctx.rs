@@ -27,9 +27,10 @@ const DEFAULT_FLAME_CONF: &str = "flame-cluster.yaml";
 const DEFAULT_CONTEXT_NAME: &str = "flame";
 const DEFAULT_FLAME_ENDPOINT: &str = "http://127.0.0.1:8080";
 /// Default policies to enable when none specified in config.
-/// Available configurable policies: "priority", "drf", "gang"
-/// Note: "shim" plugin is always enabled (required for executor matching)
-pub const DEFAULT_POLICIES: &[&str] = &["priority", "drf", "gang"];
+///
+/// Effective default scheduler stack: `priority + gang + shim`.
+/// `shim` is always enabled, while DRF remains available as an opt-in policy.
+pub const DEFAULT_POLICIES: &[&str] = &["priority", "gang"];
 const DEFAULT_STORAGE: &str = "sqlite://flame.db";
 const DEFAULT_MAX_EXECUTORS_PER_NODE: u32 = 128;
 pub const DEFAULT_SESSION_RETRY_LIMITS: u32 = 5;
@@ -596,6 +597,15 @@ impl TryFrom<FlameEvictionYaml> for FlameEviction {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_default_scheduler_policies() {
+        assert_eq!(DEFAULT_POLICIES, &["priority", "gang"]);
+        assert_eq!(
+            FlameCluster::default().policies,
+            vec!["priority".to_string(), "gang".to_string()]
+        );
+    }
 
     #[test]
     fn test_flame_context_from_file() -> Result<(), FlameError> {

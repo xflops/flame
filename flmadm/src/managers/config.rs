@@ -44,7 +44,6 @@ cluster:
   resreq: "cpu=1,mem=2g"
   policies:
     - priority
-    - drf
     - gang
   storage: "fs://{prefix}/data"
   executors:

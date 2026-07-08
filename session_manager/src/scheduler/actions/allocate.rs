@@ -16,7 +16,7 @@ use std::sync::Arc;
 use stdng::collections::{BinaryHeap, Cmp};
 use stdng::{logs::TraceFn, trace_fn};
 
-use crate::model::{ALL_NODE, READY_SESSION, UNBINDING_EXECUTOR, VOID_EXECUTOR};
+use crate::model::{ALL_NODE, IDLE_EXECUTOR, READY_SESSION, UNBINDING_EXECUTOR, VOID_EXECUTOR};
 use crate::scheduler::actions::{Action, ActionPtr};
 use crate::scheduler::plugins::node_order_fn;
 use crate::scheduler::plugins::ssn_order_fn;
@@ -61,11 +61,13 @@ impl Action for AllocateAction {
 
         let mut void_executors = ss.find_executors(VOID_EXECUTOR)?;
         let mut unbinding_executors = ss.find_executors(UNBINDING_EXECUTOR)?;
+        let mut idle_executors = ss.find_executors(IDLE_EXECUTOR)?;
 
         tracing::debug!(
-            "AllocateAction: {} void executors, {} unbinding executors",
+            "AllocateAction: {} void executors, {} unbinding executors, {} idle executors",
             void_executors.len(),
-            unbinding_executors.len()
+            unbinding_executors.len(),
+            idle_executors.len()
         );
 
         let node_order_fn = node_order_fn(ctx);
@@ -114,55 +116,54 @@ impl Action for AllocateAction {
                 }
             }
 
-            // Dispatch runs first in this cycle. `PluginManager` is not re-setup between actions
-            // (see `Context`): Gang's counters include binds Dispatch committed via
-            // `Statement` in this same `Context`. If those already satisfy gang scheduling, do not
-            // create more executors here.
-            let fulfilled = ctx.is_fulfilled(&ssn)?;
-            let ready = ctx.is_ready(&ssn)?;
-            if fulfilled || ready {
+            if ctx.is_fulfilled(&ssn, false)? {
                 tracing::debug!(
-                    "Skip allocate resources for session <{}>: is_fulfilled={}, is_ready={}",
+                    "Skip allocate resources for session <{}>: is_fulfilled=true",
                     ssn.id,
-                    fulfilled,
-                    ready
                 );
                 continue;
             }
 
             let mut stmt = Statement::new(ss.clone(), ctx.plugins.clone(), ctx.controller.clone());
 
-            let pipelineable = void_executors
+            let pipelineable: Vec<_> = void_executors
                 .values()
                 .chain(unbinding_executors.values())
-                .filter(|e| ctx.is_available(e, &ssn).unwrap_or(false));
+                .chain(idle_executors.values())
+                .filter(|e| ctx.is_available(e, &ssn).unwrap_or(false))
+                .cloned()
+                .collect();
 
-            for exec in pipelineable {
+            for exec in &pipelineable {
                 stmt.pipeline(exec, &ssn)?;
-                if ctx.is_ready(&ssn)? {
+                if ctx.is_fulfilled(&ssn, !stmt.is_empty())? {
                     break;
                 }
             }
 
-            for node in nodes.iter() {
-                if ctx.is_ready(&ssn)? {
-                    break;
-                }
-                while ctx.is_allocatable(node, &ssn)? && !ctx.is_ready(&ssn)? {
+            'nodes: for node in nodes.iter() {
+                loop {
+                    if ctx.is_fulfilled(&ssn, !stmt.is_empty())? {
+                        break 'nodes;
+                    }
+                    if !ctx.is_allocatable(node, &ssn)? {
+                        break;
+                    }
                     stmt.allocate(node, &ssn)?;
                 }
             }
 
-            if ctx.is_ready(&ssn)? {
+            let fulfilled = ctx.is_fulfilled(&ssn, !stmt.is_empty())?;
+            if !stmt.is_empty() && fulfilled {
                 let op_count = stmt.len();
                 let pipelined_ids = stmt.commit().await?;
                 for id in &pipelined_ids {
                     void_executors.remove(id);
                     unbinding_executors.remove(id);
+                    idle_executors.remove(id);
                 }
                 tracing::debug!("Committed {} op(s) for session <{}>", op_count, ssn.id);
                 nodes.sort_by(|a, b| node_order_fn.cmp(a, b));
-                open_ssns.push(ssn.clone());
             } else if !stmt.is_empty() {
                 tracing::debug!(
                     "Discarding incomplete batch for session <{}>: not enough resources",

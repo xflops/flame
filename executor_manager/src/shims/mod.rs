@@ -225,15 +225,16 @@ pub trait Shim: Send + 'static {
     async fn on_session_leave(&mut self) -> Result<(), FlameError>;
 }
 
+/// Process-wide lock for shim tests that mutate environment variables and the working directory.
+#[cfg(test)]
+pub(crate) static SHIMS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::fs::File;
-    use std::sync::Mutex;
     use tempfile::tempdir;
-
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn create_test_app(name: &str, working_directory: Option<String>) -> ApplicationContext {
         ApplicationContext {
@@ -259,7 +260,7 @@ mod tests {
 
     #[test]
     fn test_executor_work_dir_with_auto_dir() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = SHIMS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().unwrap();
         let socket_dir = setup_test_env(&temp);
 
@@ -280,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_executor_work_dir_with_custom_working_directory() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = SHIMS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().unwrap();
         let socket_dir = setup_test_env(&temp);
         let custom_dir = temp.path().join("custom-workdir");
@@ -301,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_executor_work_dir_socket_path_length() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = SHIMS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().unwrap();
         setup_test_env(&temp);
 
@@ -321,7 +322,7 @@ mod tests {
 
     #[test]
     fn test_executor_work_dir_cleanup_on_drop() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = SHIMS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().unwrap();
         setup_test_env(&temp);
 
@@ -355,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_executor_work_dir_no_cleanup_custom_dir_on_drop() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = SHIMS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().unwrap();
         setup_test_env(&temp);
         let custom_dir = temp.path().join("persistent-workdir");
@@ -382,7 +383,7 @@ mod tests {
 
     #[test]
     fn test_socket_path_is_fixed_location() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = SHIMS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().unwrap();
         let socket_dir = setup_test_env(&temp);
 

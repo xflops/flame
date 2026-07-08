@@ -14,7 +14,7 @@ limitations under the License.
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use common::apis::{ResourceRequirement, SessionID, TaskState};
+use common::apis::{ExecutorState, ResourceRequirement, SessionID, TaskState};
 use common::FlameError;
 
 use crate::model::{
@@ -334,7 +334,12 @@ impl Plugin for PriorityPlugin {
         }
     }
 
-    fn on_executor_pipeline(&mut self, _exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
+    fn on_executor_pipeline(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
+        // Idle executors are existing reusable supply. Allocate reserves them for Gang
+        // fulfillment, but Priority accounts them only when Dispatch actually binds them.
+        if exec.state == ExecutorState::Idle {
+            return;
+        }
         let unit = match self.ssn_unit.get(&ssn.id) {
             Some(u) => u.clone(),
             None => return,
@@ -344,7 +349,10 @@ impl Plugin for PriorityPlugin {
         }
     }
 
-    fn on_executor_discard(&mut self, _exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
+    fn on_executor_discard(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
+        if exec.state == ExecutorState::Idle {
+            return;
+        }
         let unit = match self.ssn_unit.get(&ssn.id) {
             Some(u) => u.clone(),
             None => return,

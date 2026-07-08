@@ -125,6 +125,41 @@ mod tests {
         }
     }
 
+    fn setup_test_session(
+        controller: &ControllerPtr,
+        ssn_id: &str,
+        batch_size: u32,
+        max_instances: Option<u32>,
+        task_count: usize,
+    ) -> Result<(), FlameError> {
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        tokio_test::block_on(
+            controller
+                .storage()
+                .register_node(&new_test_node("node_1".to_string())),
+        )?;
+        tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+            id: ssn_id.to_string(),
+            application: "flmtest".to_string(),
+            common_data: None,
+            min_instances: 0,
+            max_instances,
+            batch_size,
+            priority: 0,
+            resreq: Some(common::apis::ResourceRequirement {
+                cpu: 1,
+                memory: 1024 * 1024 * 1024,
+                gpu: 0,
+            }),
+        }))?;
+        for _ in 0..task_count {
+            tokio_test::block_on(controller.create_task(ssn_id.to_string(), None))?;
+        }
+        Ok(())
+    }
+
     struct TestEnv {
         url: String,
         pub controller: ControllerPtr,
@@ -175,7 +210,7 @@ mod tests {
         }
     }
 
-    /// Test the allocation of void executors to underused sessions.
+    /// Allocate enough executors for all incomplete tasks and avoid duplicates in later cycles.
     #[test]
     fn test_allocate_executors() -> Result<(), FlameError> {
         let env = TestEnv::new()?;
@@ -229,11 +264,11 @@ mod tests {
                 actions: vec![],
             };
 
-            let dispatch = DispatchAction::new_ptr();
-            tokio_test::block_on(dispatch.execute(&mut ctx))?;
-
             let alloc = AllocateAction::new_ptr();
             tokio_test::block_on(alloc.execute(&mut ctx))?;
+
+            let dispatch = DispatchAction::new_ptr();
+            tokio_test::block_on(dispatch.execute(&mut ctx))?;
 
             let ssn_list = snapshot.find_sessions(OPEN_SESSION)?;
             assert_eq!(ssn_list.len(), 1);
@@ -244,14 +279,14 @@ mod tests {
             assert_eq!(node_list.values().next().unwrap().name, "node_1");
 
             let exec_list = controller.list_executor()?;
-            assert_eq!(exec_list.len(), 1);
+            assert_eq!(exec_list.len(), task_num);
         }
 
         Ok(())
     }
 
     /// One scheduling cycle must keep the same in-memory [`crate::scheduler::plugins::PluginManager`]
-    /// so Gang (and similar) state from Dispatch is visible to Allocate.
+    /// across Allocate, Dispatch, and Shuffle.
     #[test]
     fn test_scheduler_cycle_reuses_plugin_manager_across_actions() -> Result<(), FlameError> {
         let env = TestEnv::new()?;
@@ -337,6 +372,132 @@ mod tests {
         assert_eq!(executors[0].state, common::apis::ExecutorState::Idle);
         assert_eq!(executors[0].ssn_id, None);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_priority_only_policy_allocates_one_executor() -> Result<(), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        let ssn_id = format!("priority-only-{}", Uuid::new_v4());
+        setup_test_session(&controller, &ssn_id, 1, None, 3)?;
+
+        let policies = vec!["priority".to_string()];
+        let mut ctx = Context::new(controller.clone(), &policies)?;
+        assert!(!ctx.is_fulfilled(
+            ctx.snapshot
+                .find_sessions(OPEN_SESSION)?
+                .values()
+                .next()
+                .unwrap(),
+            false,
+        )?);
+
+        tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
+        assert_eq!(controller.list_executor()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_drf_only_policy_allocates_one_executor() -> Result<(), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        let ssn_id = format!("drf-only-{}", Uuid::new_v4());
+        setup_test_session(&controller, &ssn_id, 1, None, 3)?;
+
+        let policies = vec!["drf".to_string()];
+        let mut ctx = Context::new(controller.clone(), &policies)?;
+        tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
+
+        assert_eq!(controller.list_executor()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gang_allocates_for_all_incomplete_tasks() -> Result<(), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        let ssn_id = format!("gang-all-tasks-{}", Uuid::new_v4());
+        setup_test_session(&controller, &ssn_id, 1, None, 3)?;
+
+        let policies = vec!["priority".to_string(), "gang".to_string()];
+        let mut ctx = Context::new(controller.clone(), &policies)?;
+        tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
+
+        assert_eq!(controller.list_executor()?.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gang_allocation_respects_max_instances() -> Result<(), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        let ssn_id = format!("gang-max-{}", Uuid::new_v4());
+        setup_test_session(&controller, &ssn_id, 2, Some(4), 8)?;
+
+        let policies = vec!["priority".to_string(), "gang".to_string()];
+        let mut ctx = Context::new(controller.clone(), &policies)?;
+        tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
+
+        assert_eq!(controller.list_executor()?.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn test_allocate_reuses_idle_executor() -> Result<(), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        let ssn_id = format!("reuse-idle-{}", Uuid::new_v4());
+        setup_test_session(&controller, &ssn_id, 1, None, 1)?;
+        let executor =
+            tokio_test::block_on(controller.create_executor("node_1".to_string(), ssn_id.clone()))?;
+        tokio_test::block_on(controller.register_executor(&executor))?;
+
+        let policies = vec!["priority".to_string(), "gang".to_string()];
+        let mut ctx = Context::new(controller.clone(), &policies)?;
+        for action in ctx.actions.clone() {
+            tokio_test::block_on(action.execute(&mut ctx))?;
+        }
+
+        let executors = controller.list_executor()?;
+        assert_eq!(executors.len(), 1);
+        assert_eq!(executors[0].state, common::apis::ExecutorState::Binding);
+        assert_eq!(executors[0].ssn_id.as_deref(), Some(ssn_id.as_str()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_binding_executor_prevents_duplicate_across_cycles() -> Result<(), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        let ssn_id = format!("binding-stall-{}", Uuid::new_v4());
+        setup_test_session(&controller, &ssn_id, 1, None, 1)?;
+        let executor =
+            tokio_test::block_on(controller.create_executor("node_1".to_string(), ssn_id.clone()))?;
+        tokio_test::block_on(controller.register_executor(&executor))?;
+        tokio_test::block_on(controller.bind_session(executor.id.clone(), ssn_id.clone()))?;
+
+        let policies = vec!["priority".to_string(), "gang".to_string()];
+        for _ in 0..2 {
+            let mut ctx = Context::new(controller.clone(), &policies)?;
+            let ssn = ctx
+                .snapshot
+                .find_sessions(OPEN_SESSION)?
+                .values()
+                .next()
+                .cloned()
+                .expect("test session must exist");
+            assert!(ctx.is_fulfilled(&ssn, false)?);
+            assert!(ctx.is_ready(&ssn, false)?);
+            for action in ctx.actions.clone() {
+                tokio_test::block_on(action.execute(&mut ctx))?;
+            }
+        }
+
+        let executors = controller.list_executor()?;
+        assert_eq!(executors.len(), 1);
+        assert_eq!(executors[0].state, common::apis::ExecutorState::Binding);
+        assert_eq!(executors[0].ssn_id.as_deref(), Some(ssn_id.as_str()));
         Ok(())
     }
 }

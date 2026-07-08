@@ -24,7 +24,7 @@ use common::apis::ExecutorState;
 use common::FlameError;
 
 /// One scheduling cycle: a single `Context` (one [`PluginManager::setup`] on the current
-/// snapshot) is shared by Dispatch → Allocate → Shuffle. In-memory plugin counters (e.g. Gang)
+/// snapshot) is shared by Allocate → Dispatch → Shuffle. In-memory plugin counters (e.g. Gang)
 /// accumulate across those actions; do not re-run `setup` between them.
 pub struct Context {
     pub snapshot: SnapShotPtr,
@@ -43,8 +43,8 @@ impl Context {
             plugins,
             controller,
             actions: vec![
-                DispatchAction::new_ptr(),
                 AllocateAction::new_ptr(),
+                DispatchAction::new_ptr(),
                 ShuffleAction::new_ptr(),
             ],
         })
@@ -74,17 +74,20 @@ impl Context {
         self.plugins.is_available(exec, ssn)
     }
 
-    /// Allocation-side batch readiness (e.g. Gang: pipelined + allocated executors form full
-    /// batches). Reflects in-memory plugin state, including `Statement` ops earlier in this
-    /// same cycle (typically pipeline/allocate before commit).
-    pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
-        self.plugins.is_ready(ssn)
+    /// Dispatch-side readiness: enough executors are associated with the session or selected by
+    /// speculative bind operations. If no plugin has an opinion, `has_progress` is the result.
+    pub fn is_ready(&self, ssn: &SessionInfoPtr, has_progress: bool) -> Result<bool, FlameError> {
+        self.plugins.is_ready(ssn, has_progress)
     }
 
-    /// Binding-side batch readiness (e.g. Gang: bound + on-session executors form full batches).
-    /// After Dispatch commits binds, this can be true so Allocate skips provisioning.
-    pub fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
-        self.plugins.is_fulfilled(ssn)
+    /// Allocate-side fulfillment: enough associated, reusable, or speculative executors exist
+    /// for the session. If no plugin has an opinion, `has_progress` is the result.
+    pub fn is_fulfilled(
+        &self,
+        ssn: &SessionInfoPtr,
+        has_progress: bool,
+    ) -> Result<bool, FlameError> {
+        self.plugins.is_fulfilled(ssn, has_progress)
     }
 
     pub async fn bind_session(

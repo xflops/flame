@@ -13,7 +13,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 
-use common::apis::SessionID;
+use common::apis::{SessionID, TaskState};
 use common::FlameError;
 
 use crate::model::{ExecutorInfoPtr, NodeInfoPtr, SessionInfoPtr, SnapShot};
@@ -79,14 +79,48 @@ impl Plugin for GangPlugin {
 
     fn is_ready(&self, ssn: &SessionInfoPtr) -> Option<bool> {
         let state = self.ssn_state.get(&ssn.id)?;
-        let total = state.allocated + state.pipelined;
-        Some(state.pipelined > 0 && total % state.batch_size == 0)
+        let incomplete_tasks = [TaskState::Pending, TaskState::Running]
+            .iter()
+            .map(|task_state| {
+                ssn.tasks_status
+                    .get(task_state)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0) as u64
+            })
+            .sum::<u64>();
+        let batch_size = state.batch_size as u64;
+        let uncapped = incomplete_tasks.div_ceil(batch_size) * batch_size;
+        let aligned_max = ssn
+            .max_instances
+            .map(|max| (max as u64 / batch_size) * batch_size)
+            .unwrap_or((u32::MAX as u64 / batch_size) * batch_size);
+        let needed = uncapped.min(aligned_max);
+        let total = state.allocated as u64 + state.bound as u64;
+        Some(needed == 0 || total >= needed)
     }
 
     fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> Option<bool> {
         let state = self.ssn_state.get(&ssn.id)?;
-        let total = state.allocated + state.bound;
-        Some(state.bound > 0 && total % state.batch_size == 0)
+        let incomplete_tasks = [TaskState::Pending, TaskState::Running]
+            .iter()
+            .map(|task_state| {
+                ssn.tasks_status
+                    .get(task_state)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0) as u64
+            })
+            .sum::<u64>();
+        let batch_size = state.batch_size as u64;
+        let uncapped = incomplete_tasks.div_ceil(batch_size) * batch_size;
+        let aligned_max = ssn
+            .max_instances
+            .map(|max| (max as u64 / batch_size) * batch_size)
+            .unwrap_or((u32::MAX as u64 / batch_size) * batch_size);
+        let needed = uncapped.min(aligned_max);
+        let total = state.allocated as u64 + state.pipelined as u64;
+        Some(needed == 0 || total >= needed)
     }
 
     fn on_executor_allocate(&mut self, _node: NodeInfoPtr, ssn: SessionInfoPtr) {
@@ -199,7 +233,7 @@ mod tests {
         assert!(!plugin.is_fulfilled(&ssn).unwrap());
 
         let node = create_test_node("node-1");
-        plugin.on_session_bind(ssn.clone());
+        plugin.on_executor_allocate(node, ssn.clone());
 
         assert!(plugin.is_fulfilled(&ssn).unwrap());
     }
@@ -219,11 +253,11 @@ mod tests {
         assert!(!plugin.is_fulfilled(&ssn).unwrap());
 
         let node = create_test_node("node-1");
-        plugin.on_session_bind(ssn.clone());
+        plugin.on_executor_allocate(node.clone(), ssn.clone());
 
         assert!(!plugin.is_fulfilled(&ssn).unwrap());
 
-        plugin.on_session_bind(ssn.clone());
+        plugin.on_executor_allocate(node, ssn.clone());
 
         assert!(plugin.is_fulfilled(&ssn).unwrap());
     }
@@ -246,7 +280,7 @@ mod tests {
         assert!(!plugin.is_fulfilled(&ssn).unwrap());
 
         let node = create_test_node("node-1");
-        plugin.on_session_bind(ssn.clone());
+        plugin.on_executor_allocate(node, ssn.clone());
 
         assert!(plugin.is_fulfilled(&ssn).unwrap());
     }
@@ -265,8 +299,7 @@ mod tests {
 
         assert!(!plugin.is_ready(&ssn).unwrap());
 
-        let node = create_test_node("node-1");
-        plugin.on_executor_allocate(node, ssn.clone());
+        plugin.on_session_bind(ssn.clone());
 
         assert!(plugin.is_ready(&ssn).unwrap());
     }
@@ -285,12 +318,11 @@ mod tests {
 
         assert!(!plugin.is_ready(&ssn).unwrap());
 
-        let node = create_test_node("node-1");
-        plugin.on_executor_allocate(node.clone(), ssn.clone());
+        plugin.on_session_bind(ssn.clone());
 
         assert!(!plugin.is_ready(&ssn).unwrap());
 
-        plugin.on_executor_allocate(node, ssn.clone());
+        plugin.on_session_bind(ssn.clone());
 
         assert!(plugin.is_ready(&ssn).unwrap());
     }
@@ -312,8 +344,7 @@ mod tests {
 
         assert!(!plugin.is_ready(&ssn).unwrap());
 
-        let node = create_test_node("node-1");
-        plugin.on_executor_allocate(node, ssn.clone());
+        plugin.on_session_bind(ssn.clone());
 
         assert!(plugin.is_ready(&ssn).unwrap());
     }
@@ -333,19 +364,19 @@ mod tests {
         let exec = create_test_executor("exec-1", None);
         plugin.on_executor_pipeline(exec.clone(), ssn.clone());
 
-        assert!(!plugin.is_ready(&ssn).unwrap());
+        assert!(!plugin.is_fulfilled(&ssn).unwrap());
 
         plugin.on_executor_pipeline(exec.clone(), ssn.clone());
 
-        assert!(plugin.is_ready(&ssn).unwrap());
+        assert!(plugin.is_fulfilled(&ssn).unwrap());
 
         plugin.on_executor_discard(exec.clone(), ssn.clone());
 
-        assert!(!plugin.is_ready(&ssn).unwrap());
+        assert!(!plugin.is_fulfilled(&ssn).unwrap());
 
         plugin.on_executor_discard(exec, ssn.clone());
 
-        assert!(!plugin.is_ready(&ssn).unwrap());
+        assert!(!plugin.is_fulfilled(&ssn).unwrap());
     }
 
     #[test]
@@ -362,18 +393,18 @@ mod tests {
 
         plugin.on_session_bind(ssn.clone());
 
-        assert!(!plugin.is_fulfilled(&ssn).unwrap());
+        assert!(!plugin.is_ready(&ssn).unwrap());
 
         plugin.on_session_bind(ssn.clone());
 
-        assert!(plugin.is_fulfilled(&ssn).unwrap());
+        assert!(plugin.is_ready(&ssn).unwrap());
 
         plugin.on_session_unbind(ssn.clone());
 
-        assert!(!plugin.is_fulfilled(&ssn).unwrap());
+        assert!(!plugin.is_ready(&ssn).unwrap());
 
         plugin.on_session_unbind(ssn.clone());
 
-        assert!(!plugin.is_fulfilled(&ssn).unwrap());
+        assert!(!plugin.is_ready(&ssn).unwrap());
     }
 }

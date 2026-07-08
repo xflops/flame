@@ -19,7 +19,7 @@ use crate::model::{
     OPEN_SESSION,
 };
 use crate::scheduler::plugins::{Plugin, PluginPtr};
-use common::apis::{ResourceRequirement, SessionID, TaskState};
+use common::apis::{ExecutorState, ResourceRequirement, SessionID, TaskState};
 use common::FlameError;
 
 #[derive(Default, Clone)]
@@ -252,6 +252,11 @@ impl Plugin for DRFPlugin {
     }
 
     fn on_executor_pipeline(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
+        // Idle executors already consume node resources. Allocate reserves them for Gang
+        // fulfillment, while DRF assigns their session share when Dispatch binds them.
+        if exec.state == ExecutorState::Idle {
+            return;
+        }
         let ssn_resreq = self.get_session_resreq(&ssn);
 
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
@@ -274,6 +279,9 @@ impl Plugin for DRFPlugin {
     }
 
     fn on_executor_discard(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
+        if exec.state == ExecutorState::Idle {
+            return;
+        }
         let ssn_resreq = self.get_session_resreq(&ssn);
 
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {

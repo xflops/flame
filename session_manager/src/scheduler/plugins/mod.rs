@@ -161,13 +161,21 @@ impl PluginManager {
         enabled_policies: &[String],
     ) -> Result<PluginManagerPtr, FlameError> {
         let valid_names = configurable_policy_names();
+        let all_plugin_names: Vec<&str> = PLUGIN_REGISTRY.iter().map(|p| p.name).collect();
 
         for p in enabled_policies {
             if !valid_names.contains(&p.as_str()) {
-                return Err(FlameError::InvalidConfig(format!(
-                    "unknown policy: {}. available: {:?}",
-                    p, valid_names
-                )));
+                if all_plugin_names.contains(&p.as_str()) {
+                    tracing::info!(
+                        "Policy '{}' is always enabled and does not need to be listed explicitly; ignoring",
+                        p
+                    );
+                } else {
+                    return Err(FlameError::InvalidConfig(format!(
+                        "unknown policy: {}. configurable policies: {:?}",
+                        p, valid_names
+                    )));
+                }
             }
         }
 
@@ -332,27 +340,34 @@ impl PluginManager {
         Ok(())
     }
 
-    /// True if every plugin that implements [`Plugin::is_ready`] reports readiness (no opinion
-    /// defaults to true). Counters are in-memory and advance when [`crate::scheduler::Statement`]
-    /// records `allocate` / `pipeline` without `discard`. Dispatch and Allocate share one
-    /// `PluginManager` per scheduling cycle.
-    pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
+    /// Returns the conjunction of plugin readiness opinions. Plugins returning `None` are skipped;
+    /// if every plugin abstains, the caller's in-Statement progress is the fallback.
+    pub fn is_ready(&self, ssn: &SessionInfoPtr, has_progress: bool) -> Result<bool, FlameError> {
         let plugins = lock_ptr!(self.plugins)?;
-
-        Ok(plugins
-            .iter()
-            .all(|(_, plugin)| plugin.is_ready(ssn).unwrap_or(true)))
+        let mut result = None;
+        for (_, plugin) in plugins.iter() {
+            if let Some(ready) = plugin.is_ready(ssn) {
+                result = Some(result.unwrap_or(true) && ready);
+            }
+        }
+        Ok(result.unwrap_or(has_progress))
     }
 
-    /// True if every plugin that implements [`Plugin::is_fulfilled`] reports fulfillment (no opinion
-    /// defaults to true). Updates when [`crate::scheduler::Statement`] records `bind`; after
-    /// Dispatch commits, Allocate uses this to skip redundant provisioning.
-    pub fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
+    /// Returns the conjunction of plugin fulfillment opinions. Plugins returning `None` are
+    /// skipped; if every plugin abstains, the caller's in-Statement progress is the fallback.
+    pub fn is_fulfilled(
+        &self,
+        ssn: &SessionInfoPtr,
+        has_progress: bool,
+    ) -> Result<bool, FlameError> {
         let plugins = lock_ptr!(self.plugins)?;
-
-        Ok(plugins
-            .iter()
-            .all(|(_, plugin)| plugin.is_fulfilled(ssn).unwrap_or(true)))
+        let mut result = None;
+        for (_, plugin) in plugins.iter() {
+            if let Some(fulfilled) = plugin.is_fulfilled(ssn) {
+                result = Some(result.unwrap_or(true) && fulfilled);
+            }
+        }
+        Ok(result.unwrap_or(has_progress))
     }
 
     pub fn on_executor_pipeline(
@@ -496,7 +511,7 @@ impl collections::Cmp<SessionInfoPtr> for SsnOrderFn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ExecutorInfo;
+    use crate::model::{ExecutorInfo, SessionInfo};
     use chrono::Utc;
     use common::apis::{ExecutorState, ResourceRequirement, Shim};
 
@@ -540,6 +555,35 @@ mod tests {
         assert_eq!(exec_idle.state, ExecutorState::Idle);
         assert_eq!(exec_bound.state, ExecutorState::Bound);
         assert_eq!(exec_void.state, ExecutorState::Void);
+    }
+
+    #[test]
+    fn test_readiness_has_no_opinion_without_gang() {
+        let ss = SnapShot::new();
+        let ssn = Arc::new(SessionInfo {
+            id: "ssn-no-gang".to_string(),
+            resreq: Some(ResourceRequirement::default()),
+            ..Default::default()
+        });
+        ss.add_session(ssn.clone()).unwrap();
+
+        let plugins = PluginManager::setup(&ss, &["priority".to_string()]).unwrap();
+        assert!(!plugins.is_ready(&ssn, false).unwrap());
+        assert!(plugins.is_ready(&ssn, true).unwrap());
+        assert!(!plugins.is_fulfilled(&ssn, false).unwrap());
+        assert!(plugins.is_fulfilled(&ssn, true).unwrap());
+    }
+
+    #[test]
+    fn test_explicit_shim_policy_is_accepted() {
+        let ss = SnapShot::new();
+        PluginManager::setup(&ss, &["shim".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn test_unknown_policy_is_rejected() {
+        let ss = SnapShot::new();
+        assert!(PluginManager::setup(&ss, &["unknown".to_string()]).is_err());
     }
 
     /// Test documentation for plugin fallback behavior.
