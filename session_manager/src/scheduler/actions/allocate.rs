@@ -118,12 +118,8 @@ impl Action for AllocateAction {
             // (see `Context`): Gang's counters include binds Dispatch committed via
             // `Statement` in this same `Context`. If those already satisfy gang scheduling, do not
             // create more executors here.
-            //
-            // `is_ready` / `is_fulfilled` return true once the batch is satisfied (gang) or
-            // after the first op this cycle (no gang). Skip only when one of them is already
-            // true before we begin.
-            let fulfilled = ctx.is_fulfilled(&ssn);
-            let ready = ctx.is_ready(&ssn);
+            let fulfilled = ctx.is_fulfilled(&ssn)?;
+            let ready = ctx.is_ready(&ssn)?;
             if fulfilled || ready {
                 tracing::debug!(
                     "Skip allocate resources for session <{}>: is_fulfilled={}, is_ready={}",
@@ -136,30 +132,28 @@ impl Action for AllocateAction {
 
             let mut stmt = Statement::new(ss.clone(), ctx.plugins.clone(), ctx.controller.clone());
 
-            let pipelineable: Vec<_> = void_executors
+            let pipelineable = void_executors
                 .values()
                 .chain(unbinding_executors.values())
-                .filter(|e| ctx.is_available(e, &ssn).unwrap_or(false))
-                .cloned()
-                .collect();
+                .filter(|e| ctx.is_available(e, &ssn).unwrap_or(false));
 
-            for exec in &pipelineable {
+            for exec in pipelineable {
                 stmt.pipeline(exec, &ssn)?;
-                if ctx.is_ready(&ssn) {
+                if ctx.is_ready(&ssn)? {
                     break;
                 }
             }
 
             for node in nodes.iter() {
-                if ctx.is_ready(&ssn) {
+                if ctx.is_ready(&ssn)? {
                     break;
                 }
-                while ctx.is_allocatable(node, &ssn)? && !ctx.is_ready(&ssn) {
+                while ctx.is_allocatable(node, &ssn)? && !ctx.is_ready(&ssn)? {
                     stmt.allocate(node, &ssn)?;
                 }
             }
 
-            if ctx.is_ready(&ssn) {
+            if ctx.is_ready(&ssn)? {
                 let op_count = stmt.len();
                 let pipelined_ids = stmt.commit().await?;
                 for id in &pipelined_ids {

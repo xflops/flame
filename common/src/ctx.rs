@@ -27,18 +27,9 @@ const DEFAULT_FLAME_CONF: &str = "flame-cluster.yaml";
 const DEFAULT_CONTEXT_NAME: &str = "flame";
 const DEFAULT_FLAME_ENDPOINT: &str = "http://127.0.0.1:8080";
 /// Default policies to enable when none specified in config.
-///
-/// Effective default scheduler stack: `priority + gang + shim`
-///   - "gang" is listed here so batch-size semantics and allocation guards are active
-///     by default.  Users who do not need gang scheduling may omit it; scheduling
-///     will still work but allocates one executor per cycle with no batch constraint.
-///   - "shim" is always-on (non-configurable) and runs regardless of this list.
-///
-/// Optional configurable policies (add to cluster.policies in your config to enable):
-///   - "drf" — Dominant Resource Fairness; enables fair multi-resource sharing across sessions.
-///
-/// Note: listing "shim" in the config is harmless — a warning is logged and it is ignored.
-pub const DEFAULT_POLICIES: &[&str] = &["priority", "gang"];
+/// Available configurable policies: "priority", "drf", "gang"
+/// Note: "shim" plugin is always enabled (required for executor matching)
+pub const DEFAULT_POLICIES: &[&str] = &["priority", "drf", "gang"];
 const DEFAULT_STORAGE: &str = "sqlite://flame.db";
 const DEFAULT_MAX_EXECUTORS_PER_NODE: u32 = 128;
 pub const DEFAULT_SESSION_RETRY_LIMITS: u32 = 5;
