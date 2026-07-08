@@ -347,7 +347,10 @@ impl PluginManager {
         let mut result = None;
         for (_, plugin) in plugins.iter() {
             if let Some(ready) = plugin.is_ready(ssn) {
-                result = Some(result.unwrap_or(true) && ready);
+                if !ready {
+                    return Ok(false);
+                }
+                result = Some(true);
             }
         }
         Ok(result.unwrap_or(true))
@@ -360,7 +363,10 @@ impl PluginManager {
         let mut result = None;
         for (_, plugin) in plugins.iter() {
             if let Some(fulfilled) = plugin.is_fulfilled(ssn) {
-                result = Some(result.unwrap_or(true) && fulfilled);
+                if !fulfilled {
+                    return Ok(false);
+                }
+                result = Some(true);
             }
         }
         Ok(result.unwrap_or(true))
