@@ -310,14 +310,14 @@ async fn test_application_lifecycle() -> Result<(), FlameError> {
 }
 
 #[tokio::test]
-async fn test_batch_session() -> Result<(), FlameError> {
+async fn test_session_normalizes_batch_size() -> Result<(), FlameError> {
     let conn = get_connection().await?;
 
     let ssn_attr = SessionAttributes {
-        id: String::from("ssn-batch-test"),
+        id: String::from("ssn-normalized-batch-size"),
         application: FLAME_DEFAULT_APP.to_string(),
         common_data: None,
-        min_instances: 2, // Ensure batch_size executors are allocated
+        min_instances: 2,
         max_instances: None,
         batch_size: 2,
         priority: 0,

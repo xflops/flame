@@ -5,7 +5,6 @@ cluster:
   resreq: "cpu=1,mem=2g"
   policies:
     - priority
-    - gang
   storage: none
   schedule_interval: 100
   executors:

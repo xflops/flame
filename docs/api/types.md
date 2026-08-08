@@ -95,7 +95,7 @@ message SessionSpec {
   optional bytes common_data = 4;
   uint32 min_instances = 5;
   optional uint32 max_instances = 6;
-  uint32 batch_size = 7;
+  uint32 batch_size = 7; // Reserved for future implementation; currently normalized to 1.
   uint32 priority = 8;
   optional ResourceRequirement resreq = 9;
 }
@@ -107,7 +107,7 @@ message SessionSpec {
 | `common_data` | bytes | Data shared across all tasks (optional) |
 | `min_instances` | uint32 | Minimum executor instances (default: 0) |
 | `max_instances` | uint32 | Maximum executor instances (optional, unlimited if not set) |
-| `batch_size` | uint32 | Executors per batch for gang scheduling (default: 1) |
+| `batch_size` | uint32 | Reserved for future implementation; currently `1` |
 | `priority` | uint32 | Session priority; higher = more important (default: 0) |
 | `resreq` | ResourceRequirement | Per-task resource request (optional); when absent, the server applies `cluster.resreq`, with a hardcoded `cpu=1,mem=1g,gpu=0` fallback. |
 

@@ -188,7 +188,7 @@ impl Engine for NoneEngine {
             common_data: attr.common_data,
             min_instances: attr.min_instances,
             max_instances: attr.max_instances,
-            batch_size: attr.batch_size.max(1),
+            batch_size: 1,
             priority: attr.priority,
             resreq: attr.resreq,
             status: SessionStatus {

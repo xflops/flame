@@ -208,7 +208,7 @@ class TestResourceRequirements:
         session.close()
 
     def test_session_batch_size(self):
-        """Test creating session with batch_size for gang scheduling."""
+        """Test that the reserved batch_size argument is normalized to one."""
         session_id = f"test-batch-{random_string(8)}"
         session = flamepy.create_session(
             application=FLM_TEST_SVC_APP,
@@ -663,41 +663,39 @@ class TestOpenSession:
 
 
 # =============================================================================
-# Batch Session Tests
+# Concurrent task tests
 # =============================================================================
 
 
-class TestBatchSession:
-    """Tests for batch session operations."""
+class TestConcurrentTasks:
+    """Tests for concurrent task operations."""
 
-    def test_batch_session_basic(self):
-        """Test basic batch session operation."""
+    def test_concurrent_tasks_basic(self):
+        """Test multiple task operations."""
         session = flamepy.create_session(
             application=FLM_TEST_SVC_APP,
-            batch_size=2,
             min_instances=2,
         )
 
         task_num = 4
         for i in range(task_num):
-            request = TestRequest(input=f"batch_task_{i}")
+            request = TestRequest(input=f"task_{i}")
             response = invoke_task(session, request)
-            assert response.output == f"batch_task_{i}"
+            assert response.output == f"task_{i}"
 
         session.close()
 
-    def test_batch_session_parallel_tasks(self):
-        """Test batch session with parallel task submission."""
+    def test_parallel_tasks(self):
+        """Test parallel task submission."""
         session = flamepy.create_session(
             application=FLM_TEST_SVC_APP,
-            batch_size=2,
             min_instances=2,
         )
 
         task_num = 4
         futures = []
         for i in range(task_num):
-            request = TestRequest(input=f"parallel_batch_task_{i}")
+            request = TestRequest(input=f"parallel_task_{i}")
             future = session.run(serialize_request(request))
             futures.append(future)
 
@@ -707,58 +705,6 @@ class TestBatchSession:
         assert len(results) == task_num
 
         session.close()
-
-    def test_batch_session_no_partial_start(self):
-        """Test that tasks don't start partially with batch_size > 1.
-
-        With batch_size=2 and min_instances=0, a single task should remain
-        Pending until a second task is created to complete the batch.
-        """
-        session = flamepy.create_session(
-            application=FLM_TEST_SVC_APP,
-            batch_size=2,
-            min_instances=0,
-        )
-
-        request1 = TestRequest(input="partial_start_test_1")
-        task1 = session.create_task(serialize_request(request1))
-        task1_id = task1.id
-
-        pending_deadline = time.time() + 3
-        task1_status = session.get_task(task1_id)
-        while time.time() < pending_deadline:
-            task1_status = session.get_task(task1_id)
-            assert task1_status.state == TaskState.PENDING, f"Task should remain Pending with batch_size=2 and only 1 task. Got: {task1_status.state}"
-            time.sleep(0.5)
-
-        request2 = TestRequest(input="partial_start_test_2")
-        task2 = session.create_task(serialize_request(request2))
-        task2_id = task2.id
-
-        timeout = 120
-        poll_interval = 0.5
-        deadline = time.time() + timeout
-
-        while time.time() < deadline:
-            t1 = session.get_task(task1_id)
-            t2 = session.get_task(task2_id)
-
-            t1_done = t1.state in (TaskState.SUCCEED, TaskState.FAILED)
-            t2_done = t2.state in (TaskState.SUCCEED, TaskState.FAILED)
-
-            if t1_done and t2_done:
-                assert t1.state == TaskState.SUCCEED, f"Task 1 should succeed, got {t1.state}"
-                assert t2.state == TaskState.SUCCEED, f"Task 2 should succeed, got {t2.state}"
-                break
-
-            time.sleep(poll_interval)
-        else:
-            t1 = session.get_task(task1_id)
-            t2 = session.get_task(task2_id)
-            pytest.fail(f"Timeout waiting for tasks to complete. Task1: {t1.state}, Task2: {t2.state}")
-
-        session.close()
-
 
 # =============================================================================
 # Helper Functions

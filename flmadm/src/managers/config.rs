@@ -45,7 +45,6 @@ cluster:
   policies:
     - priority
     - drf
-    - gang
   storage: "fs://{prefix}/data"
   executors:
     shim: host

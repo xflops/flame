@@ -182,8 +182,8 @@ impl SessionOptions {
         self
     }
 
-    pub fn batch_size(mut self, value: u32) -> Self {
-        self.batch_size = value;
+    pub fn batch_size(self, value: u32) -> Self {
+        let _ = value;
         self
     }
 
@@ -231,7 +231,7 @@ impl From<SessionOptions> for SessionAttributes {
             common_data: options.common_data,
             min_instances: options.min_instances,
             max_instances: options.max_instances,
-            batch_size: options.batch_size.max(1),
+            batch_size: 1,
             priority: options.priority,
             resreq: options.resreq,
         }
@@ -629,7 +629,7 @@ impl Connection {
                 common_data: attrs.common_data.clone().map(CommonData::into),
                 min_instances: attrs.min_instances,
                 max_instances: attrs.max_instances,
-                batch_size: attrs.batch_size.max(1),
+                batch_size: 1,
                 priority: attrs.priority,
                 resreq: attrs.resreq.as_ref().map(rpc::ResourceRequirement::from),
             }),
@@ -679,7 +679,7 @@ impl Connection {
             common_data: attrs.common_data.clone().map(CommonData::into),
             min_instances: attrs.min_instances,
             max_instances: attrs.max_instances,
-            batch_size: attrs.batch_size.max(1),
+            batch_size: 1,
             priority: attrs.priority,
             resreq: attrs.resreq.as_ref().map(rpc::ResourceRequirement::from),
         });
@@ -1495,7 +1495,7 @@ mod tests {
     fn session_options_generate_default_attributes() {
         let attrs = SessionOptions::new("model-app")
             .min_instances(1)
-            .batch_size(0)
+            .batch_size(2)
             .priority(7)
             .resreq("cpu=4,mem=16g")
             .into_session_attributes()
