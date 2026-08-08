@@ -25,7 +25,6 @@ use common::FlameError;
 mod actions;
 mod ctx;
 mod plugins;
-pub mod statement;
 
 pub fn new(controller: ControllerPtr) -> Arc<dyn FlameThread> {
     Arc::new(ScheduleRunner { controller })
@@ -49,8 +48,7 @@ impl FlameThread for ScheduleRunner {
         loop {
             let mut ctx = Context::new(self.controller.clone(), policies)?;
 
-            // Same `ctx` (and thus same in-memory `plugins`) for every action: Dispatch mutations
-            // are visible to Allocate (e.g. Gang `is_fulfilled` / `is_ready` after binds).
+            // Same `ctx` (and thus same in-memory `plugins`) is used for every action.
             for action in ctx.actions.clone() {
                 if let Err(e) = action.execute(&mut ctx).await {
                     tracing::error!("Failed to run scheduling: {e}");
@@ -244,14 +242,19 @@ mod tests {
             assert_eq!(node_list.values().next().unwrap().name, "node_1");
 
             let exec_list = controller.list_executor()?;
-            assert_eq!(exec_list.len(), 1);
+            // The test does not run an executor manager, so a created executor
+            // remains Void. Allocate pipelines that existing Void executor on
+            // later cycles instead of creating duplicates before it becomes
+            // Idle and Dispatch can bind it.
+            assert_eq!(exec_list.len(), 1, "cycle {i}");
+            assert_eq!(exec_list[0].ssn_id, None);
         }
 
         Ok(())
     }
 
-    /// One scheduling cycle must keep the same in-memory [`crate::scheduler::plugins::PluginManager`]
-    /// so Gang (and similar) state from Dispatch is visible to Allocate.
+    /// One scheduling cycle keeps the same in-memory [`crate::scheduler::plugins::PluginManager`]
+    /// for every action.
     #[test]
     fn test_scheduler_cycle_reuses_plugin_manager_across_actions() -> Result<(), FlameError> {
         let env = TestEnv::new()?;

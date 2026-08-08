@@ -61,7 +61,7 @@ impl Action for ShuffleAction {
             }
 
             let mut exec = None;
-            for (_, e) in bound_execs.iter_mut() {
+            for e in bound_execs.values_mut() {
                 tracing::debug!(
                     "Try to unbound Executor <{}> for session <{}>",
                     e.id,
@@ -97,12 +97,12 @@ impl Action for ShuffleAction {
                 bound_execs.remove(&exec.id);
 
                 // Pipeline the executor to the underused session to avoid over allocation.
-                ctx.pipeline_session(&exec, &ssn).await?;
+                ctx.pipeline_executor(&exec, &ssn)?;
                 underused.push(ssn.clone());
             }
         }
 
-        // Release Idle executors, so the resource can be reallocated.
+        // Release Idle executors, so their resources can be reallocated.
         let idle_execs = ss.find_executors(IDLE_EXECUTOR)?;
         for exec in idle_execs.values() {
             ctx.release_executor(exec).await?;

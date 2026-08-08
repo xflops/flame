@@ -171,7 +171,7 @@ impl TryFrom<&SessionDao> for Session {
             events: vec![],
             min_instances: ssn.min_instances as u32,
             max_instances: ssn.max_instances.map(|v| v as u32),
-            batch_size: ssn.batch_size.max(1) as u32,
+            batch_size: 1,
             priority: ssn.priority as u32,
             resreq,
             retry_count: 0,

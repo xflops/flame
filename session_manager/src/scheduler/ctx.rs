@@ -24,8 +24,8 @@ use common::apis::ExecutorState;
 use common::FlameError;
 
 /// One scheduling cycle: a single `Context` (one [`PluginManager::setup`] on the current
-/// snapshot) is shared by Dispatch → Allocate → Shuffle. In-memory plugin counters (e.g. Gang)
-/// accumulate across those actions; do not re-run `setup` between them.
+/// snapshot) is shared by Dispatch → Allocate → Shuffle. In-memory plugin counters accumulate
+/// across those actions; do not re-run `setup` between them.
 pub struct Context {
     pub snapshot: SnapShotPtr,
     pub controller: ControllerPtr,
@@ -54,6 +54,10 @@ impl Context {
         self.plugins.is_underused(ssn)
     }
 
+    pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
+        self.plugins.is_ready(ssn)
+    }
+
     pub fn is_preemptible(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
         self.plugins.is_preemptible(ssn)
     }
@@ -71,20 +75,37 @@ impl Context {
         exec: &ExecutorInfoPtr,
         ssn: &SessionInfoPtr,
     ) -> Result<bool, FlameError> {
+        if ssn
+            .resreq
+            .as_ref()
+            .is_some_and(|resreq| resreq != &exec.resreq)
+        {
+            return Ok(false);
+        }
         self.plugins.is_available(exec, ssn)
     }
 
-    /// Allocation-side batch readiness (e.g. Gang: pipelined + allocated executors form full
-    /// batches). Reflects in-memory plugin state, including `Statement` ops earlier in this
-    /// same cycle (typically pipeline/allocate before commit).
-    pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
-        self.plugins.is_ready(ssn)
+    pub async fn allocate_executor(
+        &self,
+        node: &NodeInfoPtr,
+        ssn: &SessionInfoPtr,
+    ) -> Result<(), FlameError> {
+        let executor = self
+            .controller
+            .create_executor(node.name.clone(), ssn.id.clone())
+            .await?;
+        let exec_info = Arc::new(ExecutorInfo::from(&executor));
+        self.snapshot.add_executor(exec_info.clone())?;
+        self.plugins.on_executor_pipeline(exec_info, ssn.clone())
     }
 
-    /// Binding-side batch readiness (e.g. Gang: bound + on-session executors form full batches).
-    /// After Dispatch commits binds, this can be true so Allocate skips provisioning.
-    pub fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
-        self.plugins.is_fulfilled(ssn)
+    /// Accounts for an executor reserved by this scheduling cycle.
+    pub fn pipeline_executor(
+        &self,
+        exec: &ExecutorInfoPtr,
+        ssn: &SessionInfoPtr,
+    ) -> Result<(), FlameError> {
+        self.plugins.on_executor_pipeline(exec.clone(), ssn.clone())
     }
 
     pub async fn bind_session(
@@ -98,19 +119,6 @@ impl Context {
         self.plugins.on_session_bind(ssn.clone())?;
         self.snapshot
             .update_executor_state(exec.clone(), ExecutorState::Binding)?;
-
-        Ok(())
-    }
-
-    pub async fn pipeline_session(
-        &self,
-        exec: &ExecutorInfoPtr,
-        ssn: &SessionInfoPtr,
-    ) -> Result<(), FlameError> {
-        self.plugins.on_session_bind(ssn.clone())?;
-
-        // self.snapshot
-        //     .update_executor_state(exec.clone(), ExecutorState::Binding)?;
 
         Ok(())
     }

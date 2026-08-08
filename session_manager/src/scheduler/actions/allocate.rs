@@ -18,9 +18,7 @@ use stdng::{logs::TraceFn, trace_fn};
 
 use crate::model::{ALL_NODE, READY_SESSION, UNBINDING_EXECUTOR, VOID_EXECUTOR};
 use crate::scheduler::actions::{Action, ActionPtr};
-use crate::scheduler::plugins::node_order_fn;
 use crate::scheduler::plugins::ssn_order_fn;
-use crate::scheduler::statement::Statement;
 use crate::scheduler::Context;
 
 use common::FlameError;
@@ -68,8 +66,6 @@ impl Action for AllocateAction {
             unbinding_executors.len()
         );
 
-        let node_order_fn = node_order_fn(ctx);
-
         loop {
             if open_ssns.is_empty() {
                 break;
@@ -87,6 +83,10 @@ impl Action for AllocateAction {
                     ssn.tasks_status.get(&common::apis::TaskState::Pending),
                     ssn.tasks_status.get(&common::apis::TaskState::Running)
                 );
+                continue;
+            }
+
+            if ctx.is_ready(&ssn)? {
                 continue;
             }
 
@@ -114,61 +114,26 @@ impl Action for AllocateAction {
                 }
             }
 
-            // Dispatch runs first in this cycle. `PluginManager` is not re-setup between actions
-            // (see `Context`): Gang's counters include binds Dispatch committed via
-            // `Statement` in this same `Context`. If those already satisfy gang scheduling, do not
-            // create more executors here.
-            let fulfilled = ctx.is_fulfilled(&ssn)?;
-            let ready = ctx.is_ready(&ssn)?;
-            if fulfilled || ready {
-                tracing::debug!(
-                    "Skip allocate resources for session <{}>: is_fulfilled={}, is_ready={}",
-                    ssn.id,
-                    fulfilled,
-                    ready
-                );
-                continue;
-            }
-
-            let mut stmt = Statement::new(ss.clone(), ctx.plugins.clone(), ctx.controller.clone());
-
-            let pipelineable = void_executors
+            if let Some(exec) = void_executors
                 .values()
-                .chain(unbinding_executors.values())
-                .filter(|e| ctx.is_available(e, &ssn).unwrap_or(false));
-
-            for exec in pipelineable {
-                stmt.pipeline(exec, &ssn)?;
-                if ctx.is_ready(&ssn)? {
-                    break;
-                }
-            }
-
-            for node in nodes.iter() {
-                if ctx.is_ready(&ssn)? {
-                    break;
-                }
-                while ctx.is_allocatable(node, &ssn)? && !ctx.is_ready(&ssn)? {
-                    stmt.allocate(node, &ssn)?;
-                }
-            }
-
-            if ctx.is_ready(&ssn)? {
-                let op_count = stmt.len();
-                let pipelined_ids = stmt.commit().await?;
-                for id in &pipelined_ids {
-                    void_executors.remove(id);
-                    unbinding_executors.remove(id);
-                }
-                tracing::debug!("Committed {} op(s) for session <{}>", op_count, ssn.id);
-                nodes.sort_by(|a, b| node_order_fn.cmp(a, b));
-                open_ssns.push(ssn.clone());
-            } else if !stmt.is_empty() {
-                tracing::debug!(
-                    "Discarding incomplete batch for session <{}>: not enough resources",
-                    ssn.id
-                );
-                stmt.discard()?;
+                .find(|e| ctx.is_available(e, &ssn).unwrap_or(false))
+                .cloned()
+            {
+                ctx.pipeline_executor(&exec, &ssn)?;
+                void_executors.remove(&exec.id);
+            } else if let Some(exec) = unbinding_executors
+                .values()
+                .find(|e| ctx.is_available(e, &ssn).unwrap_or(false))
+                .cloned()
+            {
+                ctx.pipeline_executor(&exec, &ssn)?;
+                unbinding_executors.remove(&exec.id);
+            } else if let Some(node) = nodes
+                .iter()
+                .find(|node| ctx.is_allocatable(node, &ssn).unwrap_or(false))
+            {
+                ctx.allocate_executor(node, &ssn).await?;
+                tracing::debug!("Allocated executor for session <{}>", ssn.id);
             }
         }
 

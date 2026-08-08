@@ -20,7 +20,6 @@ use flame_rs::client::{ResourceRequirement, SessionAttributes};
 pub async fn run(
     ctx: &FlameContext,
     app: &str,
-    batch_size: &u32,
     priority: &u32,
     resreq_str: &Option<String>,
 ) -> Result<(), Box<dyn Error>> {
@@ -44,7 +43,7 @@ pub async fn run(
         common_data: None,
         min_instances: 0,
         max_instances: None,
-        batch_size: *batch_size,
+        batch_size: 1,
         priority: *priority,
         resreq,
     };

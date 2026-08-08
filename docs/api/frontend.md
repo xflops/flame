@@ -131,7 +131,6 @@ session = flamepy.create_session(
     resreq=flamepy.ResourceRequirement.from_string("cpu=1,mem=1g"),
     min_instances=2,
     max_instances=10,
-    batch_size=1
 )
 ```
 

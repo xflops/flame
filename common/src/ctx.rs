@@ -27,9 +27,9 @@ const DEFAULT_FLAME_CONF: &str = "flame-cluster.yaml";
 const DEFAULT_CONTEXT_NAME: &str = "flame";
 const DEFAULT_FLAME_ENDPOINT: &str = "http://127.0.0.1:8080";
 /// Default policies to enable when none specified in config.
-/// Available configurable policies: "priority", "drf", "gang"
+/// Available configurable policies: "priority", "drf"
 /// Note: "shim" plugin is always enabled (required for executor matching)
-pub const DEFAULT_POLICIES: &[&str] = &["priority", "drf", "gang"];
+pub const DEFAULT_POLICIES: &[&str] = &["priority", "drf"];
 const DEFAULT_STORAGE: &str = "sqlite://flame.db";
 const DEFAULT_MAX_EXECUTORS_PER_NODE: u32 = 128;
 pub const DEFAULT_SESSION_RETRY_LIMITS: u32 = 5;
@@ -607,7 +607,7 @@ cluster:
   resreq: "cpu=1,mem=1g"
   policies:
     - priority
-    - gang
+    - drf
   storage: sqlite://flame.db
   executors:
     shim: host
@@ -628,7 +628,7 @@ cluster:
             ctx.cluster.resreq,
             Some(ResourceRequirement::from("cpu=1,mem=1g"))
         );
-        assert_eq!(ctx.cluster.policies, vec!["priority", "gang"]);
+        assert_eq!(ctx.cluster.policies, vec!["priority", "drf"]);
         assert_eq!(ctx.cluster.storage, "sqlite://flame.db");
         assert_eq!(ctx.cluster.executors.shim, Shim::Host);
         assert_eq!(ctx.cluster.limits.max_executors, 10);

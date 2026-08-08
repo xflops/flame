@@ -18,8 +18,7 @@ use common::apis::{ResourceRequirement, SessionID, TaskState};
 use common::FlameError;
 
 use crate::model::{
-    ExecutorInfoPtr, NodeInfoPtr, SessionInfo, SessionInfoPtr, SnapShot, ALL_EXECUTOR, ALL_NODE,
-    OPEN_SESSION,
+    ExecutorInfoPtr, SessionInfo, SessionInfoPtr, SnapShot, ALL_EXECUTOR, ALL_NODE, OPEN_SESSION,
 };
 use crate::scheduler::plugins::{Plugin, PluginPtr};
 
@@ -66,9 +65,13 @@ pub struct PriorityPlugin {
     /// `ResourceRequirement`. Initialised from the snapshot in `setup()`; updated
     /// via callbacks.
     ssn_allocated: HashMap<SessionID, ResourceRequirement>,
+    /// Resources selected during this scheduling cycle but not yet bound to a
+    /// session. Pipeline accounting prevents Allocate from creating more
+    /// executors for demand that is already in flight.
+    ssn_pipelined: HashMap<SessionID, ResourceRequirement>,
     /// Per-executor effective resource requirement for each session, cached in
-    /// `setup()` so callbacks can adjust `ssn_allocated` without re-deriving from
-    /// the snapshot. After the slots-cleanup refactor, every open session's
+    /// `setup()` so lifecycle callbacks can adjust resource accounting without
+    /// re-deriving from the snapshot. After the slots-cleanup refactor, every open session's
     /// `resreq` is guaranteed to be populated by `resolve_session_resreq` in
     /// `apiserver::frontend`, so this is simply a clone of `ssn.resreq`.
     ssn_unit: HashMap<SessionID, ResourceRequirement>,
@@ -81,6 +84,7 @@ impl PriorityPlugin {
             ssn_priority: HashMap::new(),
             ssn_desired: HashMap::new(),
             ssn_allocated: HashMap::new(),
+            ssn_pipelined: HashMap::new(),
             ssn_unit: HashMap::new(),
         })
     }
@@ -105,11 +109,7 @@ fn compute_demand(ssn: &SessionInfo, per_task: &ResourceRequirement) -> Resource
             task_count = task_count.saturating_add((*c).max(0) as u32);
         }
     }
-    let batch_size = ssn.batch_size.max(1);
-    // Integer floor: for non-negative counts (task_count: u32), `/` is floor.
-    let batched = (task_count / batch_size) * batch_size;
-
-    let mut demand = per_task.mul(batched);
+    let mut demand = per_task.mul(task_count);
 
     if let Some(max_i) = ssn.max_instances {
         // Per-field clamp from above.
@@ -151,6 +151,7 @@ impl Plugin for PriorityPlugin {
         self.ssn_priority.clear();
         self.ssn_desired.clear();
         self.ssn_allocated.clear();
+        self.ssn_pipelined.clear();
         self.ssn_unit.clear();
         self.max_needy_priority = 0;
 
@@ -194,6 +195,8 @@ impl Plugin for PriorityPlugin {
 
             self.ssn_desired.insert(ssn.id.clone(), granted.clone());
             self.ssn_allocated
+                .insert(ssn.id.clone(), ResourceRequirement::default());
+            self.ssn_pipelined
                 .insert(ssn.id.clone(), ResourceRequirement::default());
             self.ssn_unit.insert(ssn.id.clone(), per_task);
 
@@ -307,31 +310,13 @@ impl Plugin for PriorityPlugin {
         }
     }
 
-    fn on_executor_allocate(&mut self, _node: NodeInfoPtr, ssn: SessionInfoPtr) {
-        let unit = match self.ssn_unit.get(&ssn.id) {
-            Some(u) => u.clone(),
-            None => return,
-        };
-        if let Some(alloc) = self.ssn_allocated.get_mut(&ssn.id) {
-            alloc.add(&unit);
-        }
-    }
-
-    fn on_executor_unallocate(&mut self, _node: NodeInfoPtr, ssn: SessionInfoPtr) {
-        let unit = match self.ssn_unit.get(&ssn.id) {
-            Some(u) => u.clone(),
-            None => return,
-        };
-        if let Some(alloc) = self.ssn_allocated.get_mut(&ssn.id) {
-            // Defensive: if we'd underflow (shouldn't happen given the lifecycle),
-            // log a warning and leave the counter alone rather than panic.
-            if let Err(e) = alloc.sub(&unit) {
-                tracing::warn!(
-                    "[PriorityPlugin] sub underflow on unallocate for ssn <{}>: {e}",
-                    ssn.id
-                );
-            }
-        }
+    fn is_ready(&self, ssn: &SessionInfoPtr) -> Option<bool> {
+        let desired = self.ssn_desired.get(&ssn.id)?;
+        let allocated = self.ssn_allocated.get(&ssn.id)?;
+        let pipelined = self.ssn_pipelined.get(&ssn.id)?;
+        let mut available = allocated.clone();
+        available.add(pipelined);
+        Some(available.great_equal(desired))
     }
 
     fn on_executor_pipeline(&mut self, _exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
@@ -339,23 +324,8 @@ impl Plugin for PriorityPlugin {
             Some(u) => u.clone(),
             None => return,
         };
-        if let Some(alloc) = self.ssn_allocated.get_mut(&ssn.id) {
-            alloc.add(&unit);
-        }
-    }
-
-    fn on_executor_discard(&mut self, _exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
-        let unit = match self.ssn_unit.get(&ssn.id) {
-            Some(u) => u.clone(),
-            None => return,
-        };
-        if let Some(alloc) = self.ssn_allocated.get_mut(&ssn.id) {
-            if let Err(e) = alloc.sub(&unit) {
-                tracing::warn!(
-                    "[PriorityPlugin] sub underflow on discard for ssn <{}>: {e}",
-                    ssn.id
-                );
-            }
+        if let Some(pipelined) = self.ssn_pipelined.get_mut(&ssn.id) {
+            pipelined.add(&unit);
         }
     }
 
@@ -402,6 +372,7 @@ mod tests {
             ssn_priority: HashMap::new(),
             ssn_desired: HashMap::new(),
             ssn_allocated: HashMap::new(),
+            ssn_pipelined: HashMap::new(),
             ssn_unit: HashMap::new(),
         }
     }
@@ -715,10 +686,10 @@ mod tests {
     }
 
     #[test]
-    fn test_setup_compute_demand_batch_aligned_and_capped() {
+    fn test_setup_compute_demand_uses_all_tasks() {
         // Reach into compute_demand via a single-session snapshot.
-        // pending=5, running=1, batch_size=2, slots=3, cluster large enough not to bind.
-        // task_count=6, batched=floor(6/2)*2=6, per_task=(3,3*1024,0), demand=6×per_task=(18,18*1024,0).
+        // pending=5, running=1, slots=3, cluster large enough not to bind.
+        // task_count=6, per_task=(3,3*1024,0), demand=6×per_task=(18,18*1024,0).
         let ssn = create_test_session_full("s", 0, 5, 1, 3, 2, 0, None, Utc::now());
         let ss = create_snapshot_with_capacity(vec![ssn], 100);
 
@@ -889,13 +860,16 @@ mod tests {
         plugin.setup(&ss).unwrap();
         assert_eq!(plugin.is_underused(&ssn_high), Some(true));
 
-        // Manually drive allocated to equal desired (per-field).
-        let desired = plugin.ssn_desired.get("ssn-high").cloned().unwrap();
-        if let Some(a) = plugin.ssn_allocated.get_mut("ssn-high") {
-            *a = desired;
+        // Pipelined executors are transient capacity reservations. They do not
+        // alter persistent ownership, so the session remains underused until an
+        // executor is bound.
+        let pipelined = Arc::new(ExecutorInfo::default());
+        for _ in 0..3 {
+            plugin.on_executor_pipeline(pipelined.clone(), ssn_high.clone());
         }
-        // Now allocated == desired → None (defers to the next plugin in the chain)
-        assert_eq!(plugin.is_underused(&ssn_high), None);
+
+        assert_eq!(plugin.is_underused(&ssn_high), Some(true));
+        assert_eq!(plugin.is_ready(&ssn_high), Some(true));
     }
 
     #[test]
@@ -924,52 +898,23 @@ mod tests {
         assert_eq!(plugin.is_underused(&ssn), None);
     }
 
-    // ── allocation callback tests ────────────────────────────────────────────
+    // ── lifecycle callback tests ─────────────────────────────────────────────
 
     #[test]
-    fn test_on_executor_allocate_increments_allocated() {
-        // After setup, ssn_unit["s"] = slots × unit = 2 × (1,1024,0) = (cpu:2, memory:2048, gpu:0).
-        // on_executor_allocate adds that resreq to the allocated counter.
+    fn test_on_executor_pipeline_increments_pipelined_only() {
+        // Pipeline accounting reserves capacity for this cycle without changing
+        // persistent session ownership.
         let ssn = create_test_session_full("s", 0, 4, 0, 2, 1, 0, None, Utc::now());
         let ss = create_snapshot_with_capacity(vec![ssn.clone()], 100);
 
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
+        let exec = Arc::new(ExecutorInfo::default());
+        plugin.on_executor_pipeline(exec, ssn.clone());
         assert_eq!(
             plugin.ssn_allocated.get("s"),
             Some(&ResourceRequirement::default())
         );
-
-        let node = Arc::new(NodeInfo {
-            name: "n".to_string(),
-            allocatable: ResourceRequirement::default(),
-            state: NodeState::Ready,
-        });
-        plugin.on_executor_allocate(node, ssn.clone());
-        assert_eq!(plugin.ssn_allocated.get("s"), Some(&slots_to_rr(2)));
-    }
-
-    #[test]
-    fn test_on_executor_unallocate_decrements_allocated() {
-        // After setup with one bound executor consuming (cpu:2, memory:2048, gpu:0),
-        // ssn_allocated["s"] = (2,2048,0). Unallocate subtracts ssn_unit (also
-        // (2,2048,0) here), so we end at the zero ResourceRequirement.
-        let ssn = create_test_session_full("s", 0, 4, 0, 2, 1, 0, None, Utc::now());
-        let ss = create_snapshot_with_executor(vec![ssn.clone()], "s", 2, 100);
-
-        let mut plugin = make_plugin();
-        plugin.setup(&ss).unwrap();
-        assert_eq!(plugin.ssn_allocated.get("s"), Some(&slots_to_rr(2)));
-
-        let node = Arc::new(NodeInfo {
-            name: "n".to_string(),
-            allocatable: ResourceRequirement::default(),
-            state: NodeState::Ready,
-        });
-        plugin.on_executor_unallocate(node, ssn.clone());
-        assert_eq!(
-            plugin.ssn_allocated.get("s"),
-            Some(&ResourceRequirement::default())
-        );
+        assert_eq!(plugin.ssn_pipelined.get("s"), Some(&slots_to_rr(2)));
     }
 }
