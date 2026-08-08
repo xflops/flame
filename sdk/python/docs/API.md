@@ -83,7 +83,7 @@ Methods:
 - `common_data: bytes | None`
 - `min_instances: int`
 - `max_instances: int | None`
-- `batch_size: int`
+- `batch_size: int` (reserved for future implementation; currently normalized to `1`)
 - `resreq: ResourceRequirement | None`
 
 `ApplicationAttributes`:

@@ -229,7 +229,7 @@ impl SqliteEngine {
             .bind(SessionState::Open as i32)
             .bind(attr.min_instances as i64)
             .bind(attr.max_instances.map(|v| v as i64))
-            .bind(attr.batch_size.max(1) as i64)
+            .bind(1_i64)
             .bind(attr.priority as i64)
             .bind(resreq_cpu)
             .bind(resreq_memory)
@@ -1157,8 +1157,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_create_session_persists_batch_size() -> Result<(), FlameError> {
-        let url = common::temp_sqlite_url("flame_test_create_session_persists_batch_size");
+    fn test_create_session_normalizes_batch_size() -> Result<(), FlameError> {
+        let url = common::temp_sqlite_url("flame_test_create_session_normalizes_batch_size");
         let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
 
         for (name, attr) in common::default_applications() {
@@ -1177,10 +1177,10 @@ mod tests {
             resreq: None,
         }))?;
 
-        assert_eq!(ssn.batch_size, 2);
+        assert_eq!(ssn.batch_size, 1);
 
         let ssn = tokio_test::block_on(storage.get_session(ssn_id))?;
-        assert_eq!(ssn.batch_size, 2);
+        assert_eq!(ssn.batch_size, 1);
 
         Ok(())
     }

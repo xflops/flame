@@ -247,7 +247,7 @@ impl From<&Session> for SessionInfo {
             state: ssn.status.state,
             min_instances: ssn.min_instances,
             max_instances: ssn.max_instances,
-            batch_size: ssn.batch_size.max(1),
+            batch_size: 1,
             priority: ssn.priority,
             resreq: ssn.resreq.clone(),
             retry_count: ssn.retry_count,

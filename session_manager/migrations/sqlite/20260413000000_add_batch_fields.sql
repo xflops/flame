@@ -1,6 +1,6 @@
 -- Add batch scheduling fields (RFE400-batch-session)
--- batch_size: number of executors per batch for gang scheduling
--- batch_index: executor's index within its batch (0 to batch_size-1)
+-- batch_size: reserved session field, currently normalized to 1
+-- batch_index: reserved executor field
 
 ALTER TABLE sessions ADD COLUMN batch_size INTEGER NOT NULL DEFAULT 1;
 

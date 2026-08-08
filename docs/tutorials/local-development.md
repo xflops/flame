@@ -181,7 +181,6 @@ cluster:
   policies:
     - priority
     - drf
-    - gang
   storage: "fs:///tmp/flame-dev/data"
   executors:
     shim: host

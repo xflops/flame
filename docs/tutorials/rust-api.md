@@ -213,7 +213,6 @@ let ssn = flame::create_session(
     SessionOptions::new(cli.app.clone())
         .min_instances(1)
         .max_instances(4)
-        .batch_size(1)
         .priority(10)
         .resreq("cpu=1,mem=1g"),
 )
@@ -226,7 +225,6 @@ Common fields:
 |-------|---------|
 | `min_instances` | Minimum executors to keep for the session |
 | `max_instances` | Maximum executors the scheduler may allocate |
-| `batch_size` | Executors to allocate per scheduling batch |
 | `priority` | Session priority used by priority scheduling |
 | `resreq` | Resource request such as `cpu=1,mem=1g,gpu=0` |
 

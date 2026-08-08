@@ -26,6 +26,7 @@ use common::FlameError;
 struct DRFSessionInfo {
     pub id: SessionID,
     pub allocated: ResourceRequirement,
+    pub pipelined: ResourceRequirement,
     pub dominant_share: f64,
 }
 
@@ -105,13 +106,10 @@ impl Plugin for DRFPlugin {
 
         let executors = ss.find_executors(ALL_EXECUTOR)?;
         for exec in executors.values() {
-            if let Some(node_alloc) = self.node_allocations.get_mut(&exec.node) {
-                node_alloc.cpu += exec.resreq.cpu;
-                node_alloc.memory += exec.resreq.memory;
-                node_alloc.gpu += exec.resreq.gpu;
-            }
-
             if let Some(ssn_id) = &exec.ssn_id {
+                if let Some(node_alloc) = self.node_allocations.get_mut(&exec.node) {
+                    node_alloc.add(&exec.resreq);
+                }
                 let entry = self
                     .ssn_map
                     .entry(ssn_id.clone())
@@ -191,6 +189,14 @@ impl Plugin for DRFPlugin {
         Some(ssn_info.dominant_share < fair_share)
     }
 
+    fn is_ready(&self, ssn: &SessionInfoPtr) -> Option<bool> {
+        let ssn_info = self.ssn_map.get(&ssn.id)?;
+        let mut supplied = ssn_info.allocated.clone();
+        supplied.add(&ssn_info.pipelined);
+        let num_sessions = self.ssn_map.len().max(1) as f64;
+        Some(self.calculate_dominant_share(&supplied) >= 1.0 / num_sessions)
+    }
+
     fn is_allocatable(&self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Option<bool> {
         let node_alloc = self.node_allocations.get(&node.name)?;
         let ssn_resreq = self.get_session_resreq(ssn);
@@ -206,92 +212,19 @@ impl Plugin for DRFPlugin {
         Some(cpu_ok && mem_ok && gpu_ok)
     }
 
-    fn on_executor_allocate(&mut self, node: NodeInfoPtr, ssn: SessionInfoPtr) {
-        let ssn_resreq = self.get_session_resreq(&ssn);
-
-        if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
-            entry.allocated.cpu += ssn_resreq.cpu;
-            entry.allocated.memory += ssn_resreq.memory;
-            entry.allocated.gpu += ssn_resreq.gpu;
-        }
-        // Recalculate dominant share outside the mutable borrow
-        if let Some(entry) = self.ssn_map.get(&ssn.id) {
-            let ds = self.calculate_dominant_share(&entry.allocated);
-            if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
-                entry.dominant_share = ds;
-            }
-        }
-
-        if let Some(node_alloc) = self.node_allocations.get_mut(&node.name) {
-            node_alloc.cpu += ssn_resreq.cpu;
-            node_alloc.memory += ssn_resreq.memory;
-            node_alloc.gpu += ssn_resreq.gpu;
-        }
-    }
-
-    fn on_executor_unallocate(&mut self, node: NodeInfoPtr, ssn: SessionInfoPtr) {
-        let ssn_resreq = self.get_session_resreq(&ssn);
-
-        if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
-            entry.allocated.cpu = entry.allocated.cpu.saturating_sub(ssn_resreq.cpu);
-            entry.allocated.memory = entry.allocated.memory.saturating_sub(ssn_resreq.memory);
-            entry.allocated.gpu = entry.allocated.gpu.saturating_sub(ssn_resreq.gpu);
-        }
-        if let Some(entry) = self.ssn_map.get(&ssn.id) {
-            let ds = self.calculate_dominant_share(&entry.allocated);
-            if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
-                entry.dominant_share = ds;
-            }
-        }
-
-        if let Some(node_alloc) = self.node_allocations.get_mut(&node.name) {
-            node_alloc.cpu = node_alloc.cpu.saturating_sub(ssn_resreq.cpu);
-            node_alloc.memory = node_alloc.memory.saturating_sub(ssn_resreq.memory);
-            node_alloc.gpu = node_alloc.gpu.saturating_sub(ssn_resreq.gpu);
-        }
-    }
-
     fn on_executor_pipeline(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
-        let ssn_resreq = self.get_session_resreq(&ssn);
-
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
-            entry.allocated.cpu += ssn_resreq.cpu;
-            entry.allocated.memory += ssn_resreq.memory;
-            entry.allocated.gpu += ssn_resreq.gpu;
+            entry.pipelined.add(&exec.resreq);
         }
-        if let Some(entry) = self.ssn_map.get(&ssn.id) {
-            let ds = self.calculate_dominant_share(&entry.allocated);
-            if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
-                entry.dominant_share = ds;
+
+        // Void executors are deliberately excluded from setup's node usage.
+        // Pipeline them here so they reserve capacity exactly once for the
+        // current cycle. Executors already owned by a session were counted by
+        // setup and must not be charged again while they unbind.
+        if exec.ssn_id.is_none() {
+            if let Some(node_alloc) = self.node_allocations.get_mut(&exec.node) {
+                node_alloc.add(&exec.resreq);
             }
-        }
-
-        if let Some(node_alloc) = self.node_allocations.get_mut(&exec.node) {
-            node_alloc.cpu += ssn_resreq.cpu;
-            node_alloc.memory += ssn_resreq.memory;
-            node_alloc.gpu += ssn_resreq.gpu;
-        }
-    }
-
-    fn on_executor_discard(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
-        let ssn_resreq = self.get_session_resreq(&ssn);
-
-        if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
-            entry.allocated.cpu = entry.allocated.cpu.saturating_sub(ssn_resreq.cpu);
-            entry.allocated.memory = entry.allocated.memory.saturating_sub(ssn_resreq.memory);
-            entry.allocated.gpu = entry.allocated.gpu.saturating_sub(ssn_resreq.gpu);
-        }
-        if let Some(entry) = self.ssn_map.get(&ssn.id) {
-            let ds = self.calculate_dominant_share(&entry.allocated);
-            if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
-                entry.dominant_share = ds;
-            }
-        }
-
-        if let Some(node_alloc) = self.node_allocations.get_mut(&exec.node) {
-            node_alloc.cpu = node_alloc.cpu.saturating_sub(ssn_resreq.cpu);
-            node_alloc.memory = node_alloc.memory.saturating_sub(ssn_resreq.memory);
-            node_alloc.gpu = node_alloc.gpu.saturating_sub(ssn_resreq.gpu);
         }
     }
 
@@ -325,5 +258,79 @@ impl Plugin for DRFPlugin {
                 entry.dominant_share = ds;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use std::sync::Arc;
+
+    use common::apis::{ExecutorState, SessionState, Shim};
+
+    fn rr(cpu: u64) -> ResourceRequirement {
+        ResourceRequirement {
+            cpu,
+            memory: cpu,
+            gpu: 0,
+        }
+    }
+
+    fn session() -> SessionInfoPtr {
+        Arc::new(SessionInfo {
+            id: "session-1".to_string(),
+            application: "app".to_string(),
+            tasks_status: [(TaskState::Pending, 1)].into_iter().collect(),
+            creation_time: Utc::now(),
+            completion_time: None,
+            state: SessionState::Open,
+            min_instances: 0,
+            max_instances: None,
+            batch_size: 1,
+            priority: 0,
+            resreq: Some(rr(1)),
+            retry_count: 0,
+        })
+    }
+
+    fn void_executor(id: &str) -> ExecutorInfoPtr {
+        Arc::new(crate::model::ExecutorInfo {
+            id: id.to_string(),
+            node: "node-1".to_string(),
+            resreq: rr(1),
+            shim: Shim::Host,
+            task_id: None,
+            ssn_id: None,
+            creation_time: Utc::now(),
+            state: ExecutorState::Void,
+        })
+    }
+
+    #[test]
+    fn pipeline_accounts_void_capacity_without_changing_allocated_ownership() {
+        let ssn = session();
+        let mut plugin = DRFPlugin {
+            total: rr(4),
+            ssn_map: HashMap::from([(
+                ssn.id.clone(),
+                DRFSessionInfo {
+                    id: ssn.id.clone(),
+                    ..Default::default()
+                },
+            )]),
+            node_allocations: HashMap::from([("node-1".to_string(), rr(0))]),
+        };
+
+        for i in 0..4 {
+            plugin.on_executor_pipeline(void_executor(&format!("exec-{i}")), ssn.clone());
+        }
+
+        let info = plugin.ssn_map.get(&ssn.id).unwrap();
+        assert_eq!(info.allocated, rr(0));
+        assert_eq!(info.pipelined, rr(4));
+        assert_eq!(plugin.node_allocations.get("node-1"), Some(&rr(4)));
+        assert_eq!(plugin.is_underused(&ssn), Some(true));
+        assert_eq!(plugin.is_ready(&ssn), Some(true));
     }
 }

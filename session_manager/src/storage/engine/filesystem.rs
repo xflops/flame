@@ -775,7 +775,7 @@ impl FilesystemEngine {
             status: SessionStatus { state },
             min_instances: meta.min_instances,
             max_instances: meta.max_instances,
-            batch_size: meta.batch_size.max(1),
+            batch_size: 1,
             priority: meta.priority,
             resreq,
             retry_count: 0,
@@ -1022,7 +1022,7 @@ impl Engine for FilesystemEngine {
             completion_time: None,
             min_instances: attr.min_instances,
             max_instances: attr.max_instances,
-            batch_size: attr.batch_size.max(1),
+            batch_size: 1,
             priority: attr.priority,
             common_data_len,
             resreq_cpu: attr.resreq.as_ref().map(|r| r.cpu),
@@ -1070,9 +1070,8 @@ impl Engine for FilesystemEngine {
 
                 // If spec provided, validate full session attributes (same as sqlite engine
                 // and in-memory cache). Only checking application was insufficient:
-                // a persisted session could have batch_size/min_instances/max_instances that
-                // differ from the client spec, leading to gang scheduling deadlocks (tasks
-                // never allocated) without a clear error.
+                // a persisted session could have min_instances/max_instances that differ from
+                // the client spec, leading to surprising scheduling behavior.
                 if let Some(ref attr) = spec {
                     ssn.validate_spec(attr)?;
                 }

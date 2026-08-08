@@ -101,9 +101,6 @@ enum Commands {
         /// The name of Application
         #[arg(short, long)]
         app: String,
-        /// Number of executors per batch for gang scheduling
-        #[arg(short, long, default_value = "1")]
-        batch_size: u32,
         /// Session priority (higher = more important, default: 0)
         #[arg(short = 'p', long, default_value = "0")]
         priority: u32,
@@ -161,10 +158,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(Commands::Close { session }) => close::run(&ctx, session).await?,
         Some(Commands::Create {
             app,
-            batch_size,
             priority,
             resreq,
-        }) => create::run(&ctx, app, batch_size, priority, resreq).await?,
+        }) => create::run(&ctx, app, priority, resreq).await?,
         Some(Commands::View {
             application,
             session,

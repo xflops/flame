@@ -20,7 +20,6 @@ use stdng::{lock_ptr, new_ptr, MutexPtr};
 
 use crate::model::{ExecutorInfoPtr, NodeInfo, NodeInfoPtr, SessionInfo, SessionInfoPtr, SnapShot};
 use crate::scheduler::plugins::drf::DRFPlugin;
-use crate::scheduler::plugins::gang::GangPlugin;
 use crate::scheduler::plugins::priority::PriorityPlugin;
 use crate::scheduler::plugins::shim::ShimPlugin;
 use crate::scheduler::Context;
@@ -28,7 +27,6 @@ use crate::scheduler::Context;
 use common::FlameError;
 
 mod drf;
-mod gang;
 mod priority;
 mod shim;
 
@@ -74,6 +72,10 @@ pub trait Plugin: Send + Sync + 'static {
         None
     }
 
+    fn is_ready(&self, ssn: &SessionInfoPtr) -> Option<bool> {
+        None
+    }
+
     fn is_preemptible(&self, ssn: &SessionInfoPtr) -> Option<bool> {
         None
     }
@@ -90,26 +92,12 @@ pub trait Plugin: Send + Sync + 'static {
         None
     }
 
-    fn is_ready(&self, ssn: &SessionInfoPtr) -> Option<bool> {
-        None
-    }
-
-    fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> Option<bool> {
-        None
-    }
-
     // Events callbacks
-    fn on_executor_allocate(&mut self, node: NodeInfoPtr, ssn: SessionInfoPtr) {}
-
-    fn on_executor_unallocate(&mut self, node: NodeInfoPtr, ssn: SessionInfoPtr) {}
-
     fn on_session_bind(&mut self, ssn: SessionInfoPtr) {}
 
     fn on_session_unbind(&mut self, ssn: SessionInfoPtr) {}
 
     fn on_executor_pipeline(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {}
-
-    fn on_executor_discard(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {}
 }
 
 type PluginConstructor = fn() -> PluginPtr;
@@ -129,11 +117,6 @@ const PLUGIN_REGISTRY: &[PluginInfo] = &[
     PluginInfo {
         name: "drf",
         constructor: DRFPlugin::new_ptr,
-        configurable: true,
-    },
-    PluginInfo {
-        name: "gang",
-        constructor: GangPlugin::new_ptr,
         configurable: true,
     },
     PluginInfo {
@@ -194,7 +177,7 @@ impl PluginManager {
     /// Returns whether the session is underused (needs more executors).
     ///
     /// Uses "first non-`None` wins" ordering, identical to `ssn_order_fn`.
-    /// Plugins are consulted in registration order (Priority → DRF → Gang → Shim).
+    /// Plugins are consulted in registration order (Priority → DRF → Shim).
     /// The first plugin that returns `Some(result)` wins; `None` means "no opinion, ask the
     /// next plugin".  If no plugin has an opinion, the session is considered NOT underused.
     ///
@@ -210,6 +193,20 @@ impl PluginManager {
             }
         }
         Ok(false)
+    }
+
+    pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
+        let plugins = lock_ptr!(self.plugins)?;
+        let mut has_opinion = false;
+        for (_, plugin) in plugins.iter() {
+            if let Some(ready) = plugin.is_ready(ssn) {
+                has_opinion = true;
+                if !ready {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(has_opinion)
     }
 
     pub fn is_preemptible(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
@@ -285,34 +282,6 @@ impl PluginManager {
             .all(|(_, plugin)| plugin.is_reclaimable(exec).unwrap_or(true)))
     }
 
-    pub fn on_executor_allocate(
-        &self,
-        node: NodeInfoPtr,
-        ssn: SessionInfoPtr,
-    ) -> Result<(), FlameError> {
-        let mut plugins = lock_ptr!(self.plugins)?;
-
-        for (_, plugin) in plugins.iter_mut() {
-            plugin.on_executor_allocate(node.clone(), ssn.clone());
-        }
-
-        Ok(())
-    }
-
-    pub fn on_executor_unallocate(
-        &self,
-        node: NodeInfoPtr,
-        ssn: SessionInfoPtr,
-    ) -> Result<(), FlameError> {
-        let mut plugins = lock_ptr!(self.plugins)?;
-
-        for (_, plugin) in plugins.iter_mut() {
-            plugin.on_executor_unallocate(node.clone(), ssn.clone());
-        }
-
-        Ok(())
-    }
-
     pub fn on_session_bind(&self, ssn: SessionInfoPtr) -> Result<(), FlameError> {
         let mut plugins = lock_ptr!(self.plugins)?;
 
@@ -332,29 +301,6 @@ impl PluginManager {
         Ok(())
     }
 
-    /// True if every plugin that implements [`Plugin::is_ready`] reports readiness (no opinion
-    /// defaults to true). Counters are in-memory and advance when [`crate::scheduler::Statement`]
-    /// records `allocate` / `pipeline` without `discard`. Dispatch and Allocate share one
-    /// `PluginManager` per scheduling cycle.
-    pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
-        let plugins = lock_ptr!(self.plugins)?;
-
-        Ok(plugins
-            .iter()
-            .all(|(_, plugin)| plugin.is_ready(ssn).unwrap_or(true)))
-    }
-
-    /// True if every plugin that implements [`Plugin::is_fulfilled`] reports fulfillment (no opinion
-    /// defaults to true). Updates when [`crate::scheduler::Statement`] records `bind`; after
-    /// Dispatch commits, Allocate uses this to skip redundant provisioning.
-    pub fn is_fulfilled(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
-        let plugins = lock_ptr!(self.plugins)?;
-
-        Ok(plugins
-            .iter()
-            .all(|(_, plugin)| plugin.is_fulfilled(ssn).unwrap_or(true)))
-    }
-
     pub fn on_executor_pipeline(
         &self,
         exec: ExecutorInfoPtr,
@@ -364,20 +310,6 @@ impl PluginManager {
 
         for (_, plugin) in plugins.iter_mut() {
             plugin.on_executor_pipeline(exec.clone(), ssn.clone());
-        }
-
-        Ok(())
-    }
-
-    pub fn on_executor_discard(
-        &self,
-        exec: ExecutorInfoPtr,
-        ssn: SessionInfoPtr,
-    ) -> Result<(), FlameError> {
-        let mut plugins = lock_ptr!(self.plugins)?;
-
-        for (_, plugin) in plugins.iter_mut() {
-            plugin.on_executor_discard(exec.clone(), ssn.clone());
         }
 
         Ok(())
@@ -553,7 +485,7 @@ mod tests {
         // - None: Plugin has no opinion (fallback to default)
         //
         // Default behaviors:
-        // - is_available: None -> true (executor is available by default)
+        // - is_available: matching resources plus None -> true (executor is available by default)
         // - is_allocatable: None -> true (node is allocatable by default)
         // - is_underused: None -> false (session is NOT underused by default)
         // - is_preemptible: None -> false (session is NOT preemptible by default)

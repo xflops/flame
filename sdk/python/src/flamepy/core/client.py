@@ -149,7 +149,7 @@ def create_session(
         session_id: Optional session ID
         min_instances: Minimum number of instances (default: 0)
         max_instances: Maximum number of instances (None = unlimited)
-        batch_size: Number of executors per batch for gang scheduling (default: 1)
+        batch_size: Reserved for future implementation; sessions currently use 1.
         resreq: Optional explicit resource requirements. When omitted, the
                 server applies cluster.resource_requirement (or a hardcoded
                 fallback when that is unset).
@@ -162,7 +162,7 @@ def create_session(
             common_data=common_data,
             min_instances=min_instances,
             max_instances=max_instances,
-            batch_size=batch_size,
+            batch_size=1,
             resreq=resreq,
         )
     )
@@ -466,7 +466,7 @@ class Connection:
             common_data=common_data_bytes,
             min_instances=attrs.min_instances,
             max_instances=attrs.max_instances if attrs.max_instances is not None else None,
-            batch_size=attrs.batch_size,
+            batch_size=1,
         )
         if attrs.resreq is not None:
             session_spec.resreq.CopyFrom(
@@ -554,7 +554,7 @@ class Connection:
                 common_data=spec.common_data,
                 min_instances=spec.min_instances,
                 max_instances=spec.max_instances,
-                batch_size=spec.batch_size,
+                batch_size=1,
             )
             if spec.resreq is not None:
                 session_spec.resreq.CopyFrom(

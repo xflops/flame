@@ -5,7 +5,6 @@ cluster:
   resreq: "cpu=1,mem=1g"
   policies:
     - priority
-    - gang
   storage: fs://data/
   schedule_interval: 100           # Scheduler loop interval in milliseconds (default: 500)
   executors:

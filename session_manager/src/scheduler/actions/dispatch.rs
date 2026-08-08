@@ -19,7 +19,6 @@ use stdng::{logs::TraceFn, trace_fn};
 use crate::model::{IDLE_EXECUTOR, READY_SESSION};
 use crate::scheduler::actions::{Action, ActionPtr};
 use crate::scheduler::plugins::ssn_order_fn;
-use crate::scheduler::statement::Statement;
 use crate::scheduler::Context;
 
 use crate::FlameError;
@@ -70,37 +69,13 @@ impl Action for DispatchAction {
                 &ssn.id
             );
 
-            let mut stmt = Statement::new(ss.clone(), ctx.plugins.clone(), ctx.controller.clone());
-
-            for (_, exec) in idle_executors.iter() {
-                if ctx.is_available(exec, &ssn)? {
-                    stmt.bind(exec, &ssn)?;
-                    if ctx.is_fulfilled(&ssn)? {
-                        break;
-                    }
-                }
-            }
-
-            if ctx.is_fulfilled(&ssn)? {
-                tracing::debug!("Bind executor for session <{}>.", ssn.id);
-                let bound_ids = stmt.commit().await?;
-                for id in &bound_ids {
-                    idle_executors.remove(id);
-                }
-
-                // Re-queue only if we actually bound executors; otherwise the session
-                // would loop infinitely when is_underused() keeps returning true but
-                // no idle executors remain.
-                if !bound_ids.is_empty() {
-                    open_ssns.push(ssn);
-                }
-                continue;
-            } else if !stmt.is_empty() {
-                tracing::debug!(
-                    "Discarding unfulfilled binding for session <{}>: no available idle executors",
-                    ssn.id
-                );
-                stmt.discard()?;
+            let available = idle_executors
+                .values()
+                .find(|exec| exec.ssn_id.is_none() && ctx.is_available(exec, &ssn).unwrap_or(false))
+                .cloned();
+            if let Some(exec) = available {
+                ctx.bind_session(&exec, &ssn).await?;
+                idle_executors.remove(&exec.id);
             }
         }
 
