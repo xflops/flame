@@ -17,7 +17,7 @@ use comfy_table::presets::NOTHING;
 use comfy_table::Table;
 use serde_json::Value;
 
-use flame_rs::apis::{FlameContext, FlameError, TaskState};
+use flame_rs::apis::{FlameContext, FlameError};
 use flame_rs::client::{self, NodeState};
 
 use crate::utils::{format_memory, format_optional_duration, format_resreq};
@@ -71,17 +71,19 @@ async fn view_session(
     ssn_id: &String,
 ) -> Result<(), Box<dyn Error>> {
     let mut session = conn.get_session(ssn_id).await?;
-    let tasks = session.list_tasks().await?;
-
-    session.tasks = Some(tasks);
 
     match output_format {
-        Some(format) => match format.as_str() {
-            "json" => view_session_json(&session),
-            _ => view_session_table(&session),
-        },
-        None => view_session_table(&session),
+        Some(format) if format.as_str() == "json" => {
+            let tasks = session.list_tasks().await?;
+            session.tasks = Some(tasks);
+            view_session_json(&session)
+        }
+        _ => view_session_table(&session),
     }
+}
+
+fn format_task_summary(pending: i32, running: i32, succeed: i32, failed: i32) -> String {
+    format!("{pending} pending, {running} running, {succeed} succeed, {failed} failed")
 }
 
 fn view_session_table(session: &client::Session) -> Result<(), Box<dyn Error>> {
@@ -96,20 +98,14 @@ fn view_session_table(session: &client::Session) -> Result<(), Box<dyn Error>> {
         "Creation Time:",
         &session.creation_time.format("%T").to_string(),
     ]);
-
-    let mut success = 0;
-    let mut failed = 0;
-    for task in session.tasks.as_ref().unwrap() {
-        if task.state == TaskState::Succeed {
-            success += 1;
-        } else {
-            failed += 1;
-        }
-    }
-
     table.add_row(vec![
         "Tasks:",
-        &format!("{success} succeed, {failed} failed"),
+        &format_task_summary(
+            session.pending,
+            session.running,
+            session.succeed,
+            session.failed,
+        ),
     ]);
 
     println!("{table}");
@@ -277,5 +273,13 @@ mod tests {
         assert!(formatted.contains("10:01:02.000"));
         assert!(formatted.contains("bind failed"));
         assert!(formatted.contains("(1001)"));
+    }
+
+    #[test]
+    fn format_task_summary_includes_all_states() {
+        let summary = format_task_summary(3, 1, 2, 1);
+
+        assert_eq!(summary, "3 pending, 1 running, 2 succeed, 1 failed");
+        assert!(!summary.contains("4 failed"));
     }
 }
