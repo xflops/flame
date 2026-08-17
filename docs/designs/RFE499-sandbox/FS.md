@@ -164,7 +164,7 @@ class Sandbox:
 - Requires the session application to be `flmexec`.
 - Restores `SandboxAttr` from session `common_data`.
 - Raises `FlameError(NOT_FOUND)` if the session does not exist.
-- Raises `FlameError(INVALID_STATE)` if the session is not open.
+- Raises `FlameError(INVALID_ARGUMENT)` if the session is not open. `open_session` maps server `InvalidState` through gRPC `invalid_argument`.
 - Raises `FlameError(INVALID_ARGUMENT)` if the session is not `flmexec` or `common_data` is not a Sandbox attr.
 
 `run_code` / `submit_code`:
@@ -178,7 +178,8 @@ Lifecycle:
 
 - `close()` destroys the sandbox by closing the underlying session. A second close is a no-op.
 - Context-manager exit calls `close()`.
-- After close, `run_code`, `submit_code`, and `open(sandbox_id)` raise `FlameError(INVALID_STATE)`.
+- After close, `run_code` and `submit_code` raise `FlameError(INVALID_STATE)`.
+- After close, `open(sandbox_id)` raises `FlameError(INVALID_ARGUMENT)` from `open_session`.
 - `open` only works on a sandbox that is still open. Another client can `open` the same id while the original handle stays open and has not called `close()`.
 
 Read-only attributes:
@@ -234,7 +235,7 @@ Session `common_data` for `SandboxAttr`:
 | `create` with language not `python` or `shell` | `FlameError(INVALID_ARGUMENT)` |
 | `input` is not `bytes` or `None` | `FlameError(INVALID_ARGUMENT)` |
 | `open` on a missing session | `FlameError(NOT_FOUND)` |
-| `open` on a closed session | `FlameError(INVALID_STATE)` |
+| `open` on a closed session | `FlameError(INVALID_ARGUMENT)` |
 | `open` on a non-`flmexec` session or invalid attr bytes | `FlameError(INVALID_ARGUMENT)` |
 | Use after `close()` | `FlameError(INVALID_STATE)` |
 | Session create / task failure | Propagate the existing `FlameError` |

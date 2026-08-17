@@ -59,4 +59,5 @@ def test_sandbox_close_prevents_reopen():
 
     with pytest.raises(FlameError) as exc:
         Sandbox.open(sandbox_id)
-    assert exc.value.code == FlameErrorCode.INVALID_STATE
+    assert exc.value.code == FlameErrorCode.INVALID_ARGUMENT
+    assert "not open" in str(exc.value).lower()
