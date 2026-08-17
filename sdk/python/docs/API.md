@@ -1,6 +1,6 @@
 # Flame Python SDK API Reference
 
-The `flamepy` package provides a synchronous client for Flame sessions and tasks, a service base class for host-shim applications, object-cache helpers, and the Runner API for packaging Python workloads.
+The `flamepy` package provides a synchronous client for Flame sessions and tasks, a service base class for host-shim applications, object-cache helpers, the Runner API for packaging Python workloads, and the Tools Sandbox API for remote script execution.
 
 ## Configuration
 
@@ -182,6 +182,32 @@ Key classes and helpers:
 - `Runner.get(futures)`, `Runner.ref(futures)`, `Runner.wait(futures)`, `Runner.select(futures)`
 - `ObjectFuture.get()`, `ObjectFuture.ref()`, `ObjectFuture.wait()`
 - `get_data(data)` for decoding Runner task input/output payloads
+
+## Tools API
+
+Sandbox lives under `flamepy.tools`. It runs remote Python or shell scripts through the built-in `flmexec` application without exposing Session or task JSON.
+
+```python
+from flamepy.tools import Sandbox, SandboxAttr
+from flamepy import ResourceRequirement, FlameError
+
+attr = SandboxAttr(language="python")
+with Sandbox.create(attr) as sb:
+    print(sb.run_code("print(1 + 2)").text())
+```
+
+Key classes and methods:
+
+- `SandboxAttr(language, runtime=None, min_instances=0, max_instances=None, resreq=None)`
+- `Sandbox.create(attr)`
+- `Sandbox.open(sandbox_id)`
+- `Sandbox.run_code(code, input=None)`
+- `Sandbox.submit_code(code, input=None)`
+- `Sandbox.close()`
+- `sandbox.sandbox_id`, `sandbox.attr`
+- `SandboxOutput.data`, `SandboxOutput.text()`
+
+`language` and `runtime` are create-time only. `close()` destroys the sandbox. `open` works only while the sandbox is still open. `ResourceRequirement` and `FlameError` are imported from `flamepy`.
 
 ## Enums
 
