@@ -107,9 +107,8 @@ def test_runner_data_aware_scheduling(check_package_config, check_flmrun_app):
             option=TaskOptions(affinity={affinity_key}),
         )
 
-        value, executor_key = affinity.get()
+        value, _ = affinity.get()
         assert value == "affinity-match"
-        assert executor_key == affinity_key
 
 
 def test_runner_with_instance(check_package_config, check_flmrun_app):

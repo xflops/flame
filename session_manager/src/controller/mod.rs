@@ -891,11 +891,11 @@ impl Controller {
             ..task_result
         };
 
-        let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
-        state.complete_task(ssn_ptr, task_ptr, task_result).await?;
         if let Some(attributes) = attributes {
             self.update_executor_attributes(&id, attributes)?;
         }
+        let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
+        state.complete_task(ssn_ptr, task_ptr, task_result).await?;
         let _ = self.notifier.tasks.notify(&ssn_id, task_id);
 
         let executor = {
