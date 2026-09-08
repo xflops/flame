@@ -55,6 +55,7 @@ message BindExecutorResponse {
 message BindExecutorCompletedRequest {
   string executor_id = 1;
   optional Result result = 2;
+  optional ExecutorAttributes attributes = 3;
 }
 
 message UnbindExecutorRequest {
@@ -76,6 +77,7 @@ message LaunchTaskResponse {
 message CompleteTaskRequest {
   string executor_id = 1;
   TaskResult task_result = 2;
+  optional ExecutorAttributes attributes = 3;
 }
 
 message RegisterNodeRequest {

@@ -79,15 +79,15 @@ impl Multiplier {
 }
 
 fn session_context(common_data: Option<CommonData>) -> SessionContext {
-    SessionContext {
-        session_id: "ssn-1".to_string(),
-        application: ApplicationContext {
+    SessionContext::new(
+        "ssn-1".to_string(),
+        ApplicationContext {
             name: "test-app".to_string(),
             image: None,
             command: None,
         },
         common_data,
-    }
+    )
 }
 
 fn task_context(input: Option<flame::apis::TaskInput>) -> TaskContext {

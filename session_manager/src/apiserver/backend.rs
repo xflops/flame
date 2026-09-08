@@ -403,7 +403,11 @@ impl Backend for Flame {
         let req = req.into_inner();
 
         self.controller
-            .bind_executor_completed(req.executor_id, req.result.map(FlameResult::from))
+            .bind_executor_completed(
+                req.executor_id,
+                req.result.map(FlameResult::from),
+                req.attributes,
+            )
             .await?;
 
         Ok(Response::new(rpc::Result::default()))
@@ -464,7 +468,11 @@ impl Backend for Flame {
         )))?;
 
         self.controller
-            .complete_task(req.executor_id.clone(), TaskResult::from(task_result))
+            .complete_task(
+                req.executor_id.clone(),
+                TaskResult::from(task_result),
+                req.attributes,
+            )
             .await?;
 
         Ok(Response::new(rpc::Result::default()))

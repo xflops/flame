@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -147,6 +147,15 @@ pub struct SessionOptions {
     pub priority: u32,
     pub resreq: Option<ResourceRequirement>,
 }
+
+/// Opaque application-defined locality keys for one task.
+#[derive(Clone, Debug, Default)]
+pub struct TaskOptions {
+    pub affinity: HashSet<Vec<u8>>,
+}
+
+/// Compatibility alias; the task-creation parameter is named `option`.
+pub type TaskOption = TaskOptions;
 
 impl SessionOptions {
     pub fn new(application: impl Into<String>) -> Self {
@@ -519,6 +528,8 @@ pub struct Task {
     pub input: Option<TaskInput>,
     #[serde(with = "serde_message")]
     pub output: Option<TaskOutput>,
+    #[serde(default)]
+    pub affinity: HashSet<Vec<u8>>,
 
     pub events: Vec<Event>,
 }
@@ -863,12 +874,40 @@ impl Session {
         self.run(input).await.map(TaskHandle::from)
     }
 
+    pub async fn invoke_with_options<I, O>(
+        &self,
+        input: I,
+        option: TaskOptions,
+    ) -> Result<TaskHandle<O>, FlameError>
+    where
+        I: IntoTaskInput,
+        O: FromTaskOutput + Send + 'static,
+    {
+        self.run_with_options(input, option)
+            .await
+            .map(TaskHandle::from)
+    }
+
     pub async fn run<I, O>(&self, input: I) -> Result<TaskFuture<O>, FlameError>
     where
         I: IntoTaskInput,
         O: FromTaskOutput + Send + 'static,
     {
-        let task = self.create_task(input.into_task_input()?).await?;
+        self.run_with_options(input, TaskOptions::default()).await
+    }
+
+    pub async fn run_with_options<I, O>(
+        &self,
+        input: I,
+        option: TaskOptions,
+    ) -> Result<TaskFuture<O>, FlameError>
+    where
+        I: IntoTaskInput,
+        O: FromTaskOutput + Send + 'static,
+    {
+        let task = self
+            .create_task_with_options(input.into_task_input()?, option)
+            .await?;
         let session = self.clone();
         let session_id = session.id.clone();
         let task_id = task.id;
@@ -890,6 +929,15 @@ impl Session {
     }
 
     pub async fn create_task(&self, input: Option<TaskInput>) -> Result<Task, FlameError> {
+        self.create_task_with_options(input, TaskOptions::default())
+            .await
+    }
+
+    pub async fn create_task_with_options(
+        &self,
+        input: Option<TaskInput>,
+        option: TaskOptions,
+    ) -> Result<Task, FlameError> {
         trace_fn!("Session::create_task");
         let mut client = self
             .client
@@ -901,6 +949,7 @@ impl Session {
                 session_id: self.id.clone(),
                 input: input.map(|input| input.to_vec()),
                 output: None,
+                affinity: option.affinity.into_iter().collect(),
             }),
         };
 
@@ -1155,6 +1204,7 @@ impl TryFrom<&rpc::Task> for Task {
             ssn_id: spec.session_id.clone(),
             input: spec.input.map(TaskInput::from),
             output: spec.output.map(TaskOutput::from),
+            affinity: spec.affinity.into_iter().collect(),
             state: TaskState::try_from(status.state).unwrap_or(TaskState::default()),
             events,
         })
@@ -1487,6 +1537,7 @@ mod tests {
             state,
             input: None,
             output: None,
+            affinity: HashSet::new(),
             events: Vec::new(),
         }
     }

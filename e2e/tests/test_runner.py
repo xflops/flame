@@ -17,12 +17,13 @@ from pathlib import Path
 
 import flamepy
 import pytest
-from flamepy import runner
+from flamepy import TaskOptions, runner
 from flamepy.runner import SessionContext
 
 from e2e.helpers import (
     Calculator,
     Counter,
+    DataAwareService,
     RecursiveService,
     greet_func,
     sum_func,
@@ -94,6 +95,21 @@ def test_runner_with_class(check_package_config, check_flmrun_app):
         # Get the result
         value = res_r.get()
         assert value == 6, f"Expected 6, got {value}"
+
+
+def test_runner_data_aware_scheduling(check_package_config, check_flmrun_app):
+    """Runner carries a service publication into a later affinity task."""
+    with runner.Runner("test-runner-das") as rr:
+        service = rr.service(DataAwareService, warmup=1)
+        _, affinity_key = service.run("warmup").get()
+        affinity = service.run(
+            "affinity-match",
+            option=TaskOptions(affinity={affinity_key}),
+        )
+
+        value, executor_key = affinity.get()
+        assert value == "affinity-match"
+        assert executor_key == affinity_key
 
 
 def test_runner_with_instance(check_package_config, check_flmrun_app):

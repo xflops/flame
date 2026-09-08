@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import yaml
 
@@ -53,6 +53,21 @@ class TaskState(IntEnum):
     RUNNING = 1
     SUCCEED = 2
     FAILED = 3
+
+
+@dataclass
+class TaskOptions:
+    """Extensible options for one task; affinity is its first field."""
+
+    affinity: Set[bytes] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(key, bytes) for key in self.affinity):
+            raise TypeError("TaskOptions.affinity must contain bytes values")
+
+
+# Compatibility alias; the task-creation parameter itself is named ``option``.
+TaskOption = TaskOptions
 
 
 class ApplicationState(IntEnum):
@@ -224,6 +239,7 @@ class Task:
     creation_time: datetime
     input: Any = None
     output: Any = None
+    affinity: Set[bytes] = field(default_factory=set)
     completion_time: Optional[datetime] = None
     events: Optional[List[Event]] = None
 

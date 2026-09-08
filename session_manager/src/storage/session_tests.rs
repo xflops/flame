@@ -245,7 +245,7 @@ mod tests {
             let attr = create_session_attr("close-cancel-pending-ssn");
             storage.create_session(attr).await.unwrap();
             let task = storage
-                .create_task("close-cancel-pending-ssn".to_string(), None)
+                .create_task("close-cancel-pending-ssn".to_string(), None, None)
                 .await
                 .unwrap();
 
@@ -269,7 +269,7 @@ mod tests {
             let attr = create_session_attr("close-running-ssn");
             storage.create_session(attr).await.unwrap();
             let task = storage
-                .create_task("close-running-ssn".to_string(), None)
+                .create_task("close-running-ssn".to_string(), None, None)
                 .await
                 .unwrap();
             let ssn_ptr = storage

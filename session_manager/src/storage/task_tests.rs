@@ -53,7 +53,7 @@ mod tests {
             storage.create_session(attr).await.unwrap();
 
             let task = storage
-                .create_task("task-test-ssn".to_string(), None)
+                .create_task("task-test-ssn".to_string(), None, None)
                 .await
                 .unwrap();
 
@@ -70,11 +70,37 @@ mod tests {
 
             let input = bytes::Bytes::from(vec![1u8, 2, 3]);
             let task = storage
-                .create_task("task-input-ssn".to_string(), Some(input.clone()))
+                .create_task("task-input-ssn".to_string(), Some(input.clone()), None)
                 .await
                 .unwrap();
 
             assert_eq!(task.input, Some(input));
+        }
+
+        #[tokio::test]
+        async fn creates_task_with_affinity() {
+            let ctx = test_context();
+            let storage = storage::new_ptr(&ctx).await.unwrap();
+
+            let attr = create_session_attr("task-affinity-ssn");
+            storage.create_session(attr).await.unwrap();
+
+            let affinity = std::collections::HashSet::from([
+                bytes::Bytes::from_static(b"model-a:prefix-1"),
+                bytes::Bytes::from_static(b"model-a:prefix-2"),
+            ]);
+            let task = storage
+                .create_task(
+                    "task-affinity-ssn".to_string(),
+                    None,
+                    Some(common::apis::TaskOptions {
+                        affinity: affinity.clone(),
+                    }),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(task.affinity, affinity);
         }
 
         #[tokio::test]
@@ -86,11 +112,11 @@ mod tests {
             storage.create_session(attr).await.unwrap();
 
             let task1 = storage
-                .create_task("multi-task-ssn".to_string(), None)
+                .create_task("multi-task-ssn".to_string(), None, None)
                 .await
                 .unwrap();
             let task2 = storage
-                .create_task("multi-task-ssn".to_string(), None)
+                .create_task("multi-task-ssn".to_string(), None, None)
                 .await
                 .unwrap();
 
@@ -103,7 +129,7 @@ mod tests {
             let storage = storage::new_ptr(&ctx).await.unwrap();
 
             let result = storage
-                .create_task("nonexistent-ssn".to_string(), None)
+                .create_task("nonexistent-ssn".to_string(), None, None)
                 .await;
             assert!(result.is_err());
         }
@@ -121,7 +147,7 @@ mod tests {
             storage.create_session(attr).await.unwrap();
 
             let created_task = storage
-                .create_task("get-task-ssn".to_string(), None)
+                .create_task("get-task-ssn".to_string(), None, None)
                 .await
                 .unwrap();
 
@@ -162,7 +188,7 @@ mod tests {
             storage.create_session(attr).await.unwrap();
 
             let created_task = storage
-                .create_task("ptr-task-ssn".to_string(), None)
+                .create_task("ptr-task-ssn".to_string(), None, None)
                 .await
                 .unwrap();
 
@@ -202,7 +228,7 @@ mod tests {
 
             for _ in 0..5 {
                 storage
-                    .create_task("list-task-ssn".to_string(), None)
+                    .create_task("list-task-ssn".to_string(), None, None)
                     .await
                     .unwrap();
             }
@@ -233,7 +259,7 @@ mod tests {
             storage.create_session(attr).await.unwrap();
 
             let task = storage
-                .create_task("update-state-ssn".to_string(), None)
+                .create_task("update-state-ssn".to_string(), None, None)
                 .await
                 .unwrap();
 
@@ -266,7 +292,7 @@ mod tests {
             storage.create_session(attr).await.unwrap();
 
             let task = storage
-                .create_task("state-msg-ssn".to_string(), None)
+                .create_task("state-msg-ssn".to_string(), None, None)
                 .await
                 .unwrap();
 
@@ -308,7 +334,7 @@ mod tests {
             storage.create_session(attr).await.unwrap();
 
             let task = storage
-                .create_task("result-ssn".to_string(), None)
+                .create_task("result-ssn".to_string(), None, None)
                 .await
                 .unwrap();
 
@@ -345,7 +371,7 @@ mod tests {
             storage.create_session(attr).await.unwrap();
 
             let task = storage
-                .create_task("fail-result-ssn".to_string(), None)
+                .create_task("fail-result-ssn".to_string(), None, None)
                 .await
                 .unwrap();
 

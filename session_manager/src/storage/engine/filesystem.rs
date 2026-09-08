@@ -53,7 +53,7 @@ use common::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationSchema, ApplicationState,
     ExecutorID, ExecutorState, Node, NodeInfo, NodeState, ResourceRequirement, Session,
     SessionAttributes, SessionID, SessionState, SessionStatus, Shim, Task, TaskGID, TaskID,
-    TaskInput, TaskOutput, TaskResult, TaskState,
+    TaskInput, TaskOptions, TaskOutput, TaskResult, TaskState,
 };
 use common::{FlameError, FLAME_HOME};
 
@@ -86,6 +86,10 @@ struct TaskMetadata {
     pub output_offset: u64,
     /// Length of output data in bytes
     pub output_len: u64,
+    /// Offset in affinity.bin where the encoded affinity vector starts
+    pub affinity_offset: u64,
+    /// Length of the encoded affinity vector in bytes
+    pub affinity_len: u64,
 }
 
 /// Session metadata stored as JSON.
@@ -727,6 +731,20 @@ impl FilesystemEngine {
             None
         };
 
+        let affinity: std::collections::HashSet<Bytes> = if meta.affinity_len > 0 {
+            let data = self.read_data(
+                session_id,
+                "affinity.bin",
+                meta.affinity_offset,
+                meta.affinity_len,
+            )?;
+            let (keys, _): (Vec<Vec<u8>>, _) = bincode::decode_from_slice(&data, bincode_config())
+                .map_err(|e| FlameError::Storage(e.to_string()))?;
+            keys.into_iter().map(Bytes::from).collect()
+        } else {
+            Default::default()
+        };
+
         let state = TaskState::try_from(meta.state as i32)?;
         let completion_time = if meta.completion_time > 0 {
             DateTime::from_timestamp(meta.completion_time, 0)
@@ -740,6 +758,7 @@ impl FilesystemEngine {
             version: meta.version,
             input,
             output,
+            affinity,
             creation_time: DateTime::from_timestamp(meta.creation_time, 0)
                 .ok_or_else(|| FlameError::Storage("Invalid creation time".to_string()))?,
             completion_time,
@@ -1213,6 +1232,7 @@ impl Engine for FilesystemEngine {
         &self,
         ssn_id: SessionID,
         input: Option<TaskInput>,
+        options: Option<TaskOptions>,
     ) -> Result<Task, FlameError> {
         let ssn_meta = self.read_session_metadata(&ssn_id)?;
         if ssn_meta.state != SessionState::Open as i32 {
@@ -1233,6 +1253,16 @@ impl Engine for FilesystemEngine {
             (0, 0)
         };
 
+        let affinity_data = options
+            .unwrap_or_default()
+            .affinity
+            .iter()
+            .map(|key| key.to_vec())
+            .collect::<Vec<_>>();
+        let affinity_data = bincode::encode_to_vec(affinity_data, bincode_config())
+            .map_err(|e| FlameError::Storage(e.to_string()))?;
+        let affinity_offset = self.append_data(&ssn_id, "affinity.bin", &affinity_data)?;
+
         let mut meta = TaskMetadata {
             id: task_id,
             version: 1,
@@ -1244,6 +1274,8 @@ impl Engine for FilesystemEngine {
             input_len,
             output_offset: 0,
             output_len: 0,
+            affinity_offset,
+            affinity_len: affinity_data.len() as u64,
         };
 
         meta.checksum = calculate_checksum(&meta);
@@ -1669,6 +1701,8 @@ mod tests {
             input_len: u64::MAX,
             output_offset: u64::MAX,
             output_len: u64::MAX,
+            affinity_offset: u64::MAX,
+            affinity_len: u64::MAX,
         };
 
         let buf1 = bincode::encode_to_vec(&meta1, bincode_config()).unwrap();
@@ -1690,6 +1724,8 @@ mod tests {
             input_len: 100,
             output_offset: 0,
             output_len: 0,
+            affinity_offset: 0,
+            affinity_len: 0,
         };
 
         let checksum1 = calculate_checksum(&meta);
@@ -1901,7 +1937,7 @@ mod tests {
         // Create task with input
         let input = Bytes::from("test input data");
         let task = engine
-            .create_task("test-session".to_string(), Some(input.clone()))
+            .create_task("test-session".to_string(), Some(input.clone()), None)
             .await
             .unwrap();
         assert_eq!(task.id, 1);
@@ -1943,7 +1979,7 @@ mod tests {
 
         // Create another task
         let task5 = engine
-            .create_task("test-session".to_string(), None)
+            .create_task("test-session".to_string(), None, None)
             .await
             .unwrap();
         assert_eq!(task5.id, 2);
@@ -2081,13 +2117,13 @@ mod tests {
         engine.create_session(ssn_attr).await.unwrap();
 
         let task1 = engine
-            .create_task("test-session".to_string(), None)
+            .create_task("test-session".to_string(), None, None)
             .await
             .unwrap();
         assert_eq!(task1.state, TaskState::Pending);
 
         let task2 = engine
-            .create_task("test-session".to_string(), None)
+            .create_task("test-session".to_string(), None, None)
             .await
             .unwrap();
         assert_eq!(task2.state, TaskState::Pending);
@@ -2142,7 +2178,7 @@ mod tests {
         engine.create_session(ssn_attr).await.unwrap();
 
         let task = engine
-            .create_task("test-session".to_string(), None)
+            .create_task("test-session".to_string(), None, None)
             .await
             .unwrap();
 

@@ -209,7 +209,7 @@ mod tests {
             }))?;
 
         for _ in 0..task_num {
-            tokio_test::block_on(controller.create_task(ssn_1.id.clone(), None))?;
+            tokio_test::block_on(controller.create_task(ssn_1.id.clone(), None, None))?;
         }
 
         for i in 0..10 {
@@ -311,7 +311,7 @@ mod tests {
                 gpu: 0,
             }),
         }))?;
-        tokio_test::block_on(controller.create_task(ssn_id.clone(), None))?;
+        tokio_test::block_on(controller.create_task(ssn_id.clone(), None, None))?;
 
         {
             let ssn_ptr = controller.storage().get_session_ptr(ssn_id.clone())?;

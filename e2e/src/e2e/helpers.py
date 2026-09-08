@@ -4,6 +4,7 @@ These are defined in a separate module so they can be properly pickled.
 """
 
 import json
+import os
 import time
 from dataclasses import asdict
 from typing import Optional
@@ -26,6 +27,15 @@ from e2e.api import (
 def sum_func(a: int, b: int) -> int:
     """Sum two integers."""
     return a + b
+
+
+class DataAwareService:
+    """Small Runner service used to exercise attribute publication and affinity."""
+
+    def run(self, value: str) -> tuple[str, bytes]:
+        affinity_key = f"e2e:data-aware:{os.getpid()}".encode()
+        self._flame_session_context.publish({affinity_key})
+        return value, affinity_key
 
 
 def multiply_func(a: int, b: int) -> int:

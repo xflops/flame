@@ -28,8 +28,18 @@ message TaskContext {
     optional bytes input = 4;
 }
 
+message OnSessionEnterResponse {
+    Result result = 1;
+    optional ExecutorAttributes attributes = 2;
+}
+
+message OnTaskInvokeResponse {
+    TaskResult task_result = 1;
+    optional ExecutorAttributes attributes = 2;
+}
+
 service Instance {
-    rpc OnSessionEnter(SessionContext) returns (Result) {}
-    rpc OnTaskInvoke(TaskContext) returns (TaskResult) {}
+    rpc OnSessionEnter(SessionContext) returns (OnSessionEnterResponse) {}
+    rpc OnTaskInvoke(TaskContext) returns (OnTaskInvokeResponse) {}
     rpc OnSessionLeave(EmptyRequest) returns (Result) {}
 }

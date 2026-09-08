@@ -20,7 +20,7 @@ use crate::FlameError;
 use common::apis::{
     Application, ApplicationAttributes, ApplicationID, CommonData, Event, ExecutorID,
     ExecutorState, Node, Session, SessionAttributes, SessionID, Task, TaskGID, TaskInput,
-    TaskOutput, TaskResult, TaskState,
+    TaskOptions, TaskOutput, TaskResult, TaskState,
 };
 
 mod filesystem;
@@ -67,6 +67,7 @@ pub trait Engine: Send + Sync + 'static {
         &self,
         ssn_id: SessionID,
         task_input: Option<TaskInput>,
+        options: Option<TaskOptions>,
     ) -> Result<Task, FlameError>;
 
     async fn get_task(&self, gid: TaskGID) -> Result<Task, FlameError>;

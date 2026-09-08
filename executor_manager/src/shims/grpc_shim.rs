@@ -27,7 +27,7 @@ use tower::service_fn;
 
 use ::rpc::flame::v1 as rpc;
 use rpc::instance_client::InstanceClient;
-use rpc::EmptyRequest;
+use rpc::{EmptyRequest, ExecutorAttributes};
 
 use crate::shims::{ExecutorWorkDir, Shim};
 use common::apis::{SessionContext, TaskContext, TaskResult, TaskState};
@@ -104,7 +104,10 @@ impl GrpcShim {
 
 #[async_trait]
 impl Shim for GrpcShim {
-    async fn on_session_enter(&mut self, ctx: &SessionContext) -> Result<(), FlameError> {
+    async fn on_session_enter(
+        &mut self,
+        ctx: &SessionContext,
+    ) -> Result<super::SessionEnterResponse, FlameError> {
         trace_fn!("GrpcShim::on_session_enter");
 
         if let Some(ref mut client) = self.client {
@@ -112,20 +115,27 @@ impl Shim for GrpcShim {
             tracing::debug!("req: {:?}", req);
             let resp = client.on_session_enter(req).await?;
             let output = resp.into_inner();
-            if output.return_code != 0 {
-                return Err(FlameError::Internal(output.message.unwrap_or_default()));
+            let result = output.result.unwrap_or_default();
+            if result.return_code != 0 {
+                return Err(FlameError::Internal(result.message.unwrap_or_default()));
             }
+            return Ok(super::SessionEnterResponse {
+                executor_attributes: output
+                    .attributes
+                    .map(|attributes| std::sync::Arc::new(std::sync::Mutex::new(attributes))),
+            });
         } else {
             return Err(FlameError::Internal(format!(
                 "no connection to service at <{}>",
                 self.endpoint
             )));
         }
-
-        Ok(())
     }
 
-    async fn on_task_invoke(&mut self, ctx: &TaskContext) -> Result<TaskResult, FlameError> {
+    async fn on_task_invoke(
+        &mut self,
+        ctx: &TaskContext,
+    ) -> Result<super::TaskInvokeResponse, FlameError> {
         trace_fn!("GrpcShim::on_task_invoke");
 
         if let Some(ref mut client) = self.client {
@@ -136,7 +146,7 @@ impl Shim for GrpcShim {
 
             // Convert rpc::TaskResult to TaskResult
             // The From trait handles return_code != 0 by setting TaskState::Failed
-            let task_result: TaskResult = output.into();
+            let task_result: TaskResult = output.task_result.unwrap_or_default().into();
 
             // Log error if task failed
             if task_result.state == TaskState::Failed {
@@ -144,7 +154,10 @@ impl Shim for GrpcShim {
                 tracing::error!("Task failed: {}", error_msg);
             }
 
-            return Ok(task_result);
+            return Ok(super::TaskInvokeResponse {
+                task_result,
+                attributes: output.attributes,
+            });
         } else {
             return Err(FlameError::Internal(format!(
                 "no connection to service at <{}>",

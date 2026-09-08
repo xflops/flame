@@ -120,16 +120,19 @@ impl State for IdleState {
             let mut shim = shim_ptr.lock().await;
             shim.on_session_enter(&ssn).await
         };
-        if let Err(e) = enter_result {
-            self.bind_executor_failed(
-                BIND_RESULT_ON_SESSION_ENTER_FAILED,
-                format!("on_session_enter failed: {e}"),
-                &ssn,
-                Some(shim_ptr.clone()),
-            )
-            .await?;
-            return Ok(self.executor.clone());
-        }
+        let response = match enter_result {
+            Ok(response) => response,
+            Err(e) => {
+                self.bind_executor_failed(
+                    BIND_RESULT_ON_SESSION_ENTER_FAILED,
+                    format!("on_session_enter failed: {e}"),
+                    &ssn,
+                    Some(shim_ptr.clone()),
+                )
+                .await?;
+                return Ok(self.executor.clone());
+            }
+        };
 
         self.client
             .bind_executor_completed(
@@ -137,6 +140,12 @@ impl State for IdleState {
                 Some(FlameResult {
                     return_code: BIND_RESULT_OK,
                     message: None,
+                }),
+                response.executor_attributes.map(|attributes| {
+                    attributes
+                        .lock()
+                        .expect("executor attributes mutex poisoned")
+                        .clone()
                 }),
             )
             .await?;
@@ -176,6 +185,7 @@ impl IdleState {
                     return_code,
                     message: Some(message),
                 }),
+                None,
             )
             .await?;
         self.executor.session = Some(ssn.clone());

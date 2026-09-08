@@ -31,6 +31,7 @@ use tokio::sync::Mutex;
 use crate::executor::Executor;
 use crate::shims::grpc_shim::GrpcShim;
 use crate::shims::{ExecutorWorkDir, Shim, ShimPtr};
+use ::rpc::flame::v1 as rpc;
 use common::apis::{ApplicationContext, SessionContext, TaskContext, TaskOutput, TaskResult};
 use common::{
     FlameError, FLAME_CACHE_ENDPOINT, FLAME_CA_FILE, FLAME_ENDPOINT, FLAME_INSTANCE_ENDPOINT,
@@ -294,13 +295,19 @@ impl Drop for HostShim {
 
 #[async_trait]
 impl Shim for HostShim {
-    async fn on_session_enter(&mut self, ctx: &SessionContext) -> Result<(), FlameError> {
+    async fn on_session_enter(
+        &mut self,
+        ctx: &SessionContext,
+    ) -> Result<super::SessionEnterResponse, FlameError> {
         trace_fn!("HostShim::on_session_enter");
 
         self.instance_client.on_session_enter(ctx).await
     }
 
-    async fn on_task_invoke(&mut self, ctx: &TaskContext) -> Result<TaskResult, FlameError> {
+    async fn on_task_invoke(
+        &mut self,
+        ctx: &TaskContext,
+    ) -> Result<super::TaskInvokeResponse, FlameError> {
         trace_fn!("HostShim::on_task_invoke");
 
         self.instance_client.on_task_invoke(ctx).await

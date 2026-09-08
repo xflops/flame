@@ -11,9 +11,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::{env, fmt};
 
+use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 #[cfg(target_os = "linux")]
 use rustix::system;
@@ -281,10 +282,18 @@ pub struct Task {
     pub version: u32,
     pub input: Option<TaskInput>,
     pub output: Option<TaskOutput>,
+    /// Opaque application-defined data-locality keys.
+    pub affinity: HashSet<Bytes>,
     pub creation_time: DateTime<Utc>,
     pub completion_time: Option<DateTime<Utc>>,
     pub events: Vec<Event>,
     pub state: TaskState,
+}
+
+/// Extensible controls supplied when a task is created.
+#[derive(Clone, Debug, Default)]
+pub struct TaskOptions {
+    pub affinity: HashSet<Bytes>,
 }
 
 impl Default for Task {
@@ -295,6 +304,7 @@ impl Default for Task {
             version: 0,
             input: None,
             output: None,
+            affinity: HashSet::new(),
             creation_time: Utc::now(),
             completion_time: None,
             events: Vec::new(),

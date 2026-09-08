@@ -39,6 +39,7 @@ from flamepy.core.types import (
     Task,
     TaskID,
     TaskInformer,
+    TaskOptions,
     TaskState,
     short_name,
 )
@@ -696,7 +697,7 @@ class Session:
         """Get the common data of Session as bytes."""
         return self._common_data
 
-    def create_task(self, input_data: bytes) -> Task:
+    def create_task(self, input_data: bytes, option: Optional[TaskOptions] = None) -> Task:
         """Create a new task in the session.
 
         Args:
@@ -706,7 +707,8 @@ class Session:
         if not isinstance(input_data, bytes):
             raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "input_data must be bytes in core API")
 
-        task_spec = TaskSpec(session_id=self.id, input=input_data)
+        option = option or TaskOptions()
+        task_spec = TaskSpec(session_id=self.id, input=input_data, affinity=list(option.affinity))
 
         request = CreateTaskRequest(task=task_spec)
 
@@ -719,6 +721,7 @@ class Session:
                 state=TaskState(response.status.state),
                 creation_time=datetime.fromtimestamp(response.status.creation_time / 1000, tz=timezone.utc),
                 input=input_data,
+                affinity=set(getattr(getattr(response, "spec", None), "affinity", option.affinity)),
                 completion_time=(datetime.fromtimestamp(response.status.completion_time / 1000, tz=timezone.utc) if response.status.HasField("completion_time") else None),
                 events=_events_from_proto(response.status.events),
             )
@@ -740,6 +743,7 @@ class Session:
                 creation_time=datetime.fromtimestamp(response.status.creation_time / 1000, tz=timezone.utc),
                 input=response.spec.input if response.spec.HasField("input") else None,
                 output=response.spec.output if response.spec.HasField("output") else None,
+                affinity=set(response.spec.affinity),
                 completion_time=(datetime.fromtimestamp(response.status.completion_time / 1000, tz=timezone.utc) if response.status.HasField("completion_time") else None),
                 events=_events_from_proto(response.status.events),
             )
@@ -787,7 +791,7 @@ class Session:
         except grpc.RpcError as e:
             raise FlameError(FlameErrorCode.INTERNAL, f"failed to watch task: {e.details()}")
 
-    def invoke(self, input_data: Any) -> Any:
+    def invoke(self, input_data: Any, option: Optional[TaskOptions] = None) -> Any:
         """Invoke a task with the given input (synchronous).
 
         This method blocks until the task completes or fails.
@@ -802,9 +806,9 @@ class Session:
             >>> result = session.invoke(b"input data")
             >>> print(result)
         """
-        return self.run(input_data).result()
+        return self.run(input_data, option=option).result()
 
-    def run(self, input_data: Any) -> Future:
+    def run(self, input_data: Any, option: Optional[TaskOptions] = None) -> Future:
         """Run a task asynchronously and return a Future.
 
         This method returns immediately after task creation.
@@ -825,7 +829,7 @@ class Session:
             >>> wait(futures)
             >>> results = [f.result() for f in futures]
         """
-        task = self.create_task(input_data)
+        task = self.create_task(input_data, option=option)
         future = _LazyTaskFuture(self, task.id)
         future_informer = _FutureTaskInformer(future)
 
@@ -859,6 +863,7 @@ def _task_from_proto(response, session_id: str) -> Task:
         creation_time=datetime.fromtimestamp(response.status.creation_time / 1000, tz=timezone.utc),
         input=response.spec.input if response.spec.HasField("input") else None,
         output=response.spec.output if response.spec.HasField("output") else None,
+        affinity=set(response.spec.affinity),
         completion_time=(datetime.fromtimestamp(response.status.completion_time / 1000, tz=timezone.utc) if response.status.HasField("completion_time") else None),
         events=_events_from_proto(response.status.events),
     )

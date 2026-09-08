@@ -11,17 +11,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use common::apis::{
     Application, ApplicationAttributes, ApplicationID, CommonData, Event, EventOwner, ExecutorID,
     ExecutorState, FlameResult, Node, NodeState, Session, SessionAttributes, SessionID, SessionPtr,
-    SessionState, Task, TaskGID, TaskID, TaskInput, TaskPtr, TaskResult, TaskState,
+    SessionState, Task, TaskGID, TaskID, TaskInput, TaskOptions, TaskPtr, TaskResult, TaskState,
 };
 
 use common::FlameError;
 use stdng::{lock_ptr, logs::TraceFn, trace_fn, MutexPtr};
+
+use ::rpc::flame::v1 as rpc;
 
 use crate::model::{
     ConnectionCallbacks, ConnectionState, Executor, ExecutorFilter, ExecutorPtr, NodeConnectionPtr,
@@ -89,6 +91,14 @@ pub struct Controller {
     storage: StoragePtr,
     connection_manager: ConnectionManager<NodeCallbacks>,
     notifier: NotifyManagerPtr,
+    // Runtime-local executor attributes are deliberately not persisted. A
+    // service republishes after binding if it still owns the underlying data.
+    executor_attributes: MutexPtr<HashMap<ExecutorID, ExecutorAttributeSet>>,
+}
+
+#[derive(Clone, Debug)]
+struct ExecutorAttributeSet {
+    attr: HashSet<Vec<u8>>,
 }
 
 pub type ControllerPtr = Arc<Controller>;
@@ -101,10 +111,15 @@ pub fn new_ptr(storage: StoragePtr) -> ControllerPtr {
         storage,
         connection_manager: ConnectionManager::new(callbacks),
         notifier: NotifyManager::new_ptr(),
+        executor_attributes: stdng::new_ptr(HashMap::new()),
     })
 }
 
 impl Controller {
+    const MAX_EXECUTOR_ATTRIBUTES: usize = 1_024;
+    const MAX_EXECUTOR_ATTRIBUTE_BYTES: usize = 256;
+    const MAX_EXECUTOR_ATTRIBUTES_BYTES: usize = 64 * 1024;
+
     // ========================================================================
     // Accessors
     // ========================================================================
@@ -112,6 +127,85 @@ impl Controller {
     /// Returns a reference to the storage.
     pub fn storage(&self) -> &StoragePtr {
         &self.storage
+    }
+
+    /// Returns the current volatile attribute set for a bound executor.
+    pub(crate) fn executor_attributes(&self, id: &ExecutorID) -> Option<HashSet<Vec<u8>>> {
+        lock_ptr!(self.executor_attributes)
+            .ok()
+            .and_then(|attributes| attributes.get(id).map(|attributes| attributes.attr.clone()))
+    }
+
+    fn clear_executor_attributes(&self, id: &ExecutorID) {
+        if let Ok(mut attributes) = lock_ptr!(self.executor_attributes) {
+            attributes.remove(id);
+        }
+    }
+
+    fn validate_executor_attributes(
+        attributes: rpc::ExecutorAttributes,
+    ) -> Result<ExecutorAttributeSet, FlameError> {
+        let mut attr = HashSet::with_capacity(attributes.attr.len());
+        let mut total_bytes = 0usize;
+        for value in attributes.attr {
+            if value.is_empty() || value.len() > Self::MAX_EXECUTOR_ATTRIBUTE_BYTES {
+                return Err(FlameError::InvalidConfig(
+                    "executor attributes must be nonempty and at most 256 bytes".to_string(),
+                ));
+            }
+            if attr.insert(value.clone()) {
+                total_bytes += value.len();
+            }
+        }
+        if attr.len() > Self::MAX_EXECUTOR_ATTRIBUTES
+            || total_bytes > Self::MAX_EXECUTOR_ATTRIBUTES_BYTES
+        {
+            return Err(FlameError::InvalidConfig(
+                "executor attribute publication exceeds configured limits".to_string(),
+            ));
+        }
+
+        Ok(ExecutorAttributeSet { attr })
+    }
+
+    fn update_executor_attributes(
+        &self,
+        id: &ExecutorID,
+        attributes: ExecutorAttributeSet,
+    ) -> Result<(), FlameError> {
+        let executor = self.storage.get_executor_ptr(id.clone())?;
+        let executor = lock_ptr!(executor)?;
+        if executor.state != ExecutorState::Bound || executor.ssn_id.is_none() {
+            return Err(FlameError::InvalidState(format!(
+                "executor <{id}> must be bound before publishing attributes"
+            )));
+        }
+        drop(executor);
+
+        let mut indexed = lock_ptr!(self.executor_attributes)?;
+        indexed.insert(id.clone(), attributes);
+        Ok(())
+    }
+
+    fn validate_task_options(options: &TaskOptions) -> Result<(), FlameError> {
+        let total_bytes: usize = options.affinity.iter().map(|key| key.len()).sum();
+        if options
+            .affinity
+            .iter()
+            .any(|key| key.is_empty() || key.len() > Self::MAX_EXECUTOR_ATTRIBUTE_BYTES)
+        {
+            return Err(FlameError::InvalidConfig(
+                "task affinity keys must be nonempty and at most 256 bytes".to_string(),
+            ));
+        }
+        if options.affinity.len() > Self::MAX_EXECUTOR_ATTRIBUTES
+            || total_bytes > Self::MAX_EXECUTOR_ATTRIBUTES_BYTES
+        {
+            return Err(FlameError::InvalidConfig(
+                "task affinity exceeds configured limits".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     // ========================================================================
@@ -349,8 +443,15 @@ impl Controller {
         &self,
         ssn_id: SessionID,
         task_input: Option<TaskInput>,
+        options: Option<TaskOptions>,
     ) -> Result<Task, FlameError> {
-        let task = self.storage.create_task(ssn_id.clone(), task_input).await?;
+        if let Some(options) = options.as_ref() {
+            Self::validate_task_options(options)?;
+        }
+        let task = self
+            .storage
+            .create_task(ssn_id.clone(), task_input, options)
+            .await?;
         let _ = self.notifier.tasks.notify(&ssn_id, 0);
         Ok(task)
     }
@@ -392,7 +493,7 @@ impl Controller {
 
     pub fn get_executor(&self, id: ExecutorID) -> Result<Executor, FlameError> {
         trace_fn!("Controller::get_executor");
-        let exe_ptr = self.storage.get_executor_ptr(id)?;
+        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
         let exe = lock_ptr!(exe_ptr)?;
         Ok((*exe).clone())
     }
@@ -617,14 +718,22 @@ impl Controller {
         &self,
         id: ExecutorID,
         result: Option<FlameResult>,
+        attributes: Option<rpc::ExecutorAttributes>,
     ) -> Result<(), FlameError> {
         trace_fn!("Controller::bind_executor_completed");
-        self.bind_session_completed(id, result).await
+        let attributes = attributes
+            .map(Self::validate_executor_attributes)
+            .transpose()?;
+        self.bind_session_completed(id.clone(), result).await?;
+        if let Some(attributes) = attributes {
+            self.update_executor_attributes(&id, attributes)?;
+        }
+        Ok(())
     }
 
     pub async fn launch_task(&self, id: ExecutorID) -> Result<Option<Task>, FlameError> {
         trace_fn!("Controller::launch_task");
-        let exe_ptr = self.storage.get_executor_ptr(id)?;
+        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         let (ssn_id, task_id) = {
             let exec = lock_ptr!(exe_ptr)?;
@@ -665,7 +774,7 @@ impl Controller {
             }
         };
 
-        let task_ptr = self.wait_for_task(&ssn_ptr, &ssn_id).await?;
+        let task_ptr = self.wait_for_task(&ssn_ptr, &ssn_id, &id).await?;
 
         let Some(task_ptr) = task_ptr else {
             return Ok(None);
@@ -696,6 +805,7 @@ impl Controller {
         &self,
         ssn: &SessionPtr,
         ssn_id: &SessionID,
+        executor_id: &ExecutorID,
     ) -> Result<Option<TaskPtr>, FlameError> {
         let app_name = {
             let ssn_guard = lock_ptr!(ssn)?;
@@ -710,7 +820,8 @@ impl Controller {
         loop {
             {
                 let mut ssn_guard = lock_ptr!(ssn)?;
-                if let Some(task_ptr) = ssn_guard.pop_pending_task() {
+                let attributes = self.executor_attributes(executor_id).unwrap_or_default();
+                if let Some(task_ptr) = ssn_guard.pop_pending_task(&attributes)? {
                     return Ok(Some(task_ptr));
                 }
                 if ssn_guard.status.state == SessionState::Closed {
@@ -733,8 +844,12 @@ impl Controller {
         &self,
         id: ExecutorID,
         task_result: TaskResult,
+        attributes: Option<rpc::ExecutorAttributes>,
     ) -> Result<(), FlameError> {
         trace_fn!("Controller::complete_task");
+        let attributes = attributes
+            .map(Self::validate_executor_attributes)
+            .transpose()?;
         let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
         let (ssn_id, task_id, host) = {
             let exe = lock_ptr!(exe_ptr)?;
@@ -778,6 +893,9 @@ impl Controller {
 
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         state.complete_task(ssn_ptr, task_ptr, task_result).await?;
+        if let Some(attributes) = attributes {
+            self.update_executor_attributes(&id, attributes)?;
+        }
         let _ = self.notifier.tasks.notify(&ssn_id, task_id);
 
         let executor = {
@@ -803,6 +921,7 @@ impl Controller {
 
     pub async fn unbind_executor(&self, id: ExecutorID) -> Result<(), FlameError> {
         trace_fn!("Controller::unbind_executor");
+        self.clear_executor_attributes(&id);
         let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         state.unbind_executor().await?;
@@ -858,6 +977,7 @@ impl Controller {
 
     pub async fn release_executor(&self, id: ExecutorID) -> Result<(), FlameError> {
         trace_fn!("Controller::release_executor");
+        self.clear_executor_attributes(&id);
         let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         state.release_executor().await?;
@@ -886,6 +1006,7 @@ impl Controller {
 
     pub async fn unregister_executor(&self, id: ExecutorID) -> Result<(), FlameError> {
         trace_fn!("Controller::unregister_executor");
+        self.clear_executor_attributes(&id);
         let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
 
         // Get executor info before unregistering for notification
@@ -934,6 +1055,40 @@ mod tests {
         FlameSessionRecovery,
     };
     use tokio::sync::mpsc;
+
+    #[test]
+    fn task_options_reject_invalid_affinity_keys() {
+        assert!(Controller::validate_task_options(&TaskOptions {
+            affinity: std::collections::HashSet::from([bytes::Bytes::new()]),
+        })
+        .is_err());
+        assert!(Controller::validate_task_options(&TaskOptions {
+            affinity: std::collections::HashSet::from([bytes::Bytes::from(vec![0; 257])]),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn executor_attributes_reject_invalid_keys_before_indexing() {
+        assert!(
+            Controller::validate_executor_attributes(rpc::ExecutorAttributes {
+                attr: vec![vec![]],
+            })
+            .is_err()
+        );
+        assert!(
+            Controller::validate_executor_attributes(rpc::ExecutorAttributes {
+                attr: vec![vec![0; 257]],
+            })
+            .is_err()
+        );
+
+        let attributes = Controller::validate_executor_attributes(rpc::ExecutorAttributes {
+            attr: vec![b"kv-cache-key".to_vec(), b"kv-cache-key".to_vec()],
+        })
+        .unwrap();
+        assert_eq!(attributes.attr, HashSet::from([b"kv-cache-key".to_vec()]));
+    }
 
     /// Creates a test storage with a unique SQLite database.
     async fn create_test_storage() -> StoragePtr {
@@ -1050,6 +1205,39 @@ mod tests {
         executor.id
     }
 
+    #[tokio::test]
+    async fn unbind_clears_executor_attributes() {
+        let storage = create_test_storage().await;
+        let controller = new_ptr(storage);
+        let ssn_id = "executor-attributes-unbind".to_string();
+        let executor_id = create_binding_executor(&controller, &ssn_id).await;
+
+        controller
+            .bind_executor_completed(
+                executor_id.clone(),
+                Some(FlameResult {
+                    return_code: BIND_RESULT_OK,
+                    message: None,
+                }),
+                Some(rpc::ExecutorAttributes {
+                    attr: vec![b"kv-cache-key".to_vec()],
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            controller.executor_attributes(&executor_id),
+            Some(HashSet::from([b"kv-cache-key".to_vec()]))
+        );
+
+        controller
+            .unbind_executor(executor_id.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(controller.executor_attributes(&executor_id), None);
+    }
+
     // ========================================================================
     // Controller::register_node Tests
     // ========================================================================
@@ -1069,6 +1257,7 @@ mod tests {
                         return_code: common::apis::BIND_RESULT_ON_SESSION_ENTER_FAILED,
                         message: Some("on_session_enter failed: boom".to_string()),
                     }),
+                    None,
                 )
                 .await
         }
@@ -1176,6 +1365,7 @@ mod tests {
                         return_code: BIND_RESULT_OK,
                         message: None,
                     }),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1208,6 +1398,7 @@ mod tests {
                         return_code: BIND_RESULT_OK,
                         message: None,
                     }),
+                    None,
                 )
                 .await
                 .unwrap_err();

@@ -231,6 +231,7 @@ class RunnerService:
         """Create a wrapper for a callable execution object (function)."""
 
         def wrapper(*args, **kwargs):
+            option = kwargs.pop("option", None)
             # Convert ObjectFuture arguments to ObjectRef
             converted_args = tuple(arg.ref() if isinstance(arg, ObjectFuture) else arg for arg in args)
             converted_kwargs = {key: value.ref() if isinstance(value, ObjectFuture) else value for key, value in kwargs.items()}
@@ -245,7 +246,7 @@ class RunnerService:
             # For RL module: serialize RunnerRequest with cloudpickle, then call core API
             request_bytes = cloudpickle.dumps(request, protocol=cloudpickle.DEFAULT_PROTOCOL)
             # Submit task and return ObjectFuture
-            future = self._session.run(request_bytes)
+            future = self._session.run(request_bytes, option=option)
             return ObjectFuture(future)
 
         # Store the wrapper so __call__ can use it
@@ -286,6 +287,7 @@ class RunnerService:
         """
 
         def wrapper(*args, **kwargs):
+            option = kwargs.pop("option", None)
             # Convert ObjectFuture arguments to ObjectRef
             converted_args = tuple(arg.ref() if isinstance(arg, ObjectFuture) else arg for arg in args)
             converted_kwargs = {key: value.ref() if isinstance(value, ObjectFuture) else value for key, value in kwargs.items()}
@@ -301,7 +303,7 @@ class RunnerService:
             request_bytes = cloudpickle.dumps(request, protocol=cloudpickle.DEFAULT_PROTOCOL)
             logger.info(f"[RunnerService] Submitting task: method={method_name}, session={self._session.id}")
             # Submit task and return ObjectFuture
-            future = self._session.run(request_bytes)
+            future = self._session.run(request_bytes, option=option)
             return ObjectFuture(future)
 
         return wrapper

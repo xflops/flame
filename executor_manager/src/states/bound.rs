@@ -16,6 +16,7 @@ use stdng::{logs::TraceFn, trace_fn};
 
 use crate::client::BackendClient;
 use crate::executor::Executor;
+use crate::shims;
 use crate::states::State;
 use common::apis::{ExecutorState, TaskResult, TaskState};
 use common::FlameError;
@@ -44,10 +45,10 @@ impl State for BoundState {
                         .ok_or(FlameError::InvalidState(
                             "no shim instance in bound state".to_string(),
                         ))?;
-                let task_result = {
+                let response = {
                     let mut shim = shim_ptr.lock().await;
                     match shim.on_task_invoke(&task_ctx).await {
-                        Ok(task_result) => task_result,
+                        Ok(result) => result,
                         Err(e) => {
                             tracing::error!(
                                 "Task <{}/{}> failed during shim invocation on executor <{}>: {}",
@@ -56,17 +57,24 @@ impl State for BoundState {
                                 self.executor.id,
                                 e
                             );
-                            TaskResult {
-                                state: TaskState::Failed,
-                                output: None,
-                                message: Some(e.to_string()),
+                            shims::TaskInvokeResponse {
+                                task_result: TaskResult {
+                                    state: TaskState::Failed,
+                                    output: None,
+                                    message: Some(e.to_string()),
+                                },
+                                attributes: None,
                             }
                         }
                     }
                 };
 
                 self.client
-                    .complete_task(&self.executor.clone(), &task_result)
+                    .complete_task(
+                        &self.executor.clone(),
+                        &response.task_result,
+                        response.attributes,
+                    )
                     .await?;
 
                 let (ssn_id, task_id) = {

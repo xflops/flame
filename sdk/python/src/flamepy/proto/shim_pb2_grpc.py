@@ -38,12 +38,12 @@ class InstanceStub(object):
         self.OnSessionEnter = channel.unary_unary(
                 '/flame.v1.Instance/OnSessionEnter',
                 request_serializer=shim__pb2.SessionContext.SerializeToString,
-                response_deserializer=types__pb2.Result.FromString,
+                response_deserializer=shim__pb2.OnSessionEnterResponse.FromString,
                 _registered_method=True)
         self.OnTaskInvoke = channel.unary_unary(
                 '/flame.v1.Instance/OnTaskInvoke',
                 request_serializer=shim__pb2.TaskContext.SerializeToString,
-                response_deserializer=types__pb2.TaskResult.FromString,
+                response_deserializer=shim__pb2.OnTaskInvokeResponse.FromString,
                 _registered_method=True)
         self.OnSessionLeave = channel.unary_unary(
                 '/flame.v1.Instance/OnSessionLeave',
@@ -79,12 +79,12 @@ def add_InstanceServicer_to_server(servicer, server):
             'OnSessionEnter': grpc.unary_unary_rpc_method_handler(
                     servicer.OnSessionEnter,
                     request_deserializer=shim__pb2.SessionContext.FromString,
-                    response_serializer=types__pb2.Result.SerializeToString,
+                    response_serializer=shim__pb2.OnSessionEnterResponse.SerializeToString,
             ),
             'OnTaskInvoke': grpc.unary_unary_rpc_method_handler(
                     servicer.OnTaskInvoke,
                     request_deserializer=shim__pb2.TaskContext.FromString,
-                    response_serializer=types__pb2.TaskResult.SerializeToString,
+                    response_serializer=shim__pb2.OnTaskInvokeResponse.SerializeToString,
             ),
             'OnSessionLeave': grpc.unary_unary_rpc_method_handler(
                     servicer.OnSessionLeave,
@@ -118,7 +118,7 @@ class Instance(object):
             target,
             '/flame.v1.Instance/OnSessionEnter',
             shim__pb2.SessionContext.SerializeToString,
-            types__pb2.Result.FromString,
+            shim__pb2.OnSessionEnterResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -145,7 +145,7 @@ class Instance(object):
             target,
             '/flame.v1.Instance/OnTaskInvoke',
             shim__pb2.TaskContext.SerializeToString,
-            types__pb2.TaskResult.FromString,
+            shim__pb2.OnTaskInvokeResponse.FromString,
             options,
             channel_credentials,
             insecure,

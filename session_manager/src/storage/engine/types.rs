@@ -91,6 +91,7 @@ pub struct TaskDao {
     pub version: u32,
     pub input: Option<Vec<u8>>,
     pub output: Option<Vec<u8>>,
+    pub affinity: Option<String>,
 
     pub creation_time: i64,
     pub completion_time: Option<i64>,
@@ -197,6 +198,16 @@ impl TryFrom<&TaskDao> for Task {
             version: task.version,
             input: task.input.clone().map(Bytes::from),
             output: task.output.clone().map(Bytes::from),
+            affinity: task
+                .affinity
+                .as_deref()
+                .map(serde_json::from_str::<Vec<Vec<u8>>>)
+                .transpose()
+                .map_err(|e| FlameError::Storage(e.to_string()))?
+                .unwrap_or_default()
+                .into_iter()
+                .map(Bytes::from)
+                .collect(),
 
             creation_time: DateTime::<Utc>::from_timestamp(task.creation_time, 0)
                 .ok_or(FlameError::Storage("invalid creation time".to_string()))?,

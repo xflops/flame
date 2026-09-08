@@ -154,6 +154,7 @@ impl From<&Task> for rpc::Task {
             session_id: task.ssn_id.to_string(),
             input: task.input.clone().map(TaskInput::into),
             output: task.output.clone().map(TaskOutput::into),
+            affinity: task.affinity.iter().map(|key| key.to_vec()).collect(),
         });
         let status = Some(rpc::TaskStatus {
             state: task.state as i32,

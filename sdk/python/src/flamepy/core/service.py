@@ -14,10 +14,11 @@ limitations under the License.
 import logging
 import os
 import sys
+import threading
 from abc import abstractmethod
 from concurrent import futures
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional, Set
 
 # Handle typing.override compatibility for Python < 3.12
 if sys.version_info >= (3, 12):
@@ -39,6 +40,8 @@ from flamepy.proto.types_pb2 import (
     Result,
 )
 from flamepy.proto.types_pb2 import TaskResult as TaskResultProto
+from flamepy.proto.types_pb2 import ExecutorAttributes
+from flamepy.proto.shim_pb2 import OnSessionEnterResponse, OnTaskInvokeResponse
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +76,27 @@ class SessionContext:
 
     session_id: str
     application: ApplicationContext
+    _publish_executor_attributes: Optional[Callable[[Set[bytes]], None]] = field(
+        default=None, init=False, repr=False
+    )
+
+    def publish(self, attr: Set[bytes]) -> None:
+        """Publish a full replacement of this executor's opaque locality keys."""
+        if any(not isinstance(key, bytes) for key in attr):
+            raise TypeError("executor attributes must contain bytes values")
+        if self._publish_executor_attributes is None:
+            raise RuntimeError("SessionContext is not attached to a service")
+        self._publish_executor_attributes(set(attr))
+
+    def __getstate__(self):
+        """Exclude the service callback when Runner persists an execution object."""
+        state = self.__dict__.copy()
+        state.pop("_publish_executor_attributes", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._publish_executor_attributes = None
 
     def common_data(self) -> Optional[bytes]:
         """Get the common data as bytes."""
@@ -133,6 +157,23 @@ class FlameInstanceServicer(InstanceServicer):
 
     def __init__(self, service: FlameService):
         self._service = service
+        self._session_context: Optional[SessionContext] = None
+        self._executor_attributes: Optional[ExecutorAttributes] = None
+        self._executor_attributes_lock = threading.Lock()
+
+    def _publish_executor_attributes(self, attr: Set[bytes]) -> None:
+        with self._executor_attributes_lock:
+            self._executor_attributes = ExecutorAttributes(attr=list(attr))
+
+    def _take_executor_attributes(self) -> Optional[ExecutorAttributes]:
+        with self._executor_attributes_lock:
+            attributes = self._executor_attributes
+            self._executor_attributes = None
+            return attributes
+
+    def _clear_executor_attributes(self) -> None:
+        with self._executor_attributes_lock:
+            self._executor_attributes = None
 
     @override
     def OnSessionEnter(self, request, context):  # noqa: N802
@@ -141,6 +182,7 @@ class FlameInstanceServicer(InstanceServicer):
 
         try:
             logger.debug(f"OnSessionEnter request: {request}")
+            self._clear_executor_attributes()
 
             # Convert protobuf request to SessionContext
             app_context = ApplicationContext(
@@ -161,6 +203,8 @@ class FlameInstanceServicer(InstanceServicer):
                 session_id=request.session_id,
                 application=app_context,
             )
+            session_context._publish_executor_attributes = self._publish_executor_attributes
+            self._session_context = session_context
 
             logger.debug(f"session_context: {session_context}")
 
@@ -169,13 +213,14 @@ class FlameInstanceServicer(InstanceServicer):
             logger.debug("on_session_enter completed successfully")
 
             # Return result
-            return Result(
-                return_code=0,
+            return OnSessionEnterResponse(
+                result=Result(return_code=0),
+                attributes=self._take_executor_attributes(),
             )
 
         except Exception as e:
             logger.error(f"Error in OnSessionEnter: {e}")
-            return Result(return_code=-1, message=f"{str(e)}")
+            return OnSessionEnterResponse(result=Result(return_code=-1, message=f"{str(e)}"))
 
     @override
     def OnTaskInvoke(self, request, context):  # noqa: N802
@@ -201,12 +246,23 @@ class FlameInstanceServicer(InstanceServicer):
 
             # Return task output. Leave optional output unset for services that intentionally return None.
             if output_data is None:
-                return TaskResultProto(return_code=0, message=None)
-            return TaskResultProto(return_code=0, output=output_data, message=None)
+                task_result = TaskResultProto(return_code=0, message=None)
+            else:
+                task_result = TaskResultProto(return_code=0, output=output_data, message=None)
+            return OnTaskInvokeResponse(
+                task_result=task_result,
+                attributes=(
+                    self._take_executor_attributes()
+                    if self._session_context is not None
+                    else None
+                ),
+            )
 
         except Exception as e:
             logger.error(f"Error in OnTaskInvoke: {e}")
-            return TaskResultProto(return_code=-1, output=None, message=f"{str(e)}")
+            return OnTaskInvokeResponse(
+                task_result=TaskResultProto(return_code=-1, output=None, message=f"{str(e)}")
+            )
 
     @override
     def OnSessionLeave(self, request, context):  # noqa: N802

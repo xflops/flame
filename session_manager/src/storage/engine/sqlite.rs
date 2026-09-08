@@ -33,8 +33,8 @@ use common::{
     apis::{
         Application, ApplicationAttributes, ApplicationID, ApplicationSchema, ApplicationState,
         CommonData, Event, ExecutorID, ExecutorState, Node, Session, SessionAttributes, SessionID,
-        SessionState, SessionStatus, Shim, Task, TaskGID, TaskID, TaskInput, TaskOutput,
-        TaskResult, TaskState, DEFAULT_DELAY_RELEASE, DEFAULT_MAX_INSTANCES,
+        SessionState, SessionStatus, Shim, Task, TaskGID, TaskID, TaskInput, TaskOptions,
+        TaskOutput, TaskResult, TaskState, DEFAULT_DELAY_RELEASE, DEFAULT_MAX_INSTANCES,
     },
     FlameError,
 };
@@ -624,6 +624,7 @@ impl Engine for SqliteEngine {
         &self,
         ssn_id: SessionID,
         input: Option<TaskInput>,
+        options: Option<TaskOptions>,
     ) -> Result<Task, FlameError> {
         let mut tx = self
             .pool
@@ -632,10 +633,20 @@ impl Engine for SqliteEngine {
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
         let input: Option<Vec<u8>> = input.map(Bytes::into);
-        let sql = r#"INSERT INTO tasks (id, ssn_id, input, creation_time, state)
+        let affinity = serde_json::to_string(
+            &options
+                .unwrap_or_default()
+                .affinity
+                .iter()
+                .map(|key| key.to_vec())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| FlameError::Storage(e.to_string()))?;
+        let sql = r#"INSERT INTO tasks (id, ssn_id, input, affinity, creation_time, state)
             VALUES (
                 COALESCE((SELECT MAX(id)+1 FROM tasks WHERE ssn_id=?), 1),
                 (SELECT id FROM sessions WHERE id=? AND state=?),
+                ?,
                 ?,
                 ?,
                 ?)
@@ -645,6 +656,7 @@ impl Engine for SqliteEngine {
             .bind(ssn_id)
             .bind(SessionState::Open as i32)
             .bind(input)
+            .bind(affinity)
             .bind(Utc::now().timestamp())
             .bind(TaskState::Pending as i32)
             .fetch_one(&mut *tx)
@@ -1208,7 +1220,7 @@ mod tests {
         assert_eq!(ssn_1.application, "flmexec");
         assert_eq!(ssn_1.status.state, SessionState::Open);
 
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None))?;
+        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
         assert_eq!(task_1_1.id, 1);
         let tasks = tokio_test::block_on(storage.find_tasks(ssn_1.id.clone()))?;
         assert_eq!(tasks.len(), 1);
@@ -1313,7 +1325,7 @@ mod tests {
         assert_eq!(ssn_1.application, "flmexec");
         assert_eq!(ssn_1.status.state, SessionState::Open);
 
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id, None))?;
+        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id, None, None))?;
         assert_eq!(task_1_1.id, 1);
         let res = tokio_test::block_on(storage.unregister_application("flmexec".to_string()));
         assert!(res.is_err());
@@ -1627,10 +1639,10 @@ mod tests {
         assert_eq!(ssn_1.application, "flmexec");
         assert_eq!(ssn_1.status.state, SessionState::Open);
 
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None))?;
+        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
         assert_eq!(task_1_1.id, 1);
 
-        let task_1_2 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None))?;
+        let task_1_2 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
         assert_eq!(task_1_2.id, 2);
 
         let task_list = tokio_test::block_on(storage.find_tasks(ssn_1.id))?;
@@ -1680,10 +1692,10 @@ mod tests {
         assert_eq!(ssn_1.application, "flmexec");
         assert_eq!(ssn_1.status.state, SessionState::Open);
 
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None))?;
+        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
         assert_eq!(task_1_1.id, 1);
 
-        let task_1_2 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None))?;
+        let task_1_2 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
         assert_eq!(task_1_2.id, 2);
 
         let task_1_1 = tokio_test::block_on(storage.update_task_state(
@@ -1716,10 +1728,10 @@ mod tests {
         assert_eq!(ssn_2.application, "flmping");
         assert_eq!(ssn_2.status.state, SessionState::Open);
 
-        let task_2_1 = tokio_test::block_on(storage.create_task(ssn_2.id.clone(), None))?;
+        let task_2_1 = tokio_test::block_on(storage.create_task(ssn_2.id.clone(), None, None))?;
         assert_eq!(task_2_1.id, 1);
 
-        let task_2_2 = tokio_test::block_on(storage.create_task(ssn_2.id.clone(), None))?;
+        let task_2_2 = tokio_test::block_on(storage.create_task(ssn_2.id.clone(), None, None))?;
         assert_eq!(task_2_2.id, 2);
 
         let task_2_1 = tokio_test::block_on(storage.update_task_state(
@@ -1770,10 +1782,10 @@ mod tests {
         assert_eq!(ssn_1.application, "flmexec");
         assert_eq!(ssn_1.status.state, SessionState::Open);
 
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None))?;
+        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
         assert_eq!(task_1_1.id, 1);
 
-        let task_1_2 = tokio_test::block_on(storage.create_task(ssn_1.id, None))?;
+        let task_1_2 = tokio_test::block_on(storage.create_task(ssn_1.id, None, None))?;
         assert_eq!(task_1_2.id, 2);
 
         let ssn_1 = tokio_test::block_on(storage.close_session(ssn_1_id.clone()))?;
@@ -1809,7 +1821,7 @@ mod tests {
 
         assert_eq!(ssn_1.status.state, SessionState::Open);
 
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None))?;
+        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
         assert_eq!(task_1_1.state, TaskState::Pending);
 
         tokio_test::block_on(storage.update_task_state(task_1_1.gid(), TaskState::Running, None))?;
@@ -1844,7 +1856,7 @@ mod tests {
         assert_eq!(ssn_1.application, "flmexec");
         assert_eq!(ssn_1.status.state, SessionState::Open);
 
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id, None))?;
+        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id, None, None))?;
         assert_eq!(task_1_1.id, 1);
 
         let task_1_1 = tokio_test::block_on(storage.update_task_state(
@@ -1857,7 +1869,7 @@ mod tests {
         let ssn_1 = tokio_test::block_on(storage.close_session(ssn_1_id.clone()))?;
         assert_eq!(ssn_1.status.state, SessionState::Closed);
 
-        let res = tokio_test::block_on(storage.create_task(ssn_1.id, None));
+        let res = tokio_test::block_on(storage.create_task(ssn_1.id, None, None));
         assert!(res.is_err());
 
         Ok(())
@@ -1886,7 +1898,7 @@ mod tests {
         assert_eq!(ssn_1.application, "flmexec");
         assert_eq!(ssn_1.status.state, SessionState::Open);
 
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None))?;
+        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
         assert_eq!(task_1_1.id, 1);
 
         // It should be failed because the session is open and there are open tasks

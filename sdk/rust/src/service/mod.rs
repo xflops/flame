@@ -11,7 +11,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -44,11 +45,66 @@ pub struct ApplicationContext {
     pub command: Option<String>,
 }
 
+/// A service-owned publication slot shared with the shim. `None` means the
+/// service has not published since session entry; `Some(empty)` clears attrs.
+pub type ExecutorAttributesPtr = Arc<Mutex<Option<rpc::ExecutorAttributes>>>;
+
 #[derive(Clone, Debug)]
 pub struct SessionContext {
     pub session_id: String,
     pub application: ApplicationContext,
     pub common_data: Option<CommonData>,
+    executor_attributes: Option<ExecutorAttributesPtr>,
+}
+
+impl SessionContext {
+    pub fn new(
+        session_id: String,
+        application: ApplicationContext,
+        common_data: Option<CommonData>,
+    ) -> Self {
+        Self {
+            session_id,
+            application,
+            common_data,
+            executor_attributes: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn with_executor_attributes(mut self, executor_attributes: ExecutorAttributesPtr) -> Self {
+        self.executor_attributes = Some(executor_attributes);
+        self
+    }
+
+    /// Publish a complete replacement of this executor's opaque locality keys.
+    /// The latest value is returned with the next existing shim response.
+    pub fn publish<I, B>(&self, attributes: I) -> Result<(), FlameError>
+    where
+        I: IntoIterator<Item = B>,
+        B: Into<Vec<u8>>,
+    {
+        let attr: HashSet<Vec<u8>> = attributes.into_iter().map(Into::into).collect();
+        let executor_attributes = self.executor_attributes.as_ref().ok_or_else(|| {
+            FlameError::InvalidConfig("session context is not attached to a service".to_string())
+        })?;
+        executor_attributes
+            .lock()
+            .expect("executor attributes mutex poisoned")
+            .replace(rpc::ExecutorAttributes {
+                attr: attr.into_iter().collect(),
+            });
+        Ok(())
+    }
+
+    fn executor_attributes(&self) -> Option<rpc::ExecutorAttributes> {
+        self.executor_attributes.as_ref().and_then(|attributes| {
+            attributes
+                .lock()
+                .expect("executor attributes mutex poisoned")
+                .take()
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +156,9 @@ pub type FlameServicePtr = Arc<dyn FlameService>;
 #[cfg(unix)]
 struct ShimService {
     service: FlameServicePtr,
+    // The service receives a clone of this stable pointer at session entry.
+    // `None` distinguishes no publication from an explicit empty snapshot.
+    executor_attributes: ExecutorAttributesPtr,
 }
 
 #[cfg(unix)]
@@ -108,23 +167,40 @@ impl Instance for ShimService {
     async fn on_session_enter(
         &self,
         req: Request<rpc::SessionContext>,
-    ) -> Result<Response<rpc::Result>, Status> {
+    ) -> Result<Response<rpc::OnSessionEnterResponse>, Status> {
         tracing::debug!("ShimService::on_session_enter");
 
         let req = req.into_inner();
         let resp = match SessionContext::try_from(req) {
-            Ok(ctx) => self.service.on_session_enter(ctx).await,
+            Ok(ctx) => {
+                self.executor_attributes
+                    .lock()
+                    .expect("executor attributes mutex poisoned")
+                    .take();
+                let service_ctx = ctx.with_executor_attributes(self.executor_attributes.clone());
+                let response_ctx = service_ctx.clone();
+                self.service
+                    .on_session_enter(service_ctx)
+                    .await
+                    .map(|_| response_ctx)
+            }
             Err(e) => Err(e),
         };
 
         match resp {
-            Ok(_) => Ok(Response::new(rpc::Result {
-                return_code: 0,
-                message: None,
+            Ok(ctx) => Ok(Response::new(rpc::OnSessionEnterResponse {
+                result: Some(rpc::Result {
+                    return_code: 0,
+                    message: None,
+                }),
+                attributes: ctx.executor_attributes(),
             })),
-            Err(e) => Ok(Response::new(rpc::Result {
-                return_code: -1,
-                message: Some(e.to_string()),
+            Err(e) => Ok(Response::new(rpc::OnSessionEnterResponse {
+                result: Some(rpc::Result {
+                    return_code: -1,
+                    message: Some(e.to_string()),
+                }),
+                attributes: None,
             })),
         }
     }
@@ -132,21 +208,27 @@ impl Instance for ShimService {
     async fn on_task_invoke(
         &self,
         req: Request<rpc::TaskContext>,
-    ) -> Result<Response<rpc::TaskResult>, Status> {
+    ) -> Result<Response<rpc::OnTaskInvokeResponse>, Status> {
         tracing::debug!("ShimService::on_task_invoke");
         let req = req.into_inner();
         let resp = self.service.on_task_invoke(TaskContext::from(req)).await;
 
         match resp {
-            Ok(data) => Ok(Response::new(rpc::TaskResult {
-                return_code: 0,
-                output: data.map(|d| d.into()),
-                message: None,
+            Ok(data) => Ok(Response::new(rpc::OnTaskInvokeResponse {
+                task_result: Some(rpc::TaskResult {
+                    return_code: 0,
+                    output: data.map(|d| d.into()),
+                    message: None,
+                }),
+                attributes: self.executor_attributes(),
             })),
-            Err(e) => Ok(Response::new(rpc::TaskResult {
-                return_code: -1,
-                output: None,
-                message: Some(e.to_string()),
+            Err(e) => Ok(Response::new(rpc::OnTaskInvokeResponse {
+                task_result: Some(rpc::TaskResult {
+                    return_code: -1,
+                    output: None,
+                    message: Some(e.to_string()),
+                }),
+                attributes: None,
             })),
         }
     }
@@ -157,6 +239,10 @@ impl Instance for ShimService {
     ) -> Result<Response<rpc::Result>, Status> {
         tracing::debug!("ShimService::on_session_leave");
         let resp = self.service.on_session_leave().await;
+        self.executor_attributes
+            .lock()
+            .expect("executor attributes mutex poisoned")
+            .take();
 
         match resp {
             Ok(_) => Ok(Response::new(rpc::Result {
@@ -172,9 +258,20 @@ impl Instance for ShimService {
 }
 
 #[cfg(unix)]
+impl ShimService {
+    fn executor_attributes(&self) -> Option<rpc::ExecutorAttributes> {
+        self.executor_attributes
+            .lock()
+            .expect("executor attributes mutex poisoned")
+            .take()
+    }
+}
+
+#[cfg(unix)]
 pub async fn run(service: impl FlameService) -> Result<(), Box<dyn std::error::Error>> {
     let shim_service = ShimService {
         service: Arc::new(service),
+        executor_attributes: Arc::new(Mutex::new(None)),
     };
 
     let endpoint = std::env::var(FLAME_INSTANCE_ENDPOINT)
@@ -219,11 +316,11 @@ impl TryFrom<rpc::SessionContext> for SessionContext {
                 FlameError::InvalidConfig("session context missing application".to_string())
             })?;
 
-        Ok(SessionContext {
-            session_id: ctx.session_id.clone(),
+        Ok(SessionContext::new(
+            ctx.session_id.clone(),
             application,
-            common_data: ctx.common_data.map(|data| data.into()),
-        })
+            ctx.common_data.map(|data| data.into()),
+        ))
     }
 }
 
@@ -250,5 +347,118 @@ mod tests {
         };
 
         assert!(SessionContext::try_from(ctx).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_context_publishes_to_shared_executor_attributes() {
+        let attributes = Arc::new(Mutex::new(None));
+        let context = SessionContext::new(
+            "ssn-1".to_string(),
+            ApplicationContext {
+                name: "test-app".to_string(),
+                image: None,
+                command: None,
+            },
+            None,
+        )
+        .with_executor_attributes(attributes.clone());
+
+        context.publish([b"kv-cache-key".to_vec()]).unwrap();
+
+        assert_eq!(
+            attributes.lock().unwrap().as_ref().unwrap().attr,
+            vec![b"kv-cache-key".to_vec()]
+        );
+    }
+
+    #[cfg(unix)]
+    struct TaskPublishingService {
+        session: Mutex<Option<SessionContext>>,
+    }
+
+    #[cfg(unix)]
+    #[tonic::async_trait]
+    impl FlameService for TaskPublishingService {
+        async fn on_session_enter(&self, context: SessionContext) -> Result<(), FlameError> {
+            *self.session.lock().unwrap() = Some(context);
+            Ok(())
+        }
+
+        async fn on_task_invoke(
+            &self,
+            task: TaskContext,
+        ) -> Result<Option<TaskOutput>, FlameError> {
+            if task.task_id == "task-1" {
+                self.session
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .publish([b"kv-cache-key".to_vec()])?;
+            }
+            Ok(None)
+        }
+
+        async fn on_session_leave(&self) -> Result<(), FlameError> {
+            *self.session.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_publication_is_returned_by_shim() {
+        let shim = ShimService {
+            service: Arc::new(TaskPublishingService {
+                session: Mutex::new(None),
+            }),
+            executor_attributes: Arc::new(Mutex::new(None)),
+        };
+
+        let enter = Instance::on_session_enter(
+            &shim,
+            Request::new(rpc::SessionContext {
+                session_id: "ssn-1".to_string(),
+                application: Some(rpc::ApplicationContext {
+                    name: "test-app".to_string(),
+                    ..Default::default()
+                }),
+                common_data: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(enter.attributes.is_none());
+
+        let invoke = Instance::on_task_invoke(
+            &shim,
+            Request::new(rpc::TaskContext {
+                task_id: "task-1".to_string(),
+                session_id: "ssn-1".to_string(),
+                input: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            invoke.attributes.unwrap().attr,
+            vec![b"kv-cache-key".to_vec()]
+        );
+
+        let next_invoke = Instance::on_task_invoke(
+            &shim,
+            Request::new(rpc::TaskContext {
+                task_id: "task-2".to_string(),
+                session_id: "ssn-1".to_string(),
+                input: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(next_invoke.attributes.is_none());
     }
 }

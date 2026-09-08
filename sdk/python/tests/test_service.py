@@ -54,6 +54,42 @@ def test_dataclasses_fields_and_methods():
     assert task.input == b"in"
 
 
+def test_session_context_round_trips_through_cloudpickle():
+    app = service.ApplicationContext("my-app")
+    context = service.SessionContext(_common_data=b"ABC", session_id="sess-1", application=app)
+
+    restored = cloudpickle.loads(cloudpickle.dumps(context))
+
+    assert restored.common_data() == b"ABC"
+    with pytest.raises(RuntimeError, match="not attached to a service"):
+        restored.publish({b"kv-cache-key"})
+
+
+def test_servicer_collects_published_executor_attributes():
+    class NoopService(service.FlameService):
+        def on_session_enter(self, context):
+            pass
+
+        def on_task_invoke(self, context):
+            pass
+
+        def on_session_leave(self):
+            pass
+
+    servicer = service.FlameInstanceServicer(NoopService())
+    context = service.SessionContext(
+        _common_data=None,
+        session_id="sess-1",
+        application=service.ApplicationContext("my-app"),
+    )
+    context._publish_executor_attributes = servicer._publish_executor_attributes
+
+    context.publish({b"kv-cache-key"})
+
+    assert servicer._take_executor_attributes().attr == [b"kv-cache-key"]
+    assert servicer._take_executor_attributes() is None
+
+
 def test_flame_service_abstract_minimal_implementation():
     class MyService(service.FlameService):
         def __init__(self):
@@ -99,8 +135,7 @@ def test_flame_service_abstract_minimal_implementation():
 
     req = MockSessionEnterRequest()
     resp = servicer.OnSessionEnter(req, DummyContext())
-    assert isinstance(resp, ResultProto)
-    assert resp.return_code == 0
+    assert resp.result.return_code == 0
     # Verify service received a SessionContext with the right fields
     assert svc.called["enter"].session_id == "sess-123"
 
@@ -116,9 +151,8 @@ def test_flame_service_abstract_minimal_implementation():
 
     req2 = MockTaskRequest()
     resp2 = servicer.OnTaskInvoke(req2, DummyContext())
-    assert isinstance(resp2, TaskResultProto)
-    assert resp2.return_code == 0
-    assert resp2.output == b"OUT"
+    assert resp2.task_result.return_code == 0
+    assert resp2.task_result.output == b"OUT"
     assert svc.called["invoke"].task_id == "t1"
 
     # OnSessionLeave path
@@ -160,7 +194,7 @@ def test_on_session_enter_exception_path_returns_error():  # noqa: N802
 
     req = MockSessionEnterRequest()
     resp = servicer.OnSessionEnter(req, DummyContext())
-    assert resp.return_code == -1
+    assert resp.result.return_code == -1
 
 
 def test_on_task_invoke_exception_path():  # noqa: N802
@@ -188,8 +222,8 @@ def test_on_task_invoke_exception_path():  # noqa: N802
 
     req = MockTaskRequest()
     resp = servicer.OnTaskInvoke(req, DummyContext())
-    assert resp.return_code == -1
-    assert not resp.HasField("output")
+    assert resp.task_result.return_code == -1
+    assert not resp.task_result.HasField("output")
 
 
 def test_service_preserves_empty_optional_bytes():  # noqa: N802
@@ -241,10 +275,10 @@ def test_service_preserves_empty_optional_bytes():  # noqa: N802
     enter_resp = servicer.OnSessionEnter(MockSessionEnterRequest(), DummyContext())
     invoke_resp = servicer.OnTaskInvoke(MockTaskRequest(), DummyContext())
 
-    assert enter_resp.return_code == 0
+    assert enter_resp.result.return_code == 0
     assert svc.session_context.common_data() == b""
-    assert invoke_resp.return_code == 0
-    assert not invoke_resp.HasField("output")
+    assert invoke_resp.task_result.return_code == 0
+    assert not invoke_resp.task_result.HasField("output")
     assert svc.task_context.input == b""
 
 

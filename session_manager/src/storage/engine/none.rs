@@ -39,7 +39,7 @@ use crate::FlameError;
 use common::apis::{
     Application, ApplicationAttributes, ApplicationID, ExecutorID, ExecutorState, Node, Session,
     SessionAttributes, SessionID, SessionState, SessionStatus, Task, TaskGID, TaskID, TaskInput,
-    TaskOutput, TaskResult, TaskState,
+    TaskOptions, TaskOutput, TaskResult, TaskState,
 };
 
 use super::{Engine, EnginePtr};
@@ -238,6 +238,7 @@ impl Engine for NoneEngine {
         &self,
         ssn_id: SessionID,
         task_input: Option<TaskInput>,
+        options: Option<TaskOptions>,
     ) -> Result<Task, FlameError> {
         let task_id = self.next_task_id(&ssn_id)?;
 
@@ -250,6 +251,7 @@ impl Engine for NoneEngine {
             completion_time: None,
             input: task_input,
             output: None,
+            affinity: options.unwrap_or_default().affinity,
             events: vec![],
         })
     }
@@ -395,19 +397,19 @@ mod tests {
         engine.create_session(attr).await.unwrap();
 
         let task1 = engine
-            .create_task("test-session".to_string(), None)
+            .create_task("test-session".to_string(), None, None)
             .await
             .unwrap();
         assert_eq!(task1.id, 1);
 
         let task2 = engine
-            .create_task("test-session".to_string(), None)
+            .create_task("test-session".to_string(), None, None)
             .await
             .unwrap();
         assert_eq!(task2.id, 2);
 
         let task3 = engine
-            .create_task("test-session".to_string(), None)
+            .create_task("test-session".to_string(), None, None)
             .await
             .unwrap();
         assert_eq!(task3.id, 3);
@@ -442,19 +444,19 @@ mod tests {
         engine.create_session(attr2).await.unwrap();
 
         let task1_s1 = engine
-            .create_task("session-1".to_string(), None)
+            .create_task("session-1".to_string(), None, None)
             .await
             .unwrap();
         assert_eq!(task1_s1.id, 1);
 
         let task1_s2 = engine
-            .create_task("session-2".to_string(), None)
+            .create_task("session-2".to_string(), None, None)
             .await
             .unwrap();
         assert_eq!(task1_s2.id, 1);
 
         let task2_s1 = engine
-            .create_task("session-1".to_string(), None)
+            .create_task("session-1".to_string(), None, None)
             .await
             .unwrap();
         assert_eq!(task2_s1.id, 2);
@@ -477,7 +479,7 @@ mod tests {
         engine.create_session(attr.clone()).await.unwrap();
 
         let task1 = engine
-            .create_task("test-session".to_string(), None)
+            .create_task("test-session".to_string(), None, None)
             .await
             .unwrap();
         assert_eq!(task1.id, 1);
@@ -488,7 +490,7 @@ mod tests {
         engine.create_session(attr).await.unwrap();
 
         let task_new = engine
-            .create_task("test-session".to_string(), None)
+            .create_task("test-session".to_string(), None, None)
             .await
             .unwrap();
         assert_eq!(task_new.id, 1);

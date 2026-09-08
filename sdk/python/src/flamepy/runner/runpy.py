@@ -71,6 +71,10 @@ class FlameRunpyService(FlameService):
 
         self._runner_context = runner_context
         self._execution_object = execution_object
+        # Stateless Runner instances still own process-local runtime data such
+        # as vLLM KV blocks. Give user code the session context so it can
+        # publish opaque locality keys without persisting that runtime state.
+        setattr(self._execution_object, "_flame_session_context", self._ssn_ctx)
 
     def _resolve_object_ref(self, value: Any) -> Any:
         """

@@ -25,6 +25,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use crate::executor::Executor;
 use crate::shims::wasm_shim::exports::component::flame::service;
 use crate::shims::{Shim, ShimPtr};
+use ::rpc::flame::v1 as rpc;
 use common::{self, apis, FlameError};
 
 wasmtime::component::bindgen!({
@@ -88,7 +89,7 @@ impl Shim for WasmShim {
     async fn on_session_enter(
         &mut self,
         ctx: &apis::SessionContext,
-    ) -> Result<(), common::FlameError> {
+    ) -> Result<super::SessionEnterResponse, common::FlameError> {
         trace_fn!("WasmShim::on_session_enter");
 
         let ssn_ctx = service::SessionContext {
@@ -105,13 +106,15 @@ impl Shim for WasmShim {
 
         self.session_context = Some(ctx.clone());
 
-        Ok(())
+        Ok(super::SessionEnterResponse {
+            executor_attributes: None,
+        })
     }
 
     async fn on_task_invoke(
         &mut self,
         ctx: &apis::TaskContext,
-    ) -> Result<apis::TaskResult, common::FlameError> {
+    ) -> Result<super::TaskInvokeResponse, common::FlameError> {
         trace_fn!("WasmShim::on_task_invoke");
 
         let task_ctx = service::TaskContext {
@@ -130,17 +133,23 @@ impl Shim for WasmShim {
             .map_err(|e| common::FlameError::Internal(e.to_string()))?;
 
         match result {
-            Ok(output) => Ok(apis::TaskResult {
-                state: apis::TaskState::Succeed,
-                output: output.map(apis::TaskOutput::from),
-                message: None,
+            Ok(output) => Ok(super::TaskInvokeResponse {
+                task_result: apis::TaskResult {
+                    state: apis::TaskState::Succeed,
+                    output: output.map(apis::TaskOutput::from),
+                    message: None,
+                },
+                attributes: None,
             }),
             Err(e) => {
                 tracing::error!("Task failed: {}", e.message);
-                Ok(apis::TaskResult {
-                    state: apis::TaskState::Failed,
-                    output: None,
-                    message: Some(e.message),
+                Ok(super::TaskInvokeResponse {
+                    task_result: apis::TaskResult {
+                        state: apis::TaskState::Failed,
+                        output: None,
+                        message: Some(e.message),
+                    },
+                    attributes: None,
                 })
             }
         }

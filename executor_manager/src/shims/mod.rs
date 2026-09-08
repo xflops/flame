@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 
 use self::host_shim::HostShim;
@@ -34,8 +35,23 @@ use common::apis::{
     ApplicationContext, SessionContext, Shim as ShimType, TaskContext, TaskOutput, TaskResult,
 };
 use common::{FlameError, FLAME_WORKING_DIRECTORY};
+use rpc::flame::v1::ExecutorAttributes;
 
 pub type ShimPtr = Arc<Mutex<dyn Shim>>;
+pub type ExecutorAttributesPtr = Arc<StdMutex<ExecutorAttributes>>;
+
+/// Result returned by a shim after entering a session.
+#[derive(Debug)]
+pub struct SessionEnterResponse {
+    pub executor_attributes: Option<ExecutorAttributesPtr>,
+}
+
+/// Result returned by a shim after invoking a task.
+#[derive(Debug)]
+pub struct TaskInvokeResponse {
+    pub task_result: TaskResult,
+    pub attributes: Option<ExecutorAttributes>,
+}
 
 /// Represents the executor's working directory with cleanup management.
 /// Directory structure:
@@ -220,8 +236,12 @@ pub async fn new(
 
 #[async_trait]
 pub trait Shim: Send + 'static {
-    async fn on_session_enter(&mut self, ctx: &SessionContext) -> Result<(), FlameError>;
-    async fn on_task_invoke(&mut self, ctx: &TaskContext) -> Result<TaskResult, FlameError>;
+    async fn on_session_enter(
+        &mut self,
+        ctx: &SessionContext,
+    ) -> Result<SessionEnterResponse, FlameError>;
+    async fn on_task_invoke(&mut self, ctx: &TaskContext)
+        -> Result<TaskInvokeResponse, FlameError>;
     async fn on_session_leave(&mut self) -> Result<(), FlameError>;
 }
 

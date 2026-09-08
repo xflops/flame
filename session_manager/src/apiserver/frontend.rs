@@ -498,7 +498,17 @@ impl Frontend for Flame {
 
         let task = self
             .controller
-            .create_task(ssn_id, task_spec.input.map(apis::TaskInput::from))
+            .create_task(
+                ssn_id,
+                task_spec.input.map(apis::TaskInput::from),
+                Some(apis::TaskOptions {
+                    affinity: task_spec
+                        .affinity
+                        .into_iter()
+                        .map(bytes::Bytes::from)
+                        .collect(),
+                }),
+            )
             .await
             .map(Task::from)
             .map_err(Status::from)?;

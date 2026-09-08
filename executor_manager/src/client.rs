@@ -227,10 +227,12 @@ impl BackendClient {
         &mut self,
         exe: &Executor,
         result: Option<FlameResult>,
+        attributes: Option<rpc::ExecutorAttributes>,
     ) -> Result<(), FlameError> {
         let req = BindExecutorCompletedRequest {
             executor_id: exe.id.clone(),
             result: result.map(rpc::Result::from),
+            attributes,
         };
 
         self.client
@@ -288,10 +290,12 @@ impl BackendClient {
         &mut self,
         exe: &Executor,
         task_result: &TaskResult,
+        attributes: Option<rpc::ExecutorAttributes>,
     ) -> Result<(), FlameError> {
         let req = CompleteTaskRequest {
             executor_id: exe.id.clone(),
             task_result: Some(task_result.clone().try_into()?),
+            attributes,
         };
 
         self.client
