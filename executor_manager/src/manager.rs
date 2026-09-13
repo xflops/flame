@@ -101,7 +101,9 @@ impl ExecutorManager {
                 executor_id,
                 state
             );
-            executors.remove(&executor_id);
+            if let Some(executor) = executors.remove(&executor_id) {
+                lock_ptr!(executor)?.release();
+            }
             return Ok(());
         }
 

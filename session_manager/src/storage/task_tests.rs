@@ -101,6 +101,21 @@ mod tests {
                 .unwrap();
 
             assert_eq!(task.affinity, affinity);
+            let session = storage
+                .get_session_ptr("task-affinity-ssn".to_string())
+                .unwrap();
+            let session = lock_ptr!(session).unwrap();
+            let pending = session
+                .tasks_index
+                .get(&common::apis::TaskState::Pending)
+                .unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                lock_ptr!(pending.values().next().unwrap())
+                    .unwrap()
+                    .affinity,
+                affinity
+            );
         }
 
         #[tokio::test]

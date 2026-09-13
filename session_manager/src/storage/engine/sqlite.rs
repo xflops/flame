@@ -987,13 +987,14 @@ impl Engine for SqliteEngine {
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
         let sql = r#"INSERT INTO executors
-            (id, node, resreq_cpu, resreq_memory, resreq_gpu, shim, task_id, ssn_id, creation_time, state)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, node, application, resreq_cpu, resreq_memory, resreq_gpu, shim, task_id, ssn_id, creation_time, state)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING *"#;
 
         let dao: ExecutorDao = sqlx::query_as(sql)
             .bind(&executor.id)
             .bind(&executor.node)
+            .bind(&executor.application)
             .bind(executor.resreq.cpu as i64)
             .bind(executor.resreq.memory as i64)
             .bind(executor.resreq.gpu as i64)
@@ -1047,13 +1048,14 @@ impl Engine for SqliteEngine {
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
         let sql = r#"UPDATE executors
-            SET node=?, resreq_cpu=?, resreq_memory=?, resreq_gpu=?, shim=?,
+            SET node=?, application=?, resreq_cpu=?, resreq_memory=?, resreq_gpu=?, shim=?,
                 task_id=?, ssn_id=?, state=?
             WHERE id=?
             RETURNING *"#;
 
         let dao: ExecutorDao = sqlx::query_as(sql)
             .bind(&executor.node)
+            .bind(&executor.application)
             .bind(executor.resreq.cpu as i64)
             .bind(executor.resreq.memory as i64)
             .bind(executor.resreq.gpu as i64)

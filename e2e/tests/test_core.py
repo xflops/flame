@@ -26,7 +26,7 @@ from e2e.helpers import (
 )
 from tests.utils import random_string
 
-FLM_TEST_SVC_APP = "flme2e-svc"
+FLM_TEST_SVC_APP = "flme2e-core-svc"
 TASK_FAILED_EVENT_CODE = int(flamepy.TaskState.FAILED)
 SESSION_BIND_FAILED_EVENT_CODE = 1001
 
@@ -91,9 +91,11 @@ def setup_test_env():
 
     yield
 
-    # Clean up all sessions before unregistering
+    # Clean up this application's sessions before unregistering.
     sessions = flamepy.list_sessions()
     for sess in sessions:
+        if sess.application != FLM_TEST_SVC_APP:
+            continue
         try:
             flamepy.close_session(sess.id)
         except Exception:
@@ -115,7 +117,8 @@ def test_basic_service_invoke():
     assert response.common_data is None
     assert response.service_state is not None
     assert response.service_state["task_count"] == 1
-    assert response.service_state["session_enter_count"] == 1
+    assert response.service_state["session_enter_count"] >= 1
+    assert response.service_state["session_enter_count"] == response.service_state["session_leave_count"] + 1
 
     session.close()
 
@@ -229,6 +232,8 @@ def test_service_state_tracking():
     session = flamepy.create_session(application=FLM_TEST_SVC_APP, common_data=None)
 
     num_tasks = 5
+    session_enter_count = None
+    session_leave_count = None
     for i in range(1, num_tasks + 1):
         request = TestRequest(input=f"task_{i}")
         response = invoke_task(session, request)
@@ -236,8 +241,14 @@ def test_service_state_tracking():
         # Check service state increments
         assert response.service_state is not None
         assert response.service_state["task_count"] == i
-        assert response.service_state["session_enter_count"] == 1
-        assert response.service_state["session_leave_count"] == 0
+        if session_enter_count is None:
+            session_enter_count = response.service_state["session_enter_count"]
+            assert session_enter_count >= 1
+            session_leave_count = response.service_state["session_leave_count"]
+            assert session_leave_count >= 0
+            assert session_enter_count == session_leave_count + 1
+        assert response.service_state["session_enter_count"] == session_enter_count
+        assert response.service_state["session_leave_count"] == session_leave_count
 
     session.close()
 
@@ -373,7 +384,8 @@ def test_multiple_sessions_isolation():
 
     # Task count should be reset for new session
     assert response.service_state["task_count"] == 1
-    assert response.service_state["session_enter_count"] == 1
+    assert response.service_state["session_enter_count"] >= 1
+    assert response.service_state["session_enter_count"] == response.service_state["session_leave_count"] + 1
 
     session2.close()
 

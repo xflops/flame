@@ -61,7 +61,7 @@ impl States for BoundState {
         trace_fn!("BoundState::unbind_session");
 
         let mut e = lock_ptr!(self.executor)?;
-        e.state = ExecutorState::Unbinding;
+        e.set_state(ExecutorState::Unbinding);
 
         Ok(())
     }

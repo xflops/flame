@@ -1,9 +1,9 @@
-"""Stateless Runner vLLM service with KV-cache-aware task routing."""
+"""Stateless Runner vLLM service with instance-attribute publication."""
 
 from hashlib import sha256
 
-from flamepy import ResourceRequirement, TaskOptions
-from flamepy.runner import Runner
+from flamepy import ResourceRequirement
+from flamepy.runner import Runner, RunnerService
 from vllm import LLM, SamplingParams
 
 
@@ -12,16 +12,19 @@ def kv_key(model: str, prompt: str) -> bytes:
     return sha256(f"{model}\0{prompt}".encode()).digest()
 
 
-class VllmEngine:
+class VllmEngine(RunnerService):
     def __init__(self) -> None:
         self.model = "facebook/opt-125m"
         self.llm = LLM(model=self.model)
+        self.cached_keys: set[bytes] = set()
 
     def generate(self, prompt: str) -> str:
         key = kv_key(self.model, prompt)
         output = self.llm.generate(prompt, SamplingParams(max_tokens=32))[0]
-        # Publish only opaque runtime keys; never persist vLLM's cache object.
-        self._flame_session_context.publish({key})
+        # This small example assumes no KV eviction. Production code should
+        # publish the engine's complete current cache index on every response.
+        self.cached_keys.add(key)
+        self.publish_attributes(self.cached_keys)
         return output.outputs[0].text
 
 
@@ -34,8 +37,7 @@ def main() -> None:
             resreq=ResourceRequirement(gpu=1),  # vLLM replica GPU requirement.
         )
         print(service.generate(prompt).get())
-        key = kv_key("facebook/opt-125m", prompt)
-        print(service.generate(prompt, option=TaskOptions(affinity={key})).get())
+        print(service.generate(prompt).get())
 
 
 if __name__ == "__main__":

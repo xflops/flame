@@ -12,17 +12,17 @@ limitations under the License.
 """
 
 from .helper import ErrorType, RunnerError, get_data
-from .runner import ObjectFuture, ObjectFutureIterator, Runner, RunnerService
-from .runpy import FlameRunpyService
+from .runner import ObjectFuture, ObjectFutureIterator, Runner, RunnerServiceInstance
+from .service import RunnerService
 from .types import RunnerContext, RunnerRequest, SessionContext
 
 __all__ = [
     "SessionContext",
+    "RunnerService",
     "ObjectFuture",
     "ObjectFutureIterator",
     "Runner",
-    "RunnerService",
-    "FlameRunpyService",
+    "RunnerServiceInstance",
     "RunnerContext",
     "RunnerRequest",
     "get_data",

@@ -14,7 +14,7 @@ limitations under the License.
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{types::Json, FromRow};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::FlameError;
 use bytes::Bytes;
@@ -123,6 +123,7 @@ pub struct NodeDao {
 pub struct ExecutorDao {
     pub id: ExecutorID,
     pub node: String,
+    pub application: String,
 
     pub resreq_cpu: i64,
     pub resreq_memory: i64,
@@ -378,10 +379,13 @@ impl TryFrom<&ExecutorDao> for Executor {
                 gpu: dao.resreq_gpu as i32,
             },
             shim: Shim::try_from(dao.shim).unwrap_or_default(),
+            application: dao.application.clone(),
             task_id: dao.task_id,
             ssn_id: dao.ssn_id.clone(),
+            attributes: HashSet::new(),
             creation_time: DateTime::<Utc>::from_timestamp(dao.creation_time, 0)
                 .ok_or(FlameError::Storage("invalid creation time".to_string()))?,
+            latest_updated_timestamp: Utc::now(),
             state: ExecutorState::from(dao.state),
         })
     }
@@ -400,6 +404,7 @@ impl From<&Executor> for ExecutorDao {
         Self {
             id: exec.id.clone(),
             node: exec.node.clone(),
+            application: exec.application.clone(),
             resreq_cpu: exec.resreq.cpu as i64,
             resreq_memory: exec.resreq.memory as i64,
             resreq_gpu: exec.resreq.gpu as i64,

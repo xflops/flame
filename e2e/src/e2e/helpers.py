@@ -1,17 +1,19 @@
 """
-Helper functions and classes for flmrun e2e tests.
+Helper functions and classes for Runner end-to-end tests.
 These are defined in a separate module so they can be properly pickled.
 """
 
 import json
 import os
+import socket
 import time
 from dataclasses import asdict
+from pathlib import Path
 from typing import Optional
 
 import cloudpickle
 from flamepy import ObjectRef, get_object, put_object
-from flamepy.runner import Runner, RunnerContext, RunnerRequest, SessionContext
+from flamepy.runner import Runner, RunnerContext, RunnerRequest, RunnerService, SessionContext
 from flamepy.util import short_name
 
 from e2e.api import (
@@ -29,13 +31,21 @@ def sum_func(a: int, b: int) -> int:
     return a + b
 
 
-class DataAwareService:
+class DataAwareService(RunnerService):
     """Small Runner service used to exercise attribute publication and affinity."""
 
-    def run(self, value: str) -> tuple[str, bytes]:
-        affinity_key = f"e2e:data-aware:{os.getpid()}".encode()
-        self._flame_session_context.publish({affinity_key})
-        return value, affinity_key
+    def __init__(self) -> None:
+        # FlameRunpyService reloads this execution object for every session, while
+        # the runner process remains attached to the retained executor instance.
+        # A process-stable key therefore identifies the instance DAS must reuse.
+        self.instance_key = f"e2e:data-aware:{socket.gethostname()}:{os.getpid()}".encode()
+        self.executor_id = Path(os.environ["FLAME_INSTANCE_ENDPOINT"]).stem
+
+    def run(self, value: str, delay: float = 0) -> tuple[str, bytes, str]:
+        self.publish_attributes({self.instance_key})
+        if delay:
+            time.sleep(delay)
+        return value, self.instance_key, self.executor_id
 
 
 def multiply_func(a: int, b: int) -> int:

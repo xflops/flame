@@ -21,7 +21,7 @@ use common::apis::{
 };
 
 use common::FlameError;
-use stdng::{lock_ptr, logs::TraceFn, trace_fn, MutexPtr};
+use stdng::{lock_ptr, logs::TraceFn, trace_fn};
 
 use ::rpc::flame::v1 as rpc;
 
@@ -91,14 +91,6 @@ pub struct Controller {
     storage: StoragePtr,
     connection_manager: ConnectionManager<NodeCallbacks>,
     notifier: NotifyManagerPtr,
-    // Runtime-local executor attributes are deliberately not persisted. A
-    // service republishes after binding if it still owns the underlying data.
-    executor_attributes: MutexPtr<HashMap<ExecutorID, ExecutorAttributeSet>>,
-}
-
-#[derive(Clone, Debug)]
-struct ExecutorAttributeSet {
-    attr: HashSet<Vec<u8>>,
 }
 
 pub type ControllerPtr = Arc<Controller>;
@@ -111,14 +103,13 @@ pub fn new_ptr(storage: StoragePtr) -> ControllerPtr {
         storage,
         connection_manager: ConnectionManager::new(callbacks),
         notifier: NotifyManager::new_ptr(),
-        executor_attributes: stdng::new_ptr(HashMap::new()),
     })
 }
 
 impl Controller {
     const MAX_EXECUTOR_ATTRIBUTES: usize = 1_024;
     const MAX_EXECUTOR_ATTRIBUTE_BYTES: usize = 256;
-    const MAX_EXECUTOR_ATTRIBUTES_BYTES: usize = 64 * 1024;
+    const MAX_EXECUTOR_ATTRIBUTES_BYTES: usize = 64 * 1_024;
 
     // ========================================================================
     // Accessors
@@ -129,32 +120,20 @@ impl Controller {
         &self.storage
     }
 
-    /// Returns the current volatile attribute set for a bound executor.
-    pub(crate) fn executor_attributes(&self, id: &ExecutorID) -> Option<HashSet<Vec<u8>>> {
-        lock_ptr!(self.executor_attributes)
-            .ok()
-            .and_then(|attributes| attributes.get(id).map(|attributes| attributes.attr.clone()))
-    }
-
-    fn clear_executor_attributes(&self, id: &ExecutorID) {
-        if let Ok(mut attributes) = lock_ptr!(self.executor_attributes) {
-            attributes.remove(id);
-        }
-    }
-
     fn validate_executor_attributes(
         attributes: rpc::ExecutorAttributes,
-    ) -> Result<ExecutorAttributeSet, FlameError> {
+    ) -> Result<HashSet<bytes::Bytes>, FlameError> {
         let mut attr = HashSet::with_capacity(attributes.attr.len());
         let mut total_bytes = 0usize;
         for value in attributes.attr {
-            if value.is_empty() || value.len() > Self::MAX_EXECUTOR_ATTRIBUTE_BYTES {
+            let value_len = value.len();
+            if value.is_empty() || value_len > Self::MAX_EXECUTOR_ATTRIBUTE_BYTES {
                 return Err(FlameError::InvalidConfig(
                     "executor attributes must be nonempty and at most 256 bytes".to_string(),
                 ));
             }
-            if attr.insert(value.clone()) {
-                total_bytes += value.len();
+            if attr.insert(bytes::Bytes::from(value)) {
+                total_bytes += value_len;
             }
         }
         if attr.len() > Self::MAX_EXECUTOR_ATTRIBUTES
@@ -165,25 +144,27 @@ impl Controller {
             ));
         }
 
-        Ok(ExecutorAttributeSet { attr })
+        Ok(attr)
     }
 
     fn update_executor_attributes(
         &self,
         id: &ExecutorID,
-        attributes: ExecutorAttributeSet,
+        attributes: HashSet<bytes::Bytes>,
     ) -> Result<(), FlameError> {
         let executor = self.storage.get_executor_ptr(id.clone())?;
-        let executor = lock_ptr!(executor)?;
-        if executor.state != ExecutorState::Bound || executor.ssn_id.is_none() {
+        let mut executor = lock_ptr!(executor)?;
+        if executor.state != ExecutorState::Bound {
             return Err(FlameError::InvalidState(format!(
                 "executor <{id}> must be bound before publishing attributes"
             )));
         }
-        drop(executor);
-
-        let mut indexed = lock_ptr!(self.executor_attributes)?;
-        indexed.insert(id.clone(), attributes);
+        executor.ssn_id.as_ref().ok_or_else(|| {
+            FlameError::InvalidState(format!(
+                "executor <{id}> must have a session before publishing attributes"
+            ))
+        })?;
+        executor.attributes = attributes;
         Ok(())
     }
 
@@ -247,8 +228,10 @@ impl Controller {
         let (sender, _receiver) = self.connection_manager.connect(&node.name).await?;
 
         // Build sets for comparison
-        let reported_ids: HashSet<String> =
-            reported_executors.iter().map(|e| e.id.clone()).collect();
+        let reported_ids: HashSet<&str> = reported_executors
+            .iter()
+            .map(|executor| executor.id.as_str())
+            .collect();
 
         // Get executors from DB for this node
         let db_executors = self
@@ -261,7 +244,7 @@ impl Controller {
 
         // 1. DB executors not reported by node - orphaned in DB, release them
         for db_exec in &db_executors {
-            if !reported_ids.contains(&db_exec.id) {
+            if !reported_ids.contains(db_exec.id.as_str()) {
                 tracing::info!(
                     "Executor <{}> in DB but not reported by node <{}>. Releasing orphaned executor.",
                     db_exec.id,
@@ -542,7 +525,28 @@ impl Controller {
 
     pub async fn unregister_application(&self, name: String) -> Result<(), FlameError> {
         trace_fn!("Controller::unregister_application");
-        self.storage.unregister_application(name).await
+        let idle_executor_ids = self
+            .storage
+            .list_executor(Some(&ExecutorFilter::by_state(ExecutorState::Idle)))?
+            .into_iter()
+            .filter(|executor| executor.application == name)
+            .map(|executor| executor.id)
+            .collect::<Vec<_>>();
+
+        self.storage.unregister_application(name.clone()).await?;
+
+        for executor_id in idle_executor_ids {
+            if let Err(error) = self.release_executor(executor_id.clone()).await {
+                tracing::warn!(
+                    "Failed to release Idle executor <{}> after unregistering application <{}>: {}",
+                    executor_id,
+                    name,
+                    error
+                );
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn update_application(
@@ -774,7 +778,7 @@ impl Controller {
             }
         };
 
-        let task_ptr = self.wait_for_task(&ssn_ptr, &ssn_id, &id).await?;
+        let task_ptr = self.wait_for_task(&ssn_ptr, &ssn_id).await?;
 
         let Some(task_ptr) = task_ptr else {
             return Ok(None);
@@ -805,7 +809,6 @@ impl Controller {
         &self,
         ssn: &SessionPtr,
         ssn_id: &SessionID,
-        executor_id: &ExecutorID,
     ) -> Result<Option<TaskPtr>, FlameError> {
         let app_name = {
             let ssn_guard = lock_ptr!(ssn)?;
@@ -820,8 +823,7 @@ impl Controller {
         loop {
             {
                 let mut ssn_guard = lock_ptr!(ssn)?;
-                let attributes = self.executor_attributes(executor_id).unwrap_or_default();
-                if let Some(task_ptr) = ssn_guard.pop_pending_task(&attributes)? {
+                if let Some(task_ptr) = ssn_guard.pop_pending_task() {
                     return Ok(Some(task_ptr));
                 }
                 if ssn_guard.status.state == SessionState::Closed {
@@ -921,7 +923,6 @@ impl Controller {
 
     pub async fn unbind_executor(&self, id: ExecutorID) -> Result<(), FlameError> {
         trace_fn!("Controller::unbind_executor");
-        self.clear_executor_attributes(&id);
         let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         state.unbind_executor().await?;
@@ -977,7 +978,6 @@ impl Controller {
 
     pub async fn release_executor(&self, id: ExecutorID) -> Result<(), FlameError> {
         trace_fn!("Controller::release_executor");
-        self.clear_executor_attributes(&id);
         let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         state.release_executor().await?;
@@ -1006,7 +1006,6 @@ impl Controller {
 
     pub async fn unregister_executor(&self, id: ExecutorID) -> Result<(), FlameError> {
         trace_fn!("Controller::unregister_executor");
-        self.clear_executor_attributes(&id);
         let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
 
         // Get executor info before unregistering for notification
@@ -1087,7 +1086,33 @@ mod tests {
             attr: vec![b"kv-cache-key".to_vec(), b"kv-cache-key".to_vec()],
         })
         .unwrap();
-        assert_eq!(attributes.attr, HashSet::from([b"kv-cache-key".to_vec()]));
+        assert_eq!(
+            attributes,
+            HashSet::from([bytes::Bytes::from_static(b"kv-cache-key")])
+        );
+
+        let byte_boundary = (0_u16..256)
+            .map(|index| {
+                let mut value = index.to_be_bytes().to_vec();
+                value.resize(Controller::MAX_EXECUTOR_ATTRIBUTE_BYTES, 0);
+                value
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            Controller::validate_executor_attributes(rpc::ExecutorAttributes {
+                attr: byte_boundary.clone(),
+            })
+            .is_ok()
+        );
+
+        let mut over_byte_limit = byte_boundary;
+        over_byte_limit.push(b"overflow".to_vec());
+        assert!(
+            Controller::validate_executor_attributes(rpc::ExecutorAttributes {
+                attr: over_byte_limit,
+            })
+            .is_err()
+        );
     }
 
     /// Creates a test storage with a unique SQLite database.
@@ -1206,7 +1231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unbind_clears_executor_attributes() {
+    async fn unbind_retains_executor_instance_metadata() {
         let storage = create_test_storage().await;
         let controller = new_ptr(storage);
         let ssn_id = "executor-attributes-unbind".to_string();
@@ -1225,17 +1250,109 @@ mod tests {
             )
             .await
             .unwrap();
+        let executor = controller.get_executor(executor_id.clone()).unwrap();
+        assert_eq!(executor.application, "test-app");
         assert_eq!(
-            controller.executor_attributes(&executor_id),
-            Some(HashSet::from([b"kv-cache-key".to_vec()]))
+            executor.attributes,
+            HashSet::from([bytes::Bytes::from_static(b"kv-cache-key")])
         );
+
+        controller
+            .update_executor_attributes(&executor_id, HashSet::new())
+            .unwrap();
+        assert!(controller
+            .get_executor(executor_id.clone())
+            .unwrap()
+            .attributes
+            .is_empty());
+        controller
+            .update_executor_attributes(
+                &executor_id,
+                HashSet::from([bytes::Bytes::from_static(b"kv-cache-key")]),
+            )
+            .unwrap();
 
         controller
             .unbind_executor(executor_id.clone())
             .await
             .unwrap();
+        controller
+            .unbind_executor_completed(executor_id.clone())
+            .await
+            .unwrap();
 
-        assert_eq!(controller.executor_attributes(&executor_id), None);
+        let executor = controller.get_executor(executor_id.clone()).unwrap();
+        assert_eq!(executor.application, "test-app");
+        assert_eq!(
+            executor.attributes,
+            HashSet::from([bytes::Bytes::from_static(b"kv-cache-key")])
+        );
+
+        let snapshot = controller.snapshot().unwrap();
+        let executor = snapshot
+            .find_executors(None)
+            .unwrap()
+            .remove(&executor_id)
+            .unwrap();
+        assert_eq!(executor.application, "test-app");
+        assert_eq!(
+            executor.attributes,
+            HashSet::from([bytes::Bytes::from_static(b"kv-cache-key")])
+        );
+
+        controller
+            .release_executor(executor_id.clone())
+            .await
+            .unwrap();
+        controller
+            .unregister_executor(executor_id.clone())
+            .await
+            .unwrap();
+        assert!(controller.get_executor(executor_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn unregister_application_releases_its_idle_executors() {
+        let storage = create_test_storage().await;
+        let controller = new_ptr(storage);
+        let ssn_id = "unregister-releases-idle";
+        let executor_id = create_binding_executor(&controller, ssn_id).await;
+
+        controller
+            .bind_executor_completed(
+                executor_id.clone(),
+                Some(FlameResult {
+                    return_code: BIND_RESULT_OK,
+                    message: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        controller.close_session(ssn_id.to_string()).await.unwrap();
+        controller
+            .unbind_executor(executor_id.clone())
+            .await
+            .unwrap();
+        controller
+            .unbind_executor_completed(executor_id.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            controller.get_executor(executor_id.clone()).unwrap().state,
+            ExecutorState::Idle
+        );
+
+        controller
+            .unregister_application("test-app".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            controller.get_executor(executor_id).unwrap().state,
+            ExecutorState::Releasing
+        );
     }
 
     // ========================================================================
@@ -1553,6 +1670,26 @@ mod tests {
             // Node should still be Ready
             let stored_node = storage.get_node("replace-node").unwrap().unwrap();
             assert_eq!(stored_node.state, NodeState::Ready);
+        }
+
+        #[tokio::test]
+        async fn test_register_node_preserves_persisted_executor_application() {
+            let storage = create_test_storage().await;
+            let controller = new_ptr(storage);
+            let executor_id = create_binding_executor(&controller, "reconnect-application").await;
+            let mut reported = controller.get_executor(executor_id.clone()).unwrap();
+            assert_eq!(reported.application, "test-app");
+            reported.application = "other-app".to_string();
+
+            controller
+                .register_node(&create_test_node("bind-node"), &[reported])
+                .await
+                .unwrap();
+
+            assert_eq!(
+                controller.get_executor(executor_id).unwrap().application,
+                "test-app"
+            );
         }
 
         #[tokio::test]

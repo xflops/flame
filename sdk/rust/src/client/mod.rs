@@ -468,6 +468,7 @@ pub struct Application {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Executor {
     pub id: String,
+    pub application: String,
     pub state: ExecutorState,
     pub session_id: Option<String>,
     pub node: String,
@@ -1397,6 +1398,7 @@ impl TryFrom<&rpc::Executor> for Executor {
 
         Ok(Executor {
             id: metadata.id,
+            application: spec.application,
             session_id: status.session_id,
             node: spec.node,
             state,
@@ -1783,6 +1785,30 @@ mod tests {
         assert_eq!(sdk_rr.cpu, 4);
         assert_eq!(sdk_rr.memory, 16 * 1024 * 1024 * 1024);
         assert_eq!(sdk_rr.gpu, 2);
+    }
+
+    #[test]
+    fn executor_try_from_preserves_application() {
+        let rpc_executor = rpc::Executor {
+            metadata: Some(rpc::Metadata {
+                id: "executor-1".to_string(),
+                name: String::new(),
+            }),
+            spec: Some(rpc::ExecutorSpec {
+                node: "node-1".to_string(),
+                resreq: Some(rpc::ResourceRequirement::default()),
+                shim: rpc::Shim::Host as i32,
+                application: "app-1".to_string(),
+            }),
+            status: Some(rpc::ExecutorStatus {
+                state: rpc::ExecutorState::ExecutorIdle as i32,
+                session_id: None,
+            }),
+        };
+
+        let executor = Executor::try_from(&rpc_executor).unwrap();
+
+        assert_eq!(executor.application, "app-1");
     }
 
     /// Verifies that `Session::try_from` extracts the optional `resreq` from

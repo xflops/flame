@@ -45,6 +45,7 @@ cluster:
   policies:
     - priority
     - drf
+    - das
   storage: "fs://{prefix}/data"
   executors:
     shim: host

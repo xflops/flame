@@ -3,7 +3,6 @@
 This document describes the common message types used across Flame's gRPC services.
 
 > **Note on Timestamps**: Most timestamps in Flame use Unix milliseconds. However, `last_heartbeat_time` in `NodeStatus` uses Unix seconds for compatibility with Kubernetes conventions.
-
 > **Note on Field Numbering**: Some message types (e.g., `SessionSpec`, `TaskSpec`) have field numbers starting at 2. This is intentional to maintain backward compatibility with earlier versions of the API where field 1 was reserved or removed.
 
 ## Core Types
@@ -297,7 +296,7 @@ message ApplicationSpec {
 | `environments` | Environment[] | Environment variables |
 | `working_directory` | string | Working directory |
 | `max_instances` | uint32 | Maximum concurrent instances |
-| `delay_release` | int64 | Delay before releasing idle executors (ms) |
+| `delay_release` | int64 | Base executor release delay in seconds (default: 60); retained Idle executors use twice this delay |
 | `schema` | ApplicationSchema | Input/output schema definitions |
 | `url` | string | Service URL for remote services |
 | `installer` | string | Optional installer name used by the executor before launching the application |
@@ -391,6 +390,7 @@ message ExecutorSpec {
   reserved 3;
   reserved "slots";
   Shim shim = 4;
+  string application = 5;
 }
 ```
 
@@ -399,6 +399,21 @@ message ExecutorSpec {
 | `node` | string | Node hosting this executor |
 | `resreq` | ResourceRequirement | Resource requirements (cpu, memory, gpu) |
 | `shim` | Shim | Supported shim type |
+| `application` | string | Application owning the executor's retained service instance |
+
+### ExecutorAttributes
+
+Opaque locality keys published by a service instance.
+
+```protobuf
+message ExecutorAttributes {
+  repeated bytes attr = 1;
+}
+```
+
+Each transported value is a complete replacement snapshot. Keys must be
+nonempty and no larger than 256 bytes; one snapshot may contain at most 1,024
+distinct keys and 64 KiB after deduplication.
 
 ### ExecutorStatus
 
@@ -420,7 +435,7 @@ message ExecutorStatus {
 
 State machine for executor lifecycle:
 
-```
+```text
 void ──> idle ──> releasing ──> released
           ↑  │
           │  binding

@@ -139,6 +139,7 @@ struct Multiplier {
 #[flame::instance]
 impl Multiplier {
     async fn enter(&self, instance: FlameInstance) -> Result<(), FlameError> {
+        instance.publish([b"multiplier-ready".to_vec()])?;
         let factor = instance
             .common_data::<Factor>()?
             .map(|value| value.factor)
@@ -162,6 +163,52 @@ impl Multiplier {
 ```
 
 By default the instance macro looks for lifecycle hooks named `enter` and `leave`. Implement `FlameService` directly when you need byte-level task control.
+
+Macro-generated services own their publisher automatically. A direct
+`FlameService` implementation must own and expose one:
+
+```rust
+use flame_rs::apis::{FlameError, TaskOutput};
+use flame_rs::service::{
+    FlameService, Publisher, SessionContext, TaskContext,
+};
+
+#[derive(Default)]
+struct RawService {
+    publisher: Publisher,
+}
+
+#[flame_rs::service::async_trait]
+impl FlameService for RawService {
+    fn publisher(&self) -> &Publisher {
+        &self.publisher
+    }
+
+    async fn on_session_enter(&self, _: SessionContext) -> Result<(), FlameError> {
+        Ok(())
+    }
+
+    async fn on_task_invoke(
+        &self,
+        _: TaskContext,
+    ) -> Result<Option<TaskOutput>, FlameError> {
+        self.publish([b"raw-service-ready".to_vec()])?;
+        Ok(None)
+    }
+
+    async fn on_session_leave(&self) -> Result<(), FlameError> {
+        Ok(())
+    }
+}
+```
+
+`self.publish()` and the runtime-provided `FlameInstance::publish()` add opaque
+locality keys to the next successful session-enter response or the next task
+response, including a failed task. Calls in one round are unioned, and the
+transported set completely replaces the prior instance snapshot. Keys must be
+nonempty and at most 256 bytes; a round supports at most 1,024 distinct keys and
+64 KiB after deduplication. A manually constructed `FlameInstance` is not
+attached to a service publisher, so its `publish()` method returns an error.
 
 ## Use Object Cache
 

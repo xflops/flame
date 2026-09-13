@@ -12,6 +12,7 @@ cluster:
   resreq: "cpu=1,mem=2g"
   policies:
     - drf
+    - das
   scheduleInterval: 100
   storage: "fs:///var/lib/flame/session"
   executors:

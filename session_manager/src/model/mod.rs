@@ -18,9 +18,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use stdng::{lock_ptr, MutexPtr};
 
@@ -32,6 +33,7 @@ use common::{ctx::DEFAULT_SESSION_RETRY_LIMITS, FlameError};
 use rpc::flame::v1 as rpc;
 
 pub type SessionInfoPtr = Arc<SessionInfo>;
+pub type TaskInfoPtr = Arc<TaskInfo>;
 pub type ExecutorInfoPtr = Arc<ExecutorInfo>;
 pub type NodeInfoPtr = Arc<NodeInfo>;
 pub type AppInfoPtr = Arc<AppInfo>;
@@ -45,7 +47,6 @@ pub struct SnapShot {
 
     pub sessions: MutexPtr<HashMap<SessionID, SessionInfoPtr>>,
     pub ssn_index: MutexPtr<HashMap<SessionState, HashMap<SessionID, SessionInfoPtr>>>,
-
     pub executors: MutexPtr<HashMap<ExecutorID, ExecutorInfoPtr>>,
     pub exec_index: MutexPtr<HashMap<ExecutorState, HashMap<ExecutorID, ExecutorInfoPtr>>>,
 
@@ -122,6 +123,7 @@ pub struct TaskInfo {
     pub completion_time: Option<DateTime<Utc>>,
 
     pub state: TaskState,
+    pub affinity: HashSet<Bytes>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -141,6 +143,7 @@ pub struct SessionInfo {
     pub priority: u32,
     pub resreq: Option<ResourceRequirement>,
     pub retry_count: u32,
+    pub task_index: HashMap<TaskState, BTreeMap<TaskID, TaskInfoPtr>>,
 }
 
 impl SessionInfo {
@@ -155,11 +158,17 @@ pub struct ExecutorInfo {
     pub node: String,
     pub resreq: ResourceRequirement,
     pub shim: Shim,
+    /// Application owning the retained service instance.
+    pub application: String,
     pub task_id: Option<TaskID>,
     pub ssn_id: Option<SessionID>,
 
     pub creation_time: DateTime<Utc>,
+    /// Last in-memory lifecycle update, used to age Idle retained instances.
+    pub latest_updated_timestamp: DateTime<Utc>,
     pub state: ExecutorState,
+    /// Last accepted volatile attributes for the retained service instance.
+    pub attributes: HashSet<Bytes>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -211,10 +220,13 @@ impl From<&Executor> for ExecutorInfo {
             node: exec.node.clone(),
             resreq: exec.resreq.clone(),
             shim: exec.shim,
+            application: exec.application.clone(),
             task_id: exec.task_id,
             ssn_id: exec.ssn_id.clone(),
             creation_time: exec.creation_time,
+            latest_updated_timestamp: exec.latest_updated_timestamp,
             state: exec.state,
+            attributes: exec.attributes.clone(),
         }
     }
 }
@@ -227,18 +239,33 @@ impl From<&Task> for TaskInfo {
             creation_time: task.creation_time,
             completion_time: task.completion_time,
             state: task.state,
+            affinity: task.affinity.clone(),
         }
     }
 }
 
-impl From<&Session> for SessionInfo {
-    fn from(ssn: &Session) -> Self {
+impl TryFrom<&Session> for SessionInfo {
+    type Error = FlameError;
+
+    fn try_from(ssn: &Session) -> Result<Self, Self::Error> {
         let mut tasks_status = HashMap::new();
         for (k, v) in &ssn.tasks_index {
             tasks_status.insert(*k, v.len() as i32);
         }
+        let mut task_index = HashMap::new();
+        for (state, tasks) in ssn
+            .tasks_index
+            .iter()
+            .filter(|(state, _)| !state.is_terminal())
+        {
+            let mut task_infos = BTreeMap::new();
+            for (task_id, task) in tasks {
+                task_infos.insert(*task_id, Arc::new(TaskInfo::from(&*lock_ptr!(task)?)));
+            }
+            task_index.insert(*state, task_infos);
+        }
 
-        SessionInfo {
+        Ok(SessionInfo {
             id: ssn.id.clone(),
             application: ssn.application.clone(),
             tasks_status,
@@ -251,7 +278,8 @@ impl From<&Session> for SessionInfo {
             priority: ssn.priority,
             resreq: ssn.resreq.clone(),
             retry_count: ssn.retry_count,
-        }
+            task_index,
+        })
     }
 }
 
@@ -801,9 +829,12 @@ impl SnapShot {
             resreq: exec.resreq.clone(),
             task_id: exec.task_id,
             shim: exec.shim,
+            application: exec.application.clone(),
             ssn_id: exec.ssn_id.clone(),
             creation_time: exec.creation_time,
+            latest_updated_timestamp: Utc::now(),
             state,
+            attributes: exec.attributes.clone(),
         });
 
         self.delete_executor(new_exec.clone())?;
@@ -865,11 +896,24 @@ pub struct Executor {
     pub node: String,
     pub resreq: ResourceRequirement,
     pub shim: Shim,
+    /// Persisted owner of the retained service instance, also carried by RPC.
+    pub application: String,
     pub task_id: Option<TaskID>,
     pub ssn_id: Option<SessionID>,
+    /// Volatile instance attributes, intentionally omitted from storage/RPC.
+    pub attributes: HashSet<Bytes>,
 
     pub creation_time: DateTime<Utc>,
+    /// Volatile lifecycle timestamp; intentionally omitted from storage and RPC.
+    pub latest_updated_timestamp: DateTime<Utc>,
     pub state: ExecutorState,
+}
+
+impl Executor {
+    pub fn set_state(&mut self, state: ExecutorState) {
+        self.state = state;
+        self.latest_updated_timestamp = Utc::now();
+    }
 }
 
 impl Default for Executor {
@@ -879,9 +923,12 @@ impl Default for Executor {
             node: String::new(),
             resreq: ResourceRequirement::default(),
             shim: Shim::Host,
+            application: String::new(),
             task_id: None,
             ssn_id: None,
+            attributes: HashSet::new(),
             creation_time: Utc::now(),
+            latest_updated_timestamp: Utc::now(),
             state: ExecutorState::default(),
         }
     }
@@ -908,9 +955,12 @@ impl From<&rpc::Executor> for Executor {
             node: spec.node.clone(),
             resreq: spec.resreq.unwrap().into(),
             shim: Shim::from(spec.shim()),
+            application: spec.application.clone(),
             task_id: None,
             ssn_id: None,
+            attributes: HashSet::new(),
             creation_time: Utc::now(),
+            latest_updated_timestamp: Utc::now(),
             state,
         }
     }
@@ -933,6 +983,7 @@ impl From<&Executor> for rpc::Executor {
             resreq: Some(e.resreq.clone().into()),
             node: e.node.clone(),
             shim: rpc::Shim::from(e.shim).into(), // Include shim in spec
+            application: e.application.clone(),
         });
 
         let status = Some(rpc::ExecutorStatus {
@@ -953,6 +1004,32 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
+    #[test]
+    fn executor_rpc_round_trip_preserves_application() {
+        let executor = Executor {
+            application: "test-app".to_string(),
+            ..Default::default()
+        };
+
+        let rpc_executor = rpc::Executor::from(&executor);
+        assert_eq!(rpc_executor.spec.as_ref().unwrap().application, "test-app");
+        assert_eq!(Executor::from(&rpc_executor).application, "test-app");
+    }
+
+    #[test]
+    fn executor_info_preserves_latest_updated_timestamp() {
+        let timestamp = Utc::now() - Duration::minutes(5);
+        let executor = Executor {
+            latest_updated_timestamp: timestamp,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ExecutorInfo::from(&executor).latest_updated_timestamp,
+            timestamp
+        );
+    }
+
     /// Helper to create a test executor with given resreq.
     fn create_test_executor(
         id: &str,
@@ -964,10 +1041,13 @@ mod tests {
             node: "test-node".to_string(),
             resreq,
             shim: Shim::Host,
+            application: String::new(),
             task_id: None,
             ssn_id: None,
             creation_time: Utc::now(),
+            latest_updated_timestamp: Utc::now(),
             state,
+            attributes: HashSet::new(),
         })
     }
 
@@ -990,6 +1070,7 @@ mod tests {
             priority: 0,
             resreq,
             retry_count: 0,
+            task_index: HashMap::new(),
         })
     }
 
@@ -1015,7 +1096,7 @@ mod tests {
             ..Default::default()
         };
 
-        let info = SessionInfo::from(&session);
+        let info = SessionInfo::try_from(&session).unwrap();
 
         assert_eq!(info.retry_count, 7);
     }
@@ -1124,9 +1205,15 @@ mod tests {
     #[test]
     fn test_snapshot_update_executor_state() {
         let ss = SnapShot::new();
+        let previous_timestamp = Utc::now() - Duration::minutes(5);
 
         // Add an idle executor
-        let exec = create_test_executor("exec-1", slots_rr(2), ExecutorState::Idle);
+        let exec = Arc::new(ExecutorInfo {
+            application: "test-app".to_string(),
+            attributes: HashSet::from([Bytes::from_static(b"key")]),
+            latest_updated_timestamp: previous_timestamp,
+            ..(*create_test_executor("exec-1", slots_rr(2), ExecutorState::Idle)).clone()
+        });
         ss.add_executor(exec.clone()).unwrap();
 
         // Verify it's in the idle index
@@ -1144,6 +1231,13 @@ mod tests {
         // Verify it's now in bound index
         let bound_execs = ss.find_executors(BOUND_EXECUTOR).unwrap();
         assert_eq!(bound_execs.len(), 1);
+        let updated = bound_execs.get("exec-1").unwrap();
+        assert_eq!(updated.application, "test-app");
+        assert!(updated.latest_updated_timestamp > previous_timestamp);
+        assert_eq!(
+            updated.attributes,
+            HashSet::from([Bytes::from_static(b"key")])
+        );
     }
 
     /// Test pipelined_executors filters by resreq equality correctly.

@@ -106,10 +106,20 @@ impl Plugin for DRFPlugin {
 
         let executors = ss.find_executors(ALL_EXECUTOR)?;
         for exec in executors.values() {
-            if let Some(ssn_id) = &exec.ssn_id {
+            // Idle retained instances and executors still releasing continue
+            // to occupy node resources even though they have no session owner.
+            // Void executors are charged when pipelined below; Released
+            // executors no longer occupy capacity.
+            if !matches!(
+                exec.state,
+                common::apis::ExecutorState::Void | common::apis::ExecutorState::Released
+            ) {
                 if let Some(node_alloc) = self.node_allocations.get_mut(&exec.node) {
                     node_alloc.add(&exec.resreq);
                 }
+            }
+
+            if let Some(ssn_id) = &exec.ssn_id {
                 let entry = self
                     .ssn_map
                     .entry(ssn_id.clone())
@@ -219,9 +229,9 @@ impl Plugin for DRFPlugin {
 
         // Void executors are deliberately excluded from setup's node usage.
         // Pipeline them here so they reserve capacity exactly once for the
-        // current cycle. Executors already owned by a session were counted by
-        // setup and must not be charged again while they unbind.
-        if exec.ssn_id.is_none() {
+        // current cycle. Every other live state was already charged by setup,
+        // including an Unbinding executor whose session ID was cleared.
+        if exec.state == common::apis::ExecutorState::Void {
             if let Some(node_alloc) = self.node_allocations.get_mut(&exec.node) {
                 node_alloc.add(&exec.resreq);
             }
@@ -291,6 +301,7 @@ mod tests {
             priority: 0,
             resreq: Some(rr(1)),
             retry_count: 0,
+            task_index: HashMap::new(),
         })
     }
 
@@ -300,10 +311,13 @@ mod tests {
             node: "node-1".to_string(),
             resreq: rr(1),
             shim: Shim::Host,
+            application: String::new(),
             task_id: None,
             ssn_id: None,
             creation_time: Utc::now(),
+            latest_updated_timestamp: Utc::now(),
             state: ExecutorState::Void,
+            attributes: Default::default(),
         })
     }
 
@@ -332,5 +346,82 @@ mod tests {
         assert_eq!(plugin.node_allocations.get("node-1"), Some(&rr(4)));
         assert_eq!(plugin.is_underused(&ssn), Some(true));
         assert_eq!(plugin.is_ready(&ssn), Some(true));
+    }
+
+    #[test]
+    fn retained_idle_executor_blocks_cross_application_overcommit() {
+        let snapshot = SnapShot::new();
+        let node = Arc::new(crate::model::NodeInfo {
+            name: "node-1".to_string(),
+            allocatable: rr(1),
+            state: common::apis::NodeState::Ready,
+        });
+        snapshot.add_node(node.clone()).unwrap();
+
+        let retained = Arc::new(crate::model::ExecutorInfo {
+            id: "retained-app-a".to_string(),
+            application: "app-a".to_string(),
+            node: node.name.clone(),
+            resreq: rr(1),
+            state: ExecutorState::Idle,
+            ..Default::default()
+        });
+        snapshot.add_executor(retained).unwrap();
+
+        let pending = Arc::new(SessionInfo {
+            id: "session-app-b".to_string(),
+            application: "app-b".to_string(),
+            tasks_status: [(TaskState::Pending, 1)].into_iter().collect(),
+            state: SessionState::Open,
+            resreq: Some(rr(1)),
+            ..Default::default()
+        });
+        snapshot.add_session(pending.clone()).unwrap();
+
+        let mut plugin = DRFPlugin {
+            total: ResourceRequirement::default(),
+            ssn_map: HashMap::new(),
+            node_allocations: HashMap::new(),
+        };
+        plugin.setup(&snapshot).unwrap();
+
+        assert_eq!(plugin.node_allocations.get(&node.name), Some(&rr(1)));
+        assert_eq!(plugin.is_allocatable(&node, &pending), Some(false));
+        assert_eq!(plugin.ssn_map.get(&pending.id).unwrap().allocated, rr(0));
+    }
+
+    #[test]
+    fn pipelining_unowned_unbinding_executor_does_not_double_charge_node() {
+        let snapshot = SnapShot::new();
+        let node = Arc::new(crate::model::NodeInfo {
+            name: "node-1".to_string(),
+            allocatable: rr(2),
+            state: common::apis::NodeState::Ready,
+        });
+        snapshot.add_node(node.clone()).unwrap();
+
+        let unbinding = Arc::new(crate::model::ExecutorInfo {
+            id: "unbinding".to_string(),
+            node: node.name.clone(),
+            resreq: rr(1),
+            ssn_id: None,
+            state: ExecutorState::Unbinding,
+            ..Default::default()
+        });
+        snapshot.add_executor(unbinding.clone()).unwrap();
+
+        let pending = session();
+        snapshot.add_session(pending.clone()).unwrap();
+        let mut plugin = DRFPlugin {
+            total: ResourceRequirement::default(),
+            ssn_map: HashMap::new(),
+            node_allocations: HashMap::new(),
+        };
+        plugin.setup(&snapshot).unwrap();
+        assert_eq!(plugin.node_allocations.get(&node.name), Some(&rr(1)));
+
+        plugin.on_executor_pipeline(unbinding, pending);
+
+        assert_eq!(plugin.node_allocations.get(&node.name), Some(&rr(1)));
     }
 }

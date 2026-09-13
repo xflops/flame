@@ -116,6 +116,7 @@ class Echo(flamepy.FlameService):
         self.common_data = context.common_data()
 
     def on_task_invoke(self, context: flamepy.TaskContext) -> Optional[bytes]:
+        self.publish({b"echo-cache"})
         return context.input
 
     def on_session_leave(self):
@@ -127,6 +128,13 @@ if __name__ == "__main__":
 ```
 
 The service runtime provides `FLAME_INSTANCE_ENDPOINT` and calls the service through a Unix domain socket. Service methods should return bytes or `None`.
+
+`self.publish()` adds opaque locality keys to the next successful session-enter
+response or the next task response, including a failed task. Calls within one
+response are unioned; the transported set is a complete replacement for the
+instance's previous snapshot. Keys are nonempty `bytes` values of at most 256
+bytes. One publication round supports at most 1,024 distinct keys and 64 KiB
+after deduplication.
 
 ## Use The Service Helper
 
@@ -200,6 +208,34 @@ with Runner("square-app") as runner:
 
 Runner returns `ObjectFuture` values. Use `future.get()` to fetch a concrete result, `future.ref()` to get the `ObjectRef`, `runner.wait()` to wait for a batch, and `runner.select()` to iterate as results complete.
 
+`Runner.service()` returns a public `RunnerServiceInstance` client handle. It
+exposes the execution object's remote methods and owns that session's `close()`
+lifecycle. Application execution objects subclass `RunnerService` when they
+need service-side session context or instance-attribute publication.
+Plain functions, classes, and object instances do not need to subclass it when
+they use neither API.
+
+Migration: the client proxy previously exported as `RunnerService` is renamed
+to `RunnerServiceInstance`. The `RunnerService` name now refers to the optional
+executor-side base class.
+
+Subclass `flamepy.runner.RunnerService` to access Runner-managed service state.
+`self.session_context()` returns the active session context, while
+`self.publish_attributes(attrs)` adds opaque `bytes` keys to the current
+session-entry or invocation response. Repeated calls in one response accumulate;
+Runner publishes and drains the set at the response boundary. Every response is
+a complete replacement, so each invoked method must publish all currently valid
+keys, including methods that do not change the cache. Task calls can request a
+matching instance with `TaskOptions(affinity={key})`.
+
+The returned service-side context is `flamepy.SessionContext`. It is distinct
+from `flamepy.runner.SessionContext`, which configures Runner session creation.
+
+The Runner process is retained with its executor, but Runner reloads the
+execution object on each session entry and clears it on session leave. Affinity
+keys intended for reuse across sessions should identify data retained outside
+that session's execution object, such as process-local or external cached data.
+
 To verify a configured cluster end to end with Runner, run:
 
 ```bash
@@ -218,7 +254,7 @@ Installed wheels also provide the `flamepy-runner-e2e` command. The check valida
 | Applications | `register_application()`, `unregister_application()`, `get_application()`, `list_applications()` |
 | Services | `FlameService`, `flamepy.run()`, `flamepy.service.FlameInstance`, `flamepy.service.Session` |
 | Objects | `put_object()`, `get_object()`, `update_object()`, `patch_object()`, `upload_object()`, `download_object()` |
-| Runner | `Runner`, `Runner.service()`, `ObjectFuture` |
+| Runner | `Runner`, `RunnerService`, `RunnerServiceInstance`, `ObjectFuture` |
 
 See also:
 

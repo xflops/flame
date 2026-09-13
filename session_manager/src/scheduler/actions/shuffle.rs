@@ -16,7 +16,9 @@ use std::sync::Arc;
 use stdng::collections::{BinaryHeap, Cmp};
 use stdng::{logs::TraceFn, trace_fn};
 
-use crate::model::{BOUND_EXECUTOR, IDLE_EXECUTOR, READY_SESSION};
+use chrono::{DateTime, Duration, Utc};
+
+use crate::model::{ExecutorInfo, SnapShot, BOUND_EXECUTOR, IDLE_EXECUTOR, READY_SESSION};
 use crate::scheduler::actions::{Action, ActionPtr};
 use crate::scheduler::ctx::Context;
 use crate::scheduler::plugins::ssn_order_fn;
@@ -24,6 +26,16 @@ use crate::scheduler::plugins::ssn_order_fn;
 use common::FlameError;
 
 pub struct ShuffleAction {}
+
+fn idle_executor_expired(snapshot: &SnapShot, executor: &ExecutorInfo) -> Result<bool, FlameError> {
+    let Some(application) = snapshot.get_application(&executor.application)? else {
+        return Ok(true);
+    };
+    let delay_release = application.delay_release;
+    let idle_delay = delay_release.max(Duration::zero()) * 2;
+    let idle_age = Utc::now().signed_duration_since(executor.latest_updated_timestamp);
+    Ok(idle_age < Duration::zero() || idle_age >= idle_delay)
+}
 
 impl ShuffleAction {
     pub fn new_ptr() -> ActionPtr {
@@ -102,12 +114,171 @@ impl Action for ShuffleAction {
             }
         }
 
-        // Release Idle executors, so their resources can be reallocated.
+        // Release retained Idle executors after the application's grace period,
+        // so DAS can reuse them without allowing indefinite resource starvation.
         let idle_execs = ss.find_executors(IDLE_EXECUTOR)?;
         for exec in idle_execs.values() {
-            ctx.release_executor(exec).await?;
+            if idle_executor_expired(&ss, exec)? {
+                ctx.release_executor(exec).await?;
+            }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::AppInfo;
+    use common::apis::{
+        ApplicationAttributes, ExecutorState, FlameResult, Node, NodeState, ResourceRequirement,
+        SessionAttributes, BIND_RESULT_OK,
+    };
+    use common::ctx::{FlameCluster, FlameClusterContext};
+
+    fn idle_executor(updated_at: DateTime<Utc>) -> ExecutorInfo {
+        ExecutorInfo {
+            application: "app".to_string(),
+            latest_updated_timestamp: updated_at,
+            ..Default::default()
+        }
+    }
+
+    fn snapshot(delay_release: Option<Duration>) -> SnapShot {
+        let snapshot = SnapShot::new();
+        if let Some(delay_release) = delay_release {
+            snapshot
+                .add_application(Arc::new(AppInfo {
+                    name: "app".to_string(),
+                    delay_release,
+                    ..Default::default()
+                }))
+                .unwrap();
+        }
+        snapshot
+    }
+
+    #[test]
+    fn idle_retention_honors_delay() {
+        let now = Utc::now();
+        let configured_delay = Duration::minutes(1);
+        let snapshot = snapshot(Some(configured_delay));
+
+        assert!(
+            !idle_executor_expired(&snapshot, &idle_executor(now - Duration::seconds(90)),)
+                .unwrap()
+        );
+        assert!(
+            idle_executor_expired(&snapshot, &idle_executor(now - Duration::seconds(121)),)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn idle_retention_releases_immediately_without_positive_delay() {
+        let now = Utc::now();
+        let executor = idle_executor(now);
+
+        assert!(idle_executor_expired(&snapshot(Some(Duration::zero())), &executor).unwrap());
+        assert!(idle_executor_expired(&snapshot(Some(Duration::seconds(-1))), &executor).unwrap());
+    }
+
+    #[test]
+    fn idle_retention_releases_executor_for_unregistered_application() {
+        let executor = idle_executor(Utc::now());
+
+        assert!(idle_executor_expired(&snapshot(None), &executor).unwrap());
+    }
+
+    #[test]
+    fn idle_retention_expires_after_clock_rollback() {
+        let now = Utc::now();
+        let executor = idle_executor(now + Duration::seconds(1));
+
+        assert!(idle_executor_expired(&snapshot(Some(Duration::minutes(1))), &executor,).unwrap());
+    }
+
+    #[tokio::test]
+    async fn shuffle_releases_executor_that_becomes_idle_after_application_unregister() {
+        let config = FlameClusterContext {
+            cluster: FlameCluster {
+                storage: "none".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let storage = crate::storage::new_ptr(&config).await.unwrap();
+        let controller = crate::controller::new_ptr(storage.clone());
+        controller
+            .register_application("app".to_string(), ApplicationAttributes::default())
+            .await
+            .unwrap();
+        storage
+            .register_node(&Node {
+                name: "node".to_string(),
+                state: NodeState::Ready,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        controller
+            .create_session(SessionAttributes {
+                id: "session".to_string(),
+                application: "app".to_string(),
+                resreq: Some(ResourceRequirement::default()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let executor = controller
+            .create_executor("node".to_string(), "session".to_string())
+            .await
+            .unwrap();
+        controller.register_executor(&executor).await.unwrap();
+        controller
+            .bind_session(executor.id.clone(), "session".to_string())
+            .await
+            .unwrap();
+        controller
+            .bind_executor_completed(
+                executor.id.clone(),
+                Some(FlameResult {
+                    return_code: BIND_RESULT_OK,
+                    message: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        controller
+            .close_session("session".to_string())
+            .await
+            .unwrap();
+        controller
+            .unbind_executor(executor.id.clone())
+            .await
+            .unwrap();
+
+        controller
+            .unregister_application("app".to_string())
+            .await
+            .unwrap();
+        controller
+            .unbind_executor_completed(executor.id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            controller.get_executor(executor.id.clone()).unwrap().state,
+            ExecutorState::Idle
+        );
+
+        let mut context = Context::new(controller.clone(), &[]).unwrap();
+        ShuffleAction {}.execute(&mut context).await.unwrap();
+
+        assert_eq!(
+            controller.get_executor(executor.id).unwrap().state,
+            ExecutorState::Releasing
+        );
     }
 }

@@ -56,6 +56,7 @@ struct Multiplier {
 #[flame::instance]
 impl Multiplier {
     async fn enter(&self, instance: FlameInstance) -> Result<(), FlameError> {
+        instance.publish([b"entered".to_vec()])?;
         let factor = instance
             .common_data::<Factor>()?
             .map(|factor| factor.value)
@@ -136,6 +137,8 @@ async fn instance_entrypoint_can_use_typed_common_data() {
         .on_session_enter(session_context(Some(common_data)))
         .await
         .unwrap();
+    assert_eq!(service.publisher().take().attr, vec![b"entered".to_vec()]);
+    assert!(service.publisher().take().attr.is_empty());
 
     let input = Number { value: 7 }.encode().unwrap();
     let output = service

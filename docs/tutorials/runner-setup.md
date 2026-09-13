@@ -160,7 +160,7 @@ Runner(name: str, fail_if_exists: bool = False)
 
 Methods:
 
-- `service(execution_object, autoscale=None, warmup=0, resreq=None)`: create a `RunnerService`.
+- `service(execution_object, autoscale=None, warmup=0, resreq=None)`: create a `RunnerServiceInstance`.
 - `get(futures)`: resolve multiple `ObjectFuture` values to concrete objects.
 - `ref(futures)`: resolve multiple `ObjectFuture` values to `ObjectRef` values.
 - `wait(futures)`: wait for multiple futures without fetching objects.
@@ -180,9 +180,13 @@ with Runner("cpu-app") as runner:
     )
 ```
 
-### RunnerService
+### RunnerServiceInstance
 
-`RunnerService` exposes public methods of the function, class, or instance passed to `Runner.service()`.
+`RunnerServiceInstance` exposes public methods of the function, class, or instance passed to `Runner.service()`.
+
+This client proxy was previously exported as `RunnerService`. It is renamed to
+`RunnerServiceInstance`; `RunnerService` now names the optional executor-side
+base described below.
 
 - Function services are callable directly.
 - Class and instance services expose one wrapper method for each public method.
@@ -198,6 +202,71 @@ Default service behavior with `warmup=0`:
 | Instance | `True` | `False` | `1` | `1` |
 
 For functions, builtins, and classes, `autoscale` is configurable. When `warmup=N` and `N > 0`, autoscaled services use `min_instances=N` and no max limit; fixed services use `min_instances=N` and `max_instances=N`. Object instances are always fixed, always stateful, and reject `warmup` values other than `0` or `1`.
+
+### Data-Aware Instance Selection
+
+`RunnerService` is optional. Continue passing plain functions, classes, or
+instances to `Runner.service()` unless the execution object needs the active
+session context or attribute publication.
+
+Subclass `flamepy.runner.RunnerService` and use `publish_attributes(attrs)` to
+add opaque `bytes` keys held by that instance. Repeated calls during one method
+accumulate, and Runner drains the published set after each response. Every
+response completely replaces the executor snapshot, so publish the instance's
+complete current keys from every invoked method, including read-only methods.
+`session_context()` also exposes the active Flame session context:
+
+```python
+import os
+from pathlib import Path
+
+import flamepy
+from flamepy.runner import Runner, RunnerService
+
+
+class Cache(RunnerService):
+    def __init__(self):
+        # The Runner process survives executor unbind; the execution object does not.
+        self.path = Path(f"/tmp/flame-runner-cache-{os.getpid()}")
+        self.keys = set()
+
+    def store(self, key: bytes, value: str) -> str:
+        self.path.write_text(value)
+        self.keys = {key}
+        self.publish_attributes(self.keys)
+        return value
+
+    def load(self, key: bytes) -> str:
+        self.keys.add(key)
+        self.publish_attributes(self.keys)
+        return self.path.read_text()
+
+
+with Runner("cache-app") as runner:
+    key = b"model:block:7"
+
+    warm_cache = runner.service(Cache, warmup=2)
+    warm_cache.store(key, "value").wait()
+
+    target_cache = runner.service(Cache, warmup=0)
+    warm_cache.close()
+    result = target_cache.load(key, option=flamepy.TaskOptions(affinity={key}))
+    print(result.get())
+```
+
+Runner publishes the complete set after session entry and every task, including
+a failed task. Omitting a key removes it from the executor snapshot, and
+publishing nothing clears the snapshot. Keys must be nonempty and at most 256
+bytes. One publication round supports at most 1,024 distinct keys and 64 KiB
+after deduplication.
+
+Runner loads the session's execution object on enter and clears it on leave.
+Cross-session affinity must therefore describe data owned by the retained
+Runner process, as above, or by another durable instance-local resource. The
+second session is created before the first one closes so its task is ready to
+use the retained executor. Idle instances remain reusable for twice the
+application's configured `delay_release` before Shuffle releases them: 120
+seconds with the default 60-second setting.
 
 ### ObjectFuture
 

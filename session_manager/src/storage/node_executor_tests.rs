@@ -141,31 +141,38 @@ mod tests {
                 gpu: 0,
             },
             shim: Shim::Host,
+            application: "test-app".to_string(),
             task_id: None,
             ssn_id: None,
+            attributes: Default::default(),
             creation_time: Utc::now(),
+            latest_updated_timestamp: Utc::now(),
             state: ExecutorState::Void,
         };
 
         let created = tokio_test::block_on(storage.create_executor(&executor))?;
         assert_eq!(created.id, "exec-1");
         assert_eq!(created.state, ExecutorState::Void);
+        assert_eq!(created.application, "test-app");
 
         // Get the executor
         let retrieved = tokio_test::block_on(storage.get_executor(&"exec-1".to_string()))?;
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.node, "test-node-exec");
+        assert_eq!(retrieved.application, "test-app");
 
         // Update executor state
         let updated = tokio_test::block_on(
             storage.update_executor_state(&"exec-1".to_string(), ExecutorState::Idle),
         )?;
         assert_eq!(updated.state, ExecutorState::Idle);
+        assert_eq!(updated.application, "test-app");
 
         // Find executors by node
         let executors = tokio_test::block_on(storage.find_executors(Some("test-node-exec")))?;
         assert_eq!(executors.len(), 1);
+        assert_eq!(executors[0].application, "test-app");
 
         // Find all executors
         let all_executors = tokio_test::block_on(storage.find_executors(None))?;
@@ -219,9 +226,12 @@ mod tests {
                     gpu: 0,
                 },
                 shim: Shim::Host,
+                application: "test-app".to_string(),
                 task_id: None,
                 ssn_id: None,
+                attributes: Default::default(),
                 creation_time: Utc::now(),
+                latest_updated_timestamp: Utc::now(),
                 state: ExecutorState::Idle,
             };
             tokio_test::block_on(storage.create_executor(&executor))?;
@@ -275,9 +285,12 @@ mod tests {
                 gpu: 0,
             },
             shim: Shim::Host,
+            application: "test-app".to_string(),
             task_id: None,
             ssn_id: None,
+            attributes: Default::default(),
             creation_time: Utc::now(),
+            latest_updated_timestamp: Utc::now(),
             state: ExecutorState::Void,
         };
         tokio_test::block_on(storage.create_executor(&executor))?;

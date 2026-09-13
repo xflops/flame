@@ -29,7 +29,7 @@ impl States for VoidState {
     async fn register_executor(&self) -> Result<(), FlameError> {
         trace_fn!("VoidState::register_executor");
         let mut e = lock_ptr!(self.executor)?;
-        e.state = ExecutorState::Idle;
+        e.set_state(ExecutorState::Idle);
 
         Ok(())
     }

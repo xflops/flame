@@ -47,7 +47,7 @@ impl States for ReleasingState {
         trace_fn!("ReleasingState::unregister_executor");
 
         let mut e = lock_ptr!(self.executor)?;
-        e.state = ExecutorState::Released;
+        e.set_state(ExecutorState::Released);
 
         Ok(())
     }

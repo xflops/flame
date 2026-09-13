@@ -11,8 +11,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashSet;
-
 use stdng::lock_ptr;
 
 use super::types::*;
@@ -87,41 +85,11 @@ impl Session {
         Ok(())
     }
 
-    /// Remove the most-local pending task for an executor.
-    ///
-    /// A task's score is the number of its opaque affinity keys in the
-    /// executor's published attributes. Task IDs are monotonic, so the lower
-    /// ID wins ties and preserves FIFO behavior when locality is equal.
-    pub fn pop_pending_task(
-        &mut self,
-        attributes: &HashSet<Vec<u8>>,
-    ) -> Result<Option<TaskPtr>, FlameError> {
-        let pending_tasks = match self.tasks_index.get(&TaskState::Pending) {
-            Some(tasks) => tasks,
-            None => return Ok(None),
-        };
-
-        let mut selected: Option<(TaskID, usize)> = None;
-        for (task_id, task_ptr) in pending_tasks {
-            let task = lock_ptr!(task_ptr)?;
-            let task_score = task
-                .affinity
-                .iter()
-                .filter(|key| attributes.contains(key.as_ref()))
-                .count();
-            if selected.is_none_or(|(selected_id, selected_score)| {
-                task_score > selected_score
-                    || (task_score == selected_score && *task_id < selected_id)
-            }) {
-                selected = Some((*task_id, task_score));
-            }
-        }
-
-        Ok(selected.and_then(|(task_id, _)| {
-            self.tasks_index
-                .get_mut(&TaskState::Pending)
-                .and_then(|tasks| tasks.remove(&task_id))
-        }))
+    /// Remove the oldest pending task.
+    pub fn pop_pending_task(&mut self) -> Option<TaskPtr> {
+        let pending_tasks = self.tasks_index.get_mut(&TaskState::Pending)?;
+        let task_id = *pending_tasks.keys().next()?;
+        pending_tasks.remove(&task_id)
     }
 
     pub fn validate_spec(&self, attr: &SessionAttributes) -> Result<(), FlameError> {
@@ -162,6 +130,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn is_ready_uses_transient_retry_count() {
@@ -183,11 +152,12 @@ mod tests {
     }
 
     #[test]
-    fn pop_pending_task_prefers_matching_affinity() {
+    fn pop_pending_task_is_fifo() {
         let mut session = Session::default();
         session
             .update_task(&Task {
                 id: 1,
+                version: 1,
                 affinity: HashSet::from([bytes::Bytes::from_static(b"cold")]),
                 ..Default::default()
             })
@@ -195,13 +165,13 @@ mod tests {
         session
             .update_task(&Task {
                 id: 2,
+                version: 1,
                 affinity: HashSet::from([bytes::Bytes::from_static(b"warm")]),
                 ..Default::default()
             })
             .unwrap();
 
-        let attributes = HashSet::from([b"warm".to_vec()]);
-        let task = session.pop_pending_task(&attributes).unwrap().unwrap();
-        assert_eq!(lock_ptr!(task).unwrap().id, 2);
+        let task = session.pop_pending_task().unwrap();
+        assert_eq!(lock_ptr!(task).unwrap().id, 1);
     }
 }

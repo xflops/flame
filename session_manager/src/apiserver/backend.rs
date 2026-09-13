@@ -323,14 +323,18 @@ impl Backend for Flame {
             .ok_or(FlameError::InvalidConfig("no executor spec".to_string()))?;
 
         let shim = Shim::from(spec.shim());
+        let now = Utc::now();
         let e = Executor {
             id: req.executor_id,
             node: spec.node,
             resreq: spec.resreq.unwrap_or_default().into(),
             shim,
+            application: spec.application,
             task_id: None,
             ssn_id: None,
-            creation_time: Utc::now(),
+            attributes: Default::default(),
+            creation_time: now,
+            latest_updated_timestamp: now,
             state: ExecutorState::Idle,
         };
 

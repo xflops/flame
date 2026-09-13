@@ -106,7 +106,7 @@ impl Storage {
             tracing::debug!("There are {} sessions in snapshot.", ssn_map.len());
             for ssn in ssn_map.deref().values() {
                 let ssn = lock_ptr!(ssn)?;
-                let info = SessionInfo::from(&(*ssn));
+                let info = SessionInfo::try_from(&(*ssn))?;
                 res.add_session(Arc::new(info))?;
             }
         }
@@ -151,7 +151,7 @@ impl Storage {
                     _ => task,
                 };
 
-                ssn.update_task(&task);
+                ssn.update_task(&task)?;
             }
 
             let mut ssn_map = lock_ptr!(self.sessions)?;
@@ -182,7 +182,7 @@ impl Storage {
                     executor.id
                 );
                 let mut recovered = executor.clone();
-                recovered.state = ExecutorState::Idle;
+                recovered.set_state(ExecutorState::Idle);
                 recovered.ssn_id = None;
                 self.engine.update_executor(&recovered).await?;
                 recovered
@@ -372,9 +372,12 @@ impl Storage {
                     node: exec.node.clone(),
                     resreq: exec.resreq.clone(),
                     shim: exec.shim,
+                    application: exec.application.clone(),
                     task_id: exec.task_id,
                     ssn_id: exec.ssn_id.clone(),
+                    attributes: exec.attributes.clone(),
                     creation_time: exec.creation_time,
+                    latest_updated_timestamp: exec.latest_updated_timestamp,
                     state: exec.state,
                 });
             }
@@ -973,24 +976,29 @@ impl Storage {
         trace_fn!("Storage::create_executor");
         let ssn = self.get_session_ptr(ssn_id.clone())?;
 
-        let resreq = {
+        let (application, resreq) = {
             let ssn = lock_ptr!(ssn)?;
-            ssn.resreq.clone().ok_or_else(|| {
+            let resreq = ssn.resreq.clone().ok_or_else(|| {
                 FlameError::InvalidState(format!(
                     "session <{}> has no resreq; resolve_session_resreq must populate it",
                     ssn_id
                 ))
-            })?
+            })?;
+            (ssn.application.clone(), resreq)
         };
 
+        let now = Utc::now();
         let e = Executor {
             id: Uuid::new_v4().to_string(),
             node: node_name.clone(),
             resreq,
             shim: Shim::default(),
+            application,
             task_id: None,
             ssn_id: None,
-            creation_time: Utc::now(),
+            attributes: Default::default(),
+            creation_time: now,
+            latest_updated_timestamp: now,
             state: ExecutorState::Void,
         };
 
@@ -1022,6 +1030,7 @@ impl Storage {
             exe.state = executor.state;
             exe.task_id = executor.task_id;
             exe.ssn_id = executor.ssn_id.clone();
+            exe.latest_updated_timestamp = executor.latest_updated_timestamp;
         }
 
         Ok(())

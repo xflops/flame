@@ -70,7 +70,7 @@ impl States for UnbindingState {
         trace_fn!("UnbindingState::unbind_session");
 
         let mut e = lock_ptr!(self.executor)?;
-        e.state = ExecutorState::Unbinding;
+        e.set_state(ExecutorState::Unbinding);
         e.ssn_id = None;
         e.task_id = None;
 
@@ -81,7 +81,7 @@ impl States for UnbindingState {
         trace_fn!("UnbindingState::unbind_session_completed");
 
         let mut e = lock_ptr!(self.executor)?;
-        e.state = ExecutorState::Idle;
+        e.set_state(ExecutorState::Idle);
         e.ssn_id = None;
         e.task_id = None;
 

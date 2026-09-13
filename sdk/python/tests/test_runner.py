@@ -6,8 +6,10 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import cloudpickle
 import pytest
 
+from flamepy.runner import RunnerService
 from flamepy.runner.storage import CacheStorage, FileStorage, create_storage_backend
 from flamepy.runner.types import RunnerContext, RunnerRequest, SessionContext
 
@@ -126,6 +128,16 @@ class TestCacheStorage:
 
 
 # Runner Service Tests
+
+
+def test_runner_service_types_are_distinct_public_exports():
+    from flamepy.runner import RunnerServiceInstance
+    from flamepy.runner.runner import RunnerServiceInstance as ProxyType
+    from flamepy.runner.service import RunnerService as ExecutionType
+
+    assert RunnerService is ExecutionType
+    assert RunnerServiceInstance is ProxyType
+    assert RunnerService is not RunnerServiceInstance
 
 
 class DummyObjectRef:
@@ -322,9 +334,9 @@ def test_runner_package_skips_generated_metadata_for_legacy_projects(tmp_path, m
     assert "Skipping pyproject.toml generation" in caplog.text
 
 
-def test_runnerservice_generates_method_wrappers():
-    """Test RunnerService generates wrappers for public methods."""
-    from flamepy.runner.runner import RunnerService
+def test_runner_service_instance_generates_method_wrappers():
+    """Test RunnerServiceInstance generates wrappers for public methods."""
+    from flamepy.runner.runner import RunnerServiceInstance
 
     class Calculator:
         def add(self, a, b):
@@ -337,7 +349,7 @@ def test_runnerservice_generates_method_wrappers():
             pass
 
     calc = Calculator()
-    rs = object.__new__(RunnerService)
+    rs = object.__new__(RunnerServiceInstance)
     rs._app = "test-app"
     rs._execution_object = calc
     rs._function_wrapper = None
@@ -353,14 +365,14 @@ def test_runnerservice_generates_method_wrappers():
     assert not hasattr(rs, "_private")
 
 
-def test_runnerservice_callable_for_function():
-    """Test RunnerService is callable when execution object is a function."""
-    from flamepy.runner.runner import RunnerService
+def test_runner_service_instance_callable_for_function():
+    """Test RunnerServiceInstance is callable for a function execution object."""
+    from flamepy.runner.runner import RunnerServiceInstance
 
     def my_func(x):
         return x * 2
 
-    rs = object.__new__(RunnerService)
+    rs = object.__new__(RunnerServiceInstance)
     rs._app = "test-app"
     rs._execution_object = my_func
     rs._function_wrapper = None
@@ -377,15 +389,15 @@ def test_runnerservice_callable_for_function():
     assert callable(rs)
 
 
-def test_runnerservice_not_callable_for_class():
-    """Test RunnerService raises TypeError when called but object is class."""
-    from flamepy.runner.runner import RunnerService
+def test_runner_service_instance_not_callable_for_class():
+    """Test RunnerServiceInstance raises TypeError when its object is a class."""
+    from flamepy.runner.runner import RunnerServiceInstance
 
     class MyClass:
         def method(self):
             pass
 
-    rs = object.__new__(RunnerService)
+    rs = object.__new__(RunnerServiceInstance)
     rs._app = "test-app"
     rs._execution_object = MyClass()
     rs._function_wrapper = None
@@ -399,11 +411,11 @@ def test_runnerservice_not_callable_for_class():
         rs()
 
 
-def test_runnerservice_close_closes_session():
-    """Test RunnerService.close() closes the underlying session."""
-    from flamepy.runner.runner import RunnerService
+def test_runner_service_instance_close_closes_session():
+    """Test RunnerServiceInstance.close() closes the underlying session."""
+    from flamepy.runner.runner import RunnerServiceInstance
 
-    rs = object.__new__(RunnerService)
+    rs = object.__new__(RunnerServiceInstance)
     rs._app = "test-app"
 
     mock_session = MagicMock()
@@ -414,15 +426,15 @@ def test_runnerservice_close_closes_session():
     mock_session.close.assert_called_once()
 
 
-def test_runnerservice_does_not_overwrite_close_with_user_method():
-    """Test generated wrappers do not replace RunnerService lifecycle methods."""
-    from flamepy.runner.runner import RunnerService
+def test_runner_service_instance_does_not_overwrite_close():
+    """Test generated wrappers do not replace proxy lifecycle methods."""
+    from flamepy.runner.runner import RunnerServiceInstance
 
     class ServiceWithClose:
         def close(self):
             return "user-close"
 
-    rs = object.__new__(RunnerService)
+    rs = object.__new__(RunnerServiceInstance)
     rs._app = "test-app"
     rs._execution_object = ServiceWithClose()
     rs._function_wrapper = None
@@ -467,12 +479,12 @@ def test_runner_context_defaults_by_execution_object():
 
 
 def test_runner_service_passes_public_options(monkeypatch):
-    """Test Runner.service forwards only public options to RunnerService."""
+    """Test Runner.service forwards only public options to its proxy."""
     from flamepy.runner.runner import Runner
 
     calls = []
 
-    class FakeRunnerService:
+    class FakeRunnerServiceInstance:
         def __init__(self, app, execution_object, autoscale=None, warmup=0, resreq=None):
             calls.append((app, execution_object, autoscale, warmup, resreq))
 
@@ -484,7 +496,7 @@ def test_runner_service_passes_public_options(monkeypatch):
     runner._services = []
     resreq = object()
 
-    monkeypatch.setattr("flamepy.runner.runner.RunnerService", FakeRunnerService)
+    monkeypatch.setattr("flamepy.runner.runner.RunnerServiceInstance", FakeRunnerServiceInstance)
 
     runner.service(sample_func, autoscale=False, warmup=2, resreq=resreq)
 
@@ -561,6 +573,193 @@ def test_runpy_resolves_object_ref_to_cached_none():
         args, kwargs = svc._resolve_object_refs_parallel((ref,), {"value": ref})
         assert args == (None,)
         assert kwargs == {"value": None}
+
+
+def test_runpy_injects_and_republishes_instance_attributes():
+    from flamepy.core.service import ApplicationContext, SessionContext, TaskContext
+    from flamepy.runner.runpy import FlameRunpyService
+
+    class Worker(RunnerService):
+        def run(self):
+            self.publish_attributes({b"b"})
+            self.publish_attributes({b"c"})
+            return self.session_context().session_id
+
+    svc = FlameRunpyService()
+    svc._load_runner_context = lambda: RunnerContext(Worker)
+    session = SessionContext(None, "session", ApplicationContext("app"))
+
+    svc.on_session_enter(session)
+    assert svc._execution_object._flame_instance_attributes == set()
+    assert list(svc._take_attributes().attr) == []
+
+    request = RunnerRequest(method="run")
+    object_ref = SimpleNamespace(encode=lambda: b"result-ref")
+    with patch("flamepy.runner.runpy.put_object", return_value=object_ref) as put:
+        result = svc.on_task_invoke(TaskContext("task", "session", cloudpickle.dumps(request)))
+
+    assert result == b"result-ref"
+    put.assert_called_once_with("app/session", "session")
+    assert set(svc._take_attributes().attr) == {b"b", b"c"}
+    assert svc._execution_object._flame_instance_attributes == set()
+
+    builtin_service = FlameRunpyService()
+    builtin_service._set_execution_from_context(RunnerContext(len))
+    builtin_service._publish_instance_attributes()
+    assert list(builtin_service._take_attributes().attr) == []
+
+
+def test_runner_service_exposes_runtime_state():
+    from flamepy.core.service import ApplicationContext, SessionContext
+    from flamepy.runner.runpy import FlameRunpyService
+
+    class Worker(RunnerService):
+        pass
+
+    worker = Worker()
+    with pytest.raises(RuntimeError, match="not bound to a session"):
+        worker.session_context()
+    worker.publish_attributes({b"initial"})
+    worker.publish_attributes({b"initial", b"next"})
+    assert worker._flame_instance_attributes == {b"initial", b"next"}
+
+    with pytest.raises(TypeError, match="must contain bytes"):
+        worker.publish_attributes({"invalid"})
+    assert worker._flame_instance_attributes == {b"initial", b"next"}
+    worker.publish_attributes({b"valid"})
+    assert worker._flame_instance_attributes == {b"initial", b"next", b"valid"}
+
+    svc = FlameRunpyService()
+    svc._load_runner_context = lambda: RunnerContext(worker)
+    session = SessionContext(None, "session", ApplicationContext("app"))
+
+    svc.on_session_enter(session)
+    assert svc._execution_object.session_context() is session
+    assert set(svc._take_attributes().attr) == {b"initial", b"next", b"valid"}
+    assert svc._execution_object._flame_instance_attributes == set()
+    svc._execution_object.publish_attributes({b"key"})
+    svc._publish_instance_attributes()
+    assert set(svc._take_attributes().attr) == {b"key"}
+
+    execution_object = svc._execution_object
+    svc.on_session_leave()
+    with pytest.raises(RuntimeError, match="not bound to a session"):
+        execution_object.session_context()
+
+
+def test_runpy_serialization_excludes_executor_local_state():
+    from flamepy.core.service import ApplicationContext, SessionContext
+    from flamepy.runner.runpy import FlameRunpyService
+
+    class Worker(RunnerService):
+        def __init__(self):
+            self.value = 7
+
+    worker = Worker()
+    worker._flame_session_context = SessionContext(None, "old", ApplicationContext("app"))
+    worker.publish_attributes({b"executor-local"})
+
+    serialized = FlameRunpyService._serialize_runner_context(RunnerContext(worker))
+    restored = cloudpickle.loads(serialized).execution_object
+
+    assert restored.value == 7
+    assert restored._flame_session_context is None
+    assert "_flame_session_context" not in restored.__dict__
+    assert "_flame_instance_attributes" not in restored.__dict__
+
+
+def test_runner_service_validates_combined_publication_limit():
+    worker = RunnerService()
+    attributes = {index.to_bytes(2, "big") for index in range(1_024)}
+    worker.publish_attributes(attributes)
+
+    with pytest.raises(ValueError, match="exceeds configured limits"):
+        worker.publish_attributes({b"overflow"})
+
+    assert worker._flame_instance_attributes == attributes
+
+
+def test_runpy_reloads_execution_object_between_sessions():
+    from flamepy.core.service import ApplicationContext, SessionContext, TaskContext
+    from flamepy.runner.runpy import FlameRunpyService
+
+    class Worker:
+        _flame_instance_attributes = {b"a"}
+
+        def fail(self):
+            self._flame_instance_attributes.add(b"failed")
+            raise RuntimeError("failed")
+
+    class OtherWorker:
+        _flame_instance_attributes = {b"other"}
+
+    svc = FlameRunpyService()
+    contexts = iter([RunnerContext(Worker), RunnerContext(Worker), RunnerContext(OtherWorker)])
+    svc._load_runner_context = lambda: next(contexts)
+    session = SessionContext(None, "session", ApplicationContext("app"))
+
+    svc.on_session_enter(session)
+    assert set(svc._take_attributes().attr) == {b"a"}
+
+    request = RunnerRequest(method="fail")
+    with pytest.raises(RuntimeError, match="failed"):
+        svc.on_task_invoke(TaskContext("task", "session", cloudpickle.dumps(request)))
+    assert set(svc._take_attributes().attr) == {b"failed"}
+
+    with pytest.raises(ValueError, match="Task input is None"):
+        svc.on_task_invoke(TaskContext("invalid-task", "session", None))
+    assert list(svc._take_attributes().attr) == []
+
+    original = svc._execution_object
+    svc.on_session_leave()
+    assert svc._ssn_ctx is None
+    assert svc._runner_context is None
+    assert svc._execution_object is None
+
+    svc.on_session_enter(session)
+    assert svc._execution_object is not original
+    assert set(svc._take_attributes().attr) == {b"a"}
+
+    previous = svc._execution_object
+    other = SessionContext(None, "other-session", ApplicationContext("app"))
+    svc.on_session_leave()
+    svc.on_session_enter(other)
+    assert svc._execution_object is not previous
+    assert isinstance(svc._execution_object, OtherWorker)
+    assert set(svc._take_attributes().attr) == {b"other"}
+
+
+def test_runpy_copies_predeclared_attributes_per_instance():
+    from flamepy.runner.runpy import FlameRunpyService
+
+    class Worker:
+        _flame_instance_attributes = {b"shared-default"}
+
+    first = FlameRunpyService()
+    second = FlameRunpyService()
+    first._set_execution_from_context(RunnerContext(Worker))
+    second._set_execution_from_context(RunnerContext(Worker))
+
+    first._execution_object._flame_instance_attributes.add(b"first-only")
+    assert first._execution_object._flame_instance_attributes == {
+        b"shared-default",
+        b"first-only",
+    }
+    assert second._execution_object._flame_instance_attributes == {b"shared-default"}
+
+
+def test_runpy_rejects_invalid_instance_attributes():
+    from flamepy.core.service import ApplicationContext, SessionContext
+    from flamepy.runner.runpy import FlameRunpyService
+
+    class Worker:
+        _flame_instance_attributes = {"not-bytes"}
+
+    svc = FlameRunpyService()
+    svc._load_runner_context = lambda: RunnerContext(Worker)
+
+    with pytest.raises(TypeError, match="must contain bytes"):
+        svc.on_session_enter(SessionContext(None, "session", ApplicationContext("app")))
 
 
 def test_runner_get_resolves_futures():

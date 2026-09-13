@@ -431,6 +431,7 @@ mod tests {
             priority,
             resreq: Some(slots_to_rr(slots.into())),
             retry_count: 0,
+            task_index: HashMap::new(),
         })
     }
 
@@ -503,10 +504,13 @@ mod tests {
                 gpu: 0,
             },
             shim: Shim::Host,
+            application: String::new(),
             task_id: None,
             ssn_id: Some(exec_ssn_id.to_string()),
             creation_time: Utc::now(),
+            latest_updated_timestamp: Utc::now(),
             state: ExecutorState::Bound,
+            attributes: Default::default(),
         });
         ss.add_executor(exec).unwrap();
         ss

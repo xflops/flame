@@ -5,6 +5,7 @@ cluster:
   resreq: "cpu=1,mem=2g"
   policies:
     - priority
+    - das
   storage: none
   schedule_interval: 100
   executors:

@@ -173,6 +173,7 @@ struct NodeMetadata {
 struct ExecutorMetadata {
     pub id: String,
     pub node: String,
+    pub application: String,
     pub resreq_cpu: u64,
     pub resreq_memory: u64,
     #[serde(default)]
@@ -1497,6 +1498,7 @@ impl Engine for FilesystemEngine {
         let meta = ExecutorMetadata {
             id: executor.id.clone(),
             node: executor.node.clone(),
+            application: executor.application.clone(),
             resreq_cpu: executor.resreq.cpu,
             resreq_memory: executor.resreq.memory,
             resreq_gpu: executor.resreq.gpu,
@@ -1530,9 +1532,12 @@ impl Engine for FilesystemEngine {
                     gpu: meta.resreq_gpu,
                 },
                 shim: Shim::try_from(meta.shim).unwrap_or_default(),
+                application: meta.application,
                 task_id: meta.task_id.map(|t| t as TaskID),
                 ssn_id: meta.ssn_id,
+                attributes: Default::default(),
                 creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
+                latest_updated_timestamp: Utc::now(),
                 state: ExecutorState::from(meta.state),
             })),
             Err(FlameError::NotFound(_)) => Ok(None),
@@ -1546,6 +1551,7 @@ impl Engine for FilesystemEngine {
         let meta = ExecutorMetadata {
             id: executor.id.clone(),
             node: executor.node.clone(),
+            application: executor.application.clone(),
             resreq_cpu: executor.resreq.cpu,
             resreq_memory: executor.resreq.memory,
             resreq_gpu: executor.resreq.gpu,
@@ -1581,9 +1587,12 @@ impl Engine for FilesystemEngine {
                 gpu: meta.resreq_gpu,
             },
             shim: Shim::try_from(meta.shim).unwrap_or_default(),
+            application: meta.application,
             task_id: meta.task_id.map(|t| t as TaskID),
             ssn_id: meta.ssn_id,
+            attributes: Default::default(),
             creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
+            latest_updated_timestamp: Utc::now(),
             state,
         })
     }
@@ -1646,10 +1655,13 @@ impl Engine for FilesystemEngine {
                                 gpu: meta.resreq_gpu,
                             },
                             shim: Shim::try_from(meta.shim).unwrap_or_default(),
+                            application: meta.application,
                             task_id: meta.task_id.map(|t| t as TaskID),
                             ssn_id: meta.ssn_id,
+                            attributes: Default::default(),
                             creation_time: DateTime::from_timestamp(meta.creation_time, 0)
                                 .unwrap_or_default(),
+                            latest_updated_timestamp: Utc::now(),
                             state: ExecutorState::from(meta.state),
                         });
                     }
@@ -2269,26 +2281,33 @@ mod tests {
                 gpu: 0,
             },
             shim: Shim::Host,
+            application: "test-app".to_string(),
             task_id: None,
             ssn_id: None,
+            attributes: Default::default(),
             creation_time: Utc::now(),
+            latest_updated_timestamp: Utc::now(),
             state: ExecutorState::Void,
         };
 
         let created = engine.create_executor(&executor).await.unwrap();
         assert_eq!(created.id, "exec-1");
+        assert_eq!(created.application, "test-app");
 
         let found = engine.get_executor(&"exec-1".to_string()).await.unwrap();
         assert!(found.is_some());
+        assert_eq!(found.unwrap().application, "test-app");
 
         let updated = engine
             .update_executor_state(&"exec-1".to_string(), ExecutorState::Idle)
             .await
             .unwrap();
         assert_eq!(updated.state, ExecutorState::Idle);
+        assert_eq!(updated.application, "test-app");
 
         let executors = engine.find_executors(None).await.unwrap();
         assert_eq!(executors.len(), 1);
+        assert_eq!(executors[0].application, "test-app");
 
         let by_node = engine.find_executors(Some("exec-test-node")).await.unwrap();
         assert_eq!(by_node.len(), 1);
@@ -2335,9 +2354,12 @@ mod tests {
                     gpu: 0,
                 },
                 shim: Shim::Host,
+                application: "test-app".to_string(),
                 task_id: None,
                 ssn_id: None,
+                attributes: Default::default(),
                 creation_time: Utc::now(),
+                latest_updated_timestamp: Utc::now(),
                 state: ExecutorState::Void,
             };
             engine.create_executor(&executor).await.unwrap();

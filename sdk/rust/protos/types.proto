@@ -140,6 +140,7 @@ message ExecutorSpec {
   reserved 3;
   reserved "slots";
   Shim shim = 4;  // Supported shim type reported by executor
+  string application = 5;
 }
 
 /* 

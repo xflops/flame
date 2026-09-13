@@ -115,11 +115,11 @@ class ObjectFutureIterator:
             yield self._future_map[future]
 
 
-class RunnerService:
+class RunnerServiceInstance:
     """Encapsulates an execution object for remote invocation within Flame.
 
-    This class creates a session with the flamepy.runner.runpy service and dynamically
-    generates wrapper methods for all public methods of the execution object.
+    This class creates a Runner session and dynamically generates wrapper methods
+    for all public methods of the execution object.
     Each wrapper submits tasks to the session and returns ObjectFuture instances.
 
     Attributes:
@@ -136,16 +136,20 @@ class RunnerService:
         warmup: int = 0,
         resreq: Optional[ResourceRequirement] = None,
     ):
-        """Initialize a RunnerService.
+        """Initialize a RunnerServiceInstance.
 
         Args:
             app: The name of the application registered in Flame.
-                 The associated service must be flamepy.runner.runpy.
+                 The associated application must support Runner.
             execution_object: The Python execution object to be managed and
                              exposed as a remote service. Can be a class, instance,
                              or function. If the object has a `_session_context`
                              attribute of type SessionContext, its session_id
-                             will be used instead of auto-generating one.
+                             will be used instead of auto-generating one. The
+                             Subclass `flamepy.runner.RunnerService` to access
+                             the active session through `session_context()` and
+                             advertise locality through
+                             `publish_attributes(attrs)`.
             autoscale: For functions, builtins, and classes, whether to create
                       instances dynamically based on pending tasks. Defaults to
                       True for those service types. Object instances are always
@@ -175,7 +179,7 @@ class RunnerService:
         # Determine session_id: use custom if provided, otherwise generate
         session_id = custom_session_id if custom_session_id else short_name(app)
 
-        # Create a session with flamepy.runner.runpy service
+        # Create a Runner session.
         # For RL module: serialize RunnerContext with cloudpickle, put in cache to get ObjectRef,
         # then encode ObjectRef to bytes for core API
         runner_context = RunnerContext(execution_object=execution_object, autoscale=autoscale, warmup=warmup)
@@ -183,9 +187,9 @@ class RunnerService:
         serialized_ctx = cloudpickle.dumps(runner_context, protocol=cloudpickle.DEFAULT_PROTOCOL)
         # Put in cache with <app>/<session_id> key prefix
         key_prefix = f"{app}/{session_id}"
-        logger.debug(f"[RunnerService] Putting RunnerContext in cache: key_prefix={key_prefix}, stateful={runner_context.stateful}, autoscale={runner_context.autoscale}")
+        logger.debug(f"[RunnerServiceInstance] Putting RunnerContext in cache: key_prefix={key_prefix}, stateful={runner_context.stateful}, autoscale={runner_context.autoscale}")
         object_ref = put_object(key_prefix, serialized_ctx)
-        logger.debug(f"[RunnerService] RunnerContext cached: key={object_ref.key}, version={object_ref.version}")
+        logger.debug(f"[RunnerServiceInstance] RunnerContext cached: key={object_ref.key}, version={object_ref.version}")
         # Encode ObjectRef to bytes for core API
         common_data_bytes = object_ref.encode()
         session_spec = SessionAttributes(
@@ -197,14 +201,14 @@ class RunnerService:
             batch_size=1,
             resreq=resreq,
         )
-        logger.info(f"[RunnerService] Opening session: session_id={session_id}, app={app}")
+        logger.info(f"[RunnerServiceInstance] Opening session: session_id={session_id}, app={app}")
         try:
             self._session = open_session(session_id=session_id, spec=session_spec)
         except Exception as e:
-            logger.error(f"[RunnerService] Failed to open session: {type(e).__name__}: {e}", exc_info=True)
+            logger.error(f"[RunnerServiceInstance] Failed to open session: {type(e).__name__}: {e}", exc_info=True)
             raise
 
-        logger.info(f"[RunnerService] Session opened: id={self._session.id}")
+        logger.info(f"[RunnerServiceInstance] Session opened: id={self._session.id}")
 
         # Generate wrapper methods for all public methods of the execution object
         self._generate_wrappers()
@@ -266,7 +270,7 @@ class RunnerService:
 
             if hasattr(type(self), attr_name) or attr_name in self.__dict__:
                 logger.warning(
-                    "Skipping wrapper for method '%s' because it conflicts with RunnerService",
+                    "Skipping wrapper for method '%s' because it conflicts with RunnerServiceInstance",
                     attr_name,
                 )
                 continue
@@ -301,7 +305,7 @@ class RunnerService:
 
             # For RL module: serialize RunnerRequest with cloudpickle, then call core API
             request_bytes = cloudpickle.dumps(request, protocol=cloudpickle.DEFAULT_PROTOCOL)
-            logger.info(f"[RunnerService] Submitting task: method={method_name}, session={self._session.id}")
+            logger.info(f"[RunnerServiceInstance] Submitting task: method={method_name}, session={self._session.id}")
             # Submit task and return ObjectFuture
             future = self._session.run(request_bytes, option=option)
             return ObjectFuture(future)
@@ -309,7 +313,7 @@ class RunnerService:
         return wrapper
 
     def __call__(self, *args, **kwargs) -> ObjectFuture:
-        """Make RunnerService callable for function execution objects.
+        """Make RunnerServiceInstance callable for function execution objects.
 
         This method allows calling the service directly when the execution object
         is a function (not a class or instance).
@@ -325,15 +329,15 @@ class RunnerService:
             TypeError: If the execution object is not a callable function
         """
         if self._function_wrapper is None:
-            raise TypeError(f"RunnerService for app '{self._app}' is not callable. The execution object is a class or instance, not a function. Call specific methods instead.")
+            raise TypeError(f"RunnerServiceInstance for app '{self._app}' is not callable. The execution object is a class or instance, not a function. Call specific methods instead.")
         return self._function_wrapper(*args, **kwargs)
 
     def close(self) -> None:
-        """Gracefully close the RunnerService and clean up resources.
+        """Gracefully close the RunnerServiceInstance and clean up resources.
 
         This closes the underlying session.
         """
-        logger.debug(f"Closing RunnerService for app '{self._app}'")
+        logger.debug(f"Closing RunnerServiceInstance for app '{self._app}'")
         self._session.close()
 
 
@@ -346,7 +350,7 @@ class Runner:
 
     Attributes:
         _name: The name of the application/package
-        _services: List of RunnerService instances created within this context
+        _services: List of RunnerServiceInstance objects created within this context
         _package_path: Path to the created package file
         _app_registered: Whether the application was successfully registered
         _storage_backend: Storage backend instance for uploading/deleting packages
@@ -375,7 +379,7 @@ class Runner:
                            If omitted, the executor uses the latest installed Flame Python SDK.
         """
         self._name = name
-        self._services: List[RunnerService] = []
+        self._services: List[RunnerServiceInstance] = []
         self._package_path: Optional[str] = None
         self._app_registered = False
         self._context = FlameContext()
@@ -506,7 +510,7 @@ class Runner:
 
         This method can be called explicitly or is automatically called when
         exiting the context manager. It performs the following cleanup:
-        1. Closes all RunnerService instances (only if app was registered by this Runner)
+        1. Closes all RunnerServiceInstance objects (only if app was registered by this Runner)
         2. Deletes all cached objects for this application from flame-cache
         3. Unregisters the application (only if registered by this Runner instance)
         4. Deletes the package from storage (only if uploaded by this Runner)
@@ -568,8 +572,8 @@ class Runner:
         autoscale: Optional[bool] = None,
         warmup: int = 0,
         resreq: Optional[ResourceRequirement] = None,
-    ) -> RunnerService:
-        """Create a RunnerService for the given execution object.
+    ) -> RunnerServiceInstance:
+        """Create a RunnerServiceInstance for the given execution object.
 
         Args:
             execution_object: A function, class, or class instance to expose as a service
@@ -585,7 +589,7 @@ class Runner:
                     fallback when that is unset).
 
         Returns:
-            A RunnerService instance
+            A RunnerServiceInstance
 
         Raises:
             ValueError: If the requested stateful/autoscale/warmup combination is
@@ -593,7 +597,7 @@ class Runner:
         """
         logger.debug(f"Creating service for {type(execution_object).__name__} (autoscale={autoscale}, warmup={warmup})")
 
-        runner_service = RunnerService(
+        runner_service = RunnerServiceInstance(
             self._name,
             execution_object,
             autoscale=autoscale,
@@ -750,11 +754,7 @@ class Runner:
         has_legacy_metadata = os.path.exists(os.path.join(cwd, "setup.py")) or os.path.exists(os.path.join(cwd, "setup.cfg"))
         if has_legacy_metadata:
             if self._dependencies:
-                logger.warning(
-                    "Python package metadata (setup.py/setup.cfg) already exists. "
-                    "Skipping pyproject.toml generation to avoid conflicting with existing metadata. "
-                    "Please specify dependencies in your setup.py or setup.cfg."
-                )
+                logger.warning("Python package metadata (setup.py/setup.cfg) already exists. Skipping pyproject.toml generation to avoid conflicting with existing metadata. Please specify dependencies in your setup.py or setup.cfg.")
             else:
                 logger.debug("Python package metadata already exists, skipping generated metadata")
             return None

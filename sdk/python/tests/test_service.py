@@ -3,6 +3,7 @@
 import gc
 import logging
 import os
+import threading
 import types
 
 import cloudpickle
@@ -12,9 +13,21 @@ import flamepy.core.service as service
 import flamepy.service.client as service_client
 from flamepy.core.service import ApplicationContext, SessionContext, TaskContext
 from flamepy.core.types import TaskOutput
+from flamepy.proto import shim_pb2
 from flamepy.proto.types_pb2 import Result as ResultProto
-from flamepy.proto.types_pb2 import TaskResult as TaskResultProto
 from flamepy.service.instance import FlameInstance
+
+
+class _NoopService(service.FlameService):
+    def on_session_enter(self, context):
+        pass
+
+    def on_task_invoke(self, context):
+        pass
+
+    def on_session_leave(self):
+        pass
+
 
 # Core Service Tests
 
@@ -61,33 +74,199 @@ def test_session_context_round_trips_through_cloudpickle():
     restored = cloudpickle.loads(cloudpickle.dumps(context))
 
     assert restored.common_data() == b"ABC"
-    with pytest.raises(RuntimeError, match="not attached to a service"):
-        restored.publish({b"kv-cache-key"})
+    assert not hasattr(restored, "publish")
 
 
-def test_servicer_collects_published_executor_attributes():
-    class NoopService(service.FlameService):
+def test_publish_calls_are_unioned_and_sent_once():
+    publisher = _NoopService()
+    publisher.publish([b"kv-cache-key", b"kv-cache-key"])
+    publisher.publish([b"prefix-key", b"block-key"])
+    publisher.publish([])
+
+    attributes = publisher._take_attributes()
+    assert set(attributes.attr) == {b"kv-cache-key", b"prefix-key", b"block-key"}
+    assert list(publisher._take_attributes().attr) == []
+
+    publisher.publish([])
+    republished = publisher._take_attributes()
+    assert list(republished.attr) == []
+
+    instance = FlameInstance()
+    instance.publish({b"instance-key"})
+    assert instance._take_attributes().attr == [b"instance-key"]
+
+
+def test_publish_racing_response_delivers_one_complete_snapshot():
+    publisher = service._Publisher()
+    barrier = threading.Barrier(2)
+
+    def update():
+        barrier.wait()
+        publisher.publish(frozenset({b"race-a", b"race-b"}))
+
+    thread = threading.Thread(target=update)
+    thread.start()
+    barrier.wait()
+    raced = publisher.take()
+    thread.join()
+    after_race = publisher.take()
+    nonempty = [set(attributes.attr) for attributes in (raced, after_race) if attributes.attr]
+
+    assert nonempty == [{b"race-a", b"race-b"}]
+
+
+def test_concurrent_servicers_publish_to_their_own_instance():
+    barrier = threading.Barrier(2)
+
+    class PublishingService(service.FlameService):
+        def __init__(self, key):
+            self.key = key
+
         def on_session_enter(self, context):
             pass
 
         def on_task_invoke(self, context):
-            pass
+            barrier.wait()
+            self.publish({self.key})
 
         def on_session_leave(self):
             pass
 
-    servicer = service.FlameInstanceServicer(NoopService())
-    context = service.SessionContext(
-        _common_data=None,
-        session_id="sess-1",
-        application=service.ApplicationContext("my-app"),
+    servicers = [
+        service.FlameInstanceServicer(PublishingService(b"instance-a")),
+        service.FlameInstanceServicer(PublishingService(b"instance-b")),
+    ]
+    responses = [None, None]
+
+    def invoke(index):
+        responses[index] = servicers[index].OnTaskInvoke(
+            shim_pb2.TaskContext(task_id=f"task-{index}", session_id="session"),
+            DummyContext(),
+        )
+
+    threads = [threading.Thread(target=invoke, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert set(responses[0].attributes.attr) == {b"instance-a"}
+    assert set(responses[1].attributes.attr) == {b"instance-b"}
+
+
+def test_servicer_wraps_enter_and_task_publication():
+    class PublishingService(service.FlameService):
+        def on_session_enter(self, context):
+            self.publish({b"entered"})
+            self.publish({b"prefix", b"block"})
+
+        def on_task_invoke(self, context):
+            if context.task_id == "task-error":
+                self.publish({b"error-key"})
+                raise RuntimeError("task failed")
+            return None
+
+        def on_session_leave(self):
+            pass
+
+    servicer = service.FlameInstanceServicer(PublishingService())
+    enter_request = shim_pb2.SessionContext(
+        session_id="session-1",
+        application=shim_pb2.ApplicationContext(name="application-1"),
     )
-    context._publish_executor_attributes = servicer._publish_executor_attributes
+    task_request = shim_pb2.TaskContext(task_id="task-1", session_id="session-2")
 
-    context.publish({b"kv-cache-key"})
+    enter_response = servicer.OnSessionEnter(enter_request, DummyContext())
+    assert set(enter_response.attributes.attr) == {b"entered", b"prefix", b"block"}
 
-    assert servicer._take_executor_attributes().attr == [b"kv-cache-key"]
-    assert servicer._take_executor_attributes() is None
+    servicer.OnSessionLeave(None, DummyContext())
+    task_response = servicer.OnTaskInvoke(task_request, DummyContext())
+    assert list(task_response.attributes.attr) == []
+
+    next_response = servicer.OnTaskInvoke(task_request, DummyContext())
+    assert next_response.HasField("attributes")
+    assert list(next_response.attributes.attr) == []
+
+    failed_response = servicer.OnTaskInvoke(
+        shim_pb2.TaskContext(task_id="task-error", session_id="session-2"),
+        DummyContext(),
+    )
+    assert failed_response.task_result.return_code == -1
+    assert set(failed_response.attributes.attr) == {b"error-key"}
+
+
+def test_failed_session_enter_does_not_consume_pending_publication():
+    class FailFirstEnterService(service.FlameService):
+        def on_session_enter(self, context):
+            if context.session_id == "failed-session":
+                self.publish({b"failed-enter-key"})
+                raise RuntimeError("session enter failed")
+
+        def on_task_invoke(self, context):
+            return None
+
+        def on_session_leave(self):
+            pass
+
+    servicer = service.FlameInstanceServicer(FailFirstEnterService())
+
+    def request(session_id):
+        return shim_pb2.SessionContext(
+            session_id=session_id,
+            application=shim_pb2.ApplicationContext(name="application-1"),
+        )
+
+    failed = servicer.OnSessionEnter(request("failed-session"), DummyContext())
+    assert failed.result.return_code == -1
+    assert not failed.HasField("attributes")
+
+    succeeded = servicer.OnSessionEnter(request("next-session"), DummyContext())
+    assert succeeded.result.return_code == 0
+    assert set(succeeded.attributes.attr) == {b"failed-enter-key"}
+
+    empty = servicer.OnSessionEnter(request("empty-session"), DummyContext())
+    assert empty.HasField("attributes")
+    assert list(empty.attributes.attr) == []
+
+
+@pytest.mark.parametrize(
+    ("attributes", "error"),
+    [
+        (["not-bytes"], TypeError),
+        ([b""], ValueError),
+        ([b"x" * 257], ValueError),
+        ([index.to_bytes(2, "big") for index in range(1_025)], ValueError),
+    ],
+)
+def test_publish_validates_rfe275_limits(attributes, error):
+    with pytest.raises(error):
+        _NoopService().publish(attributes)
+
+
+def test_publish_rejects_cumulative_limit_without_partial_update():
+    publisher = _NoopService()
+    first = [index.to_bytes(2, "big") for index in range(600)]
+    overflow = [index.to_bytes(2, "big") for index in range(600, 1_100)]
+
+    publisher.publish(first)
+    with pytest.raises(ValueError):
+        publisher.publish(overflow)
+    assert len(publisher._take_attributes().attr) == 600
+    assert list(publisher._take_attributes().attr) == []
+
+
+def test_publish_byte_limit_resets_after_take():
+    publisher = _NoopService()
+    boundary = [index.to_bytes(2, "big") + bytes(254) for index in range(256)]
+
+    publisher.publish(boundary)
+    publisher.publish(boundary)
+    with pytest.raises(ValueError):
+        publisher.publish([b"overflow"])
+    assert len(publisher._take_attributes().attr) == 256
+
+    publisher.publish(boundary)
+    assert len(publisher._take_attributes().attr) == 256
 
 
 def test_flame_service_abstract_minimal_implementation():

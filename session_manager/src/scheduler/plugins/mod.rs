@@ -19,6 +19,7 @@ use stdng::collections;
 use stdng::{lock_ptr, new_ptr, MutexPtr};
 
 use crate::model::{ExecutorInfoPtr, NodeInfo, NodeInfoPtr, SessionInfo, SessionInfoPtr, SnapShot};
+use crate::scheduler::plugins::das::DasPlugin;
 use crate::scheduler::plugins::drf::DRFPlugin;
 use crate::scheduler::plugins::priority::PriorityPlugin;
 use crate::scheduler::plugins::shim::ShimPlugin;
@@ -26,6 +27,7 @@ use crate::scheduler::Context;
 
 use common::FlameError;
 
+mod das;
 mod drf;
 mod priority;
 mod shim;
@@ -64,6 +66,14 @@ pub trait Plugin: Send + Sync + 'static {
         None
     }
     fn node_order_fn(&self, s1: &NodeInfo, s2: &NodeInfo) -> Option<Ordering> {
+        None
+    }
+    fn executor_order_fn(
+        &self,
+        session: &SessionInfo,
+        e1: &crate::model::ExecutorInfo,
+        e2: &crate::model::ExecutorInfo,
+    ) -> Option<Ordering> {
         None
     }
 
@@ -117,6 +127,11 @@ const PLUGIN_REGISTRY: &[PluginInfo] = &[
     PluginInfo {
         name: "drf",
         constructor: DRFPlugin::new_ptr,
+        configurable: true,
+    },
+    PluginInfo {
+        name: "das",
+        constructor: DasPlugin::new_ptr,
         configurable: true,
     },
     PluginInfo {
@@ -177,7 +192,7 @@ impl PluginManager {
     /// Returns whether the session is underused (needs more executors).
     ///
     /// Uses "first non-`None` wins" ordering, identical to `ssn_order_fn`.
-    /// Plugins are consulted in registration order (Priority → DRF → Shim).
+    /// Plugins are consulted in registration order (Priority → DRF → DAS → Shim).
     /// The first plugin that returns `Some(result)` wins; `None` means "no opinion, ask the
     /// next plugin".  If no plugin has an opinion, the session is considered NOT underused.
     ///
@@ -342,6 +357,24 @@ impl PluginManager {
         Ordering::Equal
     }
 
+    pub fn executor_order_fn(
+        &self,
+        session: &SessionInfoPtr,
+        e1: &ExecutorInfoPtr,
+        e2: &ExecutorInfoPtr,
+    ) -> Ordering {
+        if let Ok(plugins) = lock_ptr!(self.plugins) {
+            for (_, plugin) in plugins.iter() {
+                if let Some(order) = plugin.executor_order_fn(session, e1, e2) {
+                    if order != Ordering::Equal {
+                        return order;
+                    }
+                }
+            }
+        }
+        Ordering::Equal
+    }
+
     /// Find executors that are available for a given session.
     ///
     /// This method filters executors based on all registered plugins'
@@ -443,10 +476,13 @@ mod tests {
                 gpu: 0,
             },
             shim: Shim::Host,
+            application: String::new(),
             task_id: None,
             ssn_id: None,
             creation_time: Utc::now(),
+            latest_updated_timestamp: Utc::now(),
             state: ExecutorState::Idle,
+            attributes: Default::default(),
         })
     }
 
@@ -472,6 +508,20 @@ mod tests {
         assert_eq!(exec_idle.state, ExecutorState::Idle);
         assert_eq!(exec_bound.state, ExecutorState::Bound);
         assert_eq!(exec_void.state, ExecutorState::Void);
+    }
+
+    #[test]
+    fn das_policy_is_configurable_and_composes_before_shim() {
+        let snapshot = SnapShot::new();
+        let manager = PluginManager::setup(&snapshot, &["das".to_string()]).unwrap();
+        let plugins = lock_ptr!(manager.plugins).unwrap();
+        assert_eq!(
+            plugins
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["das", "shim"]
+        );
     }
 
     /// Test documentation for plugin fallback behavior.

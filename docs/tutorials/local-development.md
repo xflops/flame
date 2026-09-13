@@ -181,6 +181,7 @@ cluster:
   policies:
     - priority
     - drf
+    - das
   storage: "fs:///tmp/flame-dev/data"
   executors:
     shim: host

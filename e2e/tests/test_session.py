@@ -35,7 +35,7 @@ from e2e.api import TestRequest
 from e2e.helpers import invoke_task, serialize_request
 from tests.utils import random_string
 
-FLM_TEST_SVC_APP = "flme2e-svc"
+FLM_TEST_SVC_APP = "flme2e-session-svc"
 
 
 @pytest.fixture(scope="module", autouse=True)

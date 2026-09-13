@@ -16,7 +16,7 @@ mod tests {
     use crate::storage;
     use common::apis::{
         ApplicationAttributes, Node, NodeState, ResourceRequirement, SessionAttributes,
-        SessionState,
+        SessionState, TaskOptions, TaskState,
     };
     use common::ctx::{FlameCluster, FlameClusterContext};
     use stdng::lock_ptr;
@@ -169,6 +169,72 @@ mod tests {
 
             let ssn_info = sessions.values().next().unwrap();
             assert_eq!(ssn_info.state, SessionState::Closed);
+        }
+
+        #[tokio::test]
+        async fn task_index_contains_only_non_terminal_tasks_with_affinity() {
+            let ctx = test_context();
+            let storage = storage::new_ptr(&ctx).await.unwrap();
+            storage
+                .create_session(create_session_attr("task-index-ssn"))
+                .await
+                .unwrap();
+
+            let pending_key = bytes::Bytes::from_static(b"pending");
+            let pending = storage
+                .create_task(
+                    "task-index-ssn".to_string(),
+                    None,
+                    Some(TaskOptions {
+                        affinity: [pending_key.clone()].into_iter().collect(),
+                    }),
+                )
+                .await
+                .unwrap();
+            let running = storage
+                .create_task(
+                    "task-index-ssn".to_string(),
+                    None,
+                    Some(TaskOptions {
+                        affinity: [bytes::Bytes::from_static(b"running")]
+                            .into_iter()
+                            .collect(),
+                    }),
+                )
+                .await
+                .unwrap();
+            let finished = storage
+                .create_task("task-index-ssn".to_string(), None, None)
+                .await
+                .unwrap();
+            let session = storage
+                .get_session_ptr("task-index-ssn".to_string())
+                .unwrap();
+            let running_ptr = storage.get_task_ptr(running.gid()).unwrap();
+            storage
+                .update_task_state(session.clone(), running_ptr, TaskState::Running, None)
+                .await
+                .unwrap();
+            let finished_ptr = storage.get_task_ptr(finished.gid()).unwrap();
+            storage
+                .update_task_state(session, finished_ptr, TaskState::Succeed, None)
+                .await
+                .unwrap();
+
+            let snapshot = storage.snapshot().unwrap();
+            let sessions = lock_ptr!(snapshot.sessions).unwrap();
+            let session = sessions.get("task-index-ssn").unwrap();
+            let indexed = session.task_index.get(&TaskState::Pending).unwrap();
+
+            assert_eq!(indexed.len(), 1);
+            let task = indexed.get(&pending.id).unwrap();
+            assert_eq!(task.state, TaskState::Pending);
+            assert_eq!(task.affinity, [pending_key].into_iter().collect());
+            assert_eq!(
+                session.task_index.get(&TaskState::Running).unwrap().len(),
+                1
+            );
+            assert!(!session.task_index.contains_key(&TaskState::Succeed));
         }
     }
 }

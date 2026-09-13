@@ -177,11 +177,26 @@ with Runner("add-app") as runner:
 
 Key classes and helpers:
 
+- `RunnerService` is an optional execution-object base. Plain functions,
+  classes, and instances remain supported when these service-side APIs are not
+  needed.
+- `RunnerService.session_context()` returns the active service-side session
+  context (`flamepy.SessionContext`), not the Runner session-creation
+  configuration type of the same name.
+- `RunnerService.publish_attributes(attrs)` adds opaque `bytes` locality keys
+  to the current Runner response; repeated calls in the response accumulate.
+  Every response replaces the prior executor snapshot, so publish the complete
+  current key set from every invoked method.
 - `Runner(name, fail_if_exists=False)`
 - `Runner.service(execution_object, autoscale=None, warmup=0, resreq=None)`
+- `RunnerServiceInstance` is the client proxy returned by `Runner.service()`.
 - `Runner.get(futures)`, `Runner.ref(futures)`, `Runner.wait(futures)`, `Runner.select(futures)`
 - `ObjectFuture.get()`, `ObjectFuture.ref()`, `ObjectFuture.wait()`
 - `get_data(data)` for decoding Runner task input/output payloads
+
+Migration: the former client-proxy symbol `RunnerService` is now
+`RunnerServiceInstance`; `RunnerService` now names the optional executor-side
+base class.
 
 ## Tools API
 

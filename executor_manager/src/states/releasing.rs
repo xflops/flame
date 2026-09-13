@@ -35,9 +35,75 @@ impl State for ReleasingState {
             .unregister_executor(&self.executor.clone())
             .await?;
 
-        // After released, the executor is released now.
-        self.executor.state = ExecutorState::Released;
+        self.release_completed();
 
         Ok(self.executor.clone())
+    }
+}
+
+impl ReleasingState {
+    fn release_completed(&mut self) {
+        // The executor and its retained service instance share one lifetime.
+        // Drop the last executor-owned shim reference only after Session
+        // Manager has accepted the unregister operation.
+        self.executor.release();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shims::{SessionEnterResponse, Shim as ShimService, ShimPtr, TaskInvokeResponse};
+    use common::apis::{ResourceRequirement, SessionContext, Shim, TaskContext};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    struct TestShim;
+
+    #[async_trait]
+    impl ShimService for TestShim {
+        async fn on_session_enter(
+            &mut self,
+            _ctx: &SessionContext,
+        ) -> Result<SessionEnterResponse, FlameError> {
+            unreachable!()
+        }
+
+        async fn on_task_invoke(
+            &mut self,
+            _ctx: &TaskContext,
+        ) -> Result<TaskInvokeResponse, FlameError> {
+            unreachable!()
+        }
+
+        async fn on_session_leave(&mut self) -> Result<(), FlameError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn release_clears_retained_instance() {
+        let shim: ShimPtr = Arc::new(Mutex::new(TestShim));
+        let executor = Executor {
+            id: "executor-1".to_string(),
+            application: "test-app".to_string(),
+            resreq: ResourceRequirement::default(),
+            node: "node-1".to_string(),
+            shim: Shim::Host,
+            session: None,
+            task: None,
+            context: None,
+            shim_instance: Some(shim),
+            state: ExecutorState::Releasing,
+        };
+        let mut state = ReleasingState {
+            client: BackendClient::default(),
+            executor,
+        };
+
+        state.release_completed();
+
+        assert_eq!(state.executor.state, ExecutorState::Released);
+        assert!(state.executor.shim_instance.is_none());
     }
 }

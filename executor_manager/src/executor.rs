@@ -28,6 +28,7 @@ use common::{ctx::FlameClusterContext, FlameError};
 #[derive(Clone)]
 pub struct Executor {
     pub id: String,
+    pub application: String,
     pub resreq: ResourceRequirement,
     pub node: String,
     /// Supported shim type from executor-manager config.
@@ -77,6 +78,7 @@ impl TryFrom<&rpc::Executor> for Executor {
 
         Ok(Executor {
             id: metadata.id.clone(),
+            application: spec.application.clone(),
             resreq: resreq.into(),
             node: spec.node.clone(),
             shim: Shim::from(spec.shim()), // Get shim from spec
@@ -106,6 +108,7 @@ impl From<&Executor> for rpc::Executor {
             resreq: Some(e.resreq.clone().into()),
             node: e.node.clone(),
             shim: rpc::Shim::from(e.shim).into(), // Include shim in spec
+            application: e.application.clone(),
         });
 
         let status = Some(ExecutorStatus {
@@ -122,6 +125,13 @@ impl From<&Executor> for rpc::Executor {
 }
 
 impl Executor {
+    pub(crate) fn release(&mut self) {
+        self.shim_instance = None;
+        self.session = None;
+        self.task = None;
+        self.state = ExecutorState::Released;
+    }
+
     pub fn update(&mut self, next: &Executor) {
         tracing::debug!(
             "Update executor <{}> from <{}> to <{}>",
@@ -129,6 +139,7 @@ impl Executor {
             self.state,
             next.state
         );
+        self.application = next.application.clone();
         self.state = next.state;
         self.shim_instance = next.shim_instance.clone();
         self.session = next.session.clone();
@@ -161,6 +172,11 @@ pub fn start(client: BackendClient, executor: ExecutorPtr, app_manager: Arc<Appl
                     let mut exec = lock_ptr!(executor);
                     match exec {
                         Ok(mut exec) => {
+                            // A server-pushed removal wins over a state
+                            // transition that was already in flight.
+                            if exec.state == ExecutorState::Released {
+                                break;
+                            }
                             exec.update(&next_state);
                         }
                         Err(e) => {

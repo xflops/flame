@@ -43,7 +43,7 @@ impl States for IdleState {
 
         let mut e = lock_ptr!(self.executor)?;
         e.ssn_id = Some(ssn_id);
-        e.state = ExecutorState::Binding;
+        e.set_state(ExecutorState::Binding);
 
         Ok(())
     }
@@ -58,7 +58,7 @@ impl States for IdleState {
         trace_fn!("IdleState::release_executor");
 
         let mut e = lock_ptr!(self.executor)?;
-        e.state = ExecutorState::Releasing;
+        e.set_state(ExecutorState::Releasing);
 
         Ok(())
     }

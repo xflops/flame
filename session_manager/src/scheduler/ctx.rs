@@ -12,6 +12,7 @@ limitations under the License.
 */
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use stdng::collections;
@@ -20,7 +21,7 @@ use crate::controller::ControllerPtr;
 use crate::model::{ExecutorInfo, ExecutorInfoPtr, NodeInfoPtr, SessionInfoPtr, SnapShotPtr};
 use crate::scheduler::actions::{ActionPtr, AllocateAction, DispatchAction, ShuffleAction};
 use crate::scheduler::plugins::{PluginManager, PluginManagerPtr};
-use common::apis::ExecutorState;
+use common::apis::{ExecutorID, ExecutorState};
 use common::FlameError;
 
 /// One scheduling cycle: a single `Context` (one [`PluginManager::setup`] on the current
@@ -75,6 +76,9 @@ impl Context {
         exec: &ExecutorInfoPtr,
         ssn: &SessionInfoPtr,
     ) -> Result<bool, FlameError> {
+        if exec.application != ssn.application {
+            return Ok(false);
+        }
         if ssn
             .resreq
             .as_ref()
@@ -83,6 +87,28 @@ impl Context {
             return Ok(false);
         }
         self.plugins.is_available(exec, ssn)
+    }
+
+    pub fn select_executor(
+        &self,
+        session: &SessionInfoPtr,
+        idle_executors: &HashMap<ExecutorID, ExecutorInfoPtr>,
+    ) -> Result<Option<ExecutorInfoPtr>, FlameError> {
+        let mut eligible = idle_executors
+            .values()
+            .map(|executor| {
+                Ok(
+                    (executor.ssn_id.is_none() && self.is_available(executor, session)?)
+                        .then(|| executor.clone()),
+                )
+            })
+            .collect::<Result<Vec<_>, FlameError>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        eligible.sort_by(|e1, e2| self.plugins.executor_order_fn(session, e2, e1));
+        Ok(eligible.into_iter().next())
     }
 
     pub async fn allocate_executor(
@@ -159,5 +185,151 @@ struct SsnOrderFn {
 impl collections::Cmp<SessionInfoPtr> for SsnOrderFn {
     fn cmp(&self, t1: &SessionInfoPtr, t2: &SessionInfoPtr) -> Ordering {
         self.plugin_mgr.ssn_order_fn(t1, t2)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::SessionInfo;
+    use bytes::Bytes;
+    use common::apis::{ExecutorState, ResourceRequirement, Session, Shim, Task};
+    use common::ctx::{FlameCluster, FlameClusterContext};
+    use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn select_executor_uses_context_plugins() {
+        let resreq = ResourceRequirement {
+            cpu: 1,
+            memory: 1024,
+            gpu: 0,
+        };
+        let mut source = Session {
+            id: "session".to_string(),
+            application: "test-app".to_string(),
+            resreq: Some(resreq.clone()),
+            ..Default::default()
+        };
+        source
+            .update_task(&Task {
+                id: 1,
+                ssn_id: source.id.clone(),
+                affinity: HashSet::from([Bytes::from_static(b"local")]),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let session = Arc::new(SessionInfo::try_from(&source).unwrap());
+        let snapshot = crate::model::SnapShot::new();
+        snapshot.add_session(session.clone()).unwrap();
+        let plugins = PluginManager::setup(&snapshot, &["das".to_string()]).unwrap();
+
+        let config = FlameClusterContext {
+            cluster: FlameCluster {
+                storage: "none".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let storage = crate::storage::new_ptr(&config).await.unwrap();
+        let controller = crate::controller::new_ptr(storage);
+        let context = Context {
+            snapshot: Arc::new(snapshot),
+            controller,
+            actions: vec![],
+            plugins,
+        };
+
+        let local = Arc::new(ExecutorInfo {
+            id: "z-local".to_string(),
+            state: ExecutorState::Idle,
+            application: "test-app".to_string(),
+            resreq: resreq.clone(),
+            attributes: HashSet::from([Bytes::from_static(b"local")]),
+            ..Default::default()
+        });
+        let remote = Arc::new(ExecutorInfo {
+            id: "y-remote".to_string(),
+            state: ExecutorState::Idle,
+            application: "test-app".to_string(),
+            resreq: resreq.clone(),
+            ..Default::default()
+        });
+        let owned = Arc::new(ExecutorInfo {
+            id: "a-owned".to_string(),
+            state: ExecutorState::Idle,
+            application: "test-app".to_string(),
+            ssn_id: Some("other-session".to_string()),
+            resreq: resreq.clone(),
+            attributes: HashSet::from([Bytes::from_static(b"local")]),
+            ..Default::default()
+        });
+        let wrong_resource = Arc::new(ExecutorInfo {
+            id: "b-wrong-resource".to_string(),
+            state: ExecutorState::Idle,
+            application: "test-app".to_string(),
+            resreq: ResourceRequirement {
+                cpu: 2,
+                ..resreq.clone()
+            },
+            attributes: HashSet::from([Bytes::from_static(b"local")]),
+            ..Default::default()
+        });
+        let wrong_shim = Arc::new(ExecutorInfo {
+            id: "c-wrong-shim".to_string(),
+            state: ExecutorState::Idle,
+            application: "test-app".to_string(),
+            resreq: resreq.clone(),
+            shim: Shim::Wasm,
+            attributes: HashSet::from([Bytes::from_static(b"local")]),
+            ..Default::default()
+        });
+        let wrong_application = Arc::new(ExecutorInfo {
+            id: "d-wrong-application".to_string(),
+            state: ExecutorState::Idle,
+            application: "other-app".to_string(),
+            resreq,
+            attributes: HashSet::from([Bytes::from_static(b"local")]),
+            ..Default::default()
+        });
+        let idle_executors = HashMap::from([
+            (local.id.clone(), local.clone()),
+            (remote.id.clone(), remote.clone()),
+            (owned.id.clone(), owned),
+            (wrong_resource.id.clone(), wrong_resource),
+            (wrong_shim.id.clone(), wrong_shim),
+            (wrong_application.id.clone(), wrong_application.clone()),
+        ]);
+
+        assert!(context.is_available(&local, &session).unwrap());
+        assert!(context.is_available(&remote, &session).unwrap());
+        assert!(!context.is_available(&wrong_application, &session).unwrap());
+
+        let selected = context
+            .select_executor(&session, &idle_executors)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&selected, &local));
+
+        let first_eligible = idle_executors
+            .values()
+            .find(|executor| {
+                executor.ssn_id.is_none()
+                    && context.is_available(executor, &session).unwrap_or(false)
+            })
+            .unwrap()
+            .clone();
+        let plugins = PluginManager::setup(&context.snapshot, &[]).unwrap();
+        let context_without_das = Context {
+            snapshot: context.snapshot.clone(),
+            controller: context.controller.clone(),
+            actions: vec![],
+            plugins,
+        };
+        let selected = context_without_das
+            .select_executor(&session, &idle_executors)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&selected, &first_eligible));
     }
 }

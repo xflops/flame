@@ -12,6 +12,7 @@ limitations under the License.
 */
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
@@ -45,16 +46,81 @@ pub struct ApplicationContext {
     pub command: Option<String>,
 }
 
-/// A service-owned publication slot shared with the shim. `None` means the
-/// service has not published since session entry; `Some(empty)` clears attrs.
-pub type ExecutorAttributesPtr = Arc<Mutex<Option<rpc::ExecutorAttributes>>>;
+const MAX_EXECUTOR_ATTRIBUTES: usize = 1_024;
+const MAX_EXECUTOR_ATTRIBUTE_BYTES: usize = 256;
+const MAX_EXECUTOR_ATTRIBUTES_BYTES: usize = 64 * 1_024;
+
+#[derive(Clone, Debug, Default)]
+pub struct Publisher {
+    attributes: Arc<Mutex<HashSet<Vec<u8>>>>,
+    attributes_bytes: Arc<AtomicUsize>,
+}
+
+impl Publisher {
+    fn publish<I, B>(&self, attributes: I) -> Result<(), FlameError>
+    where
+        I: IntoIterator<Item = B>,
+        B: Into<Vec<u8>>,
+    {
+        let mut snapshot = HashSet::new();
+        let mut snapshot_bytes = 0;
+        for value in attributes.into_iter().map(Into::into) {
+            let value_len = value.len();
+            if value.is_empty() || value_len > MAX_EXECUTOR_ATTRIBUTE_BYTES {
+                return Err(FlameError::InvalidConfig(
+                    "executor attributes must be nonempty and at most 256 bytes".to_string(),
+                ));
+            }
+            if snapshot.insert(value) {
+                snapshot_bytes += value_len;
+                if snapshot.len() > MAX_EXECUTOR_ATTRIBUTES
+                    || snapshot_bytes > MAX_EXECUTOR_ATTRIBUTES_BYTES
+                {
+                    return Err(FlameError::InvalidConfig(
+                        "executor attribute publication exceeds configured limits".to_string(),
+                    ));
+                }
+            }
+        }
+
+        let mut current = self
+            .attributes
+            .lock()
+            .map_err(|_| FlameError::Internal("publisher mutex poisoned".to_string()))?;
+        let current_bytes = self.attributes_bytes.load(Ordering::Relaxed);
+        let (added_count, added_bytes) = snapshot
+            .difference(&current)
+            .fold((0, 0), |(count, bytes), value| {
+                (count + 1, bytes + value.len())
+            });
+        if current.len() + added_count > MAX_EXECUTOR_ATTRIBUTES
+            || current_bytes + added_bytes > MAX_EXECUTOR_ATTRIBUTES_BYTES
+        {
+            return Err(FlameError::InvalidConfig(
+                "executor attribute publication exceeds configured limits".to_string(),
+            ));
+        }
+        current.extend(snapshot);
+        self.attributes_bytes
+            .fetch_add(added_bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn take(&self) -> rpc::ExecutorAttributes {
+        let mut attributes = self.attributes.lock().expect("publisher mutex poisoned");
+        self.attributes_bytes.store(0, Ordering::Relaxed);
+        rpc::ExecutorAttributes {
+            attr: std::mem::take(&mut *attributes).into_iter().collect(),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SessionContext {
     pub session_id: String,
     pub application: ApplicationContext,
     pub common_data: Option<CommonData>,
-    executor_attributes: Option<ExecutorAttributesPtr>,
 }
 
 impl SessionContext {
@@ -67,43 +133,7 @@ impl SessionContext {
             session_id,
             application,
             common_data,
-            executor_attributes: None,
         }
-    }
-
-    #[cfg(unix)]
-    fn with_executor_attributes(mut self, executor_attributes: ExecutorAttributesPtr) -> Self {
-        self.executor_attributes = Some(executor_attributes);
-        self
-    }
-
-    /// Publish a complete replacement of this executor's opaque locality keys.
-    /// The latest value is returned with the next existing shim response.
-    pub fn publish<I, B>(&self, attributes: I) -> Result<(), FlameError>
-    where
-        I: IntoIterator<Item = B>,
-        B: Into<Vec<u8>>,
-    {
-        let attr: HashSet<Vec<u8>> = attributes.into_iter().map(Into::into).collect();
-        let executor_attributes = self.executor_attributes.as_ref().ok_or_else(|| {
-            FlameError::InvalidConfig("session context is not attached to a service".to_string())
-        })?;
-        executor_attributes
-            .lock()
-            .expect("executor attributes mutex poisoned")
-            .replace(rpc::ExecutorAttributes {
-                attr: attr.into_iter().collect(),
-            });
-        Ok(())
-    }
-
-    fn executor_attributes(&self) -> Option<rpc::ExecutorAttributes> {
-        self.executor_attributes.as_ref().and_then(|attributes| {
-            attributes
-                .lock()
-                .expect("executor attributes mutex poisoned")
-                .take()
-        })
     }
 }
 
@@ -117,11 +147,39 @@ pub struct TaskContext {
 #[derive(Clone, Debug)]
 pub struct FlameInstance {
     session: SessionContext,
+    publisher: Publisher,
+    publisher_attached: bool,
 }
 
 impl FlameInstance {
     pub fn new(session: SessionContext) -> Self {
-        Self { session }
+        Self {
+            session,
+            publisher: Publisher::default(),
+            publisher_attached: false,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn with_publisher(session: SessionContext, publisher: Publisher) -> Self {
+        Self {
+            session,
+            publisher,
+            publisher_attached: true,
+        }
+    }
+
+    pub fn publish<I, B>(&self, attributes: I) -> Result<(), FlameError>
+    where
+        I: IntoIterator<Item = B>,
+        B: Into<Vec<u8>>,
+    {
+        if !self.publisher_attached {
+            return Err(FlameError::InvalidConfig(
+                "flame instance is not attached to a service".to_string(),
+            ));
+        }
+        self.publisher.publish(attributes)
     }
 
     pub fn session_id(&self) -> &str {
@@ -146,6 +204,17 @@ impl FlameInstance {
 
 #[tonic::async_trait]
 pub trait FlameService: Send + Sync + 'static {
+    fn publisher(&self) -> &Publisher;
+
+    fn publish<I, B>(&self, attributes: I) -> Result<(), FlameError>
+    where
+        Self: Sized,
+        I: IntoIterator<Item = B>,
+        B: Into<Vec<u8>>,
+    {
+        self.publisher().publish(attributes)
+    }
+
     async fn on_session_enter(&self, _: SessionContext) -> Result<(), FlameError>;
     async fn on_task_invoke(&self, _: TaskContext) -> Result<Option<TaskOutput>, FlameError>;
     async fn on_session_leave(&self) -> Result<(), FlameError>;
@@ -156,9 +225,6 @@ pub type FlameServicePtr = Arc<dyn FlameService>;
 #[cfg(unix)]
 struct ShimService {
     service: FlameServicePtr,
-    // The service receives a clone of this stable pointer at session entry.
-    // `None` distinguishes no publication from an explicit empty snapshot.
-    executor_attributes: ExecutorAttributesPtr,
 }
 
 #[cfg(unix)]
@@ -172,28 +238,17 @@ impl Instance for ShimService {
 
         let req = req.into_inner();
         let resp = match SessionContext::try_from(req) {
-            Ok(ctx) => {
-                self.executor_attributes
-                    .lock()
-                    .expect("executor attributes mutex poisoned")
-                    .take();
-                let service_ctx = ctx.with_executor_attributes(self.executor_attributes.clone());
-                let response_ctx = service_ctx.clone();
-                self.service
-                    .on_session_enter(service_ctx)
-                    .await
-                    .map(|_| response_ctx)
-            }
+            Ok(ctx) => self.service.on_session_enter(ctx).await,
             Err(e) => Err(e),
         };
 
         match resp {
-            Ok(ctx) => Ok(Response::new(rpc::OnSessionEnterResponse {
+            Ok(()) => Ok(Response::new(rpc::OnSessionEnterResponse {
                 result: Some(rpc::Result {
                     return_code: 0,
                     message: None,
                 }),
-                attributes: ctx.executor_attributes(),
+                attributes: Some(self.service.publisher().take()),
             })),
             Err(e) => Ok(Response::new(rpc::OnSessionEnterResponse {
                 result: Some(rpc::Result {
@@ -212,6 +267,7 @@ impl Instance for ShimService {
         tracing::debug!("ShimService::on_task_invoke");
         let req = req.into_inner();
         let resp = self.service.on_task_invoke(TaskContext::from(req)).await;
+        let attributes = Some(self.service.publisher().take());
 
         match resp {
             Ok(data) => Ok(Response::new(rpc::OnTaskInvokeResponse {
@@ -220,7 +276,7 @@ impl Instance for ShimService {
                     output: data.map(|d| d.into()),
                     message: None,
                 }),
-                attributes: self.executor_attributes(),
+                attributes,
             })),
             Err(e) => Ok(Response::new(rpc::OnTaskInvokeResponse {
                 task_result: Some(rpc::TaskResult {
@@ -228,7 +284,7 @@ impl Instance for ShimService {
                     output: None,
                     message: Some(e.to_string()),
                 }),
-                attributes: None,
+                attributes,
             })),
         }
     }
@@ -239,10 +295,6 @@ impl Instance for ShimService {
     ) -> Result<Response<rpc::Result>, Status> {
         tracing::debug!("ShimService::on_session_leave");
         let resp = self.service.on_session_leave().await;
-        self.executor_attributes
-            .lock()
-            .expect("executor attributes mutex poisoned")
-            .take();
 
         match resp {
             Ok(_) => Ok(Response::new(rpc::Result {
@@ -258,20 +310,9 @@ impl Instance for ShimService {
 }
 
 #[cfg(unix)]
-impl ShimService {
-    fn executor_attributes(&self) -> Option<rpc::ExecutorAttributes> {
-        self.executor_attributes
-            .lock()
-            .expect("executor attributes mutex poisoned")
-            .take()
-    }
-}
-
-#[cfg(unix)]
 pub async fn run(service: impl FlameService) -> Result<(), Box<dyn std::error::Error>> {
     let shim_service = ShimService {
         service: Arc::new(service),
-        executor_attributes: Arc::new(Mutex::new(None)),
     };
 
     let endpoint = std::env::var(FLAME_INSTANCE_ENDPOINT)
@@ -350,38 +391,23 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn session_context_publishes_to_shared_executor_attributes() {
-        let attributes = Arc::new(Mutex::new(None));
-        let context = SessionContext::new(
-            "ssn-1".to_string(),
-            ApplicationContext {
-                name: "test-app".to_string(),
-                image: None,
-                command: None,
-            },
-            None,
-        )
-        .with_executor_attributes(attributes.clone());
-
-        context.publish([b"kv-cache-key".to_vec()]).unwrap();
-
-        assert_eq!(
-            attributes.lock().unwrap().as_ref().unwrap().attr,
-            vec![b"kv-cache-key".to_vec()]
-        );
-    }
-
-    #[cfg(unix)]
+    #[derive(Default)]
     struct TaskPublishingService {
-        session: Mutex<Option<SessionContext>>,
+        publisher: Publisher,
     }
 
     #[cfg(unix)]
     #[tonic::async_trait]
     impl FlameService for TaskPublishingService {
+        fn publisher(&self) -> &Publisher {
+            &self.publisher
+        }
+
         async fn on_session_enter(&self, context: SessionContext) -> Result<(), FlameError> {
-            *self.session.lock().unwrap() = Some(context);
+            if context.session_id == "ssn-failed" {
+                self.publish([b"failed-enter-key".to_vec()])?;
+                return Err(FlameError::Internal("session enter failed".to_string()));
+            }
             Ok(())
         }
 
@@ -390,31 +416,153 @@ mod tests {
             task: TaskContext,
         ) -> Result<Option<TaskOutput>, FlameError> {
             if task.task_id == "task-1" {
-                self.session
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .publish([b"kv-cache-key".to_vec()])?;
+                self.publish([b"a".to_vec()])?;
+                self.publish([b"b".to_vec(), b"c".to_vec()])?;
+                self.publish(Vec::<Vec<u8>>::new())?;
+            } else if task.task_id == "task-error" {
+                self.publish([b"error-key".to_vec()])?;
+                return Err(FlameError::Internal("task failed".to_string()));
             }
             Ok(None)
         }
 
         async fn on_session_leave(&self) -> Result<(), FlameError> {
-            *self.session.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    struct ConcurrentPublishingService {
+        key: Vec<u8>,
+        barrier: Arc<tokio::sync::Barrier>,
+        publisher: Publisher,
+    }
+
+    #[cfg(unix)]
+    #[tonic::async_trait]
+    impl FlameService for ConcurrentPublishingService {
+        fn publisher(&self) -> &Publisher {
+            &self.publisher
+        }
+
+        async fn on_session_enter(&self, _: SessionContext) -> Result<(), FlameError> {
+            Ok(())
+        }
+
+        async fn on_task_invoke(&self, _: TaskContext) -> Result<Option<TaskOutput>, FlameError> {
+            self.barrier.wait().await;
+            self.publish([self.key.clone()])?;
+            Ok(None)
+        }
+
+        async fn on_session_leave(&self) -> Result<(), FlameError> {
             Ok(())
         }
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn task_publication_is_returned_by_shim() {
-        let shim = ShimService {
-            service: Arc::new(TaskPublishingService {
-                session: Mutex::new(None),
+    async fn concurrent_shims_publish_to_their_own_instance() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let shim_a = ShimService {
+            service: Arc::new(ConcurrentPublishingService {
+                key: b"instance-a".to_vec(),
+                barrier: barrier.clone(),
+                publisher: Publisher::default(),
             }),
-            executor_attributes: Arc::new(Mutex::new(None)),
         };
+        let shim_b = ShimService {
+            service: Arc::new(ConcurrentPublishingService {
+                key: b"instance-b".to_vec(),
+                barrier,
+                publisher: Publisher::default(),
+            }),
+        };
+        let request = |task_id: &str| {
+            Request::new(rpc::TaskContext {
+                task_id: task_id.to_string(),
+                session_id: "session".to_string(),
+                input: None,
+            })
+        };
+
+        let (response_a, response_b) = tokio::join!(
+            Instance::on_task_invoke(&shim_a, request("task-a")),
+            Instance::on_task_invoke(&shim_b, request("task-b")),
+        );
+
+        assert_eq!(
+            response_a.unwrap().into_inner().attributes.unwrap().attr,
+            vec![b"instance-a".to_vec()]
+        );
+        assert_eq!(
+            response_b.unwrap().into_inner().attributes.unwrap().attr,
+            vec![b"instance-b".to_vec()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn instance_publication_is_retained_and_delivered_once() {
+        let shim = ShimService {
+            service: Arc::new(TaskPublishingService::default()),
+        };
+        let publisher = shim.service.publisher().clone();
+
+        let detached = FlameInstance::new(SessionContext::new(
+            "detached".to_string(),
+            ApplicationContext {
+                name: "test-app".to_string(),
+                image: None,
+                command: None,
+            },
+            None,
+        ));
+        assert!(detached.publish([b"not-delivered".to_vec()]).is_err());
+
+        publisher
+            .publish(vec![b"deduplicated".to_vec(); 1_025])
+            .unwrap();
+        assert_eq!(publisher.take().attr.len(), 1);
+        let instance = FlameInstance::with_publisher(
+            SessionContext::new(
+                "ssn-handle".to_string(),
+                ApplicationContext {
+                    name: "test-app".to_string(),
+                    image: None,
+                    command: None,
+                },
+                None,
+            ),
+            publisher.clone(),
+        );
+        instance.publish([b"instance-key".to_vec()]).unwrap();
+        assert_eq!(publisher.take().attr, vec![b"instance-key".to_vec()]);
+        assert!(publisher.publish([vec![b'x'; 257]]).is_err());
+        let too_many = (0_u16..1_025).map(|value| value.to_be_bytes().to_vec());
+        assert!(publisher.publish(too_many).is_err());
+
+        let failed_enter = Instance::on_session_enter(
+            &shim,
+            Request::new(rpc::SessionContext {
+                session_id: "ssn-failed".to_string(),
+                application: Some(rpc::ApplicationContext {
+                    name: "test-app".to_string(),
+                    ..Default::default()
+                }),
+                common_data: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(failed_enter.result.unwrap().return_code, -1);
+        assert!(failed_enter.attributes.is_none());
+        assert!(publisher
+            .attributes
+            .lock()
+            .unwrap()
+            .contains(b"failed-enter-key".as_slice()));
 
         let enter = Instance::on_session_enter(
             &shim,
@@ -430,7 +578,15 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(enter.attributes.is_none());
+        assert_eq!(
+            enter
+                .attributes
+                .unwrap()
+                .attr
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([b"failed-enter-key".to_vec()])
+        );
 
         let invoke = Instance::on_task_invoke(
             &shim,
@@ -444,8 +600,13 @@ mod tests {
         .unwrap()
         .into_inner();
         assert_eq!(
-            invoke.attributes.unwrap().attr,
-            vec![b"kv-cache-key".to_vec()]
+            invoke
+                .attributes
+                .unwrap()
+                .attr
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
         );
 
         let next_invoke = Instance::on_task_invoke(
@@ -459,6 +620,138 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(next_invoke.attributes.is_none());
+        assert!(next_invoke.attributes.unwrap().attr.is_empty());
+
+        let republished = Instance::on_task_invoke(
+            &shim,
+            Request::new(rpc::TaskContext {
+                task_id: "task-2".to_string(),
+                session_id: "ssn-1".to_string(),
+                input: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(republished.attributes.unwrap().attr.is_empty());
+
+        assert!(publisher.publish([Vec::new()]).is_err());
+        publisher.publish([b"retained-key".to_vec()]).unwrap();
+        Instance::on_session_leave(&shim, Request::new(rpc::EmptyRequest {}))
+            .await
+            .unwrap();
+        assert!(publisher
+            .attributes
+            .lock()
+            .unwrap()
+            .contains(b"retained-key".as_slice()));
+
+        let reenter = Instance::on_session_enter(
+            &shim,
+            Request::new(rpc::SessionContext {
+                session_id: "ssn-2".to_string(),
+                application: Some(rpc::ApplicationContext {
+                    name: "test-app".to_string(),
+                    ..Default::default()
+                }),
+                common_data: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let expected = HashSet::from([b"retained-key".to_vec()]);
+        assert_eq!(
+            reenter
+                .attributes
+                .unwrap()
+                .attr
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            expected
+        );
+        assert!(publisher.take().attr.is_empty());
+
+        let empty_enter = Instance::on_session_enter(
+            &shim,
+            Request::new(rpc::SessionContext {
+                session_id: "ssn-3".to_string(),
+                application: Some(rpc::ApplicationContext {
+                    name: "test-app".to_string(),
+                    ..Default::default()
+                }),
+                common_data: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(empty_enter.attributes.unwrap().attr.is_empty());
+
+        let failed = Instance::on_task_invoke(
+            &shim,
+            Request::new(rpc::TaskContext {
+                task_id: "task-error".to_string(),
+                session_id: "ssn-2".to_string(),
+                input: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(failed.task_result.unwrap().return_code, -1);
+        assert_eq!(failed.attributes.unwrap().attr, vec![b"error-key".to_vec()]);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let publish_barrier = barrier.clone();
+        let publish_publisher = publisher.clone();
+        let publish_task = tokio::spawn(async move {
+            publish_barrier.wait().await;
+            publish_publisher
+                .publish([b"race-a".to_vec(), b"race-b".to_vec()])
+                .unwrap();
+        });
+        barrier.wait().await;
+        let raced = publisher.take();
+        publish_task.await.unwrap();
+        let after_race = publisher.take();
+        let expected = HashSet::from([b"race-a".to_vec(), b"race-b".to_vec()]);
+        let nonempty = [raced, after_race]
+            .into_iter()
+            .filter(|attributes| !attributes.attr.is_empty())
+            .map(|attributes| attributes.attr.into_iter().collect::<HashSet<_>>())
+            .collect::<Vec<_>>();
+        assert_eq!(nonempty, vec![expected]);
+
+        publisher
+            .publish((0..600).map(|index| format!("limit-key-{index}").into_bytes()))
+            .unwrap();
+        publisher
+            .publish(
+                (600..MAX_EXECUTOR_ATTRIBUTES)
+                    .map(|index| format!("limit-key-{index}").into_bytes()),
+            )
+            .unwrap();
+        assert!(publisher.publish([b"one-key-too-many".to_vec()]).is_err());
+        assert_eq!(publisher.take().attr.len(), MAX_EXECUTOR_ATTRIBUTES);
+
+        let byte_boundary = (0_u16..256)
+            .map(|index| {
+                let mut value = index.to_be_bytes().to_vec();
+                value.resize(MAX_EXECUTOR_ATTRIBUTE_BYTES, 0);
+                value
+            })
+            .collect::<Vec<_>>();
+        publisher.publish(byte_boundary.clone()).unwrap();
+        publisher.publish(byte_boundary.clone()).unwrap();
+        assert!(publisher.publish([b"overflow".to_vec()]).is_err());
+        assert_eq!(publisher.take().attr.len(), byte_boundary.len());
+
+        publisher.publish(byte_boundary.clone()).unwrap();
+        assert_eq!(publisher.take().attr.len(), byte_boundary.len());
+        assert!(publisher.take().attr.is_empty());
+
+        drop(shim);
+        drop(publisher);
     }
 }

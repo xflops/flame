@@ -69,10 +69,7 @@ impl Action for DispatchAction {
                 &ssn.id
             );
 
-            let available = idle_executors
-                .values()
-                .find(|exec| exec.ssn_id.is_none() && ctx.is_available(exec, &ssn).unwrap_or(false))
-                .cloned();
+            let available = ctx.select_executor(&ssn, &idle_executors)?;
             if let Some(exec) = available {
                 ctx.bind_session(&exec, &ssn).await?;
                 idle_executors.remove(&exec.id);

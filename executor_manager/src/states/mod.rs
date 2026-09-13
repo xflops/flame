@@ -83,6 +83,7 @@ mod tests {
     fn create_test_executor(id: &str, state: ExecutorState) -> Executor {
         Executor {
             id: id.to_string(),
+            application: "test-app".to_string(),
             node: "test-node".to_string(),
             resreq: ResourceRequirement::default(),
             shim: Shim::Host,

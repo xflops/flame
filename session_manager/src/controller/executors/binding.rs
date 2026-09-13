@@ -42,7 +42,7 @@ impl BindingState {
         self.storage.get_session_ptr(ssn_id)?;
 
         let mut e = lock_ptr!(self.executor)?;
-        e.state = ExecutorState::Bound;
+        e.set_state(ExecutorState::Bound);
 
         Ok(())
     }
@@ -54,7 +54,7 @@ impl BindingState {
         self.increment_session_retry_count(&executor).await?;
 
         let mut e = lock_ptr!(self.executor)?;
-        e.state = ExecutorState::Unbinding;
+        e.set_state(ExecutorState::Unbinding);
         e.ssn_id = None;
         e.task_id = None;
 
@@ -160,7 +160,7 @@ impl States for BindingState {
             "Executor <{}> unregistering from binding state, moving to released",
             e.id
         );
-        e.state = ExecutorState::Released;
+        e.set_state(ExecutorState::Released);
         e.ssn_id = None;
         e.task_id = None;
 
@@ -177,7 +177,7 @@ impl States for BindingState {
 
         let mut e = lock_ptr!(self.executor)?;
         e.ssn_id = Some(ssn_id);
-        e.state = ExecutorState::Binding;
+        e.set_state(ExecutorState::Binding);
 
         Ok(())
     }
@@ -204,7 +204,7 @@ impl States for BindingState {
             e.id,
             e.ssn_id
         );
-        e.state = ExecutorState::Unbinding;
+        e.set_state(ExecutorState::Unbinding);
 
         Ok(())
     }
@@ -217,7 +217,7 @@ impl States for BindingState {
             "Executor <{}> unbind completed from binding state, returning to idle",
             e.id
         );
-        e.state = ExecutorState::Idle;
+        e.set_state(ExecutorState::Idle);
         e.ssn_id = None;
         e.task_id = None;
 

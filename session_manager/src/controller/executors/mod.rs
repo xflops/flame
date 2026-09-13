@@ -100,9 +100,12 @@ mod tests {
             node: "test-node".to_string(),
             resreq: ResourceRequirement::default(),
             shim: Shim::Host,
+            application: String::new(),
             task_id: None,
             ssn_id: None,
+            attributes: Default::default(),
             creation_time: Utc::now(),
+            latest_updated_timestamp: Utc::now(),
             state,
         })
     }
@@ -429,9 +432,11 @@ mod tests {
         async fn test_bind_session_completed_transitions_to_bound() {
             let exe_ptr = create_test_executor("exe-1", ExecutorState::Binding);
             let storage = create_mock_storage().await;
-            let (ssn_id, _) = create_stored_test_session(&storage).await;
+            let (ssn_id, ssn_ptr) = create_stored_test_session(&storage).await;
+            let application = lock_ptr!(ssn_ptr).unwrap().application.clone();
             {
                 let mut exe = lock_ptr!(exe_ptr).unwrap();
+                exe.application = application.clone();
                 exe.ssn_id = Some(ssn_id);
             }
 
@@ -443,7 +448,9 @@ mod tests {
             let result = state.bind_session_completed(None).await;
 
             assert!(result.is_ok());
-            assert_eq!(get_state(&exe_ptr).unwrap(), ExecutorState::Bound);
+            let executor = lock_ptr!(exe_ptr).unwrap();
+            assert_eq!(executor.state, ExecutorState::Bound);
+            assert_eq!(executor.application, application);
         }
 
         #[tokio::test]
@@ -467,9 +474,11 @@ mod tests {
         async fn test_failed_bind_session_completed_transitions_to_unbinding() {
             let exe_ptr = create_test_executor("exe-1", ExecutorState::Binding);
             let storage = create_mock_storage().await;
-            let (ssn_id, _) = create_stored_test_session(&storage).await;
+            let (ssn_id, ssn_ptr) = create_stored_test_session(&storage).await;
+            let application = lock_ptr!(ssn_ptr).unwrap().application.clone();
             {
                 let mut exe = lock_ptr!(exe_ptr).unwrap();
+                exe.application = application.clone();
                 exe.ssn_id = Some(ssn_id.clone());
                 exe.task_id = Some(1);
             }
@@ -489,6 +498,7 @@ mod tests {
             assert!(result.is_ok());
             let exe = lock_ptr!(exe_ptr).unwrap();
             assert_eq!(exe.state, ExecutorState::Unbinding);
+            assert_eq!(exe.application, application);
             assert_eq!(exe.ssn_id, None);
             assert_eq!(exe.task_id, None);
 
@@ -714,6 +724,7 @@ mod tests {
 
     mod unbinding_state_tests {
         use super::*;
+        use bytes::Bytes;
 
         #[tokio::test]
         async fn test_unbind_executor_completed_transitions_to_idle() {
@@ -722,8 +733,11 @@ mod tests {
 
             {
                 let mut exe = lock_ptr!(exe_ptr).unwrap();
+                exe.application = "test-app".to_string();
                 exe.ssn_id = Some("ssn-1".to_string());
                 exe.task_id = Some(1);
+                exe.attributes = [Bytes::from_static(b"retained")].into_iter().collect();
+                exe.latest_updated_timestamp = Utc::now() - chrono::Duration::minutes(10);
             }
 
             let state = UnbindingState {
@@ -737,8 +751,14 @@ mod tests {
             assert_eq!(get_state(&exe_ptr).unwrap(), ExecutorState::Idle);
 
             let exe = lock_ptr!(exe_ptr).unwrap();
+            assert_eq!(exe.application, "test-app");
+            assert_eq!(
+                exe.attributes,
+                [Bytes::from_static(b"retained")].into_iter().collect()
+            );
             assert!(exe.ssn_id.is_none());
             assert!(exe.task_id.is_none());
+            assert!(exe.latest_updated_timestamp > Utc::now() - chrono::Duration::minutes(1));
         }
 
         #[tokio::test]

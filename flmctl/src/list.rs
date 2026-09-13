@@ -18,7 +18,7 @@ use comfy_table::presets::NOTHING;
 use comfy_table::Table;
 use flame_rs as flame;
 use flame_rs::apis::{FlameContext, FlameError, SessionState};
-use flame_rs::client::{Connection, NodeState};
+use flame_rs::client::{Connection, Executor, NodeState};
 
 use crate::utils::{format_memory, format_resreq};
 
@@ -123,23 +123,30 @@ async fn list_session(conn: Connection) -> Result<(), Box<dyn Error>> {
 
 async fn list_executor(conn: Connection) -> Result<(), Box<dyn Error>> {
     let executor_list = conn.list_executor().await?;
+    let table = executor_table(&executor_list);
+
+    println!("{table}");
+
+    Ok(())
+}
+
+fn executor_table(executors: &[Executor]) -> Table {
     let mut table = Table::new();
     table
         .load_preset(NOTHING)
-        .set_header(vec!["ID", "State", "Session", "Node"]);
+        .set_header(vec!["ID", "State", "App", "Session", "Node"]);
 
-    for executor in &executor_list {
+    for executor in executors {
         table.add_row(vec![
             executor.id.to_string(),
             executor.state.to_string(),
+            executor.application.to_string(),
             executor.session_id.clone().unwrap_or("-".to_string()),
             executor.node.to_string(),
         ]);
     }
 
-    println!("{table}");
-
-    Ok(())
+    table
 }
 
 async fn list_node(conn: Connection) -> Result<(), Box<dyn Error>> {
@@ -169,4 +176,26 @@ async fn list_node(conn: Connection) -> Result<(), Box<dyn Error>> {
     println!("{table}");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use flame_rs::apis::ExecutorState;
+
+    use super::*;
+
+    #[test]
+    fn executor_table_shows_application() {
+        let table = executor_table(&[Executor {
+            id: "executor-1".to_string(),
+            application: "app-1".to_string(),
+            state: ExecutorState::Idle,
+            session_id: None,
+            node: "node-1".to_string(),
+        }])
+        .to_string();
+
+        assert!(table.contains("App"));
+        assert!(table.contains("app-1"));
+    }
 }

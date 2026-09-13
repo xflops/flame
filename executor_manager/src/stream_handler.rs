@@ -393,12 +393,13 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_conversion() {
+    fn test_executor_conversion_preserves_application() {
         use common::apis::{ExecutorState, ResourceRequirement, Shim};
 
         // Test that Executor can be created with expected fields
         let executor = Executor {
             id: "test-exec".to_string(),
+            application: "test-app".to_string(),
             node: "test-node".to_string(),
             resreq: ResourceRequirement::default(),
             session: None,
@@ -410,7 +411,13 @@ mod tests {
         };
 
         assert_eq!(executor.id, "test-exec");
+        assert_eq!(executor.application, "test-app");
         assert_eq!(executor.node, "test-node");
         assert_eq!(executor.state, ExecutorState::Idle);
+
+        let rpc_executor = proto::Executor::from(&executor);
+        assert_eq!(rpc_executor.spec.as_ref().unwrap().application, "test-app");
+        let restored = Executor::try_from(&rpc_executor).unwrap();
+        assert_eq!(restored.application, "test-app");
     }
 }

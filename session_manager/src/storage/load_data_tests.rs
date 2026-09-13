@@ -13,10 +13,15 @@ limitations under the License.
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use chrono::Utc;
-    use common::apis::{ExecutorState, Node, NodeInfo, NodeState, ResourceRequirement, Shim};
+    use common::apis::{
+        ApplicationAttributes, ExecutorState, Node, NodeInfo, NodeState, ResourceRequirement,
+        SessionAttributes, Shim, TaskOptions,
+    };
     use common::ctx::{FlameCluster, FlameClusterContext, FlameExecutors, FlameLimits};
     use common::FlameError;
+    use std::collections::HashSet;
     use stdng::lock_ptr;
 
     use crate::model::Executor;
@@ -69,6 +74,7 @@ mod tests {
         };
         tokio_test::block_on(engine.create_node(&node))?;
 
+        let stale_timestamp = Utc::now() - chrono::Duration::minutes(10);
         let binding_executor = Executor {
             id: "binding-exec".to_string(),
             node: "recovery-node".to_string(),
@@ -78,9 +84,12 @@ mod tests {
                 gpu: 0,
             },
             shim: Shim::Host,
+            application: "volatile-app".to_string(),
             task_id: None,
             ssn_id: Some("incomplete-session".to_string()),
+            attributes: HashSet::from([Bytes::from_static(b"volatile-key")]),
             creation_time: Utc::now(),
+            latest_updated_timestamp: stale_timestamp,
             state: ExecutorState::Binding,
         };
         tokio_test::block_on(engine.create_executor(&binding_executor))?;
@@ -94,9 +103,12 @@ mod tests {
                 gpu: 0,
             },
             shim: Shim::Host,
+            application: "volatile-app".to_string(),
             task_id: None,
             ssn_id: None,
+            attributes: HashSet::from([Bytes::from_static(b"volatile-key")]),
             creation_time: Utc::now(),
+            latest_updated_timestamp: stale_timestamp,
             state: ExecutorState::Idle,
         };
         tokio_test::block_on(engine.create_executor(&idle_executor))?;
@@ -111,15 +123,22 @@ mod tests {
         let binding_exec = executors.iter().find(|e| e.id == "binding-exec").unwrap();
         assert_eq!(binding_exec.state, ExecutorState::Idle);
         assert_eq!(binding_exec.ssn_id, None);
+        assert_eq!(binding_exec.application, "volatile-app");
+        assert!(binding_exec.attributes.is_empty());
+        assert!(binding_exec.latest_updated_timestamp > stale_timestamp);
 
         let idle_exec = executors.iter().find(|e| e.id == "idle-exec").unwrap();
         assert_eq!(idle_exec.state, ExecutorState::Idle);
+        assert_eq!(idle_exec.application, "volatile-app");
+        assert!(idle_exec.attributes.is_empty());
+        assert!(idle_exec.latest_updated_timestamp > stale_timestamp);
 
         let db_executor = tokio_test::block_on(engine.get_executor(&"binding-exec".to_string()))?;
         assert!(db_executor.is_some());
         let db_executor = db_executor.unwrap();
         assert_eq!(db_executor.state, ExecutorState::Idle);
         assert_eq!(db_executor.ssn_id, None);
+        assert_eq!(db_executor.application, "volatile-app");
 
         Ok(())
     }
@@ -165,9 +184,12 @@ mod tests {
                     gpu: 0,
                 },
                 shim: Shim::Host,
+                application: "state-app".to_string(),
                 task_id: None,
                 ssn_id: None,
+                attributes: Default::default(),
                 creation_time: Utc::now(),
+                latest_updated_timestamp: Utc::now(),
                 state: *state,
             };
             tokio_test::block_on(engine.create_executor(&executor))?;
@@ -187,8 +209,53 @@ mod tests {
                 "Executor {} should remain in {:?} state",
                 id, expected_state
             );
+            assert_eq!(exec.application, "state-app");
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_data_restores_pending_task_affinity() -> Result<(), FlameError> {
+        let url = common::temp_sqlite_url("flame_test_load_data_affinity");
+        let ctx = create_test_context(&url);
+        let storage = crate::storage::new_ptr(&ctx).await?;
+        storage
+            .register_application("affinity-app".to_string(), ApplicationAttributes::default())
+            .await?;
+        storage
+            .create_session(SessionAttributes {
+                id: "affinity-session".to_string(),
+                application: "affinity-app".to_string(),
+                ..Default::default()
+            })
+            .await?;
+        let shared = bytes::Bytes::from_static(b"shared");
+        for _ in 0..2 {
+            storage
+                .create_task(
+                    "affinity-session".to_string(),
+                    None,
+                    Some(TaskOptions {
+                        affinity: [shared.clone()].into_iter().collect(),
+                    }),
+                )
+                .await?;
+        }
+        drop(storage);
+
+        let recovered = crate::storage::new_ptr(&ctx).await?;
+        recovered.load_data().await?;
+        let session = recovered.get_session_ptr("affinity-session".to_string())?;
+        let session = lock_ptr!(session)?;
+        let pending = session
+            .tasks_index
+            .get(&common::apis::TaskState::Pending)
+            .expect("recovered session must contain Pending tasks");
+        assert_eq!(pending.len(), 2);
+        for task in pending.values() {
+            assert!(lock_ptr!(task)?.affinity.contains(&shared));
+        }
         Ok(())
     }
 }

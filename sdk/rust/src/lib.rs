@@ -23,14 +23,13 @@ pub use client::{
     Connection, Session, SessionOptions, TaskFuture, TaskHandle, TaskOption, TaskOptions,
     TaskResult,
 };
+#[cfg(feature = "macros")]
+pub use flame_rs_macros::{entrypoint, instance, FlameMessage};
 pub use message::{FlameMessage, FromTaskOutput, IntoCommonData, IntoTaskInput};
 pub use object::{
     delete_objects, download_object, get_object, patch_object, put_object, update_object,
     upload_object, ObjectFuture, ObjectKey, ObjectRef,
 };
-
-#[cfg(feature = "macros")]
-pub use flame_rs_macros::{entrypoint, instance, FlameMessage};
 
 #[doc(hidden)]
 pub mod __private {

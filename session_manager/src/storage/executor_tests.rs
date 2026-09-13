@@ -70,6 +70,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(executor.node, "exec-node");
+            assert_eq!(executor.application, "test-app");
             assert_eq!(executor.state, ExecutorState::Void);
         }
 

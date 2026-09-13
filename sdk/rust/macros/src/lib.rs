@@ -180,12 +180,14 @@ fn expand_entrypoint(args: MacroArgs, mut item: ItemFn) -> Result<TokenStream2> 
         #[doc(hidden)]
         #vis struct #wrapper_ident {
             session: ::std::sync::Mutex<::std::option::Option<#crate_path::service::SessionContext>>,
+            publisher: #crate_path::service::Publisher,
         }
 
         impl ::std::default::Default for #wrapper_ident {
             fn default() -> Self {
                 Self {
                     session: ::std::sync::Mutex::new(None),
+                    publisher: ::std::default::Default::default(),
                 }
             }
         }
@@ -218,7 +220,10 @@ fn expand_entrypoint(args: MacroArgs, mut item: ItemFn) -> Result<TokenStream2> 
                     )
                 })?;
 
-                Ok(#crate_path::service::FlameInstance::new(session))
+                Ok(#crate_path::service::FlameInstance::with_publisher(
+                    session,
+                    self.publisher.clone(),
+                ))
             }
         }
 
@@ -232,6 +237,10 @@ fn expand_entrypoint(args: MacroArgs, mut item: ItemFn) -> Result<TokenStream2> 
 
         #[#crate_path::service::async_trait]
         impl #crate_path::service::FlameService for #wrapper_ident {
+            fn publisher(&self) -> &#crate_path::service::Publisher {
+                &self.publisher
+            }
+
             async fn on_session_enter(
                 &self,
                 ctx: #crate_path::service::SessionContext,
@@ -354,6 +363,7 @@ fn expand_instance(args: MacroArgs, mut item: ItemImpl) -> Result<TokenStream2> 
         pub struct #wrapper_ident {
             inner: #self_ty,
             session: ::std::sync::Mutex<::std::option::Option<#crate_path::service::SessionContext>>,
+            publisher: #crate_path::service::Publisher,
         }
 
         impl #wrapper_ident {
@@ -384,7 +394,10 @@ fn expand_instance(args: MacroArgs, mut item: ItemImpl) -> Result<TokenStream2> 
                     )
                 })?;
 
-                Ok(#crate_path::service::FlameInstance::new(session))
+                Ok(#crate_path::service::FlameInstance::with_publisher(
+                    session,
+                    self.publisher.clone(),
+                ))
             }
         }
 
@@ -395,12 +408,17 @@ fn expand_instance(args: MacroArgs, mut item: ItemImpl) -> Result<TokenStream2> 
                 #wrapper_ident {
                     inner: self,
                     session: ::std::sync::Mutex::new(None),
+                    publisher: ::std::default::Default::default(),
                 }
             }
         }
 
         #[#crate_path::service::async_trait]
         impl #crate_path::service::FlameService for #wrapper_ident {
+            fn publisher(&self) -> &#crate_path::service::Publisher {
+                &self.publisher
+            }
+
             async fn on_session_enter(
                 &self,
                 ctx: #crate_path::service::SessionContext,

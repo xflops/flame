@@ -6,8 +6,8 @@ The Instance service defines the interface between executors and application ins
 
 ```protobuf
 service Instance {
-  rpc OnSessionEnter(SessionContext) returns (Result) {}
-  rpc OnTaskInvoke(TaskContext) returns (TaskResult) {}
+  rpc OnSessionEnter(SessionContext) returns (OnSessionEnterResponse) {}
+  rpc OnTaskInvoke(TaskContext) returns (OnTaskInvokeResponse) {}
   rpc OnSessionLeave(EmptyRequest) returns (Result) {}
 }
 ```
@@ -18,7 +18,7 @@ The Instance service is implemented by application shims that manage the actual 
 
 ### Lifecycle Flow
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                     Executor Bound                          │
 └─────────────────────────────────────────────────────────────┘
@@ -78,9 +78,19 @@ Called when an executor binds to a session. Use this to initialize application-s
 | `url` | string | Service URL (optional) |
 | `installer` | string | Installer name (optional) |
 
-**Response:** [Result](types.md#result)
+**Response:** `OnSessionEnterResponse`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `result` | [Result](types.md#result) | Session-enter result |
+| `attributes` | `ExecutorAttributes` | Complete instance-attribute snapshot (optional) |
+
+On success, SDK shims include `attributes`, including a present empty snapshot
+that clears the previously accepted attributes. A failed session enter omits
+the field and does not consume attributes accumulated by the publisher.
 
 **Example Implementation (Python):**
+
 ```python
 import json
 
@@ -107,15 +117,19 @@ Called for each task that needs to be executed.
 | `session_id` | string | Session identifier |
 | `input` | bytes | Task input data (optional) |
 
-**Response:** [TaskResult](types.md#taskresult)
+**Response:** `OnTaskInvokeResponse`
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `return_code` | int32 | 0 for success, non-zero for failure |
-| `output` | bytes | Task output data (optional) |
-| `message` | string | Error or status message (optional) |
+| `task_result` | [TaskResult](types.md#taskresult) | Task result and optional output |
+| `attributes` | `ExecutorAttributes` | Complete instance-attribute snapshot (optional) |
+
+SDK shims include the current snapshot for both successful and failed task
+invocations. A present empty snapshot clears the previously accepted
+attributes.
 
 **Example Implementation (Python):**
+
 ```python
 def on_task_invoke(self, context):
     input_data = json.loads(context.input)
@@ -132,6 +146,7 @@ Called when the executor unbinds from the session. Use this to clean up resource
 **Response:** [Result](types.md#result)
 
 **Example Implementation (Python):**
+
 ```python
 def on_session_leave(self):
     self.db.close()  # Clean up resources

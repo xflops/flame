@@ -20,7 +20,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import cloudpickle
 
 from flamepy.core import ObjectRef, get_object, put_object, update_object
-from flamepy.core.service import FlameService, SessionContext, TaskContext
+from flamepy.core.service import FlameService as CoreFlameService
+from flamepy.core.service import SessionContext, TaskContext
 from flamepy.core.types import TaskOutput
 from flamepy.runner.types import RunnerContext, RunnerRequest
 
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 MAX_PARALLEL_RESOLVE = 8
 
 
-class FlameRunpyService(FlameService):
+class FlameRunpyService(CoreFlameService):
     """
     Common Python service for Flame that executes customized Python applications.
 
@@ -69,12 +70,52 @@ class FlameRunpyService(FlameService):
             logger.info(f"Instantiating class {execution_object.__name__}")
             execution_object = execution_object()
 
+        instance_vars = getattr(execution_object, "__dict__", None)
+        if isinstance(instance_vars, dict) and "_flame_instance_attributes" not in instance_vars:
+            inherited_attributes = getattr(execution_object, "_flame_instance_attributes", ())
+            setattr(execution_object, "_flame_instance_attributes", set(inherited_attributes))
+        elif not hasattr(execution_object, "_flame_instance_attributes"):
+            try:
+                setattr(execution_object, "_flame_instance_attributes", set())
+            except (AttributeError, TypeError):
+                # Some supported callables, such as builtins, cannot own attributes.
+                pass
+
+        try:
+            setattr(execution_object, "_flame_session_context", self._ssn_ctx)
+        except (AttributeError, TypeError):
+            # Some supported callables, such as builtins, cannot own attributes.
+            pass
+
         self._runner_context = runner_context
         self._execution_object = execution_object
-        # Stateless Runner instances still own process-local runtime data such
-        # as vLLM KV blocks. Give user code the session context so it can
-        # publish opaque locality keys without persisting that runtime state.
-        setattr(self._execution_object, "_flame_session_context", self._ssn_ctx)
+
+    def _publish_instance_attributes(self) -> None:
+        """Publish and drain attributes accumulated by the Runner object."""
+        attributes = getattr(self._execution_object, "_flame_instance_attributes", ())
+        self.publish(attributes)
+        try:
+            setattr(self._execution_object, "_flame_instance_attributes", set())
+        except (AttributeError, TypeError):
+            pass
+
+    @staticmethod
+    def _serialize_runner_context(runner_context: RunnerContext) -> bytes:
+        """Serialize user state without executor-local Runner fields."""
+        execution_object = runner_context.execution_object
+        instance_vars = getattr(execution_object, "__dict__", None)
+        if not isinstance(instance_vars, dict):
+            return cloudpickle.dumps(runner_context, protocol=cloudpickle.DEFAULT_PROTOCOL)
+
+        runtime_vars = {}
+        for name in ("_flame_session_context", "_flame_instance_attributes"):
+            if name in instance_vars:
+                runtime_vars[name] = instance_vars.pop(name)
+
+        try:
+            return cloudpickle.dumps(runner_context, protocol=cloudpickle.DEFAULT_PROTOCOL)
+        finally:
+            instance_vars.update(runtime_vars)
 
     def _resolve_object_ref(self, value: Any) -> Any:
         """
@@ -214,11 +255,12 @@ class FlameRunpyService(FlameService):
         logger.info(f"Entering session: {context.session_id}")
         logger.debug(f"Application: {context.application.name}")
 
-        # Store the session context for use in task invocation
+        # Store the session context for use in task invocation.
         self._ssn_ctx = context
 
         runner_context = self._load_runner_context()
         self._set_execution_from_context(runner_context)
+        self._publish_instance_attributes()
 
         logger.info(f"Session entered successfully, execution object loaded (stateful={runner_context.stateful}, autoscale={runner_context.autoscale})")
         return True
@@ -328,7 +370,7 @@ class FlameRunpyService(FlameService):
                 )
                 # For RL module: serialize RunnerContext with cloudpickle, update in cache to get ObjectRef,
                 # then encode ObjectRef to bytes for core API
-                serialized_ctx = cloudpickle.dumps(updated_context, protocol=cloudpickle.DEFAULT_PROTOCOL)
+                serialized_ctx = self._serialize_runner_context(updated_context)
 
                 # Get original ObjectRef and update it
                 common_data_bytes = self._ssn_ctx.common_data()
@@ -354,6 +396,8 @@ class FlameRunpyService(FlameService):
         except Exception as e:
             logger.error(f"Error in task {context.task_id}: {e}", exc_info=True)
             raise
+        finally:
+            self._publish_instance_attributes()
 
     def on_session_leave(self) -> bool:
         """
@@ -369,7 +413,14 @@ class FlameRunpyService(FlameService):
         logger.info(f"Leaving session: {self._ssn_ctx.session_id if self._ssn_ctx else 'unknown'}")
 
         # Clean up session context
+        if self._execution_object is not None:
+            try:
+                setattr(self._execution_object, "_flame_session_context", None)
+            except (AttributeError, TypeError):
+                pass
         self._ssn_ctx = None
+        self._runner_context = None
+        self._execution_object = None
 
         # Future implementation will:
         # 1. Uninstall any temporary packages that were installed

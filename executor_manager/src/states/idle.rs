@@ -88,31 +88,43 @@ impl State for IdleState {
             &ssn.session_id.clone()
         );
 
-        let env_vars = match self.app_manager.install(&ssn.application).await {
-            Ok(env_vars) => env_vars,
-            Err(e) => {
-                self.bind_executor_failed(
-                    BIND_RESULT_APPLICATION_INSTALL_FAILED,
-                    format!("application installation failed: {e}"),
-                    &ssn,
-                    None,
-                )
-                .await?;
-                return Ok(self.executor.clone());
+        let shim_ptr = match self.executor.shim_instance.clone() {
+            Some(shim_ptr) => {
+                tracing::debug!(
+                    "Reuse retained instance for Executor <{}> and application <{}>.",
+                    self.executor.id,
+                    ssn.application.name
+                );
+                shim_ptr
             }
-        };
+            None => {
+                let env_vars = match self.app_manager.install(&ssn.application).await {
+                    Ok(env_vars) => env_vars,
+                    Err(e) => {
+                        self.bind_executor_failed(
+                            BIND_RESULT_APPLICATION_INSTALL_FAILED,
+                            format!("application installation failed: {e}"),
+                            &ssn,
+                            None,
+                        )
+                        .await?;
+                        return Ok(self.executor.clone());
+                    }
+                };
 
-        let shim_ptr = match shims::new(&self.executor.clone(), &ssn.application, &env_vars).await {
-            Ok(shim_ptr) => shim_ptr,
-            Err(e) => {
-                self.bind_executor_failed(
-                    BIND_RESULT_SHIM_CREATE_FAILED,
-                    format!("shim creation failed: {e}"),
-                    &ssn,
-                    None,
-                )
-                .await?;
-                return Ok(self.executor.clone());
+                match shims::new(&self.executor.clone(), &ssn.application, &env_vars).await {
+                    Ok(shim_ptr) => shim_ptr,
+                    Err(e) => {
+                        self.bind_executor_failed(
+                            BIND_RESULT_SHIM_CREATE_FAILED,
+                            format!("shim creation failed: {e}"),
+                            &ssn,
+                            None,
+                        )
+                        .await?;
+                        return Ok(self.executor.clone());
+                    }
+                }
             }
         };
 

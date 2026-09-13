@@ -13,11 +13,14 @@ limitations under the License.
 
 import os
 import tempfile
+import time
+import uuid
 from pathlib import Path
 
 import flamepy
 import pytest
 from flamepy import TaskOptions, runner
+from flamepy.proto.types_pb2 import ExecutorBound, ExecutorIdle
 from flamepy.runner import SessionContext
 
 from e2e.helpers import (
@@ -98,17 +101,62 @@ def test_runner_with_class(check_package_config, check_flmrun_app):
 
 
 def test_runner_data_aware_scheduling(check_package_config, check_flmrun_app):
-    """Runner carries a service publication into a later affinity task."""
-    with runner.Runner("test-runner-das") as rr:
-        service = rr.service(DataAwareService, warmup=1)
-        _, affinity_key = service.run("warmup").get()
-        affinity = service.run(
-            "affinity-match",
-            option=TaskOptions(affinity={affinity_key}),
-        )
+    """DAS rebinds the matching one of two retained Runner processes."""
 
-        value, _ = affinity.get()
-        assert value == "affinity-match"
+    def wait_for_executors(predicate, timeout=60):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            matched = [executor for executor in flamepy.list_executors() if predicate(executor)]
+            if len(matched) == 2:
+                return matched
+            time.sleep(0.1)
+        pytest.fail("timed out waiting for two DAS test executors")
+
+    with runner.Runner("test-runner-das") as rr:
+        warm_service = rr.service(DataAwareService, warmup=2)
+        warm_session_id = warm_service._session.id
+        bound = wait_for_executors(lambda executor: executor.status.state == ExecutorBound and executor.status.session_id == warm_session_id)
+
+        executor_ids = {executor.metadata.id for executor in bound}
+        key_by_executor = {}
+        probe_deadline = time.monotonic() + 60
+        attempt = 0
+        while key_by_executor.keys() != executor_ids and time.monotonic() < probe_deadline:
+            probes = [warm_service.run(f"warmup-{attempt}-{index}", delay=1) for index in range(2)]
+            for probe in probes:
+                _, key, executor_id = probe.get()
+                key_by_executor[executor_id] = key
+            attempt += 1
+        assert key_by_executor.keys() == executor_ids, "not all bound DAS executors accepted a warmup probe"
+
+        # Create the target sessions before releasing the warm session so the
+        # affinity tasks can be submitted within the bounded Idle reuse window.
+        target_executor_ids = sorted(executor_ids, reverse=True)
+        targets = [key_by_executor[executor_id] for executor_id in target_executor_ids]
+        services = [rr.service(DataAwareService, warmup=0) for _ in targets]
+        warm_service.close()
+        wait_for_executors(lambda executor: executor.metadata.id in executor_ids and executor.status.state == ExecutorIdle)
+
+        # Let several scheduler cycles pass. Without the Idle grace, Shuffle
+        # would release these retained Runner processes before DAS can reuse them.
+        time.sleep(2)
+        retained = [executor for executor in flamepy.list_executors() if executor.metadata.id in executor_ids]
+        assert {executor.metadata.id for executor in retained} == executor_ids
+        assert all(executor.status.state == ExecutorIdle for executor in retained)
+
+        futures = [
+            service.run(
+                f"affinity-match-{index}",
+                option=TaskOptions(affinity={target}),
+            )
+            for index, (service, target) in enumerate(zip(services, targets))
+        ]
+
+        for index, (future, target, executor_id) in enumerate(zip(futures, targets, target_executor_ids)):
+            value, selected_key, selected_executor_id = future.get()
+            assert value == f"affinity-match-{index}"
+            assert selected_key == target
+            assert selected_executor_id == executor_id
 
 
 def test_runner_with_instance(check_package_config, check_flmrun_app):
@@ -256,7 +304,7 @@ def test_objectfuture_iterator(check_package_config, check_flmrun_app):
 
 
 def test_runner_service_close(check_package_config, check_flmrun_app):
-    """Test Case 11: Test that RunnerService.close() works."""
+    """Test Case 11: Test that RunnerServiceInstance.close() works."""
     with runner.Runner("test-service-close") as rr:
         sum_service = rr.service(sum_func)
 
@@ -719,7 +767,7 @@ def test_session_context_dynamic_class(check_package_config, check_flmrun_app):
 def test_runner_recursive_same_session(check_package_config, check_flmrun_app):
     """Test Case 39: Test recursive runner execution within the same session.
 
-    This test verifies that a task can create another RunnerService using the same
+    This test verifies that a task can create another RunnerServiceInstance using the same
     session ID, enabling recursive task submission within the same session.
     The open_session API allows this by returning the existing session instead of
     creating a new one.
@@ -786,9 +834,6 @@ def test_runner_recursive_same_session(check_package_config, check_flmrun_app):
 # =============================================================================
 
 
-FLMRUN_E2E_APP = "flmrun-e2e"
-
-
 @pytest.fixture
 def setup_flmrun_with_e2e():
     """
@@ -803,9 +848,10 @@ def setup_flmrun_with_e2e():
         pytest.skip("Requires /opt/e2e directory (Docker E2E environment only)")
 
     flmrun = flamepy.get_application("flmrun")
+    app_name = f"flmrun-e2e-{uuid.uuid4().hex[:8]}"
 
     flamepy.register_application(
-        FLMRUN_E2E_APP,
+        app_name,
         flamepy.ApplicationAttributes(
             working_directory="/opt/e2e",
             command=flmrun.command,
@@ -816,9 +862,9 @@ def setup_flmrun_with_e2e():
         ),
     )
 
-    yield
+    yield app_name
 
-    flamepy.unregister_application(FLMRUN_E2E_APP)
+    flamepy.unregister_application(app_name)
 
 
 @pytest.mark.skipif(not os.path.exists("/opt/e2e"), reason="Requires Docker E2E environment")
@@ -827,12 +873,13 @@ class TestFlmrunApplication:
 
     def test_flmrun_application_registered(self, setup_flmrun_with_e2e):
         """Test that flmrun is registered as a default application."""
+        app_name = setup_flmrun_with_e2e
         apps = flamepy.list_applications()
         app_names = [app.name for app in apps]
-        assert FLMRUN_E2E_APP in app_names, f"{FLMRUN_E2E_APP} not found in applications: {app_names}"
+        assert app_name in app_names, f"{app_name} not found in applications: {app_names}"
 
-        flmrun = flamepy.get_application(FLMRUN_E2E_APP)
-        assert flmrun.name == FLMRUN_E2E_APP
+        flmrun = flamepy.get_application(app_name)
+        assert flmrun.name == app_name
         assert flmrun.state == flamepy.ApplicationState.ENABLED
         assert flmrun.command.endswith("/bin/uv")
         assert flmrun.arguments[:4] == [
@@ -846,9 +893,10 @@ class TestFlmrunApplication:
         """Test Case 1: Run a simple sum function remotely."""
         from e2e.helpers import serialize_runner_context, serialize_runner_request
 
+        app_name = setup_flmrun_with_e2e
         ctx = runner.RunnerContext(execution_object=sum_func)
-        common_data_bytes = serialize_runner_context(ctx, FLMRUN_E2E_APP)
-        ssn = flamepy.create_session(FLMRUN_E2E_APP, common_data_bytes)
+        common_data_bytes = serialize_runner_context(ctx, app_name)
+        ssn = flamepy.create_session(app_name, common_data_bytes)
 
         try:
             req = runner.RunnerRequest(method=None, args=(1, 2))
@@ -866,11 +914,12 @@ class TestFlmrunApplication:
         """Test Case 2: Run methods on a class instance."""
         from e2e.helpers import serialize_runner_context, serialize_runner_request
 
+        app_name = setup_flmrun_with_e2e
         calc = Calculator()
 
         ctx = runner.RunnerContext(execution_object=calc)
-        common_data_bytes = serialize_runner_context(ctx, FLMRUN_E2E_APP)
-        ssn = flamepy.create_session(FLMRUN_E2E_APP, common_data_bytes)
+        common_data_bytes = serialize_runner_context(ctx, app_name)
+        ssn = flamepy.create_session(app_name, common_data_bytes)
 
         try:
             req = runner.RunnerRequest(method="add", args=(5, 3))
@@ -897,9 +946,10 @@ class TestFlmrunApplication:
         """Test Case 3: Run a function with keyword arguments."""
         from e2e.helpers import serialize_runner_context, serialize_runner_request
 
+        app_name = setup_flmrun_with_e2e
         ctx = runner.RunnerContext(execution_object=greet_func)
-        common_data_bytes = serialize_runner_context(ctx, FLMRUN_E2E_APP)
-        ssn = flamepy.create_session(FLMRUN_E2E_APP, common_data_bytes)
+        common_data_bytes = serialize_runner_context(ctx, app_name)
+        ssn = flamepy.create_session(app_name, common_data_bytes)
 
         try:
             req = runner.RunnerRequest(method=None, kwargs={"name": "World", "greeting": "Hi"})
@@ -920,11 +970,12 @@ class TestFlmrunApplication:
         """Test Case 6: Run a stateful class with instance variables."""
         from e2e.helpers import serialize_runner_context, serialize_runner_request
 
+        app_name = setup_flmrun_with_e2e
         counter = Counter()
 
         ctx = runner.RunnerContext(execution_object=counter)
-        common_data_bytes = serialize_runner_context(ctx, FLMRUN_E2E_APP)
-        ssn = flamepy.create_session(FLMRUN_E2E_APP, common_data_bytes)
+        common_data_bytes = serialize_runner_context(ctx, app_name)
+        ssn = flamepy.create_session(app_name, common_data_bytes)
 
         try:
             req = runner.RunnerRequest(method="increment")
