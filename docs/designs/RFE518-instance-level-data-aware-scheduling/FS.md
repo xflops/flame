@@ -87,25 +87,27 @@ class Cache(flamepy.runner.RunnerService):
 `publish_attributes(attrs)` adds opaque `bytes` keys to the current
 session-enter or task-invocation response. Repeated calls in that round
 accumulate. Runner publishes and drains the round after the callback, so each
-response remains a complete replacement and stale keys are not carried into a
-later round. Callables that cannot own dynamic attributes publish an empty set.
+response carries only attributes published in that round. Session Manager
+unions them into the executor's retained set. Callables that cannot own dynamic
+attributes publish an empty set.
 
-RFE518 keeps each transported snapshot as a complete replacement, but aggregates
-all calls made before that snapshot is transported:
+RFE518 changes RFE275's replacement behavior to cumulative executor attributes
+and aggregates all calls made before each publication is transported:
 
 - repeated calls from one session-enter or task invocation are unioned;
 - duplicate keys remain single set entries;
 - a response that consumes publication (successful session enter or any task
   response) transports the union and clears the local accumulator;
-- an empty union explicitly clears the executor's accepted snapshot;
+- Session Manager extends the executor's retained set with that union;
+- an empty union is a no-op;
 - keys are opaque, nonempty byte strings;
 - each key is at most 256 bytes; and
 - one publication round contains at most 1,024 distinct keys and 64 KiB after
   deduplication.
 
 A round starts after the previous `take` and ends at the next `take`. Attributes
-from completed rounds are neither retained locally nor used for deduplication,
-key-count, or byte-count accounting in later rounds.
+from completed rounds are retained only in Session Manager's executor set; they
+are not retained in the publisher or counted toward later publication limits.
 
 For example, `self.publish({a})` followed by `self.publish({b, c})` causes the
 enclosing session-enter or task response to carry `{a, b, c}`.
@@ -133,24 +135,26 @@ RFE518 reuses the RFE275 shim and backend attribute fields. It adds no Publish
 RPC.
 
 - Successful `OnSessionEnterResponse` and every `OnTaskInvokeResponse` call
-  `Publisher.take` and include the returned set. An empty set clears Session
-  Manager's last accepted snapshot. A failed session-enter response is not
-  accepted by Executor Manager, so it neither includes nor consumes the
-  publisher; the next consuming shim response can deliver its attributes.
-- `on_session_leave` neither clears the publisher nor consumes its snapshot.
+  `Publisher.take` and include the returned set. Session Manager unions it into
+  the executor's existing set, and an empty set is a no-op. A failed
+  session-enter response is not accepted by Executor Manager, so it neither
+  includes nor consumes the publisher; the next consuming shim response can
+  deliver its attributes.
+- `on_session_leave` neither clears the publisher nor consumes its pending set.
 - The shim calls `take` only after the wrapped callback completes, so the
   response observes the complete union from that callback.
 
 Publication is still piggybacked. While an instance is Idle, Session Manager
-continues using its last accepted snapshot. Only attributes collected since the
-previous `take` are sent with a response.
+continues using its accumulated attributes. Only attributes collected since the
+previous `take` are sent with a response; previously accepted attributes remain
+in Session Manager until executor removal.
 
 ### Instance attribute ownership
 
 Published attributes belong to the service instance, and the executor and
 instance share one lifetime. Moving the executor from Bound to Idle does not
 destroy the instance or clear its publication state. Session Manager likewise
-retains the instance's last accepted attributes when the executor leaves a
+retains the instance's accumulated attributes when the executor leaves a
 session.
 
 Idle reuse is bounded by time. Actions run in Dispatch → Allocate → Shuffle
@@ -324,7 +328,7 @@ still runs normally on a cache miss.
 
 The DAS plugin chooses among actual `ExecutorState::Idle` executors before they
 bind to a session. It does not route work among executors already Bound to that
-session. A Bound executor retains the instance snapshot, calls
+session. A Bound executor retains its accumulated attributes, calls
 `pop_pending_task()`, and receives the FIFO head.
 
 Consequently, when a session already has a Bound waiter, that executor may take
@@ -352,12 +356,16 @@ methods expose those operations. Runner publishes and drains the accumulated
 attributes after enter/invoke. The reserved runtime fields are excluded when a
 stateful execution object is persisted, so session context and executor-local
 affinity cannot migrate to another executor. The Runner process and its
-publisher belong to the executor instance, but the execution object belongs to
-the current session: Runner loads it on every session enter and clears it on
-session leave. A Runner workload that wants locality across sessions therefore
-publishes keys for data retained by the Runner process or another durable
-instance-local resource, rather than keys whose data exists only on the current
-execution object.
+publisher belong to the executor instance. Runner retains class execution
+objects in a process-local map keyed by fully qualified class name and rebinds a
+cached object when the executor enters another session. Supplied object
+instances remain session-scoped and stateful; functions remain session-scoped
+and may use imported module-level state. A class Runner workload may therefore
+publish keys for data held directly by its retained execution object. The cache
+is volatile and is discarded when the executor process exits; its contents are
+not covered by Runner's stateful object persistence. Classes with the same
+module and qualified name intentionally resolve to the same cached object in an
+executor process.
 `FlameInstanceServicer` and Rust `ShimService` take attributes from their service
 publisher after callbacks. `SessionContext` carries only session information.
 
@@ -417,7 +425,7 @@ registry, assignment map, task attempt, or new task-delivery protocol is added.
 
 ### Complexity
 
-For per-task key limit `K`, per-executor attribute limit `A`, `Q` non-terminal
+For per-task key limit `K`, cumulative executor attribute count `A`, `Q` non-terminal
 tasks, `P` Pending tasks, and `I` available Idle executors, task state updates
 perform no affinity work. A scheduling snapshot builds `Q` lightweight
 `TaskInfo` records and copies their affinity sets in `O(Q × K)` while ignoring
@@ -426,11 +434,12 @@ cycle. Sorting candidates is `O(I log I × A)`: comparisons score executors by
 iterating their bounded attribute sets and testing membership in the plugin
 `HashSet`. Task pop remains the Pending `BTreeMap` operation.
 
-No individual task/executor Cartesian match is constructed. RFE275 bounds each
-task and executor snapshot to 1,024 keys and 64 KiB. The per-cycle session union
-can grow with the Pending queue, but each unique key has one set entry and the
-union is not rebuilt once per executor. RFE518 adds no persistent task/executor
-routing index.
+No individual task/executor Cartesian match is constructed. Each task and
+publication round is bounded to 1,024 keys and 64 KiB. An executor's cumulative
+set can grow until that executor is removed. The per-cycle session union can
+likewise grow with the Pending queue, but each unique key has one set entry and
+the union is not rebuilt once per executor. RFE518 adds no persistent
+task/executor routing index.
 
 The implementation is guarded by tests for per-cycle union rebuilding, shared
 keys, FIFO removal, snapshot membership, and sorted executor selection.
@@ -444,7 +453,8 @@ an environment-independent p99 threshold.
 ### Publication and lifecycle
 
 - Python and Rust `self.publish` union repeated calls made before the next
-  session-enter or task response, which carries one complete snapshot.
+  session-enter or task response; Session Manager extends the executor's set
+  with every response.
 - `FlameService` owns the publisher; Rust `FlameInstance` handles share its
   internally synchronized attributes.
 - Runner's `RunnerService` exposes the active session context and mutable
@@ -452,8 +462,8 @@ an environment-independent p99 threshold.
   and drains the round after enter and invoke, including failed task invocation.
 - Stateful Runner persistence excludes the session context and executor-local
   publication accumulator.
-- A response with no publication produces a present empty snapshot and clears
-  the backend.
+- A response with no publication produces a present empty set and leaves the
+  backend unchanged.
 - Each publication round enforces the same deduplicated 1,024-key and 64-KiB
   limits in Python and Rust; `take` resets both counters for the next round.
 - `take` runs after the wrapped callback and transports its complete union.
@@ -507,7 +517,7 @@ an environment-independent p99 threshold.
 Run SDK unit suites, Executor Manager lifecycle tests, Session Manager plugin
 and queue tests, the full scheduler regression suite, and the Runner DAS E2E
 scenario covering process-stable attributes across session leave, execution
-object replacement, retention across multiple scheduler cycles, and Idle
+object rebinding, retention across multiple scheduler cycles, and Idle
 executor selection.
 
 ## 5. Rollout and Rollback

@@ -679,12 +679,16 @@ def test_runner_service_validates_combined_publication_limit():
     assert worker._flame_instance_attributes == attributes
 
 
-def test_runpy_reloads_execution_object_between_sessions():
+def test_runpy_reuses_class_execution_object_between_sessions():
     from flamepy.core.service import ApplicationContext, SessionContext, TaskContext
     from flamepy.runner.runpy import FlameRunpyService
 
-    class Worker:
+    class Worker(RunnerService):
         _flame_instance_attributes = {b"a"}
+        init_count = 0
+
+        def __init__(self):
+            type(self).init_count += 1
 
         def fail(self):
             self._flame_instance_attributes.add(b"failed")
@@ -699,6 +703,8 @@ def test_runpy_reloads_execution_object_between_sessions():
     session = SessionContext(None, "session", ApplicationContext("app"))
 
     svc.on_session_enter(session)
+    assert Worker.init_count == 1
+    assert svc._execution_object.session_context() is session
     assert set(svc._take_attributes().attr) == {b"a"}
 
     request = RunnerRequest(method="fail")
@@ -716,9 +722,12 @@ def test_runpy_reloads_execution_object_between_sessions():
     assert svc._runner_context is None
     assert svc._execution_object is None
 
-    svc.on_session_enter(session)
-    assert svc._execution_object is not original
-    assert set(svc._take_attributes().attr) == {b"a"}
+    rebound = SessionContext(None, "rebound-session", ApplicationContext("app"))
+    svc.on_session_enter(rebound)
+    assert svc._execution_object is original
+    assert Worker.init_count == 1
+    assert svc._execution_object.session_context() is rebound
+    assert list(svc._take_attributes().attr) == []
 
     previous = svc._execution_object
     other = SessionContext(None, "other-session", ApplicationContext("app"))
@@ -727,6 +736,51 @@ def test_runpy_reloads_execution_object_between_sessions():
     assert svc._execution_object is not previous
     assert isinstance(svc._execution_object, OtherWorker)
     assert set(svc._take_attributes().attr) == {b"other"}
+
+
+def test_runpy_does_not_reuse_functions_or_object_instances():
+    from flamepy.runner.runpy import FlameRunpyService
+
+    def first_function():
+        return "first"
+
+    def second_function():
+        return "second"
+
+    class Worker:
+        pass
+
+    svc = FlameRunpyService()
+    first_worker = Worker()
+    second_worker = Worker()
+
+    for execution_object in (
+        first_function,
+        second_function,
+        first_worker,
+        second_worker,
+    ):
+        svc._set_execution_from_context(RunnerContext(execution_object))
+        assert svc._execution_object is execution_object
+        svc.on_session_leave()
+
+
+def test_runpy_class_cache_uses_fully_qualified_name():
+    from flamepy.runner.runpy import FlameRunpyService
+
+    first_class = type("Worker", (), {})
+    second_class = type("Worker", (), {})
+    assert first_class is not second_class
+    assert first_class.__module__ == second_class.__module__
+    assert first_class.__qualname__ == second_class.__qualname__
+
+    svc = FlameRunpyService()
+    svc._set_execution_from_context(RunnerContext(first_class))
+    first_execution_object = svc._execution_object
+    svc.on_session_leave()
+
+    svc._set_execution_from_context(RunnerContext(second_class))
+    assert svc._execution_object is first_execution_object
 
 
 def test_runpy_copies_predeclared_attributes_per_instance():

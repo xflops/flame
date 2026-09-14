@@ -411,9 +411,10 @@ message ExecutorAttributes {
 }
 ```
 
-Each transported value is a complete replacement snapshot. Keys must be
-nonempty and no larger than 256 bytes; one snapshot may contain at most 1,024
-distinct keys and 64 KiB after deduplication.
+Session Manager extends the executor's existing attribute set with every
+transported value. Keys remain until the executor is removed. Keys must be
+nonempty and no larger than 256 bytes; one publication may contain at most
+1,024 distinct keys and 64 KiB after deduplication.
 
 ### ExecutorStatus
 

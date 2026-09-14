@@ -205,7 +205,7 @@ impl FlameService for RawService {
 `self.publish()` and the runtime-provided `FlameInstance::publish()` add opaque
 locality keys to the next successful session-enter response or the next task
 response, including a failed task. Calls in one round are unioned, and the
-transported set completely replaces the prior instance snapshot. Keys must be
+transported set extends the executor's retained attributes. Keys must be
 nonempty and at most 256 bytes; a round supports at most 1,024 distinct keys and
 64 KiB after deduplication. A manually constructed `FlameInstance` is not
 attached to a service publisher, so its `publish()` method returns an error.

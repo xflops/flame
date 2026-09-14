@@ -164,7 +164,7 @@ impl Controller {
                 "executor <{id}> must have a session before publishing attributes"
             ))
         })?;
-        executor.attributes = attributes;
+        executor.attributes.extend(attributes);
         Ok(())
     }
 
@@ -1231,7 +1231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unbind_retains_executor_instance_metadata() {
+    async fn executor_accumulates_attributes_and_retains_them_on_unbind() {
         let storage = create_test_storage().await;
         let controller = new_ptr(storage);
         let ssn_id = "executor-attributes-unbind".to_string();
@@ -1260,17 +1260,48 @@ mod tests {
         controller
             .update_executor_attributes(&executor_id, HashSet::new())
             .unwrap();
-        assert!(controller
-            .get_executor(executor_id.clone())
-            .unwrap()
-            .attributes
-            .is_empty());
+        assert_eq!(
+            controller
+                .get_executor(executor_id.clone())
+                .unwrap()
+                .attributes,
+            HashSet::from([bytes::Bytes::from_static(b"kv-cache-key")])
+        );
         controller
-            .update_executor_attributes(
-                &executor_id,
-                HashSet::from([bytes::Bytes::from_static(b"kv-cache-key")]),
-            )
+            .create_task(ssn_id.clone(), None, None)
+            .await
             .unwrap();
+        controller
+            .launch_task(executor_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        controller
+            .complete_task(
+                executor_id.clone(),
+                TaskResult {
+                    state: TaskState::Succeed,
+                    message: None,
+                    output: None,
+                },
+                Some(rpc::ExecutorAttributes {
+                    attr: vec![b"second-key".to_vec()],
+                }),
+            )
+            .await
+            .unwrap();
+
+        let expected_attributes = HashSet::from([
+            bytes::Bytes::from_static(b"kv-cache-key"),
+            bytes::Bytes::from_static(b"second-key"),
+        ]);
+        assert_eq!(
+            controller
+                .get_executor(executor_id.clone())
+                .unwrap()
+                .attributes,
+            expected_attributes
+        );
 
         controller
             .unbind_executor(executor_id.clone())
@@ -1283,10 +1314,7 @@ mod tests {
 
         let executor = controller.get_executor(executor_id.clone()).unwrap();
         assert_eq!(executor.application, "test-app");
-        assert_eq!(
-            executor.attributes,
-            HashSet::from([bytes::Bytes::from_static(b"kv-cache-key")])
-        );
+        assert_eq!(executor.attributes, expected_attributes);
 
         let snapshot = controller.snapshot().unwrap();
         let executor = snapshot
@@ -1295,10 +1323,7 @@ mod tests {
             .remove(&executor_id)
             .unwrap();
         assert_eq!(executor.application, "test-app");
-        assert_eq!(
-            executor.attributes,
-            HashSet::from([bytes::Bytes::from_static(b"kv-cache-key")])
-        );
+        assert_eq!(executor.attributes, expected_attributes);
 
         controller
             .release_executor(executor_id.clone())

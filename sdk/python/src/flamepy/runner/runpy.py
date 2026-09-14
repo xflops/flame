@@ -43,6 +43,7 @@ class FlameRunpyService(CoreFlameService):
         """Initialize the FlameRunpyService."""
         self._ssn_ctx: SessionContext = None
         self._execution_object: Any = None
+        self._class_execution_objects: Dict[str, Any] = {}
         self._runner_context: RunnerContext = None
 
     def _load_runner_context(self) -> RunnerContext:
@@ -67,8 +68,11 @@ class FlameRunpyService(CoreFlameService):
             raise ValueError("Execution object is None in RunnerContext")
 
         if inspect.isclass(execution_object):
-            logger.info(f"Instantiating class {execution_object.__name__}")
-            execution_object = execution_object()
+            class_name = f"{execution_object.__module__}.{execution_object.__qualname__}"
+            if class_name not in self._class_execution_objects:
+                logger.info(f"Instantiating class {class_name}")
+                self._class_execution_objects[class_name] = execution_object()
+            execution_object = self._class_execution_objects[class_name]
 
         instance_vars = getattr(execution_object, "__dict__", None)
         if isinstance(instance_vars, dict) and "_flame_instance_attributes" not in instance_vars:

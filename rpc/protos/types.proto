@@ -73,7 +73,7 @@ message TaskSpec {
 }
 
 // Volatile, executor-local data advertised by a service for affinity routing.
-// A publication replaces the executor's complete attribute set.
+// A publication extends the executor's retained attribute set.
 message ExecutorAttributes {
   repeated bytes attr = 1;
 }

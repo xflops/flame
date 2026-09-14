@@ -83,11 +83,12 @@ Called when an executor binds to a session. Use this to initialize application-s
 | Field | Type | Description |
 |-------|------|-------------|
 | `result` | [Result](types.md#result) | Session-enter result |
-| `attributes` | `ExecutorAttributes` | Complete instance-attribute snapshot (optional) |
+| `attributes` | `ExecutorAttributes` | New instance attributes (optional) |
 
-On success, SDK shims include `attributes`, including a present empty snapshot
-that clears the previously accepted attributes. A failed session enter omits
-the field and does not consume attributes accumulated by the publisher.
+On success, SDK shims include `attributes`. Session Manager unions nonempty
+values into the executor's existing set; an empty value is a no-op. A failed
+session enter omits the field and does not consume attributes accumulated by
+the publisher.
 
 **Example Implementation (Python):**
 
@@ -122,11 +123,11 @@ Called for each task that needs to be executed.
 | Field | Type | Description |
 |-------|------|-------------|
 | `task_result` | [TaskResult](types.md#taskresult) | Task result and optional output |
-| `attributes` | `ExecutorAttributes` | Complete instance-attribute snapshot (optional) |
+| `attributes` | `ExecutorAttributes` | New instance attributes (optional) |
 
-SDK shims include the current snapshot for both successful and failed task
-invocations. A present empty snapshot clears the previously accepted
-attributes.
+SDK shims include attributes published by both successful and failed task
+invocations. Session Manager unions them into the executor's existing set; an
+empty value is a no-op.
 
 **Example Implementation (Python):**
 

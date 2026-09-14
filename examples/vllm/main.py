@@ -1,43 +1,46 @@
-"""Stateless Runner vLLM service with instance-attribute publication."""
+"""Verify that DAS reuses a retained Runner process and its vLLM engine."""
 
-from hashlib import sha256
+import time
 
-from flamepy import ResourceRequirement
-from flamepy.runner import Runner, RunnerService
-from vllm import LLM, SamplingParams
+from flamepy import ResourceRequirement, TaskOptions
+from flamepy.runner import Runner
 
-
-def kv_key(model: str, prompt: str) -> bytes:
-    """Application-owned stable key; production code should hash token blocks."""
-    return sha256(f"{model}\0{prompt}".encode()).digest()
+from engine import MODEL, VllmEngine, kv_key
 
 
-class VllmEngine(RunnerService):
-    def __init__(self) -> None:
-        self.model = "facebook/opt-125m"
-        self.llm = LLM(model=self.model)
-        self.cached_keys: set[bytes] = set()
-
-    def generate(self, prompt: str) -> str:
-        key = kv_key(self.model, prompt)
-        output = self.llm.generate(prompt, SamplingParams(max_tokens=32))[0]
-        # This small example assumes no KV eviction. Production code should
-        # publish the engine's complete current cache index on every response.
-        self.cached_keys.add(key)
-        self.publish_attributes(self.cached_keys)
-        return output.outputs[0].text
+DELAY_RELEASE_SECONDS = 90
 
 
 def main() -> None:
-    prompt = "Explain data-aware scheduling in one sentence."
-    with Runner("vllm-das") as rr:
-        service = rr.service(
+    prompt = (
+        "Data-aware scheduling routes inference requests to workers that already "
+        "hold reusable model state, reducing repeated data transfer and prefill "
+        "computation while retaining normal fallback scheduling. "
+    ) * 4
+    with Runner("vllm-das", fail_if_exists=True) as rr:
+        first_service = rr.service(
             VllmEngine,
-            warmup=1,  # Start one replica so it can build a warm KV cache.
-            resreq=ResourceRequirement(gpu=1),  # vLLM replica GPU requirement.
+            resreq=ResourceRequirement(gpu=1),
         )
-        print(service.generate(prompt).get())
-        print(service.generate(prompt).get())
+        first = first_service.generate(prompt).get()
+        print(first.text)
+
+        # With the default 60-second delay_release, the executor unbinds after
+        # waiting for more work and remains Idle for another 120 seconds.
+        time.sleep(DELAY_RELEASE_SECONDS)
+
+        second_service = rr.service(
+            VllmEngine,
+            resreq=ResourceRequirement(gpu=1),
+        )
+        second = second_service.generate(
+            prompt,
+            option=TaskOptions(affinity={kv_key(MODEL, prompt)}),
+        ).get()
+        print(second.text)
+
+        assert second.cached_tokens > 0, "the retained prompt cache was not reused"
+        print("reused the cached prompt after the executor unbound")
 
 
 if __name__ == "__main__":

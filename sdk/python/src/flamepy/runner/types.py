@@ -76,7 +76,8 @@ class RunnerContext:
         execution_object: The execution object for the customized session.
         stateful: Derived from execution_object type unless explicitly provided.
                   Object instances are always stateful. Functions, builtins, and
-                  classes are always stateless.
+                  classes are always stateless. A class execution object may be
+                  reused in one executor process, but its state is not persisted.
         autoscale: If True, create instances dynamically (min=warmup or 0, max=None).
                    If False, create fixed instances (min=max=warmup or 1). Object
                    instances are always fixed.

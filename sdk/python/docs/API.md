@@ -185,8 +185,7 @@ Key classes and helpers:
   configuration type of the same name.
 - `RunnerService.publish_attributes(attrs)` adds opaque `bytes` locality keys
   to the current Runner response; repeated calls in the response accumulate.
-  Every response replaces the prior executor snapshot, so publish the complete
-  current key set from every invoked method.
+  Session Manager unions every response into the executor's retained set.
 - `Runner(name, fail_if_exists=False)`
 - `Runner.service(execution_object, autoscale=None, warmup=0, resreq=None)`
 - `RunnerServiceInstance` is the client proxy returned by `Runner.service()`.

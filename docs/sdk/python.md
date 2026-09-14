@@ -131,10 +131,10 @@ The service runtime provides `FLAME_INSTANCE_ENDPOINT` and calls the service thr
 
 `self.publish()` adds opaque locality keys to the next successful session-enter
 response or the next task response, including a failed task. Calls within one
-response are unioned; the transported set is a complete replacement for the
-instance's previous snapshot. Keys are nonempty `bytes` values of at most 256
-bytes. One publication round supports at most 1,024 distinct keys and 64 KiB
-after deduplication.
+response are unioned, and Session Manager extends the executor's retained set
+with every response. Keys are nonempty `bytes` values of at most 256 bytes. One
+publication round supports at most 1,024 distinct keys and 64 KiB after
+deduplication.
 
 ## Use The Service Helper
 
@@ -223,18 +223,22 @@ Subclass `flamepy.runner.RunnerService` to access Runner-managed service state.
 `self.session_context()` returns the active session context, while
 `self.publish_attributes(attrs)` adds opaque `bytes` keys to the current
 session-entry or invocation response. Repeated calls in one response accumulate;
-Runner publishes and drains the set at the response boundary. Every response is
-a complete replacement, so each invoked method must publish all currently valid
-keys, including methods that do not change the cache. Task calls can request a
-matching instance with `TaskOptions(affinity={key})`.
+Runner publishes and drains the set at the response boundary. Session Manager
+unions every response into the executor's retained attribute set. Task calls can
+request a matching instance with `TaskOptions(affinity={key})`.
 
 The returned service-side context is `flamepy.SessionContext`. It is distinct
 from `flamepy.runner.SessionContext`, which configures Runner session creation.
 
-The Runner process is retained with its executor, but Runner reloads the
-execution object on each session entry and clears it on session leave. Affinity
-keys intended for reuse across sessions should identify data retained outside
-that session's execution object, such as process-local or external cached data.
+The Runner process retains class execution objects by fully qualified class
+name and reuses them across sessions on that executor. Supplied object instances
+remain session-scoped and stateful, and functions remain session-scoped while
+their imported module-level state naturally follows Python module lifetime.
+Class-service affinity keys may therefore identify data held directly by the
+retained execution object. This executor-local cache is volatile: class state is
+not persisted or migrated and is discarded when the executor process exits.
+Two class services with the same module and qualified class name intentionally
+reuse the same object within that process.
 
 To verify a configured cluster end to end with Runner, run:
 

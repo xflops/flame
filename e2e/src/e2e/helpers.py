@@ -35,9 +35,8 @@ class DataAwareService(RunnerService):
     """Small Runner service used to exercise attribute publication and affinity."""
 
     def __init__(self) -> None:
-        # FlameRunpyService reloads this execution object for every session, while
-        # the runner process remains attached to the retained executor instance.
-        # A process-stable key therefore identifies the instance DAS must reuse.
+        # Keep identity independent of the execution-object lifecycle so this
+        # helper also covers function and supplied-object services.
         self.instance_key = f"e2e:data-aware:{socket.gethostname()}:{os.getpid()}".encode()
         self.executor_id = Path(os.environ["FLAME_INSTANCE_ENDPOINT"]).stem
 

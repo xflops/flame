@@ -211,9 +211,8 @@ session context or attribute publication.
 
 Subclass `flamepy.runner.RunnerService` and use `publish_attributes(attrs)` to
 add opaque `bytes` keys held by that instance. Repeated calls during one method
-accumulate, and Runner drains the published set after each response. Every
-response completely replaces the executor snapshot, so publish the instance's
-complete current keys from every invoked method, including read-only methods.
+accumulate, and Runner drains the published set after each response. Session
+Manager unions every response into the executor's retained attribute set.
 `session_context()` also exposes the active Flame session context:
 
 ```python
@@ -226,7 +225,7 @@ from flamepy.runner import Runner, RunnerService
 
 class Cache(RunnerService):
     def __init__(self):
-        # The Runner process survives executor unbind; the execution object does not.
+        # Runner retains class execution objects with the executor process.
         self.path = Path(f"/tmp/flame-runner-cache-{os.getpid()}")
         self.keys = set()
 
@@ -254,19 +253,19 @@ with Runner("cache-app") as runner:
     print(result.get())
 ```
 
-Runner publishes the complete set after session entry and every task, including
-a failed task. Omitting a key removes it from the executor snapshot, and
-publishing nothing clears the snapshot. Keys must be nonempty and at most 256
-bytes. One publication round supports at most 1,024 distinct keys and 64 KiB
-after deduplication.
+Runner publishes accumulated keys after session entry and every task, including
+a failed task. Session Manager retains previously accepted keys, and publishing
+nothing is a no-op. Keys must be nonempty and at most 256 bytes. One publication
+round supports at most 1,024 distinct keys and 64 KiB after deduplication.
 
-Runner loads the session's execution object on enter and clears it on leave.
-Cross-session affinity must therefore describe data owned by the retained
-Runner process, as above, or by another durable instance-local resource. The
-second session is created before the first one closes so its task is ready to
-use the retained executor. Idle instances remain reusable for twice the
-application's configured `delay_release` before Shuffle releases them: 120
-seconds with the default 60-second setting.
+Runner retains class execution objects by fully qualified class name in each
+executor process and reuses them when that executor binds to another session.
+Supplied object instances remain session-scoped and stateful, while functions
+remain session-scoped and can use their module-level state. The second session
+is created before the first one closes so its task is ready to use the retained
+executor. Idle instances remain reusable for twice the application's configured
+`delay_release` before Shuffle releases them: 120 seconds with the default
+60-second setting.
 
 ### ObjectFuture
 
