@@ -42,7 +42,9 @@ impl FlameClientTls {
     /// If ca_file is specified, use it; otherwise use system CA bundle.
     /// The domain parameter is used for server name verification.
     pub fn client_tls_config(&self, domain: &str) -> Result<ClientTlsConfig, FlameError> {
-        let mut config = ClientTlsConfig::new().domain_name(domain);
+        let mut config = ClientTlsConfig::new()
+            .domain_name(domain)
+            .with_native_roots();
 
         if let Some(ref ca_file) = self.ca_file {
             let ca = fs::read_to_string(ca_file).map_err(|e| {

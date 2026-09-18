@@ -18,6 +18,7 @@
         "service": {
           "type": "object",
           "properties": {
+            "type": { "type": "string", "enum": ["ClusterIP"] },
             "frontendPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
             "backendPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
           }
@@ -31,6 +32,7 @@
         "service": {
           "type": "object",
           "properties": {
+            "type": { "type": "string", "enum": ["ClusterIP"] },
             "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
           }
         }
@@ -65,6 +67,12 @@
             "caKey": { "type": "string", "minLength": 1 }
           }
         }
+      }
+    },
+    "clientConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" }
       }
     }
   },

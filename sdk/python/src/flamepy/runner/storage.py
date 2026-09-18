@@ -280,7 +280,7 @@ class HttpStorage(StorageBackend):
 
 
 class CacheStorage(StorageBackend):
-    """Storage backend using flame-object-cache via gRPC."""
+    """Storage backend using flame-object-cache directly or through a gRPC proxy."""
 
     def __init__(self, storage_base: str | None = None, app_name: str | None = None):
         from flamepy.core.types import FlameClientCache, FlameContext
@@ -289,7 +289,7 @@ class CacheStorage(StorageBackend):
 
         if storage_base is not None:
             parsed_url = urlparse(storage_base)
-            if parsed_url.scheme not in ("grpc", "grpcs"):
+            if parsed_url.scheme not in ("grpc", "grpcs", "grpcs-proxy"):
                 raise FlameError(FlameErrorCode.INVALID_CONFIG, f"Invalid cache storage URL: {storage_base}")
             self._scheme = parsed_url.scheme
             self._host = parsed_url.hostname or "localhost"
@@ -322,8 +322,11 @@ class CacheStorage(StorageBackend):
 
         try:
             key = f"{self._app_name}/pkg/{filename}"
-            ref = upload_object(key, local_path)
-            url = f"{self._scheme}://{self._host}:{self._port}/{ref.key}"
+            ref = upload_object(key, local_path, endpoint=self._endpoint)
+            # Preserve the server-returned owning-cache endpoint so consumers
+            # such as executor-manager do not receive this external client's
+            # proxy endpoint.
+            url = f"{ref.endpoint.rstrip('/')}/{ref.key}"
             logger.debug(f"Uploaded package to cache: {url}")
             return url
         except Exception as e:
@@ -380,10 +383,10 @@ def create_storage_backend(storage_base: str | None = None, app_name: str | None
         return FileStorage(storage_base)
     elif parsed_url.scheme in ("http", "https"):
         return HttpStorage(storage_base)
-    elif parsed_url.scheme in ("grpc", "grpcs"):
+    elif parsed_url.scheme in ("grpc", "grpcs", "grpcs-proxy"):
         return CacheStorage(storage_base, app_name=app_name)
     else:
         raise FlameError(
             FlameErrorCode.INVALID_CONFIG,
-            f"Unsupported storage scheme: {parsed_url.scheme}. Supported: file://, http://, https://, grpc://, grpcs://",
+            f"Unsupported storage scheme: {parsed_url.scheme}. Supported: file://, http://, https://, grpc://, grpcs://, grpcs-proxy://",
         )

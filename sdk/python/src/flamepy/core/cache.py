@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
 import bson
 import cloudpickle
@@ -658,7 +659,7 @@ def _deserialize_object(batch: pa.RecordBatch) -> Any:
     return _deserialize_object_data(data_bytes)
 
 
-_client_pool: Dict[str, flight.FlightClient] = {}
+_client_pool: Dict[tuple[str, Optional[str]], flight.FlightClient] = {}
 _client_pool_lock = threading.Lock()
 
 _context_cache: Optional[FlameContext] = None
@@ -679,7 +680,19 @@ def _get_cached_context() -> FlameContext:
 def _normalize_endpoint(endpoint: str) -> str:
     if endpoint.startswith("grpcs://"):
         return endpoint.replace("grpcs://", "grpc+tls://")
+    if endpoint.startswith("grpcs-proxy://"):
+        return endpoint.replace("grpcs-proxy://", "grpc+tls://")
     return endpoint
+
+
+def _validate_proxy_endpoint(endpoint: str) -> None:
+    parsed = urlparse(endpoint)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid object cache proxy endpoint: {endpoint}") from exc
+    if parsed.scheme != "grpcs-proxy" or not parsed.hostname or parsed.username or parsed.password or parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment or port is None:
+        raise ValueError("Object cache proxy endpoint must be grpcs-proxy://<host>:<port> without credentials, a path, query, or fragment")
 
 
 GRPC_OPTIONS = [
@@ -688,38 +701,81 @@ GRPC_OPTIONS = [
 ]
 
 
-def _create_flight_client(location: str, tls_config: Optional[FlameClientTls] = None) -> flight.FlightClient:
+def _create_flight_client(
+    location: str,
+    tls_config: Optional[FlameClientTls] = None,
+    authority: Optional[str] = None,
+) -> flight.FlightClient:
+    options = list(GRPC_OPTIONS)
+    if authority:
+        options.append(("grpc.default_authority", authority))
+
     if location.startswith("grpc+tls://"):
         if tls_config and tls_config.ca_file:
             with open(tls_config.ca_file, "rb") as f:
                 root_certs = f.read()
-            return flight.FlightClient(location, tls_root_certs=root_certs, generic_options=GRPC_OPTIONS)
+            return flight.FlightClient(location, tls_root_certs=root_certs, generic_options=options)
         else:
-            return flight.FlightClient(location, generic_options=GRPC_OPTIONS)
+            return flight.FlightClient(location, generic_options=options)
     else:
-        return flight.FlightClient(location, generic_options=GRPC_OPTIONS)
+        return flight.FlightClient(location, generic_options=options)
 
 
-def _remove_stale_client(location: str) -> None:
+def _cache_proxy_endpoint() -> Optional[str]:
+    """Return the configured TLS Flight proxy, if any."""
+    try:
+        cache_config = _get_cached_context().cache
+    except Exception:
+        return None
+    if isinstance(cache_config, str):
+        endpoint = cache_config
+    elif isinstance(cache_config, FlameClientCache):
+        endpoint = cache_config.endpoint
+    else:
+        endpoint = cache_config.get("endpoint") if cache_config else None
+    if endpoint and urlparse(endpoint).scheme == "grpcs-proxy":
+        _validate_proxy_endpoint(endpoint)
+        return endpoint
+    return None
+
+
+def _resolve_flight_endpoint(endpoint: str) -> tuple[str, Optional[str]]:
+    """Resolve an object endpoint to its dial location and gRPC authority."""
+    parsed = urlparse(endpoint)
+    if parsed.scheme == "grpc-proxy":
+        raise ValueError("grpc-proxy:// is unsupported; use grpcs-proxy://")
+    if parsed.scheme == "grpcs-proxy":
+        _validate_proxy_endpoint(endpoint)
+    proxy_endpoint = _cache_proxy_endpoint()
+    if parsed.scheme in ("grpc", "grpcs", "grpc+tls") and proxy_endpoint:
+        authority = parsed.netloc
+        if not authority:
+            raise ValueError(f"Invalid object cache endpoint: {endpoint}")
+        return _normalize_endpoint(proxy_endpoint), authority
+    return _normalize_endpoint(endpoint), None
+
+
+def _remove_stale_client(pool_key: tuple[str, Optional[str]]) -> None:
     with _client_pool_lock:
-        _client_pool.pop(location, None)
+        _client_pool.pop(pool_key, None)
 
 
 def _get_flight_client(endpoint: str, tls_config: Optional[FlameClientTls] = None) -> flight.FlightClient:
-    location = _normalize_endpoint(endpoint)
+    location, authority = _resolve_flight_endpoint(endpoint)
+    pool_key = (location, authority)
 
     with _client_pool_lock:
-        if location in _client_pool:
-            return _client_pool[location]
+        if pool_key in _client_pool:
+            return _client_pool[pool_key]
 
-        client = _create_flight_client(location, tls_config)
-        _client_pool[location] = client
+        client = _create_flight_client(location, tls_config, authority)
+        _client_pool[pool_key] = client
         return client
 
 
 def _get_flight_client_with_retry(endpoint: str, tls_config: Optional[FlameClientTls] = None, max_retries: int = 1) -> flight.FlightClient:
     """Get FlightClient with retry on stale connection - removes failed client from pool and retries."""
-    location = _normalize_endpoint(endpoint)
+    pool_key = _resolve_flight_endpoint(endpoint)
 
     for attempt in range(max_retries + 1):
         client = _get_flight_client(endpoint, tls_config)
@@ -731,7 +787,7 @@ def _get_flight_client_with_retry(endpoint: str, tls_config: Optional[FlameClien
             return client
         except (flight.FlightUnavailableError, OSError) as e:
             logger.warning(f"Flight client connection failed (attempt {attempt + 1}): {e}")
-            _remove_stale_client(location)
+            _remove_stale_client(pool_key)
             if attempt == max_retries:
                 raise
 
@@ -1159,7 +1215,7 @@ def delete_objects(key_prefix: str) -> None:
 _UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
 
 
-def upload_object(key_or_prefix: str, file_path: str) -> ObjectRef:
+def upload_object(key_or_prefix: str, file_path: str, endpoint: Optional[str] = None) -> ObjectRef:
     """Upload a file to the cache using do_put with streaming.
 
     Args:
@@ -1167,6 +1223,8 @@ def upload_object(key_or_prefix: str, file_path: str) -> ObjectRef:
                        or key prefix (e.g., "myapp/pkg"). If prefix, server
                        generates a UUID for the object_id.
         file_path: Path to the local file to upload
+        endpoint: Optional cache endpoint override. When omitted, the endpoint
+                  is loaded from the current Flame context.
 
     Returns:
         ObjectRef pointing to the uploaded file
@@ -1184,21 +1242,29 @@ def upload_object(key_or_prefix: str, file_path: str) -> ObjectRef:
     if object_key.is_all_sessions():
         raise ValueError(f"Invalid key format: {key_or_prefix}")
 
-    context = _get_cached_context()
-    cache_config = context.cache
+    if endpoint is None:
+        cache_config = _get_cached_context().cache
+    else:
+        # An explicit endpoint is sufficient for public-root TLS and plaintext
+        # connections. Reuse context TLS settings when available, but do not
+        # make an otherwise self-contained endpoint depend on global config.
+        try:
+            cache_config = _get_cached_context().cache
+        except Exception:
+            cache_config = None
 
-    if cache_config is None:
+    if cache_config is None and endpoint is None:
         raise ValueError("Cache configuration not found")
 
-    if isinstance(cache_config, str):
+    cache_tls = cache_config.tls if isinstance(cache_config, FlameClientCache) else None
+    if endpoint is not None:
+        cache_endpoint = endpoint
+    elif isinstance(cache_config, str):
         cache_endpoint = cache_config
-        cache_tls = None
     elif isinstance(cache_config, FlameClientCache):
         cache_endpoint = cache_config.endpoint
-        cache_tls = cache_config.tls
     else:
         cache_endpoint = cache_config.get("endpoint")
-        cache_tls = None
 
     if not cache_endpoint:
         raise ValueError("Cache endpoint not configured")

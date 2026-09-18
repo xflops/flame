@@ -1,4 +1,5 @@
 import threading
+from types import SimpleNamespace
 
 import bson
 import numpy as np
@@ -32,6 +33,143 @@ from flamepy.core.cache import (
     _serialize_object_data,
     delete_objects,
 )
+
+
+class TestFlightClientEndpoints:
+    def setup_method(self):
+        from flamepy.core import cache as cache_module
+
+        with cache_module._client_pool_lock:
+            cache_module._client_pool.clear()
+
+    def teardown_method(self):
+        from flamepy.core import cache as cache_module
+
+        with cache_module._client_pool_lock:
+            cache_module._client_pool.clear()
+
+    def test_direct_grpc_endpoint_is_unchanged(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        calls = []
+        monkeypatch.setattr(
+            cache_module,
+            "_get_cached_context",
+            lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpc://cache:9090")),
+        )
+        monkeypatch.setattr(cache_module.flight, "FlightClient", lambda location, **kwargs: calls.append((location, kwargs)) or object())
+
+        cache_module._get_flight_client("grpc://cache:9090")
+
+        assert calls == [("grpc://cache:9090", {"generic_options": cache_module.GRPC_OPTIONS})]
+
+    def test_proxy_dials_gateway_with_object_authority(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        calls = []
+        monkeypatch.setattr(
+            cache_module,
+            "_get_cached_context",
+            lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpcs-proxy://gateway.example:8080")),
+        )
+        monkeypatch.setattr(cache_module.flight, "FlightClient", lambda location, **kwargs: calls.append((location, kwargs)) or object())
+
+        cache_module._get_flight_client("grpc://object-cache.flame.svc:9090")
+
+        assert calls[0][0] == "grpc+tls://gateway.example:8080"
+        assert ("grpc.default_authority", "object-cache.flame.svc:9090") in calls[0][1]["generic_options"]
+
+    def test_proxy_uses_custom_tls_roots_with_object_authority(self, monkeypatch, tmp_path):
+        from flamepy.core import cache as cache_module
+
+        ca_file = tmp_path / "proxy-ca.pem"
+        ca_file.write_bytes(b"proxy CA")
+        calls = []
+        monkeypatch.setattr(
+            cache_module,
+            "_get_cached_context",
+            lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpcs-proxy://gateway.example:443")),
+        )
+        monkeypatch.setattr(cache_module.flight, "FlightClient", lambda location, **kwargs: calls.append((location, kwargs)) or object())
+
+        tls = cache_module.FlameClientTls(ca_file=str(ca_file))
+        cache_module._get_flight_client("grpc://object-cache-0.flame.svc:9090", tls)
+
+        assert calls[0][0] == "grpc+tls://gateway.example:443"
+        assert calls[0][1]["tls_root_certs"] == b"proxy CA"
+        assert ("grpc.default_authority", "object-cache-0.flame.svc:9090") in calls[0][1]["generic_options"]
+
+    @pytest.mark.parametrize("scheme", ["grpcs", "grpc+tls"])
+    def test_proxy_dials_gateway_for_tls_object_endpoint(self, monkeypatch, scheme):
+        from flamepy.core import cache as cache_module
+
+        calls = []
+        monkeypatch.setattr(
+            cache_module,
+            "_get_cached_context",
+            lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpcs-proxy://gateway.example:8080")),
+        )
+        monkeypatch.setattr(cache_module.flight, "FlightClient", lambda location, **kwargs: calls.append((location, kwargs)) or object())
+
+        cache_module._get_flight_client(f"{scheme}://object-cache.flame.svc:9090")
+
+        assert calls[0][0] == "grpc+tls://gateway.example:8080"
+        assert ("grpc.default_authority", "object-cache.flame.svc:9090") in calls[0][1]["generic_options"]
+
+    def test_proxy_pool_is_isolated_by_object_authority(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        calls = []
+        monkeypatch.setattr(
+            cache_module,
+            "_get_cached_context",
+            lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpcs-proxy://gateway.example:8080")),
+        )
+        monkeypatch.setattr(cache_module.flight, "FlightClient", lambda location, **kwargs: calls.append((location, kwargs)) or object())
+
+        first = cache_module._get_flight_client("grpc://cache-a:9090")
+        assert cache_module._get_flight_client("grpc://cache-a:9090") is first
+        cache_module._get_flight_client("grpc://cache-b:9090")
+
+        assert len(calls) == 2
+        assert ("grpc+tls://gateway.example:8080", "cache-a:9090") in cache_module._client_pool
+        assert ("grpc+tls://gateway.example:8080", "cache-b:9090") in cache_module._client_pool
+
+    def test_proxy_endpoint_itself_uses_its_default_authority(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        calls = []
+        monkeypatch.setattr(
+            cache_module,
+            "_get_cached_context",
+            lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpcs-proxy://gateway.example:8080")),
+        )
+        monkeypatch.setattr(cache_module.flight, "FlightClient", lambda location, **kwargs: calls.append((location, kwargs)) or object())
+
+        cache_module._get_flight_client("grpcs-proxy://gateway.example:8080")
+
+        assert calls == [("grpc+tls://gateway.example:8080", {"generic_options": cache_module.GRPC_OPTIONS})]
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "grpcs-proxy://gateway.example:8080/path",
+            "grpcs-proxy://gateway.example:8080?host=cache:9090",
+            "grpcs-proxy://user@gateway.example:8080",
+            "grpcs-proxy://gateway.example",
+        ],
+    )
+    def test_proxy_endpoint_rejects_url_extras(self, endpoint):
+        from flamepy.core import cache as cache_module
+
+        with pytest.raises(ValueError, match="proxy endpoint"):
+            cache_module._resolve_flight_endpoint(endpoint)
+
+    def test_plaintext_proxy_scheme_is_rejected(self):
+        from flamepy.core import cache as cache_module
+
+        with pytest.raises(ValueError, match="use grpcs-proxy"):
+            cache_module._resolve_flight_endpoint("grpc-proxy://gateway.example:8080")
 
 
 class TestSerialization:
@@ -941,6 +1079,48 @@ class TestDeleteObjects:
 
 
 class TestUploadDownloadObject:
+    def test_upload_object_uses_explicit_endpoint_without_context(self, monkeypatch, tmp_path):
+        from flamepy.core import cache as cache_module
+
+        test_file = tmp_path / "test.tar.gz"
+        test_file.write_bytes(b"test content")
+        endpoints = []
+
+        class MockWriter:
+            def write_batch(self, batch):
+                pass
+
+            def done_writing(self):
+                pass
+
+            def close(self):
+                pass
+
+        metadata = iter(
+            [
+                bson.encode({"endpoint": "grpc://cache-0:9090", "key": "myapp/pkg/test.tar.gz", "version": 1}),
+                None,
+            ]
+        )
+        reader = SimpleNamespace(read=lambda: next(metadata))
+        client = SimpleNamespace(do_put=lambda *args: (MockWriter(), reader))
+
+        def get_client(endpoint, tls=None):
+            endpoints.append(endpoint)
+            return client
+
+        monkeypatch.setattr(cache_module, "_get_cached_context", lambda: (_ for _ in ()).throw(ValueError("no config")))
+        monkeypatch.setattr(cache_module, "_get_flight_client", get_client)
+
+        ref = cache_module.upload_object(
+            "myapp/pkg/test.tar.gz",
+            str(test_file),
+            endpoint="grpcs-proxy://gateway.example:443",
+        )
+
+        assert endpoints == ["grpcs-proxy://gateway.example:443"]
+        assert ref.endpoint == "grpc://cache-0:9090"
+
     def test_upload_object_with_full_key(self, monkeypatch, tmp_path):
         from flamepy.core import cache as cache_module
         from flamepy.core.types import FlameClientCache

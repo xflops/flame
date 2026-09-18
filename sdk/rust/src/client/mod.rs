@@ -87,7 +87,9 @@ pub async fn connect_with_tls(
             tls.client_tls_config(domain)?
         } else {
             // Use default TLS config (system CA bundle)
-            tonic::transport::ClientTlsConfig::new().domain_name(domain)
+            tonic::transport::ClientTlsConfig::new()
+                .domain_name(domain)
+                .with_native_roots()
         };
 
         channel_builder = channel_builder.tls_config(client_tls_config).map_err(|e| {

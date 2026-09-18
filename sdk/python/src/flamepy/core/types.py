@@ -334,7 +334,9 @@ class FlameClientCache:
     """Cache configuration for the client.
 
     Attributes:
-        endpoint: Cache endpoint URL (e.g., "grpcs://flame-object-cache:9090").
+        endpoint: Cache endpoint URL. Use ``grpc://`` or ``grpcs://`` for a
+            direct connection, or ``grpcs-proxy://`` to dial a TLS gRPC proxy
+            while routing object references by their original authority.
         tls: TLS configuration for cache (optional, separate from cluster TLS).
         storage: Local storage path for cache (optional).
     """

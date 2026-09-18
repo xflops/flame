@@ -1535,6 +1535,9 @@ impl FlightService for FlightCacheServer {
 /// # Arguments
 /// * `cache_config` - Cache configuration (includes optional TLS config)
 pub async fn run(cache_config: &FlameCache) -> Result<(), FlameError> {
+    // Clients may use a Service to select a cache replica for the initial
+    // request. References returned by that replica must identify the replica
+    // itself because cached objects are replica-local.
     let endpoint = CacheEndpoint::try_from(cache_config)?;
     let address_str = format!("{}:{}", endpoint.host, endpoint.port);
 
@@ -1554,11 +1557,7 @@ pub async fn run(cache_config: &FlameCache) -> Result<(), FlameError> {
         cache_config.eviction.max_objects
     );
 
-    let cache = Arc::new(ObjectCache::new(
-        endpoint.clone(),
-        storage,
-        Some(&eviction_config),
-    )?);
+    let cache = Arc::new(ObjectCache::new(endpoint, storage, Some(&eviction_config))?);
 
     cache.load_from_storage().await?;
 
@@ -2115,14 +2114,20 @@ mod tests {
 
         #[tokio::test]
         async fn create_metadata_includes_endpoint() {
-            let cache = create_test_cache().await;
+            let endpoint = CacheEndpoint {
+                scheme: "grpc".to_string(),
+                host: "10.0.0.42".to_string(),
+                port: 9090,
+            };
+            let storage = crate::storage::connect("none").await.unwrap();
+            let cache = ObjectCache::new(endpoint, storage, None).unwrap();
             let meta = cache.create_metadata("app/session/key".to_string(), 1, 100, 5);
 
             assert_eq!(meta.key, "app/session/key");
             assert_eq!(meta.version, 1);
             assert_eq!(meta.size, 100);
             assert_eq!(meta.delta_count, 5);
-            assert!(meta.endpoint.contains("localhost:9090"));
+            assert_eq!(meta.endpoint, "grpc://10.0.0.42:9090");
         }
     }
 
@@ -2320,6 +2325,30 @@ mod tests {
                     .unwrap(),
                 CACHE_FORMAT_ARROW_TABLE
             );
+        }
+
+        #[tokio::test]
+        async fn get_flight_info_advertises_owning_cache_endpoint() {
+            let endpoint = CacheEndpoint {
+                scheme: "grpc".to_string(),
+                host: "10.0.0.42".to_string(),
+                port: 9090,
+            };
+            let storage = crate::storage::connect("none").await.unwrap();
+            let cache = Arc::new(ObjectCache::new(endpoint, storage, None).unwrap());
+            let server = FlightCacheServer::new(cache);
+
+            let info = server
+                .get_flight_info(Request::new(FlightDescriptor::new_path(vec![
+                    "app/session/object".to_string(),
+                ])))
+                .await
+                .unwrap()
+                .into_inner();
+
+            assert_eq!(info.endpoint.len(), 1);
+            assert_eq!(info.endpoint[0].location.len(), 1);
+            assert_eq!(info.endpoint[0].location[0].uri, "grpc://10.0.0.42:9090");
         }
 
         async fn get_batches(server: &FlightCacheServer, ticket: &str) -> Vec<RecordBatch> {

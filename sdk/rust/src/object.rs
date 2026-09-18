@@ -32,7 +32,7 @@ use bytes::Bytes;
 use futures::{stream, TryStreamExt};
 use serde_derive::{Deserialize, Serialize as DeriveSerialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Uri};
 use url::Url;
 
 use crate::apis::{FlameClientCache, FlameClientTls, FlameContext, FlameError};
@@ -350,7 +350,7 @@ async fn update_object_bytes(
     bytes: impl Into<Vec<u8>>,
 ) -> Result<ObjectRef, FlameError> {
     ObjectKey::from_key(&reference.key)?;
-    let endpoint = CacheEndpoint::parse(&reference.endpoint)?;
+    let endpoint = endpoint_for_reference(&reference.endpoint)?;
     let tls = current_cache_tls()?;
     let descriptor = FlightDescriptor::new_path(vec![reference.key.clone()]);
     do_put_bytes(&endpoint, tls.as_ref(), descriptor, bytes.into()).await
@@ -369,7 +369,7 @@ async fn patch_object_bytes(
     bytes: impl Into<Vec<u8>>,
 ) -> Result<ObjectRef, FlameError> {
     ObjectKey::from_key(&reference.key)?;
-    let endpoint = CacheEndpoint::parse(&reference.endpoint)?;
+    let endpoint = endpoint_for_reference(&reference.endpoint)?;
     let tls = current_cache_tls()?;
     let descriptor = FlightDescriptor::new_cmd(format!("PATCH:{}", reference.key));
     do_put_bytes(&endpoint, tls.as_ref(), descriptor, bytes.into()).await
@@ -432,7 +432,7 @@ pub async fn download_object(
     dest_path: impl AsRef<Path>,
 ) -> Result<(), FlameError> {
     ObjectKey::from_key(&reference.key)?;
-    let endpoint = CacheEndpoint::parse(&reference.endpoint)?;
+    let endpoint = endpoint_for_reference(&reference.endpoint)?;
     let tls = current_cache_tls()?;
     let mut client = flight_client(connect_cache(&endpoint, tls.as_ref()).await?);
     let mut stream = client
@@ -527,23 +527,41 @@ struct CacheEndpoint {
     scheme: String,
     host: String,
     port: u16,
+    authority: Option<String>,
 }
 
 impl CacheEndpoint {
     fn parse(raw: &str) -> Result<Self, FlameError> {
         let parsed = Url::parse(raw)
             .map_err(|e| FlameError::InvalidConfig(format!("invalid cache endpoint: {}", e)))?;
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || !matches!(parsed.path(), "" | "/")
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(FlameError::InvalidConfig(
+                "cache endpoint must not contain credentials, a path, query, or fragment"
+                    .to_string(),
+            ));
+        }
         let scheme = match parsed.scheme() {
             "grpc" => "grpc",
             "grpcs" | "grpc+tls" => "grpcs",
+            "grpcs-proxy" => "grpcs-proxy",
             scheme => {
                 return Err(FlameError::InvalidConfig(format!(
-                    "unsupported cache endpoint scheme <{}>; expected grpc, grpcs, or grpc+tls",
+                    "unsupported cache endpoint scheme <{}>; expected grpc, grpcs, grpc+tls, or grpcs-proxy",
                     scheme
                 )));
             }
         }
         .to_string();
+        if scheme == "grpcs-proxy" && parsed.port().is_none() {
+            return Err(FlameError::InvalidConfig(
+                "grpcs-proxy endpoint requires an explicit port".to_string(),
+            ));
+        }
         let host = parsed
             .host_str()
             .ok_or_else(|| FlameError::InvalidConfig("cache endpoint missing host".to_string()))?
@@ -551,11 +569,21 @@ impl CacheEndpoint {
             .trim_end_matches(']')
             .to_string();
         let port = parsed.port().unwrap_or(DEFAULT_CACHE_PORT);
-        Ok(Self { scheme, host, port })
+        Ok(Self {
+            scheme,
+            host,
+            port,
+            authority: None,
+        })
     }
 
     fn uri_host(&self) -> String {
         host_for_uri(&self.host)
+    }
+
+    fn proxy_for(mut self, origin: &Self) -> Self {
+        self.authority = Some(format!("{}:{}", origin.uri_host(), origin.port));
+        self
     }
 }
 
@@ -617,11 +645,33 @@ fn current_cache_tls() -> Result<Option<FlameClientTls>, FlameError> {
         .and_then(|cache| cache.tls.clone()))
 }
 
+fn endpoint_for_reference(reference_endpoint: &str) -> Result<CacheEndpoint, FlameError> {
+    let origin = CacheEndpoint::parse(reference_endpoint)?;
+    let Ok(context) = FlameContext::from_file_with_env(None) else {
+        return Ok(origin);
+    };
+    let Some(cache) = context
+        .get_current_context()
+        .ok()
+        .and_then(|current| current.cache.as_ref())
+    else {
+        return Ok(origin);
+    };
+    let Some(configured_endpoint) = cache.endpoint.as_deref() else {
+        return Ok(origin);
+    };
+    if !configured_endpoint.starts_with("grpcs-proxy://") {
+        return Ok(origin);
+    }
+    let proxy = CacheEndpoint::parse(configured_endpoint)?;
+    Ok(proxy.proxy_for(&origin))
+}
+
 async fn connect_cache(
     endpoint: &CacheEndpoint,
     tls: Option<&FlameClientTls>,
 ) -> Result<Channel, FlameError> {
-    let transport_endpoint = if endpoint.scheme == "grpcs" {
+    let transport_endpoint = if matches!(endpoint.scheme.as_str(), "grpcs" | "grpcs-proxy") {
         format!("https://{}:{}", endpoint.uri_host(), endpoint.port)
     } else {
         format!("http://{}:{}", endpoint.uri_host(), endpoint.port)
@@ -631,12 +681,17 @@ async fn connect_cache(
         .map_err(|e| FlameError::Internal(format!("invalid cache endpoint: {}", e)))?
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS));
 
-    if endpoint.scheme == "grpcs" {
-        if let Some(tls) = tls {
-            builder = builder
-                .tls_config(tls.client_tls_config(&endpoint.host)?)
-                .map_err(|e| FlameError::Internal(format!("cache TLS config error: {}", e)))?;
-        }
+    if matches!(endpoint.scheme.as_str(), "grpcs" | "grpcs-proxy") {
+        let tls = tls.cloned().unwrap_or_default();
+        builder = builder
+            .tls_config(tls.client_tls_config(&endpoint.host)?)
+            .map_err(|e| FlameError::Internal(format!("cache TLS config error: {}", e)))?;
+    }
+
+    if let Some(authority) = endpoint.authority.as_deref() {
+        let origin = Uri::from_maybe_shared(format!("http://{authority}"))
+            .map_err(|e| FlameError::Internal(format!("invalid cache proxy authority: {}", e)))?;
+        builder = builder.origin(origin);
     }
 
     builder
@@ -727,7 +782,7 @@ where
 
 async fn fetch_object_bytes(reference: &ObjectRef) -> Result<Vec<u8>, FlameError> {
     ObjectKey::from_key(&reference.key)?;
-    let endpoint = CacheEndpoint::parse(&reference.endpoint)?;
+    let endpoint = endpoint_for_reference(&reference.endpoint)?;
     let tls = current_cache_tls()?;
     let mut client = flight_client(connect_cache(&endpoint, tls.as_ref()).await?);
     let mut stream = client
@@ -912,6 +967,27 @@ mod tests {
         assert_eq!(endpoint.scheme, "grpcs");
         assert_eq!(endpoint.host, "cache.example.com");
         assert_eq!(endpoint.port, 9443);
+        assert!(endpoint.authority.is_none());
+    }
+
+    #[test]
+    fn cache_endpoint_accepts_grpcs_proxy() {
+        let proxy = CacheEndpoint::parse("grpcs-proxy://gateway.example.com:9090").unwrap();
+        let origin = CacheEndpoint::parse("grpc://cache-0.cache:9090").unwrap();
+        let routed = proxy.proxy_for(&origin);
+        assert_eq!(routed.scheme, "grpcs-proxy");
+        assert_eq!(routed.host, "gateway.example.com");
+        assert_eq!(routed.port, 9090);
+        assert_eq!(routed.authority.as_deref(), Some("cache-0.cache:9090"));
+    }
+
+    #[test]
+    fn cache_endpoint_rejects_proxy_url_extras() {
+        assert!(CacheEndpoint::parse("grpc-proxy://gateway:9090").is_err());
+        assert!(CacheEndpoint::parse("grpcs-proxy://gateway:9090/path").is_err());
+        assert!(CacheEndpoint::parse("grpcs-proxy://gateway:9090?host=cache:9090").is_err());
+        assert!(CacheEndpoint::parse("grpcs-proxy://user@gateway:9090").is_err());
+        assert!(CacheEndpoint::parse("grpcs-proxy://gateway").is_err());
     }
 
     #[test]

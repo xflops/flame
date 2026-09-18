@@ -53,6 +53,12 @@ def test_create_storage_backend_grpcs():
     assert isinstance(back, CacheStorage)
 
 
+def test_create_storage_backend_grpcs_proxy():
+    back = create_storage_backend("grpcs-proxy://gateway.example:8080", app_name="myapp")
+    assert isinstance(back, CacheStorage)
+    assert back._endpoint == "grpcs-proxy://gateway.example:8080"
+
+
 def test_create_storage_backend_default_uses_cache(monkeypatch):
     from flamepy.core.types import FlameClientCache
 
@@ -72,8 +78,9 @@ class TestCacheStorage:
         test_file = tmp_path / "myapp-1.0.0.tar.gz"
         test_file.write_bytes(b"package content")
 
-        def mock_upload_object(key, file_path):
+        def mock_upload_object(key, file_path, endpoint=None):
             assert key == "myapp/pkg/myapp-1.0.0.tar.gz"
+            assert endpoint == "grpc://host:9090"
             return ObjectRef(endpoint="grpc://host:9090", key=key, version=1)
 
         monkeypatch.setattr("flamepy.core.cache.upload_object", mock_upload_object)
@@ -82,6 +89,23 @@ class TestCacheStorage:
         url = storage.upload(str(test_file), "myapp-1.0.0.tar.gz")
 
         assert url == "grpc://host:9090/myapp/pkg/myapp-1.0.0.tar.gz"
+
+    def test_upload_preserves_returned_cache_endpoint(self, monkeypatch, tmp_path):
+        from flamepy.core.cache import ObjectRef
+
+        test_file = tmp_path / "myapp-1.0.0.tar.gz"
+        test_file.write_bytes(b"package content")
+
+        def mock_upload_object(key, file_path, endpoint=None):
+            assert endpoint == "grpcs-proxy://gateway.example:443"
+            return ObjectRef(endpoint="grpc://10.0.0.42:9090", key=key, version=1)
+
+        monkeypatch.setattr("flamepy.core.cache.upload_object", mock_upload_object)
+
+        storage = CacheStorage("grpcs-proxy://gateway.example:443", app_name="myapp")
+        url = storage.upload(str(test_file), "myapp-1.0.0.tar.gz")
+
+        assert url == "grpc://10.0.0.42:9090/myapp/pkg/myapp-1.0.0.tar.gz"
 
     def test_download(self, monkeypatch, tmp_path):
         dest_file = tmp_path / "downloaded.tar.gz"
