@@ -82,6 +82,7 @@ class Shim(IntEnum):
 
     HOST = 0
     WASM = 1
+    CRI = 3
 
 
 class FlameErrorCode(IntEnum):

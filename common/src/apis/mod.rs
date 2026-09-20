@@ -62,6 +62,8 @@ mod tests {
         assert_eq!(Shim::try_from("wasm".to_string()).unwrap(), Shim::Wasm);
         assert_eq!(Shim::try_from("Wasm".to_string()).unwrap(), Shim::Wasm);
         assert_eq!(Shim::try_from("WASM".to_string()).unwrap(), Shim::Wasm);
+        assert_eq!(Shim::try_from("cri".to_string()).unwrap(), Shim::Cri);
+        assert_eq!(Shim::try_from("CRI".to_string()).unwrap(), Shim::Cri);
         assert!(Shim::try_from("invalid".to_string()).is_err());
     }
 

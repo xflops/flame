@@ -16,8 +16,9 @@ use stdng::{logs::TraceFn, trace_fn};
 
 use crate::client::BackendClient;
 use crate::executor::Executor;
+use crate::shims;
 use crate::states::State;
-use common::apis::ExecutorState;
+use common::apis::{ExecutorState, Shim};
 use common::FlameError;
 
 #[derive(Clone)]
@@ -30,6 +31,16 @@ pub struct ReleasingState {
 impl State for ReleasingState {
     async fn execute(&mut self) -> Result<Executor, FlameError> {
         trace_fn!("ReleasingState::execute");
+
+        let shim_ptr = match self.executor.shim_instance.clone() {
+            Some(shim_ptr) => Some(shim_ptr),
+            None if self.executor.shim == Shim::Cri => Some(shims::new_ptr(&self.executor, None)?),
+            None => None,
+        };
+        if let Some(shim_ptr) = shim_ptr {
+            shim_ptr.lock().await.destroy_instance().await?;
+            self.executor.shim_instance = None;
+        }
 
         self.client
             .unregister_executor(&self.executor.clone())
@@ -53,6 +64,7 @@ impl ReleasingState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::appmgr::ApplicationManager;
     use crate::shims::{SessionEnterResponse, Shim as ShimService, ShimPtr, TaskInvokeResponse};
     use common::apis::{ResourceRequirement, SessionContext, Shim, TaskContext};
     use std::sync::Arc;
@@ -62,6 +74,13 @@ mod tests {
 
     #[async_trait]
     impl ShimService for TestShim {
+        async fn create_service(
+            &mut self,
+            _app_manager: Arc<ApplicationManager>,
+        ) -> Result<(), FlameError> {
+            unreachable!()
+        }
+
         async fn on_session_enter(
             &mut self,
             _ctx: &SessionContext,
@@ -78,6 +97,10 @@ mod tests {
 
         async fn on_session_leave(&mut self) -> Result<(), FlameError> {
             unreachable!()
+        }
+
+        async fn destroy_instance(&mut self) -> Result<(), FlameError> {
+            Ok(())
         }
     }
 

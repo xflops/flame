@@ -57,6 +57,11 @@ impl State for BoundState {
                                 self.executor.id,
                                 e
                             );
+                            tracing::warn!(
+                                "Executor <{}> will report the failure and unbind; service cleanup waits for release",
+                                self.executor.id
+                            );
+                            self.executor.state = ExecutorState::Unbinding;
                             shims::TaskInvokeResponse {
                                 task_result: TaskResult {
                                     state: TaskState::Failed,
@@ -81,7 +86,7 @@ impl State for BoundState {
                     let task = &self.executor.task.clone().unwrap();
                     (task.session_id.clone(), task.task_id.clone())
                 };
-                tracing::debug!("Complete task <{ssn_id}/{task_id}>")
+                tracing::debug!("Complete task <{ssn_id}/{task_id}>");
             }
             None => {
                 self.executor.state = ExecutorState::Unbinding;

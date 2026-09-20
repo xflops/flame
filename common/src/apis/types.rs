@@ -23,7 +23,6 @@ use stdng::MutexPtr;
 pub const DEFAULT_MAX_INSTANCES: u32 = 1_000_000;
 pub const DEFAULT_DELAY_RELEASE: Duration = Duration::seconds(60);
 pub const BIND_RESULT_OK: i32 = 0;
-pub const BIND_RESULT_APPLICATION_INSTALL_FAILED: i32 = 10;
 pub const BIND_RESULT_SHIM_CREATE_FAILED: i32 = 11;
 pub const BIND_RESULT_ON_SESSION_ENTER_FAILED: i32 = 12;
 pub const BIND_RESULT_UNKNOWN_FAILED: i32 = 19;
@@ -92,6 +91,7 @@ pub enum Shim {
     #[default]
     Host = 0,
     Wasm = 1,
+    Cri = 3,
 }
 
 #[derive(Clone, Debug, Default)]

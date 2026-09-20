@@ -11,6 +11,7 @@ wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 rpc = { path = "../rpc" }
 common = { path = "../common" }
 stdng = { path = "../stdng" }
+cri-rs = { path = "../cri" }
 
 tokio = { workspace = true }
 tonic = { workspace = true }

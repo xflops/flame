@@ -318,6 +318,7 @@ impl TryFrom<String> for Shim {
         match s.to_lowercase().as_str() {
             "host" => Ok(Self::Host),
             "wasm" => Ok(Self::Wasm),
+            "cri" => Ok(Self::Cri),
             _ => Err(FlameError::InvalidConfig(format!("invalid shim: {s}"))),
         }
     }
@@ -328,6 +329,7 @@ impl From<rpc::Shim> for Shim {
         match s {
             rpc::Shim::Host => Self::Host,
             rpc::Shim::Wasm => Self::Wasm,
+            rpc::Shim::Cri => Self::Cri,
         }
     }
 }

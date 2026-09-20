@@ -159,6 +159,7 @@ pub enum ApplicationState {
 pub enum Shim {
     Host = 0,
     Wasm = 1,
+    Cri = 3,
 }
 
 #[derive(
@@ -196,6 +197,7 @@ impl From<rpc::Shim> for Shim {
         match shim {
             rpc::Shim::Host => Shim::Host,
             rpc::Shim::Wasm => Shim::Wasm,
+            rpc::Shim::Cri => Shim::Cri,
         }
     }
 }

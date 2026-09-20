@@ -11,10 +11,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fs;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
@@ -29,6 +31,7 @@ use ::rpc::flame::v1 as rpc;
 use rpc::instance_client::InstanceClient;
 use rpc::{EmptyRequest, ExecutorAttributes};
 
+use crate::appmgr::ApplicationManager;
 use crate::shims::{ExecutorWorkDir, Shim};
 use common::apis::{SessionContext, TaskContext, TaskResult, TaskState};
 use common::FlameError;
@@ -41,11 +44,15 @@ pub struct GrpcShim {
 
 impl GrpcShim {
     pub fn new(work_dir: &ExecutorWorkDir) -> Result<Self, FlameError> {
+        Self::new_at(work_dir.socket())
+    }
+
+    pub fn new_at(endpoint: &Path) -> Result<Self, FlameError> {
         trace_fn!("GrpcShim::new");
 
         Ok(Self {
             client: None,
-            endpoint: work_dir.socket().to_string_lossy().to_string(),
+            endpoint: endpoint.to_string_lossy().to_string(),
         })
     }
 
@@ -57,25 +64,31 @@ impl GrpcShim {
     pub async fn connect(&mut self) -> Result<(), FlameError> {
         trace_fn!("GrpcShim::connect");
 
-        WaitForSvcSocketFuture::new(self.endpoint.clone()).await?;
+        self.wait_for_socket().await?;
         tracing::debug!("Try to connect to service at <{}>", self.endpoint);
 
-        let channel = Endpoint::try_from("http://[::]:50051")
-            .unwrap()
-            .connect_with_connector({
-                let service_addr = self.endpoint.clone();
+        let endpoint = Endpoint::try_from("http://[::]:50051").unwrap();
+        let connect = endpoint.connect_with_connector({
+            let service_addr = self.endpoint.clone();
 
-                service_fn(move |_: Uri| {
-                    let service_addr = service_addr.clone();
-                    async move {
-                        UnixStream::connect(service_addr)
-                            .await
-                            .map(TokioIo::new)
-                            .map_err(std::io::Error::other)
-                    }
-                })
+            service_fn(move |_: Uri| {
+                let service_addr = service_addr.clone();
+                async move {
+                    UnixStream::connect(service_addr)
+                        .await
+                        .map(TokioIo::new)
+                        .map_err(std::io::Error::other)
+                }
             })
+        });
+        let channel = tokio::time::timeout(Duration::from_secs(30), connect)
             .await
+            .map_err(|_| {
+                FlameError::Network(format!(
+                    "timed out connecting to service at <{}>",
+                    self.endpoint
+                ))
+            })?
             .map_err(|e| {
                 FlameError::Network(format!(
                     "failed to connect to service at <{}>: {e}",
@@ -86,6 +99,37 @@ impl GrpcShim {
         self.client = Some(InstanceClient::new(channel));
 
         Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_socket(&self) -> Result<(), FlameError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match std::fs::symlink_metadata(&self.endpoint) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(FlameError::InvalidState(format!(
+                        "instance endpoint <{}> must not be a symlink",
+                        self.endpoint
+                    )));
+                }
+                Ok(metadata) if metadata.file_type().is_socket() => return Ok(()),
+                Ok(_) => {
+                    return Err(FlameError::InvalidState(format!(
+                        "instance endpoint <{}> is not a Unix socket",
+                        self.endpoint
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(FlameError::Storage(error.to_string())),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(FlameError::Network(format!(
+                    "timed out waiting for service socket <{}>",
+                    self.endpoint
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[cfg(not(unix))]
@@ -104,6 +148,13 @@ impl GrpcShim {
 
 #[async_trait]
 impl Shim for GrpcShim {
+    async fn create_service(
+        &mut self,
+        _app_manager: Arc<ApplicationManager>,
+    ) -> Result<(), FlameError> {
+        self.connect().await
+    }
+
     async fn on_session_enter(
         &mut self,
         ctx: &SessionContext,
@@ -188,28 +239,10 @@ impl Shim for GrpcShim {
 
         Ok(())
     }
-}
 
-struct WaitForSvcSocketFuture {
-    path: String,
-}
-
-impl WaitForSvcSocketFuture {
-    pub fn new(path: String) -> Self {
-        Self { path }
-    }
-}
-
-impl Future for WaitForSvcSocketFuture {
-    type Output = Result<(), FlameError>;
-
-    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-        if fs::exists(&self.path).unwrap_or(false) {
-            Poll::Ready(Ok(()))
-        } else {
-            ctx.waker().wake_by_ref();
-            Poll::Pending
-        }
+    async fn destroy_instance(&mut self) -> Result<(), FlameError> {
+        self.close();
+        Ok(())
     }
 }
 
@@ -286,13 +319,6 @@ mod tests {
         shim.close();
 
         assert!(shim.client.is_none());
-    }
-
-    #[test]
-    fn test_wait_for_svc_socket_future_new() {
-        let future = WaitForSvcSocketFuture::new("/tmp/test.sock".to_string());
-
-        assert_eq!(future.path, "/tmp/test.sock");
     }
 
     #[tokio::test]

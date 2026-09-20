@@ -23,6 +23,7 @@ use stdng::{lock_ptr, MutexPtr};
 use crate::appmgr::ApplicationManager;
 use crate::client::BackendClient;
 use crate::executor::{self, Executor, ExecutorPtr};
+use crate::shims;
 use crate::stream_handler::StreamHandler;
 
 pub enum ExecutorMessage {
@@ -79,7 +80,7 @@ impl ExecutorManager {
         while let Some(msg) = executor_rx.recv().await {
             match msg {
                 ExecutorMessage::Update(executor) => {
-                    self.handle_executor_update(executor)?;
+                    self.handle_executor_update(executor).await?;
                 }
             }
         }
@@ -89,11 +90,9 @@ impl ExecutorManager {
         Ok(())
     }
 
-    fn handle_executor_update(&mut self, mut executor: Executor) -> Result<(), FlameError> {
+    async fn handle_executor_update(&mut self, mut executor: Executor) -> Result<(), FlameError> {
         let executor_id = executor.id.clone();
         let state = executor.state;
-
-        let mut executors = lock_ptr!(self.executors)?;
 
         if state == ExecutorState::Released {
             tracing::info!(
@@ -101,11 +100,24 @@ impl ExecutorManager {
                 executor_id,
                 state
             );
-            if let Some(executor) = executors.remove(&executor_id) {
-                lock_ptr!(executor)?.release();
+            let removed = {
+                let mut executors = lock_ptr!(self.executors)?;
+                executors.remove(&executor_id)
+            };
+            if let Some(executor) = removed {
+                let shim = {
+                    let mut executor = lock_ptr!(executor)?;
+                    executor.state = ExecutorState::Released;
+                    executor.shim_instance.clone()
+                };
+                if let Some(shim) = shim {
+                    shim.lock().await.destroy_instance().await?;
+                }
             }
             return Ok(());
         }
+
+        let mut executors = lock_ptr!(self.executors)?;
 
         if !executors.contains_key(&executor_id) {
             tracing::info!(

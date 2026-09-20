@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, create_dir_all, OpenOptions};
 #[cfg(unix)]
@@ -28,14 +28,15 @@ use nix::unistd::Pid;
 use stdng::{logs::TraceFn, trace_fn};
 use tokio::sync::Mutex;
 
+use crate::appmgr::ApplicationManager;
 use crate::executor::Executor;
 use crate::shims::grpc_shim::GrpcShim;
 use crate::shims::{ExecutorWorkDir, Shim, ShimPtr};
 use ::rpc::flame::v1 as rpc;
 use common::apis::{ApplicationContext, SessionContext, TaskContext, TaskOutput, TaskResult};
 use common::{
-    FlameError, FLAME_CACHE_ENDPOINT, FLAME_CA_FILE, FLAME_ENDPOINT, FLAME_INSTANCE_ENDPOINT,
-    FLAME_LOG,
+    get_python_runtime, FlameError, FLAME_CACHE_ENDPOINT, FLAME_CA_FILE, FLAME_ENDPOINT,
+    FLAME_INSTANCE_ENDPOINT, FLAME_LOG, FLAME_PYTHON_VERSION_ENV,
 };
 
 struct HostInstance {
@@ -68,36 +69,26 @@ impl HostInstance {
 }
 
 pub struct HostShim {
-    instance: HostInstance,
-    instance_client: GrpcShim,
-    work_dir: ExecutorWorkDir,
+    executor: Executor,
+    app: ApplicationContext,
+    instance: Option<HostInstance>,
+    instance_client: Option<GrpcShim>,
+    work_dir: Option<ExecutorWorkDir>,
 }
 
 const RUST_LOG: &str = "RUST_LOG";
 const DEFAULT_SVC_LOG_LEVEL: &str = "info";
 
 impl HostShim {
-    pub async fn new_ptr(
-        executor: &Executor,
-        app: &ApplicationContext,
-        install_env_vars: &HashMap<String, String>,
-    ) -> Result<ShimPtr, FlameError> {
+    pub fn new_ptr(executor: &Executor, app: &ApplicationContext) -> ShimPtr {
         trace_fn!("HostShim::new_ptr");
-
-        // Create work directory first - it provides socket path for GrpcShim
-        let work_dir = ExecutorWorkDir::new(app, &executor.id)?;
-
-        let mut instance_client = GrpcShim::new(&work_dir)?;
-
-        let instance = Self::launch_instance(app, executor, &work_dir, install_env_vars)?;
-
-        instance_client.connect().await?;
-
-        Ok(Arc::new(Mutex::new(Self {
-            instance,
-            instance_client,
-            work_dir,
-        })))
+        Arc::new(Mutex::new(Self {
+            executor: executor.clone(),
+            app: app.clone(),
+            instance: None,
+            instance_client: None,
+            work_dir: None,
+        }))
     }
 
     fn create_dir(path: &Path, name: &str) -> Result<(), FlameError> {
@@ -281,27 +272,121 @@ impl HostShim {
     fn is_path_env(key: &str) -> bool {
         matches!(key, "PATH" | "PYTHONPATH" | "LD_LIBRARY_PATH")
     }
+
+    fn base_runtime_environment(
+        app: &ApplicationContext,
+        flame_home: &Path,
+    ) -> HashMap<String, String> {
+        if app.url.is_some()
+            || !app
+                .installer
+                .as_deref()
+                .is_some_and(|installer| installer.eq_ignore_ascii_case("python"))
+        {
+            return HashMap::new();
+        }
+
+        let runtime = get_python_runtime(
+            flame_home,
+            app.environments
+                .get(FLAME_PYTHON_VERSION_ENV)
+                .map(String::as_str),
+        );
+        let Some(site_packages) = runtime.site_packages else {
+            return HashMap::new();
+        };
+
+        let mut environment = HashMap::from([
+            (FLAME_PYTHON_VERSION_ENV.to_string(), runtime.version),
+            (
+                "PYTHONPATH".to_string(),
+                site_packages.to_string_lossy().to_string(),
+            ),
+        ]);
+        let native_paths = Self::find_native_lib_paths(&site_packages);
+        if !native_paths.is_empty() {
+            environment.insert("LD_LIBRARY_PATH".to_string(), native_paths.join(":"));
+        }
+        environment
+    }
+
+    fn find_native_lib_paths(root: &Path) -> Vec<String> {
+        fn scan(path: &Path, paths: &mut HashSet<String>, depth: usize) {
+            if depth > 4 {
+                return;
+            }
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        scan(&path, paths, depth + 1);
+                    } else if path.extension().is_some_and(|extension| extension == "so") {
+                        if let Some(parent) = path.parent() {
+                            paths.insert(parent.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut paths = HashSet::new();
+        scan(root, &mut paths, 0);
+        paths.into_iter().collect()
+    }
 }
 
 impl Drop for HostShim {
     fn drop(&mut self) {
-        // 1. Close gRPC connection first
-        self.instance_client.close();
-        // 2. Kill child process
-        self.instance.kill_process();
-        // 3. Cleanup is handled by ExecutorWorkDir::drop()
+        if let Some(client) = self.instance_client.as_mut() {
+            client.close();
+        }
+        if let Some(instance) = self.instance.as_mut() {
+            instance.kill_process();
+        }
     }
 }
 
 #[async_trait]
 impl Shim for HostShim {
+    async fn create_service(
+        &mut self,
+        app_manager: Arc<ApplicationManager>,
+    ) -> Result<(), FlameError> {
+        if self.instance.is_some() {
+            return Ok(());
+        }
+        let mut installation = app_manager.install(&self.app).await?;
+        let flame_home = env::var("FLAME_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/opt/flame"));
+        installation
+            .env_vars
+            .extend(Self::base_runtime_environment(&self.app, &flame_home));
+        let work_dir = ExecutorWorkDir::new(&self.app, &self.executor.id)?;
+        let mut instance_client = GrpcShim::new(&work_dir)?;
+        let mut instance =
+            Self::launch_instance(&self.app, &self.executor, &work_dir, &installation.env_vars)?;
+        if let Err(error) = instance_client.connect().await {
+            instance.kill_process();
+            return Err(error);
+        }
+        self.work_dir = Some(work_dir);
+        self.instance_client = Some(instance_client);
+        self.instance = Some(instance);
+        Ok(())
+    }
+
     async fn on_session_enter(
         &mut self,
         ctx: &SessionContext,
     ) -> Result<super::SessionEnterResponse, FlameError> {
         trace_fn!("HostShim::on_session_enter");
 
-        self.instance_client.on_session_enter(ctx).await
+        self.instance_client
+            .as_mut()
+            .ok_or_else(|| FlameError::InvalidState("Host instance is not created".to_string()))?
+            .on_session_enter(ctx)
+            .await
     }
 
     async fn on_task_invoke(
@@ -310,19 +395,54 @@ impl Shim for HostShim {
     ) -> Result<super::TaskInvokeResponse, FlameError> {
         trace_fn!("HostShim::on_task_invoke");
 
-        self.instance_client.on_task_invoke(ctx).await
+        self.instance_client
+            .as_mut()
+            .ok_or_else(|| FlameError::InvalidState("Host instance is not created".to_string()))?
+            .on_task_invoke(ctx)
+            .await
     }
 
     async fn on_session_leave(&mut self) -> Result<(), FlameError> {
         trace_fn!("HostShim::on_session_leave");
 
-        self.instance_client.on_session_leave().await
+        self.instance_client
+            .as_mut()
+            .ok_or_else(|| FlameError::InvalidState("Host instance is not created".to_string()))?
+            .on_session_leave()
+            .await
+    }
+
+    async fn destroy_instance(&mut self) -> Result<(), FlameError> {
+        if let Some(mut client) = self.instance_client.take() {
+            client.close();
+        }
+        if let Some(mut instance) = self.instance.take() {
+            instance.kill_process();
+        }
+        self.work_dir = None;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::apis::{ExecutorState, ResourceRequirement, Shim as ShimType};
+
+    fn test_executor() -> Executor {
+        Executor {
+            id: "executor-1".to_string(),
+            application: "test-app".to_string(),
+            resreq: ResourceRequirement::default(),
+            node: "node-1".to_string(),
+            shim: ShimType::Host,
+            session: None,
+            task: None,
+            context: None,
+            shim_instance: None,
+            state: ExecutorState::Idle,
+        }
+    }
 
     #[test]
     fn expand_command_args_from_launch_env() {
@@ -332,5 +452,68 @@ mod tests {
             HostShim::expand_env_vars("python${FLAME_PYTHON_VERSION}", Some(&envs)),
             "python3.12"
         );
+    }
+
+    #[test]
+    fn url_less_python_host_uses_installed_base_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let site_packages = temp.path().join("lib/python3.12/site-packages");
+        fs::create_dir_all(&site_packages).unwrap();
+        let app = ApplicationContext {
+            name: "flmrun".to_string(),
+            shim: ShimType::Host,
+            image: None,
+            command: None,
+            arguments: vec![],
+            working_directory: None,
+            environments: HashMap::new(),
+            url: None,
+            installer: Some("python".to_string()),
+        };
+
+        let environment = HostShim::base_runtime_environment(&app, temp.path());
+
+        assert_eq!(
+            environment
+                .get(FLAME_PYTHON_VERSION_ENV)
+                .map(String::as_str),
+            Some("3.12")
+        );
+        assert_eq!(
+            environment.get("PYTHONPATH").map(String::as_str),
+            Some(site_packages.to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_service_installs_before_runtime_creation() {
+        let app = ApplicationContext {
+            name: "test-app".to_string(),
+            shim: ShimType::Host,
+            image: None,
+            command: None,
+            arguments: vec![],
+            working_directory: None,
+            environments: HashMap::new(),
+            url: Some("file:///unused-package.tar.gz".to_string()),
+            installer: Some("unsupported".to_string()),
+        };
+        let mut shim = HostShim {
+            executor: test_executor(),
+            app,
+            instance: None,
+            instance_client: None,
+            work_dir: None,
+        };
+
+        let error = shim
+            .create_service(Arc::new(ApplicationManager::new().unwrap()))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Unknown installer type"));
+        assert!(shim.instance.is_none());
+        assert!(shim.instance_client.is_none());
+        assert!(shim.work_dir.is_none());
     }
 }

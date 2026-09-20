@@ -326,6 +326,7 @@ impl From<Shim> for rpc::Shim {
         match s {
             Shim::Host => Self::Host,
             Shim::Wasm => Self::Wasm,
+            Shim::Cri => Self::Cri,
         }
     }
 }

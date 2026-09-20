@@ -242,7 +242,10 @@ impl Controller {
 
         // Compare both directions and release mismatched executors
 
-        // 1. DB executors not reported by node - orphaned in DB, release them
+        // 1. DB executors not reported by the node have lost their in-memory
+        // shim. Retain the record and ask the executor-manager run loop to
+        // perform targeted cleanup by persisted executor ID. The interrupted
+        // task is failed only after cleanup is acknowledged by unregister_executor.
         for db_exec in &db_executors {
             if !reported_ids.contains(db_exec.id.as_str()) {
                 tracing::info!(
@@ -250,16 +253,19 @@ impl Controller {
                     db_exec.id,
                     node.name
                 );
-                if let Err(e) = self.release_executor(db_exec.id.clone()).await {
-                    tracing::warn!(
-                        "Failed to release orphaned executor <{}>: {}",
-                        db_exec.id,
-                        e
-                    );
-                }
+                let mut cleanup_executor = db_exec.clone();
+                cleanup_executor.state = ExecutorState::Releasing;
+                self.storage.update_executor(&cleanup_executor).await?;
+                sender.send(cleanup_executor).await.map_err(|error| {
+                    FlameError::Network(format!(
+                        "failed to send cleanup for stale executor <{}>: {error}",
+                        db_exec.id
+                    ))
+                })?;
+                continue;
             }
 
-            // Send executor to node (whether aligned or being released)
+            // Only replay executors whose runtime was actually reported.
             if let Err(e) = sender.send(db_exec.clone()).await {
                 tracing::warn!("Failed to send executor <{}> to node: {:?}", db_exec.id, e);
             }
@@ -1014,6 +1020,29 @@ impl Controller {
             (*exe).clone()
         };
 
+        // Crash recovery is terminal in v1: after the node confirms targeted
+        // service destruction, fail the interrupted task instead of retrying it.
+        if let (Some(task_id), Some(ssn_id)) = (executor.task_id, executor.ssn_id.as_ref()) {
+            let gid = TaskGID {
+                ssn_id: ssn_id.clone(),
+                task_id,
+            };
+            let ssn_ptr = self.storage.get_session_ptr(ssn_id.clone())?;
+            let task_ptr = self.storage.get_task_ptr(gid)?;
+            self.storage
+                .update_task_state(
+                    ssn_ptr,
+                    task_ptr,
+                    TaskState::Failed,
+                    Some(format!(
+                        "Executor <{}> was lost; its service was destroyed without retry",
+                        executor.id
+                    )),
+                )
+                .await?;
+            let _ = self.notifier.tasks.notify(ssn_id, task_id);
+        }
+
         let state = executors::from(self.storage.clone(), exe_ptr)?;
         state.unregister_executor().await?;
 
@@ -1021,9 +1050,13 @@ impl Controller {
         self.notifier.executors.remove(&id)?;
 
         // Notify the node about the executor deletion
+        let mut released_executor = executor.clone();
+        released_executor.state = ExecutorState::Released;
+        released_executor.task_id = None;
+        released_executor.ssn_id = None;
         if let Err(e) = self
             .connection_manager
-            .notify_executor(&executor.node, &executor)
+            .notify_executor(&released_executor.node, &released_executor)
             .await
         {
             tracing::debug!(
@@ -1622,6 +1655,7 @@ mod tests {
     mod register_node_tests {
         use super::*;
         use std::collections::HashSet;
+        use std::time::Duration;
 
         #[tokio::test]
         async fn test_update_node_does_not_transition_state() {
@@ -1676,6 +1710,93 @@ mod tests {
             let result = controller.register_node(&node, &[]).await;
 
             assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn missing_persisted_executor_is_sent_for_targeted_release() {
+            let storage = create_test_storage().await;
+            let controller = new_ptr(storage.clone());
+            let node = create_test_node("recovery-node");
+            storage.register_node(&node).await.unwrap();
+            controller
+                .register_application("test-app".to_string(), create_test_application())
+                .await
+                .unwrap();
+            let session = controller
+                .create_session(create_test_session_attr("recovery-session"))
+                .await
+                .unwrap();
+            let executor = storage
+                .create_executor(node.name.clone(), session.id)
+                .await
+                .unwrap();
+
+            controller.register_node(&node, &[]).await.unwrap();
+
+            let (_, receiver) = controller.get_node_channel(&node.name).unwrap().unwrap();
+            let cleanup = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cleanup.id, executor.id);
+            assert_eq!(cleanup.state, ExecutorState::Releasing);
+            assert_eq!(
+                controller.get_executor(executor.id).unwrap().state,
+                ExecutorState::Releasing
+            );
+        }
+
+        #[tokio::test]
+        async fn cleanup_ack_fails_interrupted_task_without_retry() {
+            let storage = create_test_storage().await;
+            let controller = new_ptr(storage.clone());
+            let node = create_test_node("terminal-recovery-node");
+            storage.register_node(&node).await.unwrap();
+            controller
+                .register_application("test-app".to_string(), create_test_application())
+                .await
+                .unwrap();
+            let session = controller
+                .create_session(create_test_session_attr("terminal-recovery-session"))
+                .await
+                .unwrap();
+            let task = controller
+                .create_task(session.id.clone(), None, None)
+                .await
+                .unwrap();
+            let session_ptr = storage.get_session_ptr(session.id.clone()).unwrap();
+            let task_ptr = storage
+                .get_task_ptr(TaskGID {
+                    ssn_id: session.id.clone(),
+                    task_id: task.id,
+                })
+                .unwrap();
+            storage
+                .update_task_state(session_ptr, task_ptr, TaskState::Running, None)
+                .await
+                .unwrap();
+            let mut executor = storage
+                .create_executor(node.name, session.id.clone())
+                .await
+                .unwrap();
+            executor.state = ExecutorState::Releasing;
+            executor.ssn_id = Some(session.id.clone());
+            executor.task_id = Some(task.id);
+            storage.update_executor(&executor).await.unwrap();
+
+            controller
+                .unregister_executor(executor.id.clone())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                controller.get_task(session.id, task.id).unwrap().state,
+                TaskState::Failed
+            );
+            assert!(matches!(
+                controller.get_executor(executor.id).unwrap_err(),
+                FlameError::NotFound(_)
+            ));
         }
 
         #[tokio::test]

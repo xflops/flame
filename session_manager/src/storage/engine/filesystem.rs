@@ -128,7 +128,7 @@ struct ApplicationMetadata {
     pub state: i32,
     pub creation_time: i64,
     #[serde(default)]
-    pub shim: i32, // 0 = Host (default), 1 = Wasm
+    pub shim: i32, // 0 = Host (default), 1 = Wasm, 3 = Cri
     pub image: Option<String>,
     pub description: Option<String>,
     pub labels: Vec<String>,

@@ -87,6 +87,8 @@ message Task {
 enum Shim {
   Host = 0;
   Wasm = 1;
+  // Value 2 is intentionally left available for RFE522 Sidecar.
+  Cri = 3;
 }
 
 enum ApplicationState {
@@ -112,7 +114,7 @@ message ApplicationSchema {
 }
 
 message ApplicationSpec {
-  Shim shim = 1;  // Required shim type (Host or Wasm), defaults to Host
+  Shim shim = 1;  // Required shim type, defaults to Host
   optional string description = 2;
   repeated string labels = 3;
   optional string image = 4;

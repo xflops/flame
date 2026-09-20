@@ -65,3 +65,11 @@ Task files under `tasks/` are local agent notes. Keep them out of commits and PR
 ## Core Principles
 - **Simplicity First**: Make every change as simple as possible. Impact minimal code
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards
+
+---
+
+## Global Architecture Assumption
+
+- A service instance is application/executor scoped, not session scoped. Create
+  it once for an executor, retain it across session bindings, and destroy it
+  only when the executor is released.

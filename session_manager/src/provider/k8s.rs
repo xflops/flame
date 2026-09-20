@@ -40,7 +40,7 @@ impl Provider for K8sProvider {
         // Here're also some enhancements in other components:
         //   - The executor manager will be a sidecar of the Pod and it can only manage one single instance (max_instance = 1).
         //   - The executor manager should create the executor during startup, and register it to the session manager.
-        //   - Add a new shim, named 'sidecar', which will not stop the instance when unbinding; depends on provider to delete the pod.
+        //   - Add a new shim, named 'sidecar', whose release cleanup does not delete the enclosing pod; the provider owns pod deletion.
         //   - The scheduler should not dispatch tasks if the application of executor is mismatched.
         todo!()
     }

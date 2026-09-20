@@ -74,8 +74,7 @@ Define shared constants for `Result.return_code` so the failure phase is machine
 | Constant | Code | Meaning |
 | -------- | ---- | ------- |
 | `BIND_RESULT_OK` | `0` | Bind completed successfully. |
-| `BIND_RESULT_APPLICATION_INSTALL_FAILED` | `10` | Executor-manager failed to install or prepare the application package. |
-| `BIND_RESULT_SHIM_CREATE_FAILED` | `11` | Executor-manager failed to create the shim or service instance. |
+| `BIND_RESULT_SHIM_CREATE_FAILED` | `11` | Executor-manager failed to create the shim or service instance, including Host package installation. |
 | `BIND_RESULT_ON_SESSION_ENTER_FAILED` | `12` | The service instance returned an error from `OnSessionEnter`. |
 | `BIND_RESULT_UNKNOWN_FAILED` | `19` | Bind failed before executor-manager could classify the phase. |
 
@@ -210,7 +209,6 @@ impl From<rpc::Result> for FlameResult { ... }
 impl From<FlameResult> for rpc::Result { ... }
 
 pub const BIND_RESULT_OK: i32 = 0;
-pub const BIND_RESULT_APPLICATION_INSTALL_FAILED: i32 = 10;
 pub const BIND_RESULT_SHIM_CREATE_FAILED: i32 = 11;
 pub const BIND_RESULT_ON_SESSION_ENTER_FAILED: i32 = 12;
 pub const BIND_RESULT_UNKNOWN_FAILED: i32 = 19;
@@ -278,18 +276,8 @@ function bind_idle_executor(executor):
         transition executor to Releasing
         return
 
-    if install application fails:
-        backend.BindExecutorCompleted(
-            executor.id,
-            result = {
-                return_code: BIND_RESULT_APPLICATION_INSTALL_FAILED,
-                message: install_error,
-            },
-        )
-        transition executor to Unbinding
-        return
-
-    if create shim fails:
+    shim = create shim
+    if shim creation or shim.create_service(app_manager) fails:
         backend.BindExecutorCompleted(
             executor.id,
             result = {
@@ -479,11 +467,11 @@ Expected outcome: users see the bind failure event, and the session can be sched
 
 1. Session `s2` is scheduled to executor `e-b`.
 2. Executor-manager cannot install the application package.
-3. Executor-manager calls `BindExecutorCompleted(e-b, result={ return_code: BIND_RESULT_APPLICATION_INSTALL_FAILED, message: "installer exited with status 127" })`.
-4. Session-manager records `SESSION_BIND_FAILED` with the installation failure code and increments `s2.retry_count`.
+3. HostShim returns the installation error from `create_service`, and executor-manager calls `BindExecutorCompleted(e-b, result={ return_code: BIND_RESULT_SHIM_CREATE_FAILED, message: "shim service creation failed: installer exited with status 127" })`.
+4. Session-manager records `SESSION_BIND_FAILED` with the service-creation failure code and increments `s2.retry_count`.
 5. Executor `e-b` moves from `Binding` to `Unbinding` for cleanup.
 
-Expected outcome: users and metrics can distinguish an installation failure from an `OnSessionEnter` failure using `Result.return_code`.
+Expected outcome: users and metrics can distinguish service creation (including installation) from an `OnSessionEnter` failure using `Result.return_code`.
 
 **Example 3: Repeated Enter Failures**
 
@@ -521,8 +509,7 @@ Expected outcome: no bind failure event.
 
 - `BindExecutorCompletedRequest` with failed `result` records a session event owned by `task_id = 0`.
 - `BindExecutorCompletedRequest` with omitted or successful `result` preserves the current success path.
-- Executor-manager uses `BIND_RESULT_APPLICATION_INSTALL_FAILED` for application installation failures.
-- Executor-manager uses `BIND_RESULT_SHIM_CREATE_FAILED` for shim or service instance creation failures.
+- Executor-manager uses `BIND_RESULT_SHIM_CREATE_FAILED` for shim or service instance creation failures, including Host application installation.
 - Executor-manager uses `BIND_RESULT_ON_SESSION_ENTER_FAILED` for `OnSessionEnter` failures and keeps the service return code in `Result.message`.
 - Executor-manager calls `OnSessionEnter` once per bind attempt and reports failure through `BindExecutorCompletedRequest.result` instead of retrying locally.
 - A failed bind result returns `INVALID_STATE` if the executor no longer has an assigned `ssn_id`.
@@ -545,7 +532,7 @@ Expected outcome: no bind failure event.
   - the event includes `BIND_RESULT_ON_SESSION_ENTER_FAILED`;
   - the executor returns through unbind cleanup;
   - the task remains pending.
-- Force application installation to fail and verify the bind completion uses `BIND_RESULT_APPLICATION_INSTALL_FAILED`.
+- Force application installation to fail and verify the bind completion uses `BIND_RESULT_SHIM_CREATE_FAILED`.
 - Configure `recovery.session.retry_limits = 2` and verify session-manager records the retry-limit event after two failed bind completions, keeps the session open, does not assign or bind another executor to that session, and leaves any already assigned executor unchanged.
 - With `recovery.session.retry_limits = 2`, fail three already-binding executors for the same session and verify `retry_count == 3`, all three `SESSION_BIND_FAILED` events are recorded, and only one `SESSION_RETRY_LIMIT_REACHED` event is recorded.
 

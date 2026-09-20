@@ -32,15 +32,7 @@ impl State for UnbindingState {
         trace_fn!("UnbindingState::execute");
 
         self.client.unbind_executor(&self.executor.clone()).await?;
-        if let Some(shim_ptr) = self.executor.shim_instance.clone() {
-            let mut shim = shim_ptr.lock().await;
-            shim.on_session_leave().await?;
-        } else {
-            tracing::debug!(
-                "Executor <{}> has no shim instance during unbinding; skip on_session_leave",
-                self.executor.id
-            );
-        }
+        self.leave_session().await;
 
         self.client
             .unbind_executor_completed(&self.executor.clone())
@@ -53,6 +45,24 @@ impl State for UnbindingState {
 }
 
 impl UnbindingState {
+    async fn leave_session(&self) {
+        if let Some(shim_ptr) = self.executor.shim_instance.clone() {
+            let mut shim = shim_ptr.lock().await;
+            if let Err(error) = shim.on_session_leave().await {
+                tracing::warn!(
+                    "Executor <{}> session leave failed; completing unbind and retaining the application service: {}",
+                    self.executor.id,
+                    error
+                );
+            }
+        } else {
+            tracing::debug!(
+                "Executor <{}> has no shim instance during unbinding; skip on_session_leave",
+                self.executor.id
+            );
+        }
+    }
+
     fn unbind_completed(&mut self) {
         self.executor.task = None;
         self.executor.session = None;
@@ -65,15 +75,25 @@ impl UnbindingState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::appmgr::ApplicationManager;
     use crate::shims::{SessionEnterResponse, Shim, ShimPtr, TaskInvokeResponse};
     use common::apis::{ResourceRequirement, SessionContext, Shim as ShimType, TaskContext};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
-    struct TestShim;
+    struct TestShim {
+        fail_leave: bool,
+    }
 
     #[async_trait]
     impl Shim for TestShim {
+        async fn create_service(
+            &mut self,
+            _app_manager: Arc<ApplicationManager>,
+        ) -> Result<(), FlameError> {
+            unreachable!()
+        }
+
         async fn on_session_enter(
             &mut self,
             _ctx: &SessionContext,
@@ -89,13 +109,23 @@ mod tests {
         }
 
         async fn on_session_leave(&mut self) -> Result<(), FlameError> {
-            Ok(())
+            if self.fail_leave {
+                Err(FlameError::Internal(
+                    "session was never entered".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn destroy_instance(&mut self) -> Result<(), FlameError> {
+            unreachable!("application-scoped service must survive session unbind")
         }
     }
 
     #[tokio::test]
-    async fn successful_unbind_retains_instance() {
-        let shim: ShimPtr = Arc::new(Mutex::new(TestShim));
+    async fn successful_unbind_retains_application_instance() {
+        let shim: ShimPtr = Arc::new(Mutex::new(TestShim { fail_leave: false }));
         let executor = Executor {
             id: "executor-1".to_string(),
             application: "test-app".to_string(),
@@ -116,6 +146,34 @@ mod tests {
         state.unbind_completed();
 
         assert_eq!(state.executor.state, ExecutorState::Idle);
+        assert!(Arc::ptr_eq(
+            state.executor.shim_instance.as_ref().unwrap(),
+            &shim
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_session_leave_does_not_destroy_application_instance() {
+        let shim: ShimPtr = Arc::new(Mutex::new(TestShim { fail_leave: true }));
+        let executor = Executor {
+            id: "executor-1".to_string(),
+            application: "test-app".to_string(),
+            resreq: ResourceRequirement::default(),
+            node: "node-1".to_string(),
+            shim: ShimType::Host,
+            session: None,
+            task: None,
+            context: None,
+            shim_instance: Some(shim.clone()),
+            state: ExecutorState::Unbinding,
+        };
+        let state = UnbindingState {
+            client: BackendClient::default(),
+            executor,
+        };
+
+        state.leave_session().await;
+
         assert!(Arc::ptr_eq(
             state.executor.shim_instance.as_ref().unwrap(),
             &shim

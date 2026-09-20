@@ -125,20 +125,21 @@ flmctl get app my-app -o yaml
 
 **Related Features:**
 - **flmadm install**: Installs `uv` and `flamepy` as prerequisites
-- **Shims (`executor_manager/src/shims/`)**: Receive environment variables from ApplicationManager
-- **Session Binding (`idle.rs`)**: Calls ApplicationManager before creating shim
+- **Host shim (`executor_manager/src/shims/host_shim.rs`)**: Calls the shared ApplicationManager while creating the host service and merges the returned environment
+- **Session Binding (`idle.rs`)**: Passes the shared ApplicationManager to `create_service`
 - **Runner (`flamepy/runner/runpy.py`)**: Simplified to remove installation logic
 
 **Updates Required:**
 - `runpy.py`: Remove `_install_package_from_url()` method; rely on pre-installed packages
-- `idle.rs`: Add ApplicationManager integration before `shims::new()`
+- `idle.rs`: Pass the shared ApplicationManager to `Shim::create_service`
 - `types.proto`: Add `installer` field to `ApplicationSpec`
 - `common/src/apis/types.rs`: Add `installer` field to `Application`
 - `flmadm`: Ensure `uv` is installed during `flmadm install`
 
 **Integration Points:**
-- ApplicationManager integrates at `IdleState::execute()` before shim creation
-- Environment variables flow: ApplicationManager → Shim → Application process
+- `HostShim::create_service` invokes ApplicationManager before launching the process
+- Environment variables flow: ApplicationManager → HostShim → Application process
+- CRI and WASM shims do not invoke ApplicationManager
 
 **Compatibility:**
 - Backward compatible: Applications without `installer` field work unchanged
@@ -189,11 +190,17 @@ flmctl get app my-app -o yaml
 │  │                                                                        │  │
 │  │  execute() {                                                           │  │
 │  │    ssn = bind_executor()                                              │  │
-│  │    env_vars = app_manager.install(&ssn.application).await?  // NEW    │  │
-│  │    shim = shims::new(&executor, &ssn.application, &env_vars)          │  │
+│  │    shim = shims::new_ptr(&executor, Some(&ssn.application))           │  │
+│  │    shim.create_service(app_manager.clone()).await?                    │  │
 │  │    shim.on_session_enter(&ssn)                                        │  │
 │  │  }                                                                     │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  HostShim::create_service(app_manager)                                       │
+│    1. env_vars = app_manager.install(&app)                                   │
+│    2. create the executor work directory                                     │
+│    3. launch the process with env_vars                                        │
+│    4. connect to its Instance socket                                          │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -666,30 +673,23 @@ pub struct ApplicationContext {
 
 `executor_manager/src/states/idle.rs`:
 ```rust
-// Before shims::new()
-let env_vars = self.app_manager.install(&ssn.application).await?;
-
-// Pass env_vars to shim creation
-let shim_ptr = shims::new(&self.executor, &ssn.application, &env_vars).await?;
+let shim_ptr = shims::new_ptr(&self.executor, Some(&ssn.application))?;
+shim_ptr
+    .lock()
+    .await
+    .create_service(self.app_manager.clone())
+    .await?;
 ```
 
 `executor_manager/src/shims/host_shim.rs`:
 ```rust
-// Merge app_manager env_vars into application launch environment
-impl HostShim {
-    pub async fn new_ptr(
-        executor: &Executor,
-        app: &ApplicationContext,
-        install_env_vars: &HashMap<String, String>,  // New parameter
-    ) -> Result<ShimPtr, FlameError> {
-        // ... existing setup ...
-        
-        // Merge install_env_vars into process environment
-        for (key, value) in install_env_vars {
-            envs.entry(key.clone()).or_insert_with(|| value.clone());
-        }
-        
-        // ... continue with process launch ...
+impl Shim for HostShim {
+    async fn create_service(
+        &mut self,
+        app_manager: Arc<ApplicationManager>,
+    ) -> Result<(), FlameError> {
+        let install_env_vars = app_manager.install(&self.app).await?;
+        // Create the work directory and launch with install_env_vars.
     }
 }
 ```
@@ -717,8 +717,8 @@ def on_session_enter(self, context: SessionContext) -> bool:
 1. Client creates session with application "my-ml-app" (`installer: python`, `url` configured)
 2. Executor becomes idle and calls `bind_executor()`
 3. Session manager returns `SessionContext` with `ApplicationContext` containing installer type and URL
-4. `IdleState::execute()` calls `app_manager.install(&app)`
-5. ApplicationManager:
+4. `IdleState::execute()` constructs `HostShim` and calls `create_service(app_manager)`
+5. `HostShim::create_service()` calls ApplicationManager, which:
    - Parses `installer: python` → `InstallerType::Python`
    - Creates entry with `state: Installing`
    - Downloads package from URL
@@ -726,9 +726,8 @@ def on_session_enter(self, context: SessionContext) -> bool:
    - Runs `uv pip install --target $FLAME_HOME/data/apps/my-ml-app/lib .`
    - Computes `PYTHONPATH` and `LD_LIBRARY_PATH`
    - Updates entry with `state: Installed`, stores env_vars
-6. `IdleState::execute()` calls `shims::new()` with env_vars
-7. HostShim launches application process with `PYTHONPATH` and `LD_LIBRARY_PATH` set
-8. Application starts immediately (packages pre-installed)
+6. HostShim launches the application process with `PYTHONPATH` and `LD_LIBRARY_PATH` set
+7. Application starts immediately (packages pre-installed)
 
 **Expected outcome:** Application starts successfully with all dependencies available.
 
@@ -739,15 +738,14 @@ def on_session_enter(self, context: SessionContext) -> bool:
 **Step-by-step workflow:**
 1. Three executors (E1, E2, E3) become idle simultaneously
 2. All call `bind_executor()` and receive `SessionContext` for "my-ml-app"
-3. All call `app_manager.install(&app)` concurrently
+3. All construct HostShim and call `create_service(app_manager)` concurrently
 4. ApplicationManager:
    - E1 acquires write lock first, starts installation
    - E2, E3 block on write lock
    - E1 completes installation, releases lock
    - E2 acquires lock, sees `state: Installed`, returns env_vars immediately
    - E3 acquires lock, sees `state: Installed`, returns env_vars immediately
-5. All three executors proceed to create shims with env_vars
-6. All three launch applications successfully
+5. All three HostShim instances launch applications with the returned env_vars
 
 **Expected outcome:** Only one installation occurs; all executors get correct env_vars.
 
@@ -757,11 +755,9 @@ def on_session_enter(self, context: SessionContext) -> bool:
 
 **Step-by-step workflow:**
 1. Executor binds to session with "my-wasm-app" (shim: Wasm, no `installer` field)
-2. `IdleState::execute()` calls `app_manager.install(&app)`
-3. ApplicationManager sees `app.installer` is None
-4. Returns empty `HashMap` immediately (no installation needed)
-5. WasmShim loads `.wasm` component from `app.command` path
-6. Application executes tasks directly
+2. `IdleState::execute()` constructs WasmShim and calls `create_service(app_manager)`
+3. WasmShim ignores ApplicationManager and loads the component from `app.command`
+4. Application executes tasks directly
 
 **Expected outcome:** No installation; WASM application runs immediately.
 
@@ -771,11 +767,10 @@ def on_session_enter(self, context: SessionContext) -> bool:
 
 **Step-by-step workflow:**
 1. Executor binds to session with "flmping" application (no `installer`, no `url`)
-2. `IdleState::execute()` calls `app_manager.install(&app)`
-3. ApplicationManager sees `app.installer` is None
-4. Returns empty `HashMap` immediately
-5. HostShim spawns process using system-installed binary
-6. Application starts using pre-installed binaries
+2. `IdleState::execute()` constructs HostShim and calls `create_service(app_manager)`
+3. HostShim calls ApplicationManager, which returns an empty environment because no URL is configured
+4. HostShim spawns the system-installed binary
+5. Application starts using pre-installed binaries
 
 **Expected outcome:** No installation; application starts immediately.
 
@@ -784,11 +779,11 @@ def on_session_enter(self, context: SessionContext) -> bool:
 **Description:** Package installation fails and subsequent executor attempts.
 
 **Step-by-step workflow:**
-1. First executor calls `app_manager.install(&app)` for app with `installer: python`
+1. First executor calls `HostShim::create_service(app_manager)` for an app with `installer: python`
 2. Installation fails (e.g., network error, invalid package, uv not found)
 3. ApplicationManager stores `state: Failed("uv pip install failed. See log: ...")`
-4. Returns error to first executor, which fails binding
-5. Second executor calls `app_manager.install(&app)`
+4. Returns the error from `create_service`; the first executor fails binding
+5. A second executor calls `HostShim::create_service(app_manager)`
 6. ApplicationManager sees `state: Failed`, returns cached error immediately
 7. Administrator fixes issue and updates application via `flmctl apply`
 8. Session manager notifies executor manager of application update

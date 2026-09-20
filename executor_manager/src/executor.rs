@@ -206,6 +206,8 @@ pub fn start(client: BackendClient, executor: ExecutorPtr, app_manager: Arc<Appl
                         error = %e,
                         "Failed to execute executor state"
                     );
+                    // State/RPC errors are not necessarily shim crashes. Keep the worker alive so
+                    // session-manager can drive the executor through unbinding and release.
                 }
             }
         }

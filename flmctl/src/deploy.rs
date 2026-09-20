@@ -318,8 +318,9 @@ fn parse_shim(value: Option<&str>) -> Result<Option<Shim>, FlameError> {
         None => Ok(Some(Shim::Host)),
         Some("Host") | Some("host") => Ok(Some(Shim::Host)),
         Some("Wasm") | Some("wasm") | Some("WASM") => Ok(Some(Shim::Wasm)),
+        Some("Cri") | Some("cri") | Some("CRI") => Ok(Some(Shim::Cri)),
         Some(other) => Err(FlameError::InvalidConfig(format!(
-            "invalid shim value '{}'. Must be Host or Wasm",
+            "invalid shim value '{}'. Must be Host, Wasm, or Cri",
             other
         ))),
     }

@@ -23,3 +23,122 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Cargo test
         run: cargo test --workspace --exclude flame-rs --exclude cri-rs
+
+  cri-shim-e2e:
+    name: CRI Shim E2E
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Install CRI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            apt-transport-https \
+            ca-certificates \
+            containernetworking-plugins \
+            curl \
+            gnupg \
+            protobuf-compiler
+          if ! command -v containerd >/dev/null; then
+            sudo apt-get install -y containerd
+          fi
+          curl -fsSL https://gvisor.dev/archive.key \
+            | sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+            | sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y runsc
+          runsc --version
+      - name: Configure containerd CRI and CNI
+        run: |
+          sudo systemctl stop containerd
+          sudo install -d /etc/containerd
+          containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+
+          sudo sed -i -E \
+            "s/(default_runtime_name[[:space:]]*=[[:space:]]*)['\"]runc['\"]/\1'runsc'/" \
+            /etc/containerd/config.toml
+          if grep -q 'io.containerd.cri.v1.runtime' /etc/containerd/config.toml; then
+            sudo tee -a /etc/containerd/config.toml >/dev/null <<'EOF'
+          [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc]
+            runtime_type = 'io.containerd.runsc.v1'
+          [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc.options]
+            TypeUrl = 'io.containerd.runsc.v1.options'
+            ConfigPath = '/etc/containerd/runsc.toml'
+          EOF
+          elif grep -q 'io.containerd.grpc.v1.cri' /etc/containerd/config.toml; then
+            sudo tee -a /etc/containerd/config.toml >/dev/null <<'EOF'
+          [plugins.'io.containerd.grpc.v1.cri'.containerd.runtimes.runsc]
+            runtime_type = 'io.containerd.runsc.v1'
+          [plugins.'io.containerd.grpc.v1.cri'.containerd.runtimes.runsc.options]
+            TypeUrl = 'io.containerd.runsc.v1.options'
+            ConfigPath = '/etc/containerd/runsc.toml'
+          EOF
+          else
+            echo 'unsupported containerd config version' >&2
+            exit 1
+          fi
+          grep -Eq "default_runtime_name[[:space:]]*=[[:space:]]*['\"]runsc['\"]" \
+            /etc/containerd/config.toml
+          command -v containerd-shim-runsc-v1
+          sudo tee /etc/containerd/runsc.toml >/dev/null <<'EOF'
+          [runsc_config]
+            host-uds = 'create'
+          EOF
+          sudo containerd --config /etc/containerd/config.toml config dump >/dev/null
+
+          sudo install -d /opt/cni/bin /etc/cni/net.d
+          for plugin in /usr/lib/cni/*; do
+            sudo ln -sf "${plugin}" "/opt/cni/bin/$(basename "${plugin}")"
+          done
+          sudo tee /etc/cni/net.d/00-flame.conflist >/dev/null <<'EOF'
+          {
+            "cniVersion": "1.0.0",
+            "name": "flame",
+            "plugins": [
+              {
+                "type": "bridge",
+                "bridge": "flame0",
+                "isGateway": true,
+                "ipMasq": true,
+                "ipam": {
+                  "type": "host-local",
+                  "ranges": [[{"subnet": "10.250.0.0/16"}]],
+                  "routes": [{"dst": "0.0.0.0/0"}]
+                }
+              },
+              {
+                "type": "portmap",
+                "capabilities": {"portMappings": true}
+              }
+            ]
+          }
+          EOF
+
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo systemctl restart containerd
+          sudo chown "${USER}:$(id -gn)" /run/containerd/containerd.sock
+          test -S /run/containerd/containerd.sock
+          sudo ctr plugins ls
+      - name: Run CRI shim E2E
+        timeout-minutes: 15
+        run: |
+          cargo test -p cri-rs --test cri_shim_e2e -- --ignored --nocapture --test-threads=1
+      - name: Print containerd diagnostics
+        if: always()
+        run: |
+          sudo ctr plugins ls || true
+          sudo ctr --namespace k8s.io images list || true
+          sudo ctr --namespace k8s.io containers list || true
+          sudo ctr --namespace k8s.io tasks list || true
+          sudo journalctl -u containerd --no-pager -n 300 || true
+          ip address show || true
+          ip route show || true
+      - name: Stop containerd
+        if: always()
+        run: sudo systemctl stop containerd

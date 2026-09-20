@@ -37,7 +37,7 @@ use tokio::sync::RwLock;
 use tonic::transport::ClientTlsConfig;
 
 use common::apis::ApplicationContext;
-use common::{get_python_runtime, FlameError, FLAME_PYTHON_VERSION_ENV};
+use common::{get_python_runtime, FlameError, PythonRuntime, FLAME_PYTHON_VERSION_ENV};
 
 #[derive(Clone, Debug, Eq)]
 struct InstallKey {
@@ -123,9 +123,30 @@ pub struct AppInstaller {
     pub name: String,
     pub installer_type: InstallerType,
     pub state: InstallState,
-    pub install_path: PathBuf,
     pub env_vars: HashMap<String, String>,
+    pub mounts: Vec<InstallationMount>,
     pub installed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallationMountKind {
+    Release,
+    PythonRuntime,
+    UvCache,
+    PipCache,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstallationMount {
+    pub host_path: PathBuf,
+    pub kind: InstallationMountKind,
+    pub readonly: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ApplicationInstallation {
+    pub env_vars: HashMap<String, String>,
+    pub mounts: Vec<InstallationMount>,
 }
 
 impl AppInstaller {
@@ -134,11 +155,55 @@ impl AppInstaller {
             name: name.to_string(),
             installer_type,
             state: InstallState::NotInstalled,
-            install_path: PathBuf::new(),
             env_vars: HashMap::new(),
+            mounts: Vec::new(),
             installed_at: None,
         }
     }
+
+    fn installation(&self) -> ApplicationInstallation {
+        ApplicationInstallation {
+            env_vars: self.env_vars.clone(),
+            mounts: self.mounts.clone(),
+        }
+    }
+}
+
+fn installation_mounts(
+    flame_home: &Path,
+    release_path: &Path,
+    installer_type: &InstallerType,
+    python_runtime: Option<&PythonRuntime>,
+) -> Vec<InstallationMount> {
+    let mut mounts = vec![InstallationMount {
+        host_path: release_path.to_path_buf(),
+        kind: InstallationMountKind::Release,
+        readonly: true,
+    }];
+    if installer_type == &InstallerType::Python {
+        if let Some(site_packages) =
+            python_runtime.and_then(|runtime| runtime.site_packages.clone())
+        {
+            mounts.push(InstallationMount {
+                host_path: site_packages,
+                kind: InstallationMountKind::PythonRuntime,
+                readonly: true,
+            });
+        }
+        mounts.extend([
+            InstallationMount {
+                host_path: flame_home.join("data/cache/uv"),
+                kind: InstallationMountKind::UvCache,
+                readonly: false,
+            },
+            InstallationMount {
+                host_path: flame_home.join("data/cache/pip"),
+                kind: InstallationMountKind::PipCache,
+                readonly: false,
+            },
+        ]);
+    }
+    mounts
 }
 
 pub struct ApplicationManager {
@@ -167,23 +232,32 @@ impl ApplicationManager {
     pub async fn install(
         &self,
         app: &ApplicationContext,
-    ) -> Result<HashMap<String, String>, FlameError> {
+    ) -> Result<ApplicationInstallation, FlameError> {
+        if app.url.is_none() {
+            tracing::debug!(
+                "No package URL configured for app <{}>, skipping installation",
+                app.name
+            );
+            return Ok(ApplicationInstallation::default());
+        }
         let installer_type = match &app.installer {
             None => {
                 tracing::debug!("No installer configured for app <{}>, skipping", app.name);
-                return Ok(HashMap::new());
+                return Ok(ApplicationInstallation::default());
             }
             Some(installer_str) => installer_str.parse::<InstallerType>()?,
         };
-        let python_version = (installer_type == InstallerType::Python).then(|| {
+        let python_runtime = (installer_type == InstallerType::Python).then(|| {
             get_python_runtime(
                 &self.flame_home,
                 app.environments
                     .get(FLAME_PYTHON_VERSION_ENV)
                     .map(|s| s.as_str()),
             )
-            .version
         });
+        let python_version = python_runtime
+            .as_ref()
+            .map(|runtime| runtime.version.clone());
         let install_key = InstallKey::new(
             &app.name,
             &installer_type,
@@ -199,7 +273,7 @@ impl ApplicationManager {
             if let Some(installed) = app_entry {
                 let installed = installed.read().await;
                 if installed.state == InstallState::Installed {
-                    return Ok(installed.env_vars.clone());
+                    return Ok(installed.installation());
                 }
             }
         }
@@ -219,7 +293,7 @@ impl ApplicationManager {
         let mut installed = app_entry.write().await;
 
         if installed.state == InstallState::Installed {
-            return Ok(installed.env_vars.clone());
+            return Ok(installed.installation());
         }
 
         if let InstallState::Failed(msg) = &installed.state {
@@ -228,21 +302,7 @@ impl ApplicationManager {
 
         installed.state = InstallState::Installing;
 
-        // If no URL is provided, return base env vars (for built-in apps like flmrun)
-        let url = match app.url.as_ref() {
-            None => {
-                tracing::debug!(
-                    "No URL configured for app <{}> with installer, using base env",
-                    app.name
-                );
-                let env_vars = self.get_base_env_vars(&app.environments);
-                installed.state = InstallState::Installed;
-                installed.env_vars = env_vars.clone();
-                installed.installed_at = Some(Utc::now());
-                return Ok(env_vars);
-            }
-            Some(url) => url,
-        };
+        let url = app.url.as_ref().expect("URL presence checked above");
 
         let release_path = self
             .flame_home
@@ -274,11 +334,16 @@ impl ApplicationManager {
         };
 
         installed.state = InstallState::Installed;
-        installed.install_path = src_path;
         installed.env_vars = env_vars.clone();
+        installed.mounts = installation_mounts(
+            &self.flame_home,
+            &release_path,
+            &installer_type,
+            python_runtime.as_ref(),
+        );
         installed.installed_at = Some(Utc::now());
 
-        Ok(env_vars)
+        Ok(installed.installation())
     }
 
     pub fn is_installed(&self, app_name: &str) -> bool {
@@ -294,64 +359,6 @@ impl ApplicationManager {
             }
         }
         false
-    }
-
-    fn get_base_env_vars(
-        &self,
-        app_environments: &HashMap<String, String>,
-    ) -> HashMap<String, String> {
-        let mut env_vars = HashMap::new();
-
-        let requested_python_version = app_environments
-            .get(FLAME_PYTHON_VERSION_ENV)
-            .map(|s| s.as_str());
-
-        let runtime = get_python_runtime(&self.flame_home, requested_python_version);
-        if let Some(site_packages) = runtime.site_packages {
-            env_vars.insert(FLAME_PYTHON_VERSION_ENV.to_string(), runtime.version);
-            let site_packages_str = site_packages.to_string_lossy().to_string();
-
-            let mut python_paths = vec![site_packages_str.clone()];
-            if let Some(app_pythonpath) = app_environments.get("PYTHONPATH") {
-                python_paths.push(app_pythonpath.clone());
-            }
-            env_vars.insert("PYTHONPATH".to_string(), python_paths.join(":"));
-
-            let mut ld_paths = Self::find_native_lib_paths(&site_packages);
-            if let Some(app_ld_path) = app_environments.get("LD_LIBRARY_PATH") {
-                ld_paths.push(app_ld_path.clone());
-            }
-            if !ld_paths.is_empty() {
-                env_vars.insert("LD_LIBRARY_PATH".to_string(), ld_paths.join(":"));
-            }
-        }
-
-        env_vars
-    }
-
-    fn find_native_lib_paths(site_packages: &Path) -> Vec<String> {
-        let mut paths = std::collections::HashSet::new();
-
-        fn scan_dir(dir: &Path, paths: &mut std::collections::HashSet<String>, depth: usize) {
-            if depth > 4 {
-                return;
-            }
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        scan_dir(&path, paths, depth + 1);
-                    } else if path.extension().map(|e| e == "so").unwrap_or(false) {
-                        if let Some(parent) = path.parent() {
-                            paths.insert(parent.to_string_lossy().to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        scan_dir(site_packages, &mut paths, 0);
-        paths.into_iter().collect()
     }
 
     async fn download_package(
@@ -448,6 +455,7 @@ impl Default for ApplicationManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::apis::Shim;
 
     #[test]
     fn release_id_is_stable_sha256() {
@@ -487,5 +495,89 @@ mod tests {
         let with_py312 = InstallKey::new("demo", &InstallerType::Python, Some(&url), Some(&py312));
 
         assert_ne!(with_py311.release_id(), with_py312.release_id());
+    }
+
+    #[test]
+    fn installation_preserves_runtime_mounts() {
+        let mut installed = AppInstaller::new("demo", InstallerType::Python);
+        installed.env_vars = HashMap::from([(
+            "PYTHONPATH".to_string(),
+            "/opt/flame/data/apps/demo/releases/hash/deps".to_string(),
+        )]);
+        installed.mounts = vec![InstallationMount {
+            host_path: PathBuf::from("/opt/flame/data/apps/demo/releases/hash"),
+            kind: InstallationMountKind::Release,
+            readonly: true,
+        }];
+
+        let installation = installed.installation();
+
+        assert_eq!(installation.mounts, installed.mounts);
+        assert_eq!(installation.env_vars, installed.env_vars);
+    }
+
+    #[test]
+    fn python_installation_mounts_release_runtime_and_writable_caches() {
+        let runtime = PythonRuntime {
+            version: "3.12".to_string(),
+            site_packages: Some(PathBuf::from("/opt/flame/lib/python3.12/site-packages")),
+        };
+
+        let mounts = installation_mounts(
+            Path::new("/opt/flame"),
+            Path::new("/opt/flame/data/apps/demo/releases/hash"),
+            &InstallerType::Python,
+            Some(&runtime),
+        );
+
+        assert_eq!(mounts.len(), 4);
+        assert_eq!(mounts[0].kind, InstallationMountKind::Release);
+        assert_eq!(mounts[1].kind, InstallationMountKind::PythonRuntime);
+        assert!(mounts[0].readonly);
+        assert!(mounts[1].readonly);
+        assert_eq!(mounts[2].kind, InstallationMountKind::UvCache);
+        assert_eq!(mounts[3].kind, InstallationMountKind::PipCache);
+        assert!(!mounts[2].readonly);
+        assert!(!mounts[3].readonly);
+    }
+
+    #[tokio::test]
+    async fn image_only_application_skips_installation() {
+        let manager = ApplicationManager::new().unwrap();
+        let app = ApplicationContext {
+            name: "image-only".to_string(),
+            shim: Shim::Cri,
+            image: Some("example/image:latest".to_string()),
+            command: None,
+            arguments: vec![],
+            working_directory: None,
+            environments: HashMap::new(),
+            url: None,
+            installer: Some("not-a-real-installer".to_string()),
+        };
+
+        let installation = manager.install(&app).await.unwrap();
+        assert!(installation.env_vars.is_empty());
+        assert!(installation.mounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn url_less_host_installer_is_a_no_op() {
+        let manager = ApplicationManager::new().unwrap();
+        let app = ApplicationContext {
+            name: "flmrun".to_string(),
+            shim: Shim::Host,
+            image: None,
+            command: None,
+            arguments: vec![],
+            working_directory: None,
+            environments: HashMap::new(),
+            url: None,
+            installer: Some("python".to_string()),
+        };
+
+        let installation = manager.install(&app).await.unwrap();
+        assert!(installation.env_vars.is_empty());
+        assert!(installation.mounts.is_empty());
     }
 }

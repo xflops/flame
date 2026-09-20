@@ -22,8 +22,8 @@ use crate::executor::Executor;
 use crate::shims;
 use crate::states::State;
 use common::apis::{
-    ExecutorState, FlameResult, BIND_RESULT_APPLICATION_INSTALL_FAILED, BIND_RESULT_OK,
-    BIND_RESULT_ON_SESSION_ENTER_FAILED, BIND_RESULT_SHIM_CREATE_FAILED,
+    ExecutorState, FlameResult, BIND_RESULT_OK, BIND_RESULT_ON_SESSION_ENTER_FAILED,
+    BIND_RESULT_SHIM_CREATE_FAILED,
 };
 use common::FlameError;
 
@@ -98,21 +98,7 @@ impl State for IdleState {
                 shim_ptr
             }
             None => {
-                let env_vars = match self.app_manager.install(&ssn.application).await {
-                    Ok(env_vars) => env_vars,
-                    Err(e) => {
-                        self.bind_executor_failed(
-                            BIND_RESULT_APPLICATION_INSTALL_FAILED,
-                            format!("application installation failed: {e}"),
-                            &ssn,
-                            None,
-                        )
-                        .await?;
-                        return Ok(self.executor.clone());
-                    }
-                };
-
-                match shims::new(&self.executor.clone(), &ssn.application, &env_vars).await {
+                let shim_ptr = match shims::new_ptr(&self.executor, Some(&ssn.application)) {
                     Ok(shim_ptr) => shim_ptr,
                     Err(e) => {
                         self.bind_executor_failed(
@@ -124,7 +110,24 @@ impl State for IdleState {
                         .await?;
                         return Ok(self.executor.clone());
                     }
+                };
+
+                let create_result = {
+                    let mut shim = shim_ptr.lock().await;
+                    shim.create_service(self.app_manager.clone()).await
+                };
+                if let Err(error) = create_result {
+                    self.bind_executor_failed(
+                        BIND_RESULT_SHIM_CREATE_FAILED,
+                        format!("shim service creation failed: {error}"),
+                        &ssn,
+                        None,
+                    )
+                    .await?;
+                    return Ok(self.executor.clone());
                 }
+
+                shim_ptr
             }
         };
 

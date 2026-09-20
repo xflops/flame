@@ -64,9 +64,10 @@ impl TryFrom<&ApplicationYaml> for ApplicationAttributes {
         let shim = match yaml.spec.shim.as_deref() {
             Some("Host") | Some("host") | None => Some(Shim::Host),
             Some("Wasm") | Some("wasm") | Some("WASM") => Some(Shim::Wasm),
+            Some("Cri") | Some("cri") | Some("CRI") => Some(Shim::Cri),
             Some(other) => {
                 return Err(FlameError::InvalidConfig(format!(
-                    "Invalid shim value '{}'. Must be 'Host' or 'Wasm'.",
+                    "Invalid shim value '{}'. Must be 'Host', 'Wasm', or 'Cri'.",
                     other
                 )))
             }

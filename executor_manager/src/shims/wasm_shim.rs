@@ -11,7 +11,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -22,6 +21,7 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
+use crate::appmgr::ApplicationManager;
 use crate::executor::Executor;
 use crate::shims::wasm_shim::exports::component::flame::service;
 use crate::shims::{Shim, ShimPtr};
@@ -39,18 +39,37 @@ wasmtime::component::bindgen!({
 // and non-blocking. For long-running Wasm tasks, consider using tokio::task::spawn_blocking.
 
 pub struct WasmShim {
+    app: apis::ApplicationContext,
     session_context: Option<apis::SessionContext>,
+    runtime: Option<WasmRuntime>,
+}
+
+struct WasmRuntime {
     instance: Flame,
     store: Store<ServerWasiView>,
 }
 
 impl WasmShim {
-    pub async fn new_ptr(
-        _: &Executor,
-        app: &apis::ApplicationContext,
-        _install_env_vars: &HashMap<String, String>,
-    ) -> Result<ShimPtr, common::FlameError> {
+    pub fn new_ptr(_: &Executor, app: &apis::ApplicationContext) -> ShimPtr {
         trace_fn!("WasmShim::new_ptr");
+
+        Arc::new(Mutex::new(WasmShim {
+            app: app.clone(),
+            runtime: None,
+            session_context: None,
+        }))
+    }
+}
+
+#[async_trait]
+impl Shim for WasmShim {
+    async fn create_service(
+        &mut self,
+        _app_manager: Arc<ApplicationManager>,
+    ) -> Result<(), common::FlameError> {
+        if self.runtime.is_some() {
+            return Ok(());
+        }
 
         let mut config = Config::default();
         config.wasm_component_model(true);
@@ -63,7 +82,8 @@ impl WasmShim {
         let wasi_view = ServerWasiView::new();
         let mut store = Store::new(&engine, wasi_view);
 
-        let cmd = app
+        let cmd = self
+            .app
             .command
             .clone()
             .ok_or(FlameError::InvalidConfig("command is empty".to_string()))?;
@@ -76,16 +96,10 @@ impl WasmShim {
             common::FlameError::Internal(format!("Failed to instantiate the flame world: {}", e))
         })?;
 
-        Ok(Arc::new(Mutex::new(WasmShim {
-            store,
-            instance,
-            session_context: None,
-        })))
+        self.runtime = Some(WasmRuntime { store, instance });
+        Ok(())
     }
-}
 
-#[async_trait]
-impl Shim for WasmShim {
     async fn on_session_enter(
         &mut self,
         ctx: &apis::SessionContext,
@@ -97,10 +111,14 @@ impl Shim for WasmShim {
             common_data: ctx.common_data.clone().map(apis::CommonData::into),
         };
 
-        let _ = self
+        let runtime = self
+            .runtime
+            .as_mut()
+            .ok_or_else(|| FlameError::InvalidState("Wasm instance is not created".to_string()))?;
+        let _ = runtime
             .instance
             .component_flame_service()
-            .call_on_session_enter(&mut self.store, &ssn_ctx)
+            .call_on_session_enter(&mut runtime.store, &ssn_ctx)
             .map_err(|e| common::FlameError::Internal(e.to_string()))?
             .map_err(|e| common::FlameError::Internal(e.message))?;
 
@@ -122,11 +140,15 @@ impl Shim for WasmShim {
             task_id: ctx.task_id.clone(),
         };
 
-        let result = self
+        let runtime = self
+            .runtime
+            .as_mut()
+            .ok_or_else(|| FlameError::InvalidState("Wasm instance is not created".to_string()))?;
+        let result = runtime
             .instance
             .component_flame_service()
             .call_on_task_invoke(
-                &mut self.store,
+                &mut runtime.store,
                 &task_ctx,
                 ctx.input.clone().map(apis::TaskInput::into).as_ref(),
             )
@@ -170,13 +192,23 @@ impl Shim for WasmShim {
             common_data: None,
         };
 
-        let _ = self
+        let runtime = self
+            .runtime
+            .as_mut()
+            .ok_or_else(|| FlameError::InvalidState("Wasm instance is not created".to_string()))?;
+        let _ = runtime
             .instance
             .component_flame_service()
-            .call_on_session_leave(&mut self.store, &ssn_ctx)
+            .call_on_session_leave(&mut runtime.store, &ssn_ctx)
             .map_err(|e| common::FlameError::Internal(e.to_string()))?
             .map_err(|e| common::FlameError::Internal(e.message))?;
 
+        Ok(())
+    }
+
+    async fn destroy_instance(&mut self) -> Result<(), common::FlameError> {
+        self.session_context = None;
+        self.runtime = None;
         Ok(())
     }
 }

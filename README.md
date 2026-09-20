@@ -49,7 +49,7 @@ root@06383dd94875:/# flmctl list -s
 
 **Task:** A task within a `Session` contains the main algorithm defined by the task's metadata and input/output information (e.g., volume paths).
 
-**Executor:** The Executor manages the lifecycle of Applications/Services, which contain the user's code for executing tasks. Applications are typically not reused between sessions, though images may be reused to avoid repeated downloads.
+**Executor:** The Executor manages the lifecycle of an Application/Service, which contains the user's code for executing tasks. An idle executor may retain its application instance and reuse it across compatible sessions until the executor is released.
 
 **Shim:** The protocol implementation used by the Executor to manage applications, supporting various protocols such as gRPC, RESTful APIs, stdio, and more.
 
@@ -59,7 +59,7 @@ Flame accepts connections from user clients and creates `Session`s for jobs. Cli
 
 The `Session Scheduler` allocates resources to each session based on scheduling configurations by requesting the resource manager (e.g., Kubernetes) to launch executors.
 
-Executors connect back to Flame via `gRPC` to pull tasks from their related `Session` and reuse the executor. Executors are released/deleted when no more tasks remain in the related session.
+Executors connect back to Flame via `gRPC` to pull tasks from their bound `Session`. After unbinding, an executor may be reused by another session of the same application; it is released after the application's configured idle delay or when the application is removed.
 
 Services receive notifications when they're bound or unbound to related sessions, allowing them to take appropriate actions (e.g., connecting to databases). Services can then pull tasks from the `Session` and reuse data to accelerate execution.
 

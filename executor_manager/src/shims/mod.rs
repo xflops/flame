@@ -11,12 +11,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod cri_shim;
 mod grpc_shim;
 mod host_shim;
 #[cfg(feature = "wasm")]
 mod wasm_shim;
 
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,10 +26,12 @@ use async_trait::async_trait;
 use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 
+use self::cri_shim::CriShim;
 use self::host_shim::HostShim;
 #[cfg(feature = "wasm")]
 use self::wasm_shim::WasmShim;
 
+use crate::appmgr::ApplicationManager;
 use crate::executor::Executor;
 use common::apis::{
     ApplicationContext, SessionContext, Shim as ShimType, TaskContext, TaskOutput, TaskResult,
@@ -202,13 +204,14 @@ impl Drop for ExecutorWorkDir {
     }
 }
 
-/// Create a new shim instance based on executor's cluster context configuration.
-/// The shim type is determined by the executor-manager's flame-cluster.yaml config,
-/// not from the application context (which is deprecated).
-pub async fn new(
+/// Create a shim from the executor-manager's configured runtime.
+///
+/// A normal application-scoped shim requires `Some(app)`. `None` requests a
+/// cleanup-only shim for a runtime that can outlive executor-manager; currently
+/// only CRI needs one because containerd retains its workload across restarts.
+pub fn new_ptr(
     executor: &Executor,
-    app: &ApplicationContext,
-    install_env_vars: &HashMap<String, String>,
+    app: Option<&ApplicationContext>,
 ) -> Result<ShimPtr, FlameError> {
     // Get shim type from executor's cluster context configuration
     let shim_type = executor
@@ -223,19 +226,30 @@ pub async fn new(
         shim_type
     );
 
-    match shim_type {
+    match (shim_type, app) {
         #[cfg(feature = "wasm")]
-        ShimType::Wasm => Ok(WasmShim::new_ptr(executor, app, install_env_vars).await?),
+        (ShimType::Wasm, Some(app)) => Ok(WasmShim::new_ptr(executor, app)),
         #[cfg(not(feature = "wasm"))]
-        ShimType::Wasm => Err(FlameError::InvalidConfig(
+        (ShimType::Wasm, Some(_)) => Err(FlameError::InvalidConfig(
             "WASM shim is not enabled. Rebuild with --features wasm".to_string(),
         )),
-        ShimType::Host => Ok(HostShim::new_ptr(executor, app, install_env_vars).await?),
+        (ShimType::Host, Some(app)) => Ok(HostShim::new_ptr(executor, app)),
+        (ShimType::Cri, app) => Ok(CriShim::new_ptr(executor, app)),
+        (ShimType::Host | ShimType::Wasm, None) => Err(FlameError::InvalidConfig(format!(
+            "{:?} shim requires an application context",
+            shim_type
+        ))),
     }
 }
 
 #[async_trait]
 pub trait Shim: Send + 'static {
+    /// Creates the application-scoped runtime service. Called once when the
+    /// executor first receives an application session.
+    async fn create_service(
+        &mut self,
+        app_manager: Arc<ApplicationManager>,
+    ) -> Result<(), FlameError>;
     async fn on_session_enter(
         &mut self,
         ctx: &SessionContext,
@@ -243,17 +257,57 @@ pub trait Shim: Send + 'static {
     async fn on_task_invoke(&mut self, ctx: &TaskContext)
         -> Result<TaskInvokeResponse, FlameError>;
     async fn on_session_leave(&mut self) -> Result<(), FlameError>;
+    /// Destroys the application-scoped runtime service when its executor is
+    /// released (or when cleaning up that executor after manager restart).
+    async fn destroy_instance(&mut self) -> Result<(), FlameError>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::apis::{ExecutorState, ResourceRequirement};
+    use common::ctx::FlameClusterContext;
     use std::collections::HashMap;
     use std::fs::File;
     use std::sync::Mutex;
     use tempfile::tempdir;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn create_test_executor(shim: ShimType) -> Executor {
+        let mut context = FlameClusterContext::default();
+        context.cluster.executors.shim = shim;
+        Executor {
+            id: "executor-1".to_string(),
+            application: "test-app".to_string(),
+            resreq: ResourceRequirement::default(),
+            node: "node-1".to_string(),
+            shim,
+            session: None,
+            task: None,
+            context: Some(context),
+            shim_instance: None,
+            state: ExecutorState::Idle,
+        }
+    }
+
+    #[test]
+    fn host_and_wasm_require_application_context() {
+        for shim in [ShimType::Host, ShimType::Wasm] {
+            let error = match new_ptr(&create_test_executor(shim), None) {
+                Ok(_) => panic!("{shim:?} unexpectedly accepted no application context"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("requires an application context"));
+        }
+    }
+
+    #[test]
+    fn cri_accepts_missing_application_for_cleanup() {
+        assert!(new_ptr(&create_test_executor(ShimType::Cri), None).is_ok());
+    }
 
     fn create_test_app(name: &str, working_directory: Option<String>) -> ApplicationContext {
         ApplicationContext {
