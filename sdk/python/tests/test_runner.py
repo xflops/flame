@@ -107,6 +107,23 @@ class TestCacheStorage:
 
         assert url == "grpc://10.0.0.42:9090/myapp/pkg/myapp-1.0.0.tar.gz"
 
+    def test_upload_converts_flight_tls_scheme_for_package_url(self, monkeypatch, tmp_path):
+        from flamepy.core.cache import ObjectRef
+
+        test_file = tmp_path / "myapp-1.0.0.tar.gz"
+        test_file.write_bytes(b"package content")
+
+        def mock_upload_object(key, file_path, endpoint=None):
+            assert endpoint == "grpcs://cache-service:9090"
+            return ObjectRef(endpoint="grpc+tls://10.0.0.42:9090", key=key, version=1)
+
+        monkeypatch.setattr("flamepy.core.cache.upload_object", mock_upload_object)
+
+        storage = CacheStorage("grpcs://cache-service:9090", app_name="myapp")
+        url = storage.upload(str(test_file), "myapp-1.0.0.tar.gz")
+
+        assert url == "grpcs://10.0.0.42:9090/myapp/pkg/myapp-1.0.0.tar.gz"
+
     def test_download(self, monkeypatch, tmp_path):
         dest_file = tmp_path / "downloaded.tar.gz"
 

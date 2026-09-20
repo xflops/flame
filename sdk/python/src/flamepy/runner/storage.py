@@ -325,8 +325,12 @@ class CacheStorage(StorageBackend):
             ref = upload_object(key, local_path, endpoint=self._endpoint)
             # Preserve the server-returned owning-cache endpoint so consumers
             # such as executor-manager do not receive this external client's
-            # proxy endpoint.
-            url = f"{ref.endpoint.rstrip('/')}/{ref.key}"
+            # proxy endpoint. Arrow Flight spells secure locations as
+            # ``grpc+tls``, while Flame package URLs use ``grpcs``.
+            package_endpoint = ref.endpoint
+            if package_endpoint.startswith("grpc+tls://"):
+                package_endpoint = package_endpoint.replace("grpc+tls://", "grpcs://", 1)
+            url = f"{package_endpoint.rstrip('/')}/{ref.key}"
             logger.debug(f"Uploaded package to cache: {url}")
             return url
         except Exception as e:
