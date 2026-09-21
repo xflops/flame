@@ -1,0 +1,18 @@
+---
+cluster:
+  name: flame-cri-e2e
+  endpoint: "http://10.250.0.1:8080"
+  resreq: "cpu=1,mem=512m"
+  policies:
+    - priority
+    - drf
+    - das
+  storage: "fs:///opt/flame-test/data/session"
+  executors:
+    shim: cri
+  limits:
+    max_executors: 16
+cache:
+  endpoint: "grpc://10.250.0.1:9090"
+  network_interface: "flame0"
+  storage: "/opt/flame-test/data/cache"

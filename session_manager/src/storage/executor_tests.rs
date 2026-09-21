@@ -15,7 +15,10 @@ limitations under the License.
 mod tests {
     use crate::model::{Executor, ExecutorFilter};
     use crate::storage;
-    use common::apis::{ExecutorState, Node, NodeState, ResourceRequirement, SessionAttributes};
+    use common::apis::{
+        ApplicationAttributes, ExecutorState, Node, NodeState, ResourceRequirement,
+        SessionAttributes, Shim,
+    };
     use common::ctx::{FlameCluster, FlameClusterContext};
     use stdng::lock_ptr;
 
@@ -95,6 +98,33 @@ mod tests {
                 .unwrap();
 
             assert_ne!(exec1.id, exec2.id);
+        }
+
+        #[tokio::test]
+        async fn uses_application_shim() {
+            let ctx = test_context();
+            let storage = storage::new_ptr(&ctx).await.unwrap();
+            storage
+                .register_application(
+                    "test-app".to_string(),
+                    ApplicationAttributes {
+                        shim: Shim::Cri,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            storage
+                .create_session(create_session_attr("cri-exec-ssn"))
+                .await
+                .unwrap();
+
+            let executor = storage
+                .create_executor("cri-node".to_string(), "cri-exec-ssn".to_string())
+                .await
+                .unwrap();
+
+            assert_eq!(executor.shim, Shim::Cri);
         }
 
         #[tokio::test]

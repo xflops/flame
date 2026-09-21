@@ -38,7 +38,8 @@ class DataAwareService(RunnerService):
         # Keep identity independent of the execution-object lifecycle so this
         # helper also covers function and supplied-object services.
         self.instance_key = f"e2e:data-aware:{socket.gethostname()}:{os.getpid()}".encode()
-        self.executor_id = Path(os.environ["FLAME_INSTANCE_ENDPOINT"]).stem
+        endpoint = Path(os.environ["FLAME_INSTANCE_ENDPOINT"])
+        self.executor_id = endpoint.parent.name if endpoint.name == "instance.sock" else endpoint.stem
 
     def run(self, value: str, delay: float = 0) -> tuple[str, bytes, str]:
         self.publish_attributes({self.instance_key})

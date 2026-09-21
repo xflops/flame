@@ -12,6 +12,7 @@ limitations under the License.
 */
 
 pub mod apis;
+pub mod application;
 pub mod ctx;
 pub mod net;
 pub mod pprof;
@@ -26,8 +27,6 @@ pub use python::{get_python_runtime, PythonRuntime};
 use std::string::FromUtf8Error;
 
 use prost::UnknownEnumValue;
-use serde_json::json;
-use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 use time::macros::format_description;
@@ -37,8 +36,6 @@ use tracing_appender::rolling;
 use tracing_subscriber::filter::{FromEnvError, ParseError};
 use tracing_subscriber::fmt::time::LocalTime;
 use tracing_subscriber::fmt::writer::MakeWriterExt;
-
-use crate::apis::{ApplicationAttributes, ApplicationSchema};
 
 #[derive(Error, Debug)]
 pub enum FlameError {
@@ -228,97 +225,6 @@ pub fn init_logger(component: Option<&str>) -> Result<Option<WorkerGuard>, Flame
     }
 }
 
-pub fn default_applications() -> HashMap<String, ApplicationAttributes> {
-    let script_input_schema = json!({
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "type": "object",
-        "properties": {
-            "language": {
-                "type": "string",
-                "description": "The language of the script, e.g. python"
-            },
-            "code": {
-                "type": "string",
-                "description": "The code of the script to run, e.g. print('Hello, world!')"
-            },
-            "input": {
-                "type": "array",
-                "items": {
-                    "type": "integer",
-                    "description": "The input to the script in bytes, e.g. [0x1, 0x2]"
-                }
-            }
-        },
-        "required": [
-            "language",
-            "code"
-        ]
-    });
-
-    let script_output_schema = json!({
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "type": "string",
-        "description": "The output of the script in UTF-8."
-    });
-
-    // Use ${FLAME_HOME} variable substitution syntax
-    // This will be expanded at runtime by the executor to the actual FLAME_HOME path
-    let flmexec_cmd = "${FLAME_HOME}/bin/flmexec-service".to_string();
-    let flmping_cmd = "${FLAME_HOME}/bin/flmping-service".to_string();
-    let flmping_url = "file://${FLAME_HOME}/bin/flmping-service".to_string();
-    let flmrun_cmd = "${FLAME_HOME}/bin/uv".to_string();
-
-    HashMap::from([
-        (
-            "flmexec".to_string(),
-            ApplicationAttributes {
-                // shim removed - now configured in executor-manager
-                description: Some(
-                    "The Flame Executor application, which is used to run scripts.".to_string(),
-                ),
-                command: Some(flmexec_cmd),
-                schema: Some(ApplicationSchema {
-                    input: Some(script_input_schema.to_string()),
-                    output: Some(script_output_schema.to_string()),
-                    ..ApplicationSchema::default()
-                }),
-                ..ApplicationAttributes::default()
-            },
-        ),
-        (
-            "flmping".to_string(),
-            ApplicationAttributes {
-                // shim removed - now configured in executor-manager
-                url: Some(flmping_url),
-                command: Some(flmping_cmd),
-                ..ApplicationAttributes::default()
-            },
-        ),
-        (
-            "flmrun".to_string(),
-            ApplicationAttributes {
-                // shim removed - now configured in executor-manager
-                description: Some(
-                    "The Flame Runner application for executing customized Python applications."
-                        .to_string(),
-                ),
-                command: Some(flmrun_cmd),
-                arguments: vec![
-                    "run".to_string(),
-                    "--python".to_string(),
-                    "python${FLAME_PYTHON_VERSION}".to_string(),
-                    "python".to_string(),
-                    "-m".to_string(),
-                    "flamepy.runner.runpy".to_string(),
-                ],
-                installer: Some("python".to_string()),
-                working_directory: None,
-                ..ApplicationAttributes::default()
-            },
-        ),
-    ])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,24 +256,5 @@ mod tests {
         let status = Status::from(error);
         assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(status.message(), "test");
-    }
-
-    #[test]
-    fn default_flmrun_uses_env_selected_uv_python() {
-        let apps = default_applications();
-        let flmrun = apps.get("flmrun").unwrap();
-
-        assert_eq!(flmrun.command.as_deref(), Some("${FLAME_HOME}/bin/uv"));
-        assert_eq!(
-            flmrun.arguments,
-            vec![
-                "run",
-                "--python",
-                "python${FLAME_PYTHON_VERSION}",
-                "python",
-                "-m",
-                "flamepy.runner.runpy",
-            ]
-        );
     }
 }

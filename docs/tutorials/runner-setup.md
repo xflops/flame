@@ -5,7 +5,8 @@ The Runner API packages the current Python project, registers a temporary Flame 
 ## Prerequisites
 
 - A running Flame cluster with the session manager, executor manager, and object cache.
-- The built-in `flmrun` application registered in Flame.
+- A configured `flmrun` application registered from
+  `<config-dir>/applications/flmrun.yaml` when the session manager starts.
 - A Python environment that can import `flamepy`.
 
 Verify the template application:

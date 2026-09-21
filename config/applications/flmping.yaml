@@ -1,0 +1,7 @@
+metadata:
+  name: flmping
+spec:
+  shim: host
+  url: file://${FLAME_HOME}/bin/flmping-service
+  command: ${FLAME_HOME}/bin/flmping-service
+  schema: {}

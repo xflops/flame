@@ -463,6 +463,7 @@ class Runner:
                 environments["FLAME_PYTHON_VERSION"] = self._python_version
 
             app_attrs = ApplicationAttributes(
+                shim=template_app.shim,
                 image=template_app.image,
                 command=template_app.command,
                 description=f"Runner application: {self._name}",

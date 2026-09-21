@@ -986,13 +986,26 @@ impl Storage {
             })?;
             (ssn.application.clone(), resreq)
         };
+        let shim = {
+            let applications = lock_ptr!(self.applications)?;
+            match applications.get(&application) {
+                Some(application) => lock_ptr!(application)?.shim,
+                None => {
+                    tracing::warn!(
+                        "Application <{}> is missing while creating an executor; using the default shim",
+                        application
+                    );
+                    Shim::default()
+                }
+            }
+        };
 
         let now = Utc::now();
         let e = Executor {
             id: Uuid::new_v4().to_string(),
             node: node_name.clone(),
             resreq,
-            shim: Shim::default(),
+            shim,
             application,
             task_id: None,
             ssn_id: None,

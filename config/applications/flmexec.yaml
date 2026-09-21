@@ -1,0 +1,11 @@
+metadata:
+  name: flmexec
+spec:
+  shim: host
+  description: The Flame Executor application, which is used to run scripts.
+  command: ${FLAME_HOME}/bin/flmexec-service
+  schema:
+    input: >-
+      {"$schema":"http://json-schema.org/draft-07/schema#","properties":{"code":{"description":"The code of the script to run, e.g. print('Hello, world!')","type":"string"},"input":{"items":{"description":"The input to the script in bytes, e.g. [0x1, 0x2]","type":"integer"},"type":"array"},"language":{"description":"The language of the script, e.g. python","type":"string"}},"required":["language","code"],"type":"object"}
+    output: >-
+      {"$schema":"http://json-schema.org/draft-07/schema#","description":"The output of the script in UTF-8.","type":"string"}

@@ -67,7 +67,8 @@ Verify the cluster:
 /tmp/flame-dev/bin/flmctl list -a
 ```
 
-The built-in applications should include `flmping`, `flmexec`, and `flmrun`.
+The standard manifests installed in `/tmp/flame-dev/conf/applications` should
+register `flmping`, `flmexec`, and `flmrun`.
 
 ## Client Configuration
 

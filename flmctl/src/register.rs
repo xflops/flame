@@ -13,13 +13,11 @@ limitations under the License.
 
 use std::{fs, path::Path};
 
+use common::application::parse_application_manifests;
 use flame_rs as flame;
-use flame_rs::{
-    apis::{FlameContext, FlameError},
-    client::ApplicationAttributes,
-};
+use flame_rs::apis::{FlameContext, FlameError};
 
-use crate::apis::ApplicationYaml;
+use crate::utils::client_application_attributes;
 
 pub async fn run(ctx: &FlameContext, path: &String) -> Result<(), FlameError> {
     if !Path::new(&path).is_file() {
@@ -36,19 +34,16 @@ pub async fn run(ctx: &FlameContext, path: &String) -> Result<(), FlameError> {
     )
     .await?;
 
-    let documents: Vec<&str> = contents
-        .split("\n---\n")
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let applications = parse_application_manifests(&contents)
+        .map_err(|error| FlameError::InvalidConfig(format!("invalid <{path}>: {error}")))?;
 
-    for doc in documents {
-        let app: ApplicationYaml =
-            serde_yaml::from_str(doc).map_err(|e| FlameError::Internal(e.to_string()))?;
+    for application in applications {
+        let attributes = application
+            .attributes()
+            .map(client_application_attributes)
+            .map_err(|error| FlameError::InvalidConfig(error.to_string()))?;
 
-        let app_attr = ApplicationAttributes::try_from(&app)?;
-
-        conn.register_application(app.metadata.name, app_attr)
+        conn.register_application(application.metadata.name, attributes)
             .await?;
     }
 

@@ -274,6 +274,12 @@ fn install_components(
     // Generate configuration
     let config_generator = ConfigGenerator::new();
     config_generator.generate_config(&paths.prefix)?;
+    if config
+        .profiles
+        .contains(&crate::types::InstallProfile::ControlPlane)
+    {
+        config_generator.install_application_manifests(src_dir, &paths.prefix)?;
+    }
 
     Ok(())
 }

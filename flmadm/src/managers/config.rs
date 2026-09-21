@@ -33,6 +33,66 @@ impl ConfigGenerator {
         Ok(())
     }
 
+    /// Install the application manifests shipped with Flame.
+    ///
+    /// Application manifests are configuration, so an existing destination is
+    /// always preserved. A clean installation removes the configuration
+    /// directory before this method runs and therefore receives fresh defaults.
+    pub fn install_application_manifests(&self, source: &Path, prefix: &Path) -> Result<()> {
+        let source_dir = source.join("config/applications");
+        let destination_dir = prefix.join("conf/applications");
+
+        fs::create_dir_all(&destination_dir).with_context(|| {
+            format!(
+                "Failed to create application configuration directory: {}",
+                destination_dir.display()
+            )
+        })?;
+
+        let mut manifests = fs::read_dir(&source_dir)
+            .with_context(|| {
+                format!(
+                    "Failed to read application manifests from: {}",
+                    source_dir.display()
+                )
+            })?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        manifests.sort_by_key(|entry| entry.file_name());
+
+        for entry in manifests {
+            let source_path = entry.path();
+            let is_yaml = source_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| matches!(extension, "yaml" | "yml"));
+            if !entry.file_type()?.is_file() || !is_yaml {
+                continue;
+            }
+
+            let destination_path = destination_dir.join(entry.file_name());
+            if destination_path.exists() {
+                println!(
+                    "✓ Application manifest already exists: {}",
+                    destination_path.display()
+                );
+                continue;
+            }
+
+            fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "Failed to install application manifest {}",
+                    source_path.display()
+                )
+            })?;
+            println!(
+                "✓ Installed application manifest: {}",
+                destination_path.display()
+            );
+        }
+
+        Ok(())
+    }
+
     fn get_config_template(&self, prefix: &str) -> String {
         format!(
             r#"# Flame Cluster Configuration
@@ -58,5 +118,148 @@ cache:
 "#,
             prefix = prefix
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::apis::Shim;
+    use common::application::parse_application_manifests;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn write_manifest(source: &Path, name: &str, contents: &str) {
+        let applications = source.join("config/applications");
+        fs::create_dir_all(&applications).unwrap();
+        fs::write(applications.join(name), contents).unwrap();
+    }
+
+    #[test]
+    fn installs_yaml_application_manifests() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        let prefix = temp.path().join("prefix");
+        write_manifest(&source, "flmexec.yaml", "metadata:\n  name: flmexec\n");
+        write_manifest(&source, "flmping.yml", "metadata:\n  name: flmping\n");
+        write_manifest(&source, "README.md", "not a manifest\n");
+
+        ConfigGenerator::new()
+            .install_application_manifests(&source, &prefix)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(prefix.join("conf/applications/flmexec.yaml")).unwrap(),
+            "metadata:\n  name: flmexec\n"
+        );
+        assert!(prefix.join("conf/applications/flmping.yml").is_file());
+        assert!(!prefix.join("conf/applications/README.md").exists());
+    }
+
+    #[test]
+    fn preserves_existing_application_manifest() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        let prefix = temp.path().join("prefix");
+        write_manifest(&source, "flmexec.yaml", "metadata:\n  name: default\n");
+        let destination = prefix.join("conf/applications/flmexec.yaml");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, "metadata:\n  name: customized\n").unwrap();
+
+        ConfigGenerator::new()
+            .install_application_manifests(&source, &prefix)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination).unwrap(),
+            "metadata:\n  name: customized\n"
+        );
+    }
+
+    #[test]
+    fn shipped_manifests_define_the_standard_host_applications() {
+        let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/applications");
+        let load = |name: &str| {
+            let contents = fs::read_to_string(source_dir.join(format!("{name}.yaml"))).unwrap();
+            let mut manifests = parse_application_manifests(&contents).unwrap();
+            assert_eq!(manifests.len(), 1);
+            let manifest = manifests.remove(0);
+            assert_eq!(manifest.metadata.name, name);
+            manifest.attributes().unwrap()
+        };
+
+        let flmexec = load("flmexec");
+        assert_eq!(flmexec.shim, Shim::Host);
+        assert_eq!(
+            flmexec.description.as_deref(),
+            Some("The Flame Executor application, which is used to run scripts.")
+        );
+        assert_eq!(
+            flmexec.command.as_deref(),
+            Some("${FLAME_HOME}/bin/flmexec-service")
+        );
+        let schema = flmexec.schema.unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(schema.input.as_deref().unwrap()).unwrap(),
+            json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": {
+                    "language": {
+                        "type": "string",
+                        "description": "The language of the script, e.g. python"
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "The code of the script to run, e.g. print('Hello, world!')"
+                    },
+                    "input": {
+                        "type": "array",
+                        "items": {
+                            "type": "integer",
+                            "description": "The input to the script in bytes, e.g. [0x1, 0x2]"
+                        }
+                    }
+                },
+                "required": ["language", "code"]
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(schema.output.as_deref().unwrap()).unwrap(),
+            json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "string",
+                "description": "The output of the script in UTF-8."
+            })
+        );
+
+        let flmping = load("flmping");
+        assert_eq!(flmping.shim, Shim::Host);
+        assert_eq!(
+            flmping.url.as_deref(),
+            Some("file://${FLAME_HOME}/bin/flmping-service")
+        );
+        assert_eq!(
+            flmping.command.as_deref(),
+            Some("${FLAME_HOME}/bin/flmping-service")
+        );
+        assert!(flmping.schema.is_some());
+
+        let flmrun = load("flmrun");
+        assert_eq!(flmrun.shim, Shim::Host);
+        assert_eq!(flmrun.command.as_deref(), Some("${FLAME_HOME}/bin/uv"));
+        assert_eq!(
+            flmrun.arguments,
+            [
+                "run",
+                "--python",
+                "python${FLAME_PYTHON_VERSION}",
+                "python",
+                "-m",
+                "flamepy.runner.runpy",
+            ]
+        );
+        assert_eq!(flmrun.installer.as_deref(), Some("python"));
+        assert!(flmrun.schema.is_some());
     }
 }

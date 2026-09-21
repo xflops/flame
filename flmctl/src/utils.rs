@@ -12,7 +12,41 @@ limitations under the License.
 */
 
 use chrono::Duration;
-use flame_rs::client::ResourceRequirement;
+use flame_rs::{
+    apis::Shim as ClientShim,
+    client::{
+        ApplicationAttributes as ClientApplicationAttributes,
+        ApplicationSchema as ClientApplicationSchema, ResourceRequirement,
+    },
+};
+
+pub fn client_application_attributes(
+    attributes: common::apis::ApplicationAttributes,
+) -> ClientApplicationAttributes {
+    ClientApplicationAttributes {
+        shim: Some(match attributes.shim {
+            common::apis::Shim::Host => ClientShim::Host,
+            common::apis::Shim::Wasm => ClientShim::Wasm,
+            common::apis::Shim::Cri => ClientShim::Cri,
+        }),
+        image: attributes.image,
+        description: attributes.description,
+        labels: attributes.labels,
+        command: attributes.command,
+        arguments: attributes.arguments,
+        environments: attributes.environments,
+        working_directory: attributes.working_directory,
+        max_instances: Some(attributes.max_instances),
+        delay_release: Some(attributes.delay_release),
+        schema: attributes.schema.map(|schema| ClientApplicationSchema {
+            input: schema.input,
+            output: schema.output,
+            common_data: schema.common_data,
+        }),
+        url: attributes.url,
+        installer: attributes.installer,
+    }
+}
 
 /// Formats a byte count into a human-readable string with appropriate unit suffix.
 /// Uses binary prefixes (Ki, Mi, Gi) following Kubernetes conventions.

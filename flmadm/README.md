@@ -220,6 +220,11 @@ When installing over an existing installation:
 - With `--force`: Automatically overwrites all components without prompting
 - With `--clean`: Backs up and removes the entire installation before installing
 
+Cluster configuration and application manifests are preserved on reinstall,
+including with `--force`. Use `--clean` to restore the shipped application
+manifests, or edit `${PREFIX}/conf/applications/*.yaml` to customize the
+applications registered by session manager.
+
 ## Uninstall Options
 
 - `--prefix <PATH>`: Installation directory to uninstall (default: `/usr/local/flame`)
@@ -252,7 +257,11 @@ ${PREFIX}/
 │   ├── fsm.log
 │   └── fem.log
 ├── conf/                   # Configuration
-│   └── flame-cluster.yaml
+│   ├── flame-cluster.yaml
+│   └── applications/       # Applications registered when session manager starts
+│       ├── flmexec.yaml
+│       ├── flmping.yaml
+│       └── flmrun.yaml
 └── data/                   # Data directory (cache, database)
     ├── cache/
     └── sessions.db

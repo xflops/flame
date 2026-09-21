@@ -967,6 +967,7 @@ impl Engine for FilesystemEngine {
         });
 
         meta.version += 1;
+        meta.shim = attr.shim as i32;
         meta.image = attr.image;
         meta.description = attr.description;
         meta.labels = attr.labels;
@@ -1821,6 +1822,8 @@ mod tests {
 
         // Update application
         let updated_attr = ApplicationAttributes {
+            shim: Shim::Cri,
+            image: Some("updated-image".to_string()),
             description: Some("Updated description".to_string()),
             ..attr
         };
@@ -1829,6 +1832,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(app3.description, Some("Updated description".to_string()));
+        assert_eq!(app3.shim, Shim::Cri);
+        assert_eq!(app3.image.as_deref(), Some("updated-image"));
         assert_eq!(app3.version, 2);
 
         // Unregister application

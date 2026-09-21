@@ -13,12 +13,12 @@ limitations under the License.
 
 use clap::Parser;
 use futures::future::select_all;
-use tokio::task::JoinHandle;
 
 use common::ctx::FlameClusterContext;
 use common::FlameError;
 
 mod apiserver;
+mod applications;
 mod controller;
 mod events;
 mod model;
@@ -43,6 +43,7 @@ async fn main() -> Result<(), FlameError> {
 
     let cli = Cli::parse();
     let ctx = FlameClusterContext::from_file(cli.config)?;
+    let configured_applications = applications::load(&applications::manifest_directory())?;
 
     tracing::info!("flame-session-manager is starting ...");
 
@@ -61,6 +62,33 @@ async fn main() -> Result<(), FlameError> {
     storage.load_data().await?;
 
     let controller = controller::new_ptr(storage.clone());
+
+    // Application manifests are authoritative for the names they define. Apps
+    // absent from the directory are left untouched.
+    applications::reconcile(
+        configured_applications,
+        {
+            let controller = controller.clone();
+            move |name, attributes| {
+                let controller = controller.clone();
+                async move { controller.register_application(name, attributes).await }
+            }
+        },
+        {
+            let controller = controller.clone();
+            move |name, attributes| {
+                let controller = controller.clone();
+                async move {
+                    let current = controller.get_application(name.clone()).await?;
+                    if applications::matches_attributes(&current, &attributes) {
+                        return Ok(());
+                    }
+                    controller.update_application(name, attributes).await
+                }
+            }
+        },
+    )
+    .await?;
 
     // Start provider task.
     #[allow(clippy::let_underscore_future)]
@@ -107,16 +135,6 @@ async fn main() -> Result<(), FlameError> {
     }
 
     tracing::info!("flame-session-manager started.");
-
-    // Register default applications.
-    #[allow(clippy::let_underscore_future)]
-    let _: JoinHandle<Result<(), FlameError>> = tokio::spawn(async move {
-        for (name, attr) in common::default_applications() {
-            controller.register_application(name, attr).await?;
-        }
-
-        Ok(())
-    });
 
     let (res, idx, _) = select_all(handlers).await;
     tracing::info!("Thread <{idx}> exited with result: {res:?}");

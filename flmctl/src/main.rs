@@ -18,7 +18,6 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use flame_rs::apis::FlameContext;
 
-mod apis;
 mod close;
 mod create;
 mod deploy;

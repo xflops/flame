@@ -16,9 +16,10 @@ The implementation follows these reviewed decisions:
    uses the conventional local containerd CRI socket and leaves
    `runtime_handler` empty, so containerd selects its configured default
    runtime, CNI, cgroups, registry credentials, and gVisor policy. The platform
-   must make the object-cache data plane reachable from CRI sandboxes while
-   keeping session manager and unrelated VPC services unreachable; Flame does
-   not configure routes, DNS, or network policy.
+   must make the object-cache data plane and configured session-manager endpoint
+   reachable from CRI sandboxes while keeping unrelated control-plane and VPC
+   services unreachable; Flame does not configure routes, DNS, or network
+   policy.
 3. **Unix socket transport (recommended, with an explicit gVisor exception).**
    Preserve the current Rust/Python Instance API by mounting one private
    per-executor directory and allowing the sandbox to create its service UDS
@@ -39,17 +40,22 @@ The implementation follows these reviewed decisions:
    skip installation. GPU requirements remain unsupported in v1.
 6. **Layered implementation.** Keep the reviewed CRI model/manager independent
    of executor-manager integration and test its runtime transaction directly.
+7. **Applications are configuration.** Session manager seeds applications from
+   manifests next to `flame-cluster.yaml`; it has no compiled-in application
+   definitions. A manifest owns only the application name it declares, so it
+   updates that stored definition without deleting unrelated stored
+   applications.
 
 ## 1. Motivation
 
 ### Background
 
-Executor manager currently launches Host applications as child processes and
-Wasm applications in-process. The `cri-rs` crate can call a CRI v1 runtime, but
-it is not connected to executor manager and its public model is not suitable
-for recovery: desired container configuration and observed runtime state share
-one type, status conversion loses runtime identity, and list calls are not
-scoped to Flame-owned workloads.
+Before this work, executor manager launched Host applications as child
+processes and Wasm applications in-process. The `cri-rs` crate could call a CRI
+v1 runtime, but it was not connected to executor manager and its public model
+was not suitable for recovery: desired container configuration and observed
+runtime state shared one type, status conversion lost runtime identity, and
+list calls were not scoped to Flame-owned workloads.
 
 The CRI shim launches a containerized application which implements the same
 Instance gRPC API as a Host application. `Shim::Cri` nevertheless remains an
@@ -70,8 +76,9 @@ Success means:
   shim contract;
 - partial creation is rolled back and deletion is idempotent;
 - no operation can list or delete another CRI consumer's workload;
-- CRI sandboxes can reach their configured cache and every owning cache endpoint
-  carried by an `ObjectRef`, without reaching session manager; and
+- CRI sandboxes can reach their configured session-manager endpoint, cache, and
+  every owning cache endpoint carried by an `ObjectRef`, while unrelated
+  control-plane services remain isolated; and
 - an application container cannot acquire more host access than the explicit
   CRI shim policy allows.
 
@@ -79,8 +86,8 @@ Success means:
 
 ### Configuration
 
-The follow-on executor integration adds one value to the existing shim setting.
-The application and executor manager both select it:
+CRI adds one value to the existing shim setting. The application and executor
+manager both select it:
 
 ```yaml
 cluster:
@@ -99,14 +106,18 @@ driver, registry credentials, or gVisor flags. Those are node prerequisites
 owned by the platform/containerd administrator. Applications cannot override
 them. In particular, the platform must provide routing, name resolution, and
 firewall or network-policy access from the sandbox to the configured cache and
-the cache endpoints stored in ObjectRefs. It must not expose session manager or
-general VPC access to the sandbox.
+the cache endpoints stored in ObjectRefs. The configured session-manager
+endpoint must also be reachable for recursive Flame operations such as Runner
+or flmexec. Unrelated control-plane services and general VPC access remain
+isolated by platform policy.
 
 Executor manager injects `FLAME_CACHE_ENDPOINT` using an address reachable from
-the sandbox network namespace. It does not inject `FLAME_ENDPOINT`; CRI
-applications communicate with executor manager through the Instance UDS and do
-not connect to session manager directly. An ObjectRef is resolved against its
-owning cache endpoint unless the SDK is configured with a cache proxy.
+the sandbox network namespace and injects `FLAME_ENDPOINT` using the configured
+cluster endpoint. The latter enables recursive Runner and flmexec operations;
+normal Instance callbacks still use the executor-local UDS. Both configured
+endpoints must therefore be non-loopback and reachable from the sandbox. An
+ObjectRef is resolved against its owning cache endpoint unless the SDK is
+configured with a cache proxy.
 
 The CRI shim uses fixed, documented safety defaults: always pull the image when
 creating a workload, 30 seconds for startup, 10 seconds for stop, and
@@ -136,6 +147,67 @@ variable is a configuration error. Because package installation occurs on the
 host, the selected image must match the host architecture, libc, Python minor
 version, and extension ABI. A separately built image with incompatible native
 dependencies is unsupported by this v1 design.
+
+### Application manifests
+
+Applications are configured as YAML rather than compiled into session manager.
+Session manager reads regular files ending in `.yaml` or `.yml` from
+`${FLAME_HOME}/conf/applications/`, independent of the path passed to
+`--config`. It sorts paths lexicographically and then processes YAML documents
+in file order. Non-YAML files are ignored, and a missing applications directory
+is equivalent to an empty manifest set.
+
+Each YAML document uses the same strict manifest model as `flmctl`:
+
+```yaml
+metadata:
+  name: flmrun
+spec:
+  shim: cri
+  image: registry.example.com/xflops/flmrt:latest
+  command: /usr/local/flame/bin/uv
+  arguments:
+    - run
+    - --python
+    - python${FLAME_PYTHON_VERSION}
+    - python
+    - -m
+    - flamepy.runner.runpy
+  environments:
+    FLAME_HOME: /usr/local/flame
+    FLAME_PYTHON_VERSION: "3.12"
+  installer: python
+  schema: {}
+```
+
+`metadata.name` is required and validated as an application name. `spec`
+accepts the existing application attributes: `shim`, `image`, `description`,
+`labels`, `command`, `arguments`, `environments`, `working_directory`,
+`max_instances`, `delay_release`, `schema`, `url`, and `installer`. Omitted
+fields use `ApplicationAttributes` defaults, including `shim: host`. Unknown
+fields, malformed YAML, invalid field values, unreadable files, a non-directory
+applications path, and duplicate application names across any files or YAML
+documents are startup errors. Session manager validates the complete manifest
+set before opening storage or serving either API, so these errors cannot produce
+a partially applied manifest set.
+
+After loading persisted storage and before starting providers, APIs, or the
+scheduler, session manager reconciles manifests in deterministic order. A
+manifest is authoritative for its declared name: a missing stored application
+is registered, and an existing definition is updated when any configured
+attribute differs. Stored applications whose names do not occur in the
+manifest directory remain unchanged; removing a manifest does not unregister
+the corresponding application. Runtime metadata such as application version
+and creation time is not part of manifest equality.
+
+There are no compiled default applications. The source tree provides standard
+Host manifests for `flmexec`, `flmping`, and `flmrun` under
+`config/applications/`. A control-plane `flmadm install` copies missing YAML/YML
+files to `${PREFIX}/conf/applications/`. Existing destination files are always
+preserved, including with `--force`, so operator customizations survive an
+upgrade. A `--clean` installation removes the prior configuration and therefore
+installs fresh shipped manifests. Worker-only and client-only installations do
+not install control-plane application manifests.
 
 ### Internal API
 
@@ -214,6 +286,12 @@ Executor manager
 `CriShim` owns an executor work directory, a CRI workload handle, and the
 existing `GrpcShim`. Session enter, task invoke, and session leave continue to
 use `GrpcShim`; only application launch, health, and cleanup differ.
+
+Before any runtime path starts, session manager loads and reconciles the
+installation-owned application manifests from
+`${FLAME_HOME}/conf/applications`. This keeps Host and CRI application policy
+outside the binary and lets the CRI E2E installation replace the standard Host
+definitions with CRI definitions without a special registration API.
 
 ### Instance connectivity
 
@@ -324,6 +402,8 @@ CRI shim because they address the application sandbox, not the executor-manager
 host. `CriShim` rejects such a configured cache endpoint before creating a
 workload. Flame does not add host networking, endpoint NAT, DNS overrides, or
 cache-replica discovery to compensate for an unreachable platform network.
+The same rejection applies to the cluster endpoint injected as
+`FLAME_ENDPOINT`.
 
 ### Ownership and identity
 
@@ -399,13 +479,15 @@ installation path as Host when the application has a package URL. It mounts
 the returned release and Python runtime read-only, mounts the managed UV/pip
 caches read/write, and rewrites the installer's environment to executor-local
 container paths. It always pulls the image, rejects GPU combinations, creates
-a per-executor directory, and injects the cache, cache TLS, log, and Instance
-socket environment required by the application. It does not inject the
-session-manager `FLAME_ENDPOINT`. The per-executor directory is mounted
-read/write. When object-cache TLS uses a configured private CA, that cache CA
-is copied into the private directory and exposed as `FLAME_CA_FILE`; the
-session-manager CA is never staged because CRI applications do not receive or
-connect to the session-manager endpoint.
+a per-executor directory, and injects the cluster, cache, TLS, log, and Instance
+socket environment required by the application. The per-executor directory is
+mounted read/write. `FLAME_CA_FILE` is the SDK trust setting used for both
+cluster and cache clients. When either endpoint uses a configured private CA,
+CRI builds a PEM bundle from the independently configured `cluster.tls.ca_file`
+and `cache.tls.ca_file`, copies it into the private directory, and exposes the
+bundle as `FLAME_CA_FILE`. This avoids incorrectly using one service's CA as
+the other service's sole trust root while retaining a single SDK trust-file
+contract.
 
 `create_service` owns rollback because a failed instance is never stored in
 the executor state. The runtime instance is application-scoped and shares the
@@ -458,10 +540,11 @@ runtime mounts are read-only. gVisor is configured with
 `host-uds=create`—not `open` or `all`—so the workload can bind its own Instance
 socket without connecting to host services exposed elsewhere.
 
-Sandbox network policy allows DNS, required internet egress, and the object
-cache port on the explicit Flame worker set. It denies session-manager,
-metadata, unrelated host services, and all other VPC destinations. Cache access
-does not imply general worker-to-worker connectivity.
+Sandbox network policy allows DNS, required internet egress, the configured
+session-manager endpoint, and the object-cache port on the explicit Flame
+worker set. It denies metadata, unrelated control-plane and host services, and
+all other VPC destinations. Cache and session-manager access do not imply
+general worker-to-worker connectivity.
 
 ### Observability
 
@@ -484,34 +567,53 @@ stop, and remove. Every post-sandbox failure must prove reverse rollback.
 Executor tests use fake CRI and Instance services to cover environment/mount
 translation (including writable UV/pip caches), bind/reuse/unbind, early exit,
 startup timeout, cleanup after bind failure, reconnect, controller-driven
-restart, rejection of loopback cache endpoints, and absence of
-`FLAME_ENDPOINT`.
+restart, rejection of loopback cluster and cache endpoints, recursive
+`FLAME_ENDPOINT` injection, and cluster/cache CA bundle staging.
 
 The `CRI Shim E2E` Linux CI job provisions a real containerd CRI v1 service and
-bridge CNI, configures `runsc` as containerd's default CRI runtime, then tests
-the `WorkloadManager` boundary directly. A dedicated workload verifies
-gVisor's in-sandbox boot marker, proving that the empty runtime handler selected
-the configured default instead of silently falling back to `runc`. The suite
-covers the operations used by `CriShim` (`create`, `list_workload`, `status`,
-and `delete`) with a shim-shaped workload: ownership metadata, image, command
-and arguments,
-environment, working directory, read-only and writable mounts, resource
-limits, security context, and log directory. It reconstructs the handle by
-executor labels before deletion to exercise restart cleanup and verifies that
-an unrelated executor filter cannot discover the workload. Independent cases
-cover the running workload contract, final container environment and rebased
-installation paths, exited-container status, reconnect/list recovery, and
-idempotent deletion. The cases run serially, use unique ownership labels, and
-always attempt targeted cleanup after a successful create.
+bridge CNI, configures `runsc` as containerd's default CRI runtime with
+`host-uds=create`, and publishes `flmrt` to a local registry. `flmrt` is a
+production runtime image assembled through the normal worker installation: its
+final stage contains the installed Flame services, Python SDK, runtimes, and
+tools under `/usr/local/flame`, but no E2E source tree and no executor-manager
+binary. Test code is therefore not baked into the runtime image.
 
-A serialized Linux-only test against a compatible containerd Runner image
-remains optional, should include a native Python dependency, uses unique
-ownership labels, and never enumerates or deletes unowned workloads.
-The network fixture resolves an `ObjectRef` owned by a cache endpoint on another
-host or network namespace; proxy-mode coverage verifies that the proxy is dialed
-while the owning endpoint is preserved as the gRPC authority.
+The job first runs the `WorkloadManager` boundary cases directly against the
+real CRI service. A dedicated workload verifies gVisor's in-sandbox boot marker,
+proving that the empty runtime handler selected the configured default instead
+of silently falling back to `runc`. The suite covers the operations used by
+`CriShim` (`create`, `list_workload`, `status`, and `delete`) with ownership
+metadata, image, command and arguments, environment, working directory,
+read-only and writable mounts, resource limits, security context, and log
+directory. It reconstructs the handle by executor labels before deletion,
+verifies that an unrelated executor filter cannot discover the workload, and
+covers running and exited status, rebased installation paths, reconnect/list
+recovery, and idempotent deletion. Cases run serially and always attempt
+targeted cleanup after a successful create.
+
+The same job then starts the actual session manager, object cache, and executor
+manager with CRI manifests for `flmping`, `flmrun`, and `flmexec`. It runs the
+shared E2E Runner, flmexec, and Sandbox suites; every application service
+executes inside gVisor through the production CRI shim. Runner packages and
+uploads its working directory through the configured package/cache backend.
+flmexec and Sandbox exercise the configured `flmexec` service, including a
+flmexec script that recursively creates Runner applications and installs a
+native NumPy dependency. The generic Agent/Session service suite is omitted
+because Runner already covers packaged dynamic services and Sandbox covers the
+agent execution path through flmexec. This validates image-only services,
+Runner package delivery, recursive `FLAME_ENDPOINT` access, object-cache
+traffic, and real Instance UDS lifecycle under gVisor.
 
 ## 4. Use Cases
+
+### Configure applications without rebuilding Flame
+
+An operator edits `${PREFIX}/conf/applications/flmrun.yaml` to select a CRI
+image and restarts session manager. Startup validates all application YAML/YML
+files before opening the service, then updates the persisted `flmrun`
+definition to match the manifest. Other applications previously registered
+through the API remain stored because they have no matching manifest. A later
+`flmadm install --force` preserves the customized file.
 
 ### Run with gVisor
 

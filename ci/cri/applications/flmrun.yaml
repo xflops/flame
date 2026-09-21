@@ -1,0 +1,20 @@
+metadata:
+  name: flmrun
+spec:
+  shim: cri
+  image: localhost:5000/xflops/flmrt:ci
+  description: The Flame Runner application for executing customized Python applications.
+  command: /usr/local/flame/bin/uv
+  arguments:
+    - run
+    - --python
+    - /usr/bin/python3
+    - python
+    - -m
+    - flamepy.runner.runpy
+  environments:
+    FLAME_HOME: /usr/local/flame
+    FLAME_PYTHON_VERSION: "3.12"
+    PYTHONPATH: /usr/local/flame/lib/python3.12/site-packages
+  installer: python
+  schema: {}

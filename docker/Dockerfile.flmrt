@@ -1,0 +1,34 @@
+FROM ubuntu:24.04 AS installer
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /usr/bin/
+
+WORKDIR /usr/src/flame
+COPY . .
+
+RUN ./target/release/flmadm install \
+    --src-dir /usr/src/flame \
+    --prefix /usr/local/flame \
+    --worker \
+    --no-systemd \
+    --skip-build \
+    --force \
+    --python-version 3.12 \
+    && rm -f /usr/local/flame/bin/flame-executor-manager
+
+FROM ubuntu:24.04
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=installer /usr/local/flame /usr/local/flame
+
+ENV FLAME_HOME=/usr/local/flame
+ENV PATH=/usr/local/flame/bin:${PATH}
+ENV PYTHONPATH=/usr/local/flame/lib/python3.12/site-packages
+
+WORKDIR /var/lib/flame

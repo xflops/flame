@@ -3,6 +3,14 @@ flame.db*
 
 # Ignore local build & ci
 target/
+!target/
+target/*
+!target/release/
+target/release/*
+!target/release/flmadm
+!target/release/flame-executor-manager
+!target/release/flmexec-service
+!target/release/flmping-service
 ci/
 .git/
 tmp/

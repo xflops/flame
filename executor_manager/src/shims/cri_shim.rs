@@ -35,8 +35,11 @@ use crate::executor::Executor;
 use crate::shims::grpc_shim::GrpcShim;
 use crate::shims::{Shim, ShimPtr};
 use common::apis::{ApplicationContext, SessionContext, TaskContext};
-use common::ctx::{FlameCache, FlameClusterContext};
-use common::{FlameError, FLAME_CACHE_ENDPOINT, FLAME_CA_FILE, FLAME_INSTANCE_ENDPOINT, FLAME_LOG};
+use common::ctx::FlameClusterContext;
+use common::{
+    FlameError, FLAME_CACHE_ENDPOINT, FLAME_CA_FILE, FLAME_ENDPOINT, FLAME_INSTANCE_ENDPOINT,
+    FLAME_LOG,
+};
 
 const WORK_ROOT: &str = "/var/lib/flame/executors";
 const LOG_ROOT: &str = "/var/log/flame/executors";
@@ -94,6 +97,7 @@ impl CriShim {
         let log_level = std::env::var(RUST_LOG).unwrap_or_else(|_| DEFAULT_LOG_LEVEL.to_string());
         let mut env = build_environment(
             &app.environments,
+            &context.cluster.endpoint,
             context.cache.as_ref().map(|cache| cache.endpoint.as_str()),
             &socket,
             &log_level,
@@ -101,13 +105,10 @@ impl CriShim {
         let installation_mounts = container_mounts(&work_dir, &installation)?;
         let installed_environment = rebase_install_environment(&installation, &installation_mounts);
         merge_install_environment(&mut env, &installed_environment);
-        if let Some(ca_source) = cache_ca_file(context.cache.as_ref()) {
+        let ca_sources = endpoint_ca_files(context);
+        if !ca_sources.is_empty() {
             let ca_target = work_dir.join("ca.crt");
-            fs::copy(ca_source, &ca_target).map_err(|error| {
-                FlameError::Storage(format!(
-                    "failed to stage CRI object-cache CA file <{ca_source}>: {error}"
-                ))
-            })?;
+            stage_ca_bundle(&ca_sources, &ca_target)?;
             #[cfg(unix)]
             fs::set_permissions(&ca_target, fs::Permissions::from_mode(0o400))?;
             env.insert(
@@ -357,12 +358,12 @@ fn validate_inputs(executor: &Executor, app: &ApplicationContext) -> Result<(), 
             "CRI applications do not support GPU resources in v1".to_string(),
         ));
     }
-    if let Some(cache) = executor
-        .context
-        .as_ref()
-        .and_then(|context| context.cache.as_ref())
-    {
-        reject_loopback_endpoint(&cache.endpoint)?;
+    let context = executor.context.as_ref().ok_or_else(|| {
+        FlameError::InvalidState("CRI executor is missing cluster context".to_string())
+    })?;
+    reject_loopback_endpoint(&context.cluster.endpoint, "cluster")?;
+    if let Some(cache) = context.cache.as_ref() {
+        reject_loopback_endpoint(&cache.endpoint, "cache")?;
     }
     validate_path_component(&executor.id)
 }
@@ -476,12 +477,14 @@ fn expand_container_environment(
     .map_err(|error| FlameError::InvalidConfig(error.cause))
 }
 
-fn reject_loopback_endpoint(endpoint: &str) -> Result<(), FlameError> {
+fn reject_loopback_endpoint(endpoint: &str, endpoint_kind: &str) -> Result<(), FlameError> {
     let url = Url::parse(endpoint).map_err(|error| {
-        FlameError::InvalidConfig(format!("invalid cache endpoint <{endpoint}>: {error}"))
+        FlameError::InvalidConfig(format!(
+            "invalid {endpoint_kind} endpoint <{endpoint}>: {error}"
+        ))
     })?;
     let host = url.host_str().ok_or_else(|| {
-        FlameError::InvalidConfig(format!("cache endpoint <{endpoint}> has no host"))
+        FlameError::InvalidConfig(format!("{endpoint_kind} endpoint <{endpoint}> has no host"))
     })?;
     let normalized_host = host.trim_start_matches('[').trim_end_matches(']');
     let loopback = normalized_host.eq_ignore_ascii_case("localhost")
@@ -490,7 +493,7 @@ fn reject_loopback_endpoint(endpoint: &str) -> Result<(), FlameError> {
             .is_ok_and(|address| address.is_loopback());
     if loopback {
         Err(FlameError::InvalidConfig(format!(
-            "cache endpoint <{endpoint}> is loopback and unreachable from a CRI sandbox"
+            "{endpoint_kind} endpoint <{endpoint}> is loopback and unreachable from a CRI sandbox"
         )))
     } else {
         Ok(())
@@ -499,6 +502,7 @@ fn reject_loopback_endpoint(endpoint: &str) -> Result<(), FlameError> {
 
 fn build_environment(
     application: &HashMap<String, String>,
+    cluster_endpoint: &str,
     cache_endpoint: Option<&str>,
     socket: &Path,
     log_level: &str,
@@ -510,16 +514,55 @@ fn build_environment(
         FLAME_INSTANCE_ENDPOINT.to_string(),
         socket.to_string_lossy().to_string(),
     );
+    env.insert(FLAME_ENDPOINT.to_string(), cluster_endpoint.to_string());
     if let Some(endpoint) = cache_endpoint {
         env.insert(FLAME_CACHE_ENDPOINT.to_string(), endpoint.to_string());
     }
     env
 }
 
-fn cache_ca_file(cache: Option<&FlameCache>) -> Option<&str> {
-    cache
+fn endpoint_ca_files(context: &FlameClusterContext) -> Vec<&str> {
+    let mut files = Vec::new();
+    if let Some(ca_file) = context
+        .cluster
+        .tls
+        .as_ref()
+        .and_then(|tls| tls.ca_file.as_deref())
+    {
+        files.push(ca_file);
+    }
+    if let Some(ca_file) = context
+        .cache
+        .as_ref()
         .and_then(|cache| cache.tls.as_ref())
         .and_then(|tls| tls.ca_file.as_deref())
+    {
+        if !files.contains(&ca_file) {
+            files.push(ca_file);
+        }
+    }
+    files
+}
+
+fn stage_ca_bundle(sources: &[&str], target: &Path) -> Result<(), FlameError> {
+    let mut bundle = Vec::new();
+    for source in sources {
+        let certificate = fs::read(source).map_err(|error| {
+            FlameError::Storage(format!(
+                "failed to read CRI endpoint CA file <{source}>: {error}"
+            ))
+        })?;
+        if !bundle.is_empty() && !bundle.ends_with(b"\n") {
+            bundle.push(b'\n');
+        }
+        bundle.extend_from_slice(&certificate);
+    }
+    fs::write(target, bundle).map_err(|error| {
+        FlameError::Storage(format!(
+            "failed to stage CRI endpoint CA bundle <{}>: {error}",
+            target.display()
+        ))
+    })
 }
 
 fn workload_name(application: &str, executor_id: &str) -> String {
@@ -598,8 +641,6 @@ fn cleanup_directory(path: &Path) {
 mod tests {
     use super::*;
     use common::apis::{ExecutorState, ResourceRequirement, Shim as ShimType};
-    use common::ctx::FlameTls;
-    use common::FLAME_ENDPOINT;
     use tempfile::tempdir;
 
     fn test_executor() -> Executor {
@@ -829,18 +870,24 @@ mod tests {
     }
 
     #[test]
-    fn cri_uses_only_object_cache_ca() {
-        let cache = FlameCache {
-            tls: Some(FlameTls {
-                cert_file: String::new(),
-                key_file: String::new(),
-                ca_file: Some("/cache/ca.crt".to_string()),
-            }),
-            ..Default::default()
-        };
+    fn cri_stages_cluster_and_cache_ca_as_one_trust_bundle() {
+        let temp = tempdir().unwrap();
+        let cluster_ca = temp.path().join("cluster.crt");
+        let cache_ca = temp.path().join("cache.crt");
+        let bundle = temp.path().join("bundle.crt");
+        fs::write(&cluster_ca, "cluster-ca").unwrap();
+        fs::write(&cache_ca, "cache-ca\n").unwrap();
 
-        assert_eq!(cache_ca_file(Some(&cache)), Some("/cache/ca.crt"));
-        assert_eq!(cache_ca_file(None), None);
+        stage_ca_bundle(
+            &[cluster_ca.to_str().unwrap(), cache_ca.to_str().unwrap()],
+            &bundle,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(bundle).unwrap(),
+            "cluster-ca\ncache-ca\n"
+        );
     }
 
     #[test]
@@ -852,16 +899,19 @@ mod tests {
     }
 
     #[test]
-    fn loopback_cache_endpoints_are_rejected() {
+    fn loopback_cluster_and_cache_endpoints_are_rejected() {
         for endpoint in [
             "grpc://127.0.0.1:9090",
             "grpc://[::1]:9090",
             "grpc://localhost:9090",
         ] {
-            assert!(reject_loopback_endpoint(endpoint).is_err());
+            assert!(reject_loopback_endpoint(endpoint, "cache").is_err());
         }
-        assert!(reject_loopback_endpoint("grpc://10.0.0.10:9090").is_ok());
-        assert!(reject_loopback_endpoint("grpcs-proxy://cache.example:443").is_ok());
+        let cluster_error =
+            reject_loopback_endpoint("http://127.0.0.1:8080", "cluster").unwrap_err();
+        assert!(cluster_error.to_string().contains("cluster endpoint"));
+        assert!(reject_loopback_endpoint("grpc://10.0.0.10:9090", "cache").is_ok());
+        assert!(reject_loopback_endpoint("grpcs-proxy://cache.example:443", "cache").is_ok());
     }
 
     #[test]
@@ -872,14 +922,18 @@ mod tests {
     }
 
     #[test]
-    fn cri_environment_does_not_expose_session_manager() {
+    fn cri_environment_exposes_container_reachable_session_manager() {
         let env = build_environment(
             &HashMap::new(),
+            "http://session-manager.flame:8080",
             Some("grpc://cache.example:9090"),
             Path::new("/var/lib/flame/executors/e/instance.sock"),
             "info",
         );
-        assert!(!env.contains_key(FLAME_ENDPOINT));
+        assert_eq!(
+            env.get(FLAME_ENDPOINT).map(String::as_str),
+            Some("http://session-manager.flame:8080")
+        );
         assert_eq!(
             env.get(FLAME_CACHE_ENDPOINT).map(String::as_str),
             Some("grpc://cache.example:9090")

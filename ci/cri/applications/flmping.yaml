@@ -1,0 +1,10 @@
+metadata:
+  name: flmping
+spec:
+  shim: cri
+  image: localhost:5000/xflops/flmrt:ci
+  url: file://${FLAME_HOME}/bin/flmping-service
+  command: /usr/local/flame/bin/flmping-service
+  environments:
+    FLAME_HOME: /usr/local/flame
+  schema: {}

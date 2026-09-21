@@ -262,7 +262,9 @@ impl Engine for SqliteEngine {
 
         let sql = r#"INSERT INTO applications
             (
-                name, 
+                name,
+                shim,
+                image,
                 description, 
                 labels, 
                 command, 
@@ -276,10 +278,12 @@ impl Engine for SqliteEngine {
                 installer,
                 creation_time, 
                 state)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING *"#;
         let app: ApplicationDao = sqlx::query_as(sql)
             .bind(name)
+            .bind(attr.shim as i32)
+            .bind(attr.image)
             .bind(attr.description)
             .bind(Json(attr.labels))
             .bind(attr.command)
@@ -295,7 +299,16 @@ impl Engine for SqliteEngine {
             .bind(ApplicationState::Enabled as i32)
             .fetch_one(&mut *tx)
             .await
-            .map_err(|e| FlameError::Storage(format!("failed to register application: {e}")))?;
+            .map_err(|error| {
+                if error
+                    .as_database_error()
+                    .is_some_and(|error| error.is_unique_violation())
+                {
+                    FlameError::AlreadyExist("application already exists".to_string())
+                } else {
+                    FlameError::Storage(format!("failed to register application: {error}"))
+                }
+            })?;
 
         tx.commit()
             .await
@@ -328,7 +341,9 @@ impl Engine for SqliteEngine {
             attr.schema.clone().map(AppSchemaDao::from).map(Json);
 
         let sql = r#"UPDATE applications
-                    SET schema=?,
+                    SET shim=?,
+                        image=?,
+                        schema=?,
                         description=?,
                         labels=?,
                         command=?,
@@ -344,6 +359,8 @@ impl Engine for SqliteEngine {
                     RETURNING *"#;
 
         let app: ApplicationDao = sqlx::query_as(sql)
+            .bind(attr.shim as i32)
+            .bind(attr.image)
             .bind(schema)
             .bind(attr.description)
             .bind(Json(attr.labels))
@@ -1170,12 +1187,19 @@ mod tests {
 
     use super::*;
 
+    fn test_applications() -> Vec<(String, ApplicationAttributes)> {
+        ["flmexec", "flmping", "flmrun"]
+            .into_iter()
+            .map(|name| (name.to_string(), ApplicationAttributes::default()))
+            .collect()
+    }
+
     #[test]
     fn test_create_session_normalizes_batch_size() -> Result<(), FlameError> {
         let url = common::temp_sqlite_url("flame_test_create_session_normalizes_batch_size");
         let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
 
-        for (name, attr) in common::default_applications() {
+        for (name, attr) in test_applications() {
             tokio_test::block_on(storage.register_application(name.clone(), attr))?;
         }
 
@@ -1203,7 +1227,7 @@ mod tests {
         let url = common::temp_sqlite_url("flame_test_get_task_with_events");
         let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
 
-        for (name, attr) in common::default_applications() {
+        for (name, attr) in test_applications() {
             tokio_test::block_on(storage.register_application(name.clone(), attr))?;
         }
 
@@ -1253,7 +1277,7 @@ mod tests {
         let url = common::temp_sqlite_url("flame_test_update_application");
         let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
 
-        for (name, attr) in common::default_applications() {
+        for (name, attr) in test_applications() {
             tokio_test::block_on(storage.register_application(name.clone(), attr))?;
         }
 
@@ -1264,7 +1288,7 @@ mod tests {
         let app_2 = tokio_test::block_on(storage.update_application(
             "flmexec".to_string(),
             ApplicationAttributes {
-                shim: Shim::Host,
+                shim: Shim::Cri,
                 description: Some("This is my agent for testing.".to_string()),
                 labels: vec!["test".to_string(), "agent".to_string()],
                 image: Some("may-agent".to_string()),
@@ -1280,6 +1304,8 @@ mod tests {
             },
         ))?;
         assert_eq!(app_2.name, "flmexec");
+        assert_eq!(app_2.shim, Shim::Cri);
+        assert_eq!(app_2.image.as_deref(), Some("may-agent"));
         assert_eq!(
             app_2.description,
             Some("This is my agent for testing.".to_string())
@@ -1307,7 +1333,7 @@ mod tests {
         let url = common::temp_sqlite_url("flame_test_unregister_application");
         let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
 
-        for (name, attr) in common::default_applications() {
+        for (name, attr) in test_applications() {
             tokio_test::block_on(storage.register_application(name.clone(), attr))?;
         }
 
@@ -1414,6 +1440,8 @@ mod tests {
             ),
         ];
         for (name, attr) in apps {
+            let expected_shim = attr.shim;
+            let expected_image = attr.image.clone();
             tokio_test::block_on(storage.register_application(name.clone(), attr)).map_err(
                 |e| FlameError::Storage(format!("failed to register application <{name}>: {e}")),
             )?;
@@ -1424,8 +1452,27 @@ mod tests {
 
             assert_eq!(app_1.name, name);
             assert_eq!(app_1.state, ApplicationState::Enabled);
+            assert_eq!(app_1.shim, expected_shim);
+            assert_eq!(app_1.image, expected_image);
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_register_duplicate_application_returns_already_exists() -> Result<(), FlameError> {
+        let url = common::temp_sqlite_url("flame_test_register_duplicate_app");
+        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
+
+        tokio_test::block_on(
+            storage.register_application("duplicate".to_string(), ApplicationAttributes::default()),
+        )?;
+        let error = tokio_test::block_on(
+            storage.register_application("duplicate".to_string(), ApplicationAttributes::default()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, FlameError::AlreadyExist(_)));
         Ok(())
     }
 
@@ -1434,7 +1481,7 @@ mod tests {
         let url = common::temp_sqlite_url("flame_test_app");
         let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
 
-        for (name, attr) in common::default_applications() {
+        for (name, attr) in test_applications() {
             tokio_test::block_on(storage.register_application(name.clone(), attr))?;
         }
 
@@ -1621,7 +1668,7 @@ mod tests {
     fn test_single_session() -> Result<(), FlameError> {
         let url = common::temp_sqlite_url("flame_test_single_session");
         let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-        for (name, attr) in common::default_applications() {
+        for (name, attr) in test_applications() {
             tokio_test::block_on(storage.register_application(name.clone(), attr))?;
         }
 
@@ -1674,7 +1721,7 @@ mod tests {
     fn test_multiple_session() -> Result<(), FlameError> {
         let url = common::temp_sqlite_url("flame_test_multiple_session");
         let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-        for (name, attr) in common::default_applications() {
+        for (name, attr) in test_applications() {
             tokio_test::block_on(storage.register_application(name.clone(), attr))?;
         }
 
@@ -1765,7 +1812,7 @@ mod tests {
     fn test_close_session_with_open_tasks() -> Result<(), FlameError> {
         let url = common::temp_sqlite_url("flame_test_close_session_with_open_tasks");
         let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-        for (name, attr) in common::default_applications() {
+        for (name, attr) in test_applications() {
             tokio_test::block_on(storage.register_application(name.clone(), attr))?;
         }
         let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
@@ -1806,7 +1853,7 @@ mod tests {
     fn test_close_session_with_running_tasks() -> Result<(), FlameError> {
         let url = common::temp_sqlite_url("flame_test_close_session_with_running_tasks");
         let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-        for (name, attr) in common::default_applications() {
+        for (name, attr) in test_applications() {
             tokio_test::block_on(storage.register_application(name.clone(), attr))?;
         }
         let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
@@ -1839,7 +1886,7 @@ mod tests {
         let url = common::temp_sqlite_url("flame_test_create_task_for_close_session");
 
         let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-        for (name, attr) in common::default_applications() {
+        for (name, attr) in test_applications() {
             tokio_test::block_on(storage.register_application(name.clone(), attr))?;
         }
         let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
@@ -1881,7 +1928,7 @@ mod tests {
     fn test_delete_session_with_open_tasks() -> Result<(), FlameError> {
         let url = common::temp_sqlite_url("flame_test_delete_session_with_open_tasks");
         let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-        for (name, attr) in common::default_applications() {
+        for (name, attr) in test_applications() {
             tokio_test::block_on(storage.register_application(name.clone(), attr))?;
         }
         let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());

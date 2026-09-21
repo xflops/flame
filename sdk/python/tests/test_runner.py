@@ -9,7 +9,8 @@ from unittest.mock import MagicMock, patch
 import cloudpickle
 import pytest
 
-from flamepy.runner import RunnerService
+from flamepy.core.types import Shim
+from flamepy.runner import Runner, RunnerService
 from flamepy.runner.storage import CacheStorage, FileStorage, create_storage_backend
 from flamepy.runner.types import RunnerContext, RunnerRequest, SessionContext
 
@@ -71,6 +72,44 @@ def test_create_storage_backend_default_uses_cache(monkeypatch):
 
     back = create_storage_backend(None, app_name="myapp")
     assert isinstance(back, CacheStorage)
+
+
+def test_runner_application_inherits_template_shim(monkeypatch, tmp_path):
+    context = SimpleNamespace(
+        package=SimpleNamespace(storage=f"file://{tmp_path}"),
+        cache=None,
+        runner=SimpleNamespace(template="flmrun"),
+    )
+    template = SimpleNamespace(
+        shim=Shim.CRI,
+        image="registry.example/flmrt:latest",
+        command="flmrun-service",
+        working_directory=None,
+        environments=None,
+        labels=None,
+        arguments=None,
+        max_instances=None,
+        delay_release=None,
+        schema=None,
+        installer=None,
+    )
+    storage = MagicMock()
+    registered = MagicMock()
+
+    monkeypatch.setattr("flamepy.runner.runner.FlameContext", lambda: context)
+    monkeypatch.setattr(
+        "flamepy.runner.runner.get_application",
+        MagicMock(side_effect=[None, template]),
+    )
+    monkeypatch.setattr("flamepy.runner.runner.create_storage_backend", lambda *args, **kwargs: storage)
+    monkeypatch.setattr(Runner, "_create_package", lambda self: str(tmp_path / "runner.tar.gz"))
+    monkeypatch.setattr(Runner, "_upload_package", lambda self: "grpc://cache/runner.tar.gz")
+    monkeypatch.setattr("flamepy.runner.runner.register_application", registered)
+
+    Runner("generated-runner")
+
+    attributes = registered.call_args.args[1]
+    assert attributes.shim == Shim.CRI
 
 
 class TestCacheStorage:

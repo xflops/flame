@@ -13,7 +13,7 @@ limitations under the License.
 
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 
 use bytesize::ByteSize;
 use serde_derive::{Deserialize, Serialize};
@@ -369,24 +369,31 @@ pub fn parse_memory_size(s: &str) -> Result<u64, FlameError> {
 }
 
 impl FlameClusterContext {
-    pub fn from_file(fp: Option<String>) -> Result<Self, FlameError> {
-        let fp = match fp {
-            None => {
-                format!("{}/.flame/{}", env!("HOME", "."), DEFAULT_FLAME_CONF)
-            }
-            Some(path) => path,
-        };
+    pub fn config_path(fp: Option<&str>) -> PathBuf {
+        fp.map(PathBuf::from).unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "{}/.flame/{}",
+                env!("HOME", "."),
+                DEFAULT_FLAME_CONF
+            ))
+        })
+    }
 
-        if !Path::new(&fp).is_file() {
-            return Err(FlameError::InvalidConfig(format!("<{fp}> is not a file")));
+    pub fn from_file(fp: Option<String>) -> Result<Self, FlameError> {
+        let fp = Self::config_path(fp.as_deref());
+
+        if !fp.is_file() {
+            return Err(FlameError::InvalidConfig(format!(
+                "<{}> is not a file",
+                fp.display()
+            )));
         }
 
-        let contents =
-            fs::read_to_string(fp.clone()).map_err(|e| FlameError::Internal(e.to_string()))?;
+        let contents = fs::read_to_string(&fp).map_err(|e| FlameError::Internal(e.to_string()))?;
         let ctx: FlameClusterContextYaml =
             serde_yaml::from_str(&contents).map_err(|e| FlameError::Internal(e.to_string()))?;
 
-        tracing::debug!("Load FlameClusterContext from <{fp}>: {ctx:?}");
+        tracing::debug!("Load FlameClusterContext from <{}>: {ctx:?}", fp.display());
 
         FlameClusterContext::try_from(ctx)
     }

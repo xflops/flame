@@ -1,0 +1,15 @@
+metadata:
+  name: flmrun
+spec:
+  shim: host
+  description: The Flame Runner application for executing customized Python applications.
+  command: ${FLAME_HOME}/bin/uv
+  arguments:
+    - run
+    - --python
+    - python${FLAME_PYTHON_VERSION}
+    - python
+    - -m
+    - flamepy.runner.runpy
+  installer: python
+  schema: {}
