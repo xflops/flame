@@ -1,10 +1,10 @@
-name: Flame CI
+name: Benchmark
 on: [push, pull_request]
 env:
   CLICOLOR_FORCE: 1
 jobs:
-  benchmark:
-    name: Benchmark
+  host-shim-benchmark:
+    name: Host Shim Benchmark
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -36,14 +36,75 @@ jobs:
           profile: minimal
           override: true
 
-      - name: Run Rust E2E Tests
+      - name: Run Flame benchmark
         env:
           FLAME_ROOT: ${{ github.workspace }}
+          FLAME_BENCHMARK_ENDPOINT: https://127.0.0.1:8080
+          FLAME_BENCHMARK_RUNTIME: Host
         run: |
-          make e2e-rs
+          cargo test -p flame-rs --test benchmark_test -- --nocapture
 
       - name: Show logs on failure
         if: failure()
         run: |
           docker compose logs flame-session-manager
           docker compose logs flame-executor-manager
+
+  cri-shim-benchmark:
+    name: CRI Shim Benchmark
+    runs-on: ubuntu-latest
+    env:
+      INSTALL_PREFIX: /opt/flame-test
+      FLAME_ENDPOINT: http://10.250.0.1:8080
+      FLAME_CACHE_ENDPOINT: grpc://10.250.0.1:9090
+      FLAME_E2E_RUNTIME_IMAGE: localhost:5000/xflops/flmrt:ci
+      FLAME_CRI_SANDBOX_IMAGE: registry.k8s.io/pause:3.10.2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install host and CRI dependencies
+        run: hack/cri-shim-e2e.sh install-dependencies
+
+      - name: Build and install Flame
+        run: hack/cri-shim-e2e.sh install-flame
+
+      - name: Build and publish flmrt to the local registry
+        run: hack/cri-shim-e2e.sh publish-runtime-image
+
+      - name: Configure containerd, gVisor, and CNI
+        run: hack/cri-shim-e2e.sh configure-runtime
+
+      - name: Cache the benchmark images
+        run: hack/cri-shim-e2e.sh cache-runtime-image
+
+      - name: Start the BareMetal Flame cluster
+        run: hack/cri-shim-e2e.sh start-cluster
+
+      - name: Run CRI shim benchmark
+        timeout-minutes: 15
+        env:
+          FLAME_BENCHMARK_ENDPOINT: http://10.250.0.1:8080
+          FLAME_BENCHMARK_RUNTIME: CRI Shim
+        run: |
+          cargo test -p flame-rs --test benchmark_test -- --nocapture
+
+      - name: Verify Flame-owned CRI workloads
+        run: hack/cri-shim-e2e.sh verify-workloads
+
+      - name: Print CRI and Flame diagnostics
+        if: always()
+        run: hack/cri-shim-e2e.sh diagnostics
+
+      - name: Stop CRI benchmark services
+        if: always()
+        run: hack/cri-shim-e2e.sh stop-services
+
+      - name: Uninstall Flame
+        if: always()
+        run: hack/cri-shim-e2e.sh uninstall-flame

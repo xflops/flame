@@ -238,21 +238,6 @@ impl Shim for CriShim {
         &mut self,
         context: &TaskContext,
     ) -> Result<super::TaskInvokeResponse, FlameError> {
-        let handle = self.handle.as_ref().ok_or_else(|| {
-            FlameError::InvalidState("CRI workload has already been shut down".to_string())
-        })?;
-        let status = self
-            .manager
-            .as_mut()
-            .ok_or_else(|| FlameError::InvalidState("CRI instance is not created".to_string()))?
-            .status(handle)
-            .await?;
-        if !status.healthy() {
-            return Err(FlameError::InvalidState(format!(
-                "CRI workload <{}> is not healthy",
-                handle.sandbox_id()
-            )));
-        }
         self.instance_client
             .as_mut()
             .ok_or_else(|| FlameError::InvalidState("CRI instance is not created".to_string()))?

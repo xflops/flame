@@ -119,10 +119,10 @@ endpoints must therefore be non-loopback and reachable from the sandbox. An
 ObjectRef is resolved against its owning cache endpoint unless the SDK is
 configured with a cache proxy.
 
-The CRI shim uses fixed, documented safety defaults: always pull the image when
-creating a workload, 30 seconds for startup, 10 seconds for stop, and
-`/var/log/flame/executors` as the log root. Changing these policies requires a
-separate design rather than an open-ended CRI configuration block.
+The CRI shim uses fixed, documented safety defaults: query CRI image status and
+pull only when the image is absent, 30 seconds for startup, 10 seconds for stop,
+and `/var/log/flame/executors` as the log root. Changing these policies requires
+a separate design rather than an open-ended CRI configuration block.
 
 For a Runner-created application, `ApplicationSpec.url` and `installer` are
 handled by the existing `ApplicationManager` before the CRI workload starts.
@@ -452,7 +452,7 @@ The call sequence is:
 
 1. Connect to `/run/containerd/containerd.sock`; verify CRI version and runtime
    readiness.
-2. Pull each image unconditionally using the CRI image service.
+2. Query each image through the CRI image service and pull it only when absent.
 3. Run the pod sandbox with an empty runtime handler so containerd uses its
    configured default.
 4. Create each container in the sandbox.
@@ -478,7 +478,7 @@ On bind, executor manager constructs the selected shim and immediately calls
 installation path as Host when the application has a package URL. It mounts
 the returned release and Python runtime read-only, mounts the managed UV/pip
 caches read/write, and rewrites the installer's environment to executor-local
-container paths. It always pulls the image, rejects GPU combinations, creates
+container paths. It pulls a missing image, rejects GPU combinations, creates
 a per-executor directory, and injects the cluster, cache, TLS, log, and Instance
 socket environment required by the application. The per-executor directory is
 mounted read/write. `FLAME_CA_FILE` is the SDK trust setting used for both
@@ -603,6 +603,23 @@ because Runner already covers packaged dynamic services and Sandbox covers the
 agent execution path through flmexec. This validates image-only services,
 Runner package delivery, recursive `FLAME_ENDPOINT` access, object-cache
 traffic, and real Instance UDS lifecycle under gVisor.
+
+The benchmark workflow exposes `Host Shim Benchmark` and `CRI Shim Benchmark`
+as peer jobs. The CRI job uses the BareMetal containerd and gVisor topology and
+pre-pulls both `flmrt` and containerd's configured sandbox image before timing.
+Both jobs execute the shared `(session count, tasks per session)` matrix:
+`1 × 1`, `1 × 1000`, `10 × 1`, and `10 × 1000`. This reports cold single-task
+round trip followed by warm single-session throughput, concurrent round trip,
+and concurrent throughput through one code path. Only the endpoint/runtime
+environment and cluster setup differ, so workloads and reported metrics remain
+directly comparable.
+
+The `BareMetal E2E` workflow follows the same runtime split: `Host Shim E2E`
+and `CRI Shim E2E` are peer jobs. They retain separate provisioning because
+the CRI variant must configure containerd, gVisor, CNI, and the runtime image,
+then run the same application-level Runner, flmexec, and sandbox E2E cases
+against that environment. `cri-rs` unit tests remain part of normal Code
+Verify coverage; there is no separate CRI-only application test suite.
 
 ## 4. Use Cases
 

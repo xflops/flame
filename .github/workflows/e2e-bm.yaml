@@ -1,12 +1,12 @@
-name: Flame CI
+name: BareMetal E2E
 on: [push, pull_request]
 env:
   CLICOLOR_FORCE: 1
   INSTALL_PREFIX: /opt/flame-test
   FLAME_ENDPOINT: http://127.0.0.1:8080
 jobs:
-  ci:
-    name: BareMetal Python Test
+  host-shim-e2e:
+    name: Host Shim E2E
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -174,6 +174,7 @@ jobs:
       FLAME_ENDPOINT: http://10.250.0.1:8080
       FLAME_CACHE_ENDPOINT: grpc://10.250.0.1:9090
       FLAME_E2E_RUNTIME_IMAGE: localhost:5000/xflops/flmrt:ci
+      FLAME_CRI_SANDBOX_IMAGE: registry.k8s.io/pause:3.10.2
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -199,12 +200,6 @@ jobs:
 
       - name: Configure containerd, gVisor, and CNI
         run: hack/cri-shim-e2e.sh configure-runtime
-
-      - name: Run WorkloadManager integration cases
-        timeout-minutes: 15
-        run: |
-          cargo test -p cri-rs --test cri_shim_e2e -- \
-            --ignored --nocapture --test-threads=1
 
       - name: Start the BareMetal Flame cluster
         run: hack/cri-shim-e2e.sh start-cluster

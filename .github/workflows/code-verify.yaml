@@ -22,4 +22,4 @@ jobs:
       - name: Cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Cargo test
-        run: cargo test --workspace --exclude flame-rs --exclude cri-rs
+        run: cargo test --workspace --exclude flame-rs

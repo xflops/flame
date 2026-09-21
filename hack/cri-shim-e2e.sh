@@ -10,6 +10,7 @@ cd "$REPO_ROOT"
 
 INSTALL_PREFIX="${INSTALL_PREFIX:-/opt/flame-test}"
 FLAME_E2E_RUNTIME_IMAGE="${FLAME_E2E_RUNTIME_IMAGE:-localhost:5000/xflops/flmrt:ci}"
+FLAME_CRI_SANDBOX_IMAGE="${FLAME_CRI_SANDBOX_IMAGE:-registry.k8s.io/pause:3.10.2}"
 CI_ENV_FILE="${GITHUB_ENV:-/tmp/flame-cri-e2e.env}"
 
 install_dependencies() {
@@ -72,10 +73,25 @@ publish_runtime_image() {
     docker push "$FLAME_E2E_RUNTIME_IMAGE"
 }
 
+cache_runtime_image() {
+    sudo ctr --namespace k8s.io images pull --plain-http \
+        "$FLAME_E2E_RUNTIME_IMAGE"
+    sudo ctr --namespace k8s.io images pull "$FLAME_CRI_SANDBOX_IMAGE"
+    sudo ctr --namespace k8s.io images list \
+        | grep -F "$FLAME_E2E_RUNTIME_IMAGE"
+    sudo ctr --namespace k8s.io images list \
+        | grep -F "$FLAME_CRI_SANDBOX_IMAGE"
+}
+
 configure_runtime() {
     sudo systemctl stop containerd
     sudo install -d /etc/containerd /etc/containerd/certs.d/localhost:5000
     containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+    if ! grep -q 'io.containerd.cri.v1.images' /etc/containerd/config.toml \
+        || ! grep -q 'io.containerd.cri.v1.runtime' /etc/containerd/config.toml; then
+        echo 'containerd 2.x CRI plugins are required' >&2
+        exit 1
+    fi
 
     sudo sed -i -E \
         "s/(default_runtime_name[[:space:]]*=[[:space:]]*)['\"]runc['\"]/\1'runsc'/" \
@@ -83,26 +99,18 @@ configure_runtime() {
     sudo sed -i -E \
         "s#(config_path[[:space:]]*=[[:space:]]*)['\"][^'\"]*['\"]#\1'/etc/containerd/certs.d'#" \
         /etc/containerd/config.toml
-    if grep -q 'io.containerd.cri.v1.runtime' /etc/containerd/config.toml; then
-        sudo tee -a /etc/containerd/config.toml >/dev/null <<'EOF'
+    sudo sed -i -E \
+        "s#(sandbox[[:space:]]*=[[:space:]]*)['\"][^'\"]*['\"]#\1'$FLAME_CRI_SANDBOX_IMAGE'#" \
+        /etc/containerd/config.toml
+    grep -Eq "sandbox[[:space:]]*=[[:space:]]*['\"]$FLAME_CRI_SANDBOX_IMAGE['\"]" \
+        /etc/containerd/config.toml
+    sudo tee -a /etc/containerd/config.toml >/dev/null <<'EOF'
 [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc]
   runtime_type = 'io.containerd.runsc.v1'
 [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc.options]
   TypeUrl = 'io.containerd.runsc.v1.options'
   ConfigPath = '/etc/containerd/runsc.toml'
 EOF
-    elif grep -q 'io.containerd.grpc.v1.cri' /etc/containerd/config.toml; then
-        sudo tee -a /etc/containerd/config.toml >/dev/null <<'EOF'
-[plugins.'io.containerd.grpc.v1.cri'.containerd.runtimes.runsc]
-  runtime_type = 'io.containerd.runsc.v1'
-[plugins.'io.containerd.grpc.v1.cri'.containerd.runtimes.runsc.options]
-  TypeUrl = 'io.containerd.runsc.v1.options'
-  ConfigPath = '/etc/containerd/runsc.toml'
-EOF
-    else
-        echo 'unsupported containerd config version' >&2
-        exit 1
-    fi
     grep -Eq "default_runtime_name[[:space:]]*=[[:space:]]*['\"]runsc['\"]" \
         /etc/containerd/config.toml
     command -v containerd-shim-runsc-v1
@@ -223,7 +231,7 @@ uninstall_flame() {
 }
 
 usage() {
-    echo "Usage: $0 {install-dependencies|install-flame|publish-runtime-image|configure-runtime|start-cluster|verify-workloads|diagnostics|stop-services|uninstall-flame}" >&2
+    echo "Usage: $0 {install-dependencies|install-flame|publish-runtime-image|configure-runtime|cache-runtime-image|start-cluster|verify-workloads|diagnostics|stop-services|uninstall-flame}" >&2
 }
 
 case "${1:-}" in
@@ -231,6 +239,7 @@ case "${1:-}" in
     install-flame) install_flame ;;
     publish-runtime-image) publish_runtime_image ;;
     configure-runtime) configure_runtime ;;
+    cache-runtime-image) cache_runtime_image ;;
     start-cluster) start_cluster ;;
     verify-workloads) verify_workloads ;;
     diagnostics) diagnostics ;;

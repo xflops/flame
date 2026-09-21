@@ -37,13 +37,13 @@ use crate::cri_v1::image_service_client::ImageServiceClient;
 use crate::cri_v1::runtime_service_client::RuntimeServiceClient;
 use crate::cri_v1::{
     ContainerFilter, ContainerStatusRequest, ContainerStatusResponse, CreateContainerRequest,
-    CreateContainerResponse, ListContainersRequest, ListContainersResponse, ListPodSandboxRequest,
-    ListPodSandboxResponse, PodSandboxFilter, PodSandboxStatus, PodSandboxStatusRequest,
-    PodSandboxStatusResponse, PullImageRequest, PullImageResponse, RemoveContainerRequest,
-    RemoveContainerResponse, RemovePodSandboxRequest, RemovePodSandboxResponse,
-    RunPodSandboxRequest, RunPodSandboxResponse, StartContainerRequest, StartContainerResponse,
-    StatusRequest, StopContainerRequest, StopContainerResponse, StopPodSandboxRequest,
-    StopPodSandboxResponse, VersionRequest,
+    CreateContainerResponse, ImageStatusRequest, ImageStatusResponse, ListContainersRequest,
+    ListContainersResponse, ListPodSandboxRequest, ListPodSandboxResponse, PodSandboxFilter,
+    PodSandboxStatus, PodSandboxStatusRequest, PodSandboxStatusResponse, PullImageRequest,
+    PullImageResponse, RemoveContainerRequest, RemoveContainerResponse, RemovePodSandboxRequest,
+    RemovePodSandboxResponse, RunPodSandboxRequest, RunPodSandboxResponse, StartContainerRequest,
+    StartContainerResponse, StatusRequest, StopContainerRequest, StopContainerResponse,
+    StopPodSandboxRequest, StopPodSandboxResponse, VersionRequest,
 };
 
 pub const CONTAINERD_SOCKET: &str = "/run/containerd/containerd.sock";
@@ -173,6 +173,11 @@ impl RuntimeApi for RuntimeServiceClient<Channel> {
 
 #[async_trait]
 trait ImageApi: Send {
+    async fn image_status(
+        &mut self,
+        request: Request<ImageStatusRequest>,
+    ) -> Result<tonic::Response<ImageStatusResponse>, Status>;
+
     async fn pull_image(
         &mut self,
         request: Request<PullImageRequest>,
@@ -181,6 +186,13 @@ trait ImageApi: Send {
 
 #[async_trait]
 impl ImageApi for ImageServiceClient<Channel> {
+    async fn image_status(
+        &mut self,
+        request: Request<ImageStatusRequest>,
+    ) -> Result<tonic::Response<ImageStatusResponse>, Status> {
+        ImageServiceClient::image_status(self, request).await
+    }
+
     async fn pull_image(
         &mut self,
         request: Request<PullImageRequest>,
@@ -319,17 +331,34 @@ impl WorkloadManager {
 
         for container in &spec.containers {
             let image = image_spec(&container.image);
-            self.img_client
-                .pull_image(request_with_timeout(
-                    PullImageRequest {
-                        image: Some(image),
-                        auth: None,
-                        sandbox_config: Some(sandbox_config.clone()),
+            let image_present = match self
+                .img_client
+                .image_status(request_with_timeout(
+                    ImageStatusRequest {
+                        image: Some(image.clone()),
+                        verbose: false,
                     },
-                    IMAGE_PULL_TIMEOUT,
+                    RPC_TIMEOUT,
                 ))
                 .await
-                .map_err(|status| rpc_error("PullImage", status))?;
+            {
+                Ok(response) => response.into_inner().image.is_some(),
+                Err(status) if status.code() == Code::NotFound => false,
+                Err(status) => return Err(rpc_error("ImageStatus", status)),
+            };
+            if !image_present {
+                self.img_client
+                    .pull_image(request_with_timeout(
+                        PullImageRequest {
+                            image: Some(image),
+                            auth: None,
+                            sandbox_config: Some(sandbox_config.clone()),
+                        },
+                        IMAGE_PULL_TIMEOUT,
+                    ))
+                    .await
+                    .map_err(|status| rpc_error("PullImage", status))?;
+            }
         }
 
         let sandbox_id = match self
@@ -718,6 +747,7 @@ mod tests {
         labels: Mutex<HashMap<String, String>>,
         sandbox_present: Mutex<bool>,
         container_present: Mutex<bool>,
+        image_present: Mutex<bool>,
     }
 
     struct FakeRuntime {
@@ -915,11 +945,27 @@ mod tests {
 
     #[async_trait]
     impl ImageApi for FakeImages {
+        async fn image_status(
+            &mut self,
+            _: Request<ImageStatusRequest>,
+        ) -> Result<tonic::Response<ImageStatusResponse>, Status> {
+            self.state.calls.lock().unwrap().push("image_status");
+            let image = (*self.state.image_present.lock().unwrap()).then(|| crate::cri_v1::Image {
+                id: "image-1".to_string(),
+                ..Default::default()
+            });
+            Ok(tonic::Response::new(ImageStatusResponse {
+                image,
+                ..Default::default()
+            }))
+        }
+
         async fn pull_image(
             &mut self,
             _: Request<PullImageRequest>,
         ) -> Result<tonic::Response<PullImageResponse>, Status> {
             self.state.calls.lock().unwrap().push("pull_image");
+            *self.state.image_present.lock().unwrap() = true;
             Ok(tonic::Response::new(PullImageResponse {
                 image_ref: "image-1".to_string(),
             }))
@@ -977,7 +1023,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_pulls_image_before_starting_sandbox() {
+    async fn create_pulls_missing_image_before_starting_sandbox() {
         let state = Arc::new(FakeState::default());
         let runtime = FakeRuntime {
             state: state.clone(),
@@ -991,7 +1037,27 @@ mod tests {
         manager.create(&fake_spec("executor-1")).await.unwrap();
 
         let calls = state.calls.lock().unwrap();
-        assert_eq!(calls[0..2], ["pull_image", "run_sandbox"]);
+        assert_eq!(calls[0..3], ["image_status", "pull_image", "run_sandbox"]);
+    }
+
+    #[tokio::test]
+    async fn create_uses_cached_image_without_pulling() {
+        let state = Arc::new(FakeState::default());
+        *state.image_present.lock().unwrap() = true;
+        let runtime = FakeRuntime {
+            state: state.clone(),
+            fail_start: false,
+        };
+        let images = FakeImages {
+            state: state.clone(),
+        };
+        let mut manager = WorkloadManager::with_apis(Box::new(runtime), Box::new(images));
+
+        manager.create(&fake_spec("executor-1")).await.unwrap();
+
+        let calls = state.calls.lock().unwrap();
+        assert_eq!(calls[0..2], ["image_status", "run_sandbox"]);
+        assert!(!calls.contains(&"pull_image"));
     }
 
     #[tokio::test]
