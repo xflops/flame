@@ -14,11 +14,12 @@ env:
   DOCKER_BUILDKIT: 1
   IMAGE_REGISTRY: xflops
   IMAGE_TAG: ci
+  AUTO_DIAGNOSTICS: "false"
 
 jobs:
   ci:
     name: Kubernetes E2E Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - name: Checkout
@@ -26,6 +27,9 @@ jobs:
 
       - name: Set up Helm
         uses: azure/setup-helm@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Create Kind cluster
         uses: helm/kind-action@v1
@@ -35,27 +39,30 @@ jobs:
           wait: 120s
 
       - name: Build Flame images
-        run: |
-          docker build -t ${IMAGE_REGISTRY}/flame-session-manager:${IMAGE_TAG} -f docker/Dockerfile.fsm .
-          docker build -t ${IMAGE_REGISTRY}/flame-object-cache:${IMAGE_TAG} -f docker/Dockerfile.foc .
-          docker build -t ${IMAGE_REGISTRY}/flame-executor-manager:${IMAGE_TAG} -f docker/Dockerfile.fem .
-          docker build -t ${IMAGE_REGISTRY}/flame-console:${IMAGE_TAG} -f docker/Dockerfile.console .
+        run: docker buildx bake --file ci/k8s/docker-bake.hcl --load
 
       - name: Load images into Kind
         run: |
           kind load docker-image ${IMAGE_REGISTRY}/flame-session-manager:${IMAGE_TAG} --name flame
           kind load docker-image ${IMAGE_REGISTRY}/flame-object-cache:${IMAGE_TAG} --name flame
           kind load docker-image ${IMAGE_REGISTRY}/flame-executor-manager:${IMAGE_TAG} --name flame
-          kind load docker-image ${IMAGE_REGISTRY}/flame-console:${IMAGE_TAG} --name flame
 
-      - name: Run Kubernetes e2e
-        run: ci/k8s/e2e.sh
+      - name: Install cert-manager and Envoy Gateway
+        run: ci/k8s/e2e.sh install-infrastructure
+
+      - name: Install Flame
+        run: ci/k8s/e2e.sh install-flame
+
+      - name: Configure external access
+        run: ci/k8s/e2e.sh configure-access
+
+      - name: Run smoke tests from VM
+        run: ci/k8s/e2e.sh run-smoke-tests
+
+      - name: Run E2E tests from VM
+        timeout-minutes: 20
+        run: ci/k8s/e2e.sh run-e2e-tests
 
       - name: Print Kubernetes diagnostics
         if: failure() || cancelled()
-        run: |
-          kubectl -n flame-k8s-e2e get all,pvc || true
-          kubectl -n flame-k8s-e2e get events --sort-by=.lastTimestamp || true
-          kubectl -n flame-k8s-e2e logs -l app.kubernetes.io/component=session-manager --all-containers --tail=500 || true
-          kubectl -n flame-k8s-e2e logs -l app.kubernetes.io/component=object-cache --all-containers --tail=500 || true
-          kubectl -n flame-k8s-e2e logs -l app.kubernetes.io/component=executor-manager --all-containers --tail=500 || true
+        run: ci/k8s/e2e.sh diagnostics

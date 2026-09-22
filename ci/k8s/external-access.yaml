@@ -1,0 +1,179 @@
+# Rendered by ci/k8s/e2e.sh. These resources are CI-owned and deliberately
+# remain outside the Flame Helm chart.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${EXTERNAL_SESSION_SERVICE}
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: flame
+    app.kubernetes.io/instance: ${RELEASE}
+    app.kubernetes.io/component: session-external
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/instance: ${RELEASE}
+    app.kubernetes.io/component: session-manager
+  ports:
+    - name: frontend
+      port: ${SESSION_FRONTEND_PORT}
+      targetPort: frontend
+      nodePort: ${SESSION_NODE_PORT}
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ${RELEASE}-cache-selfsigned
+  namespace: ${NAMESPACE}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ${RELEASE}-cache-ca
+  namespace: ${NAMESPACE}
+spec:
+  isCA: true
+  commonName: ${RELEASE}-cache-e2e-ca
+  secretName: ${CACHE_CA_SECRET}
+  issuerRef:
+    name: ${RELEASE}-cache-selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ${RELEASE}-cache-ca
+  namespace: ${NAMESPACE}
+spec:
+  ca:
+    secretName: ${CACHE_CA_SECRET}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ${RELEASE}-cache-server
+  namespace: ${NAMESPACE}
+spec:
+  secretName: ${CACHE_TLS_SECRET}
+  dnsNames:
+    - ${CACHE_GATEWAY_HOST}
+  ipAddresses:
+${CACHE_CERTIFICATE_IPS}
+  issuerRef:
+    name: ${RELEASE}-cache-ca
+    kind: Issuer
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: ${ENVOY_PROXY}
+  namespace: ${NAMESPACE}
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: NodePort
+        externalTrafficPolicy: Cluster
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              ports:
+                - name: https-443
+                  port: 443
+                  protocol: TCP
+                  targetPort: 10443
+                  nodePort: ${CACHE_GATEWAY_NODE_PORT}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: ${GATEWAY_CLASS}
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: ${ENVOY_PROXY}
+    namespace: ${NAMESPACE}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: ${GATEWAY}
+  namespace: ${NAMESPACE}
+spec:
+  gatewayClassName: ${GATEWAY_CLASS}
+  listeners:
+    - name: cache
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: ${CACHE_TLS_SECRET}
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ${CACHE_BOOTSTRAP_ROUTE}
+  namespace: ${NAMESPACE}
+spec:
+  parentRefs:
+    - name: ${GATEWAY}
+      sectionName: cache
+  hostnames:
+    - ${CACHE_GATEWAY_HOST}
+  rules:
+    - backendRefs:
+        - name: ${CACHE_SERVICE}
+          port: ${CACHE_FLIGHT_PORT}
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: ${CACHE_BACKEND}
+  namespace: ${NAMESPACE}
+spec:
+  type: DynamicResolver
+  appProtocols:
+    - gateway.envoyproxy.io/h2c
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ${CACHE_OWNER_ROUTE}
+  namespace: ${NAMESPACE}
+spec:
+  parentRefs:
+    - name: ${GATEWAY}
+      sectionName: cache
+  rules:
+    - backendRefs:
+        - group: gateway.envoyproxy.io
+          kind: Backend
+          name: ${CACHE_BACKEND}
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: ${CACHE_SECURITY_POLICY}
+  namespace: ${NAMESPACE}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: ${CACHE_OWNER_ROUTE}
+  authorization:
+    defaultAction: Deny
+    rules:
+      - name: flame-cache-pods
+        action: Allow
+        cel: "${CACHE_AUTHORITY_EXPRESSION}"

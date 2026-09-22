@@ -13,6 +13,7 @@ spec:
       port: {{ .Values.objectCache.service.port }}
       targetPort: flight
       protocol: TCP
+      appProtocol: kubernetes.io/h2c
   selector:
     {{- include "flame.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: object-cache

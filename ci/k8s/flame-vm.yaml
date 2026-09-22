@@ -1,0 +1,15 @@
+# Rendered by ci/k8s/e2e.sh for clients running directly on the VM.
+current-context: ${RELEASE}-e2e
+contexts:
+  - name: ${RELEASE}-e2e
+    cluster:
+      endpoint: http://127.0.0.1:${SESSION_NODE_PORT}
+    cache:
+      endpoint: grpcs-proxy://${CACHE_GATEWAY_HOST}:${CACHE_GATEWAY_NODE_PORT}
+      tls:
+        ca_file: ${CACHE_CA_FILE}
+    package:
+      excludes:
+        - "*.log"
+        - "*.pkl"
+        - "*.tmp"

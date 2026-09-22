@@ -15,7 +15,7 @@ use serde_derive::{Deserialize, Serialize};
 use std::env;
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tonic::transport::{Certificate, ClientTlsConfig};
 
 use crate::apis::FlameError;
@@ -274,9 +274,13 @@ impl FlameContext {
 
     pub fn from_file(fp: Option<String>) -> Result<Self, FlameError> {
         let fp = match fp {
-            None => {
-                format!("{}/.flame/{}", env!("HOME", "."), DEFAULT_FLAME_CONF)
-            }
+            None => env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".flame")
+                .join(DEFAULT_FLAME_CONF)
+                .to_string_lossy()
+                .into_owned(),
             Some(path) => path,
         };
 
