@@ -346,8 +346,8 @@ openssl verify -CAfile /etc/flame/certs/ca.crt /etc/flame/certs/server.crt
 | SDK Python       | `sdk/python/src/flamepy/core/client.py` | Configure grpcio with TLS                                  |
 | CLI              | `flmctl/src/*.rs`                       | Use TLS config from flame.yaml                             |
 | Installer        | `installer/flame-cluster.yaml`          | Update example config with new structure                   |
-| CI               | `ci/flame-cluster.yaml`                 | Update CI config with new structure                        |
-| CI               | `ci/generate-certs.sh`                  | Shell script to generate TLS certificates                  |
+| CI               | `ci/docker/flame-cluster.yaml`          | Update CI config with new structure                        |
+| CI               | `ci/docker/generate-certs.sh`           | Shell script to generate TLS certificates                  |
 
 *Breaking Changes (Alpha Release):*
 
@@ -702,11 +702,11 @@ builder
 
 **Certificate Generation:**
 
-Use standard OpenSSL commands to generate certificates. A helper script is provided at `ci/generate-certs.sh`:
+Use standard OpenSSL commands to generate certificates. A helper script is provided at `ci/docker/generate-certs.sh`:
 
 ```bash
 #!/bin/bash
-# ci/generate-certs.sh - Generate self-signed TLS certificates
+# ci/docker/generate-certs.sh - Generate self-signed TLS certificates
 # Usage: ./generate-certs.sh [output_dir] [san_list]
 
 OUTPUT_DIR="${1:-./certs}"
@@ -786,7 +786,7 @@ tonic = { version = "0.12", features = ["tls"] }
 
 1. Generate self-signed certificates using the provided script:
 ```bash
-ci/generate-certs.sh /tmp/flame-certs "localhost,127.0.0.1"
+ci/docker/generate-certs.sh /tmp/flame-certs "localhost,127.0.0.1"
 ```
 
 2. Configure Session Manager (`flame-cluster.yaml`):
@@ -898,7 +898,7 @@ contexts:
 
 1. Generate certificates using OpenSSL or the provided script:
 ```bash
-ci/generate-certs.sh /etc/flame/certs "localhost,192.168.1.100,session-manager.local"
+ci/docker/generate-certs.sh /etc/flame/certs "localhost,192.168.1.100,session-manager.local"
 ```
 
 2. Install and configure Session Manager on the head node:
@@ -967,10 +967,10 @@ sudo systemctl start flame-executor-manager
 1. Generate separate certificates for each service:
 ```bash
 # Session Manager certificate (for management network)
-ci/generate-certs.sh /etc/flame/certs/session-manager "192.168.1.100,session-manager.mgmt.local"
+ci/docker/generate-certs.sh /etc/flame/certs/session-manager "192.168.1.100,session-manager.mgmt.local"
 
 # Object Cache certificate (for data network)  
-ci/generate-certs.sh /etc/flame/certs/object-cache "10.0.0.100,object-cache.data.local"
+ci/docker/generate-certs.sh /etc/flame/certs/object-cache "10.0.0.100,object-cache.data.local"
 ```
 
 2. Configure with separate TLS for each service:

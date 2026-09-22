@@ -69,7 +69,7 @@ fn get_ca_cert_path() -> String {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         format!("{}/../..", manifest_dir)
     });
-    format!("{}/ci/certs/ca.crt", root)
+    format!("{}/ci/docker/certs/ca.crt", root)
 }
 
 struct BenchmarkCase {

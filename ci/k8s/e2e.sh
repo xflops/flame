@@ -279,7 +279,7 @@ create_external_access() {
     wait_route_ready "$CACHE_OWNER_ROUTE"
     wait_security_policy_accepted
 
-    # Confirm the generated Service has the fixed NodePort mapped by ci/kind.yaml.
+    # Confirm the generated Service has the fixed NodePort mapped by ci/k8s/kind.yaml.
     kubectl -n "$ENVOY_GATEWAY_NAMESPACE" get service \
         -l "gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE},gateway.envoyproxy.io/owning-gateway-name=${GATEWAY}" \
         -o jsonpath="{.items[0].spec.ports[?(@.nodePort==${CACHE_GATEWAY_NODE_PORT})].nodePort}" \

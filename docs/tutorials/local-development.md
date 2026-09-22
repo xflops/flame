@@ -9,8 +9,6 @@ This guide sets up a single-node Flame cluster from the local source tree withou
 - `uv`
 - Git
 
-The helper script also starts a temporary HTTP package server with `dufs`; install `dufs` only if you use `hack/local-test.sh`.
-
 ## Install
 
 Build all release artifacts:
@@ -138,20 +136,6 @@ cargo build --release
 ```
 
 Then restart the three services.
-
-## Helper Script
-
-`hack/local-test.sh` wraps install, start, stop, logs, and test commands:
-
-```bash
-./hack/local-test.sh install
-./hack/local-test.sh start
-./hack/local-test.sh status
-./hack/local-test.sh test
-./hack/local-test.sh stop
-```
-
-The script starts an additional `dufs` server for HTTP package storage, so `dufs` must be installed before `./hack/local-test.sh start`.
 
 ## Logs
 

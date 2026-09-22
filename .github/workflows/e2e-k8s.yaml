@@ -35,7 +35,7 @@ jobs:
         uses: helm/kind-action@v1
         with:
           cluster_name: flame
-          config: ci/kind.yaml
+          config: ci/k8s/kind.yaml
           wait: 120s
 
       - name: Build Flame images

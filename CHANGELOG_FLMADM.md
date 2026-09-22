@@ -72,33 +72,10 @@ A complete administration tool for installing, configuring, and managing Flame c
 - More realistic testing (actual binaries)
 - Better error reporting (native process output)
 
-### 4. Local Development Helper Script
-
-**File:** `hack/local-test.sh`
-
-A convenient script for local development workflow:
-
-```bash
-./hack/local-test.sh install    # Install Flame
-./hack/local-test.sh start      # Start services
-./hack/local-test.sh stop       # Stop services
-./hack/local-test.sh restart    # Restart services
-./hack/local-test.sh status     # Check service status
-./hack/local-test.sh logs       # View service logs
-./hack/local-test.sh test       # Run E2E tests
-./hack/local-test.sh uninstall  # Uninstall Flame
-./hack/local-test.sh clean      # Stop and uninstall
-```
-
-**Environment variables:**
-- `INSTALL_PREFIX`: Installation directory (default: `/tmp/flame-dev`)
-- `FLAME_ENDPOINT`: Flame endpoint URL (default: `http://127.0.0.1:8080`)
-
-### 5. Documentation
+### 4. Documentation
 
 **New documents:**
 - `docs/tutorials/local-development.md`: Complete guide for local development
-  - Quick start with helper script
   - Manual installation steps
   - Development workflow
   - Troubleshooting
@@ -109,7 +86,7 @@ A convenient script for local development workflow:
 - `AGENTS.md`: Updated build and test commands with local options
 - `flmadm/README.md`: Comprehensive flmadm usage guide
 
-### 6. Workspace Updates
+### 5. Workspace Updates
 
 **File:** `Cargo.toml`
 
@@ -136,10 +113,18 @@ docker compose down
 
 **New workflow (Local, faster):**
 ```bash
-./hack/local-test.sh install
-./hack/local-test.sh start
-./hack/local-test.sh test
-./hack/local-test.sh clean
+make install-dev
+
+FLAME_HOME=/tmp/flame-dev /tmp/flame-dev/bin/flame-object-cache --config /tmp/flame-dev/conf/flame-cluster.yaml &
+CACHE_PID=$!
+FLAME_HOME=/tmp/flame-dev /tmp/flame-dev/bin/flame-session-manager --config /tmp/flame-dev/conf/flame-cluster.yaml &
+FSM_PID=$!
+FLAME_HOME=/tmp/flame-dev /tmp/flame-dev/bin/flame-executor-manager --config /tmp/flame-dev/conf/flame-cluster.yaml &
+FEM_PID=$!
+
+make e2e-py-local
+kill "$FEM_PID" "$FSM_PID" "$CACHE_PID"
+make uninstall-dev
 ```
 
 ### Quick Development Iteration
@@ -150,9 +135,10 @@ make install-dev
 
 # Development cycle
 cargo build --release             # Build changes
-./hack/local-test.sh restart      # Restart services
-./hack/local-test.sh test         # Run tests
-./hack/local-test.sh logs         # Check logs if needed
+make install-dev                  # Reinstall the updated binaries
+# Restart the three processes using docs/tutorials/local-development.md
+make e2e-py-local                 # Run tests
+tail -f /tmp/flame-dev/logs/*.log # Check logs if needed
 ```
 
 ## Performance Improvements
@@ -185,9 +171,6 @@ Developers can choose their preferred workflow based on their needs.
 - `flmadm/src/commands/{mod.rs, install.rs, uninstall.rs}`
 - `flmadm/src/managers/{mod.rs, source.rs, build.rs, user.rs, config.rs, systemd.rs, installation.rs, backup.rs}`
 
-### Scripts (1 file)
-- `hack/local-test.sh`
-
 ### Documentation (5 files)
 - `flmadm/README.md`
 - `docs/designs/RFE333-flmadm/FS.md`
@@ -208,9 +191,9 @@ Developers can choose their preferred workflow based on their needs.
 
 ### Manual Testing Checklist
 - [ ] `make install-dev` works
-- [ ] Services start correctly with `./hack/local-test.sh start`
+- [ ] Services start correctly with the commands in the local development guide
 - [ ] `make e2e-py-local` runs tests successfully
-- [ ] Services stop cleanly with `./hack/local-test.sh stop`
+- [ ] The local service processes stop cleanly
 - [ ] `make uninstall-dev` removes installation
 - [ ] CI workflow passes on GitHub Actions
 
@@ -221,11 +204,11 @@ The updated CI workflow will automatically test flmadm installation and E2E test
 
 1. **Test the changes:**
    ```bash
-   # Local testing
-   ./hack/local-test.sh install
-   ./hack/local-test.sh start
-   ./hack/local-test.sh test
-   ./hack/local-test.sh clean
+   make install-dev
+   # Start the three services as described in docs/tutorials/local-development.md
+   make e2e-py-local
+   # Stop the service processes, then remove the installation
+   make uninstall-dev
    ```
 
 2. **CI verification:**

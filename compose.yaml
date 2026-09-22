@@ -7,8 +7,8 @@ services:
     environment:
       - RUST_LOG=info
     volumes:
-      - ./ci/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
-      - ./ci/certs:/etc/flame/certs:ro
+      - ./ci/docker/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
+      - ./ci/docker/certs:/etc/flame/certs:ro
       - ./logs:/usr/local/flame/logs
     ports:
       - 8080:8080
@@ -23,8 +23,8 @@ services:
     environment:
       - RUST_LOG=info
     volumes:
-      - ./ci/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
-      - ./ci/certs:/etc/flame/certs:ro
+      - ./ci/docker/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
+      - ./ci/docker/certs:/etc/flame/certs:ro
       - flame-cache-storage:/var/lib/flame/cache
       - ./logs:/usr/local/flame/logs
     ports:
@@ -54,8 +54,8 @@ services:
     depends_on:
       - flame-object-cache
     volumes:
-      - ./ci/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
-      - ./ci/certs:/etc/flame/certs:ro
+      - ./ci/docker/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
+      - ./ci/docker/certs:/etc/flame/certs:ro
       - ./examples:/opt/examples
       - ./e2e:/opt/e2e
       - type: volume
@@ -76,8 +76,8 @@ services:
     environment:
       - RUST_LOG=info
     volumes:
-      - ./ci/flame.yaml:/root/.flame/flame.yaml
-      - ./ci/certs:/etc/flame/certs:ro
+      - ./ci/docker/flame.yaml:/root/.flame/flame.yaml
+      - ./ci/docker/certs:/etc/flame/certs:ro
       - ./examples:/opt/examples
       - ./e2e:/opt/e2e
       - ./work/cache:/usr/local/flame/data/cache

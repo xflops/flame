@@ -5,7 +5,7 @@
 
 set -Eeuo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 INSTALL_PREFIX="${INSTALL_PREFIX:-/opt/flame-test}"
@@ -160,7 +160,7 @@ EOF
     sudo chown "$(id -un):$(id -gn)" /run/containerd/containerd.sock
     test -S /run/containerd/containerd.sock
     sudo ctr plugins ls
-    FLAME_CRI_DEDICATED_NODE=true hack/validate-cri-runtime.sh
+    FLAME_CRI_DEDICATED_NODE=true ci/cri/validate-runtime.sh
 }
 
 start_cluster() {

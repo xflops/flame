@@ -70,8 +70,8 @@ jobs:
         run: |
           echo "=== Copy local configuration ==="
           mkdir -p ~/.flame
-          cp ci/flame-local.yaml ~/.flame/flame.yaml
-          echo "✓ Copied flame-local.yaml to ~/.flame/flame.yaml"
+          cp ci/bm/flame.yaml ~/.flame/flame.yaml
+          echo "✓ Copied ci/bm/flame.yaml to ~/.flame/flame.yaml"
 
       - name: Setup Python environment
         run: |
@@ -190,19 +190,19 @@ jobs:
           python-version: "3.12"
 
       - name: Install host and CRI dependencies
-        run: hack/cri-shim-e2e.sh install-dependencies
+        run: ci/cri/e2e.sh install-dependencies
 
       - name: Build and install Flame
-        run: hack/cri-shim-e2e.sh install-flame
+        run: ci/cri/e2e.sh install-flame
 
       - name: Build and publish flmrt to the local registry
-        run: hack/cri-shim-e2e.sh publish-runtime-image
+        run: ci/cri/e2e.sh publish-runtime-image
 
       - name: Configure containerd, gVisor, and CNI
-        run: hack/cri-shim-e2e.sh configure-runtime
+        run: ci/cri/e2e.sh configure-runtime
 
       - name: Start the BareMetal Flame cluster
-        run: hack/cri-shim-e2e.sh start-cluster
+        run: ci/cri/e2e.sh start-cluster
 
       - name: Run shared Python E2E cases through CRI
         timeout-minutes: 90
@@ -216,16 +216,16 @@ jobs:
             tests/test_sandbox.py
 
       - name: Verify Flame-owned CRI workloads
-        run: hack/cri-shim-e2e.sh verify-workloads
+        run: ci/cri/e2e.sh verify-workloads
 
       - name: Print CRI and Flame diagnostics
         if: always()
-        run: hack/cri-shim-e2e.sh diagnostics
+        run: ci/cri/e2e.sh diagnostics
 
       - name: Stop CRI E2E services
         if: always()
-        run: hack/cri-shim-e2e.sh stop-services
+        run: ci/cri/e2e.sh stop-services
 
       - name: Uninstall Flame
         if: always()
-        run: hack/cri-shim-e2e.sh uninstall-flame
+        run: ci/cri/e2e.sh uninstall-flame

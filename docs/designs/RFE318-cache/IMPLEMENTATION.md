@@ -31,8 +31,8 @@ The naive HTTP-based in-memory cache has been removed from `flame-executor-manag
 
 #### 2. Configuration Updates
 - ✅ `common/src/ctx.rs`: Added `storage` field to `FlameCache` and `FlameCacheYaml`
-- ✅ `ci/flame-cluster.yaml`: Updated cache configuration with grpc endpoint and storage path
-- ✅ `ci/flame.yaml`: Updated client cache configuration to use new structure
+- ✅ `ci/docker/flame-cluster.yaml`: Updated cache configuration with grpc endpoint and storage path
+- ✅ `ci/docker/flame.yaml`: Updated client cache configuration to use new structure
 
 #### 3. Python SDK (`sdk/python/`)
 - ✅ Updated `ObjectRef` structure (endpoint, key, version)

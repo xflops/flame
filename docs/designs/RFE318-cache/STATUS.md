@@ -111,8 +111,8 @@ Moved from HTTP headers/app_metadata to `FlightDescriptor.path[0]` for better co
 - `sdk/python/pyproject.toml` - Added pyarrow dependency
 
 **Configuration**:
-- `ci/flame-cluster.yaml` - Updated cache config
-- `ci/flame.yaml` - Updated client cache config
+- `ci/docker/flame-cluster.yaml` - Updated cache config
+- `ci/docker/flame.yaml` - Updated client cache config
 - `compose.yaml` - Added cache service
 - `Makefile` - Added cache build targets
 

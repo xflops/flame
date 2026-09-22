@@ -835,7 +835,7 @@ Chart unit checks:
 
 Kind smoke test:
 
-1. Create a Kind cluster with the existing `ci/kind.yaml`.
+1. Create a Kind cluster with the existing `ci/k8s/kind.yaml`.
 2. Load or pull the Flame component and console images.
 3. Install the chart with default values.
 4. Wait for session-manager, object-cache, and executor-manager pods.
@@ -962,9 +962,9 @@ Expected outcome:
 **Implementation References:**
 
 - `compose.yaml`
-- `ci/flame-cluster.yaml`
-- `ci/flame.yaml`
-- `ci/kind.yaml`
+- `ci/docker/flame-cluster.yaml`
+- `ci/docker/flame.yaml`
+- `ci/k8s/kind.yaml`
 - `docker/Dockerfile.fsm`
 - `docker/Dockerfile.foc`
 - `docker/Dockerfile.fem`

@@ -10,7 +10,7 @@ services:
     environment:
       - RUST_LOG=debug
     volumes:
-      - ./ci/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
+      - ./ci/docker/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
     ports:
       - 8080:8080
 
@@ -33,7 +33,7 @@ services:
         max_attempts: 3
         window: 120s
     volumes:
-      - ./ci/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
+      - ./ci/docker/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
       - ./examples:/opt/examples
       - ./e2e:/opt/e2e
       - flame-work:/usr/local/flame/work
@@ -49,7 +49,7 @@ services:
     environment:
       - RUST_LOG=info
     volumes:
-      - ./ci/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
+      - ./ci/docker/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
       - ./examples:/opt/examples
       - ./e2e:/opt/e2e
 

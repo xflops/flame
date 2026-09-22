@@ -1414,4 +1414,3 @@ pub struct BuildArtifacts {
 - flmctl implementation: `flmctl/src/main.rs` (user CLI)
 - Common utilities: `common/src/` (shared installation/backup utilities)
 - Python SDK: `sdk/python/`
-- Systemd service examples: `ci/supervisord/` (for reference, not systemd but service config)

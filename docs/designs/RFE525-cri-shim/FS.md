@@ -145,7 +145,7 @@ workers. Shared nodes retain it if another workload contract uses `hostPort`.
 Omitting `portmap` does not remove the bridge, sandbox IP, egress,
 session-manager access, or object-cache access.
 
-Operators run `hack/validate-cri-runtime.sh` as the executor-manager service
+Operators run `ci/cri/validate-runtime.sh` as the executor-manager service
 user after provisioning and before admitting the node. The read-only preflight
 checks the effective containerd default runtime and runsc runtime type, the
 configured runsc platform and `host-uds` policy, bridge/IPAM CNI, CRI socket

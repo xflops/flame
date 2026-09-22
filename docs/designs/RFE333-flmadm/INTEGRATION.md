@@ -51,23 +51,7 @@ Updated `.github/workflows/e2e-py.yaml` to use `flmadm` for installation:
 - **More realistic**: Tests run against actual binaries
 - **Better error reporting**: Native process output
 
-### 3. Local Development Script
-
-Created `hack/local-test.sh` helper script for local development:
-
-```bash
-./hack/local-test.sh install    # Install Flame locally
-./hack/local-test.sh start      # Start services
-./hack/local-test.sh stop       # Stop services
-./hack/local-test.sh restart    # Restart services
-./hack/local-test.sh status     # Check status
-./hack/local-test.sh logs       # View logs
-./hack/local-test.sh test       # Run E2E tests
-./hack/local-test.sh uninstall  # Uninstall
-./hack/local-test.sh clean      # Stop and uninstall
-```
-
-### 4. Documentation
+### 3. Documentation
 
 Created comprehensive documentation:
 
@@ -94,15 +78,23 @@ docker compose down
 
 **New workflow (Local, faster):**
 ```bash
-# Install and start cluster
-./hack/local-test.sh install
-./hack/local-test.sh start
+# Install the cluster
+make install-dev
+
+# Start the services
+FLAME_HOME=/tmp/flame-dev /tmp/flame-dev/bin/flame-object-cache --config /tmp/flame-dev/conf/flame-cluster.yaml &
+CACHE_PID=$!
+FLAME_HOME=/tmp/flame-dev /tmp/flame-dev/bin/flame-session-manager --config /tmp/flame-dev/conf/flame-cluster.yaml &
+FSM_PID=$!
+FLAME_HOME=/tmp/flame-dev /tmp/flame-dev/bin/flame-executor-manager --config /tmp/flame-dev/conf/flame-cluster.yaml &
+FEM_PID=$!
 
 # Run tests
-./hack/local-test.sh test
+make e2e-py-local
 
 # Stop and cleanup
-./hack/local-test.sh clean
+kill "$FEM_PID" "$FSM_PID" "$CACHE_PID"
+make uninstall-dev
 ```
 
 ### For CI/CD
@@ -196,8 +188,7 @@ Edit the configuration file to customize your local cluster:
 
 ```bash
 vim /tmp/flame-dev/conf/flame-cluster.yaml
-# Restart services after changes
-./hack/local-test.sh restart
+# Stop and restart the service processes after changes
 ```
 
 ## Troubleshooting
@@ -222,9 +213,6 @@ vim /tmp/flame-dev/conf/flame-cluster.yaml
 Check logs:
 
 ```bash
-./hack/local-test.sh logs
-
-# Or directly
 cat /tmp/flame-dev/logs/fsm.log
 cat /tmp/flame-dev/logs/fem.log
 ```

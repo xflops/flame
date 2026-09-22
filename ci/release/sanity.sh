@@ -455,7 +455,7 @@ run_pypi_compose_e2e() {
     log "Running PyPI flamepy ${PYTHON_VERSION} Runner check in ${PYPI_CHECK_IMAGE}"
     run "$CONTAINER_CLI" run --rm \
         --network "$COMPOSE_NETWORK_NAME" \
-        -v "$ROOT_DIR/ci/certs:/etc/flame/certs:ro" \
+        -v "$ROOT_DIR/ci/docker/certs:/etc/flame/certs:ro" \
         -v "$PYPI_CHECK_SCRIPT:/tmp/flame-release-sanity-pypi-check.sh:ro" \
         -e "PYPI_INDEX_URL=${PYPI_INDEX_URL}" \
         -e "PYTHON_VERSION=${PYTHON_VERSION}" \

@@ -315,12 +315,12 @@ make release-sanity
 Set `RELEASE_SANITY_COMPOSE_DOWN=0` only when you need to inspect the compose
 cluster after a failed run.
 
-The compose smoke uses the TLS settings in `ci/flame-cluster.yaml` and
-`ci/flame.yaml`. If `ci/certs` does not already contain release-test
+The compose smoke uses the TLS settings in `ci/docker/flame-cluster.yaml` and
+`ci/docker/flame.yaml`. If `ci/docker/certs` does not already contain release-test
 certificates, generate them before running the compose sanity check:
 
 ```shell
-ci/generate-certs.sh --output ci/certs \
+ci/docker/generate-certs.sh --output ci/docker/certs \
   --san-list localhost,127.0.0.1,flame-session-manager,flame-object-cache \
   --ip-range 172.20.0.0/24
 ```
