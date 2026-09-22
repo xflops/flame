@@ -282,6 +282,94 @@ mod tests {
         Ok(())
     }
 
+    fn assert_dispatch_reuses_idle_executors(task_counts: &[usize]) -> Result<(), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        tokio_test::block_on(
+            controller
+                .storage()
+                .register_node(&new_test_node("node_1".to_string())),
+        )?;
+
+        let mut session_ids = Vec::new();
+        for task_count in task_counts {
+            let ssn_id = format!("reuse-idle-{}", Uuid::new_v4());
+            tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+                id: ssn_id.clone(),
+                application: "flmtest".to_string(),
+                common_data: None,
+                min_instances: 0,
+                max_instances: None,
+                batch_size: 1,
+                priority: 0,
+                resreq: Some(common::apis::ResourceRequirement {
+                    cpu: 1,
+                    memory: 1024 * 1024 * 1024,
+                    gpu: 0,
+                }),
+            }))?;
+            for _ in 0..*task_count {
+                tokio_test::block_on(controller.create_task(ssn_id.clone(), None, None))?;
+            }
+            session_ids.push(ssn_id);
+        }
+
+        let executor_count = task_counts.iter().sum::<usize>();
+        for _ in 0..executor_count {
+            let executor = tokio_test::block_on(
+                controller.create_executor("node_1".to_string(), session_ids[0].clone()),
+            )?;
+            tokio_test::block_on(controller.register_executor(&executor))?;
+        }
+
+        let default_policies = common::ctx::DEFAULT_POLICIES
+            .iter()
+            .map(|policy| policy.to_string())
+            .collect::<Vec<_>>();
+        let mut ctx = Context::new(controller.clone(), &default_policies)?;
+
+        let dispatch = DispatchAction::new_ptr();
+        tokio_test::block_on(dispatch.execute(&mut ctx))?;
+
+        let allocate = AllocateAction::new_ptr();
+        tokio_test::block_on(allocate.execute(&mut ctx))?;
+
+        let executors = controller.list_executor()?;
+        assert_eq!(executors.len(), executor_count);
+        assert!(executors.iter().all(|executor| {
+            executor.state == common::apis::ExecutorState::Binding
+                && executor
+                    .ssn_id
+                    .as_ref()
+                    .is_some_and(|session_id| session_ids.contains(session_id))
+        }));
+        for (session_id, task_count) in session_ids.iter().zip(task_counts) {
+            assert_eq!(
+                executors
+                    .iter()
+                    .filter(|executor| executor.ssn_id.as_ref() == Some(session_id))
+                    .count(),
+                *task_count
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_dispatch_reuses_all_idle_executors_for_one_session() -> Result<(), FlameError> {
+        assert_dispatch_reuses_idle_executors(&[2])
+    }
+
+    #[test]
+    fn test_dispatch_reuses_idle_executors_for_separate_sessions() -> Result<(), FlameError> {
+        assert_dispatch_reuses_idle_executors(&[1, 1])
+    }
+
     #[test]
     fn test_scheduler_skips_not_ready_session() -> Result<(), FlameError> {
         let env = TestEnv::new_with_retry_limit(1)?;

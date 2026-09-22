@@ -284,10 +284,12 @@ does not enable another scheduler policy as a side effect.
 
 The plugin ranks, but does not filter, executors. `DispatchAction` selects a
 ready session and passes it with the `ExecutorState::Idle` executor map to
-`Context::select_executor(session, idle_executors)`. The scheduling context
-owns the plugin manager, applies the existing executor ownership, resource,
-shim, and policy availability checks, orders eligible candidates, and returns
-the executor with the greatest DAS score.
+`Context::select_executor(session, idle_executors)`. After a successful bind,
+Dispatch requeues a session that still has unsatisfied demand so retained Idle
+executors satisfy that demand before Allocate creates new ones. The scheduling
+context owns the plugin manager, applies the existing executor ownership,
+resource, shim, and policy availability checks, orders eligible candidates,
+and returns the executor with the greatest DAS score.
 
 The plugin interface gains a session-aware executor comparator:
 

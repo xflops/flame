@@ -73,6 +73,16 @@ impl Action for DispatchAction {
             if let Some(exec) = available {
                 ctx.bind_session(&exec, &ssn).await?;
                 idle_executors.remove(&exec.id);
+
+                // A session may need more than one executor. Give Dispatch the
+                // first opportunity to satisfy that demand from retained Idle
+                // executors before Allocate creates new ones. `is_underused`
+                // says the session remains eligible for capacity, while
+                // `is_ready` also counts pipelined capacity and prevents us
+                // from requeueing when that in-flight capacity is sufficient.
+                if !idle_executors.is_empty() && ctx.is_underused(&ssn)? && !ctx.is_ready(&ssn)? {
+                    open_ssns.push(ssn);
+                }
             }
         }
 

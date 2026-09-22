@@ -78,10 +78,22 @@ pub trait Plugin: Send + Sync + 'static {
     }
 
     // Filter Fn
+    /// Whether the session is eligible for more capacity under this policy.
+    ///
+    /// This is a demand/fairness decision based on capacity already allocated
+    /// to the session. It deliberately does not mean that another allocation
+    /// should start: `is_ready` also accounts for capacity already in flight.
+    /// `None` delegates the decision to the next configured policy.
     fn is_underused(&self, ssn: &SessionInfoPtr) -> Option<bool> {
         None
     }
 
+    /// Whether allocated plus pipelined capacity has satisfied this policy's
+    /// target for the session.
+    ///
+    /// Actions use this together with `is_underused` to avoid binding or
+    /// creating another executor while sufficient capacity is already in
+    /// flight. `None` delegates the decision to the next configured policy.
     fn is_ready(&self, ssn: &SessionInfoPtr) -> Option<bool> {
         None
     }
@@ -200,6 +212,10 @@ impl PluginManager {
     /// - `Some(false)` → blocked; no further plugins consulted.
     /// - `Some(true)` → underused; overrides any downstream-plugin veto.
     /// - `None` → defer to the next plugin in the chain for additional underuse checks.
+    ///
+    /// Underused is not the inverse of ready. A session may be underused based
+    /// on allocated capacity while pipelined capacity already satisfies its
+    /// target; callers must also consult `is_ready` before requesting more.
     pub fn is_underused(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
         let plugins = lock_ptr!(self.plugins)?;
         for (_, plugin) in plugins.iter() {
@@ -210,18 +226,21 @@ impl PluginManager {
         Ok(false)
     }
 
+    /// Returns whether the active demand policy has reserved enough capacity.
+    ///
+    /// Like `is_underused`, the first plugin with an opinion is authoritative.
+    /// In the default chain Priority's task-derived demand is the allocation
+    /// ceiling; DRF supplies readiness when Priority is disabled.
+    /// This check includes pipelined capacity, unlike `is_underused`, and thus
+    /// prevents duplicate allocation while an executor is being provisioned.
     pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
         let plugins = lock_ptr!(self.plugins)?;
-        let mut has_opinion = false;
         for (_, plugin) in plugins.iter() {
             if let Some(ready) = plugin.is_ready(ssn) {
-                has_opinion = true;
-                if !ready {
-                    return Ok(false);
-                }
+                return Ok(ready);
             }
         }
-        Ok(has_opinion)
+        Ok(false)
     }
 
     pub fn is_preemptible(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
