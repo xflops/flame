@@ -60,7 +60,7 @@ struct FlameClusterYaml {
     pub resreq: Option<String>,
     pub policies: Option<Vec<String>>,
     pub storage: Option<String>,
-    /// Schedule interval in milliseconds for the session scheduler loop
+    /// Maximum scheduler wait in milliseconds when no state change occurs.
     pub schedule_interval: Option<u64>,
     /// Executors configuration (moved under cluster)
     pub executors: Option<FlameExecutorsYaml>,
@@ -173,6 +173,7 @@ pub struct FlameExecutors {
 #[derive(Debug, Clone)]
 pub struct FlameLimits {
     pub max_sessions: Option<usize>,
+    /// Maximum number of non-Released executors allowed on each node.
     pub max_executors: u32,
 }
 

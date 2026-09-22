@@ -64,6 +64,16 @@ impl Action for DispatchAction {
                 continue;
             }
 
+            // A downstream policy such as DRF may still consider the session
+            // underused after the active demand policy (Priority) has already
+            // reserved enough capacity. Check readiness before consuming
+            // another retained Idle executor, just as Allocate does before
+            // creating or pipelining capacity.
+            if ctx.is_ready(&ssn)? {
+                tracing::debug!("Session <{}> is ready, skip it.", ssn.id);
+                continue;
+            }
+
             tracing::debug!(
                 "Session <{}> is underused, start to allocate resources.",
                 &ssn.id

@@ -11,7 +11,7 @@ cluster:
     shim: host
   limits:
     max_sessions: 1000
-    max_executors: 10
+    max_executors: 4
   tls:
     cert_file: "/etc/flame/certs/server.crt"
     key_file: "/etc/flame/certs/server.key"

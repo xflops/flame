@@ -23,7 +23,7 @@ jobs:
       - name: Start Flame with benchmark config
         run: |
           cp ci/flame-cluster-benchmark.yaml ci/flame-cluster.yaml
-          docker compose up --build --force-recreate -d
+          docker compose up --build --force-recreate -d --scale flame-executor-manager=1
 
       - name: Install gRPC
         run: |
@@ -40,7 +40,8 @@ jobs:
         env:
           FLAME_ROOT: ${{ github.workspace }}
           FLAME_BENCHMARK_ENDPOINT: https://127.0.0.1:8080
-          FLAME_BENCHMARK_RUNTIME: Host
+          FLAME_BENCHMARK_RUNTIME: Host Shim
+          FLAME_BENCHMARK_EXECUTORS: 4
         run: |
           cargo test -p flame-rs --test benchmark_test -- --nocapture
 
@@ -59,6 +60,7 @@ jobs:
       FLAME_CACHE_ENDPOINT: grpc://10.250.0.1:9090
       FLAME_E2E_RUNTIME_IMAGE: localhost:5000/xflops/flmrt:ci
       FLAME_CRI_SANDBOX_IMAGE: registry.k8s.io/pause:3.10.2
+      FLAME_CLUSTER_CONFIG: ci/cri/flame-cluster-benchmark.yaml
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -91,6 +93,7 @@ jobs:
         env:
           FLAME_BENCHMARK_ENDPOINT: http://10.250.0.1:8080
           FLAME_BENCHMARK_RUNTIME: CRI Shim
+          FLAME_BENCHMARK_EXECUTORS: 4
         run: |
           cargo test -p flame-rs --test benchmark_test -- --nocapture
 

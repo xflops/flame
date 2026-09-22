@@ -2051,6 +2051,7 @@ dependencies = [
  "bson",
  "bytes",
  "chrono",
+ "comfy-table",
  "flame-rs-macros",
  "futures",
  "prost 0.14.3",

@@ -14,7 +14,8 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
+use tokio::time::Duration;
 
 use common::apis::{ExecutorID, SessionID, TaskID};
 use common::FlameError;
@@ -137,11 +138,32 @@ impl Default for ExecutorNotifier {
     }
 }
 
+#[derive(Default)]
+pub struct SchedulerNotifier {
+    notification: Notify,
+}
+
+impl SchedulerNotifier {
+    pub fn notify(&self) {
+        // `Notify` stores at most one permit, which coalesces bursts of state
+        // changes into one additional scheduling pass.
+        self.notification.notify_one();
+    }
+
+    pub async fn wait(&self, interval: Duration) {
+        tokio::select! {
+            _ = self.notification.notified() => {}
+            _ = tokio::time::sleep(interval) => {}
+        }
+    }
+}
+
 pub type NotifyManagerPtr = Arc<NotifyManager>;
 
 pub struct NotifyManager {
     pub tasks: TaskNotifier,
     pub executors: ExecutorNotifier,
+    pub scheduler: SchedulerNotifier,
 }
 
 impl NotifyManager {
@@ -149,6 +171,7 @@ impl NotifyManager {
         Self {
             tasks: TaskNotifier::new(),
             executors: ExecutorNotifier::new(),
+            scheduler: SchedulerNotifier::default(),
         }
     }
 
@@ -166,6 +189,23 @@ impl Default for NotifyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn scheduler_notification_wakes_early_and_coalesces() {
+        use tokio::time::{Duration, Instant};
+
+        let notifier = SchedulerNotifier::default();
+        notifier.notify();
+        notifier.notify();
+
+        let before_event = Instant::now();
+        notifier.wait(Duration::from_millis(100)).await;
+        assert_eq!(Instant::now() - before_event, Duration::ZERO);
+
+        let before_timeout = Instant::now();
+        notifier.wait(Duration::from_millis(100)).await;
+        assert_eq!(Instant::now() - before_timeout, Duration::from_millis(100));
+    }
 
     mod task_notifier_tests {
         use super::*;

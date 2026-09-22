@@ -1,0 +1,21 @@
+---
+cluster:
+  name: flame-cri-benchmark
+  endpoint: "http://10.250.0.1:8080"
+  resreq: "cpu=1,mem=1g"
+  policies:
+    - priority
+  storage: none
+  schedule_interval: 100
+  executors:
+    shim: cri
+  limits:
+    max_sessions: 1000
+    max_executors: 4
+cache:
+  endpoint: "grpc://10.250.0.1:9090"
+  network_interface: "flame0"
+  eviction:
+    policy: "lru"
+    max_memory: "1024M"
+    max_objects: 100000

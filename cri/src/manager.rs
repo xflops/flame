@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use common::FlameError;
@@ -27,7 +27,7 @@ use tonic::transport::{Endpoint, Uri};
 use tonic::{Code, Request, Status};
 #[cfg(unix)]
 use tower::service_fn;
-use tracing::info;
+use tracing::debug;
 
 use crate::apis::{
     ContainerStatus, LABEL_WORKLOAD_UID, WorkloadFilter, WorkloadHandle, WorkloadSpec,
@@ -40,10 +40,10 @@ use crate::cri_v1::{
     CreateContainerResponse, ImageStatusRequest, ImageStatusResponse, ListContainersRequest,
     ListContainersResponse, ListPodSandboxRequest, ListPodSandboxResponse, PodSandboxFilter,
     PodSandboxStatus, PodSandboxStatusRequest, PodSandboxStatusResponse, PullImageRequest,
-    PullImageResponse, RemoveContainerRequest, RemoveContainerResponse, RemovePodSandboxRequest,
-    RemovePodSandboxResponse, RunPodSandboxRequest, RunPodSandboxResponse, StartContainerRequest,
-    StartContainerResponse, StatusRequest, StopContainerRequest, StopContainerResponse,
-    StopPodSandboxRequest, StopPodSandboxResponse, VersionRequest,
+    PullImageResponse, RemovePodSandboxRequest, RemovePodSandboxResponse, RunPodSandboxRequest,
+    RunPodSandboxResponse, StartContainerRequest, StartContainerResponse, StatusRequest,
+    StopContainerRequest, StopContainerResponse, StopPodSandboxRequest, StopPodSandboxResponse,
+    VersionRequest,
 };
 
 pub const CONTAINERD_SOCKET: &str = "/run/containerd/containerd.sock";
@@ -91,10 +91,6 @@ trait RuntimeApi: Send {
         &mut self,
         request: Request<StopPodSandboxRequest>,
     ) -> Result<tonic::Response<StopPodSandboxResponse>, Status>;
-    async fn remove_container(
-        &mut self,
-        request: Request<RemoveContainerRequest>,
-    ) -> Result<tonic::Response<RemoveContainerResponse>, Status>;
     async fn remove_pod_sandbox(
         &mut self,
         request: Request<RemovePodSandboxRequest>,
@@ -157,12 +153,6 @@ impl RuntimeApi for RuntimeServiceClient<Channel> {
     ) -> Result<tonic::Response<StopPodSandboxResponse>, Status> {
         RuntimeServiceClient::stop_pod_sandbox(self, request).await
     }
-    async fn remove_container(
-        &mut self,
-        request: Request<RemoveContainerRequest>,
-    ) -> Result<tonic::Response<RemoveContainerResponse>, Status> {
-        RuntimeServiceClient::remove_container(self, request).await
-    }
     async fn remove_pod_sandbox(
         &mut self,
         request: Request<RemovePodSandboxRequest>,
@@ -224,9 +214,9 @@ impl WorkloadManager {
     /// Connect to a CRI v1 Unix socket. Flame uses [`CONTAINERD_SOCKET`]; the
     /// explicit endpoint exists for local fake-runtime and integration tests.
     pub async fn connect_to(endpoint: &str) -> Result<Self, FlameError> {
+        let started = Instant::now();
         let channel = Self::new_channel(endpoint).await?;
-        let mut rt_client = RuntimeServiceClient::new(channel);
-        let channel = Self::new_channel(endpoint).await?;
+        let mut rt_client = RuntimeServiceClient::new(channel.clone());
         let img_client = ImageServiceClient::new(channel);
 
         let response = rt_client
@@ -276,9 +266,12 @@ impl WorkloadManager {
             }
         }
 
-        info!(
-            "CRI runtime: {}/{} ({})",
-            response.runtime_name, response.runtime_version, response.runtime_api_version
+        debug!(
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            runtime_name = %response.runtime_name,
+            runtime_version = %response.runtime_version,
+            runtime_api_version = %response.runtime_api_version,
+            "connected to CRI runtime and validated health"
         );
 
         Ok(Self {
@@ -331,6 +324,7 @@ impl WorkloadManager {
 
         for container in &spec.containers {
             let image = image_spec(&container.image);
+            let started = Instant::now();
             let image_present = match self
                 .img_client
                 .image_status(request_with_timeout(
@@ -346,7 +340,14 @@ impl WorkloadManager {
                 Err(status) if status.code() == Code::NotFound => false,
                 Err(status) => return Err(rpc_error("ImageStatus", status)),
             };
+            debug!(
+                image = %container.image,
+                present = image_present,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "checked CRI image status"
+            );
             if !image_present {
+                let started = Instant::now();
                 self.img_client
                     .pull_image(request_with_timeout(
                         PullImageRequest {
@@ -358,9 +359,15 @@ impl WorkloadManager {
                     ))
                     .await
                     .map_err(|status| rpc_error("PullImage", status))?;
+                debug!(
+                    image = %container.image,
+                    elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    "pulled CRI image"
+                );
             }
         }
 
+        let started = Instant::now();
         let sandbox_id = match self
             .rt_client
             .run_pod_sandbox(request_with_timeout(
@@ -381,6 +388,11 @@ impl WorkloadManager {
                 return Err(with_cleanup(primary, cleanup.err()));
             }
         };
+        debug!(
+            sandbox_id = %sandbox_id,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "created and started CRI pod sandbox"
+        );
         if sandbox_id.is_empty() {
             return Err(FlameError::InvalidState(
                 "RunPodSandbox returned an empty sandbox ID".to_string(),
@@ -395,6 +407,7 @@ impl WorkloadManager {
 
         for container in &spec.containers {
             let config = spec.container_config(container)?;
+            let started = Instant::now();
             let container_id = match self
                 .rt_client
                 .create_container(request_with_timeout(
@@ -414,6 +427,12 @@ impl WorkloadManager {
                     return Err(with_cleanup(primary, cleanup.err()));
                 }
             };
+            debug!(
+                container = %container.name,
+                container_id = %container_id,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "created CRI container"
+            );
             if container_id.is_empty() {
                 let primary = FlameError::InvalidState(
                     "CreateContainer returned an empty container ID".to_string(),
@@ -423,10 +442,13 @@ impl WorkloadManager {
             }
             handle.container_ids.push(container_id.clone());
 
+            let started = Instant::now();
             if let Err(status) = self
                 .rt_client
                 .start_container(request_with_timeout(
-                    StartContainerRequest { container_id },
+                    StartContainerRequest {
+                        container_id: container_id.clone(),
+                    },
                     RPC_TIMEOUT,
                 ))
                 .await
@@ -435,6 +457,12 @@ impl WorkloadManager {
                 let cleanup = self.delete(&handle).await;
                 return Err(with_cleanup(primary, cleanup.err()));
             }
+            debug!(
+                container = %container.name,
+                container_id = %container_id,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "started CRI container"
+            );
         }
 
         Ok(handle)
@@ -444,12 +472,12 @@ impl WorkloadManager {
         let sandbox = self.sandbox_status(handle.sandbox_id()).await?;
         ensure_owned(&sandbox, handle.filter())?;
         let mut containers = Vec::new();
-        for container_id in self.container_ids(handle.sandbox_id()).await? {
+        for container_id in handle.container_ids() {
             let response = self
                 .rt_client
                 .container_status(request_with_timeout(
                     ContainerStatusRequest {
-                        container_id,
+                        container_id: container_id.clone(),
                         verbose: false,
                     },
                     RPC_TIMEOUT,
@@ -462,6 +490,12 @@ impl WorkloadManager {
                     "CRI ContainerStatus response is missing status".to_string(),
                 )
             })?;
+            if status.id != *container_id {
+                return Err(FlameError::InvalidState(format!(
+                    "CRI ContainerStatus returned container <{}> for requested container <{container_id}>",
+                    status.id
+                )));
+            }
             if !handle.filter().matches(&status.labels) {
                 return Err(FlameError::InvalidState(format!(
                     "refusing to inspect container <{}> outside the requested owner scope",
@@ -524,14 +558,18 @@ impl WorkloadManager {
         };
         ensure_owned(&sandbox, handle.filter())?;
 
-        let container_ids = self.container_ids(handle.sandbox_id()).await?;
         let mut errors = Vec::new();
-        for container_id in container_ids {
+        self.stop_workload(handle, &mut errors).await;
+        cleanup_result(errors)
+    }
+
+    async fn stop_workload(&mut self, handle: &WorkloadHandle, errors: &mut Vec<String>) {
+        for container_id in handle.container_ids() {
             if let Err(status) = self
                 .rt_client
                 .stop_container(request_with_timeout(
                     StopContainerRequest {
-                        container_id,
+                        container_id: container_id.clone(),
                         timeout: STOP_TIMEOUT_SECONDS,
                     },
                     RPC_TIMEOUT + Duration::from_secs(STOP_TIMEOUT_SECONDS as u64),
@@ -555,7 +593,6 @@ impl WorkloadManager {
         {
             errors.push(format!("StopPodSandbox: {status}"));
         }
-        cleanup_result(errors)
     }
 
     pub async fn delete(&mut self, handle: &WorkloadHandle) -> Result<(), FlameError> {
@@ -567,29 +604,7 @@ impl WorkloadManager {
         ensure_owned(&sandbox, handle.filter())?;
 
         let mut errors = Vec::new();
-        if let Err(error) = self.stop(handle).await {
-            errors.push(error.to_string());
-        }
-        for container_id in self
-            .container_ids(handle.sandbox_id())
-            .await
-            .unwrap_or_else(|error| {
-                errors.push(error.to_string());
-                handle.container_ids().to_vec()
-            })
-        {
-            if let Err(status) = self
-                .rt_client
-                .remove_container(request_with_timeout(
-                    RemoveContainerRequest { container_id },
-                    RPC_TIMEOUT,
-                ))
-                .await
-                && status.code() != Code::NotFound
-            {
-                errors.push(format!("RemoveContainer: {status}"));
-            }
-        }
+        self.stop_workload(handle, &mut errors).await;
         if let Err(status) = self
             .rt_client
             .remove_pod_sandbox(request_with_timeout(
@@ -748,6 +763,12 @@ mod tests {
         sandbox_present: Mutex<bool>,
         container_present: Mutex<bool>,
         image_present: Mutex<bool>,
+        fail_stop_container: Mutex<bool>,
+        fail_stop_sandbox: Mutex<bool>,
+        fail_remove_sandbox: Mutex<bool>,
+        cleanup_not_found: Mutex<bool>,
+        container_status_requests: Mutex<Vec<String>>,
+        container_status_response_id: Mutex<Option<String>>,
     }
 
     struct FakeRuntime {
@@ -882,12 +903,25 @@ mod tests {
 
         async fn container_status(
             &mut self,
-            _: Request<ContainerStatusRequest>,
+            request: Request<ContainerStatusRequest>,
         ) -> Result<tonic::Response<ContainerStatusResponse>, Status> {
             self.call("container_status");
+            let requested_id = request.into_inner().container_id;
+            self.state
+                .container_status_requests
+                .lock()
+                .unwrap()
+                .push(requested_id.clone());
+            let response_id = self
+                .state
+                .container_status_response_id
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(requested_id);
             Ok(tonic::Response::new(ContainerStatusResponse {
                 status: Some(crate::cri_v1::ContainerStatus {
-                    id: "container-1".to_string(),
+                    id: response_id,
                     metadata: Some(ContainerMetadata {
                         name: "application".to_string(),
                         attempt: 0,
@@ -909,6 +943,12 @@ mod tests {
             _: Request<StopContainerRequest>,
         ) -> Result<tonic::Response<StopContainerResponse>, Status> {
             self.call("stop_container");
+            if *self.state.cleanup_not_found.lock().unwrap() {
+                return Err(Status::not_found("container removed"));
+            }
+            if *self.state.fail_stop_container.lock().unwrap() {
+                return Err(Status::internal("injected stop container failure"));
+            }
             Ok(tonic::Response::new(StopContainerResponse {}))
         }
 
@@ -917,16 +957,13 @@ mod tests {
             _: Request<StopPodSandboxRequest>,
         ) -> Result<tonic::Response<StopPodSandboxResponse>, Status> {
             self.call("stop_sandbox");
+            if *self.state.cleanup_not_found.lock().unwrap() {
+                return Err(Status::not_found("sandbox stopped"));
+            }
+            if *self.state.fail_stop_sandbox.lock().unwrap() {
+                return Err(Status::internal("injected stop sandbox failure"));
+            }
             Ok(tonic::Response::new(StopPodSandboxResponse {}))
-        }
-
-        async fn remove_container(
-            &mut self,
-            _: Request<RemoveContainerRequest>,
-        ) -> Result<tonic::Response<RemoveContainerResponse>, Status> {
-            self.call("remove_container");
-            *self.state.container_present.lock().unwrap() = false;
-            Ok(tonic::Response::new(RemoveContainerResponse {}))
         }
 
         async fn remove_pod_sandbox(
@@ -934,7 +971,14 @@ mod tests {
             _: Request<RemovePodSandboxRequest>,
         ) -> Result<tonic::Response<RemovePodSandboxResponse>, Status> {
             self.call("remove_sandbox");
+            if *self.state.cleanup_not_found.lock().unwrap() {
+                return Err(Status::not_found("sandbox removed"));
+            }
+            if *self.state.fail_remove_sandbox.lock().unwrap() {
+                return Err(Status::internal("injected remove sandbox failure"));
+            }
             *self.state.sandbox_present.lock().unwrap() = false;
+            *self.state.container_present.lock().unwrap() = false;
             Ok(tonic::Response::new(RemovePodSandboxResponse {}))
         }
     }
@@ -1061,6 +1105,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_uses_container_ids_from_handle() {
+        let state = Arc::new(FakeState::default());
+        let runtime = FakeRuntime {
+            state: state.clone(),
+            fail_start: false,
+        };
+        let images = FakeImages {
+            state: state.clone(),
+        };
+        let mut manager = WorkloadManager::with_apis(Box::new(runtime), Box::new(images));
+        let handle = manager.create(&fake_spec("executor-1")).await.unwrap();
+        state.calls.lock().unwrap().clear();
+
+        let status = manager.status(&handle).await.unwrap();
+
+        assert!(status.healthy());
+        assert_eq!(
+            *state.calls.lock().unwrap(),
+            ["sandbox_status", "container_status"]
+        );
+        assert_eq!(
+            *state.container_status_requests.lock().unwrap(),
+            ["container-1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn status_rejects_mismatched_container_id() {
+        let state = Arc::new(FakeState::default());
+        let runtime = FakeRuntime {
+            state: state.clone(),
+            fail_start: false,
+        };
+        let images = FakeImages {
+            state: state.clone(),
+        };
+        let mut manager = WorkloadManager::with_apis(Box::new(runtime), Box::new(images));
+        let handle = manager.create(&fake_spec("executor-1")).await.unwrap();
+        *state.container_status_response_id.lock().unwrap() = Some("unexpected".to_string());
+
+        let error = manager.status(&handle).await.unwrap_err().to_string();
+
+        assert!(error.contains("unexpected"));
+        assert!(error.contains("container-1"));
+        assert_eq!(
+            *state.container_status_requests.lock().unwrap(),
+            ["container-1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_uses_container_ids_from_handle() {
+        let state = Arc::new(FakeState::default());
+        let runtime = FakeRuntime {
+            state: state.clone(),
+            fail_start: false,
+        };
+        let images = FakeImages {
+            state: state.clone(),
+        };
+        let mut manager = WorkloadManager::with_apis(Box::new(runtime), Box::new(images));
+        let handle = manager.create(&fake_spec("executor-1")).await.unwrap();
+        state.calls.lock().unwrap().clear();
+
+        manager.stop(&handle).await.unwrap();
+
+        assert_eq!(
+            *state.calls.lock().unwrap(),
+            ["sandbox_status", "stop_container", "stop_sandbox"]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_checks_ownership_once_and_removes_sandbox() {
+        let state = Arc::new(FakeState::default());
+        let runtime = FakeRuntime {
+            state: state.clone(),
+            fail_start: false,
+        };
+        let images = FakeImages {
+            state: state.clone(),
+        };
+        let mut manager = WorkloadManager::with_apis(Box::new(runtime), Box::new(images));
+        let handle = manager.create(&fake_spec("executor-1")).await.unwrap();
+        state.calls.lock().unwrap().clear();
+
+        manager.delete(&handle).await.unwrap();
+
+        assert_eq!(
+            *state.calls.lock().unwrap(),
+            [
+                "sandbox_status",
+                "stop_container",
+                "stop_sandbox",
+                "remove_sandbox"
+            ]
+        );
+        assert!(!*state.container_present.lock().unwrap());
+        assert!(!*state.sandbox_present.lock().unwrap());
+
+        state.calls.lock().unwrap().clear();
+        manager.delete(&handle).await.unwrap();
+        assert_eq!(*state.calls.lock().unwrap(), ["sandbox_status"]);
+    }
+
+    #[tokio::test]
+    async fn delete_aggregates_cleanup_errors_and_continues() {
+        let state = Arc::new(FakeState::default());
+        let runtime = FakeRuntime {
+            state: state.clone(),
+            fail_start: false,
+        };
+        let images = FakeImages {
+            state: state.clone(),
+        };
+        let mut manager = WorkloadManager::with_apis(Box::new(runtime), Box::new(images));
+        let handle = manager.create(&fake_spec("executor-1")).await.unwrap();
+        *state.fail_stop_container.lock().unwrap() = true;
+        *state.fail_stop_sandbox.lock().unwrap() = true;
+        *state.fail_remove_sandbox.lock().unwrap() = true;
+        state.calls.lock().unwrap().clear();
+
+        let error = manager.delete(&handle).await.unwrap_err().to_string();
+
+        assert!(error.contains("StopContainer"));
+        assert!(error.contains("StopPodSandbox"));
+        assert!(error.contains("RemovePodSandbox"));
+        assert_eq!(
+            *state.calls.lock().unwrap(),
+            [
+                "sandbox_status",
+                "stop_container",
+                "stop_sandbox",
+                "remove_sandbox"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_ignores_not_found_from_cleanup_operations() {
+        let state = Arc::new(FakeState::default());
+        let runtime = FakeRuntime {
+            state: state.clone(),
+            fail_start: false,
+        };
+        let images = FakeImages {
+            state: state.clone(),
+        };
+        let mut manager = WorkloadManager::with_apis(Box::new(runtime), Box::new(images));
+        let handle = manager.create(&fake_spec("executor-1")).await.unwrap();
+        *state.cleanup_not_found.lock().unwrap() = true;
+        state.calls.lock().unwrap().clear();
+
+        manager.delete(&handle).await.unwrap();
+
+        assert_eq!(
+            *state.calls.lock().unwrap(),
+            [
+                "sandbox_status",
+                "stop_container",
+                "stop_sandbox",
+                "remove_sandbox"
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn start_failure_rolls_back_container_and_sandbox() {
         let state = Arc::new(FakeState::default());
         let runtime = FakeRuntime {
@@ -1077,15 +1288,14 @@ mod tests {
         assert!(!*state.container_present.lock().unwrap());
         assert!(!*state.sandbox_present.lock().unwrap());
         let calls = state.calls.lock().unwrap();
-        assert!(
-            calls
-                .windows(2)
-                .any(|calls| calls == ["stop_container", "stop_sandbox"])
-        );
-        assert!(
-            calls
-                .windows(2)
-                .any(|calls| calls == ["remove_container", "remove_sandbox"])
+        assert_eq!(
+            calls[calls.len() - 4..],
+            [
+                "sandbox_status",
+                "stop_container",
+                "stop_sandbox",
+                "remove_sandbox"
+            ]
         );
     }
 

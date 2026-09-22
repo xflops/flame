@@ -7,7 +7,7 @@ cluster:
     - priority
     - das
   storage: fs://data/
-  schedule_interval: 500           # Scheduler loop interval in milliseconds (default: 500)
+  schedule_interval: 500           # Scheduler loop interval in milliseconds (default: 100)
   executors:
     shim: host
   limits:

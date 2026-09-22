@@ -19,7 +19,7 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cri_rs::{
@@ -72,6 +72,7 @@ impl CriShim {
         if self.handle.is_some() {
             return Ok(());
         }
+        let create_started = Instant::now();
         let executor = &self.executor;
         let app = self.app.as_ref().ok_or_else(|| {
             FlameError::InvalidState("cleanup-only CRI shim cannot create an instance".to_string())
@@ -80,7 +81,14 @@ impl CriShim {
         let context = executor.context.as_ref().ok_or_else(|| {
             FlameError::InvalidState("CRI executor is missing cluster context".to_string())
         })?;
+        let install_started = Instant::now();
         let installation = app_manager.install(app).await?;
+        tracing::debug!(
+            executor_id = %executor.id,
+            phase = "install_application",
+            elapsed_ms = install_started.elapsed().as_secs_f64() * 1000.0,
+            "CRI shim startup phase completed"
+        );
 
         let (work_dir, uid, gid) = prepare_executor_directory(&executor.id)?;
         let mut directory_guard = DirectoryGuard::new(work_dir.clone());
@@ -160,11 +168,25 @@ impl CriShim {
             log_directory: log_dir.to_string_lossy().to_string(),
         };
 
+        let manager_connect_started = Instant::now();
         let mut manager = WorkloadManager::connect().await?;
+        tracing::debug!(
+            executor_id = %executor.id,
+            phase = "manager_connect",
+            elapsed_ms = manager_connect_started.elapsed().as_secs_f64() * 1000.0,
+            "CRI shim startup phase completed"
+        );
+        let workload_create_started = Instant::now();
         let handle = match manager.create(&spec).await {
             Ok(handle) => handle,
             Err(error) => return Err(error),
         };
+        tracing::debug!(
+            executor_id = %executor.id,
+            phase = "workload_create",
+            elapsed_ms = workload_create_started.elapsed().as_secs_f64() * 1000.0,
+            "CRI shim startup phase completed"
+        );
         let mut instance_client = match GrpcShim::new_at(&socket) {
             Ok(client) => client,
             Err(primary) => {
@@ -173,6 +195,7 @@ impl CriShim {
             }
         };
 
+        let readiness_started = Instant::now();
         let readiness = tokio::time::timeout(Duration::from_secs(30), async {
             let monitor = async {
                 loop {
@@ -204,12 +227,24 @@ impl CriShim {
             let cleanup = manager.delete(&handle).await.err();
             return Err(with_cleanup(primary, cleanup));
         }
+        tracing::debug!(
+            executor_id = %executor.id,
+            phase = "instance_uds_readiness",
+            elapsed_ms = readiness_started.elapsed().as_secs_f64() * 1000.0,
+            "CRI shim startup phase completed"
+        );
 
         directory_guard.disarm();
         self.manager = Some(manager);
         self.handle = Some(handle);
         self.instance_client = Some(instance_client);
         self.work_dir = Some(work_dir);
+        tracing::debug!(
+            executor_id = %executor.id,
+            phase = "total",
+            elapsed_ms = create_started.elapsed().as_secs_f64() * 1000.0,
+            "CRI shim startup completed"
+        );
         Ok(())
     }
 }

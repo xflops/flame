@@ -21,16 +21,40 @@ use stdng::{lock_ptr, new_ptr, MutexPtr};
 use crate::model::{ExecutorInfoPtr, NodeInfo, NodeInfoPtr, SessionInfo, SessionInfoPtr, SnapShot};
 use crate::scheduler::plugins::das::DasPlugin;
 use crate::scheduler::plugins::drf::DRFPlugin;
+use crate::scheduler::plugins::minmax::MinMaxPlugin;
 use crate::scheduler::plugins::priority::PriorityPlugin;
 use crate::scheduler::plugins::shim::ShimPlugin;
 use crate::scheduler::Context;
 
+use common::ctx::FlameClusterContext;
 use common::FlameError;
 
 mod das;
 mod drf;
+mod minmax;
 mod priority;
 mod shim;
+
+#[derive(Clone, Debug)]
+pub struct PluginsOptions {
+    pub policies: Vec<String>,
+    pub max_executors: u32,
+}
+
+impl From<&FlameClusterContext> for PluginsOptions {
+    fn from(context: &FlameClusterContext) -> Self {
+        Self {
+            policies: context.cluster.policies.clone(),
+            max_executors: context.cluster.limits.max_executors,
+        }
+    }
+}
+
+impl Default for PluginsOptions {
+    fn default() -> Self {
+        Self::from(&FlameClusterContext::default())
+    }
+}
 
 pub type PluginPtr = Box<dyn Plugin>;
 pub type PluginManagerPtr = Arc<PluginManager>;
@@ -166,13 +190,10 @@ pub struct PluginManager {
 }
 
 impl PluginManager {
-    pub fn setup(
-        ss: &SnapShot,
-        enabled_policies: &[String],
-    ) -> Result<PluginManagerPtr, FlameError> {
+    pub fn setup(ss: &SnapShot, options: &PluginsOptions) -> Result<PluginManagerPtr, FlameError> {
         let valid_names = configurable_policy_names();
 
-        for p in enabled_policies {
+        for p in &options.policies {
             if !valid_names.contains(&p.as_str()) {
                 return Err(FlameError::InvalidConfig(format!(
                     "unknown policy: {}. available: {:?}",
@@ -181,11 +202,17 @@ impl PluginManager {
             }
         }
 
-        let mut plugins: Vec<(String, PluginPtr)> = PLUGIN_REGISTRY
-            .iter()
-            .filter(|info| !info.configurable || enabled_policies.iter().any(|p| p == info.name))
-            .map(|info| (info.name.to_string(), (info.constructor)()))
-            .collect();
+        let minmax_plugin = MinMaxPlugin::new_ptr(options);
+        let mut plugins: Vec<(String, PluginPtr)> =
+            vec![(minmax_plugin.name().to_string(), minmax_plugin)];
+        plugins.extend(
+            PLUGIN_REGISTRY
+                .iter()
+                .filter(|info| {
+                    !info.configurable || options.policies.iter().any(|p| p == info.name)
+                })
+                .map(|info| (info.name.to_string(), (info.constructor)())),
+        );
 
         tracing::info!(
             "Enabled scheduler plugins: {:?}",
@@ -532,14 +559,18 @@ mod tests {
     #[test]
     fn das_policy_is_configurable_and_composes_before_shim() {
         let snapshot = SnapShot::new();
-        let manager = PluginManager::setup(&snapshot, &["das".to_string()]).unwrap();
+        let options = PluginsOptions {
+            policies: vec!["das".to_string()],
+            ..Default::default()
+        };
+        let manager = PluginManager::setup(&snapshot, &options).unwrap();
         let plugins = lock_ptr!(manager.plugins).unwrap();
         assert_eq!(
             plugins
                 .iter()
                 .map(|(name, _)| name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["das", "shim"]
+            vec!["minmax", "das", "shim"]
         );
     }
 

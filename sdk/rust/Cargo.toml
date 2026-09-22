@@ -44,6 +44,9 @@ bson = { workspace = true }
 tonic-build = { workspace = true }
 tonic-prost-build = { workspace = true }
 
+[dev-dependencies]
+comfy-table = { workspace = true }
+
 [features]
 default = []
 macros = ["dep:flame-rs-macros"]

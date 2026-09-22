@@ -11,18 +11,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Benchmark test for Flame single-task latency and multi-session throughput.
+//! Benchmark test for Flame startup latency and steady-state task throughput.
 //!
-//! The same parameterized runner measures a matrix of session and task counts,
-//! from a 1 × 1 round trip through concurrent throughput. Each matrix case must
-//! complete within 10 minutes. Runtime-specific topology is selected only
-//! through the benchmark environment.
+//! A single cold `1 × 1` sample measures the first session round trip,
+//! including executor and application startup. A `10 × 1` scale-out sample
+//! then measures concurrent startup, followed by an untimed warm-up that keeps
+//! all available executors busy before statistics are collected. The four-case
+//! matrix runs repeatedly against retained executors and reports min, median,
+//! and max wall time and throughput. Each sample must complete within 10 minutes.
+//! Runtime-specific topology is selected only through the benchmark environment.
 //!
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{fs::OpenOptions, io::Write};
 
+use comfy_table::{presets::ASCII_MARKDOWN, Cell, CellAlignment, Table};
 use futures::future::try_join_all;
 use stdng::new_ptr;
 
@@ -40,7 +45,23 @@ fn benchmark_endpoint() -> String {
 }
 
 fn benchmark_runtime() -> String {
-    std::env::var("FLAME_BENCHMARK_RUNTIME").unwrap_or_else(|_| "Host".to_string())
+    std::env::var("FLAME_BENCHMARK_RUNTIME").unwrap_or_else(|_| "Host Shim".to_string())
+}
+
+fn benchmark_executor_count() -> Result<usize, FlameError> {
+    let count = match std::env::var("FLAME_BENCHMARK_EXECUTORS") {
+        Ok(value) => value.parse().map_err(|_| {
+            FlameError::InvalidConfig(format!("invalid FLAME_BENCHMARK_EXECUTORS value <{value}>"))
+        })?,
+        Err(std::env::VarError::NotPresent) => STEADY_STATE_CONCURRENCY,
+        Err(error) => return Err(FlameError::InvalidConfig(error.to_string())),
+    };
+    if count == 0 {
+        return Err(FlameError::InvalidConfig(
+            "FLAME_BENCHMARK_EXECUTORS must be greater than zero".to_string(),
+        ));
+    }
+    Ok(count)
 }
 
 fn get_ca_cert_path() -> String {
@@ -51,7 +72,52 @@ fn get_ca_cert_path() -> String {
     format!("{}/ci/certs/ca.crt", root)
 }
 
-const BENCHMARK_MATRIX: &[(usize, usize)] = &[(1, 1), (1, 1000), (10, 1), (10, 1000)];
+struct BenchmarkCase {
+    phase: &'static str,
+    session_count: usize,
+    tasks_per_session: usize,
+    repetitions: usize,
+}
+
+const COLD_CASE: BenchmarkCase = BenchmarkCase {
+    phase: "cold-start",
+    session_count: 1,
+    tasks_per_session: 1,
+    repetitions: 1,
+};
+const STEADY_STATE_CONCURRENCY: usize = 10;
+const SCALE_OUT_CASE: BenchmarkCase = BenchmarkCase {
+    phase: "scale-out",
+    session_count: STEADY_STATE_CONCURRENCY,
+    tasks_per_session: 1,
+    repetitions: 1,
+};
+const BENCHMARK_MATRIX: &[BenchmarkCase] = &[
+    BenchmarkCase {
+        phase: "steady-state",
+        session_count: 1,
+        tasks_per_session: 1,
+        repetitions: 5,
+    },
+    BenchmarkCase {
+        phase: "steady-state",
+        session_count: 1,
+        tasks_per_session: 1000,
+        repetitions: 3,
+    },
+    BenchmarkCase {
+        phase: "steady-state",
+        session_count: STEADY_STATE_CONCURRENCY,
+        tasks_per_session: 1,
+        repetitions: 5,
+    },
+    BenchmarkCase {
+        phase: "steady-state",
+        session_count: STEADY_STATE_CONCURRENCY,
+        tasks_per_session: 1000,
+        repetitions: 3,
+    },
+];
 const TIMEOUT_SECS: u64 = 600; // 10 minutes
 const EXECUTOR_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -101,21 +167,22 @@ impl TaskInformer for BenchmarkTaskInformer {
 }
 
 struct BenchmarkResult {
-    session_count: usize,
-    tasks_per_session: usize,
     duration: Duration,
     succeeded: u64,
     failed: u64,
 }
 
-impl BenchmarkResult {
-    fn total_tasks(&self) -> usize {
-        self.session_count * self.tasks_per_session
-    }
-
-    fn throughput(&self) -> f64 {
-        self.succeeded as f64 / self.duration.as_secs_f64()
-    }
+struct BenchmarkStatistics {
+    phase: &'static str,
+    session_count: usize,
+    tasks_per_session: usize,
+    repetitions: usize,
+    duration_min: Duration,
+    duration_median: Duration,
+    duration_max: Duration,
+    throughput_min: f64,
+    throughput_median: f64,
+    throughput_max: f64,
 }
 
 /// Run tasks for a single session
@@ -180,10 +247,37 @@ async fn wait_for_executors_to_settle(conn: &flame::client::Connection) -> Resul
     }
 }
 
+async fn wait_for_retained_executor_count(
+    conn: &flame::client::Connection,
+    expected: usize,
+) -> Result<(), FlameError> {
+    let deadline = Instant::now() + EXECUTOR_SETTLE_TIMEOUT;
+    loop {
+        let idle = conn
+            .list_executor()
+            .await?
+            .into_iter()
+            .filter(|executor| {
+                executor.application == FLAME_APP && executor.state == ExecutorState::Idle
+            })
+            .count();
+        if idle == expected {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(FlameError::Network(format!(
+                "benchmark expected {expected} retained Idle executors, found {idle}"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn run_benchmark(
     conn: &flame::client::Connection,
     session_count: usize,
     tasks_per_session: usize,
+    sample_id: &str,
 ) -> Result<BenchmarkResult, FlameError> {
     let metrics = Arc::new(BenchmarkMetrics::new());
     let start = Instant::now();
@@ -192,8 +286,9 @@ async fn run_benchmark(
     for session_index in 0..session_count {
         let conn = conn.clone();
         let metrics = metrics.clone();
-        let session_id =
-            format!("benchmark-{session_count}x{tasks_per_session}-ssn-{session_index}");
+        let session_id = format!(
+            "benchmark-{sample_id}-{session_count}x{tasks_per_session}-ssn-{session_index}"
+        );
         let handle = tokio::spawn(async move {
             run_session(&conn, session_id, tasks_per_session, metrics).await
         });
@@ -207,17 +302,15 @@ async fn run_benchmark(
     }
 
     let result = BenchmarkResult {
-        session_count,
-        tasks_per_session,
         duration: start.elapsed(),
         succeeded: metrics.succeeded.load(Ordering::Relaxed),
         failed: metrics.failed.load(Ordering::Relaxed),
     };
     wait_for_executors_to_settle(conn).await?;
+    let total_tasks = session_count * tasks_per_session;
     assert_eq!(result.failed, 0, "benchmark had failed tasks");
     assert_eq!(
-        result.succeeded as usize,
-        result.total_tasks(),
+        result.succeeded as usize, total_tasks,
         "not all benchmark tasks succeeded"
     );
     assert!(
@@ -230,11 +323,129 @@ async fn run_benchmark(
     Ok(result)
 }
 
+async fn run_case(
+    conn: &flame::client::Connection,
+    case: &BenchmarkCase,
+) -> Result<BenchmarkStatistics, FlameError> {
+    assert!(case.repetitions > 0, "benchmark case needs samples");
+
+    let mut durations = Vec::with_capacity(case.repetitions);
+    let mut throughputs = Vec::with_capacity(case.repetitions);
+    for sample_index in 0..case.repetitions {
+        let sample_id = format!("{}-{sample_index}", case.phase);
+        let result =
+            run_benchmark(conn, case.session_count, case.tasks_per_session, &sample_id).await?;
+        durations.push(result.duration);
+        throughputs.push(result.succeeded as f64 / result.duration.as_secs_f64());
+    }
+
+    durations.sort_unstable();
+    throughputs.sort_by(f64::total_cmp);
+    let median_index = case.repetitions / 2;
+
+    Ok(BenchmarkStatistics {
+        phase: case.phase,
+        session_count: case.session_count,
+        tasks_per_session: case.tasks_per_session,
+        repetitions: case.repetitions,
+        duration_min: durations[0],
+        duration_median: durations[median_index],
+        duration_max: durations[case.repetitions - 1],
+        throughput_min: throughputs[0],
+        throughput_median: throughputs[median_index],
+        throughput_max: throughputs[case.repetitions - 1],
+    })
+}
+
+fn format_results(runtime: &str, results: &[BenchmarkStatistics]) -> String {
+    let mut table = Table::new();
+    table.load_preset(ASCII_MARKDOWN).set_header([
+        "Phase",
+        "Sessions",
+        "Tasks/session",
+        "Samples",
+        "Wall time ms (min/p50/max)",
+        "Tasks/sec (min/p50/max)",
+    ]);
+
+    for result in results {
+        table.add_row([
+            Cell::new(result.phase),
+            Cell::new(result.session_count).set_alignment(CellAlignment::Right),
+            Cell::new(result.tasks_per_session).set_alignment(CellAlignment::Right),
+            Cell::new(result.repetitions).set_alignment(CellAlignment::Right),
+            Cell::new(format!(
+                "{:.2}/{:.2}/{:.2}",
+                result.duration_min.as_secs_f64() * 1000.0,
+                result.duration_median.as_secs_f64() * 1000.0,
+                result.duration_max.as_secs_f64() * 1000.0,
+            ))
+            .set_alignment(CellAlignment::Right),
+            Cell::new(format!(
+                "{:.2}/{:.2}/{:.2}",
+                result.throughput_min, result.throughput_median, result.throughput_max,
+            ))
+            .set_alignment(CellAlignment::Right),
+        ]);
+    }
+
+    format!("## {} BENCHMARK RESULTS\n\n{table}", runtime.to_uppercase())
+}
+
+fn print_results(runtime: &str, results: &[BenchmarkStatistics]) {
+    let report = format_results(runtime, results);
+    println!("\n{report}");
+    if let Ok(summary_path) = std::env::var("GITHUB_STEP_SUMMARY") {
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&summary_path)
+            .and_then(|mut summary| writeln!(summary, "{report}"))
+        {
+            Ok(()) => {}
+            Err(error) => eprintln!(
+                "failed to append benchmark results to GitHub summary <{summary_path}>: {error}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn benchmark_results_use_a_markdown_table() {
+    let report = format_results(
+        "Host Shim",
+        &[BenchmarkStatistics {
+            phase: "steady",
+            session_count: 4,
+            tasks_per_session: 1000,
+            repetitions: 3,
+            duration_min: Duration::from_millis(1000),
+            duration_median: Duration::from_millis(1250),
+            duration_max: Duration::from_millis(1500),
+            throughput_min: 100.0,
+            throughput_median: 200.0,
+            throughput_max: 300.0,
+        }],
+    );
+
+    assert!(report.starts_with("## HOST SHIM BENCHMARK RESULTS\n\n|"));
+    assert!(report.contains("| steady"));
+    assert!(report.contains("1000.00/1250.00/1500.00"));
+    assert!(report.contains("100.00/200.00/300.00"));
+}
+
 #[tokio::test]
 async fn benchmark_task_matrix() -> Result<(), FlameError> {
     tracing_subscriber::fmt::try_init().ok();
 
     let runtime = benchmark_runtime();
+    let executor_count = benchmark_executor_count()?;
+    let warm_up_case = BenchmarkCase {
+        phase: "warm-up",
+        session_count: executor_count,
+        tasks_per_session: 100,
+        repetitions: 1,
+    };
 
     println!("\n============================================================");
     println!("{runtime} BENCHMARK");
@@ -245,26 +456,28 @@ async fn benchmark_task_matrix() -> Result<(), FlameError> {
     };
     let conn = flame::client::connect_with_tls(&benchmark_endpoint(), Some(&tls_config)).await?;
 
-    let mut results = Vec::with_capacity(BENCHMARK_MATRIX.len());
-    for &(session_count, tasks_per_session) in BENCHMARK_MATRIX {
-        results.push(run_benchmark(&conn, session_count, tasks_per_session).await?);
+    let mut results = Vec::with_capacity(BENCHMARK_MATRIX.len() + 2);
+
+    // This is the only timed case without a retained flmping executor. Images
+    // are prepared by the workflow, so it measures cached-image startup.
+    results.push(run_case(&conn, &COLD_CASE).await?);
+
+    // Exercise concurrent startup. This result remains visible because scale-out
+    // latency is useful, but it is deliberately kept separate from the stable
+    // warm-executor statistics.
+    results.push(run_case(&conn, &SCALE_OUT_CASE).await?);
+
+    // The configured per-node executor limit keeps both Host and CRI at the
+    // same retained capacity across all phases. Exercise that capacity here,
+    // then verify limit enforcement before collecting steady-state data.
+    run_case(&conn, &warm_up_case).await?;
+    wait_for_retained_executor_count(&conn, executor_count).await?;
+
+    for case in BENCHMARK_MATRIX {
+        results.push(run_case(&conn, case).await?);
     }
 
-    println!("\n============================================================");
-    println!("{} BENCHMARK RESULTS", runtime.to_uppercase());
-    println!("============================================================");
-    println!("Sessions  Tasks/session  Total tasks  Duration(s)  Tasks/sec");
-    for result in results {
-        println!(
-            "{:>8}  {:>13}  {:>11}  {:>11.2}  {:>9.2}",
-            result.session_count,
-            result.tasks_per_session,
-            result.total_tasks(),
-            result.duration.as_secs_f64(),
-            result.throughput(),
-        );
-    }
-    println!("============================================================\n");
+    print_results(&runtime, &results);
 
     Ok(())
 }

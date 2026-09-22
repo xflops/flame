@@ -273,7 +273,11 @@ mod tests {
             ExecutorState::Idle
         );
 
-        let mut context = Context::new(controller.clone(), &[]).unwrap();
+        let options = crate::scheduler::plugins::PluginsOptions {
+            policies: vec![],
+            ..Default::default()
+        };
+        let mut context = Context::new(controller.clone(), &options).unwrap();
         ShuffleAction {}.execute(&mut context).await.unwrap();
 
         assert_eq!(

@@ -120,6 +120,14 @@ impl Controller {
         &self.storage
     }
 
+    pub(crate) async fn wait_for_scheduler_event(&self, interval: tokio::time::Duration) {
+        self.notifier.scheduler.wait(interval).await;
+    }
+
+    fn notify_scheduler(&self) {
+        self.notifier.scheduler.notify();
+    }
+
     fn validate_executor_attributes(
         attributes: rpc::ExecutorAttributes,
     ) -> Result<HashSet<bytes::Bytes>, FlameError> {
@@ -442,6 +450,7 @@ impl Controller {
             .create_task(ssn_id.clone(), task_input, options)
             .await?;
         let _ = self.notifier.tasks.notify(&ssn_id, 0);
+        self.notify_scheduler();
         Ok(task)
     }
 
@@ -508,6 +517,7 @@ impl Controller {
             );
         }
 
+        self.notify_scheduler();
         Ok(())
     }
 
@@ -979,6 +989,7 @@ impl Controller {
             );
         }
 
+        self.notify_scheduler();
         Ok(())
     }
 
@@ -1235,6 +1246,92 @@ mod tests {
                 gpu: 0,
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn new_tasks_and_idle_executors_wake_scheduler() {
+        use tokio::time::Duration;
+
+        let controller = new_ptr(create_test_storage().await);
+        controller
+            .register_application("test-app".to_string(), create_test_application())
+            .await
+            .unwrap();
+
+        controller
+            .create_session(create_test_session_attr("wake-session"))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                controller.wait_for_scheduler_event(Duration::from_secs(60)),
+            )
+            .await
+            .is_err(),
+            "a session without tasks must not wake the scheduler"
+        );
+
+        controller
+            .create_task("wake-session".to_string(), None, None)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            controller.wait_for_scheduler_event(Duration::from_secs(60)),
+        )
+        .await
+        .expect("new task should wake scheduler");
+
+        controller
+            .storage()
+            .register_node(&create_test_node("wake-node"))
+            .await
+            .unwrap();
+        let executor = controller
+            .create_executor("wake-node".to_string(), "wake-session".to_string())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                controller.wait_for_scheduler_event(Duration::from_secs(60)),
+            )
+            .await
+            .is_err(),
+            "scheduler-owned executor creation must not wake the scheduler"
+        );
+
+        controller.register_executor(&executor).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            controller.wait_for_scheduler_event(Duration::from_secs(60)),
+        )
+        .await
+        .expect("newly Idle executor should wake scheduler");
+
+        controller
+            .bind_session(executor.id.clone(), "wake-session".to_string())
+            .await
+            .unwrap();
+        controller
+            .bind_executor_completed(executor.id.clone(), None, None)
+            .await
+            .unwrap();
+        controller
+            .unbind_executor(executor.id.clone())
+            .await
+            .unwrap();
+        controller
+            .unbind_executor_completed(executor.id.clone())
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            controller.wait_for_scheduler_event(Duration::from_secs(60)),
+        )
+        .await
+        .expect("executor becoming Idle after unbind should wake scheduler");
     }
 
     async fn create_binding_executor(controller: &ControllerPtr, ssn_id: &str) -> String {

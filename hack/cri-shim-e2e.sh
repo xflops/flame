@@ -11,6 +11,7 @@ cd "$REPO_ROOT"
 INSTALL_PREFIX="${INSTALL_PREFIX:-/opt/flame-test}"
 FLAME_E2E_RUNTIME_IMAGE="${FLAME_E2E_RUNTIME_IMAGE:-localhost:5000/xflops/flmrt:ci}"
 FLAME_CRI_SANDBOX_IMAGE="${FLAME_CRI_SANDBOX_IMAGE:-registry.k8s.io/pause:3.10.2}"
+FLAME_CLUSTER_CONFIG="${FLAME_CLUSTER_CONFIG:-ci/cri/flame-cluster.yaml}"
 CI_ENV_FILE="${GITHUB_ENV:-/tmp/flame-cri-e2e.env}"
 
 install_dependencies() {
@@ -45,7 +46,7 @@ install_flame() {
         --prefix "$INSTALL_PREFIX" \
         --python-version 3.12 \
         --force
-    sudo install -m 0644 ci/cri/flame-cluster.yaml \
+    sudo install -m 0644 "$FLAME_CLUSTER_CONFIG" \
         "$INSTALL_PREFIX/conf/flame-cluster.yaml"
     sudo install -d "$INSTALL_PREFIX/conf/applications"
     sudo install -m 0644 ci/cri/applications/*.yaml \
@@ -117,6 +118,7 @@ EOF
     sudo tee /etc/containerd/runsc.toml >/dev/null <<'EOF'
 [runsc_config]
   host-uds = 'create'
+  platform = 'systrap'
 EOF
     sudo tee /etc/containerd/certs.d/localhost:5000/hosts.toml >/dev/null <<'EOF'
 server = "http://localhost:5000"
@@ -145,10 +147,6 @@ EOF
         "ranges": [[{"subnet": "10.250.0.0/16"}]],
         "routes": [{"dst": "0.0.0.0/0"}]
       }
-    },
-    {
-      "type": "portmap",
-      "capabilities": {"portMappings": true}
     }
   ]
 }
@@ -162,6 +160,7 @@ EOF
     sudo chown "$(id -un):$(id -gn)" /run/containerd/containerd.sock
     test -S /run/containerd/containerd.sock
     sudo ctr plugins ls
+    FLAME_CRI_DEDICATED_NODE=true hack/validate-cri-runtime.sh
 }
 
 start_cluster() {

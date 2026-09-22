@@ -119,6 +119,42 @@ endpoints must therefore be non-loopback and reachable from the sandbox. An
 ObjectRef is resolved against its owning cache endpoint unless the SDK is
 configured with a cache proxy.
 
+#### Production runtime profile
+
+Containerd, gVisor, and CNI remain site-admin configuration, but production
+workers use an explicitly validated profile rather than depending on runtime
+defaults. For EC2 and other VM workers, the recommended runsc profile is:
+
+```toml
+[runsc_config]
+  host-uds = "create"
+  platform = "systrap"
+```
+
+`systrap` is selected explicitly because gVisor recommends it inside a VM and
+because an implicit default may change across runtime packages. Bare-metal
+workers may use a separately benchmarked `platform = "kvm"` profile when KVM
+is available; nested KVM is not the EC2 default. Both profiles preserve gVisor
+isolation and the private mounted Instance UDS contract. Host networking is not
+a supported startup optimization.
+
+A dedicated Flame worker needs bridge networking, host-local IPAM, routing,
+and any masquerading required for outbound traffic. Flame does not populate
+CRI host-port mappings, so the CNI `portmap` plugin can be omitted on dedicated
+workers. Shared nodes retain it if another workload contract uses `hostPort`.
+Omitting `portmap` does not remove the bridge, sandbox IP, egress,
+session-manager access, or object-cache access.
+
+Operators run `hack/validate-cri-runtime.sh` as the executor-manager service
+user after provisioning and before admitting the node. The read-only preflight
+checks the effective containerd default runtime and runsc runtime type, the
+configured runsc platform and `host-uds` policy, bridge/IPAM CNI, CRI socket
+access, and installed versions. Set `FLAME_CRI_DEDICATED_NODE=true` to also
+reject an unused `portmap` plugin. Runtime configuration is rolled out through
+the site's normal canary and rollback mechanism; containerd, runsc, and CNI
+plugin versions are pinned as one validated node image, and the preflight
+records their installed versions. Flame never edits this configuration.
+
 The CRI shim uses fixed, documented safety defaults: query CRI image status and
 pull only when the image is absent, 30 seconds for startup, 10 seconds for stop,
 and `/var/log/flame/executors` as the log root. Changing these policies requires
@@ -233,7 +269,12 @@ delete(handle)
 
 `stop` changes runtime state but retains resources. `delete` performs
 best-effort stop followed by removal. Both are idempotent; CRI `NotFound`
-during cleanup is success.
+during cleanup is success. For a live handle, `status` and graceful stop use
+the immutable container IDs recorded by `create` (or reconstructed by
+`list_workload`) instead of rediscovering them with `ListContainers`.
+Destructive operations validate sandbox ownership once, gracefully stop known
+containers, stop the sandbox, and let idempotent `RemovePodSandbox` remove the
+sandbox and all of its containers as required by CRI v1.
 
 ### Scope
 
@@ -550,9 +591,12 @@ general worker-to-worker connectivity.
 
 Workload lifecycle logs include node, executor, application, sandbox, and
 container IDs; session RPC logs additionally include the current session ID.
-Logs never include environment values or credentials. Metrics cover image
-pull, create, startup, stop, and remove latency/failures, rollback failures,
-owned orphan count, and running/exited workload count.
+Structured startup timings distinguish application installation, CRI manager
+connection and health validation, image lookup/pull, sandbox creation,
+container creation/start, Instance UDS readiness, and total startup. Logs never
+include environment values or credentials. Metrics cover image pull, create,
+startup, stop, and remove latency/failures, rollback failures, owned orphan
+count, and running/exited workload count.
 
 ### Test strategy
 
@@ -571,8 +615,10 @@ restart, rejection of loopback cluster and cache endpoints, recursive
 `FLAME_ENDPOINT` injection, and cluster/cache CA bundle staging.
 
 The `CRI Shim E2E` Linux CI job provisions a real containerd CRI v1 service and
-bridge CNI, configures `runsc` as containerd's default CRI runtime with
-`host-uds=create`, and publishes `flmrt` to a local registry. `flmrt` is a
+the dedicated-worker bridge CNI profile, configures `runsc` as containerd's
+default CRI runtime with `host-uds=create` and `platform=systrap`, validates the
+effective production profile with the operator preflight, and publishes
+`flmrt` to a local registry. `flmrt` is a
 production runtime image assembled through the normal worker installation: its
 final stage contains the installed Flame services, Python SDK, runtimes, and
 tools under `/usr/local/flame`, but no E2E source tree and no executor-manager
@@ -607,12 +653,33 @@ traffic, and real Instance UDS lifecycle under gVisor.
 The benchmark workflow exposes `Host Shim Benchmark` and `CRI Shim Benchmark`
 as peer jobs. The CRI job uses the BareMetal containerd and gVisor topology and
 pre-pulls both `flmrt` and containerd's configured sandbox image before timing.
-Both jobs execute the shared `(session count, tasks per session)` matrix:
-`1 × 1`, `1 × 1000`, `10 × 1`, and `10 × 1000`. This reports cold single-task
-round trip followed by warm single-session throughput, concurrent round trip,
-and concurrent throughput through one code path. Only the endpoint/runtime
-environment and cluster setup differ, so workloads and reported metrics remain
-directly comparable.
+Both jobs first report explicit cached-image cold `1 × 1` and concurrent
+scale-out `10 × 1` samples, then establish and verify four retained executors
+with an untimed warm-up. The always-on scheduler `MinMaxPlugin` enforces the
+configured per-node executor limit, including allocations pipelined during the
+current scheduling cycle. The benchmark jobs explicitly set their expected
+retained count to four; other environments default to ten, matching the normal
+cluster limit. Both jobs use one executor manager, the same executor limit,
+resource request, scheduler policy, and non-persistent session storage.
+They repeatedly execute the shared steady-state `(session
+count, tasks per session)` matrix: `1 × 1`, `1 × 1000`, `10 × 1`, and
+`10 × 1000`, reporting minimum, median, and maximum wall time and throughput.
+The benchmark renders these statistics as a Markdown table in both its log and
+the GitHub Actions job summary. Only the endpoint/runtime environment and
+cluster setup differ, so workloads and reported metrics remain directly
+comparable while startup and retained executor measurements stay distinct.
+
+Run
+[`35694567014`](https://github.com/xflops/flame/actions/runs/35694567014)
+is the production-profile tuning baseline. Its p50 results show that the warm
+`1 × 1` and `10 × 1` paths already match Host Shim, while CRI cached-image cold
+start is 489.35 ms versus 190.61 ms (2.57x) and concurrent scale-out is
+618.64 ms versus 350.08 ms (1.77x). CRI phase timing attributes 287 ms of its
+293 ms shim startup to workload creation, including 181 ms in
+`RunPodSandbox`. Site-admin runtime tuning is accepted only when repeated
+paired runs improve startup p50/p95 without regressing the shared application
+E2E cases; mixed bulk-throughput results from separate hosted runners are not
+treated as proof of a task-path regression or improvement.
 
 The `BareMetal E2E` workflow follows the same runtime split: `Host Shim E2E`
 and `CRI Shim E2E` are peer jobs. They retain separate provisioning because
@@ -620,6 +687,9 @@ the CRI variant must configure containerd, gVisor, CNI, and the runtime image,
 then run the same application-level Runner, flmexec, and sandbox E2E cases
 against that environment. `cri-rs` unit tests remain part of normal Code
 Verify coverage; there is no separate CRI-only application test suite.
+The generic Rust E2E target runs only the SDK `integration_test`; the benchmark
+test target is reserved for the controlled Host Shim and CRI Shim benchmark
+jobs.
 
 ## 4. Use Cases
 
@@ -644,7 +714,8 @@ release removes it.
 ### Roll back a failed start
 
 Image pull, sandbox run, and container creation succeed, but start fails. The
-manager removes the created container, stops the sandbox, and removes it. The
+manager gracefully stops the recorded container, stops the sandbox, and calls
+`RemovePodSandbox`, which removes the sandbox and all contained resources. The
 original start error is returned and no owned resources remain.
 
 ### Recover after process restart
@@ -664,3 +735,5 @@ record. The service is not retried or replaced in v1.
 - [`RFE384` recovery](../RFE384-flame-recovery/FS.md)
 - [Kubernetes CRI v1 API](../../../cri/protos/cri.proto)
 - [containerd runtime v2](https://github.com/containerd/containerd/blob/main/docs/runtime-v2.md)
+- [gVisor production guide](https://gvisor.dev/docs/user_guide/production/)
+- [gVisor containerd configuration](https://gvisor.dev/docs/user_guide/containerd/configuration/)

@@ -20,7 +20,7 @@ use stdng::collections;
 use crate::controller::ControllerPtr;
 use crate::model::{ExecutorInfo, ExecutorInfoPtr, NodeInfoPtr, SessionInfoPtr, SnapShotPtr};
 use crate::scheduler::actions::{ActionPtr, AllocateAction, DispatchAction, ShuffleAction};
-use crate::scheduler::plugins::{PluginManager, PluginManagerPtr};
+use crate::scheduler::plugins::{PluginManager, PluginManagerPtr, PluginsOptions};
 use common::apis::{ExecutorID, ExecutorState};
 use common::FlameError;
 
@@ -35,9 +35,9 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(controller: ControllerPtr, policies: &[String]) -> Result<Self, FlameError> {
+    pub fn new(controller: ControllerPtr, options: &PluginsOptions) -> Result<Self, FlameError> {
         let snapshot = controller.snapshot()?;
-        let plugins = PluginManager::setup(&snapshot.clone(), policies)?;
+        let plugins = PluginManager::setup(&snapshot.clone(), options)?;
 
         Ok(Context {
             snapshot,
@@ -222,7 +222,11 @@ mod tests {
         let session = Arc::new(SessionInfo::try_from(&source).unwrap());
         let snapshot = crate::model::SnapShot::new();
         snapshot.add_session(session.clone()).unwrap();
-        let plugins = PluginManager::setup(&snapshot, &["das".to_string()]).unwrap();
+        let options = PluginsOptions {
+            policies: vec!["das".to_string()],
+            ..Default::default()
+        };
+        let plugins = PluginManager::setup(&snapshot, &options).unwrap();
 
         let config = FlameClusterContext {
             cluster: FlameCluster {
@@ -319,7 +323,11 @@ mod tests {
             })
             .unwrap()
             .clone();
-        let plugins = PluginManager::setup(&context.snapshot, &[]).unwrap();
+        let options = PluginsOptions {
+            policies: vec![],
+            ..Default::default()
+        };
+        let plugins = PluginManager::setup(&context.snapshot, &options).unwrap();
         let context_without_das = Context {
             snapshot: context.snapshot.clone(),
             controller: context.controller.clone(),

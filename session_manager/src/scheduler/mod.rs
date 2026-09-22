@@ -14,9 +14,11 @@ limitations under the License.
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::{thread, time};
+use tokio::time::Duration;
 
 use crate::controller::ControllerPtr;
 use crate::scheduler::ctx::Context;
+use crate::scheduler::plugins::PluginsOptions;
 
 use crate::FlameThread;
 use common::ctx::FlameClusterContext;
@@ -38,15 +40,17 @@ struct ScheduleRunner {
 impl FlameThread for ScheduleRunner {
     async fn run(&self, flame_ctx: FlameClusterContext) -> Result<(), FlameError> {
         let schedule_interval = flame_ctx.cluster.schedule_interval;
-        let policies = &flame_ctx.cluster.policies;
+        let options = PluginsOptions::from(&flame_ctx);
         tracing::info!(
-            "Scheduler started with interval: {}ms, enabled policies: {:?}",
+            "Scheduler started with interval: {}ms, enabled policies: {:?}, max executors per node: {}",
             schedule_interval,
-            policies
+            options.policies,
+            options.max_executors,
         );
+        let schedule_interval = Duration::from_millis(schedule_interval);
 
         loop {
-            let mut ctx = Context::new(self.controller.clone(), policies)?;
+            let mut ctx = Context::new(self.controller.clone(), &options)?;
 
             // Same `ctx` (and thus same in-memory `plugins`) is used for every action.
             for action in ctx.actions.clone() {
@@ -56,7 +60,9 @@ impl FlameThread for ScheduleRunner {
                 };
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_millis(schedule_interval)).await;
+            self.controller
+                .wait_for_scheduler_event(schedule_interval)
+                .await;
         }
     }
 }
@@ -69,13 +75,15 @@ mod tests {
     use crate::model::{ALL_NODE, OPEN_SESSION};
     use crate::scheduler::actions::{AllocateAction, DispatchAction};
     use crate::scheduler::ctx::Context;
-    use crate::scheduler::plugins::PluginManager;
+    use crate::scheduler::plugins::{PluginManager, PluginsOptions};
     use crate::scheduler::ControllerPtr;
     use crate::storage;
+    use bytes::Bytes;
     use chrono::Duration;
     use chrono::Utc;
     use common::apis::{
         Application, ApplicationAttributes, Node, NodeInfo, NodeState, ResourceRequirement, Shim,
+        TaskOptions,
     };
     use common::ctx::{FlameCluster, FlameClusterContext, FlameRecovery, FlameSessionRecovery};
     use common::FlameError;
@@ -214,11 +222,8 @@ mod tests {
 
         for i in 0..10 {
             let snapshot = controller.snapshot()?;
-            let default_policies: Vec<String> = common::ctx::DEFAULT_POLICIES
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            let plugins = PluginManager::setup(&snapshot.clone(), &default_policies)?;
+            let options = PluginsOptions::default();
+            let plugins = PluginManager::setup(&snapshot.clone(), &options)?;
 
             let mut ctx = Context {
                 snapshot: snapshot.clone(),
@@ -253,6 +258,48 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_allocate_respects_max_executors() -> Result<(), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        tokio_test::block_on(
+            controller
+                .storage()
+                .register_node(&new_test_node("node_1".to_string())),
+        )?;
+
+        for index in 0..2 {
+            let session =
+                tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+                    id: format!("limited-session-{index}"),
+                    application: "flmtest".to_string(),
+                    resreq: Some(common::apis::ResourceRequirement {
+                        cpu: 1,
+                        memory: 1024,
+                        gpu: 0,
+                    }),
+                    ..Default::default()
+                }))?;
+            tokio_test::block_on(controller.create_task(session.id, None, None))?;
+        }
+
+        let options = PluginsOptions {
+            max_executors: 1,
+            ..Default::default()
+        };
+        let mut ctx = Context::new(controller.clone(), &options)?;
+        tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
+
+        let executors = controller.list_executor()?;
+        assert_eq!(executors.len(), 1);
+        assert_eq!(executors[0].node, "node_1");
+        Ok(())
+    }
+
     /// One scheduling cycle keeps the same in-memory [`crate::scheduler::plugins::PluginManager`]
     /// for every action.
     #[test]
@@ -269,11 +316,8 @@ mod tests {
                 .register_node(&new_test_node("node_1".to_string())),
         )?;
 
-        let default_policies: Vec<String> = common::ctx::DEFAULT_POLICIES
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let mut ctx = Context::new(controller.clone(), &default_policies)?;
+        let options = PluginsOptions::default();
+        let mut ctx = Context::new(controller.clone(), &options)?;
         let plugins_ptr = Arc::as_ptr(&ctx.plugins);
         for action in ctx.actions.clone() {
             tokio_test::block_on(action.execute(&mut ctx))?;
@@ -326,11 +370,8 @@ mod tests {
             tokio_test::block_on(controller.register_executor(&executor))?;
         }
 
-        let default_policies = common::ctx::DEFAULT_POLICIES
-            .iter()
-            .map(|policy| policy.to_string())
-            .collect::<Vec<_>>();
-        let mut ctx = Context::new(controller.clone(), &default_policies)?;
+        let options = PluginsOptions::default();
+        let mut ctx = Context::new(controller.clone(), &options)?;
 
         let dispatch = DispatchAction::new_ptr();
         tokio_test::block_on(dispatch.execute(&mut ctx))?;
@@ -368,6 +409,74 @@ mod tests {
     #[test]
     fn test_dispatch_reuses_idle_executors_for_separate_sessions() -> Result<(), FlameError> {
         assert_dispatch_reuses_idle_executors(&[1, 1])
+    }
+
+    #[test]
+    fn test_dispatch_preserves_das_affinity_across_scheduler_cycles() -> Result<(), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        tokio_test::block_on(
+            controller
+                .storage()
+                .register_node(&new_test_node("node_1".to_string())),
+        )?;
+
+        let mut session_ids = Vec::new();
+        for index in 0..2 {
+            let session =
+                tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+                    id: format!("das-session-{index}"),
+                    application: "flmtest".to_string(),
+                    resreq: Some(ResourceRequirement {
+                        cpu: 1,
+                        memory: 1024,
+                        gpu: 0,
+                    }),
+                    ..Default::default()
+                }))?;
+            session_ids.push(session.id);
+        }
+
+        let mut executor_ids = Vec::new();
+        for index in 0..2 {
+            let executor = tokio_test::block_on(
+                controller.create_executor("node_1".to_string(), session_ids[0].clone()),
+            )?;
+            tokio_test::block_on(controller.register_executor(&executor))?;
+            {
+                let executor = controller.storage().get_executor_ptr(executor.id.clone())?;
+                let mut executor = stdng::lock_ptr!(executor)?;
+                executor
+                    .attributes
+                    .insert(Bytes::from(format!("key-{index}")));
+            }
+            executor_ids.push(executor.id);
+        }
+
+        let options = PluginsOptions {
+            policies: vec!["priority".to_string(), "drf".to_string(), "das".to_string()],
+            ..Default::default()
+        };
+        for index in 0..2 {
+            tokio_test::block_on(controller.create_task(
+                session_ids[index].clone(),
+                None,
+                Some(TaskOptions {
+                    affinity: [Bytes::from(format!("key-{index}"))].into_iter().collect(),
+                }),
+            ))?;
+            let mut ctx = Context::new(controller.clone(), &options)?;
+            tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
+
+            let executor = controller.get_executor(executor_ids[index].clone())?;
+            assert_eq!(executor.ssn_id.as_ref(), Some(&session_ids[index]));
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -411,11 +520,8 @@ mod tests {
             tokio_test::block_on(controller.create_executor("node_1".to_string(), ssn_id.clone()))?;
         tokio_test::block_on(controller.register_executor(&executor))?;
 
-        let default_policies: Vec<String> = common::ctx::DEFAULT_POLICIES
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let mut ctx = Context::new(controller.clone(), &default_policies)?;
+        let options = PluginsOptions::default();
+        let mut ctx = Context::new(controller.clone(), &options)?;
 
         let dispatch = DispatchAction::new_ptr();
         tokio_test::block_on(dispatch.execute(&mut ctx))?;
