@@ -61,8 +61,31 @@ Required permissions:
 - PyPI publish permission for `flamepy`.
 - Docker Hub publish permission for `xflops/flame-*` repositories.
 
+The GitHub workflows require these repository or inherited organization
+credentials:
+
+| Name | Kind | Required access |
+| --- | --- | --- |
+| `PYPI_API_TOKEN` | Actions secret | PyPI project-scoped token allowed to publish `flamepy` |
+| `CARGO_REGISTRY_TOKEN` | Actions secret | crates.io token allowed to publish `stdng`, `flame-rs-macros`, and `flame-rs` |
+| `DOCKER_HUB_PAT` | Actions secret | Docker Hub personal access token with read/write access to the `xflops/flame-*` repositories |
+| `DOCKER_HUB_USERNAME` | Actions variable | Docker Hub username that owns the PAT and can push to the `xflops` organization |
+
+Configure them under **Settings → Secrets and variables → Actions**. The
+repository already exposes `DOCKER_HUB_PAT`; confirm the username variable and
+the two package-registry tokens before publishing. GitHub supplies the
+read-only `GITHUB_TOKEN` automatically.
+
 Keep local `tasks/` notes out of commits and container build contexts.
 `.dockerignore` should include `tasks/`.
+
+If a release event was missed or a publish needs an idempotent recovery run,
+dispatch the workflow against the existing release tag:
+
+```shell
+gh workflow run release-publish.yaml --ref main \
+  -f release_tag="${RELEASE_TAG}"
+```
 
 ## Source Readiness
 
@@ -247,8 +270,11 @@ Release Docker images as multi-arch manifest tags for `linux/amd64` and
 - `xflops/flame-executor-manager`
 - `xflops/flame-console`
 
-Do not move `latest` for release candidates. For stable releases, move `latest`
-only after the versioned tag has been pushed and verified.
+The release workflow publishes only the versioned release tag. Among automated
+workflows, only the main-branch image workflow moves the mutable `latest` tag.
+It promotes the four images after every SHA-tagged image is verified. Because
+registries cannot atomically update tags across repositories, rerun a failed
+main image workflow to complete a partially interrupted promotion.
 
 Build release images with manifest lists. The Makefile detects a
 Docker-compatible `CONTAINER_CLI` from the host, preferring a usable Docker
@@ -414,7 +440,8 @@ URL or the missing artifact is explicitly documented as blocked.
 
 - Do not overwrite Cargo or PyPI versions. Publish a new release candidate.
 - Do not force-push public release tags without release-owner approval.
-- Do not move `latest` for release candidates.
+- Do not move `latest` from the release workflow; automated promotion belongs
+  to main-branch image publishing.
 - Do not reduce E2E coverage to make a release pass.
 - If a release branch needs a fix, land the source change on `main` first when
   practical, then create a dedicated cherry-pick PR to the release branch.
