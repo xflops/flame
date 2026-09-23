@@ -11,10 +11,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from .sandbox import Sandbox, SandboxAttr, SandboxOutput
+from .session import Session, SessionOutput, open_session
 
 __all__ = [
-    "Sandbox",
-    "SandboxAttr",
-    "SandboxOutput",
+    "Session",
+    "SessionOutput",
+    "open_session",
 ]

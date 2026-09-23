@@ -19,7 +19,8 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Optional
 
-from flamepy.core.client import create_session, open_session
+from flamepy.core.client import create_session as _create_core_session
+from flamepy.core.client import open_session as _open_core_session
 from flamepy.core.types import FlameError, FlameErrorCode, ResourceRequirement
 
 logger = logging.getLogger(__name__)
@@ -29,8 +30,8 @@ _SUPPORTED_LANGUAGES = frozenset({"python", "shell"})
 
 
 @dataclass(frozen=True)
-class SandboxAttr:
-    """Create-time specification for a Sandbox. Frozen after construction."""
+class _SessionOptions:
+    """Create-time specification for a Session. Frozen after construction."""
 
     language: str
     runtime: Optional[str] = None
@@ -40,8 +41,8 @@ class SandboxAttr:
 
 
 @dataclass
-class SandboxOutput:
-    """Stdout from a sandbox script."""
+class SessionOutput:
+    """Stdout from a session script."""
 
     data: bytes
 
@@ -64,40 +65,40 @@ def _copy_resreq(resreq: Optional[ResourceRequirement]) -> Optional[ResourceRequ
     return ResourceRequirement(cpu=resreq.cpu, memory=resreq.memory, gpu=resreq.gpu)
 
 
-def _normalize_attr(attr: SandboxAttr) -> SandboxAttr:
-    if not isinstance(attr, SandboxAttr):
-        raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "attr must be a SandboxAttr")
-    return SandboxAttr(
-        language=_normalize_language(attr.language),
-        runtime=attr.runtime,
-        min_instances=attr.min_instances,
-        max_instances=attr.max_instances,
-        resreq=_copy_resreq(attr.resreq),
+def _normalize_options(options: _SessionOptions) -> _SessionOptions:
+    if not isinstance(options, _SessionOptions):
+        raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "invalid agent session options")
+    return _SessionOptions(
+        language=_normalize_language(options.language),
+        runtime=options.runtime,
+        min_instances=options.min_instances,
+        max_instances=options.max_instances,
+        resreq=_copy_resreq(options.resreq),
     )
 
 
-def _encode_attr(attr: SandboxAttr) -> bytes:
+def _encode_options(options: _SessionOptions) -> bytes:
     resreq = None
-    if attr.resreq is not None:
+    if options.resreq is not None:
         resreq = {
-            "cpu": attr.resreq.cpu,
-            "memory": attr.resreq.memory,
-            "gpu": attr.resreq.gpu,
+            "cpu": options.resreq.cpu,
+            "memory": options.resreq.memory,
+            "gpu": options.resreq.gpu,
         }
     return json.dumps(
         {
-            "language": attr.language,
-            "runtime": attr.runtime,
-            "min_instances": attr.min_instances,
-            "max_instances": attr.max_instances,
+            "language": options.language,
+            "runtime": options.runtime,
+            "min_instances": options.min_instances,
+            "max_instances": options.max_instances,
             "resreq": resreq,
         }
     ).encode("utf-8")
 
 
-def _decode_attr(raw: Optional[bytes]) -> SandboxAttr:
+def _decode_options(raw: Optional[bytes]) -> _SessionOptions:
     if not raw:
-        raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "sandbox attr is missing from session common_data")
+        raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "agent session options are missing from common_data")
     try:
         payload = json.loads(raw.decode("utf-8"))
         resreq_data = payload.get("resreq")
@@ -108,8 +109,8 @@ def _decode_attr(raw: Optional[bytes]) -> SandboxAttr:
                 memory=resreq_data.get("memory", 0),
                 gpu=resreq_data.get("gpu", 0),
             )
-        return _normalize_attr(
-            SandboxAttr(
+        return _normalize_options(
+            _SessionOptions(
                 language=payload["language"],
                 runtime=payload.get("runtime"),
                 min_instances=payload.get("min_instances", 0),
@@ -120,7 +121,7 @@ def _decode_attr(raw: Optional[bytes]) -> SandboxAttr:
     except FlameError:
         raise
     except Exception as exc:
-        raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "session common_data is not a Sandbox attr") from exc
+        raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "session common_data does not contain valid agent session options") from exc
 
 
 def _encode_script(language: str, runtime: Optional[str], code: str, input_data: Optional[bytes]) -> bytes:
@@ -136,66 +137,42 @@ def _encode_script(language: str, runtime: Optional[str], code: str, input_data:
     return json.dumps(payload).encode("utf-8")
 
 
-def _decode_output(raw: Optional[bytes]) -> SandboxOutput:
+def _decode_output(raw: Optional[bytes]) -> SessionOutput:
     if raw is None:
-        return SandboxOutput(data=b"")
+        return SessionOutput(data=b"")
     try:
         payload = json.loads(raw.decode("utf-8"))
-        return SandboxOutput(data=bytes(payload["data"]))
+        return SessionOutput(data=bytes(payload["data"]))
     except Exception as exc:
         raise FlameError(FlameErrorCode.INTERNAL, "response is not valid flmexec output JSON") from exc
 
 
-class Sandbox:
+class Session:
     """Domain facade for running remote Python or shell scripts."""
 
-    def __init__(self, session, attr: SandboxAttr):
+    def __init__(self, session, options: _SessionOptions):
         self._session = session
-        self._attr = attr
+        self._options = options
         self._closed = False
 
-    @classmethod
-    def create(cls, attr: SandboxAttr) -> "Sandbox":
-        attr = _normalize_attr(attr)
-        logger.debug("Creating sandbox language=%s runtime=%s", attr.language, attr.runtime)
-        session = create_session(
-            _FLMEXEC_APP,
-            common_data=_encode_attr(attr),
-            min_instances=attr.min_instances,
-            max_instances=attr.max_instances,
-            resreq=attr.resreq,
-        )
-        return cls(session, attr)
-
-    @classmethod
-    def open(cls, sandbox_id: str) -> "Sandbox":
-        session = open_session(sandbox_id)
-        if session.application != _FLMEXEC_APP:
-            raise FlameError(
-                FlameErrorCode.INVALID_ARGUMENT,
-                f"sandbox {sandbox_id!r} is not a script sandbox",
-            )
-        attr = _decode_attr(session.common_data())
-        return cls(session, attr)
+    @property
+    def attr(self) -> _SessionOptions:
+        return self._options
 
     @property
-    def attr(self) -> SandboxAttr:
-        return self._attr
-
-    @property
-    def sandbox_id(self) -> str:
+    def id(self) -> str:
         if self._session is None:
-            raise FlameError(FlameErrorCode.INVALID_STATE, "sandbox is closed")
+            raise FlameError(FlameErrorCode.INVALID_STATE, "session is closed")
         return self._session.id
 
-    def run_code(self, code: str, input: Optional[bytes] = None) -> SandboxOutput:
+    def run_code(self, code: str, input: Optional[bytes] = None) -> SessionOutput:
         self._ensure_open()
-        payload = _encode_script(self._attr.language, self._attr.runtime, code, input)
+        payload = _encode_script(self._options.language, self._options.runtime, code, input)
         return _decode_output(self._session.invoke(payload))
 
     def submit_code(self, code: str, input: Optional[bytes] = None) -> Future:
         self._ensure_open()
-        payload = _encode_script(self._attr.language, self._attr.runtime, code, input)
+        payload = _encode_script(self._options.language, self._options.runtime, code, input)
         raw_future = self._session.run(payload)
         mapped: Future = Future()
 
@@ -219,10 +196,58 @@ class Sandbox:
 
     def _ensure_open(self) -> None:
         if self._closed or self._session is None:
-            raise FlameError(FlameErrorCode.INVALID_STATE, "sandbox is closed")
+            raise FlameError(FlameErrorCode.INVALID_STATE, "session is closed")
 
-    def __enter__(self) -> "Sandbox":
+    def __enter__(self) -> "Session":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+
+def open_session(
+    *,
+    ssn_id: Optional[str] = None,
+    language: str = "python",
+    runtime: Optional[str] = None,
+    min_instances: int = 0,
+    max_instances: Optional[int] = None,
+    resreq: Optional[ResourceRequirement] = None,
+) -> Session:
+    """Create an agent session, or reopen one when ``ssn_id`` is provided."""
+    if ssn_id is None:
+        normalized_options = _normalize_options(
+            _SessionOptions(
+                language=language,
+                runtime=runtime,
+                min_instances=min_instances,
+                max_instances=max_instances,
+                resreq=resreq,
+            )
+        )
+        logger.debug(
+            "Creating agent session language=%s runtime=%s",
+            normalized_options.language,
+            normalized_options.runtime,
+        )
+        core_session = _create_core_session(
+            _FLMEXEC_APP,
+            common_data=_encode_options(normalized_options),
+            min_instances=normalized_options.min_instances,
+            max_instances=normalized_options.max_instances,
+            resreq=normalized_options.resreq,
+        )
+    else:
+        if not isinstance(ssn_id, str) or not ssn_id:
+            raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "ssn_id must be a non-empty string")
+        core_session = _open_core_session(ssn_id)
+        normalized_options = None
+
+    if core_session.application != _FLMEXEC_APP:
+        raise FlameError(
+            FlameErrorCode.INVALID_ARGUMENT,
+            f"session {core_session.id!r} is not an agent session",
+        )
+    if normalized_options is None:
+        normalized_options = _decode_options(core_session.common_data())
+    return Session(core_session, normalized_options)

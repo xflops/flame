@@ -213,7 +213,7 @@ jobs:
           pytest -vv --durations=0 \
             tests/test_runner.py \
             tests/test_flmexec.py \
-            tests/test_sandbox.py
+            tests/test_agent.py
 
       - name: Verify Flame-owned CRI workloads
         run: ci/cri/e2e.sh verify-workloads

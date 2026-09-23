@@ -17,8 +17,8 @@ limitations under the License.
 # Import proto module first to ensure types_pb2 is loaded before frontend_pb2
 from flamepy import proto  # noqa: F401
 
-# Import submodules for runner, service, tools, and util (only as submodules)
-from . import runner, service, tools, util
+# Import domain submodules (only as submodules)
+from . import agent, runner, service, util
 
 # Export all core classes/types at top level
 from .core import (  # Type aliases; Constants; Enums; Exception classes; Data classes; Context and utility classes; Client functions; Client classes; Service constants; Service context classes; Service base classes; Service functions
@@ -150,8 +150,8 @@ __all__ = [
     "put_object",
     "update_object",
     # Submodules
+    "agent",
     "runner",
     "service",
-    "tools",
     "util",
 ]

@@ -1,6 +1,6 @@
 # Flame Python SDK API Reference
 
-The `flamepy` package provides a synchronous client for Flame sessions and tasks, a service base class for host-shim applications, object-cache helpers, the Runner API for packaging Python workloads, and the Tools Sandbox API for remote script execution.
+The `flamepy` package provides a synchronous client for Flame sessions and tasks, a service base class for host-shim applications, object-cache helpers, the Runner API for packaging Python workloads, and the Agent Session API for remote script execution.
 
 ## Configuration
 
@@ -197,31 +197,30 @@ Migration: the former client-proxy symbol `RunnerService` is now
 `RunnerServiceInstance`; `RunnerService` now names the optional executor-side
 base class.
 
-## Tools API
+## Agent Session API
 
-Sandbox lives under `flamepy.tools`. It runs remote Python or shell scripts through the built-in `flmexec` application without exposing Session or task JSON.
+The agent `Session` lives under `flamepy.agent`. It runs remote Python or shell scripts through the built-in `flmexec` application without exposing the core `Session` or task JSON.
 
 ```python
-from flamepy.tools import Sandbox, SandboxAttr
+from flamepy.agent import open_session
 from flamepy import ResourceRequirement, FlameError
 
-attr = SandboxAttr(language="python")
-with Sandbox.create(attr) as sb:
-    print(sb.run_code("print(1 + 2)").text())
+with open_session() as ssn:
+    print(ssn.run_code("print(1 + 2)").text())
 ```
 
 Key classes and methods:
 
-- `SandboxAttr(language, runtime=None, min_instances=0, max_instances=None, resreq=None)`
-- `Sandbox.create(attr)`
-- `Sandbox.open(sandbox_id)`
-- `Sandbox.run_code(code, input=None)`
-- `Sandbox.submit_code(code, input=None)`
-- `Sandbox.close()`
-- `sandbox.sandbox_id`, `sandbox.attr`
-- `SandboxOutput.data`, `SandboxOutput.text()`
+- `open_session(*, ssn_id=None, language="python", runtime=None, min_instances=0, max_instances=None, resreq=None)`
+- `open_session()` creates a Python session using the server-default runtime
+- `open_session(ssn_id="...")` reopens a session by ID
+- `Session.run_code(code, input=None)`
+- `Session.submit_code(code, input=None)`
+- `Session.close()`
+- `ssn.id`, `ssn.attr`
+- `SessionOutput.data`, `SessionOutput.text()`
 
-`language` and `runtime` are create-time only. `close()` destroys the sandbox. `open` works only while the sandbox is still open. `ResourceRequirement` and `FlameError` are imported from `flamepy`.
+Creation options are ignored when `ssn_id` is provided. `ssn.attr` is a read-only view of the effective creation settings; its type is intentionally not exported. `language` and `runtime` are create-time only. `close()` destroys the session. Reopen works only while the session is still open. `ResourceRequirement` and `FlameError` are imported from `flamepy`.
 
 ## Enums
 

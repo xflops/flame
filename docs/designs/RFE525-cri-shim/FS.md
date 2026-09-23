@@ -639,13 +639,13 @@ targeted cleanup after a successful create.
 
 The same job then starts the actual session manager, object cache, and executor
 manager with CRI manifests for `flmping`, `flmrun`, and `flmexec`. It runs the
-shared E2E Runner, flmexec, and Sandbox suites; every application service
+shared E2E Runner, flmexec, and Agent Session suites; every application service
 executes inside gVisor through the production CRI shim. Runner packages and
 uploads its working directory through the configured package/cache backend.
-flmexec and Sandbox exercise the configured `flmexec` service, including a
+flmexec and Agent Session exercise the configured `flmexec` service, including a
 flmexec script that recursively creates Runner applications and installs a
-native NumPy dependency. The generic Agent/Session service suite is omitted
-because Runner already covers packaged dynamic services and Sandbox covers the
+native NumPy dependency. The generic Service Session suite is omitted
+because Runner already covers packaged dynamic services and Agent Session covers the
 agent execution path through flmexec. This validates image-only services,
 Runner package delivery, recursive `FLAME_ENDPOINT` access, object-cache
 traffic, and real Instance UDS lifecycle under gVisor.
