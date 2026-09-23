@@ -293,6 +293,7 @@ promote_images() {
         flame-object-cache
         flame-executor-manager
         flame-console
+        flame-instance-runtime
     )
     local refs=() image repository source_ref latest_ref
 

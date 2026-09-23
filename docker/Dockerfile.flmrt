@@ -1,13 +1,20 @@
-FROM ubuntu:24.04 AS installer
+FROM rust:1.95 AS installer
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates python3 \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        pkg-config \
+        libssl-dev \
+        protobuf-compiler \
+        python3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /usr/bin/
 
 WORKDIR /usr/src/flame
 COPY . .
+
+RUN rm -rf target && cargo build --release
 
 RUN ./target/release/flmadm install \
     --src-dir /usr/src/flame \

@@ -150,6 +150,8 @@ jobs:
             dockerfile: docker/Dockerfile.fem
           - image: flame-console
             dockerfile: docker/Dockerfile.console
+          - image: flame-instance-runtime
+            dockerfile: docker/Dockerfile.flmrt
     steps:
       - name: Checkout release tooling
         uses: actions/checkout@v4

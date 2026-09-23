@@ -269,11 +269,15 @@ Release Docker images as multi-arch manifest tags for `linux/amd64` and
 - `xflops/flame-object-cache`
 - `xflops/flame-executor-manager`
 - `xflops/flame-console`
+- `xflops/flame-instance-runtime` (CRI application runtime)
 
 The release workflow publishes only the versioned release tag. Among automated
 workflows, only the main-branch image workflow moves the mutable `latest` tag.
-It promotes the four images after every SHA-tagged image is verified. Because
-registries cannot atomically update tags across repositories, rerun a failed
+It promotes the five images after every SHA-tagged image is verified. The
+`flame-instance-runtime` image is only consumed by CRI applications, but it is
+also versioned by the release workflow so CRI users can pin a release. It is not
+a Flame control-plane service and must not be added to Compose service checks.
+Registries cannot atomically update tags across repositories, so rerun a failed
 main image workflow to complete a partially interrupted promotion.
 
 Build release images with manifest lists. The Makefile detects a
@@ -318,7 +322,7 @@ make release-images-push
 ```
 
 Verify the registry exposes every platform listed in `RELEASE_IMAGE_PLATFORMS`
-for all four images:
+for all five images:
 
 ```shell
 make release-images-verify
@@ -429,7 +433,7 @@ Before declaring the release complete, record:
 - GitHub release URL.
 - PyPI `flamepy` version URL and uploaded files.
 - crates.io URLs for `stdng`, `flame-rs-macros`, and `flame-rs`.
-- Docker Hub tag URLs and manifest digests for all four images.
+- Docker Hub tag URLs and manifest digests for all five images.
 - CI run URLs for the final release commit.
 - Helm/Kubernetes smoke-test output or the reason it was not run locally.
 
