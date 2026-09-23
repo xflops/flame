@@ -44,7 +44,7 @@ E2E_SYSTEM_PYTEST_ARGS ?=
 .PHONY: format format-rust format-python format-e2e
 .PHONY: e2e e2e-local e2e-py e2e-py-docker e2e-py-local e2e-rs
 .PHONY: e2e-py-system-docker e2e-py-system-local e2e-py-system-stress
-.PHONY: e2e-py-system-longevity e2e-py-system-runner
+.PHONY: e2e-py-system-longevity e2e-py-system-app
 .PHONY: docker-build docker-build-fsm docker-build-fem docker-build-console
 .PHONY: docker-push docker-push-fsm docker-push-fem docker-push-console
 .PHONY: docker-release release-sanity ci-image
@@ -137,10 +137,10 @@ e2e-py-docker: ## Run Python E2E tests with docker compose
 e2e-py-local: ## Run Python E2E tests against local cluster (requires flamepy installed via pip)
 	cd e2e && PYTHONPATH="$(CURDIR)/e2e/src:$$PYTHONPATH" FLAME_ENDPOINT=$(FLAME_ENDPOINT) pytest -vv --durations=0 .
 
-e2e-py-system-docker: ## Run opt-in Python system tests with docker compose (E2E_SYSTEM_PROFILE=all|stress|longevity|runner)
+e2e-py-system-docker: ## Run opt-in Python system tests with docker compose (E2E_SYSTEM_PROFILE=all|stress|longevity|app)
 	$(CONTAINER_CLI) compose exec -w /opt/e2e flame-console bash -c "source /usr/local/flame/sbin/flmenv.sh && FLAME_E2E_SYSTEM_TESTS=$(E2E_SYSTEM_PROFILE) PYTHONPATH=/opt/e2e/src:\$$PYTHONPATH python3 -m pytest -vv --durations=0 tests/test_system.py $(E2E_SYSTEM_PYTEST_ARGS)"
 
-e2e-py-system-local: ## Run opt-in Python system tests against local cluster (E2E_SYSTEM_PROFILE=all|stress|longevity|runner)
+e2e-py-system-local: ## Run opt-in Python system tests against local cluster (E2E_SYSTEM_PROFILE=all|stress|longevity|app)
 	cd e2e && FLAME_E2E_SYSTEM_TESTS=$(E2E_SYSTEM_PROFILE) PYTHONPATH="$(CURDIR)/e2e/src:$$PYTHONPATH" FLAME_ENDPOINT=$(FLAME_ENDPOINT) pytest -vv --durations=0 tests/test_system.py $(E2E_SYSTEM_PYTEST_ARGS)
 
 e2e-py-system-stress: ## Run Python system stress tests with docker compose
@@ -149,8 +149,8 @@ e2e-py-system-stress: ## Run Python system stress tests with docker compose
 e2e-py-system-longevity: ## Run Python system longevity tests with docker compose
 	$(MAKE) e2e-py-system-docker E2E_SYSTEM_PROFILE=longevity E2E_SYSTEM_PYTEST_ARGS="-m longevity"
 
-e2e-py-system-runner: ## Run Python system Runner tests with docker compose
-	$(MAKE) e2e-py-system-docker E2E_SYSTEM_PROFILE=runner E2E_SYSTEM_PYTEST_ARGS="-m runner"
+e2e-py-system-app: ## Run Python system App tests with docker compose
+	$(MAKE) e2e-py-system-docker E2E_SYSTEM_PROFILE=app E2E_SYSTEM_PYTEST_ARGS="-m app"
 
 e2e-rs: ## Run Rust E2E tests
 	FLAME_ROOT=$(FLAME_ROOT) cargo test -p flame-rs --test integration_test -- --nocapture

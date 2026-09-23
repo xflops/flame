@@ -5,8 +5,10 @@ import types
 import unittest
 from unittest.mock import patch
 
-from flamepy.runner.runpy import FlameRunpyService
-from flamepy.runner.types import RunnerContext
+from flamepy.app._context import _bind_invocation_context
+from flamepy.app.runpy import FlameRunpyService
+from flamepy.app.types import ServiceContext
+from flamepy.core.service import ApplicationContext, SessionContext
 
 
 class FakeLLM:
@@ -36,7 +38,13 @@ class FakeSamplingParams:
 
 
 fake_vllm = types.SimpleNamespace(LLM=FakeLLM, SamplingParams=FakeSamplingParams)
-with patch.dict(sys.modules, {"vllm": fake_vllm}):
+with (
+    patch.dict(sys.modules, {"vllm": fake_vllm}),
+    patch("flamepy.app.init"),
+    patch(
+        "flamepy.app.service", return_value=lambda execution_object: execution_object
+    ),
+):
     from engine import MODEL, VllmEngine, kv_key
 
 
@@ -46,38 +54,48 @@ class VllmEngineTest(unittest.TestCase):
 
     def test_service_publishes_prompt_keys(self) -> None:
         service = FlameRunpyService()
-        service._set_execution_from_context(RunnerContext(VllmEngine))
+        service._set_execution_from_context(
+            ServiceContext(VllmEngine, constructor_args=(MODEL,))
+        )
         execution_object = service._execution_object
-        first = execution_object.generate("first")
-        second = execution_object.generate("second")
+        session = SessionContext(None, "session", ApplicationContext("vllm-das"))
+        with _bind_invocation_context(session) as invocation_context:
+            first = execution_object.generate("first")
+            second = execution_object.generate("second")
+        service.publish(invocation_context.attributes)
 
         self.assertEqual(FakeLLM.creations, 1)
         self.assertEqual(first.cached_tokens, 0)
         self.assertEqual(second.cached_tokens, 0)
         self.assertEqual(
-            execution_object._flame_instance_attributes,
+            set(service._take_attributes().attr),
             {kv_key(MODEL, "first"), kv_key(MODEL, "second")},
         )
 
-    def test_new_session_reuses_cached_prompt(self) -> None:
+    def test_rebinding_reuses_cached_prompt(self) -> None:
         service = FlameRunpyService()
-        context = RunnerContext(VllmEngine)
+        context = ServiceContext(VllmEngine, constructor_args=(MODEL,))
         service._set_execution_from_context(context)
         first_execution_object = service._execution_object
-        first = first_execution_object.generate("same prompt")
-        first_execution_object._flame_instance_attributes.clear()
+        session = SessionContext(None, "session", ApplicationContext("vllm-das"))
+        with _bind_invocation_context(session) as invocation_context:
+            first = first_execution_object.generate("same prompt")
+        service.publish(invocation_context.attributes)
+        service._take_attributes()
 
         service.on_session_leave()
         service._set_execution_from_context(context)
         second_execution_object = service._execution_object
-        second = second_execution_object.generate("same prompt")
+        with _bind_invocation_context(session) as invocation_context:
+            second = second_execution_object.generate("same prompt")
+        service.publish(invocation_context.attributes)
 
         self.assertEqual(first.cached_tokens, 0)
         self.assertGreater(second.cached_tokens, 0)
         self.assertEqual(FakeLLM.creations, 1)
         self.assertIs(second_execution_object, first_execution_object)
         self.assertEqual(
-            second_execution_object._flame_instance_attributes,
+            set(service._take_attributes().attr),
             {kv_key(MODEL, "same prompt")},
         )
 

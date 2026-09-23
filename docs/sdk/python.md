@@ -5,7 +5,7 @@ The Python SDK is distributed as `flamepy`. It provides:
 - A synchronous client for sessions, tasks, and application registration.
 - A host-shim service base class for Python services.
 - Object-cache helpers for pickled objects, files, and versioned references.
-- The Runner API for packaging Python code and invoking functions or objects remotely.
+- The App API for packaging Python code and invoking functions or objects remotely.
 
 ## Install
 
@@ -188,65 +188,94 @@ Object references are versioned. `version=0` forces a fresh download. Nonzero ve
 
 Lower-level helpers under `flamepy.core` and `flamepy.cache` also expose `ObjectKey`, `patch_object()`, `upload_object()`, `download_object()`, and `delete_objects()`.
 
-## Use Runner
+## Use App
 
-Runner packages the current Python project, registers a Flame application based on the configured runner template, and exposes Python callables or objects as remote services:
+App packages the current Python project, registers a Flame application based on the configured app template, and exposes Python functions or classes as remote services:
 
 ```python
-from flamepy.runner import Runner
+import flamepy.app as app
 
 
+app.init("square-app")
+
+
+@app.service(warmup=2)
 def square(value: int) -> int:
     return value * value
 
 
-with Runner("square-app") as runner:
-    svc = runner.service(square, warmup=2)
-    futures = [svc(idx) for idx in range(8)]
-    print(runner.get(futures))
+futures = [square(idx) for idx in range(8)]
+print(app.get(futures))
+app.destroy()
 ```
 
-Runner returns `ObjectFuture` values. Use `future.get()` to fetch a concrete result, `future.ref()` to get the `ObjectRef`, `runner.wait()` to wait for a batch, and `runner.select()` to iterate as results complete.
+App returns `ObjectFuture` values. Use `future.get()` to fetch a concrete result, `future.ref()` to get the `ObjectRef`, `app.wait()` to wait for a batch, and `app.select()` to iterate as results complete.
 
-`Runner.service()` returns a public `RunnerServiceInstance` client handle. It
-exposes the execution object's remote methods and owns that session's `close()`
-lifecycle. Application execution objects subclass `RunnerService` when they
-need service-side session context or instance-attribute publication.
-Plain functions, classes, and object instances do not need to subclass it when
-they use neither API.
+`app.init()` initializes the process-wide application and returns its runtime
+handle for callers that need direct access. Calling it again with the same name
+returns that handle. `app.service()` is the canonical decorator and must run
+after initialization. Functions become `ServiceInstance` proxies. Decorating a
+class declares a service class without creating a session. Calling the
+decorated class creates its service handle and session; `flmrun` runs the class
+constructor, including its arguments, in the executor:
 
-Migration: the client proxy previously exported as `RunnerService` is renamed
-to `RunnerServiceInstance`. The `RunnerService` name now refers to the optional
-executor-side base class.
+```python
+@app.service(warmup=1)
+class Counter:
+    def __init__(self, value=0):
+        self.value = value
 
-Subclass `flamepy.runner.RunnerService` to access Runner-managed service state.
-`self.session_context()` returns the active session context, while
-`self.publish_attributes(attrs)` adds opaque `bytes` keys to the current
-session-entry or invocation response. Repeated calls in one response accumulate;
-Runner publishes and drains the set at the response boundary. Session Manager
-unions every response into the executor's retained attribute set. Task calls can
-request a matching instance with `TaskOptions(affinity={key})`.
+    def increment(self):
+        self.value += 1
+        return self.value
 
-The returned service-side context is `flamepy.SessionContext`. It is distinct
-from `flamepy.runner.SessionContext`, which configures Runner session creation.
 
-The Runner process retains class execution objects by fully qualified class
-name and reuses them across sessions on that executor. Supplied object instances
-remain session-scoped and stateful, and functions remain session-scoped while
-their imported module-level state naturally follows Python module lifetime.
-Class-service affinity keys may therefore identify data held directly by the
-retained execution object. This executor-local cache is volatile: class state is
-not persisted or migrated and is discarded when the executor process exits.
-Two class services with the same module and qualified class name intentionally
-reuse the same object within that process.
+counter = Counter(10)     # creates a handle; flmrun constructs Counter(10)
+counter.increment()
+```
 
-To verify a configured cluster end to end with Runner, run:
+Class-level calls such as `Counter.increment()` are not supported. Flame method
+calls remain direct Python calls—use `counter.increment()`, without a
+`.remote()` suffix. The decorator options configure the session created by each
+class construction. `app.destroy()` owns session cleanup. Application execution
+objects are functions or classes; already constructed objects are not accepted.
+Each constructed handle has a unique service ID and its own retained object.
+Constructing the same decorated class twice does not share object state. Public
+class methods must not collide with `ServiceInstance` API names such as `close`.
+
+During an App invocation, `app.session_context()` returns the active session
+context, while `app.publish_attributes(attrs)` adds opaque `bytes` keys to the
+current response. Repeated calls in one response accumulate; App publishes and
+drains the set at the response boundary. Session Manager unions every response
+into the executor's retained attribute set. Task calls can request a matching
+instance with `TaskOptions(affinity={key})`.
+
+The returned service-side context is the core `flamepy.SessionContext`. An inner
+`@app.service()` declaration made during a service invocation automatically
+reuses that invocation's session. This recursive declaration is the exception
+to the normal lifecycle ordering: it needs neither `app.init()` nor
+`app.destroy()`, because it owns neither the parent application nor the reused
+session. Nested declarations must remain in the invocation's execution context
+and do not accept `autoscale`, `warmup`, or `resreq`, because those settings
+cannot change an existing session. Nested calls must complete before the parent
+invocation returns.
+
+The App process retains a constructed service object by service ID on its
+executor and reuses it across bindings for that service. Separate constructed
+handles use separate IDs and objects, even for the same decorated class and
+constructor arguments. Functions remain session-scoped while their imported
+module-level state naturally follows Python module lifetime. Service affinity
+keys may therefore identify data held directly by the retained object. This
+executor-local state is volatile: it is not persisted or migrated and is
+discarded when the executor process exits.
+
+To verify a configured cluster end to end with App, run:
 
 ```bash
-python -m flamepy.runner.e2e
+uv run --project e2e python -m e2e.app
 ```
 
-Installed wheels also provide the `flamepy-runner-e2e` command. The check validates the `flmrun` template, Runner package upload/install, function execution, `ObjectFuture` chaining, and a stateful instance service.
+The repository-level check validates the `flmrun` template, App package upload/install, function execution, `ObjectFuture` chaining, and a remotely constructed class service.
 
 ## API Map
 
@@ -258,11 +287,11 @@ Installed wheels also provide the `flamepy-runner-e2e` command. The check valida
 | Applications | `register_application()`, `unregister_application()`, `get_application()`, `list_applications()` |
 | Services | `FlameService`, `flamepy.run()`, `flamepy.service.FlameInstance`, `flamepy.service.Session` |
 | Objects | `put_object()`, `get_object()`, `update_object()`, `patch_object()`, `upload_object()`, `download_object()` |
-| Runner | `Runner`, `RunnerService`, `RunnerServiceInstance`, `ObjectFuture` |
+| App | `flamepy.app.init()`, `flamepy.app.service()`, `flamepy.app.destroy()`, `flamepy.app.session_context()`, `flamepy.app.publish_attributes()`, `ServiceInstance`, `ObjectFuture` |
 
 See also:
 
 - [Python SDK API reference](../../sdk/python/docs/API.md)
 - [Python SDK README](../../sdk/python/README.md)
-- [Python Pi Runner example](../../examples/pi/python/README.md)
+- [Python Pi App example](../../examples/pi/python/README.md)
 - [OpenAI agent service example](../../examples/agents/openai/README.md)

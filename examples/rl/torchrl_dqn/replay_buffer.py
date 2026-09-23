@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import Any, Iterable, TYPE_CHECKING
+from typing import Any, Iterable
 
-if TYPE_CHECKING:
-    from flamepy.runner import Runner
+import flamepy.app as app
 
 try:
     from torchrl.data.replay_buffers.storages import Storage as _TorchRLStorage
@@ -214,7 +213,7 @@ class FlameObjectStorage(_TorchRLStorage):
 
     ndim = 1
 
-    def __init__(self, rr: "Runner", max_size: int, sample_work: int = 0):
+    def __init__(self, max_size: int, sample_work: int = 0):
         _require_torchrl_storage()
         super().__init__(max_size)
 
@@ -225,7 +224,7 @@ class FlameObjectStorage(_TorchRLStorage):
 
         self.max_size = max_size
         self.sample_work = sample_work
-        self.object_ref = rr.put_object({"batch": None, "total_added": 0})
+        self.object_ref = app.put({"batch": None, "total_added": 0})
         self._get_object = get_object
         self._patch_object = patch_object
         self._update_object = update_object
@@ -514,7 +513,6 @@ def split_batch(batch_size: int, parts: int) -> list[int]:
 
 
 def create_flame_replay_buffers(
-    rr: "Runner",
     replay: str,
     buffer_size: int,
     replay_shards: int,
@@ -526,7 +524,6 @@ def create_flame_replay_buffers(
         return [
             _make_replay_buffer(
                 FlameObjectStorage(
-                    rr,
                     max_size=buffer_size,
                     sample_work=sample_work,
                 )
@@ -538,7 +535,6 @@ def create_flame_replay_buffers(
         return [
             _make_replay_buffer(
                 FlameObjectStorage(
-                    rr,
                     max_size=shard_size,
                     sample_work=sample_work,
                 )

@@ -7,8 +7,9 @@ avoiding data transfer through the service. The service handles merging and samp
 Use --local flag for local mode without a Flame cluster.
 """
 
-from collector import Collector
 from replay_buffer import ReplayBuffer
+
+import flamepy.app as app
 
 DEFAULT_FULL_GET_MERGE_EVERY = 5
 DEFAULT_SAMPLE_PARALLELISM = 2
@@ -54,8 +55,6 @@ def run_distributed(
     import json
     import time
 
-    from flamepy.runner import Runner
-
     sample_request_sizes = _sample_request_sizes(batch_size, sample_parallelism)
 
     print("=" * 60)
@@ -76,28 +75,31 @@ def run_distributed(
     metrics = []
     total_added = 0
 
-    with Runner(f"replay-buffer-{env_name.lower()}") as rr:
-        buffer = ReplayBuffer(rr, force_full_get=force_full_get)
-        buffer_svc = rr.service(buffer, warmup=sample_parallelism)
-        collector = rr.service(Collector(env_name), autoscale=True)
+    # Local mode never imports this module and therefore never initializes Flame.
+    try:
+        from distributed import BufferService, CollectorService
+
+        buffer = ReplayBuffer(force_full_get=force_full_get)
+        buffer_service = BufferService()
+        collector_service = CollectorService()
 
         for iteration in range(num_iterations):
             iteration_start = time.time()
             collect_futures = [
-                collector.collect(buffer, steps_per_collection)
+                collector_service.collect(env_name, buffer, steps_per_collection)
                 for _ in range(num_collections)
             ]
-            collect_results = rr.get(collect_futures)
+            collect_results = app.get(collect_futures)
             collect_elapsed = time.time() - iteration_start
 
             merge_elapsed = 0.0
             if merge_every and iteration % merge_every == merge_every - 1:
                 merge_start = time.time()
-                buffer_svc.merge().wait()
+                buffer_service.merge(buffer).wait()
                 merge_elapsed = time.time() - merge_start
 
             state_start = time.time()
-            stats = buffer_svc.state().get()
+            stats = buffer_service.state(buffer).get()
             state_elapsed = time.time() - state_start
             total_size = stats["size"]
             total_added = stats["total_added"]
@@ -119,10 +121,10 @@ def run_distributed(
             if total_size >= batch_size and sample_request_sizes:
                 sample_start = time.time()
                 sample_futures = [
-                    buffer_svc.sample(request_size)
+                    buffer_service.sample(buffer, request_size)
                     for request_size in sample_request_sizes
                 ]
-                batches = rr.get(sample_futures)
+                batches = app.get(sample_futures)
                 sample_elapsed = time.time() - sample_start
                 sample_requests = len(batches)
                 sampled = sum(len(batch) for batch in batches)
@@ -146,6 +148,8 @@ def run_distributed(
                     "sample_requests": sample_requests,
                 }
             )
+    finally:
+        app.destroy()
 
     elapsed = time.time() - start_time
     print("\n" + "=" * 60)
@@ -189,9 +193,9 @@ def run_local(
 ):
     import random
     import time
+    from collections import deque
 
     import gymnasium as gym
-    from collections import deque
 
     print("=" * 60)
     print("Local Replay Buffer")

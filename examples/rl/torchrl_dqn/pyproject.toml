@@ -1,7 +1,7 @@
 [project]
 name = "torchrl-dqn"
 version = "0.2.0"
-description = "TorchRL DQN Example using Flame Runner and patch_object replay buffer"
+description = "TorchRL DQN Example using Flame App and patch_object replay buffer"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -18,4 +18,4 @@ box2d = ["gymnasium[box2d]"]
 dev = ["flamepy"]
 
 [tool.setuptools]
-py-modules = ["main", "model", "collector", "replay_buffer"]
+py-modules = ["main", "model", "collector", "replay_buffer", "distributed"]

@@ -670,8 +670,26 @@ def test_flame_context_env_overrides(tmp_path, monkeypatch):
     # No env override: endpoint should come from config
     ctx = FlameContext()
     assert ctx.endpoint == "http://localhost:8080"
+    assert ctx.app == "flmrun"
 
     # Override with FLAME_ENDPOINT
     monkeypatch.setenv("FLAME_ENDPOINT", "http://override:1234")
     ctx2 = FlameContext()
     assert ctx2.endpoint == "http://override:1234"
+
+
+def test_flame_context_reads_scalar_app_template(tmp_path, monkeypatch):
+    fake_home = tmp_path / ".home"
+    conf_dir = fake_home / ".flame"
+    conf_dir.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+    (conf_dir / "flame.yaml").write_text(
+        json.dumps(
+            {
+                "current-context": "flame",
+                "contexts": [{"name": "flame", "app": "custom-flmrun"}],
+            }
+        )
+    )
+
+    assert FlameContext().app == "custom-flmrun"

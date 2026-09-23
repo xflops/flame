@@ -1,59 +1,17 @@
 """
-Distributed REINFORCE on CartPole-v1 or MuJoCo using Flame Runner.
+Distributed REINFORCE on CartPole-v1 or MuJoCo using Flame App.
 Use --local flag for local training without a Flame cluster.
 Use --env to select environment (cartpole, halfcheetah, hopper, walker2d, ant).
 """
 
 import time
 
+import flamepy.app as app
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.optim as optim
-
 from model import ENV_CONFIGS, create_policy
-
-
-def collect_episode(weights, env_name: str) -> dict:
-    """Runs on distributed executors to collect one episode.
-
-    Args:
-        weights: Model state_dict (auto-resolved from ObjectRef by Runner)
-        env_name: Name of the environment to use
-    """
-    import gymnasium as gym
-    import torch
-
-    from model import ENV_CONFIGS, create_policy
-
-    env_config = ENV_CONFIGS[env_name]
-    model = create_policy(env_config)
-    model.load_state_dict(weights)
-    model.eval()
-
-    env = gym.make(env_config.name)
-    states, actions, rewards = [], [], []
-    state, _ = env.reset()
-    done = False
-
-    while not done:
-        states.append(state)
-        state_tensor = torch.FloatTensor(state).unsqueeze(0)
-        with torch.no_grad():
-            action, _ = model.get_action(state_tensor)
-        actions.append(action)
-
-        state, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
-        rewards.append(reward)
-
-    env.close()
-    return {
-        "states": states,
-        "actions": actions,
-        "rewards": rewards,
-        "total_reward": sum(rewards),
-    }
 
 
 def compute_discounted_rewards(rewards: list, gamma: float = 0.99) -> torch.Tensor:
@@ -71,15 +29,11 @@ def compute_discounted_rewards(rewards: list, gamma: float = 0.99) -> torch.Tens
 def train_distributed(
     env_name: str, num_iterations: int = 100, episodes_per_iteration: int = 10
 ):
-    from functools import partial
-
-    from flamepy.runner import Runner
-
     env_config = ENV_CONFIGS[env_name]
     total_episodes = num_iterations * episodes_per_iteration
 
     print("=" * 60)
-    print(f"Distributed REINFORCE on {env_config.name} using Flame Runner")
+    print(f"Distributed REINFORCE on {env_config.name} using Flame App")
     print("=" * 60)
     print("\nConfiguration:")
     print(f"  Environment: {env_config.name}")
@@ -98,16 +52,19 @@ def train_distributed(
     mean_reward = 0.0
     start_time = time.time()
 
-    collect_fn = partial(collect_episode, env_name=env_name)
+    # Importing the distributed module initializes Flame and declares its
+    # service. Local mode never imports it and therefore needs no cluster.
+    from distributed import collect_episode
 
-    with Runner(f"rl-{env_name}") as rr:
-        collector = rr.service(collect_fn)
-
+    try:
         for iteration in range(num_iterations):
-            weights_ref = rr.put_object(policy.state_dict())
+            weights_ref = app.put(policy.state_dict())
 
-            futures = [collector(weights_ref) for _ in range(episodes_per_iteration)]
-            episodes = rr.get(futures)
+            futures = [
+                collect_episode(env_name, weights_ref)
+                for _ in range(episodes_per_iteration)
+            ]
+            episodes = app.get(futures)
 
             iteration_rewards = [ep["total_reward"] for ep in episodes]
             mean_reward = np.mean(iteration_rewards)
@@ -138,6 +95,8 @@ def train_distributed(
                     f"Mean Reward: {mean_reward:8.1f} | "
                     f"Loss: {total_loss.item():.4f}"
                 )
+    finally:
+        app.destroy()
 
     elapsed = time.time() - start_time
     print("\n" + "=" * 60)

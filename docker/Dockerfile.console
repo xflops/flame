@@ -29,7 +29,8 @@ COPY --from=builder /usr/local/flame /usr/local/flame
 ENV PATH="/usr/local/flame/bin:${PATH}"
 ENV FLAME_HOME=/usr/local/flame
 
-# Install only pytest for tests (flamepy already in FLAME_HOME/lib, use flmenv.sh for PYTHONPATH)
-RUN pip3 install --break-system-packages pytest
+# flamepy is already in FLAME_HOME/lib; install the E2E runner and its timeout
+# plugin so pyproject.toml's per-test timeout is enforced.
+RUN pip3 install --break-system-packages pytest pytest-timeout
 
 CMD ["service", "ssh", "start", "-D"]

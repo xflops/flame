@@ -1,10 +1,10 @@
-# TorchRL DQN with Flame Runner
+# TorchRL DQN with Flame App
 
 This example adapts the TorchRL introduction tutorial's CartPole DQN loop to Flame.
 The learner stays local and uses TorchRL `QValueActor`, `TensorDict`, and `DQNLoss`.
 Flame replaces the tutorial's local collector with distributed rollout workers and
-keeps TorchRL's `ReplayBuffer` interface for replay. The distributed buffer is a
-raw `ReplayBuffer` Runner service backed by a Flame-aware TorchRL storage.
+keeps TorchRL's `ReplayBuffer` interface for replay. The distributed buffer is
+backed by a Flame-aware TorchRL storage and sampled by an autoscaled app service.
 
 Reference: <https://docs.pytorch.org/rl/stable/tutorials/torchrl_demo.html>
 
@@ -19,24 +19,26 @@ Collector -> ReplayBuffer -> sample -> DQNLoss -> optimizer
 The Flame version is:
 
 ```text
-Runner collector service -> ReplayBuffer(FlameObjectStorage) service -> DQNLoss -> optimizer
+app collector service -> ReplayBuffer(FlameObjectStorage) sampler -> DQNLoss -> optimizer
 ```
 
-- `FlameTorchRLCollector` is a stateful Runner worker. Each call loads the latest policy weights, steps a discrete-action Gymnasium environment, and writes transitions with `ReplayBuffer.extend()`.
-- `FlameObjectStorage` is a custom TorchRL `Storage` that stores its backing state in a Flame object created by `Runner.put_object()`.
+- `FlameTorchRLCollector` is a stateful App worker. Each call loads the latest policy weights, steps a discrete-action Gymnasium environment, and writes transitions with `ReplayBuffer.extend()`.
+- `FlameObjectStorage` is a custom TorchRL `Storage` that stores its backing state in a Flame object created by `app.put()`.
 - Rollout batches stay as TorchRL `TensorDict` objects through collection, replay sampling, and `DQNLoss`.
 - TorchRL `ReplayBuffer.extend()` writes call `FlameObjectStorage.set()`, which appends transition batches with `patch_object()` instead of sending them through a central service.
 - TorchRL `ReplayBuffer.sample()` reads through `FlameObjectStorage.get()`, which calls `get_object(..., deserializer=...)` to incrementally materialize new Flame object patches.
 - Replay state reads use a count-only deserializer, so the driver can check shard sizes without rebuilding sampled transition data.
-- The driver exposes raw TorchRL `ReplayBuffer` objects as Runner services for sampling and performs the TorchRL loss and optimizer step locally.
+- `distributed.py` initializes the fixed `torchrl-dqn` app and declares the collector and replay sampler services at module scope. Only distributed mode imports it.
+- The replay sampler retains raw TorchRL `ReplayBuffer` objects per executor while the driver performs the TorchRL loss and optimizer step locally.
 - `--replay simple` keeps one shared `ReplayBuffer(FlameObjectStorage)` path.
 - `--replay sharded` creates multiple raw `ReplayBuffer(FlameObjectStorage)` services, spreads collector writes across them, and samples shards independently.
-- `--local` uses the same collector and transition-to-`TensorDict` learner path without a Flame cluster.
+- `--local` uses the same collector and transition-to-`TensorDict` learner path without importing `distributed.py` or initializing a Flame app.
 
 ## Files
 
-- `main.py`: CLI, local training loop, and distributed Flame Runner loop.
-- `collector.py`: Runner-compatible rollout worker.
+- `main.py`: CLI plus local and distributed training orchestration.
+- `distributed.py`: fixed app initialization and module-level service declarations.
+- `collector.py`: App-compatible rollout worker.
 - `replay_buffer.py`: custom TorchRL storage backed by Flame `ObjectRef` plus local and sharded replay helpers.
 - `model.py`: TorchRL policy, DQN loss, and transition batch helpers.
 - `pyproject.toml`: Runtime dependencies and example package metadata.
@@ -78,7 +80,7 @@ uv run main.py --local --env acrobot --iterations 5
 | `--replay` | Replay-buffer implementation: `simple` or `sharded` | `simple` |
 | `--replay-shards` | Shards for `sharded` replay | 4 |
 | `--sample-work` | Optional CPU work units per sampled transition | 0 |
-| `--sample-parallelism` | Replay-buffer service instances and sample requests | 1 |
+| `--sample-parallelism` | Parallel replay sample requests | 1 |
 | `--metrics-json` | Write timing and throughput metrics | Off |
 | `--seed` | Torch and environment seed; `-1` disables explicit seeding | 0 |
 
@@ -162,7 +164,7 @@ uv run main.py \
 
 ```text
 ========================================================================
-TorchRL DQN with Flame Runner and Replay Buffer
+TorchRL DQN with Flame App and Replay Buffer
 ========================================================================
 
 Configuration:
@@ -192,4 +194,4 @@ This is intentionally close to the TorchRL tutorial rather than a production DQN
 It keeps exploration simple with an epsilon schedule, uses TorchRL's soft target
 network updater, and does one optimizer step per iteration by default. Increase
 `--optim-steps`, `--collections`, or `--frames-per-collection` to put more work
-behind each Runner scheduling round trip.
+behind each App scheduling round trip.

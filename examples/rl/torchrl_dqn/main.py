@@ -1,8 +1,8 @@
 """
-TorchRL-style DQN on discrete Gymnasium envs using Flame Runner and patch_object.
+TorchRL-style DQN on discrete Gymnasium envs using Flame App and patch_object.
 
 Use --local for a no-cluster smoke run. Distributed mode keeps the learner local,
-runs rollout workers with Runner.service(), and stores transitions in Flame cache.
+runs rollout workers with app.service(), and stores transitions in Flame cache.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from replay_buffer import (
     replay_buffer_shard_states,
     split_batch,
 )
-
 
 DEFAULT_ENV = "CartPole-v1"
 DEFAULT_ITERATIONS = 20
@@ -140,7 +139,6 @@ def _print_timing_summary(timings: dict[str, dict[str, float]]) -> None:
 
 def _optimize(policy, loss_fn, target_updater, optimizer, transitions) -> float:
     import torch
-
     from model import transitions_to_tensordict
 
     batch = transitions_to_tensordict(transitions)
@@ -220,16 +218,13 @@ def train_distributed(
     seed: int | None = 0,
 ):
     import torch
-    from flamepy.runner import Runner
-
-    from collector import FlameTorchRLCollector
     from model import build_loss_and_updater, build_policy, inspect_discrete_env
 
     env_spec = inspect_discrete_env(env_name)
     total_frames = iterations * collections * frames_per_collection
 
     print("=" * 72)
-    print("TorchRL DQN with Flame Runner and Replay Buffer")
+    print("TorchRL DQN with Flame App and Replay Buffer")
     print("=" * 72)
     print("\nConfiguration:")
     print(f"  Environment: {env_spec.name}")
@@ -265,48 +260,40 @@ def train_distributed(
     metrics = []
     sample_cursor = 0
 
-    runner_name = f"torchrl-dqn-{env_spec.name.lower().replace('/', '-')}"
-    with Runner(runner_name) as rr:
+    import flamepy.app as app
+
+    try:
+        from distributed import CollectorService, ReplaySamplerService
+
+        collector_service = CollectorService()
+        replay_sampler_service = ReplaySamplerService()
         replay_buffers = create_flame_replay_buffers(
-            rr,
             replay=replay,
             buffer_size=buffer_size,
             replay_shards=replay_shards,
             sample_work=sample_work,
         )
-        replay_services = [
-            rr.service(
-                replay_buffer,
-                warmup=sample_parallelism if replay == REPLAY_SIMPLE else 1,
-            )
-            for replay_buffer in replay_buffers
-        ]
-        collector = rr.service(
-            FlameTorchRLCollector(
-                env_spec.name,
-                env_spec.obs_dim,
-                env_spec.action_dim,
-                hidden_dim,
-                seed=seed,
-            ),
-            autoscale=True,
-        )
 
         for iteration in range(iterations):
             iteration_start = time.time()
             epsilon = _epsilon(iteration, iterations, epsilon_start, epsilon_end)
-            weights_ref = rr.put_object(policy.state_dict())
+            weights_ref = app.put(policy.state_dict())
             collect_start = time.time()
             collect_futures = [
-                collector.collect(
+                collector_service.collect(
                     replay_buffers[collection_index % len(replay_buffers)],
                     weights_ref,
                     frames_per_collection,
                     epsilon,
+                    env_spec.name,
+                    env_spec.obs_dim,
+                    env_spec.action_dim,
+                    hidden_dim,
+                    seed,
                 )
                 for collection_index in range(collections)
             ]
-            collect_results = rr.get(collect_futures)
+            collect_results = app.get(collect_futures)
             collect_elapsed = time.time() - collect_start
 
             state_start = time.time()
@@ -330,8 +317,9 @@ def train_distributed(
                         request_sizes = split_batch(batch_size, sample_parallelism)
                         available_size = shard_states[0]["size"]
                         sample_futures = [
-                            replay_services[0].sample(
-                                _sample_request_size(request_size, available_size)
+                            replay_sampler_service.sample(
+                                replay_buffers[0],
+                                _sample_request_size(request_size, available_size),
                             )
                             for request_size in request_sizes
                             if available_size > 0
@@ -357,9 +345,11 @@ def train_distributed(
                             )
                             if sample_size > 0:
                                 sample_futures.append(
-                                    replay_services[selected].sample(sample_size)
+                                    replay_sampler_service.sample(
+                                        replay_buffers[selected], sample_size
+                                    )
                                 )
-                    batches = rr.get(sample_futures)
+                    batches = app.get(sample_futures)
                     sample_elapsed += time.time() - sample_start
                     transitions = _concat_sample_batches(batches)
                     if _batch_len(transitions) > 0:
@@ -403,6 +393,8 @@ def train_distributed(
                 f"reward={mean_reward:6.1f} | "
                 f"loss={last_loss:.4f}"
             )
+    finally:
+        app.destroy()
 
     elapsed = time.time() - start_time
     print("\n" + "=" * 72)
@@ -476,7 +468,6 @@ def train_local(
     seed: int | None = 0,
 ):
     import torch
-
     from collector import FlameTorchRLCollector
     from model import build_loss_and_updater, build_policy, inspect_discrete_env
 
@@ -646,7 +637,7 @@ def parse_args() -> argparse.Namespace:
         f"Gymnasium environment or preset alias ({', '.join(sorted(ENV_ALIASES))})"
     )
     parser = argparse.ArgumentParser(
-        description="TorchRL DQN on discrete Gymnasium envs with Flame Runner"
+        description="TorchRL DQN on discrete Gymnasium envs with Flame App"
     )
     parser.add_argument(
         "--env",

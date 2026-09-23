@@ -18,11 +18,12 @@ limitations under the License.
 from flamepy import proto  # noqa: F401
 
 # Import domain submodules (only as submodules)
-from . import agent, runner, service, util
+from . import agent, app, service, util
 
 # Export all core classes/types at top level
 from .core import (  # Type aliases; Constants; Enums; Exception classes; Data classes; Context and utility classes; Client functions; Client classes; Service constants; Service context classes; Service base classes; Service functions
     DEFAULT_FLAME_CACHE_ENDPOINT,
+    DEFAULT_FLAME_APP_TEMPLATE,
     DEFAULT_FLAME_CONF,
     DEFAULT_FLAME_ENDPOINT,
     FLAME_INSTANCE_ENDPOINT,
@@ -36,7 +37,6 @@ from .core import (  # Type aliases; Constants; Enums; Exception classes; Data c
     Connection,
     Event,
     FlameContext,
-    FlameContextRunner,
     FlameError,
     FlameErrorCode,
     FlamePackage,
@@ -93,6 +93,7 @@ __all__ = [
     "DEFAULT_FLAME_CONF",
     "DEFAULT_FLAME_ENDPOINT",
     "DEFAULT_FLAME_CACHE_ENDPOINT",
+    "DEFAULT_FLAME_APP_TEMPLATE",
     # Enums
     "SessionState",
     "TaskState",
@@ -112,7 +113,6 @@ __all__ = [
     "TaskOptions",
     "Application",
     "FlamePackage",
-    "FlameContextRunner",
     # Context and utility classes
     "TaskInformer",
     "FlameContext",
@@ -151,7 +151,7 @@ __all__ = [
     "update_object",
     # Submodules
     "agent",
-    "runner",
+    "app",
     "service",
     "util",
 ]

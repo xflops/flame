@@ -1,5 +1,19 @@
-from ps import ConvNet, get_data_loader, ParameterServer, DataWorker, evaluate
-from flamepy.runner import Runner
+from ps import ConvNet, DataWorker, ParameterServer, evaluate, get_data_loader
+
+import flamepy.app as app
+
+app.init("ps-example")
+
+
+@app.service(autoscale=False, warmup=1)
+class ParameterServerService(ParameterServer):
+    def __init__(self):
+        super().__init__(1e-2)
+
+
+@app.service(warmup=2)
+class DataWorkerService(DataWorker):
+    pass
 
 
 if __name__ == "__main__":
@@ -7,9 +21,10 @@ if __name__ == "__main__":
     test_loader = get_data_loader()[1]
     print("Running synchronous parameter server training.")
 
-    with Runner("ps-example") as rr:
-        ps_svc = rr.service(ParameterServer(1e-2))
-        workers_svc = [rr.service(DataWorker) for _ in range(2)]
+    try:
+        ps_svc = ParameterServerService()
+        worker_svc = DataWorkerService()
+        workers_svc = [worker_svc, worker_svc]
 
         current_weights = ps_svc.get_weights().get()
         for i in range(20):
@@ -26,3 +41,5 @@ if __name__ == "__main__":
                 print("Iter {}: \taccuracy is {:.1f}".format(i, accuracy))
 
         print("Final accuracy is {:.1f}.".format(accuracy))
+    finally:
+        app.destroy()

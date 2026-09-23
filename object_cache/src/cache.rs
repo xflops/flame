@@ -2684,7 +2684,7 @@ mod tests {
                         storage: None,
                     }),
                     package: None,
-                    runner: None,
+                    app: None,
                 }],
             }
         }

@@ -8,7 +8,7 @@ from tensordict import TensorDict
 
 
 class FlameTorchRLCollector:
-    """Stateful rollout worker used through flamepy.runner."""
+    """Stateful rollout worker used through flamepy.app."""
 
     def __init__(
         self,

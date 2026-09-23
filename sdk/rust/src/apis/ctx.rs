@@ -99,14 +99,6 @@ pub struct FlamePackage {
     pub excludes: Vec<String>,
 }
 
-/// Runner configuration for application execution.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct FlameRunner {
-    /// Runner template name
-    #[serde(default)]
-    pub template: Option<String>,
-}
-
 /// A named context containing cluster, cache, and package configurations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlameContextEntry {
@@ -120,9 +112,9 @@ pub struct FlameContextEntry {
     /// Package configuration (optional)
     #[serde(default)]
     pub package: Option<FlamePackage>,
-    /// Runner configuration (optional)
+    /// App template name (optional)
     #[serde(default)]
-    pub runner: Option<FlameRunner>,
+    pub app: Option<String>,
 }
 
 /// Root configuration structure for flame.yaml
@@ -189,7 +181,7 @@ impl FlameContext {
             cluster: FlameClusterConfig { endpoint, tls },
             cache,
             package: None,
-            runner: None,
+            app: None,
         };
 
         Ok(FlameContext {

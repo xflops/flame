@@ -1,6 +1,6 @@
 # Flame Python SDK API Reference
 
-The `flamepy` package provides a synchronous client for Flame sessions and tasks, a service base class for host-shim applications, object-cache helpers, the Runner API for packaging Python workloads, and the Agent Session API for remote script execution.
+The `flamepy` package provides a synchronous client for Flame sessions and tasks, a service base class for host-shim applications, object-cache helpers, the App API for packaging Python workloads, and the Agent Session API for remote script execution.
 
 ## Configuration
 
@@ -160,42 +160,74 @@ Service contexts expose bytes-oriented APIs:
 - `TaskContext.session_id`
 - `TaskContext.input`
 
-## Runner API
+## App API
 
-Runner lives under `flamepy.runner`:
+The process-wide application API is exported from `flamepy.app`:
 
 ```python
-from flamepy.runner import Runner
+import flamepy.app as app
 
+
+app.init("add-app")
+
+
+@app.service()
 def add(a, b):
     return a + b
 
-with Runner("add-app") as runner:
-    svc = runner.service(add)
-    print(svc(1, 2).get())
+
+print(add(1, 2).get())
+app.destroy()
+```
+
+A service may invoke another declared service. The captured proxy is restored
+in the executor as a reference to its existing session:
+
+```python
+@app.service()
+def fn_a(value):
+    return value * 2
+
+
+@app.service()
+def fn_b(value):
+    return fn_a(value).get()
 ```
 
 Key classes and helpers:
 
-- `RunnerService` is an optional execution-object base. Plain functions,
-  classes, and instances remain supported when these service-side APIs are not
-  needed.
-- `RunnerService.session_context()` returns the active service-side session
-  context (`flamepy.SessionContext`), not the Runner session-creation
-  configuration type of the same name.
-- `RunnerService.publish_attributes(attrs)` adds opaque `bytes` locality keys
-  to the current Runner response; repeated calls in the response accumulate.
-  Session Manager unions every response into the executor's retained set.
-- `Runner(name, fail_if_exists=False)`
-- `Runner.service(execution_object, autoscale=None, warmup=0, resreq=None)`
-- `RunnerServiceInstance` is the client proxy returned by `Runner.service()`.
-- `Runner.get(futures)`, `Runner.ref(futures)`, `Runner.wait(futures)`, `Runner.select(futures)`
+- `app.session_context()` returns the active service-side session context
+  (`flamepy.SessionContext`) during an App invocation.
+- `app.publish_attributes(attrs)` adds opaque `bytes` locality keys to the
+  current App response; repeated calls in the response accumulate. Session
+  Manager unions every response into the executor's retained set.
+- `init(name, fail_if_exists=False)` packages and initializes the application
+  and returns its runtime handle. Repeating it for the same name returns the
+  same handle.
+- `app.service(autoscale=None, warmup=0, resreq=None)` is the canonical service
+  decorator. Functions become `ServiceInstance` proxies. Decorating a class
+  declares a service class without creating a session. Calling
+  `DecoratedClass(args...)` creates its service handle and session, and
+  `flmrun` runs the constructor with those arguments in the executor. The
+  decorator accepts functions and classes, not already constructed objects.
+- Decorated classes do not expose class-level service methods. Invoke methods
+  directly on a constructed handle, for example `instance.method(...)`; Flame
+  does not require a `.remote()` suffix.
+- Each constructed handle has a unique service ID and its own retained object;
+  two handles created from the same decorated class do not share object state.
+- Public class methods must not collide with `ServiceInstance` API names such
+  as `close`; handle construction rejects such definitions.
+- The handle returned by `app.init()` also exposes `service(...)` when direct
+  runtime access is useful. A declaration made during another App invocation
+  is the sole no-init exception; it reuses the current session.
+- `ServiceInstance` is the client proxy returned for a decorated function or by
+  calling a decorated class with its remote constructor arguments.
+- A recursive declaration may call the service decorator without `init()` and
+  does not call `destroy()`; it reuses and does not own the parent session.
+- `get(futures)`, `ref(futures)`, `wait(futures)`, `select(futures)`
+- `put(obj)` stores a shared object under the active application's cache prefix.
+- `destroy()` closes services and releases the process-wide application.
 - `ObjectFuture.get()`, `ObjectFuture.ref()`, `ObjectFuture.wait()`
-- `get_data(data)` for decoding Runner task input/output payloads
-
-Migration: the former client-proxy symbol `RunnerService` is now
-`RunnerServiceInstance`; `RunnerService` now names the optional executor-side
-base class.
 
 ## Agent Session API
 

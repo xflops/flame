@@ -17,19 +17,19 @@ import textwrap
 import flamepy
 import pytest
 
-NODEPS_RESULT_PREFIX = "FLMEXEC_RUNNER_NODEPS_RESULT="
-NUMPY_RESULT_PREFIX = "FLMEXEC_RUNNER_NUMPY_RESULT="
+NODEPS_RESULT_PREFIX = "FLMEXEC_APP_NODEPS_RESULT="
+NUMPY_RESULT_PREFIX = "FLMEXEC_APP_NUMPY_RESULT="
 
 
 @pytest.fixture(scope="module")
-def check_flmexec_runner_environment():
+def check_flmexec_app_environment():
     context = flamepy.FlameContext()
     package_config = getattr(context, "package", None)
     cache_config = getattr(context, "cache", None)
     has_package_storage = package_config is not None and getattr(package_config, "storage", None) is not None
     has_cache_endpoint = cache_config is not None
     if not has_package_storage and not has_cache_endpoint:
-        pytest.skip("Runner package storage is not configured")
+        pytest.skip("App package storage is not configured")
 
     try:
         if flamepy.get_application("flmexec") is None:
@@ -53,7 +53,7 @@ def _invoke_flmexec_python(script: str, runtime: str | None = None) -> str:
 
 
 @pytest.mark.timeout(600)
-def test_flmexec_python_script_starts_runner_without_project_metadata(check_flmexec_runner_environment):
+def test_flmexec_python_script_starts_app_without_project_metadata(check_flmexec_app_environment):
     script = textwrap.dedent(
         f"""
         import json
@@ -62,16 +62,19 @@ def test_flmexec_python_script_starts_runner_without_project_metadata(check_flme
         import uuid
 
         try:
-            from flamepy.runner import Runner
+            import flamepy.app as app
 
-            def test_fn(x):
-                return x * x
+            app_name = f"test-flmexec-app-nodeps-{{uuid.uuid4().hex[:8]}}"
 
-            app_name = f"test-flmexec-runner-nodeps-{{uuid.uuid4().hex[:8]}}"
+            app.init(app_name)
+            try:
+                @app.service()
+                def service(value):
+                    return value * value
 
-            with Runner(app_name) as rr:
-                service = rr.service(test_fn)
-                result = rr.get([service(10), service(20)])
+                result = app.get([service(10), service(20)])
+            finally:
+                app.destroy()
 
             print("{NODEPS_RESULT_PREFIX}" + json.dumps(result))
         except BaseException:
@@ -90,7 +93,7 @@ def test_flmexec_python_script_starts_runner_without_project_metadata(check_flme
 
 
 @pytest.mark.timeout(600)
-def test_flmexec_python_script_starts_runner_with_numpy_dependency(check_flmexec_runner_environment):
+def test_flmexec_python_script_starts_app_with_numpy_dependency(check_flmexec_app_environment):
     script = textwrap.dedent(
         f"""
         import json
@@ -99,23 +102,26 @@ def test_flmexec_python_script_starts_runner_with_numpy_dependency(check_flmexec
         import uuid
 
         try:
-            from flamepy.runner import Runner
+            import flamepy.app as app
 
-            def numpy_summary(limit):
-                import numpy as np
+            app_name = f"test-flmexec-app-numpy-{{uuid.uuid4().hex[:8]}}"
 
-                values = np.arange(1, limit + 1, dtype=np.int64)
-                return {{
-                    "dtype": str(values.dtype),
-                    "shape": list(values.shape),
-                    "sum": int(values.sum()),
-                }}
+            app.init(app_name, dependencies=["numpy"])
+            try:
+                @app.service()
+                def service(limit):
+                    import numpy as np
 
-            app_name = f"test-flmexec-runner-numpy-{{uuid.uuid4().hex[:8]}}"
+                    values = np.arange(1, limit + 1, dtype=np.int64)
+                    return {{
+                        "dtype": str(values.dtype),
+                        "shape": list(values.shape),
+                        "sum": int(values.sum()),
+                    }}
 
-            with Runner(app_name, dependencies=["numpy"]) as rr:
-                service = rr.service(numpy_summary)
                 result = service(5).get()
+            finally:
+                app.destroy()
 
             print("{NUMPY_RESULT_PREFIX}" + json.dumps(result, sort_keys=True))
         except BaseException:

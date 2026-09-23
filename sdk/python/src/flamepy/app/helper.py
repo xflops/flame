@@ -17,20 +17,20 @@ from typing import Any, Dict, Optional
 
 import cloudpickle
 
+from flamepy.app.types import ServiceRequest
 from flamepy.core import ObjectRef, get_object
-from flamepy.runner.types import RunnerRequest
 
 
 class ErrorType(Enum):
-    """Error types for RunnerError."""
+    """Error types for Error."""
 
     DECODE_ERROR = "decode_error"
     CACHE_RETRIEVAL_ERROR = "cache_retrieval_error"
     DATA_FORMAT_ERROR = "data_format_error"
 
 
-class RunnerError(Exception):
-    """Exception for runner helper errors.
+class Error(Exception):
+    """Exception for app helper errors.
 
     Attributes:
         error_type: The type of error (from ErrorType enum).
@@ -144,18 +144,18 @@ def get_data(data: bytes) -> Dict[str, Any]:
 
     The data can be in one of two formats:
     1. An encoded ObjectRef (BSON format) pointing to cached data
-    2. Directly pickled data (RunnerRequest or result)
+    2. Directly pickled data (ServiceRequest or result)
 
     Args:
         data: Raw bytes from task input or output. This can be either:
               - An encoded ObjectRef pointing to cached data
-              - Directly pickled RunnerRequest (for task input)
+              - Directly pickled ServiceRequest (for task input)
               - Directly pickled result object (for task output)
 
     Returns:
         A dictionary containing the resolved data:
 
-        For task input (RunnerRequest):
+        For task input (ServiceRequest):
         {
             "type": "input",
             "method": str | None,  # Method name or None for callable
@@ -172,13 +172,13 @@ def get_data(data: bytes) -> Dict[str, Any]:
         }
 
     Raises:
-        RunnerError: With error_type indicating the specific error:
+        Error: With error_type indicating the specific error:
             - ErrorType.DECODE_ERROR: If the data cannot be decoded
             - ErrorType.CACHE_RETRIEVAL_ERROR: If the object cannot be retrieved from cache
             - ErrorType.DATA_FORMAT_ERROR: If the data format is not recognized
 
     Example:
-        >>> from flamepy.runner import get_data
+        >>> from flamepy.app.helper import get_data
         >>> from flamepy.core import get_session
         >>>
         >>> # Get a session and its tasks
@@ -209,7 +209,7 @@ def get_data(data: bytes) -> Dict[str, Any]:
             object_ref = ObjectRef.decode(data)
         except Exception as decode_error:
             # If both pickle and ObjectRef decode failed, raise error
-            raise RunnerError(
+            raise Error(
                 ErrorType.DECODE_ERROR,
                 f"Failed to decode data: not valid ObjectRef or pickled data: {decode_error}",
                 cause=decode_error,
@@ -219,7 +219,7 @@ def get_data(data: bytes) -> Dict[str, Any]:
         try:
             cached_data = get_object(object_ref)
         except Exception as e:
-            raise RunnerError(
+            raise Error(
                 ErrorType.CACHE_RETRIEVAL_ERROR,
                 f"Failed to retrieve object from cache: {e}",
                 cause=e,
@@ -235,9 +235,9 @@ def get_data(data: bytes) -> Dict[str, Any]:
                 pass
 
     # Determine type and process accordingly
-    if isinstance(cached_data, RunnerRequest):
+    if isinstance(cached_data, ServiceRequest):
         # This is task input
-        return _process_runner_request(cached_data, object_ref)
+        return _process_app_request(cached_data, object_ref)
     else:
         # This is task output (result)
         metadata = {}
@@ -250,11 +250,11 @@ def get_data(data: bytes) -> Dict[str, Any]:
         return output_data.to_dict()
 
 
-def _process_runner_request(request: RunnerRequest, object_ref: ObjectRef = None) -> Dict[str, Any]:
-    """Process a RunnerRequest and resolve any ObjectRef instances.
+def _process_app_request(request: ServiceRequest, object_ref: ObjectRef = None) -> Dict[str, Any]:
+    """Process a ServiceRequest and resolve any ObjectRef instances.
 
     Args:
-        request: The RunnerRequest to process.
+        request: The ServiceRequest to process.
         object_ref: Optional ObjectRef for metadata.
 
     Returns:
@@ -298,7 +298,7 @@ def _resolve_value(value: Any, max_depth: int = 10, _current_depth: int = 0) -> 
         The resolved value with all ObjectRef instances replaced by their actual data.
 
     Raises:
-        RunnerError: With ErrorType.CACHE_RETRIEVAL_ERROR if an ObjectRef cannot be resolved.
+        Error: With ErrorType.CACHE_RETRIEVAL_ERROR if an ObjectRef cannot be resolved.
     """
     # Prevent infinite recursion
     if _current_depth > max_depth:
@@ -309,7 +309,7 @@ def _resolve_value(value: Any, max_depth: int = 10, _current_depth: int = 0) -> 
         try:
             return get_object(value)
         except Exception as e:
-            raise RunnerError(
+            raise Error(
                 ErrorType.CACHE_RETRIEVAL_ERROR,
                 f"Failed to resolve ObjectRef: {e}",
                 cause=e,

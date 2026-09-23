@@ -95,7 +95,7 @@ contexts:
         - "*.tmp"
 ```
 
-`package.storage` is optional. When it is absent, Runner packages are uploaded to the object cache through `cache.endpoint`.
+`package.storage` is optional. When it is absent, App packages are uploaded to the object cache through `cache.endpoint`.
 
 ## Run Tests
 
@@ -186,7 +186,7 @@ If services do not start, inspect the matching log file first. Common issues are
 
 If a Python client cannot connect, verify `FLAME_ENDPOINT` and `FLAME_CACHE_ENDPOINT`, then confirm the corresponding services are listening on ports `8080` and `9090`.
 
-If Runner fails to find the `flmrun` template, check that the session manager is running and that `flmctl list -a` shows `flmrun`.
+If App fails to find the `flmrun` template, check that the session manager is running and that `flmctl list -a` shows `flmrun`.
 
 ## Cleanup
 
@@ -202,5 +202,5 @@ Stop the service processes, then uninstall:
 ## See Also
 
 - [flmadm README](../../flmadm/README.md)
-- [Runner Setup Guide](runner-setup.md)
+- [App Setup Guide](app-setup.md)
 - [RFE333 Functional Specification](../designs/RFE333-flmadm/FS.md)

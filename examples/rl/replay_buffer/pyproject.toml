@@ -13,4 +13,4 @@ dependencies = [
 dev = ["flamepy"]
 
 [tool.setuptools]
-py-modules = ["main", "replay_buffer", "collector"]
+py-modules = ["main", "replay_buffer", "collector", "distributed"]

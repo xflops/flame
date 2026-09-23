@@ -257,10 +257,10 @@ run_package_checks() {
     run cargo package --manifest-path "$ROOT_DIR/sdk/rust/macros/Cargo.toml" --allow-dirty
     run cargo package --manifest-path "$ROOT_DIR/sdk/rust/Cargo.toml" --allow-dirty --features macros
 
-    log "uv run Python SDK runner tests"
+    log "uv run Python SDK app tests"
     (
         cd "$ROOT_DIR/sdk/python"
-        uv run -n --extra dev pytest tests/test_runner_e2e.py tests/test_runner.py -q
+        uv run -n --extra dev pytest tests/test_app.py -q
     )
 
     log "uv run Python SDK version import"
@@ -421,7 +421,7 @@ if "/usr/local/flame" in str(source):
 PY
 
 cd /tmp
-python -m flamepy.runner.e2e --tasks "${RUNNER_E2E_TASKS}" --json
+PYTHONPATH=/tmp/e2e-src python -m e2e.app --tasks "${APP_E2E_TASKS}" --json
 EOF
     chmod +x "$PYPI_CHECK_SCRIPT"
 }
@@ -452,14 +452,15 @@ wait_for_compose_cluster() {
 }
 
 run_pypi_compose_e2e() {
-    log "Running PyPI flamepy ${PYTHON_VERSION} Runner check in ${PYPI_CHECK_IMAGE}"
+    log "Running PyPI flamepy ${PYTHON_VERSION} App check in ${PYPI_CHECK_IMAGE}"
     run "$CONTAINER_CLI" run --rm \
         --network "$COMPOSE_NETWORK_NAME" \
         -v "$ROOT_DIR/ci/docker/certs:/etc/flame/certs:ro" \
+        -v "$ROOT_DIR/e2e/src:/tmp/e2e-src:ro" \
         -v "$PYPI_CHECK_SCRIPT:/tmp/flame-release-sanity-pypi-check.sh:ro" \
         -e "PYPI_INDEX_URL=${PYPI_INDEX_URL}" \
         -e "PYTHON_VERSION=${PYTHON_VERSION}" \
-        -e "RUNNER_E2E_TASKS=${COMPOSE_E2E_TASKS}" \
+        -e "APP_E2E_TASKS=${COMPOSE_E2E_TASKS}" \
         -e "FLAME_ENDPOINT=https://flame-session-manager:8080" \
         -e "FLAME_CACHE_ENDPOINT=grpcs://flame-object-cache:9090" \
         -e "FLAME_CA_FILE=/etc/flame/certs/ca.crt" \

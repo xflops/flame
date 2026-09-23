@@ -5,7 +5,7 @@ Flame provides SDKs for building clients that submit work to Flame and services 
 | SDK | Use it for | Documentation |
 |-----|------------|---------------|
 | Rust SDK | Typed async clients, compiled services, high-throughput task submission, and object-cache workflows | [Rust SDK](rust.md) |
-| Python SDK | Python services, scripts, agent and RL workflows, and dynamic packaging through Runner | [Python SDK](python.md) |
+| Python SDK | Python services, scripts, agent and RL workflows, and dynamic packaging through App | [Python SDK](python.md) |
 
 Both SDKs use the same Flame concepts:
 
@@ -52,5 +52,5 @@ The SDKs wrap the gRPC APIs documented in [Flame API Reference](../api/index.md)
 - [Rust Pi example](../../examples/pi/rust/README.md)
 - [Rust API tutorial](../tutorials/rust-api.md)
 - [Rust Candle Based example](../../examples/candle/based/README.md)
-- [Python Pi Runner example](../../examples/pi/python/README.md)
+- [Python Pi App example](../../examples/pi/python/README.md)
 - [Python SDK API reference](../../sdk/python/docs/API.md)

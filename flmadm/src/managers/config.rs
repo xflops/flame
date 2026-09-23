@@ -256,7 +256,7 @@ mod tests {
                 "python${FLAME_PYTHON_VERSION}",
                 "python",
                 "-m",
-                "flamepy.runner.runpy",
+                "flamepy.app.runpy",
             ]
         );
         assert_eq!(flmrun.installer.as_deref(), Some("python"));

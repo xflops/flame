@@ -164,7 +164,7 @@ For more details, see the [flmadm README](flmadm/README.md).
 * [SDKs](docs/sdk/index.md): [Rust SDK](docs/sdk/rust.md), [Python SDK](docs/sdk/python.md)
 * [Rust API Tutorial](docs/tutorials/rust-api.md)
 * [Local Development](docs/tutorials/local-development.md)
-* [Runner Setup Guide](docs/tutorials/runner-setup.md)
+* [App Setup Guide](docs/tutorials/app-setup.md)
 * [Release Process](docs/release-process.md)
 * [Design Documents](docs/designs/)
 

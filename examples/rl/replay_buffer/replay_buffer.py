@@ -1,12 +1,11 @@
 import random
-from typing import Any, List, TYPE_CHECKING
+from typing import Any, List
 
-if TYPE_CHECKING:
-    from flamepy.runner import Runner
+import flamepy.app as app
 
 
 class ReplayBuffer:
-    """Replay-buffer service used by flamepy.runner.
+    """Replay-buffer service used by flamepy.app.
 
     The incremental deserializer keeps process-local materialized state per
     service instance. Parallel requests may run on different fixed service
@@ -14,10 +13,10 @@ class ReplayBuffer:
     maintains its own best-effort materialized cache.
     """
 
-    def __init__(self, rr: "Runner", force_full_get: bool = False):
+    def __init__(self, force_full_get: bool = False):
         from flamepy.core import ObjectRef, get_object, patch_object, update_object
 
-        self.buffer_ref = rr.put_object({"transitions": [], "total_added": 0})
+        self.buffer_ref = app.put({"transitions": [], "total_added": 0})
         self.force_full_get = force_full_get
         self._object_ref = ObjectRef
         self._get_object = get_object

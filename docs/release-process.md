@@ -179,7 +179,7 @@ Python package verification:
 
 ```shell
 cd sdk/python
-uv run -n --extra dev pytest tests/test_runner_e2e.py tests/test_runner.py -q
+uv run -n --extra dev pytest tests/test_app.py -q
 uv run -n python -c 'import flamepy; print(flamepy.__version__)'
 uv build --out-dir /tmp/flamepy-${PYTHON_VERSION}-dist
 cd -
@@ -330,9 +330,9 @@ make release-images-verify
 
 After the image tags and PyPI package are published, run the Docker Compose
 release smoke check. It pulls the target image tag, starts a compose cluster, and
-runs `python -m flamepy.runner.e2e --tasks 1 --json` from a clean Python image
-that installs `flamepy==${PYTHON_VERSION}` from PyPI instead of using the SDK
-preinstalled in Flame images:
+runs the repository-level App E2E check from a clean Python image that installs
+`flamepy==${PYTHON_VERSION}` from PyPI instead of using the SDK preinstalled in
+Flame images:
 
 ```shell
 RELEASE_SANITY_LOCAL_CHECKS=0 \

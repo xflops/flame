@@ -32,21 +32,33 @@ if __name__ == "__main__":
     main()
 ```
 
-## Verify A Runner Cluster
+## Verify an App Cluster
 
 After configuring `~/.flame/flame.yaml` for a running cluster with session manager, object cache, executor manager, and the `flmrun` template application, run:
 
 ```bash
-python -m flamepy.runner.e2e
+uv run --project e2e python -m e2e.app
 ```
 
-Installed wheels also provide:
+Run the command from the repository root. The check packages a tiny temporary
+project and verifies App function calls, `ObjectFuture` chaining, and a stateful
+instance service. Use `--json` for machine-readable output and
+`--python-version 3.12` to verify a specific executor Python runtime.
 
-```bash
-flamepy-runner-e2e
+For application services, initialize the process-wide application before
+importing modules that declare services:
+
+```python
+import flamepy.app as app
+
+app.init("my-app")
+
+# my_project.services declares services with @app.service().
+from my_project import services  # noqa: E402
+
+result = services.run("input")
+app.destroy()
 ```
-
-The check packages a tiny temporary project and verifies Runner function calls, `ObjectFuture` chaining, and a stateful instance service. Use `--json` for machine-readable output and `--python-version 3.12` to verify a specific executor Python runtime.
 
 ## API Reference
 

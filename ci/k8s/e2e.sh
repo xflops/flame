@@ -13,7 +13,7 @@ OBJECT_CACHE_REPLICAS="${OBJECT_CACHE_REPLICAS:-2}"
 SESSION_MANAGER_STORAGE="${SESSION_MANAGER_STORAGE:-fs:///var/lib/flame/session}"
 TIMEOUT="${TIMEOUT:-10m}"
 FLMPING_TASKS="${FLMPING_TASKS:-3}"
-RUNNER_E2E_TASKS="${RUNNER_E2E_TASKS:-3}"
+APP_E2E_TASKS="${APP_E2E_TASKS:-3}"
 PI_NUM_BATCHES="${PI_NUM_BATCHES:-2}"
 PI_SAMPLES_PER_BATCH="${PI_SAMPLES_PER_BATCH:-1000}"
 AUTO_DIAGNOSTICS="${AUTO_DIAGNOSTICS:-true}"
@@ -362,9 +362,9 @@ run_smoke_tests() {
     flmctl --config "${HOME}/.flame/flame.yaml" list -a
     flmctl --config "${HOME}/.flame/flame.yaml" list -n
     flmping -t "$FLMPING_TASKS"
-    python3 -m flamepy.runner.e2e \
-        --name "${RELEASE}-runner-e2e" \
-        --tasks "$RUNNER_E2E_TASKS" \
+    PYTHONPATH="${ROOT_DIR}/e2e/src:${PYTHONPATH:-}" python3 -m e2e.app \
+        --name "${RELEASE}-app-e2e" \
+        --tasks "$APP_E2E_TASKS" \
         --json
 
     pushd "${FLAME_HOME}/examples/pi/python" >/dev/null
@@ -383,7 +383,7 @@ run_e2e_tests() {
         --with pytest \
         --with pytest-timeout \
         python -m pytest -vv --durations=0 \
-        tests/test_runner.py \
+        tests/test_app.py \
         tests/test_flmexec.py
     popd >/dev/null
 }
@@ -412,7 +412,7 @@ Commands:
   install-flame           Lint, render, and install Flame; accepts Helm arguments.
   configure-access        Configure session and cache access from the VM.
   run-smoke-tests         Run lightweight Flame client tests from the VM.
-  run-e2e-tests           Run the Runner and flmexec E2E cases from the VM.
+  run-e2e-tests           Run the App and flmexec E2E cases from the VM.
   diagnostics             Print Kubernetes and component diagnostics.
   all                     Run every phase; accepts Helm arguments (default).
 EOF

@@ -4,10 +4,10 @@
 
 Reinforcement Learning (RL) training is computationally intensive, with episode collection (rollouts) being a major bottleneck. Each episode requires running the environment simulation, which can be slow for complex environments. Fortunately, episode collection is **embarrassingly parallel** — each episode is independent and can run on a separate worker.
 
-By leveraging the `flamepy.Runner` API, we can distribute episode collection across multiple executors in a Flame cluster, dramatically speeding up training while keeping the policy update logic centralized. This pattern is common in distributed RL systems like IMPALA, Ape-X, and SEED.
+By leveraging the `flamepy.app` API, we can distribute episode collection across multiple executors in a Flame cluster, dramatically speeding up training while keeping the policy update logic centralized. This pattern is common in distributed RL systems like IMPALA, Ape-X, and SEED.
 
 This example illustrates:
-- How to parallelize RL episode collection using Flame Runner
+- How to parallelize RL episode collection using Flame App
 - The actor-learner pattern: distributed actors collect experience, centralized learner updates policy
 - How to serialize and broadcast PyTorch model weights to remote workers
 - Clean separation between distributed data collection and local gradient computation
@@ -32,7 +32,7 @@ This example implements the REINFORCE (policy gradient) algorithm on environment
    - `DiscretePolicy`: For CartPole (categorical distribution)
    - `ContinuousPolicy`: For MuJoCo environments (Gaussian distribution with learned std)
 
-2. **Distributed Episode Collection**: Using `flamepy.Runner`, we create a service from the `collect_episode` function. Each call to this service runs on a remote executor that:
+2. **Distributed Episode Collection**: Using the `flamepy` application API, we create a service from the `collect_episode` function. Each call to this service runs on a remote executor that:
    - Creates its own Gymnasium environment instance
    - Loads the current policy weights (serialized and sent from the learner)
    - Runs one complete episode
@@ -48,6 +48,9 @@ This example implements the REINFORCE (policy gradient) algorithm on environment
 ### Files
 
 - **`main.py`**: REINFORCE training (distributed by default, use `--local` for local mode)
+- **`distributed.py`**: fixed Flame application initialization and the
+  top-level `@app.service()` rollout declaration; imported only in distributed
+  mode
 - **`model.py`**: Shared components (policy networks, environment configs)
 - **`pyproject.toml`**: Package dependencies including `torch`, `gymnasium[mujoco]`, and `flamepy`
 - **`README.md`**: This documentation file
@@ -119,7 +122,7 @@ uv run main.py --plot
 ```shell
 root@container:/opt/examples/rl/basic# uv run main.py --env ant --iterations 20
 ============================================================
-Distributed REINFORCE on Ant-v5 using Flame Runner
+Distributed REINFORCE on Ant-v5 using Flame App
 ============================================================
 
 Configuration:
@@ -192,7 +195,7 @@ Training Complete!
 │  └─────────────┘    └─────────────┘                     │
 └─────────────────────────────────────────────────────────┘
                          │
-                         │ Flame Runner API
+                         │ Flame App API
                          ▼
 ┌────────────────────────────────────────────────────────┐
 │                  Flame Cluster                         │

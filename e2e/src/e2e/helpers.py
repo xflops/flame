@@ -1,5 +1,5 @@
 """
-Helper functions and classes for Runner end-to-end tests.
+Helper functions and classes for App end-to-end tests.
 These are defined in a separate module so they can be properly pickled.
 """
 
@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Optional
 
 import cloudpickle
+import flamepy.app as app
 from flamepy import ObjectRef, get_object, put_object
-from flamepy.runner import Runner, RunnerContext, RunnerRequest, RunnerService, SessionContext
 from flamepy.util import short_name
 
 from e2e.api import (
@@ -31,8 +31,8 @@ def sum_func(a: int, b: int) -> int:
     return a + b
 
 
-class DataAwareService(RunnerService):
-    """Small Runner service used to exercise attribute publication and affinity."""
+class DataAwareService:
+    """Small App service used to exercise attribute publication and affinity."""
 
     def __init__(self) -> None:
         # Keep identity independent of the execution-object lifecycle so this
@@ -42,7 +42,7 @@ class DataAwareService(RunnerService):
         self.executor_id = endpoint.parent.name if endpoint.name == "instance.sock" else endpoint.stem
 
     def run(self, value: str, delay: float = 0) -> tuple[str, bytes, str]:
-        self.publish_attributes({self.instance_key})
+        app.publish_attributes({self.instance_key})
         if delay:
             time.sleep(delay)
         return value, self.instance_key, self.executor_id
@@ -83,8 +83,8 @@ def square_func(x: int) -> int:
     return x * x
 
 
-def fuzzy_runner_echo_case(input_value: str, output_value: str, common_data: str, sleep_ms: int = 0) -> dict:
-    """Return a fuzzed Runner case after optionally simulating service work."""
+def fuzzy_app_echo_case(input_value: str, output_value: str, common_data: str, sleep_ms: int = 0) -> dict:
+    """Return a fuzzed App case after optionally simulating service work."""
     if sleep_ms > 0:
         time.sleep(sleep_ms / 1000.0)
     return {
@@ -110,8 +110,8 @@ class Calculator:
 class Counter:
     """Stateful counter class."""
 
-    def __init__(self):
-        self.count = 0
+    def __init__(self, count: int = 0):
+        self.count = count
 
     def increment(self) -> int:
         self.count += 1
@@ -125,21 +125,21 @@ class Counter:
         return self.count
 
 
-def serialize_runner_context(runner_context: RunnerContext, app_name: str) -> bytes:
+def serialize_service_context(service_context: app.ServiceContext, app_name: str) -> bytes:
     """
-    Serialize RunnerContext to bytes for core API.
+    Serialize app.ServiceContext to bytes for core API.
 
     Uses cloudpickle serialization, then puts in cache to get ObjectRef, then encodes to bytes.
 
     Args:
-        runner_context: RunnerContext object to serialize
+        service_context: app.ServiceContext object to serialize
         app_name: Application name for generating session ID
 
     Returns:
         bytes representation of ObjectRef
     """
     # Serialize the context using cloudpickle
-    serialized_ctx = cloudpickle.dumps(runner_context, protocol=cloudpickle.DEFAULT_PROTOCOL)
+    serialized_ctx = cloudpickle.dumps(service_context, protocol=cloudpickle.DEFAULT_PROTOCOL)
     # Generate key prefix in <app>/<session> format for caching
     key_prefix = f"{app_name}/{short_name(app_name)}"
     # Put in cache to get ObjectRef
@@ -148,14 +148,14 @@ def serialize_runner_context(runner_context: RunnerContext, app_name: str) -> by
     return object_ref.encode()
 
 
-def serialize_runner_request(request: RunnerRequest) -> bytes:
+def serialize_app_service_request(request: app.ServiceRequest) -> bytes:
     """
-    Serialize RunnerRequest to bytes for core API.
+    Serialize app.ServiceRequest to bytes for core API.
 
     Uses cloudpickle serialization.
 
     Args:
-        request: RunnerRequest object to serialize
+        request: app.ServiceRequest object to serialize
 
     Returns:
         bytes representation of the request
@@ -302,74 +302,53 @@ def invoke_task(session, request: TestRequest) -> TestResponse:
 
 
 class RecursiveService:
-    """Service that recursively calls itself via Runner.service().
+    """Service that recursively calls itself via App.service().
 
     This class demonstrates recursive task submission within the same session
     using the open_session API.
     """
 
-    _session_context: Optional[SessionContext] = None
-
-    def __init__(self, session_id: Optional[str] = None, app_name: Optional[str] = None):
-        """Initialize with session ID and app name for recursive calls.
-
-        Args:
-            session_id: The shared session ID for recursive calls.
-            app_name: The shared application name for Runner.
-        """
-        if session_id is not None and app_name is not None:
-            self._session_context = SessionContext(
-                session_id=session_id,
-                application_name=app_name,
-            )
-
     def compute_recursive(self, depth: int) -> int:
-        """Compute recursively by creating new Runner and service instances.
+        """Compute recursively by declaring another proxy for this session.
 
         At depth 0, returns 1.
-        At depth > 0, creates a new Runner (reusing existing app) and service
-        with the same session, calls compute_recursive(depth - 1), then multiplies by 2.
+        At depth > 0, declares a service with the existing session context,
+        calls compute_recursive(depth - 1), then multiplies by 2.
         """
         import logging
 
         logger = logging.getLogger(__name__)
 
         logger.info(f"[RecursiveService] compute_recursive called with depth={depth}")
-        if self._session_context is None:
-            raise ValueError("RecursiveService requires _session_context")
-
-        logger.info(f"[RecursiveService] session_context: session_id={self._session_context.session_id}, app_name={self._session_context.application_name}")
+        session_context = app.session_context()
+        logger.info(f"[RecursiveService] session_context: session_id={session_context.session_id}, app_name={session_context.application.name}")
 
         if depth <= 0:
             logger.info("[RecursiveService] Base case reached, returning 1")
             return 1
 
         try:
-            logger.info(f"[RecursiveService] Creating inner Runner for app: {self._session_context.application_name}")
+            # A recursive declaration reuses the core SessionContext and does
+            # not own the parent application or session lifecycle. It therefore
+            # needs neither app.init() nor app.destroy().
+            logger.info("[RecursiveService] Creating inner service with class")
 
-            # Create a new Runner to reuse existing app (fail_if_exists=False by default)
-            # The outer Runner manages the lifecycle (registration/unregistration)
-            with Runner(self._session_context.application_name) as inner_runner:
-                logger.info(f"[RecursiveService] Inner Runner created, _app_registered={inner_runner._app_registered}")
+            @app.service()
+            class InnerRecursiveService(type(self)):
+                pass
 
-                # Create service using Runner.service() with the class
-                # This reuses the existing session via _session_context
-                # Use a class service with autoscale=True to allow multiple
-                # executors for recursive calls.
-                logger.info("[RecursiveService] Creating inner service with class")
-                inner_service = inner_runner.service(type(self), autoscale=True)
-                logger.info(f"[RecursiveService] Inner service created, session_id={inner_service._session.id}")
+            inner_service = InnerRecursiveService()
+            logger.info(f"[RecursiveService] Inner service created, session_id={inner_service._session.id}")
 
-                # Call the inner service recursively
-                logger.info(f"[RecursiveService] Calling compute_recursive({depth - 1}) on inner service")
-                result = inner_service.compute_recursive(depth - 1)
-                logger.info("[RecursiveService] Got result future, calling get()")
-                inner_value = result.get()
-                logger.info(f"[RecursiveService] Inner value = {inner_value}")
+            logger.info(f"[RecursiveService] Calling compute_recursive({depth - 1}) on inner service")
+            result = inner_service.compute_recursive(depth - 1)
+            logger.info("[RecursiveService] Got result future, calling get()")
+            inner_value = result.get()
+            logger.info(f"[RecursiveService] Inner value = {inner_value}")
 
-                final_result = inner_value * 2
-                logger.info(f"[RecursiveService] Returning {final_result}")
-                return final_result
+            final_result = inner_value * 2
+            logger.info(f"[RecursiveService] Returning {final_result}")
+            return final_result
 
         except Exception as e:
             logger.error(f"[RecursiveService] Exception in compute_recursive(depth={depth}): {type(e).__name__}: {e}", exc_info=True)

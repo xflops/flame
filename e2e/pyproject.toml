@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 e2e = "e2e:main"
+flamepy-app-e2e = "e2e.app:main"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
@@ -45,7 +46,7 @@ log_cli_date_format = "%Y-%m-%d %H:%M:%S"
 markers = [
     "stress: opt-in system stress tests; enable with FLAME_E2E_SYSTEM_TESTS=stress or all",
     "longevity: opt-in sustained-runtime system tests; enable with FLAME_E2E_SYSTEM_TESTS=longevity or all",
-    "runner: opt-in system Runner tests; enable with FLAME_E2E_SYSTEM_TESTS=runner or all",
+    "app: opt-in system App tests; enable with FLAME_E2E_SYSTEM_TESTS=app or all",
 ]
 
 [project.optional-dependencies]

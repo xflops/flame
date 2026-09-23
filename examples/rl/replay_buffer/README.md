@@ -5,22 +5,41 @@
 ## Key Pattern: Shared Object + patch_object
 
 ```python
-with Runner("replay-buffer") as rr:
-    # Create ReplayBuffer (creates ObjectRef internally via runner)
-    buffer = ReplayBuffer(rr)
-    
-    # Wrap as a fixed multi-instance service for state/sample operations
-    buffer_svc = rr.service(buffer, warmup=sample_parallelism)
-    collector = rr.service(Collector(env_name), autoscale=True)
+import flamepy.app as app
 
-    # Pass the SAME buffer object to collectors (pickled with its ObjectRef)
-    collect_futures = [collector.collect(buffer, num_steps) for _ in range(num_collections)]
-    rr.get(collect_futures)
+app.init("replay-buffer")
 
-    # Query state and sample from the fixed-size buffer service
-    stats = buffer_svc.state().get()
-    sample_futures = [buffer_svc.sample(size) for size in sample_request_sizes]
-    batches = rr.get(sample_futures)
+
+@app.service(warmup=2)
+class BufferService:
+    def state(self, buffer):
+        return buffer.state()
+
+    def sample(self, buffer, size):
+        return buffer.sample(size)
+
+
+@app.service(autoscale=True)
+class CollectorService:
+    def collect(self, env_name, buffer, num_steps):
+        return Collector(env_name).collect(buffer, num_steps)
+# Create ReplayBuffer (creates ObjectRef under the active app)
+buffer = ReplayBuffer()
+buffer_service = BufferService()
+collector_service = CollectorService()
+
+# Pass the SAME buffer object to collectors (pickled with its ObjectRef)
+collect_futures = [
+    collector_service.collect(env_name, buffer, num_steps)
+    for _ in range(num_collections)
+]
+app.get(collect_futures)
+
+# Query state and sample from the fixed-size buffer service
+stats = buffer_service.state(buffer).get()
+sample_futures = [buffer_service.sample(buffer, size) for size in sample_request_sizes]
+batches = app.get(sample_futures)
+app.destroy()
 ```
 
 ## Why This Pattern?
@@ -63,7 +82,7 @@ uv run main.py --local
 | `--collections` | Collections per iteration | 20 |
 | `--steps-per-collection` | Steps per collection task | 500 |
 | `--batch-size` | Sample batch size | 64 |
-| `--sample-parallelism` | Fixed replay-buffer service instances and distributed sample requests per iteration | 2 |
+| `--sample-parallelism` | Distributed sample requests issued per iteration | 2 |
 | `--metrics-json` | Write distributed-mode metrics to a JSON file | Off |
 | `--merge-every` | Override replay-buffer patch merge cadence | Auto |
 | `--no-merge` | Disable patch merging, including forced-full runs | Off |
@@ -141,7 +160,7 @@ PY
 
 This default comparison intentionally keeps merge enabled for the forced-full baseline and disabled for incremental reads. Use `--merge-every` only when you want to override that policy.
 
-Use `--sample-parallelism N` when you want the learner to issue `N` replay-buffer sample requests in parallel. `ReplayBuffer` is passed as an instance, so `Runner.service()` defaults to a fixed-size service; `warmup=N` creates `N` service instances without adding in-instance threading.
+Use `--sample-parallelism N` when you want the learner to issue `N` replay-buffer sample requests in parallel. Distributed mode lazily imports `distributed.py`, whose top-level declarations initialize the fixed `replay-buffer` application. The buffer service keeps a configuration-independent warmup of two and can autoscale beyond that; the collector service also autoscales. Local mode never imports that module and does not initialize Flame.
 
 Example result from a 500,000-transition run after disabling merge for the incremental case:
 

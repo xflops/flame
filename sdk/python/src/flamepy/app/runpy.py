@@ -11,7 +11,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import inspect
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,11 +18,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cloudpickle
 
-from flamepy.core import ObjectRef, get_object, put_object, update_object
+from flamepy.app._context import (
+    _bind_invocation_context,
+    _stage_response_attributes,
+    _take_response_attributes,
+)
+from flamepy.app.types import ServiceContext, ServiceRequest
+from flamepy.core import ObjectRef, get_object, put_object
 from flamepy.core.service import FlameService as CoreFlameService
 from flamepy.core.service import SessionContext, TaskContext
 from flamepy.core.types import TaskOutput
-from flamepy.runner.types import RunnerContext, RunnerRequest
+from flamepy.proto.types_pb2 import ExecutorAttributes
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +39,9 @@ class FlameRunpyService(CoreFlameService):
     """
     Common Python service for Flame that executes customized Python applications.
 
-    This service allows users to execute arbitrary Python functions and objects
-    remotely without building custom container images. It supports method invocation
-    with various input types including positional args, keyword args, and large objects.
+    This service invokes App function and class services without requiring custom
+    container images. It accepts positional arguments, keyword arguments, and
+    object-cache references.
     """
 
     def __init__(self):
@@ -44,82 +49,49 @@ class FlameRunpyService(CoreFlameService):
         self._ssn_ctx: SessionContext = None
         self._execution_object: Any = None
         self._class_execution_objects: Dict[str, Any] = {}
-        self._runner_context: RunnerContext = None
+        self._app_context: ServiceContext = None
 
-    def _load_runner_context(self) -> RunnerContext:
-        """Load the latest RunnerContext from the session common data object."""
+    def _take_attributes(self) -> ExecutorAttributes:
+        """Take attributes belonging to the invocation assembling this response."""
+        attributes = _take_response_attributes()
+        if attributes is not None:
+            return ExecutorAttributes(attr=list(attributes))
+        return super()._take_attributes()
+
+    def _load_app_context(self) -> ServiceContext:
+        """Load the latest ServiceContext from the session common data object."""
         common_data_bytes = self._ssn_ctx.common_data()
         if common_data_bytes is None:
             raise ValueError("Common data is None in session context")
 
         object_ref = ObjectRef.decode(common_data_bytes)
         serialized_ctx = get_object(object_ref)
-        runner_context = cloudpickle.loads(serialized_ctx)
+        service_context = cloudpickle.loads(serialized_ctx)
 
-        if not isinstance(runner_context, RunnerContext):
-            raise ValueError(f"Expected RunnerContext in common_data, got {type(runner_context)}")
+        if not isinstance(service_context, ServiceContext):
+            raise ValueError(f"Expected ServiceContext in common_data, got {type(service_context)}")
 
-        return runner_context
+        return service_context
 
-    def _set_execution_from_context(self, runner_context: RunnerContext) -> None:
-        """Install the execution object from a RunnerContext into this service."""
-        execution_object = runner_context.execution_object
+    def _set_execution_from_context(self, service_context: ServiceContext) -> None:
+        """Bind a function or retained class object from a ServiceContext."""
+        execution_object = service_context.execution_object
         if execution_object is None:
-            raise ValueError("Execution object is None in RunnerContext")
+            raise ValueError("Execution object is None in ServiceContext")
 
-        if inspect.isclass(execution_object):
+        if service_context.constructor_args is not None:
             class_name = f"{execution_object.__module__}.{execution_object.__qualname__}"
-            if class_name not in self._class_execution_objects:
+            service_key = service_context.service_id or class_name
+            if service_key not in self._class_execution_objects:
                 logger.info(f"Instantiating class {class_name}")
-                self._class_execution_objects[class_name] = execution_object()
-            execution_object = self._class_execution_objects[class_name]
+                self._class_execution_objects[service_key] = execution_object(
+                    *service_context.constructor_args,
+                    **service_context.constructor_kwargs,
+                )
+            execution_object = self._class_execution_objects[service_key]
 
-        instance_vars = getattr(execution_object, "__dict__", None)
-        if isinstance(instance_vars, dict) and "_flame_instance_attributes" not in instance_vars:
-            inherited_attributes = getattr(execution_object, "_flame_instance_attributes", ())
-            setattr(execution_object, "_flame_instance_attributes", set(inherited_attributes))
-        elif not hasattr(execution_object, "_flame_instance_attributes"):
-            try:
-                setattr(execution_object, "_flame_instance_attributes", set())
-            except (AttributeError, TypeError):
-                # Some supported callables, such as builtins, cannot own attributes.
-                pass
-
-        try:
-            setattr(execution_object, "_flame_session_context", self._ssn_ctx)
-        except (AttributeError, TypeError):
-            # Some supported callables, such as builtins, cannot own attributes.
-            pass
-
-        self._runner_context = runner_context
+        self._app_context = service_context
         self._execution_object = execution_object
-
-    def _publish_instance_attributes(self) -> None:
-        """Publish and drain attributes accumulated by the Runner object."""
-        attributes = getattr(self._execution_object, "_flame_instance_attributes", ())
-        self.publish(attributes)
-        try:
-            setattr(self._execution_object, "_flame_instance_attributes", set())
-        except (AttributeError, TypeError):
-            pass
-
-    @staticmethod
-    def _serialize_runner_context(runner_context: RunnerContext) -> bytes:
-        """Serialize user state without executor-local Runner fields."""
-        execution_object = runner_context.execution_object
-        instance_vars = getattr(execution_object, "__dict__", None)
-        if not isinstance(instance_vars, dict):
-            return cloudpickle.dumps(runner_context, protocol=cloudpickle.DEFAULT_PROTOCOL)
-
-        runtime_vars = {}
-        for name in ("_flame_session_context", "_flame_instance_attributes"):
-            if name in instance_vars:
-                runtime_vars[name] = instance_vars.pop(name)
-
-        try:
-            return cloudpickle.dumps(runner_context, protocol=cloudpickle.DEFAULT_PROTOCOL)
-        finally:
-            instance_vars.update(runtime_vars)
 
     def _resolve_object_ref(self, value: Any) -> Any:
         """
@@ -247,7 +219,7 @@ class FlameRunpyService(CoreFlameService):
         """
         Handle session enter event.
 
-        Loads the RunnerContext and execution object, instantiating classes if needed.
+        Loads the ServiceContext and binds its function or retained class object.
         Package installation is handled by the executor manager before this is called.
 
         Args:
@@ -262,11 +234,10 @@ class FlameRunpyService(CoreFlameService):
         # Store the session context for use in task invocation.
         self._ssn_ctx = context
 
-        runner_context = self._load_runner_context()
-        self._set_execution_from_context(runner_context)
-        self._publish_instance_attributes()
+        service_context = self._load_app_context()
+        self._set_execution_from_context(service_context)
 
-        logger.info(f"Session entered successfully, execution object loaded (stateful={runner_context.stateful}, autoscale={runner_context.autoscale})")
+        logger.info(f"Session entered successfully, service bound (autoscale={service_context.autoscale})")
         return True
 
     def on_task_invoke(self, context: TaskContext) -> Optional[TaskOutput]:
@@ -274,12 +245,11 @@ class FlameRunpyService(CoreFlameService):
         Handle task invoke event.
 
         This method:
-        1. Uses the cached execution object from on_session_enter
-        2. Deserializes the RunnerRequest from task input
+        1. Uses the function or retained class object bound by on_session_enter
+        2. Deserializes the ServiceRequest from task input
         3. Resolves any ObjectRef instances in args/kwargs
-        4. Executes the requested method on the execution object
-        5. Persists state if stateful=True
-        6. Returns the result as bytes
+        4. Invokes the function or requested class method
+        5. Returns the result as bytes
 
         Args:
             context: Task context containing task ID, session ID, and input
@@ -293,36 +263,31 @@ class FlameRunpyService(CoreFlameService):
         logger.info(f"Invoking task: {context.task_id}")
 
         try:
-            if self._runner_context.stateful:
-                logger.debug("Refreshing stateful execution object from cache")
-                runner_context = self._load_runner_context()
-                self._set_execution_from_context(runner_context)
-
-            # Step 1: Use cached execution object (not from common_data)
+            # Step 1: Use the service bound during session enter.
             execution_object = self._execution_object
             if execution_object is None:
                 raise ValueError("Execution object is None. Session may not have been entered properly.")
 
             logger.debug(f"Execution object type: {type(execution_object)}")
 
-            # Step 2: Get the RunnerRequest from task input
+            # Step 2: Get the ServiceRequest from task input
             # For RL module: receive bytes from core API, deserialize with cloudpickle
             if context.input is None:
                 raise ValueError("Task input is None")
 
             request = cloudpickle.loads(context.input)
-            if not isinstance(request, RunnerRequest):
-                raise ValueError(f"Expected RunnerRequest in task input, got {type(request)}")
+            if not isinstance(request, ServiceRequest):
+                raise ValueError(f"Expected ServiceRequest in task input, got {type(request)}")
 
             # Ensure __post_init__ validation runs after deserialization
             # This validates that args/kwargs are the correct types
-            RunnerRequest.__post_init__(request)
+            ServiceRequest.__post_init__(request)
 
             # Validate request structure
             if request.method is not None and not isinstance(request.method, str):
                 raise ValueError(f"request.method must be a string or None, got {type(request.method)}")
 
-            logger.debug(f"RunnerRequest: method={request.method}, has_args={request.args is not None}, has_kwargs={request.kwargs is not None}")
+            logger.debug(f"ServiceRequest: method={request.method}, has_args={request.args is not None}, has_kwargs={request.kwargs is not None}")
 
             # Step 3: Resolve ObjectRef instances in args and kwargs (in parallel)
             raw_args = ()
@@ -342,51 +307,37 @@ class FlameRunpyService(CoreFlameService):
             logger.debug(f"Resolved args: {len(invoke_args)} arguments, kwargs: {len(invoke_kwargs)} keyword arguments")
 
             # Step 4: Execute the requested method
-            if request.method is None:
-                # The execution object itself is callable
-                if not callable(execution_object):
-                    raise ValueError(f"Execution object is not callable: {type(execution_object)}")
-                logger.debug(f"Invoking callable with args={invoke_args}, kwargs={invoke_kwargs}")
-                result = execution_object(*invoke_args, **invoke_kwargs)
-            else:
-                # Invoke a specific method on the execution object
-                if not hasattr(execution_object, request.method):
-                    raise ValueError(f"Execution object has no method '{request.method}'")
+            session_context = self._ssn_ctx
+            if session_context is None:
+                raise ValueError("Session context is not available")
+            if context.session_id != session_context.session_id:
+                raise ValueError(f"Task session '{context.session_id}' does not match bound session '{session_context.session_id}'")
+            with _bind_invocation_context(session_context) as invocation_context:
+                try:
+                    if request.method is None:
+                        # Invoke the function service.
+                        if not callable(execution_object):
+                            raise ValueError(f"Function service is not callable: {type(execution_object)}")
+                        logger.debug(f"Invoking function with args={invoke_args}, kwargs={invoke_kwargs}")
+                        result = execution_object(*invoke_args, **invoke_kwargs)
+                    else:
+                        # Invoke a method on the retained class object.
+                        if not hasattr(execution_object, request.method):
+                            raise ValueError(f"Execution object has no method '{request.method}'")
 
-                method = getattr(execution_object, request.method)
-                if not callable(method):
-                    raise ValueError(f"Attribute '{request.method}' is not callable")
+                        method = getattr(execution_object, request.method)
+                        if not callable(method):
+                            raise ValueError(f"Attribute '{request.method}' is not callable")
 
-                logger.debug(f"Invoking method '{request.method}' with args={invoke_args}, kwargs={invoke_kwargs}")
-                result = method(*invoke_args, **invoke_kwargs)
+                        logger.debug(f"Invoking method '{request.method}' with args={invoke_args}, kwargs={invoke_kwargs}")
+                        result = method(*invoke_args, **invoke_kwargs)
+                finally:
+                    _stage_response_attributes(invocation_context.attributes)
 
             logger.info(f"Task {context.task_id} completed successfully")
             logger.debug(f"Result type: {type(result)}")
 
-            # Step 5: Update execution object state if stateful
-            if self._runner_context.stateful:
-                logger.debug("Persisting execution object state")
-                updated_context = RunnerContext(
-                    execution_object=execution_object,  # Updated object
-                    stateful=self._runner_context.stateful,
-                    autoscale=self._runner_context.autoscale,
-                    warmup=self._runner_context.warmup,
-                )
-                # For RL module: serialize RunnerContext with cloudpickle, update in cache to get ObjectRef,
-                # then encode ObjectRef to bytes for core API
-                serialized_ctx = self._serialize_runner_context(updated_context)
-
-                # Get original ObjectRef and update it
-                common_data_bytes = self._ssn_ctx.common_data()
-                object_ref = ObjectRef.decode(common_data_bytes)
-                update_object(object_ref, serialized_ctx)
-                self._runner_context = updated_context
-                self._execution_object = execution_object
-                logger.debug("Execution object state persisted successfully in cache")
-            else:
-                logger.debug("Skipping state persistence for non-stateful service")
-
-            # Step 6: Put the result into cache and return ObjectRef encoded as bytes
+            # Step 5: Put the result into cache and return ObjectRef encoded as bytes
             # This enables efficient data transfer for large objects
             logger.debug("Putting result into cache")
             key_prefix = f"{self._ssn_ctx.application.name}/{self._ssn_ctx.session_id}"
@@ -400,8 +351,6 @@ class FlameRunpyService(CoreFlameService):
         except Exception as e:
             logger.error(f"Error in task {context.task_id}: {e}", exc_info=True)
             raise
-        finally:
-            self._publish_instance_attributes()
 
     def on_session_leave(self) -> bool:
         """
@@ -417,13 +366,8 @@ class FlameRunpyService(CoreFlameService):
         logger.info(f"Leaving session: {self._ssn_ctx.session_id if self._ssn_ctx else 'unknown'}")
 
         # Clean up session context
-        if self._execution_object is not None:
-            try:
-                setattr(self._execution_object, "_flame_session_context", None)
-            except (AttributeError, TypeError):
-                pass
         self._ssn_ctx = None
-        self._runner_context = None
+        self._app_context = None
         self._execution_object = None
 
         # Future implementation will:
@@ -464,7 +408,7 @@ def _setup_logging():
 
 
 def main():
-    """Main entrypoint for the flamepy.runner.runpy module."""
+    """Main entrypoint for the flamepy.app.runpy module."""
     from ..core.service import run
 
     _setup_logging()

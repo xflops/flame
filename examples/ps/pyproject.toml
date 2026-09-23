@@ -1,7 +1,7 @@
 [project]
 name = "ps-example"
 version = "0.2.0"
-description = "Parameter Server by flamepy.Runner"
+description = "Parameter server with flamepy.app"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

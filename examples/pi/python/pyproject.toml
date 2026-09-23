@@ -1,7 +1,7 @@
 [project]
 name = "pi"
 version = "0.2.0"
-description = "Monte Carlo Estimation of π by flamepy.Runner"
+description = "Monte Carlo estimation of π with flamepy.app"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

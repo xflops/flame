@@ -167,7 +167,7 @@ impl HostShim {
             work_dir.socket().to_string_lossy().to_string(),
         );
         if let Some(context) = &executor.context {
-            // Pass session manager endpoint for recursive runner calls
+            // Pass session manager endpoint for recursive app calls
             envs.insert(FLAME_ENDPOINT.to_string(), context.cluster.endpoint.clone());
             // Pass CA file for TLS certificate verification
             if let Some(ref tls) = context.cluster.tls {

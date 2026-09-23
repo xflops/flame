@@ -69,6 +69,7 @@ from .service import (
 # Constants
 # Type aliases
 from .types import (
+    DEFAULT_FLAME_APP_TEMPLATE,
     DEFAULT_FLAME_CACHE_ENDPOINT,
     DEFAULT_FLAME_CONF,
     DEFAULT_FLAME_ENDPOINT,
@@ -80,7 +81,6 @@ from .types import (
     CommonData,
     Event,
     FlameContext,
-    FlameContextRunner,
     FlameError,
     FlameErrorCode,
     FlamePackage,
@@ -114,6 +114,7 @@ __all__ = [
     "DEFAULT_FLAME_CONF",
     "DEFAULT_FLAME_ENDPOINT",
     "DEFAULT_FLAME_CACHE_ENDPOINT",
+    "DEFAULT_FLAME_APP_TEMPLATE",
     # Enums
     "SessionState",
     "TaskState",
@@ -133,7 +134,6 @@ __all__ = [
     "TaskOptions",
     "Application",
     "FlamePackage",
-    "FlameContextRunner",
     # Context and utility classes
     "TaskInformer",
     "FlameContext",

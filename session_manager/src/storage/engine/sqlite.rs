@@ -1512,7 +1512,7 @@ mod tests {
                 arguments: vec![
                     "run".to_string(),
                     "-n".to_string(),
-                    "flamepy.runner.runpy".to_string(),
+                    "flamepy.app.runpy".to_string(),
                 ],
                 environments: HashMap::new(),
                 working_directory: Some("/tmp".to_string()),

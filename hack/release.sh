@@ -147,15 +147,14 @@ verify_pypi() {
 verify_installed_python_package() {
     local root="$1"
     local expected_version="$2"
-    local metadata_dir metadata init_file entrypoint package_version runtime_version
+    local metadata_dir metadata init_file package_version runtime_version
 
     metadata_dir="$(find "${root}" -type d \
         -name "flamepy-${expected_version}.dist-info" -print -quit)"
     init_file="$(find "${root}" -type d -name flamepy -print -quit)/__init__.py"
     metadata="${metadata_dir}/METADATA"
-    entrypoint="$(find "${root}" -type f -name flamepy-runner-e2e -print -quit)"
-    [[ -f "${metadata}" && -f "${init_file}" && -x "${entrypoint}" ]] || {
-        echo "installed flamepy metadata, package, or entry point is missing under ${root}" >&2
+    [[ -f "${metadata}" && -f "${init_file}" ]] || {
+        echo "installed flamepy metadata or package is missing under ${root}" >&2
         return 1
     }
 
@@ -169,7 +168,7 @@ verify_installed_python_package() {
         echo "installed flamepy runtime version ${runtime_version} does not match ${expected_version}" >&2
         return 1
     }
-    PYTHONPATH="${root}" "${entrypoint}" --help >/dev/null
+    PYTHONPATH="${root}" "$(command -v python3)" -c 'import flamepy.app' >/dev/null
     echo "verified flamepy ${expected_version} under ${root}"
 }
 

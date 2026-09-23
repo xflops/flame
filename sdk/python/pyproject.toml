@@ -56,9 +56,6 @@ Homepage = "https://xflops.io"
 Repository = "https://github.com/xflops/flame"
 Issues = "https://github.com/xflops/flame/issues"
 
-[project.scripts]
-flamepy-runner-e2e = "flamepy.runner.e2e:main"
-
 [tool.ruff]
 line-length = 320
 target-version = "py39"

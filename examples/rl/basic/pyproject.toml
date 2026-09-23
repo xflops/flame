@@ -1,7 +1,7 @@
 [project]
 name = "rl"
 version = "0.2.0"
-description = "Distributed Reinforcement Learning Example using Flame Runner"
+description = "Distributed Reinforcement Learning Example using Flame App"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -17,4 +17,4 @@ plot = ["matplotlib"]
 dev = ["flamepy"]
 
 [tool.setuptools]
-py-modules = ["main", "model"]
+py-modules = ["distributed", "main", "model"]

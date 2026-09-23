@@ -65,5 +65,5 @@ gRPC status codes are used for error reporting:
 - [Rust SDK](../sdk/rust.md)
 - [Python SDK](../sdk/python.md)
 - [Local Development](../tutorials/local-development.md)
-- [Runner Setup Guide](../tutorials/runner-setup.md)
+- [App Setup Guide](../tutorials/app-setup.md)
 - [Python SDK README](../../sdk/python/README.md)

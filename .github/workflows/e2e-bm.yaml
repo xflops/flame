@@ -87,7 +87,7 @@ jobs:
         run: |
           echo "=== Verify flamepy import ==="
           python3 -c "import flamepy; print('✓ flamepy imported from:', flamepy.__file__)"
-          python3 -c "from flamepy import runner; print('✓ runner imported successfully')"
+          python3 -c "import flamepy.app as app; print('✓ app imported successfully')"
 
       - name: Check service status
         run: |
@@ -124,7 +124,7 @@ jobs:
           export PYTHONPATH="$(pwd)/e2e/src:$PYTHONPATH"
           export FLAME_LOG=DEBUG
           cd e2e
-          pytest -vv --durations=0 tests/test_runner.py tests/test_flmexec.py
+          pytest -vv --durations=0 tests/test_app.py tests/test_flmexec.py
 
       - name: Show service logs on failure
         if: failure() || cancelled()
@@ -211,7 +211,7 @@ jobs:
           export FLAME_LOG=DEBUG
           cd e2e
           pytest -vv --durations=0 \
-            tests/test_runner.py \
+            tests/test_app.py \
             tests/test_flmexec.py \
             tests/test_agent.py
 

@@ -60,44 +60,43 @@ publish through their `FlameInstance` argument:
 instance.publish([prefix_key, block_key])?;
 ```
 
-`SessionContext.publish` and package-level publish functions are removed.
+`SessionContext.publish` and the top-level package publication functions are
+removed. Invocation-scoped helpers live in `flamepy.app`.
 
-Runner provides `flamepy.runner.RunnerService` as the base class for application
-payloads. Runner attaches the active session context and instance attribute set
-when it materializes the object. User code accesses that runtime state through
-public methods rather than reserved fields:
+App payloads are plain functions or classes. For a class service, its
+constructor arguments travel with the service context and flmrun constructs the
+object in the executor. flmrun binds the active session context and an attribute
+accumulator while it invokes user code.
+User code accesses that invocation-scoped state through the public
+`flamepy.app` module helpers rather than reserved object fields.
 
-Subclassing `RunnerService` is optional. Plain functions, classes, and object
-instances remain valid when they do not need session context or attribute
-publication.
-
-`Runner.service()` continues returning a `RunnerServiceInstance`, the public
-client-side proxy for invoking the payload and managing its session.
-This is a source-level rename of the former client-proxy symbol
-`RunnerService`; that name now identifies the optional executor-side base.
+`flamepy.app.service()` exposes a function through a client-side
+`ServiceInstance`. For a class, it creates a service factory whose calls return
+`ServiceInstance` handles and manage their sessions.
 
 ```python
-class Cache(flamepy.runner.RunnerService):
+import flamepy.app as app
+
+
+class Cache:
     def store(self, block_key):
-        session_id = self.session_context().session_id
-        self.publish_attributes({block_key})
+        session_id = app.session_context().session_id
+        app.publish_attributes({block_key})
 ```
 
-`session_context()` is valid while the object is bound to a session.
-`publish_attributes(attrs)` adds opaque `bytes` keys to the current
-session-enter or task-invocation response. Repeated calls in that round
-accumulate. Runner publishes and drains the round after the callback, so each
-response carries only attributes published in that round. Session Manager
-unions them into the executor's retained set. Callables that cannot own dynamic
-attributes publish an empty set.
+`flamepy.app.session_context()` and `flamepy.app.publish_attributes(attrs)` are
+valid during a task invocation. Publication adds opaque `bytes` keys to the
+current response. Repeated calls in that round accumulate. flmrun publishes and
+drains the round after the callback, so each response carries only attributes
+published in that round. Session Manager unions them into the executor's
+retained set.
 
 RFE518 changes RFE275's replacement behavior to cumulative executor attributes
 and aggregates all calls made before each publication is transported:
 
-- repeated calls from one session-enter or task invocation are unioned;
+- repeated calls from one task invocation are unioned;
 - duplicate keys remain single set entries;
-- a response that consumes publication (successful session enter or any task
-  response) transports the union and clears the local accumulator;
+- each task response transports the union and clears the local accumulator;
 - Session Manager extends the executor's retained set with that union;
 - an empty union is a no-op;
 - keys are opaque, nonempty byte strings;
@@ -351,25 +350,30 @@ implementations. A manually constructed Rust `FlameInstance` is detached from
 the service runtime, so `publish` returns an error; macro-provided handles share
 the service publisher and transport their attributes normally.
 
-Runner attaches the active session context and a per-response attribute
-accumulator to compatible execution objects. Its public
-`RunnerService.session_context()` and `RunnerService.publish_attributes(attrs)`
-methods expose those operations. Runner publishes and drains the accumulated
-attributes after enter/invoke. The reserved runtime fields are excluded when a
-stateful execution object is persisted, so session context and executor-local
-affinity cannot migrate to another executor. The Runner process and its
-publisher belong to the executor instance. Runner retains class execution
-objects in a process-local map keyed by fully qualified class name and rebinds a
-cached object when the executor enters another session. Supplied object
-instances remain session-scoped and stateful; functions remain session-scoped
-and may use imported module-level state. A class Runner workload may therefore
+flmrun binds the active session context and attribute accumulator around each
+user invocation. The public `flamepy.app.session_context()` and
+`flamepy.app.publish_attributes(attrs)` helpers access those capabilities
+without attaching runtime fields to the execution object. After invoke, flmrun
+stages the accumulated attributes in invocation-local context, and the shim
+servicer consumes that set while assembling the same RPC response. App
+invocations therefore do not share the `FlameService` publisher, so concurrent
+responses cannot consume each other's attributes. flmrun constructs
+class execution objects remotely from the arguments stored in the service
+context. Each constructed class handle has a generated service ID. flmrun
+retains its object in a process-local map keyed by that ID and rebinds the same
+object when the executor enters another session for that service. Distinct
+handles have distinct service IDs and therefore never share a constructed
+object, even when they use the same class and constructor arguments. App
+declarations accept functions and classes rather than already constructed
+objects; functions remain session-scoped and may use imported module-level
+state. A class App workload may therefore
 publish keys for data held directly by its retained execution object. The cache
 is volatile and is discarded when the executor process exits; its contents are
-not covered by Runner's stateful object persistence. Classes with the same
-module and qualified name intentionally resolve to the same cached object in an
-executor process.
-`FlameInstanceServicer` and Rust `ShimService` take attributes from their service
-publisher after callbacks. `SessionContext` carries only session information.
+not serialized to the object cache.
+`FlameInstanceServicer` normally takes attributes from its service publisher
+after callbacks; flmrun overrides that hook to consume the staged invocation
+set. Rust `ShimService` takes attributes from its service publisher.
+`SessionContext` carries only session information.
 
 The protobuf wrappers introduced by RFE275 remain unchanged. Executor Manager
 continues forwarding snapshots through `BindExecutorCompletedRequest` and
@@ -459,17 +463,21 @@ an environment-independent p99 threshold.
   with every response.
 - `FlameService` owns the publisher; Rust `FlameInstance` handles share its
   internally synchronized attributes.
-- Runner's `RunnerService` exposes the active session context and mutable
-  publication API without exposing reserved runtime fields. Runner publishes
-  and drains the round after enter and invoke, including failed task invocation.
-- Stateful Runner persistence excludes the session context and executor-local
-  publication accumulator.
+- App module helpers expose the active session context and mutable publication
+  API without attaching reserved runtime fields to execution objects. After
+  invocation, flmrun stages the accumulated set for the shim servicer to consume
+  in that RPC response, including failed task invocation.
+- The retained class-object cache excludes the invocation context and its
+  response-local publication accumulator.
 - A response with no publication produces a present empty set and leaves the
   backend unchanged.
 - Each publication round enforces the same deduplicated 1,024-key and 64-KiB
   limits in Python and Rust; `take` resets both counters for the next round.
 - `take` runs after the wrapped callback and transports its complete union.
 - Session leave retains the executor's shim instance and attributes.
+- flmrun retains a constructed class object by service ID across bindings;
+  separately constructed handles remain isolated even when they use the same
+  class and constructor arguments.
 - Dispatch gets the first opportunity to reuse an Idle instance; Shuffle keeps
   it for twice `application.delay_release` before releasing it.
 - Application cleanup attempts to release each currently Idle executor, with
@@ -517,7 +525,7 @@ an environment-independent p99 threshold.
   benchmark workflow.
 
 Run SDK unit suites, Executor Manager lifecycle tests, Session Manager plugin
-and queue tests, the full scheduler regression suite, and the Runner DAS E2E
+and queue tests, the full scheduler regression suite, and the App DAS E2E
 scenario covering process-stable attributes across session leave, execution
 object rebinding, retention across multiple scheduler cycles, and Idle
 executor selection.

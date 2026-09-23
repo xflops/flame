@@ -36,7 +36,7 @@ CommonData = Message
 DEFAULT_FLAME_CONF = "flame.yaml"
 DEFAULT_FLAME_ENDPOINT = "http://127.0.0.1:8080"
 DEFAULT_FLAME_CACHE_ENDPOINT = "grpc://127.0.0.1:9090"
-DEFAULT_FLAME_RUNNER_TEMPLATE = "flmrun"
+DEFAULT_FLAME_APP_TEMPLATE = "flmrun"
 
 
 class SessionState(IntEnum):
@@ -318,18 +318,6 @@ class FlamePackage:
 
 
 @dataclass
-class FlameContextRunner:
-    """Runner configuration for Flame applications.
-
-    Attributes:
-        template: The name of the application template to use for runners.
-                  If not specified, defaults to 'flmrun'.
-    """
-
-    template: Optional[str] = None
-
-
-@dataclass
 class FlameClientTls:
     """Client TLS configuration for connecting to Flame services.
 
@@ -395,9 +383,10 @@ class FlameContext:
             ca_file: "/etc/flame/certs/cache-ca.crt"
         package:
           storage: "file:///var/lib/flame/packages"
-        runner:
-          template: "flmrun"
     ```
+
+    The optional ``app`` field selects an application template and defaults to
+    ``"flmrun"`` when omitted.
     """
 
     _endpoint = None
@@ -405,11 +394,10 @@ class FlameContext:
     _cache = None
     _cache_tls = None
     _package = None
-    _runner = None
+    _app = None
 
     def __init__(self):
-        # Initialize runner with default values
-        self._runner = FlameContextRunner(template=DEFAULT_FLAME_RUNNER_TEMPLATE)
+        self._app = DEFAULT_FLAME_APP_TEMPLATE
 
         home = Path.home()
         config_file = home / ".flame" / DEFAULT_FLAME_CONF
@@ -458,11 +446,8 @@ class FlameContext:
                                 all_excludes = list(set(default_excludes + excludes))
                                 self._package = FlamePackage(storage=storage, excludes=all_excludes)
 
-                        # Parse runner configuration if present
-                        runner_config = ctx.get("runner")
-                        if runner_config is not None:
-                            template = runner_config.get("template")
-                            self._runner = FlameContextRunner(template=DEFAULT_FLAME_RUNNER_TEMPLATE if template is None else template)
+                        # Parse the application template if present.
+                        self._app = ctx.get("app", DEFAULT_FLAME_APP_TEMPLATE)
                         break
                 else:
                     raise FlameError(FlameErrorCode.INVALID_CONFIG, f"context <{current_context}> not found")
@@ -561,6 +546,6 @@ class FlameContext:
         return self._cache_tls
 
     @property
-    def runner(self) -> FlameContextRunner:
-        """Get the runner configuration."""
-        return self._runner
+    def app(self) -> str:
+        """Get the application template name."""
+        return self._app

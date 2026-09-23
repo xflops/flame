@@ -35,7 +35,6 @@ pub use ctx::FlameClusterConfig;
 pub use ctx::FlameContext;
 pub use ctx::FlameContextEntry;
 pub use ctx::FlamePackage;
-pub use ctx::FlameRunner;
 
 pub type TaskID = String;
 pub type SessionID = String;

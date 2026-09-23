@@ -1,5 +1,5 @@
 """
-Monte Carlo Estimation of PI using Flame Runner API
+Monte Carlo Estimation of PI using Flame App API
 
 This example uses the Monte Carlo method to estimate the value of PI by
 randomly sampling points in a unit square and checking if they fall inside
@@ -10,30 +10,25 @@ import math
 import os
 
 import numpy as np
-from flamepy.runner import Runner
+
+import flamepy.app as app
+
+app.init("pi-example")
 
 
+@app.service()
 def estimate_batch(num_samples: int) -> int:
-    """
-    Estimate PI using Monte Carlo method with the given number of samples.
-
-    Args:
-        num_samples: Number of random points to sample
-
-    Returns:
-        Number of points inside the quarter circle
-    """
+    """Count random points that fall inside a unit quarter circle."""
     x = np.random.rand(num_samples)
     y = np.random.rand(num_samples)
-    inside_circle = np.sum(x * x + y * y <= 1.0)
-    return int(inside_circle)
+    return int(np.sum(x * x + y * y <= 1.0))
 
 
 def main():
     """Run Monte Carlo PI estimation using distributed computing."""
 
     print("=" * 60)
-    print("Monte Carlo Estimation of PI using Flame Runner")
+    print("Monte Carlo Estimation of PI using Flame App")
     print("=" * 60)
 
     # Configuration
@@ -45,22 +40,20 @@ def main():
         raise ValueError("PI_SAMPLES_PER_BATCH must be greater than 0")
     total_samples = num_batches * samples_per_batch
 
-    print(f"\nConfiguration:")
+    print("\nConfiguration:")
     print(f"  Batches: {num_batches}")
     print(f"  Samples per batch: {samples_per_batch:,}")
     print(f"  Total samples: {total_samples:,}")
-    print(f"\nRunning distributed Monte Carlo simulation...")
+    print("\nRunning distributed Monte Carlo simulation...")
 
-    # Create Runner and distribute the work
-    with Runner("pi-estimation") as rr:
-        # Create multiple estimator services (for parallel execution)
-        estimator = rr.service(estimate_batch)
-
+    try:
         # Submit all batch computations
-        results = [estimator(samples_per_batch) for _ in range(num_batches)]
+        results = [estimate_batch(samples_per_batch) for _ in range(num_batches)]
 
         # Collect results
-        insides = rr.get(results)
+        insides = app.get(results)
+    finally:
+        app.destroy()
 
     # Calculate final PI estimate
     pi_estimate = 4.0 * sum(insides) / total_samples
@@ -68,7 +61,7 @@ def main():
     error = abs(pi_estimate - math.pi)
     error_percent = (error / math.pi) * 100
 
-    print(f"\nResults:")
+    print("\nResults:")
     print(f"  Estimated PI: {pi_estimate:.10f}")
     print(f"  Actual PI:    {math.pi:.10f}")
     print(f"  Error:        {error:.10f} ({error_percent:.6f}%)")

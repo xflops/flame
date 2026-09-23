@@ -1,6 +1,6 @@
 # Parameter Server Example
 
-In AI-related distributed workloads, large amounts of data often need to be transferred between multiple worker nodes. Flame provides an object cache mechanism to facilitate the transfer of data objects between nodes. This example demonstrates the use of `Flame.runner.Runner` in a training scenario through a simple case based on the `Parameter Server` (ps-worker) pattern.
+In AI-related distributed workloads, large amounts of data often need to be transferred between multiple worker nodes. Flame provides an object cache mechanism to facilitate the transfer of data objects between nodes. This example demonstrates the `flamepy.app` API in a training scenario through a simple case based on the `Parameter Server` (ps-worker) pattern.
 
 ## Overview
 
@@ -9,7 +9,7 @@ The parameter server pattern is a classic distributed training architecture wher
 - Multiple **Data Workers** compute gradients on different data batches in parallel
 - Workers fetch the latest weights, compute gradients, and send them back to the parameter server
 
-This example uses Flame's `flamepy.runner.Runner` to orchestrate the distributed services and handle inter-service communication.
+This example uses `flamepy.app` to orchestrate the distributed services and handle inter-service communication.
 
 ## Architecture
 
@@ -36,7 +36,7 @@ This example uses Flame's `flamepy.runner.Runner` to orchestrate the distributed
 
 ## Files
 
-- `main.py`: Entry point that sets up the runner and training loop
+- `main.py`: Entry point that sets up the app and training loop
 - `ps.py`: Implementation of the model, parameter server, and data workers
 - `pyproject.toml`: Project dependencies and configuration
 
@@ -85,15 +85,31 @@ In this simplified run, the accuracy typically improves from around 10% (random 
 
 ## Key Concepts
 
-### 1. Service Creation with Runner
+### 1. Process-wide Service Creation
 
 ```python
-with Runner("ps-example") as rr:
-    ps_svc = rr.service(ParameterServer(1e-2))
-    workers_svc = [rr.service(DataWorker) for _ in range(2)]
+import flamepy.app as app
+
+app.init("ps-example")
+
+
+@app.service(warmup=1)
+class ParameterServerService(ParameterServer):
+    def __init__(self):
+        super().__init__(1e-2)
+
+
+@app.service(warmup=2)
+class DataWorkerService(DataWorker):
+    pass
+
+ps_svc = ParameterServerService()
+worker_svc = DataWorkerService()
+workers_svc = [worker_svc, worker_svc]
 ```
 
-The `Runner` creates and manages distributed services. Services can be instantiated from any Python class.
+`app.init()` initializes the application used by module-level service helpers.
+Services can be instantiated from any Python class.
 
 ### 2. Asynchronous Remote Calls
 
@@ -125,7 +141,9 @@ This is a **synchronous** parameter server where each iteration waits for all wo
 Modify the worker count in `main.py`:
 
 ```python
-workers_svc = [rr.service(DataWorker) for _ in range(4)]  # Use 4 workers
+@app.service(warmup=4)
+class DataWorkerService(DataWorker):
+    pass
 ```
 
 ### Change Learning Rate
@@ -133,7 +151,10 @@ workers_svc = [rr.service(DataWorker) for _ in range(4)]  # Use 4 workers
 Pass a different learning rate to the ParameterServer:
 
 ```python
-ps_svc = rr.service(ParameterServer(1e-3))  # Lower learning rate
+@app.service(warmup=1)
+class ParameterServerService(ParameterServer):
+    def __init__(self):
+        super().__init__(1e-3)  # Lower learning rate
 ```
 
 ### Increase Training Iterations

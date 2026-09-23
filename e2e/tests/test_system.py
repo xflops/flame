@@ -17,7 +17,7 @@ predictable. Enable one or more profiles with FLAME_E2E_SYSTEM_TESTS:
 
     FLAME_E2E_SYSTEM_TESTS=stress pytest tests/test_system.py -m stress
     FLAME_E2E_SYSTEM_TESTS=longevity pytest tests/test_system.py -m longevity
-    FLAME_E2E_SYSTEM_TESTS=runner pytest tests/test_system.py -m runner
+    FLAME_E2E_SYSTEM_TESTS=app pytest tests/test_system.py -m app
     FLAME_E2E_SYSTEM_TESTS=all pytest tests/test_system.py
 """
 
@@ -34,13 +34,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import flamepy
+import flamepy.app as app
 import pytest
-from flamepy import runner
 from flamepy.proto import types_pb2
 
 from e2e.api import TestContext
 from e2e.api import TestRequest as E2ETestRequest
-from e2e.helpers import fuzzy_runner_echo_case, invoke_task, serialize_common_data
+from e2e.helpers import invoke_task, serialize_common_data
 from tests.utils import random_string
 
 FLM_SYSTEM_TEST_APP = "flme2e-system-svc"
@@ -382,7 +382,7 @@ def _fuzz_stress_workload(
     return sessions, task_specs
 
 
-def _fuzz_runner_workload(
+def _fuzz_app_workload(
     rng: random.Random,
     tasks: int,
     max_payload_bytes: int,
@@ -411,15 +411,15 @@ def _fuzz_runner_workload(
                 common_data_bytes=common_data_bytes,
                 sleep_ms=sleep_ms,
                 input_value=_payload(
-                    f"runner-input:task-{sequence}:sleep-{sleep_ms}",
+                    f"app-input:task-{sequence}:sleep-{sleep_ms}",
                     input_bytes,
                 ),
                 output_value=_payload(
-                    f"runner-output:task-{sequence}:sleep-{sleep_ms}",
+                    f"app-output:task-{sequence}:sleep-{sleep_ms}",
                     output_bytes,
                 ),
                 common_data=_payload(
-                    f"runner-common:task-{sequence}",
+                    f"app-common:task-{sequence}",
                     common_data_bytes,
                 ),
             )
@@ -472,21 +472,21 @@ def setup_system_test_env():
     _unregister_system_application()
 
 
-def _require_runner_prerequisites():
+def _require_app_prerequisites():
     context = flamepy.FlameContext()
     has_package_storage = context.package is not None and getattr(context.package, "storage", None) is not None
     has_cache_endpoint = context.cache is not None
     if not has_package_storage and not has_cache_endpoint:
-        pytest.skip("Runner system test requires cache.endpoint or package.storage in flame.yaml")
+        pytest.skip("App system test requires cache.endpoint or package.storage in flame.yaml")
 
-    template_name = context.runner.template
+    template_name = context.app
     try:
         template_app = flamepy.get_application(template_name)
     except Exception as exc:
-        pytest.skip(f"Runner system test requires registered runner template app {template_name!r}: {exc}")
+        pytest.skip(f"App system test requires registered app template app {template_name!r}: {exc}")
 
     if template_app is None:
-        pytest.skip(f"Runner system test requires registered runner template app {template_name!r}")
+        pytest.skip(f"App system test requires registered app template app {template_name!r}")
 
     return template_name
 
@@ -735,18 +735,18 @@ def test_single_session_longevity():
             session.close()
 
 
-@pytest.mark.runner
-@_requires_system_profile("runner")
-def test_runner_fuzzed_task_workload():
-    """Exercise the Runner path with fuzzed input, output, and common-data payloads."""
-    template_name = _require_runner_prerequisites()
-    task_count = _env_int("FLAME_RUNNER_TASKS", 64)
-    warmup = _env_int("FLAME_RUNNER_WARMUP", 2, minimum=0)
-    max_payload_bytes = _env_int("FLAME_RUNNER_MAX_PAYLOAD_BYTES", 8 * 1024)
-    max_sleep_ms = _env_int("FLAME_RUNNER_MAX_SLEEP_MS", 200, minimum=0)
-    seed = _env_int("FLAME_RUNNER_RANDOM_SEED", random.randrange(1, 2**31))
+@pytest.mark.app
+@_requires_system_profile("app")
+def test_app_fuzzed_task_workload():
+    """Exercise the App path with fuzzed input, output, and common-data payloads."""
+    template_name = _require_app_prerequisites()
+    task_count = _env_int("FLAME_APP_TASKS", 64)
+    warmup = _env_int("FLAME_APP_WARMUP", 2, minimum=0)
+    max_payload_bytes = _env_int("FLAME_APP_MAX_PAYLOAD_BYTES", 8 * 1024)
+    max_sleep_ms = _env_int("FLAME_APP_MAX_SLEEP_MS", 200, minimum=0)
+    seed = _env_int("FLAME_APP_RANDOM_SEED", random.randrange(1, 2**31))
     rng = random.Random(seed)
-    task_specs = _fuzz_runner_workload(
+    task_specs = _fuzz_app_workload(
         rng,
         tasks=task_count,
         max_payload_bytes=max_payload_bytes,
@@ -754,14 +754,22 @@ def test_runner_fuzzed_task_workload():
     )
 
     cluster_before = _cluster_snapshot()
-    runner_app_name = f"system-runner-{random_string(8)}"
+    app_name = f"system-app-{random_string(8)}"
     started_at = time.perf_counter()
 
-    with runner.Runner(runner_app_name) as system_runner:
-        service = system_runner.service(
-            fuzzy_runner_echo_case,
-            warmup=warmup,
-        )
+    app.init(app_name)
+    try:
+
+        @app.service(warmup=warmup)
+        def service(input_value, output_value, common_data, sleep_ms=0):
+            if sleep_ms > 0:
+                time.sleep(sleep_ms / 1000.0)
+            return {
+                "common_data": common_data,
+                "input": input_value,
+                "output": output_value,
+            }
+
         futures = [
             service(
                 task_spec.input_value,
@@ -771,7 +779,9 @@ def test_runner_fuzzed_task_workload():
             )
             for task_spec in task_specs
         ]
-        results = system_runner.get(futures)
+        results = app.get(futures)
+    finally:
+        app.destroy()
 
     elapsed_seconds = time.perf_counter() - started_at
     for task_spec, result in zip(task_specs, results):
@@ -782,7 +792,7 @@ def test_runner_fuzzed_task_workload():
         }
 
     _write_system_report(
-        "runner",
+        "app",
         {
             "cluster": {
                 "after": _cluster_snapshot(),
@@ -792,8 +802,8 @@ def test_runner_fuzzed_task_workload():
                 "elapsed_seconds": round(elapsed_seconds, 3),
                 "tasks_per_second": round(task_count / elapsed_seconds, 3) if elapsed_seconds > 0 else 0,
             },
-            "runner": {
-                "app": runner_app_name,
+            "app": {
+                "name": app_name,
                 "template": template_name,
             },
             "workload": {
