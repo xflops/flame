@@ -225,7 +225,7 @@ install_flame() {
 create_external_access() {
     local cache_service="$1"
     local session_frontend_port="$2"
-    local cache_flight_port="$3"
+    local cache_grpc_port="$3"
     local cache_authority_expression=""
     local cache_certificate_ips=""
     local pod_ip=""
@@ -244,7 +244,7 @@ create_external_access() {
         if [[ -n "$cache_authority_expression" ]]; then
             cache_authority_expression+=" || "
         fi
-        cache_authority_expression+="request.host == '${pod_ip}:${cache_flight_port}'"
+        cache_authority_expression+="request.host == '${pod_ip}:${cache_grpc_port}'"
         if [[ -n "$cache_certificate_ips" ]]; then
             cache_certificate_ips+=$'\n'
         fi
@@ -259,12 +259,12 @@ create_external_access() {
     export CACHE_SECURITY_POLICY CACHE_CA_SECRET CACHE_TLS_SECRET
     export CACHE_SERVICE="$cache_service"
     export SESSION_FRONTEND_PORT="$session_frontend_port"
-    export CACHE_FLIGHT_PORT="$cache_flight_port"
+    export CACHE_GRPC_PORT="$cache_grpc_port"
     export CACHE_AUTHORITY_EXPRESSION="$cache_authority_expression"
     export CACHE_CERTIFICATE_IPS="$cache_certificate_ips"
 
     log "Creating CI-owned session NodePort and cache Gateway resources"
-    envsubst '${EXTERNAL_SESSION_SERVICE} ${NAMESPACE} ${RELEASE} ${SESSION_FRONTEND_PORT} ${SESSION_NODE_PORT} ${CACHE_CA_SECRET} ${CACHE_TLS_SECRET} ${CACHE_GATEWAY_HOST} ${CACHE_CERTIFICATE_IPS} ${ENVOY_PROXY} ${CACHE_GATEWAY_NODE_PORT} ${GATEWAY_CLASS} ${GATEWAY} ${CACHE_BOOTSTRAP_ROUTE} ${CACHE_SERVICE} ${CACHE_FLIGHT_PORT} ${CACHE_BACKEND} ${CACHE_OWNER_ROUTE} ${CACHE_SECURITY_POLICY} ${CACHE_AUTHORITY_EXPRESSION}' \
+    envsubst '${EXTERNAL_SESSION_SERVICE} ${NAMESPACE} ${RELEASE} ${SESSION_FRONTEND_PORT} ${SESSION_NODE_PORT} ${CACHE_CA_SECRET} ${CACHE_TLS_SECRET} ${CACHE_GATEWAY_HOST} ${CACHE_CERTIFICATE_IPS} ${ENVOY_PROXY} ${CACHE_GATEWAY_NODE_PORT} ${GATEWAY_CLASS} ${GATEWAY} ${CACHE_BOOTSTRAP_ROUTE} ${CACHE_SERVICE} ${CACHE_GRPC_PORT} ${CACHE_BACKEND} ${CACHE_OWNER_ROUTE} ${CACHE_SECURITY_POLICY} ${CACHE_AUTHORITY_EXPRESSION}' \
         <"$EXTERNAL_ACCESS_TEMPLATE" >"$RENDERED_EXTERNAL_ACCESS"
     kubectl apply -f "$RENDERED_EXTERNAL_ACCESS"
 
@@ -294,7 +294,7 @@ configure_external_access() {
     local session_service=""
     local cache_service=""
     local session_frontend_port=""
-    local cache_flight_port=""
+    local cache_grpc_port=""
 
     session_service="$(kubectl -n "$NAMESPACE" get service \
         -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=session-manager" \
@@ -304,15 +304,15 @@ configure_external_access() {
         -o jsonpath='{.items[0].metadata.name}')"
     session_frontend_port="$(kubectl -n "$NAMESPACE" get service "$session_service" \
         -o jsonpath='{.spec.ports[?(@.name=="frontend")].port}')"
-    cache_flight_port="$(kubectl -n "$NAMESPACE" get service "$cache_service" \
-        -o jsonpath='{.spec.ports[?(@.name=="flight")].port}')"
+    cache_grpc_port="$(kubectl -n "$NAMESPACE" get service "$cache_service" \
+        -o jsonpath='{.spec.ports[?(@.name=="grpc")].port}')"
     : "${session_frontend_port:?missing frontend port on service ${session_service}}"
-    : "${cache_flight_port:?missing flight port on service ${cache_service}}"
+    : "${cache_grpc_port:?missing grpc port on service ${cache_service}}"
 
     create_external_access \
         "$cache_service" \
         "$session_frontend_port" \
-        "$cache_flight_port"
+        "$cache_grpc_port"
 }
 
 extract_host_client() {

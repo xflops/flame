@@ -6,7 +6,7 @@ import warnings
 import flamepy.proto.frontend_pb2 as frontend__pb2
 import flamepy.proto.types_pb2 as types__pb2
 
-GRPC_GENERATED_VERSION = '1.84.0'
+GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -26,7 +26,7 @@ if _version_not_supported:
     )
 
 
-class FrontendStub:
+class FrontendStub(object):
     """
     The frontend service of Flame, which is used to communicate with client sdk,
     e.g. create connection/session/task and so on.
@@ -130,7 +130,7 @@ class FrontendStub:
                 _registered_method=True)
 
 
-class FrontendServicer:
+class FrontendServicer(object):
     """
     The frontend service of Flame, which is used to communicate with client sdk,
     e.g. create connection/session/task and so on.
@@ -346,7 +346,7 @@ def add_FrontendServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class Frontend:
+class Frontend(object):
     """
     The frontend service of Flame, which is used to communicate with client sdk,
     e.g. create connection/session/task and so on.

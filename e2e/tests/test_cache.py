@@ -16,7 +16,6 @@ import uuid
 
 import flamepy.core.cache as cache_module
 import pyarrow as pa
-import pyarrow.flight as flight
 import pytest
 from flamepy.core import FlameContext, ObjectRef, get_object, patch_object, put_object, update_object
 
@@ -38,8 +37,37 @@ def test_cache_put_and_get():
     assert result == test_data
 
 
+def test_cache_cloudpickle_object_and_patch_remain_raw():
+    """Arbitrary Python objects remain uncompressed, including their patches."""
+    key_prefix = f"test-app/test-cloudpickle-{uuid.uuid4().hex[:8]}"
+    base = {"text": "repeat-me" * 2000}
+    delta = {"text": "another-repeat" * 2000}
+
+    ref = put_object(key_prefix, base)
+    client = cache_module._get_cache_client(ref.endpoint, cache_module._get_cache_tls_config())
+    metadata = client.GetMetadata(cache_module.cache_pb2.CacheGetMetadataRequest(key=ref.key))
+    assert metadata.data_type == "cloudpickle"
+    patched = patch_object(ref, delta)
+    result = get_object(patched, deserializer=lambda value, patches: (value, patches))
+
+    assert result == (base, [delta])
+
+
+def test_cache_zstd_arrow_table():
+    """The Python SDK compresses Arrow data and tags the stored type."""
+    key_prefix = f"test-app/test-zstd-arrow-{uuid.uuid4().hex[:8]}"
+    table = pa.table({"item": ["repeat-me"] * 1000})
+
+    ref = put_object(key_prefix, table)
+    client = cache_module._get_cache_client(ref.endpoint, cache_module._get_cache_tls_config())
+    metadata = client.GetMetadata(cache_module.cache_pb2.CacheGetMetadataRequest(key=ref.key))
+    assert metadata.data_type == "arrow.table.zstd"
+
+    assert get_object(ref).equals(table)
+
+
 def test_cache_put_and_get_native_arrow_table():
-    """Test that Arrow tables round-trip through the native cache path."""
+    """Test that Arrow tables round-trip through the object cache."""
     key_prefix = f"test-app/test-native-arrow-{uuid.uuid4().hex[:8]}"
     table = pa.table({"col1": [1, 2, 3], "col2": ["a", "b", "c"]})
 
@@ -54,7 +82,7 @@ def test_cache_put_and_get_native_arrow_table():
 
 
 def test_cache_native_arrow_table_update():
-    """Test that native Arrow table updates rewrite the base object."""
+    """Test that Arrow table updates rewrite the base object."""
     key_prefix = f"test-app/test-native-arrow-update-{uuid.uuid4().hex[:8]}"
     table = pa.table({"value": [1, 2, 3]})
     updated = pa.table({"value": [4, 5], "label": ["x", "y"]})
@@ -134,19 +162,17 @@ def _raw_deserializer(base, deltas):
 
 
 def _remote_patch_without_local_cache_invalidation(ref: ObjectRef, delta):
-    """Patch through Flight directly to emulate another client process."""
-    batch = cache_module._serialize_object(delta)
-    client = cache_module._get_flight_client(ref.endpoint, cache_module._get_cache_tls_config())
-    descriptor = flight.FlightDescriptor.for_command(f"PATCH:{ref.key}".encode())
-    return cache_module._do_put_remote(client, descriptor, batch)
+    """Patch through gRPC directly to emulate another client process."""
+    client = cache_module._get_cache_client(ref.endpoint, cache_module._get_cache_tls_config())
+    data_type, data = cache_module._serialize_object_data(delta)
+    return cache_module._write_remote(client, ref.key, data_type, cache_module._byte_chunks(data), patch=True)
 
 
 def _remote_update_without_local_cache_invalidation(ref: ObjectRef, new_obj):
-    """Update through Flight directly to emulate another client process."""
-    batch = cache_module._serialize_object(new_obj)
-    client = cache_module._get_flight_client(ref.endpoint, cache_module._get_cache_tls_config())
-    descriptor = flight.FlightDescriptor.for_path(ref.key)
-    return cache_module._do_put_remote(client, descriptor, batch)
+    """Update through gRPC directly to emulate another client process."""
+    client = cache_module._get_cache_client(ref.endpoint, cache_module._get_cache_tls_config())
+    data_type, data = cache_module._serialize_object_data(new_obj)
+    return cache_module._write_remote(client, ref.key, data_type, cache_module._byte_chunks(data))
 
 
 def _cached_object(ref: ObjectRef):

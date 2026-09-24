@@ -72,9 +72,6 @@ quote = "1"
 syn = { version = "2", features = ["full"] }
 
 # Arrow ecosystem (v58 for tonic 0.14 compatibility)
-arrow = "58"
-arrow-flight = "58"
-arrow-ipc = { version = "58", features = ["zstd"] }
 
 # profiling and HTTP
 axum = "0.8"

@@ -50,21 +50,21 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           ports:
-            - name: flight
+            - name: grpc
               containerPort: {{ .Values.objectCache.service.port }}
               protocol: TCP
           startupProbe:
             tcpSocket:
-              port: flight
+              port: grpc
             failureThreshold: 30
             periodSeconds: 2
           readinessProbe:
             tcpSocket:
-              port: flight
+              port: grpc
             periodSeconds: 5
           livenessProbe:
             tcpSocket:
-              port: flight
+              port: grpc
             periodSeconds: 10
           volumeMounts:
             - name: config

@@ -35,12 +35,11 @@ sha2 = "0.10"
 
 bytes = { workspace = true }
 flate2 = "1"
+zstd = "0.13"
 tar = "0.4"
 zip = "2"
 reqwest = { version = "0.12", features = ["rustls-tls", "stream"], default-features = false }
 futures-util = "0.3"
-arrow = { workspace = true }
-arrow-flight = { workspace = true }
 wasmtime = { version = "43", optional = true }
 wasmtime-wasi = { version = "43", optional = true }
 anyhow = "1"

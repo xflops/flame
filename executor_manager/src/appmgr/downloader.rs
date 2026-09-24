@@ -16,11 +16,15 @@ use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tonic::transport::ClientTlsConfig;
 
 use common::FlameError;
+use rpc::flame::v1::object_cache_service_client::ObjectCacheServiceClient;
+use rpc::flame::v1::{
+    cache_get_response, CacheChunkKind, CacheGetMode, CacheGetRequest, CacheGetResponse,
+};
 
 const HTTP_TIMEOUT_SECS: u64 = 300;
 const GRPC_CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -132,10 +136,6 @@ impl GrpcDownloader {
 #[async_trait]
 impl PackageDownloader for GrpcDownloader {
     async fn download(&self, url: &url::Url, dest_path: &Path) -> Result<(), FlameError> {
-        use arrow::array::{Array, BinaryArray};
-        use arrow_flight::flight_service_client::FlightServiceClient;
-        use arrow_flight::FlightClient;
-        use futures_util::TryStreamExt;
         use tonic::transport::Channel;
 
         let host = url
@@ -170,54 +170,19 @@ impl PackageDownloader for GrpcDownloader {
                 .map_err(|e| FlameError::Internal(format!("failed to connect to cache: {}", e)))?
         };
 
-        let inner = FlightServiceClient::new(channel)
+        let mut client = ObjectCacheServiceClient::new(channel)
             .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
             .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE);
-        let mut client = FlightClient::new_from_inner(inner);
-
-        let ticket = arrow_flight::Ticket::new(format!("{}:0", key));
         let mut stream = client
-            .do_get(ticket)
+            .get(CacheGetRequest {
+                key: key.to_string(),
+                client_version: 0,
+            })
             .await
-            .map_err(|e| FlameError::Internal(format!("do_get failed: {}", e)))?;
+            .map_err(|e| FlameError::Internal(format!("cache get failed: {}", e)))?
+            .into_inner();
 
-        let temp_path = dest_path.with_extension("tmp");
-        let mut file = tokio::fs::File::create(&temp_path)
-            .await
-            .map_err(|e| FlameError::Internal(format!("failed to create temp file: {}", e)))?;
-
-        let mut total_size = 0usize;
-        while let Some(batch) = stream
-            .try_next()
-            .await
-            .map_err(|e| FlameError::Internal(format!("stream error: {}", e)))?
-        {
-            if let Some(array) = batch.column_by_name("data") {
-                if let Some(binary_array) = array.as_any().downcast_ref::<BinaryArray>() {
-                    for i in 0..binary_array.len() {
-                        let chunk = binary_array.value(i);
-                        file.write_all(chunk).await.map_err(|e| {
-                            FlameError::Internal(format!("failed to write chunk: {}", e))
-                        })?;
-                        total_size += chunk.len();
-                    }
-                }
-            }
-        }
-
-        if total_size == 0 {
-            tokio::fs::remove_file(&temp_path).await.ok();
-            return Err(FlameError::Internal(format!("object not found: {}", key)));
-        }
-
-        file.sync_all()
-            .await
-            .map_err(|e| FlameError::Internal(format!("failed to sync file: {}", e)))?;
-        drop(file);
-
-        tokio::fs::rename(&temp_path, dest_path)
-            .await
-            .map_err(|e| FlameError::Internal(format!("failed to rename temp file: {}", e)))?;
+        let total_size = write_cache_stream(&mut stream, dest_path).await?;
 
         tracing::info!(
             "Downloaded package via gRPC: {} ({} bytes)",
@@ -226,6 +191,145 @@ impl PackageDownloader for GrpcDownloader {
         );
         Ok(())
     }
+}
+
+async fn write_cache_stream<S>(stream: &mut S, dest_path: &Path) -> Result<usize, FlameError>
+where
+    S: Stream<Item = Result<CacheGetResponse, tonic::Status>> + Unpin,
+{
+    let first = stream
+        .next()
+        .await
+        .ok_or_else(|| FlameError::Internal("cache get returned no header".to_string()))?
+        .map_err(|e| FlameError::Internal(format!("cache get stream failed: {}", e)))?;
+    let Some(cache_get_response::Payload::Header(header)) = first.payload else {
+        return Err(FlameError::Internal(
+            "cache get returned data before its header".to_string(),
+        ));
+    };
+    if header.mode != CacheGetMode::Full as i32 {
+        return Err(FlameError::Internal(format!(
+            "cache get returned unexpected mode: {}",
+            header.mode
+        )));
+    }
+    let compressed = match header.data_type.as_str() {
+        "raw" => false,
+        "raw.zstd" => true,
+        other => {
+            return Err(FlameError::Internal(format!(
+                "cache get returned non-raw package data: {other}"
+            )))
+        }
+    };
+
+    let temp_path = dest_path.with_extension("tmp");
+    let encoded_path = dest_path.with_extension("zstd.tmp");
+    let result = async {
+        let write_path = if compressed {
+            &encoded_path
+        } else {
+            &temp_path
+        };
+        let mut file = tokio::fs::File::create(write_path)
+            .await
+            .map_err(|e| FlameError::Internal(format!("failed to create temp file: {}", e)))?;
+
+        let mut total_size = 0usize;
+        let mut saw_base = false;
+        let mut saw_patch = false;
+        while let Some(message) = stream.next().await {
+            let message = message
+                .map_err(|e| FlameError::Internal(format!("cache get stream failed: {}", e)))?;
+            let Some(cache_get_response::Payload::Chunk(chunk)) = message.payload else {
+                return Err(FlameError::Internal(
+                    "cache get returned an unexpected message".to_string(),
+                ));
+            };
+            if chunk.kind != CacheChunkKind::Base as i32
+                && chunk.kind != CacheChunkKind::Patch as i32
+            {
+                return Err(FlameError::Internal(format!(
+                    "cache get returned unexpected chunk kind: {}",
+                    chunk.kind
+                )));
+            }
+            if chunk.kind == CacheChunkKind::Base as i32 {
+                if saw_patch {
+                    return Err(FlameError::Internal(
+                        "cache get returned a base after a patch".to_string(),
+                    ));
+                }
+                saw_base = true;
+            } else if !saw_base {
+                return Err(FlameError::Internal(
+                    "cache get returned a patch before the base".to_string(),
+                ));
+            } else {
+                saw_patch = true;
+            }
+            file.write_all(&chunk.data)
+                .await
+                .map_err(|e| FlameError::Internal(format!("failed to write chunk: {}", e)))?;
+            total_size += chunk.data.len();
+        }
+        if !saw_base {
+            return Err(FlameError::Internal(
+                "cache get omitted the base object".to_string(),
+            ));
+        }
+
+        file.sync_all()
+            .await
+            .map_err(|e| FlameError::Internal(format!("failed to sync file: {}", e)))?;
+        drop(file);
+
+        if compressed {
+            let encoded = encoded_path.clone();
+            let decoded = temp_path.clone();
+            tokio::task::spawn_blocking(move || {
+                let input = std::fs::File::open(encoded).map_err(|e| {
+                    FlameError::Internal(format!("failed to open compressed package: {e}"))
+                })?;
+                let output = std::fs::File::create(decoded).map_err(|e| {
+                    FlameError::Internal(format!("failed to create decoded package: {e}"))
+                })?;
+                let mut output = std::io::BufWriter::new(output);
+                zstd::stream::copy_decode(input, &mut output).map_err(|e| {
+                    FlameError::InvalidConfig(format!("failed to decompress package: {e}"))
+                })?;
+                use std::io::Write;
+                output.flush().map_err(|e| {
+                    FlameError::Internal(format!("failed to flush decoded package: {e}"))
+                })?;
+                output
+                    .into_inner()
+                    .map_err(|e| {
+                        FlameError::Internal(format!("failed to finish decoded package: {e}"))
+                    })?
+                    .sync_all()
+                    .map_err(|e| {
+                        FlameError::Internal(format!("failed to sync decoded package: {e}"))
+                    })?;
+                Ok::<_, FlameError>(())
+            })
+            .await
+            .map_err(|e| FlameError::Internal(format!("package decoder task failed: {e}")))??;
+        }
+
+        tokio::fs::rename(&temp_path, dest_path)
+            .await
+            .map_err(|e| FlameError::Internal(format!("failed to rename temp file: {}", e)))?;
+        Ok(total_size)
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+    }
+    if compressed {
+        let _ = tokio::fs::remove_file(&encoded_path).await;
+    }
+    result
 }
 
 pub struct DownloaderRegistry {
@@ -288,6 +392,7 @@ impl Default for DownloaderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rpc::flame::v1::{CacheGetChunk, CacheGetHeader};
     use tempfile::TempDir;
     use tokio::io::AsyncWriteExt;
     use tonic::transport::ClientTlsConfig;
@@ -496,5 +601,160 @@ mod tests {
         assert!(url.port().is_none());
         let result = downloader.download(&url, &dest_path).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_grpc_download_stream_writes_base_and_patch_chunks() {
+        let temp_dir = TempDir::new().unwrap();
+        let dest_path = temp_dir.path().join("package.tar.gz");
+        let responses = vec![
+            Ok(CacheGetResponse {
+                payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
+                    mode: CacheGetMode::Full as i32,
+                    version: 2,
+                    data_type: "raw".to_string(),
+                })),
+            }),
+            Ok(CacheGetResponse {
+                payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
+                    kind: CacheChunkKind::Base as i32,
+                    version: 1,
+                    data: b"base".to_vec().into(),
+                })),
+            }),
+            Ok(CacheGetResponse {
+                payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
+                    kind: CacheChunkKind::Patch as i32,
+                    version: 2,
+                    data: b"patch".to_vec().into(),
+                })),
+            }),
+        ];
+        let size = write_cache_stream(&mut futures_util::stream::iter(responses), &dest_path)
+            .await
+            .unwrap();
+        assert_eq!(size, 9);
+        assert_eq!(tokio::fs::read(dest_path).await.unwrap(), b"basepatch");
+    }
+
+    #[tokio::test]
+    async fn test_grpc_download_stream_decodes_compressed_base_and_patch() {
+        let temp_dir = TempDir::new().unwrap();
+        let dest_path = temp_dir.path().join("package.tar.gz");
+        let base = zstd::stream::encode_all(b"base".as_slice(), 0).unwrap();
+        let patch = zstd::stream::encode_all(b"patch".as_slice(), 0).unwrap();
+        let responses = vec![
+            Ok(CacheGetResponse {
+                payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
+                    mode: CacheGetMode::Full as i32,
+                    version: 2,
+                    data_type: "raw.zstd".to_string(),
+                })),
+            }),
+            Ok(CacheGetResponse {
+                payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
+                    kind: CacheChunkKind::Base as i32,
+                    version: 1,
+                    data: base.into(),
+                })),
+            }),
+            Ok(CacheGetResponse {
+                payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
+                    kind: CacheChunkKind::Patch as i32,
+                    version: 2,
+                    data: patch.into(),
+                })),
+            }),
+        ];
+        let size = write_cache_stream(&mut futures_util::stream::iter(responses), &dest_path)
+            .await
+            .unwrap();
+        assert!(size > 9);
+        assert_eq!(tokio::fs::read(dest_path).await.unwrap(), b"basepatch");
+    }
+
+    #[tokio::test]
+    async fn test_grpc_download_stream_rejects_corrupt_compressed_package() {
+        let temp_dir = TempDir::new().unwrap();
+        let dest_path = temp_dir.path().join("package.tar.gz");
+        let responses = vec![
+            Ok(CacheGetResponse {
+                payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
+                    mode: CacheGetMode::Full as i32,
+                    version: 1,
+                    data_type: "raw.zstd".to_string(),
+                })),
+            }),
+            Ok(CacheGetResponse {
+                payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
+                    kind: CacheChunkKind::Base as i32,
+                    version: 1,
+                    data: b"invalid".to_vec().into(),
+                })),
+            }),
+        ];
+        assert!(
+            write_cache_stream(&mut futures_util::stream::iter(responses), &dest_path)
+                .await
+                .is_err()
+        );
+        assert!(!dest_path.exists());
+        assert!(!dest_path.with_extension("tmp").exists());
+        assert!(!dest_path.with_extension("zstd.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn test_grpc_download_stream_does_not_publish_partial_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let dest_path = temp_dir.path().join("package.tar.gz");
+        let responses = vec![
+            Ok(CacheGetResponse {
+                payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
+                    mode: CacheGetMode::Full as i32,
+                    version: 1,
+                    data_type: "raw".to_string(),
+                })),
+            }),
+            Ok(CacheGetResponse {
+                payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
+                    kind: CacheChunkKind::Base as i32,
+                    version: 1,
+                    data: b"partial".to_vec().into(),
+                })),
+            }),
+            Err(tonic::Status::internal("stream interrupted")),
+        ];
+        let result =
+            write_cache_stream(&mut futures_util::stream::iter(responses), &dest_path).await;
+        assert!(result.is_err());
+        assert!(!dest_path.exists());
+        assert!(!dest_path.with_extension("tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn test_grpc_download_rejects_non_raw_package() {
+        let temp_dir = TempDir::new().unwrap();
+        let dest_path = temp_dir.path().join("package.tar.gz");
+        let responses = vec![
+            Ok(CacheGetResponse {
+                payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
+                    mode: CacheGetMode::Full as i32,
+                    version: 1,
+                    data_type: "arrow".to_string(),
+                })),
+            }),
+            Ok(CacheGetResponse {
+                payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
+                    kind: CacheChunkKind::Base as i32,
+                    version: 1,
+                    data: b"encoded".to_vec().into(),
+                })),
+            }),
+        ];
+        let result =
+            write_cache_stream(&mut futures_util::stream::iter(responses), &dest_path).await;
+        assert!(result.unwrap_err().to_string().contains("non-raw"));
+        assert!(!dest_path.exists());
+        assert!(!dest_path.with_extension("tmp").exists());
     }
 }

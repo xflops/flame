@@ -12,7 +12,7 @@ from pathlib import Path
 def fix_imports(proto_dir: Path) -> None:
     """Fix imports in generated protobuf files to use flamepy.proto prefix."""
     # Patterns to fix: 'import X_pb2' -> 'import flamepy.proto.X_pb2'
-    import_pattern = re.compile(r"^import (frontend_pb2|shim_pb2|types_pb2)", re.MULTILINE)
+    import_pattern = re.compile(r"^import (cache_pb2|frontend_pb2|shim_pb2|types_pb2)", re.MULTILINE)
     replacement = r"import flamepy.proto.\1"
 
     for pb2_file in proto_dir.glob("*_pb2*.py"):
@@ -34,7 +34,7 @@ def main():
     protos_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate Python files from protobuf definitions
-    proto_files = ["frontend.proto", "shim.proto", "types.proto"]
+    proto_files = ["cache.proto", "frontend.proto", "shim.proto", "types.proto"]
 
     for proto_file in proto_files:
         proto_path = protos_dir / proto_file

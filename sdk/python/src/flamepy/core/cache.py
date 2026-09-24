@@ -11,47 +11,48 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import io
 import logging
+import sys
 import threading
 import uuid
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 import bson
 import cloudpickle
+import grpc
 import pyarrow as pa
-import pyarrow.flight as flight
 
 from flamepy.core.types import FlameClientCache, FlameClientTls, FlameContext
+from flamepy.proto import cache_pb2, cache_pb2_grpc
 
 if TYPE_CHECKING:
     import numpy as np
 
-# Magic prefix for fast-path serialization format identification.
-# Using "FLM" + version byte to avoid collision with pickle protocol headers.
-# Pickle protocols start with \x80 (protocol 2+) or opcodes like \x28, \x5d, etc.
-_MAGIC_PREFIX = b"FLM"
-_TYPE_CLOUDPICKLE = b"FLM\x00"
-_TYPE_NUMPY = b"FLM\x01"
-_TYPE_ARROW_TABLE = b"FLM\x02"
-_TYPE_ARROW_ARRAY = b"FLM\x03"
-_TYPE_ARROW_BATCH = b"FLM\x04"
-_MAGIC_PREFIX_LEN = len(_MAGIC_PREFIX) + 1  # 4 bytes total
+# Type identifiers live in cache metadata; payload bytes contain only the codec output.
+_TYPE_CLOUDPICKLE = "cloudpickle"
+_TYPE_NUMPY = "numpy"
+_TYPE_ARROW_TABLE = "arrow.table"
+_TYPE_ARROW_ARRAY = "arrow.array"
+_TYPE_ARROW_BATCH = "arrow.record_batch"
+_TYPE_PANDAS_DATAFRAME = "pandas.dataframe"
+_TYPE_POLARS_DATAFRAME = "polars.dataframe"
+_TYPE_RAW = "raw"
+_COMPRESSION_NONE = "none"
+_COMPRESSION_ZSTD = "zstd"
+_ZSTD_OBJECT_TYPES = {
+    _TYPE_NUMPY,
+    _TYPE_ARROW_TABLE,
+    _TYPE_ARROW_ARRAY,
+    _TYPE_ARROW_BATCH,
+    _TYPE_PANDAS_DATAFRAME,
+    _TYPE_POLARS_DATAFRAME,
+}
 
-CACHE_FORMAT_METADATA_KEY = b"flame.cache.format"
-CACHE_VERSION_METADATA_KEY = b"flame.cache.version"
-CACHE_LOGICAL_TYPE_METADATA_KEY = b"flame.cache.logical_type"
-CACHE_FORMAT_OPAQUE = b"opaque-v1"
-CACHE_FORMAT_ARROW_TABLE = b"arrow-table-v1"
-LOGICAL_TYPE_PYARROW_TABLE = "pyarrow.table"
-LOGICAL_TYPE_PYARROW_RECORD_BATCH = "pyarrow.record_batch"
-LOGICAL_TYPE_PANDAS_DATAFRAME = "pandas.dataframe"
-LOGICAL_TYPE_POLARS_DATAFRAME = "polars.dataframe"
-LOGICAL_TYPE_DATASET = "dataset"
 
 try:
     import numpy as np
@@ -82,19 +83,11 @@ logger = logging.getLogger(__name__)
 Deserializer = Callable[[Any, List[Any]], Any]
 
 WILDCARD_SESSION = "*"
-OBJECT_FIELD_VERSION = "version"
-OBJECT_FIELD_DATA = "data"
-OBJECT_RESPONSE_FIELD_KIND = "kind"
 
 
 class FetchMode(str, Enum):
     FULL = "full"
     PATCHES = "patches"
-
-
-class ObjectResponseKind(str, Enum):
-    BASE = "base"
-    PATCH = "patch"
 
 
 @dataclass
@@ -147,13 +140,6 @@ class FetchResult:
     version: int
     base: Any = None
     patches: List[Patch] = field(default_factory=list)
-
-
-@dataclass
-class CachePayload:
-    schema: pa.Schema
-    batches: List[pa.RecordBatch]
-    native_arrow: bool
 
 
 class _IdentityKey:
@@ -383,7 +369,6 @@ def _serialize_numpy(arr: "np.ndarray") -> bytes:
     """Serialize numpy array using Arrow's zero-copy tensor format."""
     tensor = pa.Tensor.from_numpy(arr)
     sink = pa.BufferOutputStream()
-    sink.write(_TYPE_NUMPY)
     pa.ipc.write_tensor(tensor, sink)
     return sink.getvalue().to_pybytes()
 
@@ -398,7 +383,6 @@ def _deserialize_numpy(data: bytes) -> "np.ndarray":
 def _serialize_arrow_table(table: pa.Table) -> bytes:
     """Serialize PyArrow Table using IPC stream format."""
     sink = pa.BufferOutputStream()
-    sink.write(_TYPE_ARROW_TABLE)
     with pa.ipc.new_stream(sink, table.schema) as writer:
         writer.write_table(table)
     return sink.getvalue().to_pybytes()
@@ -413,7 +397,6 @@ def _deserialize_arrow_table(data: bytes) -> pa.Table:
 def _serialize_arrow_batch(batch: pa.RecordBatch) -> bytes:
     """Serialize PyArrow RecordBatch using IPC stream format."""
     sink = pa.BufferOutputStream()
-    sink.write(_TYPE_ARROW_BATCH)
     with pa.ipc.new_stream(sink, batch.schema) as writer:
         writer.write_batch(batch)
     return sink.getvalue().to_pybytes()
@@ -429,7 +412,6 @@ def _serialize_arrow_array(arr: pa.Array) -> bytes:
     """Serialize PyArrow Array by wrapping in a RecordBatch."""
     batch = pa.RecordBatch.from_arrays([arr], names=["data"])
     sink = pa.BufferOutputStream()
-    sink.write(_TYPE_ARROW_ARRAY)
     with pa.ipc.new_stream(sink, batch.schema) as writer:
         writer.write_batch(batch)
     return sink.getvalue().to_pybytes()
@@ -444,7 +426,7 @@ def _deserialize_arrow_array(data: bytes) -> pa.Array:
 
 def _serialize_cloudpickle(obj: Any) -> bytes:
     """Serialize using cloudpickle (fallback for arbitrary Python objects)."""
-    return _TYPE_CLOUDPICKLE + cloudpickle.dumps(obj, protocol=cloudpickle.DEFAULT_PROTOCOL)
+    return cloudpickle.dumps(obj, protocol=cloudpickle.DEFAULT_PROTOCOL)
 
 
 def _deserialize_cloudpickle(data: bytes) -> Any:
@@ -452,214 +434,97 @@ def _deserialize_cloudpickle(data: bytes) -> Any:
     return cloudpickle.loads(data)
 
 
-def _cache_metadata_value(schema: pa.Schema, key: bytes) -> Optional[bytes]:
-    metadata = schema.metadata or {}
-    return metadata.get(key)
-
-
-def _is_native_arrow_schema(schema: pa.Schema) -> bool:
-    return _cache_metadata_value(schema, CACHE_FORMAT_METADATA_KEY) == CACHE_FORMAT_ARROW_TABLE
-
-
-def _cache_schema_version(schema: pa.Schema) -> int:
-    value = _cache_metadata_value(schema, CACHE_VERSION_METADATA_KEY)
-    if value is None:
-        return 0
-    try:
-        return int(value.decode("utf-8"))
-    except ValueError:
-        return 0
-
-
-def _schema_with_cache_metadata(schema: pa.Schema, logical_type: str, version: int = 0) -> pa.Schema:
-    metadata = dict(schema.metadata or {})
-    metadata[CACHE_FORMAT_METADATA_KEY] = CACHE_FORMAT_ARROW_TABLE
-    metadata[CACHE_VERSION_METADATA_KEY] = str(version).encode("utf-8")
-    metadata[CACHE_LOGICAL_TYPE_METADATA_KEY] = logical_type.encode("utf-8")
-    return schema.with_metadata(metadata)
-
-
-def _strip_cache_metadata(schema: pa.Schema) -> pa.Schema:
-    metadata = {key: value for key, value in (schema.metadata or {}).items() if not key.startswith(b"flame.cache.")}
-    return schema.with_metadata(metadata or None)
-
-
-def _table_with_cache_metadata(table: pa.Table, logical_type: str, version: int = 0) -> pa.Table:
-    return table.replace_schema_metadata(_schema_with_cache_metadata(table.schema, logical_type, version).metadata)
-
-
-def _batch_with_cache_metadata(batch: pa.RecordBatch, logical_type: str, version: int = 0) -> pa.RecordBatch:
-    schema = _schema_with_cache_metadata(batch.schema, logical_type, version)
-    return pa.RecordBatch.from_arrays(
-        [batch.column(i) for i in range(batch.num_columns)],
-        schema=schema,
-    )
-
-
-def _prepare_native_arrow_payload(obj: Any) -> Optional[CachePayload]:
-    """Convert supported tabular payloads to native Arrow batches."""
-    logical_type: Optional[str] = None
-    table: Optional[pa.Table] = None
-    batch: Optional[pa.RecordBatch] = None
-
+def _serialize_object_data(obj: Any) -> tuple[str, bytes]:
+    """Encode a value and return its type tag separately from its payload."""
+    if _HAS_NUMPY and isinstance(obj, np.ndarray):
+        if obj.flags.c_contiguous or obj.flags.f_contiguous:
+            return _TYPE_NUMPY, _serialize_numpy(obj)
+    if _HAS_PANDAS and isinstance(obj, pd.DataFrame):
+        return _TYPE_PANDAS_DATAFRAME, _serialize_arrow_table(pa.Table.from_pandas(obj))
+    if _HAS_POLARS and isinstance(obj, (pl.DataFrame, pl.LazyFrame)):
+        frame = obj.collect() if isinstance(obj, pl.LazyFrame) else obj
+        return _TYPE_POLARS_DATAFRAME, _serialize_arrow_table(frame.to_arrow())
     if isinstance(obj, pa.Table):
-        logical_type = LOGICAL_TYPE_PYARROW_TABLE
-        table = obj
-    elif isinstance(obj, pa.RecordBatch):
-        logical_type = LOGICAL_TYPE_PYARROW_RECORD_BATCH
-        batch = obj
-    elif _HAS_PANDAS and isinstance(obj, pd.DataFrame):
-        logical_type = LOGICAL_TYPE_PANDAS_DATAFRAME
-        table = pa.Table.from_pandas(obj)
-    elif _HAS_POLARS and isinstance(obj, pl.DataFrame):
-        logical_type = LOGICAL_TYPE_POLARS_DATAFRAME
-        table = obj.to_arrow()
-    elif _HAS_POLARS and isinstance(obj, pl.LazyFrame):
-        logical_type = LOGICAL_TYPE_POLARS_DATAFRAME
-        table = obj.collect().to_arrow()
-    elif hasattr(obj, "to_arrow"):
+        return _TYPE_ARROW_TABLE, _serialize_arrow_table(obj)
+    if isinstance(obj, pa.RecordBatch):
+        return _TYPE_ARROW_BATCH, _serialize_arrow_batch(obj)
+    if isinstance(obj, pa.Array):
+        return _TYPE_ARROW_ARRAY, _serialize_arrow_array(obj)
+    if hasattr(obj, "to_arrow"):
         try:
             arrow_obj = obj.to_arrow()
         except TypeError:
             arrow_obj = None
         if isinstance(arrow_obj, pa.Table):
-            logical_type = LOGICAL_TYPE_DATASET
-            table = arrow_obj
-        elif isinstance(arrow_obj, pa.RecordBatch):
-            logical_type = LOGICAL_TYPE_DATASET
-            batch = arrow_obj
-
-    if batch is not None and logical_type is not None:
-        batch = _batch_with_cache_metadata(batch, logical_type)
-        return CachePayload(schema=batch.schema, batches=[batch], native_arrow=True)
-
-    if table is not None and logical_type is not None:
-        table = _table_with_cache_metadata(table, logical_type)
-        batches = table.to_batches()
-        if not batches:
-            batches = [
-                pa.RecordBatch.from_arrays(
-                    [table.column(i).combine_chunks() for i in range(table.num_columns)],
-                    schema=table.schema,
-                )
-            ]
-        return CachePayload(schema=table.schema, batches=batches, native_arrow=True)
-
-    return None
+            return _TYPE_ARROW_TABLE, _serialize_arrow_table(arrow_obj)
+        if isinstance(arrow_obj, pa.RecordBatch):
+            return _TYPE_ARROW_BATCH, _serialize_arrow_batch(arrow_obj)
+    return _TYPE_CLOUDPICKLE, _serialize_cloudpickle(obj)
 
 
-def _prepare_cache_payload(obj: Any) -> CachePayload:
-    native_payload = _prepare_native_arrow_payload(obj)
-    if native_payload is not None:
-        return native_payload
-    batch = _serialize_object(obj)
-    return CachePayload(schema=batch.schema, batches=[batch], native_arrow=False)
-
-
-def _deserialize_native_arrow_table(table: pa.Table) -> Any:
-    metadata = table.schema.metadata or {}
-    logical_type = metadata.get(CACHE_LOGICAL_TYPE_METADATA_KEY, LOGICAL_TYPE_PYARROW_TABLE.encode("utf-8")).decode("utf-8")
-    user_schema = _strip_cache_metadata(table.schema)
-    table = table.replace_schema_metadata(user_schema.metadata)
-
-    if logical_type == LOGICAL_TYPE_PYARROW_RECORD_BATCH:
-        batches = table.to_batches()
-        if len(batches) == 1:
-            return batches[0]
-        return table
-
-    if logical_type == LOGICAL_TYPE_PANDAS_DATAFRAME and _HAS_PANDAS:
-        return table.to_pandas()
-
-    if logical_type == LOGICAL_TYPE_POLARS_DATAFRAME and _HAS_POLARS:
-        return pl.from_arrow(table)
-
-    return table
-
-
-def _serialize_object_data(obj: Any) -> bytes:
-    """Serialize object using the optimal format based on type.
-
-    Fast-path for numpy arrays and PyArrow types avoids cloudpickle overhead.
-    Falls back to cloudpickle for arbitrary Python objects.
-    """
-    if _HAS_NUMPY and isinstance(obj, np.ndarray):
-        if obj.flags.c_contiguous or obj.flags.f_contiguous:
-            return _serialize_numpy(obj)
-
-    if isinstance(obj, pa.Table):
-        return _serialize_arrow_table(obj)
-
-    if isinstance(obj, pa.RecordBatch):
-        return _serialize_arrow_batch(obj)
-
-    if isinstance(obj, pa.Array):
-        return _serialize_arrow_array(obj)
-
-    return _serialize_cloudpickle(obj)
-
-
-def _deserialize_object_data(data: bytes) -> Any:
-    """Deserialize object, detecting format from magic prefix."""
-    if len(data) < _MAGIC_PREFIX_LEN:
-        return cloudpickle.loads(data)
-
-    prefix = data[:_MAGIC_PREFIX_LEN]
-    payload = data[_MAGIC_PREFIX_LEN:]
-
-    if prefix == _TYPE_NUMPY:
+def _deserialize_object_data(data_type: str, data: bytes) -> Any:
+    """Decode a value using the data type supplied by object cache metadata."""
+    if data_type == _TYPE_CLOUDPICKLE:
+        return _deserialize_cloudpickle(data)
+    if data_type == _TYPE_NUMPY:
         if not _HAS_NUMPY:
             raise ImportError("numpy is required to deserialize this object")
-        return _deserialize_numpy(payload)
-
-    if prefix == _TYPE_ARROW_TABLE:
-        return _deserialize_arrow_table(payload)
-
-    if prefix == _TYPE_ARROW_BATCH:
-        return _deserialize_arrow_batch(payload)
-
-    if prefix == _TYPE_ARROW_ARRAY:
-        return _deserialize_arrow_array(payload)
-
-    if prefix == _TYPE_CLOUDPICKLE:
-        return _deserialize_cloudpickle(payload)
-
-    return cloudpickle.loads(data)
-
-
-def _serialize_object(obj: Any) -> pa.RecordBatch:
-    """Serialize a Python object to an Arrow RecordBatch.
-
-    Uses fast-path serialization for numpy arrays and PyArrow types,
-    falling back to cloudpickle for arbitrary Python objects.
-    """
-    data_bytes = _serialize_object_data(obj)
-
-    schema = pa.schema(
-        [
-            pa.field(OBJECT_FIELD_VERSION, pa.uint64()),
-            pa.field(OBJECT_FIELD_DATA, pa.binary()),
-        ]
-    )
-
-    version_array = pa.array([0], type=pa.uint64())
-    data_array = pa.array([data_bytes], type=pa.binary())
-
-    return pa.RecordBatch.from_arrays([version_array, data_array], schema=schema)
+        return _deserialize_numpy(data)
+    if data_type == _TYPE_ARROW_TABLE:
+        return _deserialize_arrow_table(data)
+    if data_type == _TYPE_ARROW_BATCH:
+        return _deserialize_arrow_batch(data)
+    if data_type == _TYPE_ARROW_ARRAY:
+        return _deserialize_arrow_array(data)
+    if data_type == _TYPE_PANDAS_DATAFRAME:
+        if not _HAS_PANDAS:
+            raise ImportError("pandas is required to deserialize this object")
+        return _deserialize_arrow_table(data).to_pandas()
+    if data_type == _TYPE_POLARS_DATAFRAME:
+        if not _HAS_POLARS:
+            raise ImportError("polars is required to deserialize this object")
+        return pl.from_arrow(_deserialize_arrow_table(data))
+    raise ValueError(f"Unsupported cache data type: {data_type}")
 
 
-def _deserialize_object(batch: pa.RecordBatch) -> Any:
-    """Deserialize a Python object from an Arrow RecordBatch.
-
-    Automatically detects the serialization format from the type marker.
-    """
-    data_array = batch.column(OBJECT_FIELD_DATA)
-    data_bytes = data_array[0].as_py()
-
-    return _deserialize_object_data(data_bytes)
+def _validate_compression(compression: str) -> str:
+    if compression not in (_COMPRESSION_NONE, _COMPRESSION_ZSTD):
+        raise ValueError(f"Unsupported cache compression: {compression}")
+    return compression
 
 
-_client_pool: Dict[tuple[str, Optional[str]], flight.FlightClient] = {}
+def _type_and_compression(data_type: str) -> tuple[str, str]:
+    if data_type.endswith(".zstd"):
+        return data_type[: -len(".zstd")], _COMPRESSION_ZSTD
+    return data_type, _COMPRESSION_NONE
+
+
+def _compress_data(data: bytes, compression: str) -> bytes:
+    if _validate_compression(compression) == _COMPRESSION_NONE:
+        return data
+    return pa.Codec(_COMPRESSION_ZSTD).compress(data, asbytes=True)
+
+
+def _decompress_data(data: bytes, compression: str) -> bytes:
+    if _validate_compression(compression) == _COMPRESSION_NONE:
+        return data
+    with pa.CompressedInputStream(pa.BufferReader(data), _COMPRESSION_ZSTD) as stream:
+        return stream.read()
+
+
+def _encode_object_data(obj: Any) -> tuple[str, bytes]:
+    """Compress structured values and tensors; leave generic Python objects raw."""
+    data_type, data = _serialize_object_data(obj)
+    torch_module = sys.modules.get("torch")
+    tensor_type = getattr(torch_module, "Tensor", None)
+    is_tensor = isinstance(tensor_type, type) and isinstance(obj, tensor_type)
+    is_numpy = _HAS_NUMPY and isinstance(obj, np.ndarray)
+    if data_type in _ZSTD_OBJECT_TYPES or is_numpy or is_tensor:
+        return f"{data_type}.zstd", _compress_data(data, _COMPRESSION_ZSTD)
+    return data_type, data
+
+
+_client_pool: Dict[tuple[str, Optional[str]], cache_pb2_grpc.ObjectCacheServiceStub] = {}
 _client_pool_lock = threading.Lock()
 
 _context_cache: Optional[FlameContext] = None
@@ -675,14 +540,6 @@ def _get_cached_context() -> FlameContext:
         if _context_cache is None:
             _context_cache = FlameContext()
         return _context_cache
-
-
-def _normalize_endpoint(endpoint: str) -> str:
-    if endpoint.startswith("grpcs://"):
-        return endpoint.replace("grpcs://", "grpc+tls://")
-    if endpoint.startswith("grpcs-proxy://"):
-        return endpoint.replace("grpcs-proxy://", "grpc+tls://")
-    return endpoint
 
 
 def _validate_proxy_endpoint(endpoint: str) -> None:
@@ -701,28 +558,31 @@ GRPC_OPTIONS = [
 ]
 
 
-def _create_flight_client(
+def _create_cache_client(
     location: str,
     tls_config: Optional[FlameClientTls] = None,
     authority: Optional[str] = None,
-) -> flight.FlightClient:
+) -> cache_pb2_grpc.ObjectCacheServiceStub:
+    parsed = urlparse(location)
+    if parsed.scheme not in ("grpc", "grpcs", "grpc+tls", "grpcs-proxy") or not parsed.netloc:
+        raise ValueError(f"Invalid object cache endpoint: {location}")
     options = list(GRPC_OPTIONS)
     if authority:
         options.append(("grpc.default_authority", authority))
-
-    if location.startswith("grpc+tls://"):
+    if parsed.scheme in ("grpcs", "grpc+tls", "grpcs-proxy"):
+        roots = None
         if tls_config and tls_config.ca_file:
             with open(tls_config.ca_file, "rb") as f:
-                root_certs = f.read()
-            return flight.FlightClient(location, tls_root_certs=root_certs, generic_options=options)
-        else:
-            return flight.FlightClient(location, generic_options=options)
+                roots = f.read()
+        credentials = grpc.ssl_channel_credentials(root_certificates=roots)
+        channel = grpc.secure_channel(parsed.netloc, credentials, options=options)
     else:
-        return flight.FlightClient(location, generic_options=options)
+        channel = grpc.insecure_channel(parsed.netloc, options=options)
+    return cache_pb2_grpc.ObjectCacheServiceStub(channel)
 
 
 def _cache_proxy_endpoint() -> Optional[str]:
-    """Return the configured TLS Flight proxy, if any."""
+    """Return the configured TLS gRPC proxy, if any."""
     try:
         cache_config = _get_cached_context().cache
     except Exception:
@@ -739,7 +599,7 @@ def _cache_proxy_endpoint() -> Optional[str]:
     return None
 
 
-def _resolve_flight_endpoint(endpoint: str) -> tuple[str, Optional[str]]:
+def _resolve_cache_endpoint(endpoint: str) -> tuple[str, Optional[str]]:
     """Resolve an object endpoint to its dial location and gRPC authority."""
     parsed = urlparse(endpoint)
     if parsed.scheme == "grpc-proxy":
@@ -748,110 +608,36 @@ def _resolve_flight_endpoint(endpoint: str) -> tuple[str, Optional[str]]:
         _validate_proxy_endpoint(endpoint)
     proxy_endpoint = _cache_proxy_endpoint()
     if parsed.scheme in ("grpc", "grpcs", "grpc+tls") and proxy_endpoint:
-        authority = parsed.netloc
-        if not authority:
+        if not parsed.netloc:
             raise ValueError(f"Invalid object cache endpoint: {endpoint}")
-        return _normalize_endpoint(proxy_endpoint), authority
-    return _normalize_endpoint(endpoint), None
+        return proxy_endpoint, parsed.netloc
+    return endpoint, None
 
 
-def _remove_stale_client(pool_key: tuple[str, Optional[str]]) -> None:
-    with _client_pool_lock:
-        _client_pool.pop(pool_key, None)
-
-
-def _get_flight_client(endpoint: str, tls_config: Optional[FlameClientTls] = None) -> flight.FlightClient:
-    location, authority = _resolve_flight_endpoint(endpoint)
+def _get_cache_client(endpoint: str, tls_config: Optional[FlameClientTls] = None) -> cache_pb2_grpc.ObjectCacheServiceStub:
+    location, authority = _resolve_cache_endpoint(endpoint)
     pool_key = (location, authority)
-
     with _client_pool_lock:
-        if pool_key in _client_pool:
-            return _client_pool[pool_key]
-
-        client = _create_flight_client(location, tls_config, authority)
-        _client_pool[pool_key] = client
-        return client
+        if pool_key not in _client_pool:
+            _client_pool[pool_key] = _create_cache_client(location, tls_config, authority)
+        return _client_pool[pool_key]
 
 
-def _get_flight_client_with_retry(endpoint: str, tls_config: Optional[FlameClientTls] = None, max_retries: int = 1) -> flight.FlightClient:
-    """Get FlightClient with retry on stale connection - removes failed client from pool and retries."""
-    pool_key = _resolve_flight_endpoint(endpoint)
-
-    for attempt in range(max_retries + 1):
-        client = _get_flight_client(endpoint, tls_config)
-        if attempt == 0:
-            return client
-
-        try:
-            client.list_actions()
-            return client
-        except (flight.FlightUnavailableError, OSError) as e:
-            logger.warning(f"Flight client connection failed (attempt {attempt + 1}): {e}")
-            _remove_stale_client(pool_key)
-            if attempt == max_retries:
-                raise
-
-    return _get_flight_client(endpoint, tls_config)
+def _write_requests(key: str, data_type: str, chunks: Any):
+    yield cache_pb2.CacheWriteRequest(header=cache_pb2.CacheWriteHeader(key=key, data_type=data_type))
+    for chunk in chunks:
+        yield cache_pb2.CacheWriteRequest(data=chunk)
 
 
-def _do_put_remote_batches(
-    client: flight.FlightClient,
-    descriptor: flight.FlightDescriptor,
-    schema: pa.Schema,
-    batches: List[pa.RecordBatch],
-    options: Optional[flight.FlightCallOptions] = None,
-) -> "ObjectRef":
-    """Perform a remote do_put operation and read the result metadata.
-
-    Args:
-        client: Arrow Flight client
-        descriptor: Flight descriptor for the put operation
-        schema: Arrow schema to upload
-        batches: RecordBatches to upload
-
-    Returns:
-        ObjectRef received from the server
-
-    Raises:
-        ValueError: If metadata cannot be read from server
-    """
-    if options is None:
-        writer, reader = client.do_put(descriptor, schema)
-    else:
-        writer, reader = client.do_put(descriptor, schema, options)
-
-    for batch in batches:
-        writer.write_batch(batch)
-
-    # Signal we're done writing
-    writer.done_writing()
-
-    # Read result metadata from PutResult stream before closing
-    # Read metadata messages using read() method (returns Buffer/bytes)
-    try:
-        while True:
-            metadata_buffer = reader.read()
-            if metadata_buffer is None:
-                break
-            # Extract ObjectRef from metadata buffer (BSON format)
-            obj_ref_data = bson.decode(bytes(metadata_buffer))
-            writer.close()
-            return ObjectRef(
-                endpoint=obj_ref_data["endpoint"],
-                key=obj_ref_data["key"],
-                version=obj_ref_data["version"],
-            )
-    except Exception as e:
-        writer.close()
-        raise ValueError(f"Failed to read metadata from cache server: {e}")
-
-    # If we get here, no PutResult was received
-    writer.close()
-    raise ValueError("No result metadata received from cache server")
+def _write_remote(client: cache_pb2_grpc.ObjectCacheServiceStub, key: str, data_type: str, chunks: Any, patch: bool = False, timeout: Optional[int] = None) -> ObjectRef:
+    rpc = client.Patch if patch else client.Put
+    metadata = rpc(_write_requests(key, data_type, chunks), timeout=timeout)
+    return ObjectRef(endpoint=metadata.endpoint, key=metadata.key, version=metadata.version)
 
 
-def _do_put_remote(client: flight.FlightClient, descriptor: flight.FlightDescriptor, batch: pa.RecordBatch) -> "ObjectRef":
-    return _do_put_remote_batches(client, descriptor, batch.schema, [batch])
+def _byte_chunks(data: bytes):
+    for start in range(0, len(data), _UPLOAD_CHUNK_SIZE):
+        yield data[start : start + _UPLOAD_CHUNK_SIZE]
 
 
 def _get_cache_tls_config() -> Optional[FlameClientTls]:
@@ -879,7 +665,7 @@ def put_object(key_prefix: str, obj: Any) -> "ObjectRef":
 
     Args:
         key_prefix: Key prefix in format "<app>/<session>"
-        obj: The object to cache (will be pickled)
+        obj: The object to cache
 
     Returns:
         ObjectRef pointing to the cached object
@@ -897,66 +683,19 @@ def put_object(key_prefix: str, obj: Any) -> "ObjectRef":
         raise ValueError("Cache configuration not found")
 
     if isinstance(cache_config, str):
-        cache_endpoint = cache_config
-        cache_storage = None
-        cache_tls = None
+        cache_endpoint, cache_tls = cache_config, None
     elif isinstance(cache_config, FlameClientCache):
-        cache_endpoint = cache_config.endpoint
-        cache_storage = cache_config.storage
-        cache_tls = cache_config.tls
+        cache_endpoint, cache_tls = cache_config.endpoint, cache_config.tls
     else:
-        cache_endpoint = cache_config.get("endpoint")
-        cache_storage = cache_config.get("storage")
-        cache_tls = None
-
+        cache_endpoint, cache_tls = cache_config.get("endpoint"), None
     if not cache_endpoint:
         raise ValueError("Cache endpoint not configured")
 
-    payload = _prepare_cache_payload(obj)
-
-    storage_path: Optional[Path] = None
-    use_local_storage = False
-
-    if cache_storage:
-        storage_path = Path(cache_storage)
-        try:
-            storage_path.mkdir(parents=True, exist_ok=True)
-            use_local_storage = storage_path.exists() and storage_path.is_dir()
-        except (PermissionError, OSError):
-            use_local_storage = False
-
-    if use_local_storage and storage_path is not None:
-        object_key_with_id = object_key.with_generated_id()
-        key = object_key_with_id.to_key()
-        if key is None:
-            raise ValueError("Failed to generate object key")
-
-        app_session_dir = storage_path / object_key.app_name / object_key.session_id
-        app_session_dir.mkdir(parents=True, exist_ok=True)
-
-        object_path = app_session_dir / f"{object_key_with_id.object_id}.arrow"
-        with pa.ipc.new_file(object_path, payload.schema) as writer:
-            for batch in payload.batches:
-                writer.write_batch(batch)
-
-        client = _get_flight_client(cache_endpoint, cache_tls)
-        descriptor = flight.FlightDescriptor.for_path(key)
-        flight_info = client.get_flight_info(descriptor)
-
-        if flight_info.endpoints:
-            remote_endpoint = flight_info.endpoints[0].locations[0]
-            endpoint_str = remote_endpoint.uri.decode("utf-8") if isinstance(remote_endpoint.uri, bytes) else str(remote_endpoint.uri)
-        else:
-            endpoint_str = cache_endpoint
-
-        logger.debug(f"put_object local_storage: key={key}, endpoint={endpoint_str}")
-        return ObjectRef(endpoint=endpoint_str, key=key, version=1)
-    else:
-        client = _get_flight_client(cache_endpoint, cache_tls)
-        upload_descriptor = flight.FlightDescriptor.for_path(object_key.to_prefix())
-        ref = _do_put_remote_batches(client, upload_descriptor, payload.schema, payload.batches)
-        logger.debug(f"put_object remote: key={ref.key}, version={ref.version}")
-        return ref
+    client = _get_cache_client(cache_endpoint, cache_tls)
+    data_type, data = _encode_object_data(obj)
+    ref = _write_remote(client, object_key.to_prefix(), data_type, _byte_chunks(data))
+    logger.debug("put_object: key=%s, version=%s", ref.key, ref.version)
+    return ref
 
 
 def get_object(ref: ObjectRef, deserializer: Optional[Deserializer] = None) -> Any:
@@ -1030,80 +769,63 @@ def get_object(ref: ObjectRef, deserializer: Optional[Deserializer] = None) -> A
     return _materialize_object(cached, deserializer)
 
 
+def _read_get_parts(responses: Any):
+    """Yield a validated header and completed base/patch payloads."""
+    iterator = iter(responses)
+    try:
+        first = next(iterator)
+    except StopIteration as exc:
+        raise ValueError("Cache Get returned no header") from exc
+    if first.WhichOneof("payload") != "header":
+        raise ValueError("Cache Get must start with a header")
+    header = first.header
+    parts = []
+    kind = None
+    version = None
+    data = bytearray()
+    for response in iterator:
+        if response.WhichOneof("payload") != "chunk":
+            raise ValueError("Unexpected Cache Get header after data")
+        chunk = response.chunk
+        if kind is None:
+            kind, version = chunk.kind, chunk.version
+        elif (chunk.kind, chunk.version) != (kind, version):
+            parts.append((kind, version, bytes(data)))
+            kind, version = chunk.kind, chunk.version
+            data.clear()
+        data.extend(chunk.data)
+    if kind is not None:
+        parts.append((kind, version, bytes(data)))
+    return header, parts
+
+
 def _fetch_object_data(ref: ObjectRef, cached_version: int) -> Optional[FetchResult]:
-    tls_config = _get_cache_tls_config()
-    client = _get_flight_client(ref.endpoint, tls_config)
-
-    ticket_str = f"{ref.key}:{cached_version}"
-    ticket = flight.Ticket(ticket_str.encode())
-    reader = client.do_get(ticket)
-
-    table = reader.read_all()
-    if _is_native_arrow_schema(table.schema):
-        return FetchResult(
-            mode=FetchMode.FULL,
-            version=_cache_schema_version(table.schema),
-            base=_deserialize_native_arrow_table(table),
-        )
-
-    if table.num_rows == 0:
+    client = _get_cache_client(ref.endpoint, _get_cache_tls_config())
+    header, parts = _read_get_parts(client.Get(cache_pb2.CacheGetRequest(key=ref.key, client_version=cached_version)))
+    if header.mode == cache_pb2.CACHE_GET_MODE_NOT_MODIFIED:
+        if parts:
+            raise ValueError("NOT_MODIFIED response included data")
         return None
-
-    if OBJECT_RESPONSE_FIELD_KIND not in table.column_names:
-        batches = table.to_batches()
-        base = _deserialize_object(batches[0])
-        version = batches[0].column(OBJECT_FIELD_VERSION)[0].as_py()
-        patches = [
-            Patch(
-                version=batch.column(OBJECT_FIELD_VERSION)[0].as_py(),
-                data=_deserialize_object(batch),
-            )
-            for batch in batches[1:]
-        ]
-        return FetchResult(
-            mode=FetchMode.FULL,
-            version=max([version] + [patch.version for patch in patches]),
-            base=base,
-            patches=patches,
-        )
-
-    versions = table.column(OBJECT_FIELD_VERSION)
-    kinds = table.column(OBJECT_RESPONSE_FIELD_KIND)
-    data_values = table.column(OBJECT_FIELD_DATA)
-    rows: list[tuple[int, ObjectResponseKind, Any]] = []
-    for idx in range(table.num_rows):
-        version = versions[idx].as_py()
-        kind_value = kinds[idx].as_py()
-        try:
-            kind = ObjectResponseKind(kind_value)
-        except ValueError as exc:
-            raise ValueError(f"Invalid object response row kind: {kind_value}") from exc
-        data = _deserialize_object_data(data_values[idx].as_py())
-        rows.append((version, kind, data))
-
-    base_rows = [row for row in rows if row[1] == ObjectResponseKind.BASE]
-    patch_rows = [row for row in rows if row[1] == ObjectResponseKind.PATCH]
-    max_version = max(row[0] for row in rows)
-    patch_versions = [row[0] for row in patch_rows]
-    if patch_versions != sorted(patch_versions) or len(patch_versions) != len(set(patch_versions)):
-        raise ValueError("Patch response rows must have unique increasing versions")
-
-    if base_rows:
-        first_base_index = next(idx for idx, row in enumerate(rows) if row[1] == ObjectResponseKind.BASE)
-        if len(base_rows) != 1 or first_base_index != 0:
-            raise ValueError("Full object response must start with exactly one base row")
-        patches = [Patch(version=row[0], data=row[2]) for row in patch_rows]
-        return FetchResult(
-            mode=FetchMode.FULL,
-            version=max_version,
-            base=base_rows[0][2],
-            patches=patches,
-        )
-
-    patches = [Patch(version=row[0], data=row[2]) for row in patch_rows]
-    if not patches:
-        return None
-    return FetchResult(mode=FetchMode.PATCHES, version=max_version, patches=patches)
+    if header.mode not in (cache_pb2.CACHE_GET_MODE_FULL, cache_pb2.CACHE_GET_MODE_PATCHES):
+        raise ValueError(f"Invalid Cache Get mode: {header.mode}")
+    data_type, compression = _type_and_compression(header.data_type)
+    if header.mode == cache_pb2.CACHE_GET_MODE_FULL:
+        if not parts or parts[0][0] != cache_pb2.CACHE_CHUNK_KIND_BASE:
+            raise ValueError("Full object response must start with a base")
+        base = _deserialize_object_data(data_type, _decompress_data(parts[0][2], compression))
+        patch_parts = parts[1:]
+        mode = FetchMode.FULL
+    else:
+        base = None
+        patch_parts = parts
+        mode = FetchMode.PATCHES
+    if any(kind != cache_pb2.CACHE_CHUNK_KIND_PATCH for kind, _, _ in patch_parts):
+        raise ValueError("Cache Get response has an unexpected part kind")
+    patch_versions = [version for _, version, _ in patch_parts]
+    if patch_versions != sorted(set(patch_versions)):
+        raise ValueError("Patch response versions must be unique and increasing")
+    patches = [Patch(version=version, data=_deserialize_object_data(data_type, _decompress_data(data, compression))) for _, version, data in patch_parts]
+    return FetchResult(mode=mode, version=header.version, base=base, patches=patches)
 
 
 def update_object(ref: ObjectRef, new_obj: Any) -> "ObjectRef":
@@ -1113,7 +835,7 @@ def update_object(ref: ObjectRef, new_obj: Any) -> "ObjectRef":
 
     Args:
         ref: ObjectRef pointing to the cached object to update
-        new_obj: The new object to store (will be pickled)
+        new_obj: The new object to encode and store
 
     Returns:
         Updated ObjectRef with new version from server
@@ -1123,16 +845,10 @@ def update_object(ref: ObjectRef, new_obj: Any) -> "ObjectRef":
     """
     ObjectKey.from_key(ref.key)
 
-    payload = _prepare_cache_payload(new_obj)
-
-    tls_config = _get_cache_tls_config()
-    client = _get_flight_client(ref.endpoint, tls_config)
-
-    upload_descriptor = flight.FlightDescriptor.for_path(ref.key)
-    new_ref = _do_put_remote_batches(client, upload_descriptor, payload.schema, payload.batches)
-
+    client = _get_cache_client(ref.endpoint, _get_cache_tls_config())
+    data_type, data = _encode_object_data(new_obj)
+    new_ref = _write_remote(client, ref.key, data_type, _byte_chunks(data))
     _cache_remove((ref.endpoint, ref.key))
-
     return new_ref
 
 
@@ -1144,7 +860,7 @@ def patch_object(ref: ObjectRef, delta: Any) -> "ObjectRef":
 
     Args:
         ref: ObjectRef pointing to the cached object to patch
-        delta: The delta data to append (will be pickled)
+        delta: The delta data to encode and append
 
     Returns:
         Updated ObjectRef with new version from server
@@ -1154,16 +870,14 @@ def patch_object(ref: ObjectRef, delta: Any) -> "ObjectRef":
     """
     ObjectKey.from_key(ref.key)
 
-    batch = _serialize_object(delta)
-
-    tls_config = _get_cache_tls_config()
-    client = _get_flight_client(ref.endpoint, tls_config)
-
-    upload_descriptor = flight.FlightDescriptor.for_command(f"PATCH:{ref.key}".encode())
-    new_ref = _do_put_remote(client, upload_descriptor, batch)
-
+    client = _get_cache_client(ref.endpoint, _get_cache_tls_config())
+    metadata = client.GetMetadata(cache_pb2.CacheGetMetadataRequest(key=ref.key))
+    stored_type, compression = _type_and_compression(metadata.data_type)
+    data_type, data = _serialize_object_data(delta)
+    if data_type != stored_type:
+        raise ValueError(f"Patch data type {data_type!r} does not match cached object type {stored_type!r}")
+    new_ref = _write_remote(client, ref.key, metadata.data_type, _byte_chunks(_compress_data(data, compression)), patch=True)
     _cache_remove((ref.endpoint, ref.key))
-
     return new_ref
 
 
@@ -1201,22 +915,41 @@ def delete_objects(key_prefix: str) -> None:
     if not cache_endpoint:
         raise ValueError("Cache endpoint not configured")
 
-    client = _get_flight_client(cache_endpoint, cache_tls)
-
-    action = flight.Action("DELETE", str(object_key).encode("utf-8"))
-    results = list(client.do_action(action))
-
-    if not results:
-        raise ValueError("No result received from DELETE action")
-
+    client = _get_cache_client(cache_endpoint, cache_tls)
+    client.Delete(cache_pb2.CacheDeleteRequest(key=str(object_key)))
     _cache_remove_matching(object_key)
 
 
 _UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
 
 
+class _ChunkReader(io.RawIOBase):
+    """Expose a validated gRPC chunk iterator to Arrow's streaming decoder."""
+
+    def __init__(self, chunks: Any):
+        self._chunks = iter(chunks)
+        self._pending = memoryview(b"")
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        target = memoryview(buffer)
+        if not target:
+            return 0
+        while not self._pending:
+            try:
+                self._pending = memoryview(next(self._chunks))
+            except StopIteration:
+                return 0
+        size = min(len(target), len(self._pending))
+        target[:size] = self._pending[:size]
+        self._pending = self._pending[size:]
+        return size
+
+
 def upload_object(key_or_prefix: str, file_path: str, endpoint: Optional[str] = None) -> ObjectRef:
-    """Upload a file to the cache using do_put with streaming.
+    """Upload a file to the cache using streaming gRPC.
 
     Args:
         key_or_prefix: Either full key (e.g., "myapp/pkg/myapp-1.0.0.tar.gz")
@@ -1269,59 +1002,24 @@ def upload_object(key_or_prefix: str, file_path: str, endpoint: Optional[str] = 
     if not cache_endpoint:
         raise ValueError("Cache endpoint not configured")
 
-    schema = pa.schema(
-        [
-            pa.field("version", pa.uint64()),
-            pa.field("data", pa.binary()),
-        ]
-    )
-
-    client = _get_flight_client(cache_endpoint, cache_tls)
-    descriptor = flight.FlightDescriptor.for_path(str(object_key))
-    options = flight.FlightCallOptions(timeout=300)
-
+    client = _get_cache_client(cache_endpoint, cache_tls)
     file_size = os.path.getsize(file_path)
-    writer = None
+
+    def chunks():
+        with open(file_path, "rb") as source:
+            while chunk := source.read(_UPLOAD_CHUNK_SIZE):
+                yield chunk
+
     try:
-        writer, reader = client.do_put(descriptor, schema, options)
-
-        with open(file_path, "rb") as f:
-            while True:
-                chunk = f.read(_UPLOAD_CHUNK_SIZE)
-                if not chunk:
-                    break
-
-                batch = pa.RecordBatch.from_arrays(
-                    [pa.array([0], type=pa.uint64()), pa.array([chunk], type=pa.binary())],
-                    schema=schema,
-                )
-                writer.write_batch(batch)
-
-        writer.done_writing()
-
-        while True:
-            metadata_buffer = reader.read()
-            if metadata_buffer is None:
-                break
-            obj_ref_data = bson.decode(bytes(metadata_buffer))
-            ref = ObjectRef(
-                endpoint=obj_ref_data["endpoint"],
-                key=obj_ref_data["key"],
-                version=obj_ref_data["version"],
-            )
-            logger.debug(f"upload_object: key={ref.key}, version={ref.version}, size={file_size}")
-            return ref
-
-        raise ValueError("No result metadata received from cache server")
-    except Exception as e:
-        raise ValueError(f"Failed to upload file to cache server: {e}")
-    finally:
-        if writer is not None:
-            writer.close()
+        ref = _write_remote(client, str(object_key), _TYPE_RAW, chunks(), timeout=300)
+        logger.debug("upload_object: key=%s, version=%s, size=%s", ref.key, ref.version, file_size)
+        return ref
+    except Exception as exc:
+        raise ValueError(f"Failed to upload file to cache server: {exc}") from exc
 
 
 def download_object(ref: ObjectRef, dest_path: str) -> None:
-    """Download a file from the cache using do_get with streaming.
+    """Download a file from the cache using streaming gRPC.
 
     Args:
         ref: ObjectRef pointing to the cached file
@@ -1332,40 +1030,42 @@ def download_object(ref: ObjectRef, dest_path: str) -> None:
     """
     import os
 
-    tls_config = _get_cache_tls_config()
-    client = _get_flight_client(ref.endpoint, tls_config)
-
-    ticket = flight.Ticket(f"{ref.key}:0".encode())
-    reader = client.do_get(ticket)
-
+    ObjectKey.from_key(ref.key)
+    client = _get_cache_client(ref.endpoint, _get_cache_tls_config())
     dest_dir = os.path.dirname(dest_path)
-    if dest_dir and not os.path.exists(dest_dir):
+    if dest_dir:
         os.makedirs(dest_dir, exist_ok=True)
 
-    total_size = 0
     try:
-        with open(dest_path, "wb") as f:
-            for batch in reader:
-                data_array = batch.column(OBJECT_FIELD_DATA)
-                kind_array = None
-                if hasattr(batch, "schema") and OBJECT_RESPONSE_FIELD_KIND in batch.schema.names:
-                    kind_array = batch.column(OBJECT_RESPONSE_FIELD_KIND)
-                for i in range(len(data_array)):
-                    if kind_array is not None:
-                        kind = kind_array[i].as_py()
-                        if kind != ObjectResponseKind.BASE.value:
-                            raise ValueError(f"download_object expected base rows only, got {kind!r} row")
-                    chunk = data_array[i].as_py()
-                    if chunk:
-                        f.write(chunk)
-                        total_size += len(chunk)
+        responses = iter(client.Get(cache_pb2.CacheGetRequest(key=ref.key, client_version=0)))
+        first = next(responses)
+        if first.WhichOneof("payload") != "header" or first.header.mode != cache_pb2.CACHE_GET_MODE_FULL:
+            raise ValueError("Expected full object response")
+        data_type, compression = _type_and_compression(first.header.data_type)
+        saw_base = False
 
-        if total_size == 0:
-            os.remove(dest_path)
-            raise ValueError(f"Object not found: {ref.key}")
+        def chunks():
+            nonlocal saw_base
+            for response in responses:
+                if response.WhichOneof("payload") != "chunk":
+                    raise ValueError("Unexpected Cache Get header")
+                chunk = response.chunk
+                if chunk.kind != cache_pb2.CACHE_CHUNK_KIND_BASE or data_type != _TYPE_RAW:
+                    raise ValueError("download_object expected raw base chunks only")
+                saw_base = True
+                yield chunk.data
 
-        logger.debug(f"download_object: key={ref.key} -> {dest_path}, size={total_size}")
-    except Exception as e:
+        with open(dest_path, "wb") as output:
+            if compression == _COMPRESSION_NONE:
+                for chunk in chunks():
+                    output.write(chunk)
+            else:
+                with pa.CompressedInputStream(pa.input_stream(_ChunkReader(chunks())), _COMPRESSION_ZSTD) as stream:
+                    while data := stream.read(_UPLOAD_CHUNK_SIZE):
+                        output.write(data)
+        if not saw_base:
+            raise ValueError("Cache Get response omitted the base")
+    except Exception as exc:
         if os.path.exists(dest_path):
             os.remove(dest_path)
-        raise ValueError(f"Failed to download file from cache server: {e}")
+        raise ValueError(f"Failed to download file from cache server: {exc}") from exc

@@ -13,6 +13,8 @@ limitations under the License.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
+        .bytes(".flame.v1.CacheWriteRequest.data")
+        .bytes(".flame.v1.CacheGetChunk.data")
         .type_attribute("flame.v1.TaskState", "#[allow(clippy::enum_variant_names)]")
         .type_attribute("flame.v1.Shim", "#[allow(clippy::enum_variant_names)]")
         .type_attribute(
@@ -26,6 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "protos/frontend.proto",
                 "protos/backend.proto",
                 "protos/shim.proto",
+                "protos/cache.proto",
             ],
             &["protos"],
         )?;

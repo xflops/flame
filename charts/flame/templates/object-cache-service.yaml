@@ -9,9 +9,9 @@ metadata:
 spec:
   type: {{ .Values.objectCache.service.type }}
   ports:
-    - name: flight
+    - name: grpc
       port: {{ .Values.objectCache.service.port }}
-      targetPort: flight
+      targetPort: grpc
       protocol: TCP
       appProtocol: kubernetes.io/h2c
   selector:

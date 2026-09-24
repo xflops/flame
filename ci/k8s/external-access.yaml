@@ -134,7 +134,7 @@ spec:
   rules:
     - backendRefs:
         - name: ${CACHE_SERVICE}
-          port: ${CACHE_FLIGHT_PORT}
+          port: ${CACHE_GRPC_PORT}
 ---
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: Backend

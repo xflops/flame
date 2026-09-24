@@ -17,11 +17,8 @@ mod none;
 pub use disk::DiskStorage;
 pub use none::NoneStorage;
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use arrow::datatypes::Schema;
 use async_trait::async_trait;
+use std::path::PathBuf;
 
 use common::FlameError;
 
@@ -37,9 +34,6 @@ pub trait StorageEngine: Send + Sync + 'static {
 
     /// Read an object with all deltas. Returns None if not found.
     async fn read_object(&self, key: &ObjectKey) -> Result<Option<Object>, FlameError>;
-
-    /// Read a native Arrow object schema without loading record batches.
-    async fn read_schema(&self, key: &ObjectKey) -> Result<Option<Arc<Schema>>, FlameError>;
 
     /// Append a delta to an existing object. Returns NotFound if base doesn't exist.
     async fn patch_object(

@@ -402,6 +402,7 @@ mod tests {
             size: 10,
             delta_count: 0,
             creation_time,
+            data_type: "raw".to_string(),
         }
     }
 

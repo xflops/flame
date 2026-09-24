@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+package flame.v1;
+
+option go_package = "github.com/flame-sh/flame/sdk/go/rpc/v1";
+
+// The cache stores opaque bytes. Clients serialize and deserialize values,
+// including Arrow values, before sending them over this service.
+service ObjectCacheService {
+  rpc Put(stream CacheWriteRequest) returns (CacheObjectMetadata) {}
+  rpc Patch(stream CacheWriteRequest) returns (CacheObjectMetadata) {}
+  rpc Get(CacheGetRequest) returns (stream CacheGetResponse) {}
+  rpc Delete(CacheDeleteRequest) returns (CacheDeleteResponse) {}
+  rpc GetMetadata(CacheGetMetadataRequest) returns (CacheObjectMetadata) {}
+  rpc List(CacheListRequest) returns (stream CacheObjectMetadata) {}
+}
+
+message CacheWriteHeader {
+  // A full app/session/object key, or an app/session prefix for PUT.
+  string key = 1;
+  // Client-defined payload type (for example, "raw.zstd"). The cache stores
+  // this without interpreting its encoding or compression.
+  string data_type = 2;
+}
+
+message CacheWriteRequest {
+  // Exactly one header must precede zero or more data chunks. Each data chunk
+  // should be at most 1 MiB to stay below the default gRPC message limit.
+  // A header without data chunks stores an empty payload.
+  oneof payload {
+    CacheWriteHeader header = 1;
+    bytes data = 2;
+  }
+}
+
+message CacheObjectMetadata {
+  // The endpoint identifies the replica that owns this object.
+  string endpoint = 1;
+  string key = 2;
+  uint64 version = 3;
+  uint64 size = 4;
+  uint64 delta_count = 5;
+  // Unix timestamp in milliseconds, retained for cache lifecycle accounting.
+  int64 creation_time = 6;
+  // Client-defined type shared by the base object and all patches.
+  string data_type = 7;
+}
+
+message CacheGetRequest {
+  string key = 1;
+  // Zero forces a full response. Otherwise the server may return unchanged or
+  // a contiguous suffix of patches after this version.
+  uint64 client_version = 2;
+}
+
+enum CacheGetMode {
+  CACHE_GET_MODE_UNSPECIFIED = 0;
+  CACHE_GET_MODE_FULL = 1;
+  CACHE_GET_MODE_PATCHES = 2;
+  CACHE_GET_MODE_NOT_MODIFIED = 3;
+}
+
+message CacheGetHeader {
+  CacheGetMode mode = 1;
+  uint64 version = 2;
+  // Client-defined type shared by the base object and all patches. Empty for
+  // NOT_MODIFIED, which carries no object bytes.
+  string data_type = 3;
+}
+
+enum CacheChunkKind {
+  CACHE_CHUNK_KIND_UNSPECIFIED = 0;
+  CACHE_CHUNK_KIND_BASE = 1;
+  CACHE_CHUNK_KIND_PATCH = 2;
+}
+
+message CacheGetChunk {
+  CacheChunkKind kind = 1;
+  uint64 version = 2;
+  bytes data = 3;
+  // Chunks for a part are contiguous and share a kind and version. The next
+  // kind/version pair or the end of the stream completes the current part.
+  // Empty parts are sent as one chunk with empty data.
+}
+
+message CacheGetResponse {
+  // The first message is always a header. NOT_MODIFIED has no chunks.
+  oneof payload {
+    CacheGetHeader header = 1;
+    CacheGetChunk chunk = 2;
+  }
+}
+
+message CacheDeleteRequest {
+  // A full key, an app/session prefix, or an app/* prefix.
+  string key = 1;
+}
+
+message CacheDeleteResponse {}
+
+message CacheGetMetadataRequest {
+  string key = 1;
+}
+
+message CacheListRequest {}

@@ -16,38 +16,45 @@ use std::future::Future;
 use std::io::Cursor;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use arrow::array::{Array, BinaryArray, StringArray, UInt64Array};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use arrow_flight::encode::FlightDataEncoderBuilder;
-use arrow_flight::error::FlightError;
-use arrow_flight::flight_service_client::FlightServiceClient;
-use arrow_flight::{Action, FlightClient, FlightDescriptor, Ticket};
 use bson::{doc, Bson, Document};
 use bytes::Bytes;
-use futures::{stream, TryStreamExt};
+use futures::stream;
 use serde_derive::{Deserialize, Serialize as DeriveSerialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tonic::transport::{Channel, Uri};
 use url::Url;
 
+use crate::apis::flame::v1::object_cache_service_client::ObjectCacheServiceClient;
+use crate::apis::flame::v1::{
+    cache_get_response, cache_write_request, CacheChunkKind, CacheDeleteRequest, CacheGetChunk,
+    CacheGetHeader, CacheGetMode, CacheGetRequest, CacheWriteHeader, CacheWriteRequest,
+};
 use crate::apis::{FlameClientCache, FlameClientTls, FlameContext, FlameError};
 use crate::message::FlameMessage;
 
-const OBJECT_FIELD_VERSION: &str = "version";
-const OBJECT_FIELD_KIND: &str = "kind";
-const OBJECT_FIELD_DATA: &str = "data";
-const OBJECT_KIND_BASE: &str = "base";
-const OBJECT_KIND_PATCH: &str = "patch";
 const WILDCARD_SESSION: &str = "*";
 const DEFAULT_CACHE_PORT: u16 = 9090;
 const CONNECT_TIMEOUT_SECS: u64 = 30;
 const UPLOAD_CHUNK_SIZE: usize = 1024 * 1024;
-const FLIGHT_MAX_MESSAGE_SIZE: usize = usize::MAX;
+
+/// The cache returns bytes and their client-defined type without interpreting either.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectBytes {
+    pub data_type: String,
+    pub version: u64,
+    pub base: ObjectBytePart,
+    pub patches: Vec<ObjectBytePart>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectBytePart {
+    pub version: u64,
+    pub data: Bytes,
+}
 
 type ObjectFutureInner<T> = Pin<Box<dyn Future<Output = Result<T, FlameError>> + Send + 'static>>;
 
@@ -306,23 +313,33 @@ pub async fn put_object_with_context<T>(
 where
     T: FlameMessage,
 {
-    let bytes = object.encode()?;
-    put_encoded_object_with_context(context, key_prefix, bytes).await
+    put_object_bytes_with_context(context, key_prefix, object.encode()?, "raw").await
 }
 
-async fn put_encoded_object_with_context(
+pub async fn put_object_bytes(
+    key_prefix: impl AsRef<str>,
+    bytes: impl Into<Bytes>,
+    data_type: impl AsRef<str>,
+) -> Result<ObjectRef, FlameError> {
+    let context = FlameContext::from_file_with_env(None)?;
+    put_object_bytes_with_context(&context, key_prefix, bytes, data_type).await
+}
+
+pub async fn put_object_bytes_with_context(
     context: &FlameContext,
     key_prefix: impl AsRef<str>,
-    bytes: impl Into<Vec<u8>>,
+    bytes: impl Into<Bytes>,
+    data_type: impl AsRef<str>,
 ) -> Result<ObjectRef, FlameError> {
     let object_key = ObjectKey::from_prefix(key_prefix.as_ref())?;
     let cache = cache_from_context(context)?;
-    let descriptor = FlightDescriptor::new_path(vec![object_key.to_prefix()]);
     do_put_bytes(
         &cache.endpoint,
         cache.tls.as_ref(),
-        descriptor,
+        object_key.to_prefix(),
+        false,
         bytes.into(),
+        data_type.as_ref(),
     )
     .await
 }
@@ -332,8 +349,14 @@ where
     T: FlameMessage + Send + 'static,
 {
     ObjectFuture::new(async move {
-        let bytes = fetch_object_bytes(&reference).await?;
-        T::decode(&bytes)
+        let object = get_object_bytes(&reference).await?;
+        if object.data_type != "raw" {
+            return Err(FlameError::InvalidConfig(format!(
+                "object {} has type {}, expected raw",
+                reference.key, object.data_type
+            )));
+        }
+        T::decode(&object.base.data)
     })
 }
 
@@ -341,58 +364,66 @@ pub async fn update_object<T>(reference: &ObjectRef, object: &T) -> Result<Objec
 where
     T: FlameMessage,
 {
-    let bytes = object.encode()?;
-    update_object_bytes(reference, bytes).await
+    update_object_bytes(reference, object.encode()?, "raw").await
 }
 
-async fn update_object_bytes(
+pub async fn update_object_bytes(
     reference: &ObjectRef,
-    bytes: impl Into<Vec<u8>>,
+    bytes: impl Into<Bytes>,
+    data_type: impl AsRef<str>,
 ) -> Result<ObjectRef, FlameError> {
     ObjectKey::from_key(&reference.key)?;
     let endpoint = endpoint_for_reference(&reference.endpoint)?;
     let tls = current_cache_tls()?;
-    let descriptor = FlightDescriptor::new_path(vec![reference.key.clone()]);
-    do_put_bytes(&endpoint, tls.as_ref(), descriptor, bytes.into()).await
+    do_put_bytes(
+        &endpoint,
+        tls.as_ref(),
+        reference.key.clone(),
+        false,
+        bytes.into(),
+        data_type.as_ref(),
+    )
+    .await
 }
 
 pub async fn patch_object<T>(reference: &ObjectRef, delta: &T) -> Result<ObjectRef, FlameError>
 where
     T: FlameMessage,
 {
-    let bytes = delta.encode()?;
-    patch_object_bytes(reference, bytes).await
+    patch_object_bytes(reference, delta.encode()?, "raw").await
 }
 
-async fn patch_object_bytes(
+pub async fn patch_object_bytes(
     reference: &ObjectRef,
-    bytes: impl Into<Vec<u8>>,
+    bytes: impl Into<Bytes>,
+    data_type: impl AsRef<str>,
 ) -> Result<ObjectRef, FlameError> {
     ObjectKey::from_key(&reference.key)?;
     let endpoint = endpoint_for_reference(&reference.endpoint)?;
     let tls = current_cache_tls()?;
-    let descriptor = FlightDescriptor::new_cmd(format!("PATCH:{}", reference.key));
-    do_put_bytes(&endpoint, tls.as_ref(), descriptor, bytes.into()).await
+    do_put_bytes(
+        &endpoint,
+        tls.as_ref(),
+        reference.key.clone(),
+        true,
+        bytes.into(),
+        data_type.as_ref(),
+    )
+    .await
 }
 
 pub async fn delete_objects(key_prefix: impl AsRef<str>) -> Result<(), FlameError> {
     let object_key = ObjectKey::from_path(key_prefix.as_ref())?;
     let context = FlameContext::from_file_with_env(None)?;
     let cache = cache_from_context(&context)?;
-    let mut client = flight_client(connect_cache(&cache.endpoint, cache.tls.as_ref()).await?);
-    let results: Vec<_> = client
-        .do_action(Action::new("DELETE", object_key.to_string().into_bytes()))
-        .await
-        .map_err(|e| FlameError::Internal(format!("cache delete failed: {}", e)))?
-        .try_collect()
+    let mut client =
+        ObjectCacheServiceClient::new(connect_cache(&cache.endpoint, cache.tls.as_ref()).await?);
+    client
+        .delete(CacheDeleteRequest {
+            key: object_key.to_string(),
+        })
         .await
         .map_err(|e| FlameError::Internal(format!("cache delete failed: {}", e)))?;
-
-    if results.is_empty() {
-        return Err(FlameError::Internal(
-            "cache delete returned no result".to_string(),
-        ));
-    }
     Ok(())
 }
 
@@ -404,10 +435,28 @@ pub async fn upload_object(
     upload_object_with_context(&context, key_or_prefix, file_path).await
 }
 
+pub async fn upload_object_with_data_type(
+    key_or_prefix: impl AsRef<str>,
+    file_path: impl AsRef<Path>,
+    data_type: impl AsRef<str>,
+) -> Result<ObjectRef, FlameError> {
+    let context = FlameContext::from_file_with_env(None)?;
+    upload_object_with_context_and_data_type(&context, key_or_prefix, file_path, data_type).await
+}
+
 pub async fn upload_object_with_context(
     context: &FlameContext,
     key_or_prefix: impl AsRef<str>,
     file_path: impl AsRef<Path>,
+) -> Result<ObjectRef, FlameError> {
+    upload_object_with_context_and_data_type(context, key_or_prefix, file_path, "raw").await
+}
+
+pub async fn upload_object_with_context_and_data_type(
+    context: &FlameContext,
+    key_or_prefix: impl AsRef<str>,
+    file_path: impl AsRef<Path>,
+    data_type: impl AsRef<str>,
 ) -> Result<ObjectRef, FlameError> {
     let object_key = ObjectKey::from_path(key_or_prefix.as_ref())?;
     if object_key.is_all_sessions() {
@@ -417,12 +466,12 @@ pub async fn upload_object_with_context(
         )));
     }
     let cache = cache_from_context(context)?;
-    let descriptor = FlightDescriptor::new_path(vec![object_key.to_string()]);
     do_put_file(
         &cache.endpoint,
         cache.tls.as_ref(),
-        descriptor,
+        object_key.to_string(),
         file_path.as_ref(),
+        data_type.as_ref(),
     )
     .await
 }
@@ -431,14 +480,30 @@ pub async fn download_object(
     reference: &ObjectRef,
     dest_path: impl AsRef<Path>,
 ) -> Result<(), FlameError> {
+    download_object_with_data_type(reference, dest_path)
+        .await
+        .map(|_| ())
+}
+
+pub async fn download_object_with_data_type(
+    reference: &ObjectRef,
+    dest_path: impl AsRef<Path>,
+) -> Result<String, FlameError> {
     ObjectKey::from_key(&reference.key)?;
     let endpoint = endpoint_for_reference(&reference.endpoint)?;
     let tls = current_cache_tls()?;
-    let mut client = flight_client(connect_cache(&endpoint, tls.as_ref()).await?);
+    let mut client = ObjectCacheServiceClient::new(connect_cache(&endpoint, tls.as_ref()).await?);
     let mut stream = client
-        .do_get(Ticket::new(format!("{}:0", reference.key)))
+        .get(CacheGetRequest {
+            key: reference.key.clone(),
+            client_version: 0,
+        })
         .await
-        .map_err(|e| FlameError::Internal(format!("cache download failed: {}", e)))?;
+        .map_err(|e| FlameError::Internal(format!("cache download failed: {}", e)))?
+        .into_inner();
+    let data_type = read_full_header(&mut stream, &reference.key)
+        .await?
+        .data_type;
 
     if let Some(parent) = dest_path.as_ref().parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -449,71 +514,65 @@ pub async fn download_object(
             ))
         })?;
     }
-
     let temp_path = dest_path.as_ref().with_extension("tmp");
-    let mut file = tokio::fs::File::create(&temp_path).await.map_err(|e| {
-        FlameError::Internal(format!("failed to create {}: {}", temp_path.display(), e))
-    })?;
-    let mut total_size = 0usize;
-
-    while let Some(batch) = stream
-        .try_next()
-        .await
-        .map_err(|e| FlameError::Internal(format!("cache download failed: {}", e)))?
-    {
-        let data = data_column(&batch)?;
-        if let Some(kind) = kind_column(&batch)? {
-            for row in 0..batch.num_rows() {
-                match kind.value(row) {
-                    OBJECT_KIND_BASE => {
-                        let chunk = data.value(row);
-                        file.write_all(chunk).await.map_err(|e| {
-                            FlameError::Internal(format!("failed to write download chunk: {}", e))
-                        })?;
-                        total_size += chunk.len();
-                    }
-                    OBJECT_KIND_PATCH => {
-                        drop(file);
-                        tokio::fs::remove_file(&temp_path).await.ok();
-                        return Err(FlameError::InvalidConfig(format!(
-                            "object {} contains patch rows and cannot be downloaded as a file",
-                            reference.key
-                        )));
-                    }
-                    other => {
-                        drop(file);
-                        tokio::fs::remove_file(&temp_path).await.ok();
-                        return Err(FlameError::InvalidConfig(format!(
-                            "invalid object response kind '{}'",
-                            other
-                        )));
+    let result = async {
+        let mut file = tokio::fs::File::create(&temp_path).await.map_err(|e| {
+            FlameError::Internal(format!("failed to create {}: {}", temp_path.display(), e))
+        })?;
+        let mut found_base = false;
+        while let Some(message) = stream
+            .message()
+            .await
+            .map_err(|e| FlameError::Internal(format!("cache download failed: {}", e)))?
+        {
+            match message.payload {
+                Some(cache_get_response::Payload::Chunk(chunk)) => {
+                    match CacheChunkKind::try_from(chunk.kind) {
+                        Ok(CacheChunkKind::Base) => {
+                            found_base = true;
+                            file.write_all(&chunk.data).await.map_err(|e| {
+                                FlameError::Internal(format!(
+                                    "failed to write download chunk: {}",
+                                    e
+                                ))
+                            })?;
+                        }
+                        Ok(CacheChunkKind::Patch) => {
+                            return Err(FlameError::InvalidConfig(format!(
+                                "object {} contains patch rows and cannot be downloaded as a file",
+                                reference.key
+                            )))
+                        }
+                        _ => {
+                            return Err(FlameError::InvalidConfig(
+                                "invalid object response chunk kind".to_string(),
+                            ))
+                        }
                     }
                 }
-            }
-        } else {
-            for row in 0..batch.num_rows() {
-                let chunk = data.value(row);
-                file.write_all(chunk).await.map_err(|e| {
-                    FlameError::Internal(format!("failed to write download chunk: {}", e))
-                })?;
-                total_size += chunk.len();
+                _ => {
+                    return Err(FlameError::InvalidConfig(
+                        "invalid object response: expected data chunk".to_string(),
+                    ))
+                }
             }
         }
+        if !found_base {
+            return Err(FlameError::NotFound(reference.key.clone()));
+        }
+        file.sync_all()
+            .await
+            .map_err(|e| FlameError::Internal(format!("failed to sync download: {}", e)))?;
+        drop(file);
+        tokio::fs::rename(&temp_path, dest_path.as_ref())
+            .await
+            .map_err(|e| FlameError::Internal(format!("failed to finish download: {}", e)))
     }
-
-    if total_size == 0 {
-        tokio::fs::remove_file(&temp_path).await.ok();
-        return Err(FlameError::NotFound(reference.key.clone()));
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temp_path).await;
     }
-
-    file.sync_all()
-        .await
-        .map_err(|e| FlameError::Internal(format!("failed to sync download: {}", e)))?;
-    drop(file);
-    tokio::fs::rename(&temp_path, dest_path.as_ref())
-        .await
-        .map_err(|e| FlameError::Internal(format!("failed to finish download: {}", e)))?;
-    Ok(())
+    result.map(|_| data_type)
 }
 
 #[derive(Debug, Clone)]
@@ -700,175 +759,261 @@ async fn connect_cache(
         .map_err(|e| FlameError::Internal(format!("failed to connect to object cache: {}", e)))
 }
 
-fn flight_client(channel: Channel) -> FlightClient {
-    let inner = FlightServiceClient::new(channel)
-        .max_decoding_message_size(FLIGHT_MAX_MESSAGE_SIZE)
-        .max_encoding_message_size(FLIGHT_MAX_MESSAGE_SIZE);
-    FlightClient::new_from_inner(inner)
+fn put_header(key: String, data_type: &str) -> CacheWriteRequest {
+    CacheWriteRequest {
+        payload: Some(cache_write_request::Payload::Header(CacheWriteHeader {
+            key,
+            data_type: data_type.to_string(),
+        })),
+    }
+}
+
+fn put_chunk(data: Bytes) -> CacheWriteRequest {
+    CacheWriteRequest {
+        payload: Some(cache_write_request::Payload::Data(data)),
+    }
+}
+
+fn write_bytes_stream(
+    key: String,
+    data: Bytes,
+    data_type: &str,
+) -> impl futures::Stream<Item = CacheWriteRequest> {
+    let header = put_header(key, data_type);
+    stream::unfold(
+        (Some(header), data, 0usize),
+        |(header, data, offset)| async move {
+            if let Some(header) = header {
+                return Some((header, (None, data, offset)));
+            }
+            if offset >= data.len() {
+                return None;
+            }
+            let end = (offset + UPLOAD_CHUNK_SIZE).min(data.len());
+            let chunk = put_chunk(data.slice(offset..end));
+            Some((chunk, (None, data, end)))
+        },
+    )
+}
+
+fn object_ref_from_metadata(
+    metadata: crate::apis::flame::v1::CacheObjectMetadata,
+) -> Result<ObjectRef, FlameError> {
+    ObjectRef::new(metadata.endpoint, metadata.key, metadata.version)
 }
 
 async fn do_put_bytes(
     endpoint: &CacheEndpoint,
     tls: Option<&FlameClientTls>,
-    descriptor: FlightDescriptor,
-    bytes: Vec<u8>,
+    key: String,
+    patch: bool,
+    data: Bytes,
+    data_type: &str,
 ) -> Result<ObjectRef, FlameError> {
-    let schema = object_schema();
-    let batch = object_record_batch(schema.clone(), bytes)
-        .map_err(|e| FlameError::Internal(format!("failed to create object batch: {}", e)))?;
-    let stream = stream::iter(vec![Ok::<RecordBatch, FlightError>(batch)]);
-    do_put_batches(endpoint, tls, descriptor, schema, stream).await
+    let input = write_bytes_stream(key, data, data_type);
+    let mut client = ObjectCacheServiceClient::new(connect_cache(endpoint, tls).await?);
+    let metadata = if patch {
+        client.patch(input).await
+    } else {
+        client.put(input).await
+    }
+    .map_err(|e| FlameError::Internal(format!("cache upload failed: {}", e)))?
+    .into_inner();
+    object_ref_from_metadata(metadata)
 }
 
 async fn do_put_file(
     endpoint: &CacheEndpoint,
     tls: Option<&FlameClientTls>,
-    descriptor: FlightDescriptor,
+    key: String,
     path: &Path,
+    data_type: &str,
 ) -> Result<ObjectRef, FlameError> {
     let file = tokio::fs::File::open(path).await.map_err(|e| {
         FlameError::InvalidConfig(format!("failed to open {}: {}", path.display(), e))
     })?;
-    let schema = object_schema();
-    let schema_for_stream = schema.clone();
-    let stream = stream::try_unfold((file, schema_for_stream), |(mut file, schema)| async move {
-        let mut chunk = vec![0_u8; UPLOAD_CHUNK_SIZE];
-        let read = file.read(&mut chunk).await.map_err(|e| {
-            FlightError::from_external_error(Box::new(std::io::Error::new(
-                e.kind(),
-                format!("failed to read object chunk: {}", e),
-            )))
-        })?;
-        if read == 0 {
-            return Ok(None);
+    let read_error = Arc::new(Mutex::new(None));
+    let error_for_stream = read_error.clone();
+    let header = put_header(key, data_type);
+    let input = stream::unfold((file, Some(header)), move |(mut file, header)| {
+        let read_error = error_for_stream.clone();
+        async move {
+            if let Some(header) = header {
+                return Some((header, (file, None)));
+            }
+            let mut chunk = vec![0_u8; UPLOAD_CHUNK_SIZE];
+            match file.read(&mut chunk).await {
+                Ok(0) => None,
+                Ok(count) => {
+                    chunk.truncate(count);
+                    Some((put_chunk(Bytes::from(chunk)), (file, None)))
+                }
+                Err(error) => {
+                    *read_error.lock().expect("upload error mutex poisoned") = Some(error);
+                    None
+                }
+            }
         }
-        chunk.truncate(read);
-        let batch = object_record_batch(schema.clone(), chunk)?;
-        Ok(Some((batch, (file, schema))))
     });
-    do_put_batches(endpoint, tls, descriptor, schema, stream).await
-}
-
-async fn do_put_batches<S>(
-    endpoint: &CacheEndpoint,
-    tls: Option<&FlameClientTls>,
-    descriptor: FlightDescriptor,
-    schema: Arc<Schema>,
-    batches: S,
-) -> Result<ObjectRef, FlameError>
-where
-    S: futures::Stream<Item = Result<RecordBatch, FlightError>> + Send + 'static,
-{
-    let channel = connect_cache(endpoint, tls).await?;
-    let mut client = flight_client(channel);
-    let flight_data = FlightDataEncoderBuilder::new()
-        .with_schema(schema)
-        .with_flight_descriptor(Some(descriptor))
-        .build(batches);
-
-    let results: Vec<_> = client
-        .do_put(flight_data)
-        .await
+    let mut client = ObjectCacheServiceClient::new(connect_cache(endpoint, tls).await?);
+    let response = client.put(input).await;
+    if let Some(error) = read_error
+        .lock()
+        .expect("upload error mutex poisoned")
+        .take()
+    {
+        return Err(FlameError::Internal(format!(
+            "failed to read object chunk: {}",
+            error
+        )));
+    }
+    let metadata = response
         .map_err(|e| FlameError::Internal(format!("cache upload failed: {}", e)))?
-        .try_collect()
-        .await
-        .map_err(|e| FlameError::Internal(format!("cache upload failed: {}", e)))?;
-    let result = results
-        .into_iter()
-        .next()
-        .ok_or_else(|| FlameError::Internal("cache upload returned no result".to_string()))?;
-    ObjectRef::decode(result.app_metadata)
+        .into_inner();
+    object_ref_from_metadata(metadata)
 }
 
-async fn fetch_object_bytes(reference: &ObjectRef) -> Result<Vec<u8>, FlameError> {
+async fn read_full_header(
+    stream: &mut tonic::Streaming<crate::apis::flame::v1::CacheGetResponse>,
+    key: &str,
+) -> Result<CacheGetHeader, FlameError> {
+    let first = stream
+        .message()
+        .await
+        .map_err(|e| FlameError::Internal(format!("cache get failed: {}", e)))?
+        .ok_or_else(|| FlameError::InvalidConfig("cache response missing header".to_string()))?;
+    let Some(cache_get_response::Payload::Header(header)) = first.payload else {
+        return Err(FlameError::InvalidConfig(
+            "cache response must start with header".to_string(),
+        ));
+    };
+    match CacheGetMode::try_from(header.mode) {
+        Ok(CacheGetMode::Full) => {}
+        Ok(CacheGetMode::NotModified) => {
+            return Err(FlameError::InvalidConfig(format!(
+                "unexpected unchanged response for full object {}",
+                key
+            )))
+        }
+        _ => {
+            return Err(FlameError::InvalidConfig(
+                "unexpected cache response mode".to_string(),
+            ))
+        }
+    }
+    Ok(header)
+}
+
+pub async fn get_object_bytes(reference: &ObjectRef) -> Result<ObjectBytes, FlameError> {
     ObjectKey::from_key(&reference.key)?;
     let endpoint = endpoint_for_reference(&reference.endpoint)?;
     let tls = current_cache_tls()?;
-    let mut client = flight_client(connect_cache(&endpoint, tls.as_ref()).await?);
+    let mut client = ObjectCacheServiceClient::new(connect_cache(&endpoint, tls.as_ref()).await?);
     let mut stream = client
-        .do_get(Ticket::new(format!("{}:0", reference.key)))
+        .get(CacheGetRequest {
+            key: reference.key.clone(),
+            client_version: 0,
+        })
         .await
-        .map_err(|e| FlameError::Internal(format!("cache get failed: {}", e)))?;
-
-    let mut base = Vec::new();
-    let mut found_base = false;
-    while let Some(batch) = stream
-        .try_next()
+        .map_err(|e| FlameError::Internal(format!("cache get failed: {}", e)))?
+        .into_inner();
+    let header = read_full_header(&mut stream, &reference.key).await?;
+    let mut builder = ObjectBytesBuilder::new(header);
+    while let Some(message) = stream
+        .message()
         .await
         .map_err(|e| FlameError::Internal(format!("cache get failed: {}", e)))?
     {
-        if batch.num_rows() == 0 {
-            continue;
+        let Some(cache_get_response::Payload::Chunk(chunk)) = message.payload else {
+            return Err(FlameError::InvalidConfig(
+                "invalid object response: expected data chunk".to_string(),
+            ));
+        };
+        builder.push(chunk)?;
+    }
+    builder.finish(&reference.key)
+}
+
+struct ObjectBytesBuilder {
+    data_type: String,
+    version: u64,
+    base: Option<(u64, Vec<u8>)>,
+    patches: Vec<(u64, Vec<u8>)>,
+}
+
+impl ObjectBytesBuilder {
+    fn new(header: CacheGetHeader) -> Self {
+        Self {
+            data_type: header.data_type,
+            version: header.version,
+            base: None,
+            patches: Vec::new(),
         }
-        let data = data_column(&batch)?;
-        if let Some(kind) = kind_column(&batch)? {
-            for row in 0..batch.num_rows() {
-                match kind.value(row) {
-                    OBJECT_KIND_BASE => {
-                        base.extend_from_slice(data.value(row));
-                        found_base = true;
+    }
+
+    fn push(&mut self, chunk: CacheGetChunk) -> Result<(), FlameError> {
+        match CacheChunkKind::try_from(chunk.kind) {
+            Ok(CacheChunkKind::Base) => {
+                if !self.patches.is_empty() {
+                    return Err(FlameError::InvalidConfig(
+                        "invalid object response: base after patch".to_string(),
+                    ));
+                }
+                match self.base.as_mut() {
+                    Some((version, data)) if *version == chunk.version => {
+                        data.extend_from_slice(&chunk.data);
                     }
-                    OBJECT_KIND_PATCH => {}
-                    other => {
-                        return Err(FlameError::InvalidConfig(format!(
-                            "invalid object response kind '{}'",
-                            other
-                        )))
+                    Some(_) => {
+                        return Err(FlameError::InvalidConfig(
+                            "invalid object response: base version changed".to_string(),
+                        ));
                     }
+                    None => self.base = Some((chunk.version, chunk.data.to_vec())),
                 }
             }
-        } else {
-            for row in 0..batch.num_rows() {
-                base.extend_from_slice(data.value(row));
-                found_base = true;
+            Ok(CacheChunkKind::Patch) => {
+                if self.base.is_none() {
+                    return Err(FlameError::InvalidConfig(
+                        "invalid object response: patch before base".to_string(),
+                    ));
+                }
+                match self.patches.last_mut() {
+                    Some((version, data)) if *version == chunk.version => {
+                        data.extend_from_slice(&chunk.data);
+                    }
+                    _ => self.patches.push((chunk.version, chunk.data.to_vec())),
+                }
+            }
+            _ => {
+                return Err(FlameError::InvalidConfig(
+                    "invalid object response chunk kind".to_string(),
+                ));
             }
         }
+        Ok(())
     }
 
-    if found_base {
-        Ok(base)
-    } else {
-        Err(FlameError::NotFound(reference.key.clone()))
+    fn finish(self, key: &str) -> Result<ObjectBytes, FlameError> {
+        let Some((base_version, base_data)) = self.base else {
+            return Err(FlameError::NotFound(key.to_string()));
+        };
+        Ok(ObjectBytes {
+            data_type: self.data_type,
+            version: self.version,
+            base: ObjectBytePart {
+                version: base_version,
+                data: Bytes::from(base_data),
+            },
+            patches: self
+                .patches
+                .into_iter()
+                .map(|(version, data)| ObjectBytePart {
+                    version,
+                    data: Bytes::from(data),
+                })
+                .collect(),
+        })
     }
-}
-
-fn object_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new(OBJECT_FIELD_VERSION, DataType::UInt64, false),
-        Field::new(OBJECT_FIELD_DATA, DataType::Binary, false),
-    ]))
-}
-
-fn object_record_batch(
-    schema: Arc<Schema>,
-    bytes: Vec<u8>,
-) -> arrow_flight::error::Result<RecordBatch> {
-    let version_array = UInt64Array::from(vec![0_u64]);
-    let data_array = BinaryArray::from(vec![bytes.as_slice()]);
-    RecordBatch::try_new(schema, vec![Arc::new(version_array), Arc::new(data_array)])
-        .map_err(FlightError::from)
-}
-
-fn data_column(batch: &RecordBatch) -> Result<&BinaryArray, FlameError> {
-    let array = batch.column_by_name(OBJECT_FIELD_DATA).ok_or_else(|| {
-        FlameError::InvalidConfig("object response missing data column".to_string())
-    })?;
-    array
-        .as_any()
-        .downcast_ref::<BinaryArray>()
-        .ok_or_else(|| FlameError::InvalidConfig("invalid object data column".to_string()))
-}
-
-fn kind_column(batch: &RecordBatch) -> Result<Option<&StringArray>, FlameError> {
-    let Some(array) = batch.column_by_name(OBJECT_FIELD_KIND) else {
-        return Ok(None);
-    };
-    Ok(Some(
-        array
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| FlameError::InvalidConfig("invalid object kind column".to_string()))?,
-    ))
 }
 
 fn object_ref_from_doc(doc: Document) -> Result<ObjectRef, FlameError> {
@@ -897,6 +1042,7 @@ fn object_ref_from_doc(doc: Document) -> Result<ObjectRef, FlameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
 
     #[derive(Debug, DeriveSerialize, Deserialize, PartialEq)]
     struct SampleObject {
@@ -1014,5 +1160,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value, 42);
+    }
+
+    #[tokio::test]
+    async fn byte_upload_stream_sends_header_then_bounded_chunks() {
+        let data = vec![7_u8; UPLOAD_CHUNK_SIZE * 2 + 1];
+        let messages: Vec<_> = write_bytes_stream(
+            "app/session/object".to_string(),
+            Bytes::from(data.clone()),
+            "client.codec.v1",
+        )
+        .collect()
+        .await;
+        assert_eq!(messages.len(), 4);
+        match &messages[0].payload {
+            Some(cache_write_request::Payload::Header(header)) => {
+                assert_eq!(header.key, "app/session/object");
+                assert_eq!(header.data_type, "client.codec.v1");
+            }
+            _ => panic!("first message must be a header"),
+        }
+        let chunks: Vec<_> = messages[1..]
+            .iter()
+            .map(|message| match &message.payload {
+                Some(cache_write_request::Payload::Data(data)) => data.as_ref(),
+                _ => panic!("expected data chunk"),
+            })
+            .collect();
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>(),
+            vec![UPLOAD_CHUNK_SIZE, UPLOAD_CHUNK_SIZE, 1]
+        );
+        assert_eq!(chunks.concat(), data);
+
+        let empty: Vec<_> =
+            write_bytes_stream("app/session/object".to_string(), Bytes::new(), "raw")
+                .collect()
+                .await;
+        assert_eq!(empty.len(), 1);
+    }
+
+    #[test]
+    fn opaque_response_assembles_parts_with_versions() {
+        let mut builder = ObjectBytesBuilder::new(CacheGetHeader {
+            mode: CacheGetMode::Full as i32,
+            version: 13,
+            data_type: "custom.binary".to_string(),
+        });
+        for (kind, version, data) in [
+            (CacheChunkKind::Base, 10, b"ba".as_slice()),
+            (CacheChunkKind::Base, 10, b"se".as_slice()),
+            (CacheChunkKind::Patch, 11, b"pa".as_slice()),
+            (CacheChunkKind::Patch, 11, b"tch".as_slice()),
+            (CacheChunkKind::Patch, 13, b"next".as_slice()),
+        ] {
+            builder
+                .push(CacheGetChunk {
+                    kind: kind as i32,
+                    version,
+                    data: Bytes::copy_from_slice(data),
+                })
+                .unwrap();
+        }
+        let object = builder.finish("app/session/object").unwrap();
+        assert_eq!(object.data_type, "custom.binary");
+        assert_eq!(object.version, 13);
+        assert_eq!(
+            object.base,
+            ObjectBytePart {
+                version: 10,
+                data: Bytes::from_static(b"base")
+            }
+        );
+        assert_eq!(
+            object.patches,
+            vec![
+                ObjectBytePart {
+                    version: 11,
+                    data: Bytes::from_static(b"patch")
+                },
+                ObjectBytePart {
+                    version: 13,
+                    data: Bytes::from_static(b"next")
+                },
+            ]
+        );
     }
 }

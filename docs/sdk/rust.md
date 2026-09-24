@@ -226,6 +226,15 @@ let loaded_again: ModelConfig = flame::get_object(updated).await?;
 
 Use `patch_object()` for versioned delta updates, `upload_object()` and `download_object()` for files, and `delete_objects()` to remove an object or prefix. `ObjectRef` carries the cache endpoint, full key, and object version.
 
+The typed helpers use the `raw` data type. For caller-defined encodings, use
+`put_object_bytes()`, `update_object_bytes()`, or `patch_object_bytes()` with
+the encoded bytes and a data type such as `raw.zstd`. `get_object_bytes()`
+returns that type and the stored base and patch bytes without decoding them.
+File transfers are also opaque: `upload_object_with_data_type()` sends a file
+with a caller-defined type, and `download_object_with_data_type()` writes the
+stored bytes and returns their type. The caller handles any compression or
+value decoding.
+
 ## Deploy And Run
 
 Build the service binary, deploy it with `flmctl deploy`, then use the same application name from the client:

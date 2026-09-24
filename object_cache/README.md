@@ -1,10 +1,10 @@
 # Flame Object Cache
 
-Apache Arrow-based object cache service for Flame distributed system.
+Object cache service for Flame distributed system.
 
 ## Overview
 
-The `flame-object-cache` is a standalone binary that provides persistent object storage using Apache Arrow Flight protocol and Arrow IPC format for efficient serialization. It runs as a dedicated service, enabling centralized caching with version tracking for efficient client-side caching.
+The `flame-object-cache` is a standalone service that stores opaque client-encoded bytes. It uses a streaming gRPC API, keeps hot payloads in memory, and persists them as binary files. Clients choose their own value encoding, including Arrow IPC for table values, and provide a data type such as `raw.zstd` when they compress the bytes.
 
 ## Features
 
@@ -12,8 +12,9 @@ The `flame-object-cache` is a standalone binary that provides persistent object 
 - **Version Tracking**: Each object has a version number, incremented on mutations
 - **Conditional Get**: Clients can check if their cached copy is still valid (RFE426)
 - **Client-Side Caching**: Python SDK caches objects locally, reducing network round-trips
-- **Persistent Storage**: Objects are stored on disk using Arrow IPC format
-- **Arrow Flight Protocol**: High-performance gRPC-based protocol for data transfer
+- **Persistent Storage**: Opaque objects and patches are stored in binary files
+- **Streaming gRPC API**: Chunked transfer without server-side value encoding
+- **Client-Side Compression**: The Python SDK compresses structured data and tensors; the cache stores their bytes unchanged
 - **Delta Support**: Append-only patches without rewriting the base object
 - **Eviction Policies**: LRU eviction with configurable memory limits
 
@@ -116,6 +117,10 @@ from flamepy.core.cache import (
 ref = put_object("app/session", my_data)
 print(f"Stored at: {ref.key}, version: {ref.version}")
 
+# The SDK uses ZSTD for arrays, tables, data frames, and tensors regardless
+# of payload size; their data type gains a .zstd suffix. Arbitrary pickled
+# objects and raw file uploads, including .tar.gz packages, remain uncompressed.
+
 # Get an object (uses client-side cache if version matches)
 data = get_object(ref)
 
@@ -153,11 +158,11 @@ Client-side caching workflow:
 ```
 Client                              Server
   |                                    |
-  |-- do_get(key:0) ------------------>|  (version=0 means "give me latest")
-  |<-- [Arrow RecordBatch with data] --|  (client caches object, version=1)
+  |-- Get(key, version=0) ------------>|  (version=0 means "give me latest")
+  |<-- [header, bytes] ---------------|  (client caches object, version=1)
   |                                    |
-  |-- do_get(key:1) ------------------>|  (client has version 1)
-  |<-- [empty stream] -----------------|  (not modified, no data transfer!)
+  |-- Get(key, version=1) ------------>|  (client has version 1)
+  |<-- [NOT_MODIFIED header] ----------|  (no payload transfer)
 ```
 
 ## Storage Structure
@@ -166,42 +171,56 @@ Client                              Server
 /var/lib/flame/cache/
 └── app_name/
     └── session_id/
-        ├── object1.arrow       # Base object
-        ├── object1.delta.001   # Delta 1
-        ├── object1.delta.002   # Delta 2
-        └── object2.arrow
+        ├── object1.bin          # Opaque base payload with cache header
+        ├── object1.deltas/
+        │   ├── 0.bin            # Opaque patch
+        │   └── 1.bin            # Opaque patch
+        └── object2.bin          # Another opaque base payload
 ```
 
-Each object is stored as an Arrow IPC file with schema: `{version: UInt64, data: Binary}`
+Opaque payloads are stored directly in binary files with a small cache header
+for version, creation time, and client-provided data type. All patches have
+the same type as the base. Clients encode Arrow tables to bytes and optionally
+compress them before uploading. The cache does not decompress hot or persisted
+objects.
 
 ## API
 
-The cache server implements the Arrow Flight protocol:
+The cache server implements `ObjectCacheService` in `cache.proto`:
 
 | Operation | Description |
 |-----------|-------------|
-| `do_put` | Upload or update an object (returns ObjectRef with version) |
-| `do_put` (PATCH cmd) | Append delta to existing object (command: `PATCH:{key}`) |
-| `do_get` | Retrieve object with conditional version check (ticket: `{key}:{version}`) |
-| `get_flight_info` | Get metadata about an object |
-| `list_flights` | List all cached objects |
-| `do_action(DELETE)` | Delete objects by key prefix (supports `{app}/*` wildcard) |
+| `Put` | Stream a new or replacement object; return its metadata |
+| `Patch` | Stream a delta for an existing object; return updated metadata |
+| `Get` | Stream a full object, later patches, or a not-modified header |
+| `GetMetadata` | Get metadata for one object |
+| `List` | Stream metadata for all objects |
+| `Delete` | Delete a key or prefix, including `{app}/*` |
 
 ### Wire Protocol Details
 
-**Conditional GET (`do_get`)**:
-- Ticket format: `{key}:{client_version}` (e.g., `app/session/obj1:5`)
+**Conditional GET (`Get`)**:
+- Request: full key and `client_version`
 - If `client_version == 0`: Always returns full object (force refresh)
-- If `client_version == server_version`: Returns empty stream (not modified)
-- If versions differ: Returns full object as Arrow RecordBatch
+- If `client_version == server_version`: Returns `NOT_MODIFIED` without payload chunks
+- If a contiguous patch suffix is available: Returns only later patches
+- Otherwise: Returns the base object and all patches
+- Chunks for one base or patch share a kind and version. A new part or the end
+  of the stream completes that part. Empty parts have one empty chunk.
+- The response header carries the shared data type for the base and patches.
+- The Python SDK interprets types such as `arrow.table.zstd` and decompresses
+  each base or patch before decoding its value. Other clients receive the type
+  and bytes unchanged. The cache does not parse the type.
 
-**PUT/UPDATE (`do_put`)**:
-- Uses `FlightDescriptor.for_path(key)` to specify object key
+**PUT/UPDATE (`Put`)**:
+- Starts with a key or prefix and client-provided data type, followed by
+  byte chunks of at most 1 MiB
 - New objects are created with `version=1`
 - Existing objects are overwritten (version incremented server-side)
 
-**PATCH (`do_put` with command)**:
-- Uses `FlightDescriptor.for_command("PATCH:{key}")` 
+**PATCH (`Patch`)**:
+- Starts with a full object key and the same data type as the base, followed
+  by byte chunks
 - Appends delta to existing object, increments version
 - Returns error if base object doesn't exist
 
@@ -215,6 +234,20 @@ cargo build --package flame-object-cache --release
 cargo test --package flame-object-cache
 ```
 
+### Performance benchmark
+
+Run the opt-in microbenchmarks with optimized code and one test thread:
+
+```bash
+cargo test -p flame-object-cache --release cache_benchmarks -- --ignored --nocapture --test-threads=1
+```
+
+The opaque-object benchmark compares copying an 8 MiB payload with sharing its
+cached snapshot. The disk benchmarks measure 8 MiB opaque writes and object reloads, plus
+sequential 1 KiB patch appends. Reloads bypass the in-memory object cache but
+may be served by the operating system's page cache; these timings are not
+physical cold-disk measurements.
+
 ## Architecture
 
 ```
@@ -223,7 +256,7 @@ cargo test --package flame-object-cache
                     │ cache            │
                     │ (standalone)     │
                     └────────┬─────────┘
-                             │ Arrow Flight
+                             │ gRPC bytes
          ┌───────────────────┼───────────────────┐
          │                   │                   │
 ┌────────┴───────┐  ┌────────┴───────┐  ┌────────┴───────┐

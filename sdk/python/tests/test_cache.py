@@ -1,41 +1,32 @@
 import threading
 from types import SimpleNamespace
 
-import bson
 import numpy as np
 import pyarrow as pa
 import pytest
 
 from flamepy.core.cache import (
-    _MAGIC_PREFIX_LEN,
     _TYPE_ARROW_ARRAY,
     _TYPE_ARROW_BATCH,
     _TYPE_ARROW_TABLE,
     _TYPE_CLOUDPICKLE,
     _TYPE_NUMPY,
-    OBJECT_FIELD_DATA,
-    OBJECT_FIELD_VERSION,
-    OBJECT_RESPONSE_FIELD_KIND,
+    _TYPE_PANDAS_DATAFRAME,
+    _TYPE_POLARS_DATAFRAME,
     FetchMode,
     FetchResult,
     Object,
     ObjectKey,
     ObjectRef,
-    ObjectResponseKind,
     Patch,
     _cache_lock,
-    _deserialize_object,
     _deserialize_object_data,
-    _is_native_arrow_schema,
     _object_cache,
-    _prepare_cache_payload,
-    _serialize_object,
     _serialize_object_data,
-    delete_objects,
 )
 
 
-class TestFlightClientEndpoints:
+class TestGrpcClientEndpoints:
     def setup_method(self):
         from flamepy.core import cache as cache_module
 
@@ -48,326 +39,129 @@ class TestFlightClientEndpoints:
         with cache_module._client_pool_lock:
             cache_module._client_pool.clear()
 
-    def test_direct_grpc_endpoint_is_unchanged(self, monkeypatch):
+    def test_direct_plaintext_endpoint(self, monkeypatch):
         from flamepy.core import cache as cache_module
 
         calls = []
-        monkeypatch.setattr(
-            cache_module,
-            "_get_cached_context",
-            lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpc://cache:9090")),
-        )
-        monkeypatch.setattr(cache_module.flight, "FlightClient", lambda location, **kwargs: calls.append((location, kwargs)) or object())
+        monkeypatch.setattr(cache_module.grpc, "insecure_channel", lambda target, options: calls.append((target, options)) or object())
+        monkeypatch.setattr(cache_module.cache_pb2_grpc, "ObjectCacheServiceStub", lambda channel: channel)
+        monkeypatch.setattr(cache_module, "_get_cached_context", lambda: SimpleNamespace(cache=None))
+        cache_module._get_cache_client("grpc://cache:9090")
+        assert calls == [("cache:9090", cache_module.GRPC_OPTIONS)]
 
-        cache_module._get_flight_client("grpc://cache:9090")
-
-        assert calls == [("grpc://cache:9090", {"generic_options": cache_module.GRPC_OPTIONS})]
-
-    def test_proxy_dials_gateway_with_object_authority(self, monkeypatch):
+    def test_proxy_preserves_object_authority_and_custom_roots(self, monkeypatch, tmp_path):
         from flamepy.core import cache as cache_module
 
-        calls = []
-        monkeypatch.setattr(
-            cache_module,
-            "_get_cached_context",
-            lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpcs-proxy://gateway.example:8080")),
-        )
-        monkeypatch.setattr(cache_module.flight, "FlightClient", lambda location, **kwargs: calls.append((location, kwargs)) or object())
-
-        cache_module._get_flight_client("grpc://object-cache.flame.svc:9090")
-
-        assert calls[0][0] == "grpc+tls://gateway.example:8080"
-        assert ("grpc.default_authority", "object-cache.flame.svc:9090") in calls[0][1]["generic_options"]
-
-    def test_proxy_uses_custom_tls_roots_with_object_authority(self, monkeypatch, tmp_path):
-        from flamepy.core import cache as cache_module
-
-        ca_file = tmp_path / "proxy-ca.pem"
+        ca_file = tmp_path / "ca.pem"
         ca_file.write_bytes(b"proxy CA")
         calls = []
-        monkeypatch.setattr(
-            cache_module,
-            "_get_cached_context",
-            lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpcs-proxy://gateway.example:443")),
-        )
-        monkeypatch.setattr(cache_module.flight, "FlightClient", lambda location, **kwargs: calls.append((location, kwargs)) or object())
+        monkeypatch.setattr(cache_module, "_get_cached_context", lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpcs-proxy://gateway.example:443")))
+        monkeypatch.setattr(cache_module.grpc, "ssl_channel_credentials", lambda root_certificates: calls.append(("roots", root_certificates)) or object())
+        monkeypatch.setattr(cache_module.grpc, "secure_channel", lambda target, credentials, options: calls.append((target, options)) or object())
+        monkeypatch.setattr(cache_module.cache_pb2_grpc, "ObjectCacheServiceStub", lambda channel: channel)
+        client = cache_module._get_cache_client("grpc://object-cache:9090", cache_module.FlameClientTls(ca_file=str(ca_file)))
+        assert client is cache_module._get_cache_client("grpc://object-cache:9090")
+        assert calls[0] == ("roots", b"proxy CA")
+        assert calls[1][0] == "gateway.example:443"
+        assert ("grpc.default_authority", "object-cache:9090") in calls[1][1]
 
-        tls = cache_module.FlameClientTls(ca_file=str(ca_file))
-        cache_module._get_flight_client("grpc://object-cache-0.flame.svc:9090", tls)
-
-        assert calls[0][0] == "grpc+tls://gateway.example:443"
-        assert calls[0][1]["tls_root_certs"] == b"proxy CA"
-        assert ("grpc.default_authority", "object-cache-0.flame.svc:9090") in calls[0][1]["generic_options"]
-
-    @pytest.mark.parametrize("scheme", ["grpcs", "grpc+tls"])
-    def test_proxy_dials_gateway_for_tls_object_endpoint(self, monkeypatch, scheme):
-        from flamepy.core import cache as cache_module
-
-        calls = []
-        monkeypatch.setattr(
-            cache_module,
-            "_get_cached_context",
-            lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpcs-proxy://gateway.example:8080")),
-        )
-        monkeypatch.setattr(cache_module.flight, "FlightClient", lambda location, **kwargs: calls.append((location, kwargs)) or object())
-
-        cache_module._get_flight_client(f"{scheme}://object-cache.flame.svc:9090")
-
-        assert calls[0][0] == "grpc+tls://gateway.example:8080"
-        assert ("grpc.default_authority", "object-cache.flame.svc:9090") in calls[0][1]["generic_options"]
-
-    def test_proxy_pool_is_isolated_by_object_authority(self, monkeypatch):
-        from flamepy.core import cache as cache_module
-
-        calls = []
-        monkeypatch.setattr(
-            cache_module,
-            "_get_cached_context",
-            lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpcs-proxy://gateway.example:8080")),
-        )
-        monkeypatch.setattr(cache_module.flight, "FlightClient", lambda location, **kwargs: calls.append((location, kwargs)) or object())
-
-        first = cache_module._get_flight_client("grpc://cache-a:9090")
-        assert cache_module._get_flight_client("grpc://cache-a:9090") is first
-        cache_module._get_flight_client("grpc://cache-b:9090")
-
-        assert len(calls) == 2
-        assert ("grpc+tls://gateway.example:8080", "cache-a:9090") in cache_module._client_pool
-        assert ("grpc+tls://gateway.example:8080", "cache-b:9090") in cache_module._client_pool
-
-    def test_proxy_endpoint_itself_uses_its_default_authority(self, monkeypatch):
-        from flamepy.core import cache as cache_module
-
-        calls = []
-        monkeypatch.setattr(
-            cache_module,
-            "_get_cached_context",
-            lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpcs-proxy://gateway.example:8080")),
-        )
-        monkeypatch.setattr(cache_module.flight, "FlightClient", lambda location, **kwargs: calls.append((location, kwargs)) or object())
-
-        cache_module._get_flight_client("grpcs-proxy://gateway.example:8080")
-
-        assert calls == [("grpc+tls://gateway.example:8080", {"generic_options": cache_module.GRPC_OPTIONS})]
-
-    @pytest.mark.parametrize(
-        "endpoint",
-        [
-            "grpcs-proxy://gateway.example:8080/path",
-            "grpcs-proxy://gateway.example:8080?host=cache:9090",
-            "grpcs-proxy://user@gateway.example:8080",
-            "grpcs-proxy://gateway.example",
-        ],
-    )
-    def test_proxy_endpoint_rejects_url_extras(self, endpoint):
+    @pytest.mark.parametrize("endpoint", ["grpcs-proxy://gateway:443/path", "grpcs-proxy://gateway"])
+    def test_invalid_proxy(self, endpoint):
         from flamepy.core import cache as cache_module
 
         with pytest.raises(ValueError, match="proxy endpoint"):
-            cache_module._resolve_flight_endpoint(endpoint)
-
-    def test_plaintext_proxy_scheme_is_rejected(self):
-        from flamepy.core import cache as cache_module
-
-        with pytest.raises(ValueError, match="use grpcs-proxy"):
-            cache_module._resolve_flight_endpoint("grpc-proxy://gateway.example:8080")
+            cache_module._resolve_cache_endpoint(endpoint)
 
 
 class TestSerialization:
-    def test_serialize_deserialize_roundtrip(self):
-        original = {"key": "value", "number": 42, "nested": {"a": 1}}
-        batch = _serialize_object(original)
+    @pytest.mark.parametrize("original", [{"nested": {"a": 1}}, [1, 2, 3], "text", 42, None])
+    def test_cloudpickle_roundtrip(self, original):
+        data_type, payload = _serialize_object_data(original)
+        assert data_type == _TYPE_CLOUDPICKLE
+        assert _deserialize_object_data(data_type, payload) == original
+        assert not payload.startswith(b"FLM")
 
-        assert batch.num_rows == 1
-        assert batch.num_columns == 2
-        assert batch.schema.names == ["version", "data"]
+    def test_numpy_array_roundtrip(self):
+        array = np.array([[1.0, 2.0], [3.0, 4.0]])
+        data_type, payload = _serialize_object_data(array)
+        assert data_type == _TYPE_NUMPY
+        np.testing.assert_array_equal(_deserialize_object_data(data_type, payload), array)
 
-        result = _deserialize_object(batch)
-        assert result == original
+    def test_non_contiguous_numpy_uses_cloudpickle(self):
+        array = np.arange(9).reshape(3, 3)[:, ::2]
+        data_type, payload = _serialize_object_data(array)
+        assert data_type == _TYPE_CLOUDPICKLE
+        np.testing.assert_array_equal(_deserialize_object_data(data_type, payload), array)
 
-    def test_serialize_handles_various_types(self):
-        test_cases = [
-            [1, 2, 3],
-            {"nested": {"deep": {"value": True}}},
-            "simple string",
-            42,
-            3.14159,
-            None,
-        ]
+    def test_arrow_table_batch_array_roundtrip(self):
+        values = [(pa.table({"x": [1, 2]}), _TYPE_ARROW_TABLE), (pa.RecordBatch.from_pydict({"x": [1, 2]}), _TYPE_ARROW_BATCH), (pa.array([1, 2]), _TYPE_ARROW_ARRAY)]
+        for value, expected_type in values:
+            data_type, payload = _serialize_object_data(value)
+            assert data_type == expected_type
+            assert _deserialize_object_data(data_type, payload).equals(value)
 
-        for original in test_cases:
-            batch = _serialize_object(original)
-            result = _deserialize_object(batch)
-            assert result == original
+    def test_pandas_dataframe_roundtrip(self):
+        from flamepy.core import cache as cache_module
 
-
-class TestFastPathSerialization:
-    def test_numpy_array_uses_fast_path(self):
-        arr = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float64)
-        data = _serialize_object_data(arr)
-
-        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_NUMPY
-        result = _deserialize_object_data(data)
-        np.testing.assert_array_equal(result, arr)
-
-    def test_numpy_array_various_dtypes(self):
-        test_cases = [
-            np.array([1, 2, 3], dtype=np.int32),
-            np.array([1.5, 2.5, 3.5], dtype=np.float32),
-            np.array([1, 2, 3], dtype=np.int64),
-            np.array([[1, 2], [3, 4]], dtype=np.float64),
-            np.zeros((10, 10, 3), dtype=np.uint8),
-        ]
-
-        for original in test_cases:
-            data = _serialize_object_data(original)
-            assert data[:_MAGIC_PREFIX_LEN] == _TYPE_NUMPY
-            result = _deserialize_object_data(data)
-            np.testing.assert_array_equal(result, original)
-            assert result.dtype == original.dtype
-
-    def test_numpy_large_array_performance(self):
-        import time
-
-        large_arr = np.random.rand(1000, 1000)
-
-        start = time.perf_counter()
-        data = _serialize_object_data(large_arr)
-        serialize_time = time.perf_counter() - start
-
-        start = time.perf_counter()
-        result = _deserialize_object_data(data)
-        deserialize_time = time.perf_counter() - start
-
-        np.testing.assert_array_almost_equal(result, large_arr)
-        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_NUMPY
-        assert serialize_time < 0.5
-        assert deserialize_time < 0.5
-
-    def test_pyarrow_table_uses_fast_path(self):
-        table = pa.table({"col1": [1, 2, 3], "col2": ["a", "b", "c"]})
-        data = _serialize_object_data(table)
-
-        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_ARROW_TABLE
-        result = _deserialize_object_data(data)
-        assert result.equals(table)
-
-    def test_pyarrow_table_uses_native_cache_payload(self):
-        table = pa.table({"col1": [1, 2, 3], "col2": ["a", "b", "c"]})
-        payload = _prepare_cache_payload(table)
-
-        assert payload.native_arrow is True
-        assert _is_native_arrow_schema(payload.schema)
-        assert payload.batches
-        assert payload.schema.metadata[b"flame.cache.logical_type"] == b"pyarrow.table"
-
-    def test_pyarrow_record_batch_uses_fast_path(self):
-        batch = pa.RecordBatch.from_pydict({"x": [1, 2, 3], "y": [4.0, 5.0, 6.0]})
-        data = _serialize_object_data(batch)
-
-        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_ARROW_BATCH
-        result = _deserialize_object_data(data)
-        assert result.equals(batch)
-
-    def test_pyarrow_record_batch_uses_native_cache_payload(self):
-        batch = pa.RecordBatch.from_pydict({"x": [1, 2, 3], "y": [4.0, 5.0, 6.0]})
-        payload = _prepare_cache_payload(batch)
-
-        assert payload.native_arrow is True
-        assert _is_native_arrow_schema(payload.schema)
-        assert payload.batches[0].to_pydict() == batch.to_pydict()
-        assert payload.schema.metadata[b"flame.cache.logical_type"] == b"pyarrow.record_batch"
-
-    def test_pandas_dataframe_uses_native_cache_payload_when_available(self):
         pd = pytest.importorskip("pandas")
-        dataframe = pd.DataFrame({"col1": [1, 2, 3], "col2": ["a", "b", "c"]})
-        payload = _prepare_cache_payload(dataframe)
+        frame = pd.DataFrame({"x": [1, 2]}, index=pd.Index([4, 5], name="row"))
+        data_type, payload = _serialize_object_data(frame)
+        assert data_type == _TYPE_PANDAS_DATAFRAME
+        pd.testing.assert_frame_equal(_deserialize_object_data(data_type, payload), frame)
+        wire_type, wire_payload = cache_module._encode_object_data(frame)
+        assert wire_type == f"{_TYPE_PANDAS_DATAFRAME}.zstd"
+        pd.testing.assert_frame_equal(_deserialize_object_data(data_type, cache_module._decompress_data(wire_payload, "zstd")), frame)
 
-        assert payload.native_arrow is True
-        assert _is_native_arrow_schema(payload.schema)
-        assert payload.schema.metadata[b"flame.cache.logical_type"] == b"pandas.dataframe"
+    def test_polars_dataframe_and_lazyframe_roundtrip(self):
+        from flamepy.core import cache as cache_module
 
-    def test_polars_dataframe_uses_native_cache_payload_when_available(self):
         pl = pytest.importorskip("polars")
-        dataframe = pl.DataFrame({"col1": [1, 2, 3], "col2": ["a", "b", "c"]})
-        payload = _prepare_cache_payload(dataframe)
+        frame = pl.DataFrame({"x": [1, 2]})
+        for value in (frame, frame.lazy()):
+            data_type, payload = _serialize_object_data(value)
+            assert data_type == _TYPE_POLARS_DATAFRAME
+            assert _deserialize_object_data(data_type, payload).equals(frame)
+            wire_type, wire_payload = cache_module._encode_object_data(value)
+            assert wire_type == f"{_TYPE_POLARS_DATAFRAME}.zstd"
+            assert _deserialize_object_data(data_type, cache_module._decompress_data(wire_payload, "zstd")).equals(frame)
 
-        assert payload.native_arrow is True
-        assert _is_native_arrow_schema(payload.schema)
-        assert payload.schema.metadata[b"flame.cache.logical_type"] == b"polars.dataframe"
+    def test_optional_torch_tensor_is_compressed_without_importing_torch(self, monkeypatch):
+        import sys
 
-    def test_pyarrow_array_uses_fast_path(self):
-        arr = pa.array([1, 2, 3, 4, 5])
-        data = _serialize_object_data(arr)
+        from flamepy.core import cache as cache_module
 
-        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_ARROW_ARRAY
-        result = _deserialize_object_data(data)
-        assert result.equals(arr)
+        class Tensor:
+            def __init__(self, value):
+                self.value = value
 
-    def test_pyarrow_chunked_array_uses_cloudpickle(self):
-        chunked = pa.chunked_array([[1, 2], [3, 4]])
-        data = _serialize_object_data(chunked)
+        monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(Tensor=Tensor))
+        wire_type, wire_payload = cache_module._encode_object_data(Tensor(7))
+        assert wire_type == "cloudpickle.zstd"
+        assert cache_module._deserialize_object_data(_TYPE_CLOUDPICKLE, cache_module._decompress_data(wire_payload, "zstd")).value == 7
 
-        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_CLOUDPICKLE
-        result = _deserialize_object_data(data)
-        assert result.equals(chunked)
+    def test_unknown_data_type_is_rejected(self):
+        with pytest.raises(ValueError, match="Unsupported cache data type"):
+            _deserialize_object_data("unknown", b"data")
 
-    def test_dict_uses_cloudpickle(self):
-        obj = {"key": "value", "number": 42}
-        data = _serialize_object_data(obj)
+    @pytest.mark.parametrize(
+        "value,expected_type",
+        [
+            (np.zeros(10000, dtype=np.int64), _TYPE_NUMPY),
+            (pa.table({"x": ["repeat" * 20] * 1000}), _TYPE_ARROW_TABLE),
+            (pa.RecordBatch.from_pydict({"x": ["repeat" * 20] * 1000}), _TYPE_ARROW_BATCH),
+            (pa.array(["repeat" * 20] * 1000), _TYPE_ARROW_ARRAY),
+        ],
+    )
+    def test_auto_compression_preserves_arrow_and_numpy_types(self, value, expected_type):
+        from flamepy.core import cache as cache_module
 
-        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_CLOUDPICKLE
-        result = _deserialize_object_data(data)
-        assert result == obj
-
-    def test_list_uses_cloudpickle(self):
-        obj = [1, 2, 3, "mixed", {"nested": True}]
-        data = _serialize_object_data(obj)
-
-        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_CLOUDPICKLE
-        result = _deserialize_object_data(data)
-        assert result == obj
-
-    def test_full_roundtrip_via_record_batch(self):
-        test_cases = [
-            np.array([1.0, 2.0, 3.0]),
-            pa.table({"a": [1, 2, 3]}),
-            pa.array([10, 20, 30]),
-            {"python": "dict"},
-            [1, 2, 3],
-        ]
-
-        for original in test_cases:
-            batch = _serialize_object(original)
-            result = _deserialize_object(batch)
-
-            if isinstance(original, np.ndarray):
-                np.testing.assert_array_equal(result, original)
-            elif isinstance(original, (pa.Table, pa.Array)):
-                assert result.equals(original)
-            else:
-                assert result == original
-
-    def test_non_contiguous_numpy_array_uses_cloudpickle(self):
-        arr = np.array([[1, 2, 3], [4, 5, 6]])
-        non_contiguous = arr[:, ::2]
-        assert not non_contiguous.flags.c_contiguous
-        assert not non_contiguous.flags.f_contiguous
-
-        data = _serialize_object_data(non_contiguous)
-        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_CLOUDPICKLE
-
-        result = _deserialize_object_data(data)
-        np.testing.assert_array_equal(result, non_contiguous)
-
-    def test_fortran_contiguous_array_uses_fast_path(self):
-        arr = np.asfortranarray([[1, 2], [3, 4], [5, 6]])
-        assert arr.flags.f_contiguous
-
-        data = _serialize_object_data(arr)
-        assert data[:_MAGIC_PREFIX_LEN] == _TYPE_NUMPY
-
-        result = _deserialize_object_data(data)
-        np.testing.assert_array_equal(result, arr)
+        data_type, data = cache_module._encode_object_data(value)
+        assert data_type == f"{expected_type}.zstd"
+        decoded = _deserialize_object_data(expected_type, cache_module._decompress_data(data, "zstd"))
+        if isinstance(value, np.ndarray):
+            np.testing.assert_array_equal(decoded, value)
+        else:
+            assert decoded.equals(value)
 
 
 class TestClientSideCaching:
@@ -379,40 +173,17 @@ class TestClientSideCaching:
         with _cache_lock:
             _object_cache.clear()
 
-    def _response_table(self, rows):
-        return pa.table(
-            {
-                OBJECT_FIELD_VERSION: pa.array([row[0] for row in rows], type=pa.uint64()),
-                OBJECT_RESPONSE_FIELD_KIND: pa.array(
-                    [row[1].value for row in rows],
-                    type=pa.string(),
-                ),
-                OBJECT_FIELD_DATA: pa.array(
-                    [_serialize_object_data(row[2]) for row in rows],
-                    type=pa.binary(),
-                ),
-            }
-        )
-
-    def _patch_fetch_client(self, monkeypatch, table):
+    def _patch_fetch_client(self, monkeypatch, responses):
         from flamepy.core import cache as cache_module
 
-        class FakeReader:
-            def read_all(self):
-                return table
-
         class FakeClient:
-            def do_get(self, ticket):
-                self.ticket = ticket
-                return FakeReader()
+            def Get(self, request):  # noqa: N802 - mirrors the generated gRPC stub
+                self.request = request
+                return iter(responses)
 
         fake_client = FakeClient()
+        monkeypatch.setattr(cache_module, "_get_cache_client", lambda endpoint, tls: fake_client)
         monkeypatch.setattr(cache_module, "_get_cache_tls_config", lambda: None)
-        monkeypatch.setattr(
-            cache_module,
-            "_get_flight_client",
-            lambda endpoint, tls_config: fake_client,
-        )
         return fake_client
 
     def test_cache_hit_returns_cached_data(self, monkeypatch):
@@ -744,70 +515,49 @@ class TestClientSideCaching:
 
         assert result == [1, 2, 3, 4, 5, 6]
 
-    def test_fetch_object_data_parses_full_response_rows(self, monkeypatch):
+    def test_fetch_object_data_parses_full_response_chunks(self, monkeypatch):
         from flamepy.core import cache as cache_module
 
-        table = self._response_table(
-            [
-                (1, ObjectResponseKind.BASE, [1]),
-                (2, ObjectResponseKind.PATCH, [2]),
-                (3, ObjectResponseKind.PATCH, [3]),
-            ]
-        )
-        self._patch_fetch_client(monkeypatch, table)
-
-        result = cache_module._fetch_object_data(
-            ObjectRef(endpoint="grpc://host:9090", key="app/session/obj6", version=1),
-            0,
-        )
-
+        pb = cache_module.cache_pb2
+        responses = [pb.CacheGetResponse(header=pb.CacheGetHeader(mode=pb.CACHE_GET_MODE_FULL, version=3, data_type=_TYPE_CLOUDPICKLE))]
+        for kind, version, value in [(pb.CACHE_CHUNK_KIND_BASE, 1, [1]), (pb.CACHE_CHUNK_KIND_PATCH, 2, [2]), (pb.CACHE_CHUNK_KIND_PATCH, 3, [3])]:
+            _, data = _serialize_object_data(value)
+            responses.append(pb.CacheGetResponse(chunk=pb.CacheGetChunk(kind=kind, version=version, data=data[:2])))
+            responses.append(pb.CacheGetResponse(chunk=pb.CacheGetChunk(kind=kind, version=version, data=data[2:])))
+        client = self._patch_fetch_client(monkeypatch, responses)
+        result = cache_module._fetch_object_data(ObjectRef("grpc://host:9090", "app/session/obj6"), 0)
+        assert client.request.key == "app/session/obj6"
         assert result.mode == FetchMode.FULL
         assert result.version == 3
         assert result.base == [1]
         assert [patch.data for patch in result.patches] == [[2], [3]]
 
-    def test_fetch_object_data_parses_native_arrow_table(self, monkeypatch):
-        from flamepy.core import cache as cache_module
-
-        table = pa.table({"x": [1, 2, 3], "y": ["a", "b", "c"]})
-        table = table.replace_schema_metadata(
-            {
-                b"flame.cache.format": b"arrow-table-v1",
-                b"flame.cache.version": b"7",
-                b"flame.cache.logical_type": b"pyarrow.table",
-            }
-        )
-        self._patch_fetch_client(monkeypatch, table)
-
-        result = cache_module._fetch_object_data(
-            ObjectRef(endpoint="grpc://host:9090", key="app/session/native-table", version=1),
-            0,
-        )
-
-        assert result.mode == FetchMode.FULL
-        assert result.version == 7
-        assert isinstance(result.base, pa.Table)
-        assert result.base.to_pydict() == {"x": [1, 2, 3], "y": ["a", "b", "c"]}
-        assert b"flame.cache.format" not in (result.base.schema.metadata or {})
-
     def test_fetch_object_data_rejects_base_after_patch(self, monkeypatch):
         from flamepy.core import cache as cache_module
 
-        table = self._response_table(
-            [
-                (2, ObjectResponseKind.PATCH, [2]),
-                (1, ObjectResponseKind.BASE, [1]),
-            ]
-        )
-        self._patch_fetch_client(monkeypatch, table)
+        pb = cache_module.cache_pb2
+        responses = [
+            pb.CacheGetResponse(header=pb.CacheGetHeader(mode=pb.CACHE_GET_MODE_FULL, version=2, data_type=_TYPE_CLOUDPICKLE)),
+            pb.CacheGetResponse(chunk=pb.CacheGetChunk(kind=pb.CACHE_CHUNK_KIND_PATCH, version=2, data=_serialize_object_data([2])[1])),
+            pb.CacheGetResponse(chunk=pb.CacheGetChunk(kind=pb.CACHE_CHUNK_KIND_BASE, version=1, data=_serialize_object_data([1])[1])),
+        ]
+        self._patch_fetch_client(monkeypatch, responses)
+        with pytest.raises(ValueError, match="start with a base"):
+            cache_module._fetch_object_data(ObjectRef("grpc://host:9090", "app/session/obj7"), 1)
 
-        ref = ObjectRef(endpoint="grpc://host:9090", key="app/session/obj7", version=1)
-        try:
-            cache_module._fetch_object_data(ref, 1)
-        except ValueError as exc:
-            assert "base row" in str(exc)
-        else:
-            raise AssertionError("expected ValueError for malformed full response")
+    def test_fetch_object_data_rejects_unknown_data_type(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        pb = cache_module.cache_pb2
+        self._patch_fetch_client(
+            monkeypatch,
+            [
+                pb.CacheGetResponse(header=pb.CacheGetHeader(mode=pb.CACHE_GET_MODE_FULL, version=1, data_type="unknown.zstd")),
+                pb.CacheGetResponse(chunk=pb.CacheGetChunk(kind=pb.CACHE_CHUNK_KIND_BASE, version=1, data=cache_module._compress_data(b"data", "zstd"))),
+            ],
+        )
+        with pytest.raises(ValueError, match="Unsupported cache data type"):
+            cache_module._fetch_object_data(ObjectRef("grpc://host:9090", "app/session/obj7"), 0)
 
     def test_thread_safety(self, monkeypatch):
         from flamepy.core import cache as cache_module
@@ -842,114 +592,7 @@ class TestClientSideCaching:
         assert len(results) == 10
 
 
-class TestPutObject:
-    def test_remote_put_sends_native_arrow_payload(self, monkeypatch):
-        from flamepy.core import cache as cache_module
-        from flamepy.core.types import FlameClientCache
-
-        captured = {"schema": None, "batches": []}
-
-        class MockWriter:
-            def write_batch(self, batch):
-                captured["batches"].append(batch)
-
-            def done_writing(self):
-                pass
-
-            def close(self):
-                pass
-
-        class MockReader:
-            def __init__(self):
-                self._read_count = 0
-
-            def read(self):
-                if self._read_count == 0:
-                    self._read_count += 1
-                    return bson.encode({"endpoint": "grpc://host:9090", "key": "app/session/native", "version": 1})
-                return None
-
-        class MockFlightClient:
-            def do_put(self, descriptor, schema):
-                captured["schema"] = schema
-                return MockWriter(), MockReader()
-
-        class MockContext:
-            cache = FlameClientCache(endpoint="grpc://host:9090")
-
-        monkeypatch.setattr(cache_module, "_context_cache", None)
-        monkeypatch.setattr(cache_module, "FlameContext", lambda: MockContext())
-        monkeypatch.setattr(cache_module, "_get_flight_client", lambda ep, tls=None: MockFlightClient())
-
-        ref = cache_module.put_object("app/session", pa.table({"x": [1, 2, 3]}))
-
-        assert ref.key == "app/session/native"
-        assert captured["schema"].metadata[b"flame.cache.format"] == b"arrow-table-v1"
-        assert captured["schema"].metadata[b"flame.cache.logical_type"] == b"pyarrow.table"
-        assert len(captured["batches"]) == 1
-        assert captured["batches"][0].to_pydict() == {"x": [1, 2, 3]}
-
-    def test_local_storage_ref_uses_cacheable_version(self, monkeypatch, tmp_path):
-        from flamepy.core import cache as cache_module
-        from flamepy.core.types import FlameClientCache
-
-        writer_calls = {"entered": 0, "exited": 0, "batches": 0, "path": None}
-
-        class MockFileWriter:
-            def __enter__(self):
-                writer_calls["entered"] += 1
-                return self
-
-            def __exit__(self, exc_type, exc, traceback):
-                writer_calls["exited"] += 1
-                return False
-
-            def write_batch(self, batch):
-                writer_calls["batches"] += 1
-
-        def mock_new_file(path, schema):
-            writer_calls["path"] = path
-            return MockFileWriter()
-
-        class MockLocation:
-            uri = "grpc://local-cache:9090"
-
-        class MockEndpoint:
-            locations = [MockLocation()]
-
-        class MockFlightInfo:
-            endpoints = [MockEndpoint()]
-
-        class MockFlightClient:
-            def get_flight_info(self, descriptor):
-                return MockFlightInfo()
-
-        class MockContext:
-            cache = FlameClientCache(
-                endpoint="grpc://host:9090",
-                storage=str(tmp_path),
-            )
-
-        monkeypatch.setattr(cache_module, "_context_cache", None)
-        monkeypatch.setattr(cache_module, "FlameContext", lambda: MockContext())
-        monkeypatch.setattr(
-            cache_module,
-            "_get_flight_client",
-            lambda endpoint, tls=None: MockFlightClient(),
-        )
-        monkeypatch.setattr(cache_module.pa.ipc, "new_file", mock_new_file)
-
-        ref = cache_module.put_object("app/session", {"value": 1})
-
-        assert ref.endpoint == "grpc://local-cache:9090"
-        assert ref.version == 1
-        assert writer_calls["entered"] == 1
-        assert writer_calls["exited"] == 1
-        assert writer_calls["batches"] == 1
-        assert writer_calls["path"].parent == tmp_path / "app" / "session"
-
-
-class TestDeleteObjects:
+class TestGrpcOperations:
     def setup_method(self):
         with _cache_lock:
             _object_cache.clear()
@@ -958,391 +601,240 @@ class TestDeleteObjects:
         with _cache_lock:
             _object_cache.clear()
 
-    def test_delete_objects_clears_client_cache(self, monkeypatch):
-        from flamepy.core import cache as cache_module
-        from flamepy.core.types import FlameClientCache
-
-        cache_key1 = ("grpc://host:9090", "myapp/session1/obj1")
-        cache_key2 = ("grpc://host:9090", "myapp/session1/obj2")
-        cache_key3 = ("grpc://host:9090", "myapp/session2/obj1")
-        cache_key4 = ("grpc://host:9090", "other/session/obj1")
-
-        with _cache_lock:
-            _object_cache[cache_key1] = Object(version=1, data="data1")
-            _object_cache[cache_key2] = Object(version=1, data="data2")
-            _object_cache[cache_key3] = Object(version=1, data="data3")
-            _object_cache[cache_key4] = Object(version=1, data="data4")
-
-        action_bodies = []
-
-        class MockFlightClient:
-            def do_action(self, action):
-                action_bodies.append(action.body.to_pybytes().decode("utf-8"))
-                return [type("Result", (), {"body": type("Body", (), {"to_pybytes": lambda: b"OK"})()})()]
-
-        class MockContext:
-            cache = FlameClientCache(endpoint="grpc://host:9090")
-
-        monkeypatch.setattr(cache_module, "FlameContext", lambda: MockContext())
-        monkeypatch.setattr(cache_module, "_get_flight_client", lambda ep, tls=None: MockFlightClient())
-
-        delete_objects("myapp/*")
-
-        with _cache_lock:
-            assert cache_key1 not in _object_cache
-            assert cache_key2 not in _object_cache
-            assert cache_key3 not in _object_cache
-            assert cache_key4 in _object_cache
-
-        assert action_bodies == ["myapp/*"]
-
-    def test_delete_objects_clears_session_without_prefix_bleed(self, monkeypatch):
-        from flamepy.core import cache as cache_module
-        from flamepy.core.types import FlameClientCache
-
-        cache_key1 = ("grpc://host:9090", "myapp/session/obj1")
-        cache_key2 = ("grpc://host:9090", "myapp/session2/obj1")
-        cache_key3 = ("grpc://host:9090", "myapp/session-extra/obj1")
-
-        with _cache_lock:
-            _object_cache[cache_key1] = Object(version=1, data="data1")
-            _object_cache[cache_key2] = Object(version=1, data="data2")
-            _object_cache[cache_key3] = Object(version=1, data="data3")
-
-        action_bodies = []
-
-        class MockFlightClient:
-            def do_action(self, action):
-                action_bodies.append(action.body.to_pybytes().decode("utf-8"))
-                return [type("Result", (), {"body": type("Body", (), {"to_pybytes": lambda: b"OK"})()})()]
-
-        class MockContext:
-            cache = FlameClientCache(endpoint="grpc://host:9090")
-
-        monkeypatch.setattr(cache_module, "FlameContext", lambda: MockContext())
-        monkeypatch.setattr(cache_module, "_get_flight_client", lambda ep, tls=None: MockFlightClient())
-
-        delete_objects("myapp/session")
-
-        with _cache_lock:
-            assert cache_key1 not in _object_cache
-            assert cache_key2 in _object_cache
-            assert cache_key3 in _object_cache
-
-        assert action_bodies == ["myapp/session"]
-
-    def test_delete_objects_clears_exact_full_key(self, monkeypatch):
-        from flamepy.core import cache as cache_module
-        from flamepy.core.types import FlameClientCache
-
-        cache_key1 = ("grpc://host:9090", "myapp/pkg/file1.tar.gz")
-        cache_key2 = ("grpc://host:9090", "myapp/pkg/file2.tar.gz")
-
-        with _cache_lock:
-            _object_cache[cache_key1] = Object(version=1, data="data1")
-            _object_cache[cache_key2] = Object(version=1, data="data2")
-
-        action_bodies = []
-
-        class MockFlightClient:
-            def do_action(self, action):
-                action_bodies.append(action.body.to_pybytes().decode("utf-8"))
-                return [type("Result", (), {"body": type("Body", (), {"to_pybytes": lambda: b"OK"})()})()]
-
-        class MockContext:
-            cache = FlameClientCache(endpoint="grpc://host:9090")
-
-        monkeypatch.setattr(cache_module, "FlameContext", lambda: MockContext())
-        monkeypatch.setattr(cache_module, "_get_flight_client", lambda ep, tls=None: MockFlightClient())
-
-        delete_objects("myapp/pkg/file1.tar.gz")
-
-        with _cache_lock:
-            assert cache_key1 not in _object_cache
-            assert cache_key2 in _object_cache
-
-        assert action_bodies == ["myapp/pkg/file1.tar.gz"]
-
-    def test_delete_objects_rejects_invalid_path_before_remote_action(self, monkeypatch):
+    def _client(self, monkeypatch):
         from flamepy.core import cache as cache_module
 
-        def fail_get_flight_client(endpoint, tls=None):
-            raise AssertionError("remote client should not be created for invalid paths")
+        pb = cache_module.cache_pb2
 
-        monkeypatch.setattr(cache_module, "_get_flight_client", fail_get_flight_client)
+        class FakeClient:
+            puts = []
+            patches = []
+            deletes = []
+            responses = []
+            metadata_data_type = _TYPE_CLOUDPICKLE
+            metadata_requests = []
 
+            def Put(self, requests, timeout=None):  # noqa: N802 - mirrors the generated gRPC stub
+                self.puts.append((list(requests), timeout))
+                return pb.CacheObjectMetadata(endpoint="grpc://host:9090", key="app/session/obj", version=2)
+
+            def Patch(self, requests, timeout=None):  # noqa: N802 - mirrors the generated gRPC stub
+                self.patches.append((list(requests), timeout))
+                return pb.CacheObjectMetadata(endpoint="grpc://host:9090", key="app/session/obj", version=2)
+
+            def Delete(self, request):  # noqa: N802 - mirrors the generated gRPC stub
+                self.deletes.append(request.key)
+                return pb.CacheDeleteResponse()
+
+            def Get(self, request):  # noqa: N802 - mirrors the generated gRPC stub
+                return iter(self.responses)
+
+            def GetMetadata(self, request):  # noqa: N802 - mirrors the generated gRPC stub
+                self.metadata_requests.append(request.key)
+                return pb.CacheObjectMetadata(data_type=self.metadata_data_type)
+
+        client = FakeClient()
+        monkeypatch.setattr(cache_module, "_get_cache_client", lambda endpoint, tls=None: client)
+        monkeypatch.setattr(cache_module, "_get_cache_tls_config", lambda: None)
+        monkeypatch.setattr(cache_module, "_get_cached_context", lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpc://host:9090", storage="/ignored")))
+        return client
+
+    def test_put_arrow_uses_opaque_serialized_chunks(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        client = self._client(monkeypatch)
+        table = pa.table({"x": [1, 2, 3]})
+        ref = cache_module.put_object("app/session", table)
+        requests, _ = client.puts[0]
+        assert ref.version == 2
+        assert requests[0].header.key == "app/session"
+        assert requests[0].header.data_type == f"{_TYPE_ARROW_TABLE}.zstd"
+        assert requests[0].WhichOneof("payload") == "header"
+        assert _deserialize_object_data(_TYPE_ARROW_TABLE, cache_module._decompress_data(b"".join(request.data for request in requests[1:]), "zstd")).equals(table)
+
+    def test_update_and_patch(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        client = self._client(monkeypatch)
+        ref = ObjectRef("grpc://host:9090", "app/session/obj", 1)
+        cache_module.update_object(ref, {"new": True})
+        cache_module.patch_object(ref, [1, 2])
+        assert len(client.puts) == len(client.patches) == 1
+        assert client.puts[0][0][0].header.key == ref.key
+        assert client.patches[0][0][0].header.key == ref.key
+        assert client.patches[0][0][0].header.data_type == _TYPE_CLOUDPICKLE
+        assert _deserialize_object_data(_TYPE_CLOUDPICKLE, b"".join(r.data for r in client.patches[0][0][1:])) == [1, 2]
+
+    def test_zstd_object_write_read_and_patch_inherits_codec(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        pb = cache_module.cache_pb2
+        client = self._client(monkeypatch)
+        client.metadata_data_type = "arrow.table.zstd"
+        value = pa.table({"repeated": ["x" * 100] * 100})
+        ref = cache_module.put_object("app/session", value)
+        requests, _ = client.puts[0]
+        assert requests[0].header.data_type == "arrow.table.zstd"
+        encoded = b"".join(request.data for request in requests[1:])
+        assert len(encoded) < 1000
+        assert cache_module._deserialize_object_data(_TYPE_ARROW_TABLE, cache_module._decompress_data(encoded, "zstd")).equals(value)
+
+        patch = pa.table({"patch": ["y"]})
+        cache_module.patch_object(ref, patch)
+        assert client.metadata_requests == [ref.key]
+        patch_requests, _ = client.patches[0]
+        assert patch_requests[0].header.data_type == "arrow.table.zstd"
+        patch_payload = b"".join(request.data for request in patch_requests[1:])
+        assert cache_module._deserialize_object_data(_TYPE_ARROW_TABLE, cache_module._decompress_data(patch_payload, "zstd")).equals(patch)
+
+        client.responses = [
+            pb.CacheGetResponse(header=pb.CacheGetHeader(mode=pb.CACHE_GET_MODE_FULL, version=2, data_type="arrow.table.zstd")),
+            pb.CacheGetResponse(chunk=pb.CacheGetChunk(kind=pb.CACHE_CHUNK_KIND_BASE, version=1, data=encoded)),
+            pb.CacheGetResponse(chunk=pb.CacheGetChunk(kind=pb.CACHE_CHUNK_KIND_PATCH, version=2, data=patch_payload)),
+        ]
+        result = cache_module._fetch_object_data(ref, 0)
+        assert result.base.equals(value)
+        assert result.patches[0].data.equals(patch)
+
+        replacement = pa.table({"replacement": ["z"]})
+        cache_module.update_object(ref, replacement)
+        update_requests, _ = client.puts[1]
+        assert update_requests[0].header.data_type == "arrow.table.zstd"
+        update_payload = b"".join(request.data for request in update_requests[1:])
+        assert cache_module._deserialize_object_data(_TYPE_ARROW_TABLE, cache_module._decompress_data(update_payload, "zstd")).equals(replacement)
+
+    def test_patch_uses_stored_type_and_rejects_mismatch_before_write(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        client = self._client(monkeypatch)
+        ref = ObjectRef("grpc://host:9090", "app/session/obj", 1)
+        cache_module.patch_object(ref, [1])
+        assert client.metadata_requests == [ref.key]
+        client.metadata_data_type = _TYPE_ARROW_TABLE
+        with pytest.raises(ValueError, match="does not match cached object type"):
+            cache_module.patch_object(ref, [2])
+        assert len(client.puts) == 0
+        assert len(client.patches) == 1
+
+    def test_automatic_compression_depends_on_type_not_size_or_ratio(self):
+        import os
+
+        from flamepy.core import cache as cache_module
+
+        for value in ("x", "x" * 100000, os.urandom(100000)):
+            data_type, data = cache_module._encode_object_data(value)
+            assert data_type == _TYPE_CLOUDPICKLE
+            assert _deserialize_object_data(data_type, data) == value
+
+        small = np.array([1], dtype=np.int64)
+        small_type, small_data = cache_module._encode_object_data(small)
+        assert small_type == "numpy.zstd"
+        np.testing.assert_array_equal(_deserialize_object_data(_TYPE_NUMPY, cache_module._decompress_data(small_data, "zstd")), small)
+
+        random = np.frombuffer(os.urandom(128 * 1024), dtype=np.uint8)
+        random_type, random_data = cache_module._encode_object_data(random)
+        assert random_type == "numpy.zstd"
+        _, uncompressed = _serialize_object_data(random)
+        assert len(random_data) > len(uncompressed)
+        np.testing.assert_array_equal(_deserialize_object_data(_TYPE_NUMPY, cache_module._decompress_data(random_data, "zstd")), random)
+
+    def test_delete_clears_matching_local_entries(self, monkeypatch):
+        from flamepy.core import cache as cache_module
+
+        client = self._client(monkeypatch)
+        with _cache_lock:
+            _object_cache[("grpc://host:9090", "app/session/obj")] = Object(1, "old")
+        cache_module.delete_objects("app/session")
+        assert client.deletes == ["app/session"]
+        with _cache_lock:
+            assert not _object_cache
+
+    def test_file_upload_download_streams_raw_bytes(self, monkeypatch, tmp_path):
+        from flamepy.core import cache as cache_module
+
+        pb = cache_module.cache_pb2
+        client = self._client(monkeypatch)
+        source = tmp_path / "source.bin"
+        data = b"x" * (cache_module._UPLOAD_CHUNK_SIZE + 3)
+        source.write_bytes(data)
+        ref = cache_module.upload_object("app/session/obj", str(source))
+        requests, timeout = client.puts[0]
+        assert timeout == 300
+        assert requests[0].header.key == "app/session/obj"
+        assert requests[0].header.data_type == "raw"
+        assert b"".join(request.data for request in requests[1:]) == data
+        assert len(requests[1].data) == cache_module._UPLOAD_CHUNK_SIZE
+        client.responses = [
+            pb.CacheGetResponse(header=pb.CacheGetHeader(mode=pb.CACHE_GET_MODE_FULL, version=2, data_type="raw")),
+            pb.CacheGetResponse(chunk=pb.CacheGetChunk(kind=pb.CACHE_CHUNK_KIND_BASE, version=2, data=data[:3])),
+            pb.CacheGetResponse(chunk=pb.CacheGetChunk(kind=pb.CACHE_CHUNK_KIND_BASE, version=2, data=data[3:])),
+        ]
+        destination = tmp_path / "dest.bin"
+        cache_module.download_object(ref, str(destination))
+        assert destination.read_bytes() == data
+
+    def test_download_decodes_raw_zstd_when_present(self, monkeypatch, tmp_path):
+        from flamepy.core import cache as cache_module
+
+        pb = cache_module.cache_pb2
+        client = self._client(monkeypatch)
+        data = b"abc" * 10000
+        encoded = cache_module._compress_data(data, "zstd")
+        client.responses = [pb.CacheGetResponse(header=pb.CacheGetHeader(mode=pb.CACHE_GET_MODE_FULL, version=2, data_type="raw.zstd"))]
+        for start in range(0, len(encoded), 7):
+            client.responses.append(pb.CacheGetResponse(chunk=pb.CacheGetChunk(kind=pb.CACHE_CHUNK_KIND_BASE, version=2, data=encoded[start : start + 7])))
+        destination = tmp_path / "downloaded.bin"
+        cache_module.download_object(ObjectRef("grpc://host:9090", "app/session/obj"), str(destination))
+        assert destination.read_bytes() == data
+
+    def test_compressed_archive_upload_keeps_original_bytes(self, monkeypatch, tmp_path):
+        import gzip
+
+        from flamepy.core import cache as cache_module
+
+        client = self._client(monkeypatch)
+        source = tmp_path / "package.tar.gz"
+        archive = gzip.compress(b"package contents" * 10000)
+        source.write_bytes(archive)
+        cache_module.upload_object("app/session/package.tar.gz", str(source))
+        requests, _ = client.puts[0]
+        assert requests[0].header.data_type == "raw"
+        assert b"".join(request.data for request in requests[1:]) == archive
+
+    def test_download_rejects_patch(self, monkeypatch, tmp_path):
+        from flamepy.core import cache as cache_module
+
+        pb = cache_module.cache_pb2
+        client = self._client(monkeypatch)
+        client.responses = [pb.CacheGetResponse(header=pb.CacheGetHeader(mode=pb.CACHE_GET_MODE_FULL, version=2, data_type="raw")), pb.CacheGetResponse(chunk=pb.CacheGetChunk(kind=pb.CACHE_CHUNK_KIND_PATCH, version=2, data=b"bad"))]
+        with pytest.raises(ValueError, match="base chunks only"):
+            cache_module.download_object(ObjectRef("grpc://host:9090", "app/session/obj"), str(tmp_path / "bad"))
+
+    def test_empty_file_round_trip(self, monkeypatch, tmp_path):
+        from flamepy.core import cache as cache_module
+
+        pb = cache_module.cache_pb2
+        client = self._client(monkeypatch)
+        source = tmp_path / "empty.bin"
+        source.write_bytes(b"")
+        ref = cache_module.upload_object("app/session/obj", str(source))
+        assert len(client.puts[0][0]) == 1
+        client.responses = [pb.CacheGetResponse(header=pb.CacheGetHeader(mode=pb.CACHE_GET_MODE_FULL, version=2, data_type="raw")), pb.CacheGetResponse(chunk=pb.CacheGetChunk(kind=pb.CACHE_CHUNK_KIND_BASE, version=2))]
+        destination = tmp_path / "downloaded.bin"
+        cache_module.download_object(ref, str(destination))
+        assert destination.read_bytes() == b""
+
+    def test_upload_validates_path_before_rpc(self, monkeypatch, tmp_path):
+        from flamepy.core import cache as cache_module
+
+        client = self._client(monkeypatch)
+        source = tmp_path / "source.bin"
+        source.write_bytes(b"data")
         with pytest.raises(ValueError):
-            delete_objects("myapp")
-
-        with pytest.raises(ValueError):
-            delete_objects("a/b/c/d")
-
-
-class TestUploadDownloadObject:
-    def test_upload_object_uses_explicit_endpoint_without_context(self, monkeypatch, tmp_path):
-        from flamepy.core import cache as cache_module
-
-        test_file = tmp_path / "test.tar.gz"
-        test_file.write_bytes(b"test content")
-        endpoints = []
-
-        class MockWriter:
-            def write_batch(self, batch):
-                pass
-
-            def done_writing(self):
-                pass
-
-            def close(self):
-                pass
-
-        metadata = iter(
-            [
-                bson.encode({"endpoint": "grpc://cache-0:9090", "key": "myapp/pkg/test.tar.gz", "version": 1}),
-                None,
-            ]
-        )
-        reader = SimpleNamespace(read=lambda: next(metadata))
-        client = SimpleNamespace(do_put=lambda *args: (MockWriter(), reader))
-
-        def get_client(endpoint, tls=None):
-            endpoints.append(endpoint)
-            return client
-
-        monkeypatch.setattr(cache_module, "_get_cached_context", lambda: (_ for _ in ()).throw(ValueError("no config")))
-        monkeypatch.setattr(cache_module, "_get_flight_client", get_client)
-
-        ref = cache_module.upload_object(
-            "myapp/pkg/test.tar.gz",
-            str(test_file),
-            endpoint="grpcs-proxy://gateway.example:443",
-        )
-
-        assert endpoints == ["grpcs-proxy://gateway.example:443"]
-        assert ref.endpoint == "grpc://cache-0:9090"
-
-    def test_upload_object_with_full_key(self, monkeypatch, tmp_path):
-        from flamepy.core import cache as cache_module
-        from flamepy.core.types import FlameClientCache
-
-        test_file = tmp_path / "test.tar.gz"
-        test_file.write_bytes(b"test content")
-
-        uploaded_key = None
-
-        class MockWriter:
-            def write_batch(self, batch):
-                pass
-
-            def done_writing(self):
-                pass
-
-            def close(self):
-                pass
-
-        class MockReader:
-            def __init__(self):
-                self._read_count = 0
-
-            def read(self):
-                if self._read_count == 0:
-                    self._read_count += 1
-                    return bson.encode({"endpoint": "grpc://host:9090", "key": "myapp/pkg/test.tar.gz", "version": 1})
-                return None
-
-        class MockFlightClient:
-            def do_put(self, descriptor, schema, options=None):
-                nonlocal uploaded_key
-                uploaded_key = "/".join(p.decode() if isinstance(p, bytes) else p for p in descriptor.path)
-                return MockWriter(), MockReader()
-
-        class MockContext:
-            cache = FlameClientCache(endpoint="grpc://host:9090")
-
-        monkeypatch.setattr(cache_module, "FlameContext", lambda: MockContext())
-        monkeypatch.setattr(cache_module, "_get_flight_client", lambda ep, tls=None: MockFlightClient())
-
-        ref = cache_module.upload_object("myapp/pkg/test.tar.gz", str(test_file))
-
-        assert ref.key == "myapp/pkg/test.tar.gz"
-        assert ref.endpoint == "grpc://host:9090"
-        assert ref.version == 1
-        assert uploaded_key == "myapp/pkg/test.tar.gz"
-
-    def test_upload_object_with_prefix(self, monkeypatch, tmp_path):
-        from flamepy.core import cache as cache_module
-        from flamepy.core.types import FlameClientCache
-
-        test_file = tmp_path / "test.tar.gz"
-        test_file.write_bytes(b"test content")
-
-        uploaded_key = None
-
-        class MockWriter:
-            def write_batch(self, batch):
-                pass
-
-            def done_writing(self):
-                pass
-
-            def close(self):
-                pass
-
-        class MockReader:
-            def __init__(self):
-                self._read_count = 0
-
-            def read(self):
-                if self._read_count == 0:
-                    self._read_count += 1
-                    return bson.encode({"endpoint": "grpc://host:9090", "key": "myapp/pkg/generated-uuid", "version": 1})
-                return None
-
-        class MockFlightClient:
-            def do_put(self, descriptor, schema, options=None):
-                nonlocal uploaded_key
-                uploaded_key = "/".join(p.decode() if isinstance(p, bytes) else p for p in descriptor.path)
-                return MockWriter(), MockReader()
-
-        class MockContext:
-            cache = FlameClientCache(endpoint="grpc://host:9090")
-
-        monkeypatch.setattr(cache_module, "FlameContext", lambda: MockContext())
-        monkeypatch.setattr(cache_module, "_get_flight_client", lambda ep, tls=None: MockFlightClient())
-
-        ref = cache_module.upload_object("myapp/pkg", str(test_file))
-
-        assert ref.key == "myapp/pkg/generated-uuid"
-        assert uploaded_key == "myapp/pkg"
-
-    def test_upload_object_file_not_found(self):
-        import pytest
-
-        from flamepy.core import cache as cache_module
-
+            cache_module.upload_object("invalid", str(source))
         with pytest.raises(FileNotFoundError):
-            cache_module.upload_object("myapp/pkg/test.tar.gz", "/nonexistent/file.tar.gz")
-
-    def test_upload_object_invalid_key_format(self, tmp_path):
-        from flamepy.core import cache as cache_module
-
-        test_file = tmp_path / "test.tar.gz"
-        test_file.write_bytes(b"test content")
-
-        with pytest.raises(ValueError):
-            cache_module.upload_object("invalid", str(test_file))
-
-        with pytest.raises(ValueError):
-            cache_module.upload_object("a/b/c/d", str(test_file))
-
-    @pytest.mark.parametrize(
-        "key_or_prefix",
-        [
-            "/session",
-            "app/",
-            "../session",
-            "app/../obj",
-            "app/session/",
-            "*/session",
-            "app/*",
-            "app/*/obj",
-            "app/session/*",
-        ],
-    )
-    def test_upload_object_validation_comes_from_object_key(self, key_or_prefix, tmp_path):
-        from flamepy.core import cache as cache_module
-
-        test_file = tmp_path / "test.tar.gz"
-        test_file.write_bytes(b"test content")
-
-        with pytest.raises(ValueError):
-            cache_module.upload_object(key_or_prefix, str(test_file))
-
-    def test_download_object(self, monkeypatch, tmp_path):
-        import pyarrow as pa
-
-        from flamepy.core import cache as cache_module
-
-        dest_file = tmp_path / "downloaded.tar.gz"
-        test_content = b"downloaded content"
-
-        class MockBatch:
-            def column(self, name):
-                if name == "data":
-                    return pa.array([test_content], type=pa.binary())
-                return pa.array([0], type=pa.uint64())
-
-        class MockReader:
-            def __iter__(self):
-                return iter([MockBatch()])
-
-        class MockFlightClient:
-            def do_get(self, ticket):
-                return MockReader()
-
-        monkeypatch.setattr(cache_module, "_get_cache_tls_config", lambda: None)
-        monkeypatch.setattr(cache_module, "_get_flight_client", lambda ep, tls=None: MockFlightClient())
-
-        ref = ObjectRef(endpoint="grpc://host:9090", key="myapp/pkg/test.tar.gz", version=0)
-        cache_module.download_object(ref, str(dest_file))
-
-        assert dest_file.exists()
-        assert dest_file.read_bytes() == test_content
-
-    def test_download_object_rejects_patch_rows(self, monkeypatch, tmp_path):
-        from flamepy.core import cache as cache_module
-
-        dest_file = tmp_path / "downloaded.tar.gz"
-        batch = pa.RecordBatch.from_arrays(
-            [
-                pa.array([1], type=pa.uint64()),
-                pa.array([ObjectResponseKind.PATCH.value], type=pa.string()),
-                pa.array([b"patch content"], type=pa.binary()),
-            ],
-            names=[OBJECT_FIELD_VERSION, OBJECT_RESPONSE_FIELD_KIND, OBJECT_FIELD_DATA],
-        )
-
-        class MockReader:
-            def __iter__(self):
-                return iter([batch])
-
-        class MockFlightClient:
-            def do_get(self, ticket):
-                return MockReader()
-
-        monkeypatch.setattr(cache_module, "_get_cache_tls_config", lambda: None)
-        monkeypatch.setattr(cache_module, "_get_flight_client", lambda ep, tls=None: MockFlightClient())
-
-        ref = ObjectRef(endpoint="grpc://host:9090", key="myapp/pkg/test.tar.gz", version=0)
-        with pytest.raises(ValueError, match="expected base rows only"):
-            cache_module.download_object(ref, str(dest_file))
-
-        assert not dest_file.exists()
-
-    def test_download_object_not_found(self, monkeypatch, tmp_path):
-        import pytest
-
-        from flamepy.core import cache as cache_module
-
-        dest_file = tmp_path / "downloaded.tar.gz"
-
-        class MockReader:
-            def __iter__(self):
-                return iter([])
-
-        class MockFlightClient:
-            def do_get(self, ticket):
-                return MockReader()
-
-        monkeypatch.setattr(cache_module, "_get_cache_tls_config", lambda: None)
-        monkeypatch.setattr(cache_module, "_get_flight_client", lambda ep, tls=None: MockFlightClient())
-
-        ref = ObjectRef(endpoint="grpc://host:9090", key="myapp/pkg/notfound.tar.gz", version=0)
-
-        with pytest.raises(ValueError, match="Failed to download"):
-            cache_module.download_object(ref, str(dest_file))
-
-        assert not dest_file.exists()
+            cache_module.upload_object("app/session/obj", str(tmp_path / "missing"))
+        assert not client.puts
 
 
 class TestObjectKey:

@@ -36,8 +36,6 @@ chrono = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 serde_derive = { workspace = true }
-arrow = { workspace = true }
-arrow-flight = { workspace = true }
 bson = { workspace = true }
 
 [build-dependencies]
