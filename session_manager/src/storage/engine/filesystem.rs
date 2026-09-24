@@ -57,7 +57,7 @@ use common::apis::{
 };
 use common::{FlameError, FLAME_HOME};
 
-use crate::model::{ApplicationFilter, Executor, SessionFilter};
+use crate::model::{ApplicationFilter, Executor, SessionFilter, TaskFilter};
 use crate::storage::engine::{Engine, EnginePtr};
 
 /// Task metadata stored in tasks.bin with fixed-size records.
@@ -379,10 +379,13 @@ impl FilesystemEngine {
             .map_err(|e| FlameError::Storage(format!("Failed to parse session metadata: {e}")))
     }
 
-    fn find_session_metadata(
+    fn _list_sessions_metadata(
         &self,
         filter: Option<&SessionFilter>,
     ) -> Result<Vec<(SessionID, SessionMetadata)>, FlameError> {
+        if filter.and_then(|filter| filter.limit) == Some(0) {
+            return Ok(Vec::new());
+        }
         let sessions_dir = self.base_path.join("sessions");
         let entries = match fs::read_dir(&sessions_dir) {
             Ok(entries) => entries,
@@ -416,6 +419,12 @@ impl FilesystemEngine {
             });
             if matches {
                 sessions.push((session_id, metadata));
+                if filter
+                    .and_then(|filter| filter.limit)
+                    .is_some_and(|limit| sessions.len() >= limit)
+                {
+                    break;
+                }
             }
         }
         Ok(sessions)
@@ -717,14 +726,27 @@ impl FilesystemEngine {
         Ok(buffer)
     }
 
-    /// Get the number of tasks in a session by checking the tasks.bin file size.
-    fn get_task_count(&self, session_id: &str) -> Result<u64, FlameError> {
-        let path = self.session_path(session_id).join("tasks.bin");
+    /// Count tasks matching the filter.
+    fn _count_task(&self, filter: &TaskFilter) -> Result<u64, FlameError> {
+        let path = self.session_path(&filter.session).join("tasks.bin");
 
-        match fs::metadata(&path) {
-            Ok(metadata) => Ok(metadata.len() / self.record_size as u64),
-            Err(_) => Ok(0),
+        let task_count = match fs::metadata(&path) {
+            Ok(metadata) => metadata.len() / self.record_size as u64,
+            Err(_) => 0,
+        };
+        let Some(states) = filter.states.as_ref() else {
+            return Ok(task_count);
+        };
+
+        let mut count = 0;
+        for task_id in 1..=task_count {
+            let metadata = self.read_task_metadata(&filter.session, task_id as TaskID)?;
+            let state = TaskState::try_from(metadata.state as i32)?;
+            if states.contains(&state) {
+                count += 1;
+            }
         }
+        Ok(count)
     }
 
     /// Read common data for a session.
@@ -875,17 +897,6 @@ impl FilesystemEngine {
         })
     }
 
-    /// Check if an application exists and is enabled.
-    fn check_application_enabled(&self, app_name: &str) -> Result<(), FlameError> {
-        let meta = self.read_application_metadata(app_name)?;
-        if meta.state != ApplicationState::Enabled as i32 {
-            return Err(FlameError::InvalidState(format!(
-                "Application {app_name} is not enabled"
-            )));
-        }
-        Ok(())
-    }
-
     fn _update_task_state(
         &self,
         ssn_id: &SessionID,
@@ -970,7 +981,7 @@ impl Engine for FilesystemEngine {
     }
 
     async fn delete_application(&self, name: ApplicationID) -> Result<(), FlameError> {
-        let mut locks = lock_app!(self)?;
+        let _guard = lock_app!(self)?;
         let app = self.read_application_metadata(&name)?;
         if app.state != ApplicationState::Disabled as i32 {
             return Err(FlameError::InvalidState(format!(
@@ -982,21 +993,11 @@ impl Engine for FilesystemEngine {
             application: Some(name.clone()),
             ..SessionFilter::default()
         };
-        let sessions = self.find_session_metadata(Some(&filter))?;
-        if sessions
-            .iter()
-            .any(|(_, metadata)| metadata.state == SessionState::Open as i32)
-        {
+        let sessions = self._list_sessions_metadata(Some(&filter))?;
+        if !sessions.is_empty() {
             return Err(FlameError::InvalidState(format!(
-                "application <{name}> has open sessions"
+                "application <{name}> still has sessions"
             )));
-        }
-
-        for (session_id, _) in sessions {
-            fs::remove_dir_all(self.session_path(&session_id)).map_err(|e| {
-                FlameError::Storage(format!("Failed to delete session '{session_id}': {e}"))
-            })?;
-            locks.remove(&session_id);
         }
 
         let app_dir = self.application_path(&name);
@@ -1026,7 +1027,7 @@ impl Engine for FilesystemEngine {
             state: Some(SessionState::Open),
             ..SessionFilter::default()
         };
-        if !self.find_session_metadata(Some(&filter))?.is_empty() {
+        if !self._list_sessions_metadata(Some(&filter))?.is_empty() {
             return Err(FlameError::Storage(format!(
                 "Cannot update application '{}': has open sessions",
                 name
@@ -1063,7 +1064,7 @@ impl Engine for FilesystemEngine {
         Self::application_from_metadata(&meta)
     }
 
-    async fn find_application(
+    async fn find_applications(
         &self,
         filter: Option<&ApplicationFilter>,
     ) -> Result<Vec<Application>, FlameError> {
@@ -1090,8 +1091,6 @@ impl Engine for FilesystemEngine {
     }
 
     async fn create_session(&self, attr: SessionAttributes) -> Result<Session, FlameError> {
-        self.check_application_enabled(&attr.application)?;
-
         if self.read_session_metadata(&attr.id).is_ok() {
             return Err(FlameError::AlreadyExist(format!(
                 "Session '{}' already exists",
@@ -1195,7 +1194,7 @@ impl Engine for FilesystemEngine {
 
         let mut meta = self.read_session_metadata(&id)?;
 
-        let task_count = self.get_task_count(&id)?;
+        let task_count = self._count_task(&TaskFilter::by_session(&id))?;
         let mut pending_tasks = Vec::new();
 
         // First pass: check for running tasks and collect pending tasks
@@ -1249,30 +1248,10 @@ impl Engine for FilesystemEngine {
             ));
         }
 
-        let task_count = self.get_task_count(&id)?;
-        for task_id in 1..=task_count {
-            if let Ok(task_meta) = self.read_task_metadata(&id, task_id as TaskID) {
-                let state = match TaskState::try_from(task_meta.state as i32) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Task {}/{} has corrupted state ({}): {}, treating as incomplete",
-                            id,
-                            task_id,
-                            task_meta.state,
-                            e
-                        );
-                        return Err(FlameError::Storage(
-                            "Cannot delete session with corrupted task state".to_string(),
-                        ));
-                    }
-                };
-                if !state.is_terminal() {
-                    return Err(FlameError::Storage(
-                        "Cannot delete session with non-terminal tasks".to_string(),
-                    ));
-                }
-            }
+        if self._count_task(&TaskFilter::non_terminal(&id))? > 0 {
+            return Err(FlameError::Storage(
+                "Cannot delete session with non-terminal tasks".to_string(),
+            ));
         }
 
         let session = self.session_from_metadata(&meta)?;
@@ -1289,12 +1268,9 @@ impl Engine for FilesystemEngine {
         Ok(session)
     }
 
-    async fn find_session(
-        &self,
-        filter: Option<&SessionFilter>,
-    ) -> Result<Vec<Session>, FlameError> {
+    async fn find_sessions(&self) -> Result<Vec<Session>, FlameError> {
         let mut sessions = Vec::new();
-        for (session_id, metadata) in self.find_session_metadata(filter)? {
+        for (session_id, metadata) in self._list_sessions_metadata(None)? {
             let session = self.session_from_metadata(&metadata)?;
             {
                 let mut locks = lock_app!(self)?;
@@ -1321,7 +1297,7 @@ impl Engine for FilesystemEngine {
 
         lock_ssn!(self, &ssn_id);
 
-        let task_count = self.get_task_count(&ssn_id)?;
+        let task_count = self._count_task(&TaskFilter::by_session(&ssn_id))?;
         let task_id = task_count + 1;
 
         let (input_offset, input_len) = if let Some(ref data) = input {
@@ -1425,7 +1401,7 @@ impl Engine for FilesystemEngine {
         lock_ssn!(self, &ssn_id);
 
         let mut tasks = Vec::new();
-        let task_count = self.get_task_count(&ssn_id)?;
+        let task_count = self._count_task(&TaskFilter::by_session(&ssn_id))?;
 
         for task_id in 1..=task_count {
             if let Ok(meta) = self.read_task_metadata(&ssn_id, task_id as TaskID) {
@@ -1893,7 +1869,7 @@ mod tests {
         assert_eq!(app2.name, "test-app");
 
         // Find applications
-        let apps = engine.find_application(None).await.unwrap();
+        let apps = engine.find_applications(None).await.unwrap();
         assert_eq!(apps.len(), 1);
 
         // Update application
@@ -1944,7 +1920,7 @@ mod tests {
         assert_eq!(unchanged.image, disabled.image);
 
         let filter = ApplicationFilter::by_state(ApplicationState::Disabled);
-        let disabled_apps = engine.find_application(Some(&filter)).await.unwrap();
+        let disabled_apps = engine.find_applications(Some(&filter)).await.unwrap();
         assert_eq!(disabled_apps.len(), 1);
         assert_eq!(disabled_apps[0].name, "test-app");
 
@@ -1981,8 +1957,7 @@ mod tests {
         let open_sessions = SessionFilter::by_application_state("test-app", SessionState::Open);
         assert_eq!(
             engine
-                .find_session(Some(&open_sessions))
-                .await
+                ._list_sessions_metadata(Some(&open_sessions))
                 .unwrap()
                 .len(),
             1
@@ -1992,6 +1967,14 @@ mod tests {
 
         engine
             .close_session("test-session".to_string())
+            .await
+            .unwrap();
+        let result = engine.delete_application("test-app".to_string()).await;
+        assert!(matches!(result, Err(FlameError::InvalidState(_))));
+        assert!(engine.get_session("test-session".to_string()).await.is_ok());
+
+        engine
+            .delete_session("test-session".to_string())
             .await
             .unwrap();
         engine
@@ -2021,7 +2004,7 @@ mod tests {
             application: Some("test-app".to_string()),
             ..SessionFilter::default()
         };
-        assert!(engine.find_session(Some(&sessions)).await.is_err());
+        assert!(engine._list_sessions_metadata(Some(&sessions)).is_err());
         assert!(engine
             .delete_application("test-app".to_string())
             .await
@@ -2078,7 +2061,7 @@ mod tests {
         assert_eq!(session2.id, "test-session");
 
         // Find sessions
-        let sessions = engine.find_session(None).await.unwrap();
+        let sessions = engine.find_sessions().await.unwrap();
         assert_eq!(sessions.len(), 1);
 
         // Close session (should work since no tasks)
@@ -2338,6 +2321,11 @@ mod tests {
 
         let task2_after = engine.get_task(task2.gid()).await.unwrap();
         assert_eq!(task2_after.state, TaskState::Cancelled);
+
+        engine
+            .delete_session("test-session".to_string())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

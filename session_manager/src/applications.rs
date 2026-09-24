@@ -22,7 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use common::apis::{Application, ApplicationAttributes, ApplicationState, ExecutorState};
+use common::apis::{
+    Application, ApplicationAttributes, ApplicationState, ExecutorState, SessionState,
+};
 use common::application::parse_application_manifests;
 use common::ctx::FlameClusterContext;
 use common::{FlameError, FLAME_HOME};
@@ -50,7 +52,7 @@ impl ApplicationManager {
 
     pub(crate) async fn reconcile_once(&self) -> Result<(), FlameError> {
         let filter = ApplicationFilter::by_state(ApplicationState::Disabled);
-        let applications = self.controller.list_application(Some(&filter)).await?;
+        let applications = self.controller.list_applications(Some(&filter)).await?;
 
         for application in applications {
             if let Err(error) = self.reconcile_application(&application.name).await {
@@ -73,17 +75,26 @@ impl ApplicationManager {
         if application.state != ApplicationState::Disabled {
             return Ok(());
         }
-        let open_sessions = SessionFilter::by_application_state(
-            application.name.clone(),
-            common::apis::SessionState::Open,
-        );
-        if self.storage.count_session(&open_sessions)? > 0 {
+        let closed_filter =
+            SessionFilter::by_application_state(application.name.clone(), SessionState::Closed);
+        for session in self.storage.list_sessions(Some(&closed_filter))? {
+            match self.controller.delete_session(session.id).await {
+                Ok(_) | Err(FlameError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let open_filter =
+            SessionFilter::by_application_state(application.name.clone(), SessionState::Open)
+                .with_limit(1);
+        let has_open_sessions = !self.storage.list_sessions(Some(&open_filter))?.is_empty();
+        if has_open_sessions {
             return Ok(());
         }
 
         let idle_executors = self
             .storage
-            .list_executor(Some(&ExecutorFilter::by_state(ExecutorState::Idle)))?
+            .list_executors(Some(&ExecutorFilter::by_state(ExecutorState::Idle)))?
             .into_iter()
             .filter(|executor| executor.application == application.name)
             .map(|executor| executor.id)
@@ -311,7 +322,19 @@ mod tests {
             .unwrap();
         controller
             .create_session(SessionAttributes {
-                id: "draining-session".to_string(),
+                id: "closed-session".to_string(),
+                application: "draining-app".to_string(),
+                ..SessionAttributes::default()
+            })
+            .await
+            .unwrap();
+        controller
+            .close_session("closed-session".to_string())
+            .await
+            .unwrap();
+        controller
+            .create_session(SessionAttributes {
+                id: "open-session".to_string(),
                 application: "draining-app".to_string(),
                 ..SessionAttributes::default()
             })
@@ -323,6 +346,11 @@ mod tests {
             .unwrap();
 
         manager.reconcile_once().await.unwrap();
+        assert!(matches!(
+            controller.get_session("closed-session".to_string()),
+            Err(FlameError::NotFound(_))
+        ));
+        assert!(controller.get_session("open-session".to_string()).is_ok());
         assert_eq!(
             controller
                 .get_application("draining-app".to_string())
@@ -333,10 +361,14 @@ mod tests {
         );
 
         controller
-            .close_session("draining-session".to_string())
+            .close_session("open-session".to_string())
             .await
             .unwrap();
         manager.reconcile_once().await.unwrap();
+        assert!(matches!(
+            controller.get_session("open-session".to_string()),
+            Err(FlameError::NotFound(_))
+        ));
         assert!(matches!(
             controller.get_application("draining-app".to_string()).await,
             Err(FlameError::NotFound(_))

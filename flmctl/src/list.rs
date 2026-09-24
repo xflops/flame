@@ -36,18 +36,18 @@ pub async fn run(
     )
     .await?;
     match (application, session, executor, node) {
-        (true, _, _, _) => list_application(conn).await,
-        (_, true, _, _) => list_session(conn).await,
-        (_, _, true, _) => list_executor(conn).await,
-        (_, _, _, true) => list_node(conn).await,
+        (true, _, _, _) => list_applications(conn).await,
+        (_, true, _, _) => list_sessions(conn).await,
+        (_, _, true, _) => list_executors(conn).await,
+        (_, _, _, true) => list_nodes(conn).await,
         _ => Err(Box::new(FlameError::InvalidConfig(
             "unsupported parameters".to_string(),
         ))),
     }
 }
 
-async fn list_application(conn: Connection) -> Result<(), Box<dyn Error>> {
-    let app_list = conn.list_application().await?;
+async fn list_applications(conn: Connection) -> Result<(), Box<dyn Error>> {
+    let app_list = conn.list_applications().await?;
 
     let mut table = Table::new();
     table
@@ -73,8 +73,8 @@ async fn list_application(conn: Connection) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn list_session(conn: Connection) -> Result<(), Box<dyn Error>> {
-    let mut ssn_list = conn.list_session().await?;
+async fn list_sessions(conn: Connection) -> Result<(), Box<dyn Error>> {
+    let mut ssn_list = conn.list_sessions().await?;
     let mut table = Table::new();
     table.load_preset(NOTHING).set_header(vec![
         "ID",
@@ -121,8 +121,8 @@ async fn list_session(conn: Connection) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn list_executor(conn: Connection) -> Result<(), Box<dyn Error>> {
-    let executor_list = conn.list_executor().await?;
+async fn list_executors(conn: Connection) -> Result<(), Box<dyn Error>> {
+    let executor_list = conn.list_executors().await?;
     let table = executor_table(&executor_list);
 
     println!("{table}");
@@ -149,8 +149,8 @@ fn executor_table(executors: &[Executor]) -> Table {
     table
 }
 
-async fn list_node(conn: Connection) -> Result<(), Box<dyn Error>> {
-    let node_list = conn.list_node().await?;
+async fn list_nodes(conn: Connection) -> Result<(), Box<dyn Error>> {
+    let node_list = conn.list_nodes().await?;
     let mut table = Table::new();
     table.load_preset(NOTHING).set_header(vec![
         "NAME", "HOSTNAME", "STATUS", "CPU", "MEMORY", "ARCH", "OS",

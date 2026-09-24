@@ -200,14 +200,14 @@ it does not introduce an atomic session-admission protocol.
 Enhance the existing application-list path with an optional state filter:
 
 ```protobuf
-message ListApplicationRequest {
+message ListApplicationsRequest {
   optional ApplicationState state = 1;
 }
 ```
 
 Add an optional `state` field to `ApplicationFilter`. The filter
-flows through `Controller::list_application`, `Storage::list_application`, and
-`Engine::find_application`. `None` preserves the current list-all behavior, so
+flows through `Controller::list_applications`, `Storage::list_applications`, and
+`Engine::find_applications`. `None` preserves the current list-all behavior, so
 existing clients remain compatible. The manager passes an
 `ApplicationFilter` whose state is `Disabled`.
 
@@ -221,7 +221,7 @@ retaining its state, IDs, and in-memory predicate fields. The list-session RPC
 exposes the application and state subset:
 
 ```protobuf
-message ListSessionRequest {
+message ListSessionsRequest {
   optional string application = 1;
   optional SessionState state = 2;
 }
@@ -231,11 +231,12 @@ Keep the other narrow storage queries used by the controller and manager:
 
 - `session_application(id)` resolves a cached or persisted session's owning
   application for `open_session(id, None)`.
-- `list_session(filter)` returns sessions matching a `SessionFilter`.
-- `count_session(filter)` provides the manager's drain check with the same
-  application-plus-`Open` filter.
+- `list_sessions(filter)` returns sessions matching a `SessionFilter`.
+- `SessionFilter.limit` bounds existence queries; the manager requests at most
+  one application-plus-`Open` session.
+- `Engine::find_sessions()` loads persisted sessions during startup recovery.
 - `delete_application(application)` performs
-  the final state/count check and delete.
+  the final state/session check and deletes only application metadata.
 
 `session_application` falls back to `Engine::get_session` so an evicted
 persisted session retains its current error behavior. These methods report
@@ -335,23 +336,26 @@ results. One application's failure is logged and does not stop another.
 For each disabled application:
 
 1. Re-read the application and stop if it is absent or no longer disabled.
-2. Count sessions whose state is `Open`; if nonzero, leave the disabled
-   application untouched.
-3. Find its idle executors and transition them toward release using the current
+2. List its cached `Closed` sessions and delete each through the controller so
+   persistence, cache, events, and task notifications are all cleaned
+   consistently.
+3. List at most one session whose state is `Open`; if one exists, leave the
+   disabled application for the next pass.
+4. Find its idle executors and transition them toward release using the current
    best-effort behavior.
-4. Call
+5. Call
    `Storage::delete_application`.
 
-The manager rechecks `Disabled` and the current open-session count before
-cleanup, and the final storage operation checks them again. These snapshots do
+The manager rechecks `Disabled` and current sessions before cleanup, and the
+final storage operation requires that no sessions remain. These snapshots do
 not eliminate the accepted check-to-create race: a request that already saw
 `Enabled` can publish between checks. Existing delay-release behavior makes
 that short overlap tolerable for now, so the design does not add broader
 synchronization.
 
-Physical deletion removes the application record, closed persisted sessions
-according to backend semantics, and cached sessions. Closed historical sessions
-do not block deletion; any `Open` session does.
+Physical application deletion removes only the application record. Session
+deletion is owned by the manager and remains a separate controller operation;
+backend application deletion rejects both open and closed remaining sessions.
 
 The application is never returned to `Enabled` after a cleanup failure.
 
@@ -458,7 +462,7 @@ Run against SQLite, filesystem, and `none`:
 ### Application manager and failure tests
 
 1. Two open sessions require both to close before deletion.
-2. Closed historical or evicted sessions do not block cleanup.
+2. Cached closed sessions are deleted before application metadata cleanup.
 3. Storage failure retains metadata and retries idempotently.
 4. One broken application does not block cleanup of another.
 5. Repeated periodic passes are harmless.

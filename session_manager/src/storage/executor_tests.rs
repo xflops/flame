@@ -272,11 +272,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(storage.list_executor(None).unwrap().len(), 1);
+            assert_eq!(storage.list_executors(None).unwrap().len(), 1);
 
             storage.delete_executor(executor.id).await.unwrap();
 
-            assert_eq!(storage.list_executor(None).unwrap().len(), 0);
+            assert_eq!(storage.list_executors(None).unwrap().len(), 0);
         }
     }
 
@@ -307,11 +307,11 @@ mod tests {
             let deleted_ids = storage.delete_executors(&to_delete).await.unwrap();
 
             assert_eq!(deleted_ids.len(), 2);
-            assert_eq!(storage.list_executor(None).unwrap().len(), 0);
+            assert_eq!(storage.list_executors(None).unwrap().len(), 0);
         }
     }
 
-    mod list_executor {
+    mod list_executors {
         use super::*;
 
         #[tokio::test]
@@ -319,7 +319,7 @@ mod tests {
             let ctx = test_context();
             let storage = storage::new_ptr(&ctx).await.unwrap();
 
-            let executors = storage.list_executor(None).unwrap();
+            let executors = storage.list_executors(None).unwrap();
             assert!(executors.is_empty());
         }
 
@@ -341,7 +341,7 @@ mod tests {
                     .unwrap();
             }
 
-            let executors = storage.list_executor(None).unwrap();
+            let executors = storage.list_executors(None).unwrap();
             assert_eq!(executors.len(), 3);
         }
 
@@ -379,7 +379,7 @@ mod tests {
                 node: None,
                 ids: None,
             };
-            let filtered = storage.list_executor(Some(&filter)).unwrap();
+            let filtered = storage.list_executors(Some(&filter)).unwrap();
             assert_eq!(filtered.len(), 1);
             assert_eq!(filtered[0].state, ExecutorState::Idle);
         }
@@ -415,7 +415,7 @@ mod tests {
                 node: Some("node-1".to_string()),
                 ids: None,
             };
-            let filtered = storage.list_executor(Some(&filter)).unwrap();
+            let filtered = storage.list_executors(Some(&filter)).unwrap();
             assert_eq!(filtered.len(), 2);
             assert!(filtered.iter().all(|e| e.node == "node-1"));
         }
@@ -449,7 +449,7 @@ mod tests {
                 node: None,
                 ids: Some(vec![exec1.id.clone(), exec2.id.clone()]),
             };
-            let filtered = storage.list_executor(Some(&filter)).unwrap();
+            let filtered = storage.list_executors(Some(&filter)).unwrap();
             assert_eq!(filtered.len(), 2);
 
             let ids: Vec<_> = filtered.iter().map(|e| e.id.as_str()).collect();
@@ -496,7 +496,7 @@ mod tests {
                 node: Some("mf-node-1".to_string()),
                 ids: None,
             };
-            let filtered = storage.list_executor(Some(&filter)).unwrap();
+            let filtered = storage.list_executors(Some(&filter)).unwrap();
             assert_eq!(filtered.len(), 1);
             assert_eq!(filtered[0].node, "mf-node-1");
             assert_eq!(filtered[0].state, ExecutorState::Idle);

@@ -245,7 +245,7 @@ impl Controller {
         // Get executors from DB for this node
         let db_executors = self
             .storage
-            .list_executor(Some(&ExecutorFilter::by_node(&node.name)))?;
+            .list_executors(Some(&ExecutorFilter::by_node(&node.name)))?;
 
         let db_ids: HashSet<String> = db_executors.iter().map(|e| e.id.clone()).collect();
 
@@ -335,8 +335,8 @@ impl Controller {
     }
 
     /// Lists all registered nodes.
-    pub fn list_node(&self) -> Result<Vec<Node>, FlameError> {
-        self.storage.list_node()
+    pub fn list_nodes(&self) -> Result<Vec<Node>, FlameError> {
+        self.storage.list_nodes()
     }
 
     /// Updates node status from a heartbeat.
@@ -401,7 +401,7 @@ impl Controller {
 
     pub async fn create_session(&self, attr: SessionAttributes) -> Result<Session, FlameError> {
         trace_fn!("Controller::create_session");
-        self.require_enabled_application(&attr.application).await?;
+        self.application_enabled(&attr.application).await?;
         self.storage.create_session(attr).await
     }
 
@@ -415,11 +415,11 @@ impl Controller {
             Some(attr) => attr.application.clone(),
             None => self.storage.session_application(id.clone()).await?,
         };
-        self.require_enabled_application(&application).await?;
+        self.application_enabled(&application).await?;
         self.storage.open_session(id, spec).await
     }
 
-    async fn require_enabled_application(&self, name: &str) -> Result<(), FlameError> {
+    async fn application_enabled(&self, name: &str) -> Result<(), FlameError> {
         let application = self.storage.get_application(name.to_string()).await?;
         if application.state != ApplicationState::Enabled {
             return Err(FlameError::InvalidState(format!(
@@ -449,11 +449,11 @@ impl Controller {
         Ok(session)
     }
 
-    pub fn list_session(
+    pub fn list_sessions(
         &self,
         filter: Option<&crate::model::SessionFilter>,
     ) -> Result<Vec<Session>, FlameError> {
-        self.storage.list_session(filter)
+        self.storage.list_sessions(filter)
     }
 
     pub async fn create_task(
@@ -478,8 +478,8 @@ impl Controller {
         self.storage.get_task(ssn_id, id)
     }
 
-    pub fn list_task(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
-        self.storage.list_task(ssn_id)
+    pub fn list_tasks(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
+        self.storage.list_tasks(ssn_id)
     }
 
     pub async fn create_executor(
@@ -516,9 +516,9 @@ impl Controller {
         Ok((*exe).clone())
     }
 
-    pub fn list_executor(&self) -> Result<Vec<Executor>, FlameError> {
-        trace_fn!("Controller::list_executor");
-        self.storage.list_executor(None)
+    pub fn list_executors(&self) -> Result<Vec<Executor>, FlameError> {
+        trace_fn!("Controller::list_executors");
+        self.storage.list_executors(None)
     }
 
     pub async fn register_executor(&self, e: &Executor) -> Result<(), FlameError> {
@@ -577,12 +577,12 @@ impl Controller {
         self.storage.update_application(name, attr).await
     }
 
-    pub async fn list_application(
+    pub async fn list_applications(
         &self,
         filter: Option<&crate::model::ApplicationFilter>,
     ) -> Result<Vec<Application>, FlameError> {
-        trace_fn!("Controller::list_application");
-        self.storage.list_application(filter).await
+        trace_fn!("Controller::list_applications");
+        self.storage.list_applications(filter).await
     }
 
     pub async fn watch_task(&self, gid: TaskGID) -> Result<Task, FlameError> {

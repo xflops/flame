@@ -141,7 +141,7 @@ impl Storage {
     }
 
     pub async fn load_data(&self) -> Result<(), FlameError> {
-        let ssn_list = self.engine.find_session(None).await?;
+        let ssn_list = self.engine.find_sessions().await?;
         for ssn in ssn_list {
             let task_list = self.engine.find_tasks(ssn.id.clone()).await?;
             let mut ssn = ssn.clone();
@@ -158,7 +158,7 @@ impl Storage {
             ssn_map.insert(ssn.id.clone(), SessionPtr::new(ssn.into()));
         }
 
-        let app_list = self.engine.find_application(None).await?;
+        let app_list = self.engine.find_applications(None).await?;
         for app in app_list {
             let mut app_map = lock_ptr!(self.applications)?;
             app_map.insert(app.name.clone(), ApplicationPtr::new(app.into()));
@@ -326,7 +326,7 @@ impl Storage {
     }
 
     /// Lists all registered nodes.
-    pub fn list_node(&self) -> Result<Vec<Node>, FlameError> {
+    pub fn list_nodes(&self) -> Result<Vec<Node>, FlameError> {
         let mut node_list = vec![];
         let node_map = lock_ptr!(self.nodes)?;
 
@@ -617,20 +617,23 @@ impl Storage {
     }
 
     pub async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        let ssn = {
+        let cached = {
             let ssn_map = lock_ptr!(self.sessions)?;
-            let ssn_ptr = ssn_map
-                .get(&id)
-                .ok_or_else(|| FlameError::NotFound(format!("session <{}>", id)))?;
-            let ssn = lock_ptr!(ssn_ptr)?;
-            ssn.clone()
+            ssn_map.get(&id).cloned()
         };
 
-        if let Err(e) = self.engine.delete_session(id.clone()).await {
-            if !matches!(e, FlameError::NotFound(_)) {
-                return Err(e);
+        let ssn = match cached {
+            Some(ssn_ptr) => {
+                let ssn = lock_ptr!(ssn_ptr)?.clone();
+                if let Err(error) = self.engine.delete_session(id.clone()).await {
+                    if !matches!(error, FlameError::NotFound(_)) {
+                        return Err(error);
+                    }
+                }
+                ssn
             }
-        }
+            None => self.engine.delete_session(id.clone()).await?,
+        };
 
         {
             let mut ssn_map = lock_ptr!(self.sessions)?;
@@ -642,7 +645,13 @@ impl Storage {
         Ok(ssn)
     }
 
-    pub fn list_session(&self, filter: Option<&SessionFilter>) -> Result<Vec<Session>, FlameError> {
+    pub fn list_sessions(
+        &self,
+        filter: Option<&SessionFilter>,
+    ) -> Result<Vec<Session>, FlameError> {
+        if filter.and_then(|filter| filter.limit) == Some(0) {
+            return Ok(Vec::new());
+        }
         let mut ssn_list = vec![];
         let ssn_map = lock_ptr!(self.sessions)?;
 
@@ -673,6 +682,12 @@ impl Storage {
                 }
             }
             ssn_list.push(ssn);
+            if filter
+                .and_then(|filter| filter.limit)
+                .is_some_and(|limit| ssn_list.len() >= limit)
+            {
+                break;
+            }
         }
 
         Ok(ssn_list)
@@ -687,7 +702,7 @@ impl Storage {
     ///     - `None` = ignore this field (match all)
     ///     - `Some(value)` = match exactly (empty vec/string matches nothing)
     ///   - All specified filters use AND logic.
-    pub fn list_executor(
+    pub fn list_executors(
         &self,
         filter: Option<&ExecutorFilter>,
     ) -> Result<Vec<Executor>, FlameError> {
@@ -785,7 +800,7 @@ impl Storage {
         Ok(task.clone())
     }
 
-    pub fn list_task(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
+    pub fn list_tasks(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
         let ssn_map = lock_ptr!(self.sessions)?;
         let ssn = ssn_map
             .get(&ssn_id)
@@ -842,20 +857,8 @@ impl Storage {
     pub async fn delete_application(&self, name: ApplicationID) -> Result<(), FlameError> {
         self.engine.delete_application(name.clone()).await?;
 
-        {
-            let mut app_map = lock_ptr!(self.applications)?;
-            let mut ssn_map = lock_ptr!(self.sessions)?;
-
-            app_map.remove(&name);
-
-            ssn_map.retain(|_, ssn| {
-                let ssn_ptr = lock_ptr!(ssn);
-                match ssn_ptr {
-                    Ok(ssn) => ssn.application != name,
-                    Err(_) => true,
-                }
-            });
-        }
+        let mut app_map = lock_ptr!(self.applications)?;
+        app_map.remove(&name);
 
         Ok(())
     }
@@ -873,11 +876,11 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn list_application(
+    pub async fn list_applications(
         &self,
         filter: Option<&ApplicationFilter>,
     ) -> Result<Vec<Application>, FlameError> {
-        self.engine.find_application(filter).await
+        self.engine.find_applications(filter).await
     }
 
     pub async fn session_application(&self, id: SessionID) -> Result<ApplicationID, FlameError> {
@@ -893,7 +896,7 @@ impl Storage {
     }
 
     pub fn count_session(&self, filter: &SessionFilter) -> Result<usize, FlameError> {
-        Ok(self.list_session(Some(filter))?.len())
+        Ok(self.list_sessions(Some(filter))?.len())
     }
 
     pub async fn update_task_state(

@@ -117,7 +117,7 @@ mod tests {
         let storage = tokio_test::block_on(crate::storage::new_ptr(&ctx))?;
         tokio_test::block_on(storage.load_data())?;
 
-        let executors = storage.list_executor(None)?;
+        let executors = storage.list_executors(None)?;
         assert_eq!(executors.len(), 2);
 
         let binding_exec = executors.iter().find(|e| e.id == "binding-exec").unwrap();
@@ -199,7 +199,7 @@ mod tests {
         let storage = tokio_test::block_on(crate::storage::new_ptr(&ctx))?;
         tokio_test::block_on(storage.load_data())?;
 
-        let executors = storage.list_executor(None)?;
+        let executors = storage.list_executors(None)?;
         assert_eq!(executors.len(), states_to_test.len());
 
         for (id, expected_state) in &states_to_test {

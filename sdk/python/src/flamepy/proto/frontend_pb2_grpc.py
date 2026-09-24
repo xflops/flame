@@ -58,14 +58,14 @@ class FrontendStub:
                 request_serializer=frontend__pb2.GetApplicationRequest.SerializeToString,
                 response_deserializer=types__pb2.Application.FromString,
                 _registered_method=True)
-        self.ListApplication = channel.unary_unary(
-                '/flame.v1.Frontend/ListApplication',
-                request_serializer=frontend__pb2.ListApplicationRequest.SerializeToString,
+        self.ListApplications = channel.unary_unary(
+                '/flame.v1.Frontend/ListApplications',
+                request_serializer=frontend__pb2.ListApplicationsRequest.SerializeToString,
                 response_deserializer=types__pb2.ApplicationList.FromString,
                 _registered_method=True)
-        self.ListExecutor = channel.unary_unary(
-                '/flame.v1.Frontend/ListExecutor',
-                request_serializer=frontend__pb2.ListExecutorRequest.SerializeToString,
+        self.ListExecutors = channel.unary_unary(
+                '/flame.v1.Frontend/ListExecutors',
+                request_serializer=frontend__pb2.ListExecutorsRequest.SerializeToString,
                 response_deserializer=types__pb2.ExecutorList.FromString,
                 _registered_method=True)
         self.ListNodes = channel.unary_unary(
@@ -103,9 +103,9 @@ class FrontendStub:
                 request_serializer=frontend__pb2.GetSessionRequest.SerializeToString,
                 response_deserializer=types__pb2.Session.FromString,
                 _registered_method=True)
-        self.ListSession = channel.unary_unary(
-                '/flame.v1.Frontend/ListSession',
-                request_serializer=frontend__pb2.ListSessionRequest.SerializeToString,
+        self.ListSessions = channel.unary_unary(
+                '/flame.v1.Frontend/ListSessions',
+                request_serializer=frontend__pb2.ListSessionsRequest.SerializeToString,
                 response_deserializer=types__pb2.SessionList.FromString,
                 _registered_method=True)
         self.CreateTask = channel.unary_unary(
@@ -123,9 +123,9 @@ class FrontendStub:
                 request_serializer=frontend__pb2.WatchTaskRequest.SerializeToString,
                 response_deserializer=types__pb2.Task.FromString,
                 _registered_method=True)
-        self.ListTask = channel.unary_stream(
-                '/flame.v1.Frontend/ListTask',
-                request_serializer=frontend__pb2.ListTaskRequest.SerializeToString,
+        self.ListTasks = channel.unary_stream(
+                '/flame.v1.Frontend/ListTasks',
+                request_serializer=frontend__pb2.ListTasksRequest.SerializeToString,
                 response_deserializer=types__pb2.Task.FromString,
                 _registered_method=True)
 
@@ -160,13 +160,13 @@ class FrontendServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def ListApplication(self, request, context):
+    def ListApplications(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def ListExecutor(self, request, context):
+    def ListExecutors(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -215,7 +215,7 @@ class FrontendServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def ListSession(self, request, context):
+    def ListSessions(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -239,7 +239,7 @@ class FrontendServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def ListTask(self, request, context):
+    def ListTasks(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -268,14 +268,14 @@ def add_FrontendServicer_to_server(servicer, server):
                     request_deserializer=frontend__pb2.GetApplicationRequest.FromString,
                     response_serializer=types__pb2.Application.SerializeToString,
             ),
-            'ListApplication': grpc.unary_unary_rpc_method_handler(
-                    servicer.ListApplication,
-                    request_deserializer=frontend__pb2.ListApplicationRequest.FromString,
+            'ListApplications': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListApplications,
+                    request_deserializer=frontend__pb2.ListApplicationsRequest.FromString,
                     response_serializer=types__pb2.ApplicationList.SerializeToString,
             ),
-            'ListExecutor': grpc.unary_unary_rpc_method_handler(
-                    servicer.ListExecutor,
-                    request_deserializer=frontend__pb2.ListExecutorRequest.FromString,
+            'ListExecutors': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListExecutors,
+                    request_deserializer=frontend__pb2.ListExecutorsRequest.FromString,
                     response_serializer=types__pb2.ExecutorList.SerializeToString,
             ),
             'ListNodes': grpc.unary_unary_rpc_method_handler(
@@ -313,9 +313,9 @@ def add_FrontendServicer_to_server(servicer, server):
                     request_deserializer=frontend__pb2.GetSessionRequest.FromString,
                     response_serializer=types__pb2.Session.SerializeToString,
             ),
-            'ListSession': grpc.unary_unary_rpc_method_handler(
-                    servicer.ListSession,
-                    request_deserializer=frontend__pb2.ListSessionRequest.FromString,
+            'ListSessions': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListSessions,
+                    request_deserializer=frontend__pb2.ListSessionsRequest.FromString,
                     response_serializer=types__pb2.SessionList.SerializeToString,
             ),
             'CreateTask': grpc.unary_unary_rpc_method_handler(
@@ -333,9 +333,9 @@ def add_FrontendServicer_to_server(servicer, server):
                     request_deserializer=frontend__pb2.WatchTaskRequest.FromString,
                     response_serializer=types__pb2.Task.SerializeToString,
             ),
-            'ListTask': grpc.unary_stream_rpc_method_handler(
-                    servicer.ListTask,
-                    request_deserializer=frontend__pb2.ListTaskRequest.FromString,
+            'ListTasks': grpc.unary_stream_rpc_method_handler(
+                    servicer.ListTasks,
+                    request_deserializer=frontend__pb2.ListTasksRequest.FromString,
                     response_serializer=types__pb2.Task.SerializeToString,
             ),
     }
@@ -461,7 +461,7 @@ class Frontend:
             _registered_method=True)
 
     @staticmethod
-    def ListApplication(request,
+    def ListApplications(request,
             target,
             options=(),
             channel_credentials=None,
@@ -474,8 +474,8 @@ class Frontend:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/flame.v1.Frontend/ListApplication',
-            frontend__pb2.ListApplicationRequest.SerializeToString,
+            '/flame.v1.Frontend/ListApplications',
+            frontend__pb2.ListApplicationsRequest.SerializeToString,
             types__pb2.ApplicationList.FromString,
             options,
             channel_credentials,
@@ -488,7 +488,7 @@ class Frontend:
             _registered_method=True)
 
     @staticmethod
-    def ListExecutor(request,
+    def ListExecutors(request,
             target,
             options=(),
             channel_credentials=None,
@@ -501,8 +501,8 @@ class Frontend:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/flame.v1.Frontend/ListExecutor',
-            frontend__pb2.ListExecutorRequest.SerializeToString,
+            '/flame.v1.Frontend/ListExecutors',
+            frontend__pb2.ListExecutorsRequest.SerializeToString,
             types__pb2.ExecutorList.FromString,
             options,
             channel_credentials,
@@ -704,7 +704,7 @@ class Frontend:
             _registered_method=True)
 
     @staticmethod
-    def ListSession(request,
+    def ListSessions(request,
             target,
             options=(),
             channel_credentials=None,
@@ -717,8 +717,8 @@ class Frontend:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/flame.v1.Frontend/ListSession',
-            frontend__pb2.ListSessionRequest.SerializeToString,
+            '/flame.v1.Frontend/ListSessions',
+            frontend__pb2.ListSessionsRequest.SerializeToString,
             types__pb2.SessionList.FromString,
             options,
             channel_credentials,
@@ -812,7 +812,7 @@ class Frontend:
             _registered_method=True)
 
     @staticmethod
-    def ListTask(request,
+    def ListTasks(request,
             target,
             options=(),
             channel_credentials=None,
@@ -825,8 +825,8 @@ class Frontend:
         return grpc.experimental.unary_stream(
             request,
             target,
-            '/flame.v1.Frontend/ListTask',
-            frontend__pb2.ListTaskRequest.SerializeToString,
+            '/flame.v1.Frontend/ListTasks',
+            frontend__pb2.ListTasksRequest.SerializeToString,
             types__pb2.Task.FromString,
             options,
             channel_credentials,

@@ -50,11 +50,11 @@ from flamepy.proto.frontend_pb2 import (
     GetApplicationRequest,
     GetSessionRequest,
     GetTaskRequest,
-    ListApplicationRequest,
-    ListExecutorRequest,
+    ListApplicationsRequest,
+    ListExecutorsRequest,
     ListNodesRequest,
-    ListSessionRequest,
-    ListTaskRequest,
+    ListSessionsRequest,
+    ListTasksRequest,
     OpenSessionRequest,
     RegisterApplicationRequest,
     UnregisterApplicationRequest,
@@ -407,10 +407,10 @@ class Connection:
 
     def list_applications(self) -> List[Application]:
         """List all applications."""
-        request = ListApplicationRequest()
+        request = ListApplicationsRequest()
 
         try:
-            response = self._frontend.ListApplication(request)
+            response = self._frontend.ListApplications(request)
 
             applications = [_application_from_proto(app) for app in response.applications]
 
@@ -434,10 +434,10 @@ class Connection:
 
     def list_executors(self) -> List[Any]:
         """List all executors."""
-        request = ListExecutorRequest()
+        request = ListExecutorsRequest()
 
         try:
-            response = self._frontend.ListExecutor(request)
+            response = self._frontend.ListExecutors(request)
             return list(response.executors)
         except grpc.RpcError as e:
             raise FlameError(FlameErrorCode.INTERNAL, f"failed to list executors: {e.details()}")
@@ -505,10 +505,10 @@ class Connection:
 
     def list_sessions(self) -> List["Session"]:
         """List all sessions."""
-        request = ListSessionRequest()
+        request = ListSessionsRequest()
 
         try:
-            response = self._frontend.ListSession(request)
+            response = self._frontend.ListSessions(request)
 
             sessions = []
             for session in response.sessions:
@@ -762,10 +762,10 @@ class Session:
             >>> for task in session.list_tasks():
             ...     print(f"Task {task.id}: {task.state}")
         """
-        request = ListTaskRequest(session_id=self.id)
+        request = ListTasksRequest(session_id=self.id)
 
         try:
-            task_stream = self.connection._frontend.ListTask(request)
+            task_stream = self.connection._frontend.ListTasks(request)
             return TaskIterator(task_stream, self.id)
 
         except grpc.RpcError as e:

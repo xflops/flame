@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::model::{ApplicationFilter, Executor, SessionFilter};
+use crate::model::{ApplicationFilter, Executor};
 use crate::FlameError;
 use common::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationState, CommonData, Event,
@@ -32,20 +32,6 @@ pub mod types;
 pub use sqlite::SqliteEngine;
 
 pub type EnginePtr = Arc<dyn Engine>;
-
-fn matches_session_filter(session: &Session, filter: &SessionFilter) -> bool {
-    filter
-        .application
-        .as_ref()
-        .is_none_or(|application| session.application == *application)
-        && filter
-            .state
-            .is_none_or(|state| session.status.state == state)
-        && filter
-            .ids
-            .as_ref()
-            .is_none_or(|ids| ids.contains(&session.id))
-}
 
 #[async_trait]
 pub trait Engine: Send + Sync + 'static {
@@ -67,7 +53,7 @@ pub trait Engine: Send + Sync + 'static {
         attr: ApplicationAttributes,
     ) -> Result<Application, FlameError>;
     async fn get_application(&self, id: ApplicationID) -> Result<Application, FlameError>;
-    async fn find_application(
+    async fn find_applications(
         &self,
         filter: Option<&ApplicationFilter>,
     ) -> Result<Vec<Application>, FlameError>;
@@ -81,10 +67,7 @@ pub trait Engine: Send + Sync + 'static {
     ) -> Result<Session, FlameError>;
     async fn close_session(&self, id: SessionID) -> Result<Session, FlameError>;
     async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError>;
-    async fn find_session(
-        &self,
-        filter: Option<&SessionFilter>,
-    ) -> Result<Vec<Session>, FlameError>;
+    async fn find_sessions(&self) -> Result<Vec<Session>, FlameError>;
 
     // Task operations
     async fn create_task(

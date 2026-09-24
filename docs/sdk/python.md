@@ -214,7 +214,8 @@ App returns `ObjectFuture` values. Use `future.get()` to fetch a concrete result
 `app.init(name, fail_if_exists=False, dependencies=None,
 python_version=None)` initializes the process-wide application and returns its
 runtime handle. Calling it again with the same name returns that handle. Set
-`fail_if_exists=True` when an existing registration should be an error.
+`fail_if_exists=True` when an existing registration should be an error. A
+disabled existing application is never reused and always produces an error.
 `dependencies` is used only to generate a `pyproject.toml` when the packaged
 project has no Python package metadata; otherwise, declare dependencies in the
 project's existing metadata. `python_version` selects the executor Python

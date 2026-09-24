@@ -26,8 +26,8 @@ use self::rpc::frontend_server::Frontend;
 use self::rpc::{
     ApplicationList, CloseSessionRequest, CreateSessionRequest, CreateTaskRequest,
     DeleteSessionRequest, ExecutorList, GetApplicationRequest, GetNodeRequest, GetNodeResponse,
-    GetSessionRequest, GetTaskRequest, ListApplicationRequest, ListExecutorRequest,
-    ListNodesRequest, ListSessionRequest, ListTaskRequest, NodeList, OpenSessionRequest,
+    GetSessionRequest, GetTaskRequest, ListApplicationsRequest, ListExecutorsRequest,
+    ListNodesRequest, ListSessionsRequest, ListTasksRequest, NodeList, OpenSessionRequest,
     RegisterApplicationRequest, Session, SessionList, Task, UnregisterApplicationRequest,
     UpdateApplicationRequest, WatchTaskRequest,
 };
@@ -97,19 +97,19 @@ fn validate_working_directory(working_dir: &Option<String>) -> Result<(), FlameE
 #[async_trait]
 impl Frontend for Flame {
     type WatchTaskStream = Pin<Box<dyn Stream<Item = Result<Task, Status>> + Send>>;
-    type ListTaskStream = Pin<Box<dyn Stream<Item = Result<Task, Status>> + Send>>;
+    type ListTasksStream = Pin<Box<dyn Stream<Item = Result<Task, Status>> + Send>>;
 
-    async fn list_task(
+    async fn list_tasks(
         &self,
-        req: Request<ListTaskRequest>,
-    ) -> Result<Response<Self::ListTaskStream>, Status> {
-        trace_fn!("Frontend::list_task");
+        req: Request<ListTasksRequest>,
+    ) -> Result<Response<Self::ListTasksStream>, Status> {
+        trace_fn!("Frontend::list_tasks");
         let req = req.into_inner();
         let ssn_id = req
             .session_id
             .parse::<apis::SessionID>()
             .map_err(|_| Status::invalid_argument("invalid session id"))?;
-        let task_list = self.controller.list_task(ssn_id).map_err(Status::from)?;
+        let task_list = self.controller.list_tasks(ssn_id).map_err(Status::from)?;
 
         let (tx, rx) = mpsc::channel(128);
 
@@ -273,16 +273,16 @@ impl Frontend for Flame {
         Ok(Response::new(rpc::Application::from(&app)))
     }
 
-    async fn list_application(
+    async fn list_applications(
         &self,
-        request: Request<ListApplicationRequest>,
+        request: Request<ListApplicationsRequest>,
     ) -> Result<Response<ApplicationList>, Status> {
-        trace_fn!("Frontend::list_application");
+        trace_fn!("Frontend::list_applications");
         let filter = crate::model::ApplicationFilter::try_from(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let app_list = self
             .controller
-            .list_application(Some(&filter))
+            .list_applications(Some(&filter))
             .await
             .map_err(Status::from)?;
 
@@ -291,12 +291,12 @@ impl Frontend for Flame {
         Ok(Response::new(ApplicationList { applications }))
     }
 
-    async fn list_executor(
+    async fn list_executors(
         &self,
-        _: tonic::Request<ListExecutorRequest>,
+        _: tonic::Request<ListExecutorsRequest>,
     ) -> Result<Response<ExecutorList>, Status> {
-        trace_fn!("Frontend::list_executor");
-        let executor_list = self.controller.list_executor().map_err(Status::from)?;
+        trace_fn!("Frontend::list_executors");
+        let executor_list = self.controller.list_executors().map_err(Status::from)?;
         let executors = executor_list.iter().map(rpc::Executor::from).collect();
         Ok(Response::new(ExecutorList { executors }))
     }
@@ -306,7 +306,7 @@ impl Frontend for Flame {
         _: tonic::Request<ListNodesRequest>,
     ) -> Result<Response<NodeList>, Status> {
         trace_fn!("Frontend::list_nodes");
-        let node_list = self.controller.list_node().map_err(Status::from)?;
+        let node_list = self.controller.list_nodes().map_err(Status::from)?;
         let nodes = node_list.iter().map(rpc::Node::from).collect();
         Ok(Response::new(NodeList { nodes }))
     }
@@ -475,16 +475,16 @@ impl Frontend for Flame {
 
         Ok(Response::new(ssn))
     }
-    async fn list_session(
+    async fn list_sessions(
         &self,
-        request: Request<ListSessionRequest>,
+        request: Request<ListSessionsRequest>,
     ) -> Result<Response<SessionList>, Status> {
-        trace_fn!("Frontend::list_session");
+        trace_fn!("Frontend::list_sessions");
         let filter = crate::model::SessionFilter::try_from(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let ssn_list = self
             .controller
-            .list_session(Some(&filter))
+            .list_sessions(Some(&filter))
             .map_err(Status::from)?;
 
         let sessions = ssn_list.iter().map(Session::from).collect();

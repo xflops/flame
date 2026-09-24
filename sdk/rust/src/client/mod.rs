@@ -32,8 +32,8 @@ use self::rpc::frontend_client::FrontendClient as FlameFrontendClient;
 use self::rpc::{
     ApplicationSpec, CloseSessionRequest, CreateSessionRequest, CreateTaskRequest, Environment,
     GetApplicationRequest, GetNodeRequest, GetSessionRequest, GetTaskRequest,
-    ListApplicationRequest, ListExecutorRequest, ListNodesRequest, ListSessionRequest,
-    ListTaskRequest, OpenSessionRequest, RegisterApplicationRequest, SessionSpec, TaskSpec,
+    ListApplicationsRequest, ListExecutorsRequest, ListNodesRequest, ListSessionsRequest,
+    ListTasksRequest, OpenSessionRequest, RegisterApplicationRequest, SessionSpec, TaskSpec,
     UnregisterApplicationRequest, UpdateApplicationRequest, WatchTaskRequest,
 };
 use crate::apis::flame::v1 as rpc;
@@ -657,10 +657,10 @@ impl Connection {
         Ok(ssn)
     }
 
-    pub async fn list_session(&self) -> Result<Vec<Session>, FlameError> {
+    pub async fn list_sessions(&self) -> Result<Vec<Session>, FlameError> {
         let mut client = FlameClient::new(self.channel.clone());
         let ssn_list = client
-            .list_session(ListSessionRequest {
+            .list_sessions(ListSessionsRequest {
                 application: None,
                 state: None,
             })
@@ -814,10 +814,10 @@ impl Connection {
         }
     }
 
-    pub async fn list_application(&self) -> Result<Vec<Application>, FlameError> {
+    pub async fn list_applications(&self) -> Result<Vec<Application>, FlameError> {
         let mut client = FlameClient::new(self.channel.clone());
         let app_list = client
-            .list_application(ListApplicationRequest { state: None })
+            .list_applications(ListApplicationsRequest { state: None })
             .await?;
 
         app_list
@@ -838,9 +838,9 @@ impl Connection {
         Application::try_from(&app.into_inner())
     }
 
-    pub async fn list_executor(&self) -> Result<Vec<Executor>, FlameError> {
+    pub async fn list_executors(&self) -> Result<Vec<Executor>, FlameError> {
         let mut client = FlameClient::new(self.channel.clone());
-        let executor_list = client.list_executor(ListExecutorRequest {}).await?;
+        let executor_list = client.list_executors(ListExecutorsRequest {}).await?;
         let inner = executor_list.into_inner();
         inner
             .executors
@@ -849,7 +849,7 @@ impl Connection {
             .collect::<Result<Vec<Executor>, FlameError>>()
     }
 
-    pub async fn list_node(&self) -> Result<Vec<Node>, FlameError> {
+    pub async fn list_nodes(&self) -> Result<Vec<Node>, FlameError> {
         let mut client = FlameClient::new(self.channel.clone());
         let node_list = client.list_nodes(ListNodesRequest {}).await?;
         Ok(node_list
@@ -988,13 +988,13 @@ impl Session {
 
     pub async fn list_tasks(&self) -> Result<Vec<Task>, FlameError> {
         // TODO (k82cn): Add top n tasks to avoid memory overflow.
-        trace_fn!("Session::list_task");
+        trace_fn!("Session::list_tasks");
         let mut client = self
             .client
             .clone()
             .ok_or(FlameError::Internal("no flame client".to_string()))?;
         let task_stream = client
-            .list_task(Request::new(ListTaskRequest {
+            .list_tasks(Request::new(ListTasksRequest {
                 session_id: self.id.to_string(),
             }))
             .await?;

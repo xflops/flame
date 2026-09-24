@@ -285,6 +285,40 @@ impl TryFrom<&Session> for SessionInfo {
     }
 }
 
+/// Filter for tasks owned by one session.
+pub struct TaskFilter {
+    /// Owning session.
+    pub session: SessionID,
+    /// Task states to include. `None` matches every state.
+    pub states: Option<Vec<TaskState>>,
+}
+
+impl TaskFilter {
+    /// Creates a filter for every task in a session.
+    pub fn by_session(session: impl Into<SessionID>) -> Self {
+        Self {
+            session: session.into(),
+            states: None,
+        }
+    }
+
+    /// Creates a filter for tasks in any of the provided states.
+    pub fn by_session_states(
+        session: impl Into<SessionID>,
+        states: impl Into<Vec<TaskState>>,
+    ) -> Self {
+        Self {
+            session: session.into(),
+            states: Some(states.into()),
+        }
+    }
+
+    /// Creates a filter for non-terminal tasks in a session.
+    pub fn non_terminal(session: impl Into<SessionID>) -> Self {
+        Self::by_session_states(session, vec![TaskState::Pending, TaskState::Running])
+    }
+}
+
 /// Filter for listing sessions.
 /// All fields are Option:
 /// - `None` = ignore this filter (match all)
@@ -298,6 +332,8 @@ pub struct SessionFilter {
     pub ids: Option<Vec<SessionID>>,
     /// Additional in-memory predicate filter.
     pub predicate: Option<SessionPredicate>,
+    /// Maximum number of matching sessions to return.
+    pub limit: Option<usize>,
 }
 
 impl SessionFilter {
@@ -308,6 +344,7 @@ impl SessionFilter {
             state: None,
             ids: None,
             predicate: None,
+            limit: None,
         }
     }
 
@@ -318,6 +355,7 @@ impl SessionFilter {
             state: Some(state),
             ids: None,
             predicate: None,
+            limit: None,
         }
     }
 
@@ -328,6 +366,18 @@ impl SessionFilter {
             state: None,
             ids: Some(ids),
             predicate: None,
+            limit: None,
+        }
+    }
+
+    /// Creates a filter for an application's sessions.
+    pub fn by_application(application: impl Into<ApplicationID>) -> Self {
+        Self {
+            application: Some(application.into()),
+            state: None,
+            ids: None,
+            predicate: None,
+            limit: None,
         }
     }
 
@@ -341,12 +391,19 @@ impl SessionFilter {
             state: Some(state),
             ids: None,
             predicate: None,
+            limit: None,
         }
     }
 
     /// Adds an in-memory predicate filter.
     pub const fn with_predicate(mut self, predicate: SessionPredicate) -> Self {
         self.predicate = Some(predicate);
+        self
+    }
+
+    /// Limits the number of matching sessions returned.
+    pub const fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
         self
     }
 }
@@ -357,15 +414,16 @@ impl Default for SessionFilter {
     }
 }
 
-impl TryFrom<rpc::ListSessionRequest> for SessionFilter {
+impl TryFrom<rpc::ListSessionsRequest> for SessionFilter {
     type Error = FlameError;
 
-    fn try_from(request: rpc::ListSessionRequest) -> Result<Self, Self::Error> {
+    fn try_from(request: rpc::ListSessionsRequest) -> Result<Self, Self::Error> {
         Ok(Self {
             application: request.application,
             state: request.state.map(SessionState::try_from).transpose()?,
             ids: None,
             predicate: None,
+            limit: None,
         })
     }
 }
@@ -518,10 +576,10 @@ impl Default for ApplicationFilter {
     }
 }
 
-impl TryFrom<rpc::ListApplicationRequest> for ApplicationFilter {
+impl TryFrom<rpc::ListApplicationsRequest> for ApplicationFilter {
     type Error = FlameError;
 
-    fn try_from(request: rpc::ListApplicationRequest) -> Result<Self, Self::Error> {
+    fn try_from(request: rpc::ListApplicationsRequest) -> Result<Self, Self::Error> {
         Ok(Self {
             state: request.state.map(ApplicationState::try_from).transpose()?,
         })
@@ -1056,7 +1114,7 @@ mod tests {
 
     #[test]
     fn application_filter_maps_rpc_state() {
-        let filter = ApplicationFilter::try_from(rpc::ListApplicationRequest {
+        let filter = ApplicationFilter::try_from(rpc::ListApplicationsRequest {
             state: Some(rpc::ApplicationState::Disabled as i32),
         })
         .unwrap();
@@ -1067,13 +1125,13 @@ mod tests {
     #[test]
     fn application_filter_rejects_unknown_rpc_state() {
         assert!(
-            ApplicationFilter::try_from(rpc::ListApplicationRequest { state: Some(99) }).is_err()
+            ApplicationFilter::try_from(rpc::ListApplicationsRequest { state: Some(99) }).is_err()
         );
     }
 
     #[test]
     fn session_filter_maps_rpc_fields() {
-        let filter = SessionFilter::try_from(rpc::ListSessionRequest {
+        let filter = SessionFilter::try_from(rpc::ListSessionsRequest {
             application: Some("test-app".to_string()),
             state: Some(rpc::SessionState::Open as i32),
         })
@@ -1085,7 +1143,7 @@ mod tests {
 
     #[test]
     fn session_filter_rejects_unknown_rpc_state() {
-        assert!(SessionFilter::try_from(rpc::ListSessionRequest {
+        assert!(SessionFilter::try_from(rpc::ListSessionsRequest {
             application: None,
             state: Some(99),
         })

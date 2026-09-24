@@ -45,7 +45,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let apps = storage.list_application(None).await.unwrap();
+            let apps = storage.list_applications(None).await.unwrap();
             assert_eq!(apps.len(), 1);
             assert_eq!(apps[0].name, "test-app");
         }
@@ -65,7 +65,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let apps = storage.list_application(None).await.unwrap();
+            let apps = storage.list_applications(None).await.unwrap();
             assert_eq!(apps.len(), 2);
         }
 
@@ -235,7 +235,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let apps = storage.list_application(None).await.unwrap();
+            let apps = storage.list_applications(None).await.unwrap();
             assert!(apps.is_empty());
         }
 
@@ -253,7 +253,7 @@ mod tests {
             let ssn_attr = create_session_attr("cleanup-ssn", "cleanup-app");
             storage.create_session(ssn_attr).await.unwrap();
 
-            assert_eq!(storage.list_session(None).unwrap().len(), 1);
+            assert_eq!(storage.list_sessions(None).unwrap().len(), 1);
 
             storage
                 .update_application_state("cleanup-app".to_string(), ApplicationState::Disabled)
@@ -272,12 +272,20 @@ mod tests {
                 .close_session("cleanup-ssn".to_string())
                 .await
                 .unwrap();
+            let result = storage.delete_application("cleanup-app".to_string()).await;
+            assert!(matches!(result, Err(common::FlameError::InvalidState(_))));
+            assert_eq!(storage.list_sessions(None).unwrap().len(), 1);
+
+            storage
+                .delete_session("cleanup-ssn".to_string())
+                .await
+                .unwrap();
             storage
                 .delete_application("cleanup-app".to_string())
                 .await
                 .unwrap();
 
-            assert_eq!(storage.list_session(None).unwrap().len(), 0);
+            assert_eq!(storage.list_sessions(None).unwrap().len(), 0);
         }
 
         #[tokio::test]
@@ -293,7 +301,7 @@ mod tests {
         }
     }
 
-    mod list_application {
+    mod list_applications {
         use super::*;
 
         #[tokio::test]
@@ -301,7 +309,7 @@ mod tests {
             let ctx = test_context();
             let storage = storage::new_ptr(&ctx).await.unwrap();
 
-            let apps = storage.list_application(None).await.unwrap();
+            let apps = storage.list_applications(None).await.unwrap();
             assert!(apps.is_empty());
         }
 
@@ -318,7 +326,7 @@ mod tests {
                     .unwrap();
             }
 
-            let apps = storage.list_application(None).await.unwrap();
+            let apps = storage.list_applications(None).await.unwrap();
             assert_eq!(apps.len(), 3);
 
             let names: Vec<_> = apps.iter().map(|a| a.name.as_str()).collect();
@@ -348,7 +356,7 @@ mod tests {
 
             let filter =
                 crate::model::ApplicationFilter::by_state(common::apis::ApplicationState::Disabled);
-            let apps = storage.list_application(Some(&filter)).await.unwrap();
+            let apps = storage.list_applications(Some(&filter)).await.unwrap();
             assert_eq!(apps.len(), 1);
             assert_eq!(apps[0].name, "disabled-app");
         }

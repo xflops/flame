@@ -186,7 +186,9 @@ flamepy.app.init(name, fail_if_exists=False)
 
 - `name`: application and package name. Repeating `init()` with the same name
   returns the same runtime handle.
-- `fail_if_exists`: when `True`, raise if the application already exists. The default reuses an existing application and skips cleanup for it.
+- `fail_if_exists`: when `True`, raise if the application already exists. The
+  default reuses an existing enabled application and skips cleanup for it; a
+  disabled application always produces an error.
 
 Top-level functions:
 

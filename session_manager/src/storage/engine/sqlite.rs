@@ -25,7 +25,7 @@ use sqlx::{
     migrate::MigrateDatabase,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
     types::Json,
-    FromRow, Sqlite, SqliteConnection, SqlitePool,
+    FromRow, QueryBuilder, Sqlite, SqliteConnection, SqlitePool,
 };
 use stdng::{logs::TraceFn, trace_fn};
 
@@ -39,12 +39,12 @@ use common::{
     FlameError,
 };
 
-use crate::model::{ApplicationFilter, Executor, SessionFilter};
+use crate::model::{ApplicationFilter, Executor, SessionFilter, TaskFilter};
 use crate::storage::engine::types::{
     AppSchemaDao, ApplicationDao, EventDao, ExecutorDao, NodeDao, SessionDao, TaskDao,
 };
 
-use crate::storage::engine::{matches_session_filter, Engine, EnginePtr};
+use crate::storage::engine::{Engine, EnginePtr};
 
 const SQLITE_SQL: &str = "migrations/sqlite";
 
@@ -87,19 +87,31 @@ impl SqliteEngine {
         Ok(Arc::new(SqliteEngine { pool: db }))
     }
 
-    async fn _count_open_tasks(
+    async fn _count_task(
         &self,
         tx: &mut SqliteConnection,
-        ssn_id: SessionID,
+        filter: &TaskFilter,
     ) -> Result<i64, FlameError> {
-        let sql = "SELECT count(*) FROM tasks WHERE ssn_id=? AND state NOT IN (?, ?)";
-        let count: i64 = sqlx::query_scalar(sql)
-            .bind(ssn_id)
-            .bind(TaskState::Failed as i32)
-            .bind(TaskState::Succeed as i32)
+        if filter.states.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(0);
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT count(*) FROM tasks WHERE ssn_id=");
+        query.push_bind(&filter.session);
+        if let Some(states) = &filter.states {
+            query.push(" AND state IN (");
+            let mut values = query.separated(", ");
+            for state in states {
+                values.push_bind(*state as i32);
+            }
+            values.push_unseparated(")");
+        }
+
+        let count: i64 = query
+            .build_query_scalar()
             .fetch_one(&mut *tx)
             .await
-            .map_err(|e| FlameError::Storage(format!("failed to count open tasks: {e}")))?;
+            .map_err(|e| FlameError::Storage(format!("failed to count tasks: {e}")))?;
         Ok(count)
     }
 
@@ -128,33 +140,54 @@ impl SqliteEngine {
         Ok(ssn)
     }
 
-    async fn _count_open_sessions(
+    async fn _count_sessions(
         &self,
         tx: &mut SqliteConnection,
-        app: String,
+        filter: &SessionFilter,
     ) -> Result<i64, FlameError> {
-        let sql = "SELECT count(*) FROM sessions WHERE application=? AND state=?";
-        let count: i64 = sqlx::query_scalar(sql)
-            .bind(app)
-            .bind(SessionState::Open as i32)
+        if filter.predicate.is_some() {
+            return Err(FlameError::Storage(
+                "session predicates cannot be evaluated by SQLite".to_string(),
+            ));
+        }
+        if filter.ids.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(0);
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT count(*) FROM sessions");
+        let mut has_condition = false;
+        if let Some(application) = &filter.application {
+            query.push(" WHERE application=").push_bind(application);
+            has_condition = true;
+        }
+        if let Some(state) = filter.state {
+            query.push(if has_condition {
+                " AND state="
+            } else {
+                " WHERE state="
+            });
+            query.push_bind(state as i32);
+            has_condition = true;
+        }
+        if let Some(ids) = &filter.ids {
+            query.push(if has_condition {
+                " AND id IN ("
+            } else {
+                " WHERE id IN ("
+            });
+            let mut values = query.separated(", ");
+            for id in ids {
+                values.push_bind(id);
+            }
+            values.push_unseparated(")");
+        }
+
+        let count: i64 = query
+            .build_query_scalar()
             .fetch_one(&mut *tx)
             .await
-            .map_err(|e| FlameError::Storage(format!("failed to count open sessions: {e}")))?;
+            .map_err(|e| FlameError::Storage(format!("failed to count sessions: {e}")))?;
         Ok(count)
-    }
-
-    async fn _list_session_ids(
-        &self,
-        tx: &mut SqliteConnection,
-        app: String,
-    ) -> Result<Vec<SessionID>, FlameError> {
-        let sql = "SELECT id FROM sessions WHERE application=?";
-        let ids: Vec<SessionID> = sqlx::query_scalar(sql)
-            .bind(app)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to list session ids: {e}")))?;
-        Ok(ids)
     }
 
     async fn _delete_application(
@@ -207,7 +240,7 @@ impl SqliteEngine {
         let sql = r#"INSERT INTO sessions (id, application, common_data, creation_time, state, min_instances, max_instances, batch_size, priority, resreq_cpu, resreq_memory, resreq_gpu)
             VALUES (
                 ?,
-                (SELECT name FROM applications WHERE name=? AND state=?),
+                ?,
                 ?,
                 ?,
                 ?,
@@ -223,7 +256,6 @@ impl SqliteEngine {
         let ssn: SessionDao = sqlx::query_as(sql)
             .bind(attr.id.clone())
             .bind(attr.application)
-            .bind(ApplicationState::Enabled as i32)
             .bind(common_data)
             .bind(Utc::now().timestamp())
             .bind(SessionState::Open as i32)
@@ -346,7 +378,8 @@ impl Engine for SqliteEngine {
             )));
         }
 
-        let count = self._count_open_sessions(&mut tx, name.clone()).await?;
+        let filter = SessionFilter::by_application_state(name.clone(), SessionState::Open);
+        let count = self._count_sessions(&mut tx, &filter).await?;
         if count > 0 {
             return Err(FlameError::Storage(format!(
                 "{count} open sessions in the application"
@@ -478,16 +511,12 @@ impl Engine for SqliteEngine {
             )));
         }
 
-        let count = self._count_open_sessions(&mut tx, name.clone()).await?;
+        let filter = SessionFilter::by_application(name.clone());
+        let count = self._count_sessions(&mut tx, &filter).await?;
         if count > 0 {
             return Err(FlameError::InvalidState(format!(
-                "application <{name}> has {count} open sessions"
+                "application <{name}> still has {count} sessions"
             )));
-        }
-
-        let ids = self._list_session_ids(&mut tx, name.clone()).await?;
-        for id in ids {
-            self._delete_session(&mut tx, id).await?;
         }
 
         self._delete_application(&mut tx, name).await?;
@@ -525,7 +554,7 @@ impl Engine for SqliteEngine {
         app.try_into()
     }
 
-    async fn find_application(
+    async fn find_applications(
         &self,
         filter: Option<&ApplicationFilter>,
     ) -> Result<Vec<Application>, FlameError> {
@@ -643,7 +672,8 @@ impl Engine for SqliteEngine {
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
-        let count = self._count_open_tasks(&mut tx, id.clone()).await?;
+        let filter = TaskFilter::non_terminal(&id);
+        let count = self._count_task(&mut tx, &filter).await?;
         if count > 0 {
             return Err(FlameError::Storage(format!(
                 "{count} open tasks in the session"
@@ -710,18 +740,14 @@ impl Engine for SqliteEngine {
         ssn.try_into()
     }
 
-    async fn find_session(
-        &self,
-        filter: Option<&SessionFilter>,
-    ) -> Result<Vec<Session>, FlameError> {
+    async fn find_sessions(&self) -> Result<Vec<Session>, FlameError> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
-        let sql = "SELECT * FROM sessions";
-        let ssn: Vec<SessionDao> = sqlx::query_as(sql)
+        let ssn: Vec<SessionDao> = sqlx::query_as("SELECT * FROM sessions")
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;
@@ -734,7 +760,6 @@ impl Engine for SqliteEngine {
             .iter()
             .map(Session::try_from)
             .filter_map(Result::ok)
-            .filter(|session| filter.is_none_or(|filter| matches_session_filter(session, filter)))
             .collect())
     }
 
@@ -1466,7 +1491,7 @@ mod tests {
         assert_eq!(unchanged.image, disabled.image);
 
         let filter = ApplicationFilter::by_state(ApplicationState::Disabled);
-        let apps = tokio_test::block_on(storage.find_application(Some(&filter)))?;
+        let apps = tokio_test::block_on(storage.find_applications(Some(&filter)))?;
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].name, "disabled-app");
 
@@ -1525,12 +1550,19 @@ mod tests {
             storage.update_application_state("flmexec".to_string(), ApplicationState::Disabled),
         )?;
         let res = tokio_test::block_on(storage.delete_application("flmexec".to_string()));
-        assert!(res.is_ok());
+        assert!(matches!(res, Err(FlameError::InvalidState(_))));
+
+        let list_ssn = tokio_test::block_on(storage.find_sessions())?;
+        assert_eq!(list_ssn.len(), 1);
+        assert_eq!(list_ssn[0].id, ssn_1_id);
+
+        tokio_test::block_on(storage.delete_session(ssn_1_id))?;
+        tokio_test::block_on(storage.delete_application("flmexec".to_string()))?;
 
         let app_1 = tokio_test::block_on(storage.get_application("flmexec".to_string()));
         assert!(app_1.is_err());
 
-        let list_ssn = tokio_test::block_on(storage.find_session(None))?;
+        let list_ssn = tokio_test::block_on(storage.find_sessions())?;
         assert_eq!(list_ssn.len(), 0);
 
         Ok(())
@@ -1947,7 +1979,7 @@ mod tests {
         ))?;
         assert_eq!(task_2_2.state, TaskState::Succeed);
 
-        let ssn_list = tokio_test::block_on(storage.find_session(None))?;
+        let ssn_list = tokio_test::block_on(storage.find_sessions())?;
         assert_eq!(ssn_list.len(), 2);
 
         let ssn_1 = tokio_test::block_on(storage.close_session(ssn_1_id.clone()))?;
@@ -2123,6 +2155,35 @@ mod tests {
 
         let ssn_1 = tokio_test::block_on(storage.delete_session(ssn_1_id.clone()))?;
         assert_eq!(ssn_1.status.state, SessionState::Closed);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_session_with_cancelled_tasks() -> Result<(), FlameError> {
+        let url = common::temp_sqlite_url("flame_test_delete_session_with_cancelled_tasks");
+        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
+        tokio_test::block_on(
+            storage.register_application("flmexec".to_string(), ApplicationAttributes::default()),
+        )?;
+        let session_id = format!(
+            "cancelled-tasks-{}",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        tokio_test::block_on(storage.create_session(SessionAttributes {
+            id: session_id.clone(),
+            application: "flmexec".to_string(),
+            ..Default::default()
+        }))?;
+        let task = tokio_test::block_on(storage.create_task(session_id.clone(), None, None))?;
+
+        tokio_test::block_on(storage.close_session(session_id.clone()))?;
+        assert_eq!(
+            tokio_test::block_on(storage.get_task(task.gid()))?.state,
+            TaskState::Cancelled
+        );
+        let deleted = tokio_test::block_on(storage.delete_session(session_id))?;
+        assert_eq!(deleted.status.state, SessionState::Closed);
 
         Ok(())
     }

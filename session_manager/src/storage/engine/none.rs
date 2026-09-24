@@ -161,28 +161,16 @@ impl Engine for NoneEngine {
             )));
         }
 
-        let mut sessions = lock_ptr!(self.sessions)?;
-        if sessions
-            .values()
-            .any(|session| session.application == id && session.status.state == SessionState::Open)
-        {
+        let sessions = lock_ptr!(self.sessions)?;
+        if sessions.values().any(|session| session.application == id) {
             return Err(FlameError::InvalidState(format!(
-                "application <{id}> has open sessions"
+                "application <{id}> still has sessions"
             )));
         }
 
-        let removed_session_ids: Vec<_> = sessions
-            .values()
-            .filter(|session| session.application == id)
-            .map(|session| session.id.clone())
-            .collect();
-        sessions.retain(|_, session| session.application != id);
         apps.remove(&id);
         drop(sessions);
         drop(apps);
-        for session_id in removed_session_ids {
-            self.remove_task_counter(&session_id)?;
-        }
         Ok(())
     }
 
@@ -232,7 +220,7 @@ impl Engine for NoneEngine {
             .ok_or_else(|| FlameError::NotFound(format!("application <{}>", id)))
     }
 
-    async fn find_application(
+    async fn find_applications(
         &self,
         filter: Option<&ApplicationFilter>,
     ) -> Result<Vec<Application>, FlameError> {
@@ -301,15 +289,14 @@ impl Engine for NoneEngine {
     }
 
     async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        lock_ptr!(self.sessions)?.remove(&id);
+        let session = lock_ptr!(self.sessions)?
+            .remove(&id)
+            .ok_or_else(|| FlameError::NotFound(format!("session <{id}>")))?;
         self.remove_task_counter(&id)?;
-        Err(FlameError::NotFound(format!("session <{id}>")))
+        Ok(session)
     }
 
-    async fn find_session(
-        &self,
-        _filter: Option<&SessionFilter>,
-    ) -> Result<Vec<Session>, FlameError> {
+    async fn find_sessions(&self) -> Result<Vec<Session>, FlameError> {
         Ok(vec![])
     }
 
@@ -454,10 +441,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_none_engine_find_session_returns_empty() {
+    async fn test_none_engine_find_sessions_returns_empty() {
         let engine = NoneEngine::new_ptr("none").await.unwrap();
 
-        let sessions = engine.find_session(None).await.unwrap();
+        let sessions = engine.find_sessions().await.unwrap();
         assert!(sessions.is_empty());
     }
 
@@ -566,7 +553,7 @@ mod tests {
         assert_eq!(task1.id, 1);
 
         let result = engine.delete_session("test-session".to_string()).await;
-        assert!(result.is_err());
+        assert_eq!(result.unwrap().id, "test-session");
 
         engine.create_session(attr).await.unwrap();
 

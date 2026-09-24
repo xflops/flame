@@ -87,7 +87,7 @@ mod tests {
                 storage.create_session(attr).await.unwrap();
             }
 
-            let sessions = storage.list_session(None).unwrap();
+            let sessions = storage.list_sessions(None).unwrap();
             assert_eq!(sessions.len(), 5);
         }
     }
@@ -329,18 +329,18 @@ mod tests {
             let attr = create_session_attr("list-delete-ssn");
             storage.create_session(attr).await.unwrap();
 
-            assert_eq!(storage.list_session(None).unwrap().len(), 1);
+            assert_eq!(storage.list_sessions(None).unwrap().len(), 1);
 
             storage
                 .delete_session("list-delete-ssn".to_string())
                 .await
                 .unwrap();
 
-            assert_eq!(storage.list_session(None).unwrap().len(), 0);
+            assert_eq!(storage.list_sessions(None).unwrap().len(), 0);
         }
     }
 
-    mod list_session {
+    mod list_sessions {
         use super::*;
 
         #[tokio::test]
@@ -348,7 +348,7 @@ mod tests {
             let ctx = test_context();
             let storage = storage::new_ptr(&ctx).await.unwrap();
 
-            let sessions = storage.list_session(None).unwrap();
+            let sessions = storage.list_sessions(None).unwrap();
             assert!(sessions.is_empty());
         }
 
@@ -362,7 +362,7 @@ mod tests {
                 storage.create_session(attr).await.unwrap();
             }
 
-            let sessions = storage.list_session(None).unwrap();
+            let sessions = storage.list_sessions(None).unwrap();
             assert_eq!(sessions.len(), 3);
 
             let ids: Vec<_> = sessions.iter().map(|s| s.id.as_str()).collect();
@@ -386,7 +386,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let sessions = storage.list_session(None).unwrap();
+            let sessions = storage.list_sessions(None).unwrap();
             assert_eq!(sessions.len(), 2);
 
             let open_count = sessions
@@ -421,7 +421,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let sessions = storage.list_session(None).unwrap();
+            let sessions = storage.list_sessions(None).unwrap();
             let session = sessions
                 .iter()
                 .find(|session| session.id == "list-event-ssn")

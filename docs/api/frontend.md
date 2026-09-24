@@ -11,10 +11,10 @@ service Frontend {
   rpc UnregisterApplication(UnregisterApplicationRequest) returns (Result) {}
   rpc UpdateApplication(UpdateApplicationRequest) returns (Result) {}
   rpc GetApplication(GetApplicationRequest) returns (Application) {}
-  rpc ListApplication(ListApplicationRequest) returns (ApplicationList) {}
+  rpc ListApplications(ListApplicationsRequest) returns (ApplicationList) {}
 
   // Executor Listing
-  rpc ListExecutor(ListExecutorRequest) returns (ExecutorList) {}
+  rpc ListExecutors(ListExecutorsRequest) returns (ExecutorList) {}
 
   // Node Operations
   rpc ListNodes(ListNodesRequest) returns (NodeList) {}
@@ -26,13 +26,13 @@ service Frontend {
   rpc OpenSession(OpenSessionRequest) returns (Session) {}
   rpc CloseSession(CloseSessionRequest) returns (Session) {}
   rpc GetSession(GetSessionRequest) returns (Session) {}
-  rpc ListSession(ListSessionRequest) returns (SessionList) {}
+  rpc ListSessions(ListSessionsRequest) returns (SessionList) {}
 
   // Task Operations
   rpc CreateTask(CreateTaskRequest) returns (Task) {}
   rpc GetTask(GetTaskRequest) returns (Task) {}
   rpc WatchTask(WatchTaskRequest) returns (stream Task) {}
-  rpc ListTask(ListTaskRequest) returns (stream Task) {}
+  rpc ListTasks(ListTasksRequest) returns (stream Task) {}
 }
 ```
 
@@ -99,11 +99,15 @@ Retrieves application details by name.
 
 **Response:** [Application](types.md#application)
 
-### ListApplication
+### ListApplications
 
-Lists all registered applications.
+Lists registered applications, optionally filtered by state.
 
-**Request:** `ListApplicationRequest` (empty)
+**Request:** `ListApplicationsRequest`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `state` | optional [ApplicationState](types.md#applicationstate) | Application state filter |
 
 **Response:** [ApplicationList](types.md#applicationlist)
 
@@ -183,11 +187,16 @@ Retrieves session details.
 
 **Response:** [Session](types.md#session)
 
-### ListSession
+### ListSessions
 
-Lists all sessions.
+Lists sessions, optionally filtered by application and state.
 
-**Request:** `ListSessionRequest` (empty)
+**Request:** `ListSessionsRequest`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `application` | optional string | Application name filter |
+| `state` | optional [SessionState](types.md#sessionstate) | Session state filter |
 
 **Response:** [SessionList](types.md#sessionlist)
 
@@ -244,11 +253,11 @@ for update in session.watch_task(task.id):
         break
 ```
 
-### ListTask
+### ListTasks
 
 Streams all tasks in a session.
 
-**Request:** `ListTaskRequest`
+**Request:** `ListTasksRequest`
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -284,10 +293,10 @@ Retrieves details for a specific node.
 
 ## Executor Operations
 
-### ListExecutor
+### ListExecutors
 
 Lists all executors in the cluster.
 
-**Request:** `ListExecutorRequest` (empty)
+**Request:** `ListExecutorsRequest` (empty)
 
 **Response:** [ExecutorList](types.md#executorlist)

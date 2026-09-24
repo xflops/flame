@@ -218,7 +218,7 @@ mod tests {
         }
     }
 
-    mod list_task {
+    mod list_tasks {
         use super::*;
 
         #[tokio::test]
@@ -229,7 +229,7 @@ mod tests {
             let attr = create_session_attr("empty-task-ssn");
             storage.create_session(attr).await.unwrap();
 
-            let tasks = storage.list_task("empty-task-ssn".to_string()).unwrap();
+            let tasks = storage.list_tasks("empty-task-ssn".to_string()).unwrap();
             assert!(tasks.is_empty());
         }
 
@@ -248,7 +248,7 @@ mod tests {
                     .unwrap();
             }
 
-            let tasks = storage.list_task("list-task-ssn".to_string()).unwrap();
+            let tasks = storage.list_tasks("list-task-ssn".to_string()).unwrap();
             assert_eq!(tasks.len(), 5);
         }
 
@@ -257,7 +257,7 @@ mod tests {
             let ctx = test_context();
             let storage = storage::new_ptr(&ctx).await.unwrap();
 
-            let result = storage.list_task("nonexistent-ssn".to_string());
+            let result = storage.list_tasks("nonexistent-ssn".to_string());
             assert!(result.is_err());
         }
     }

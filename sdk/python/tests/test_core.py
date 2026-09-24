@@ -370,7 +370,7 @@ class TestApplicationConversion:
         from flamepy.proto.types_pb2 import ApplicationList, ApplicationStatus, Metadata
 
         class Frontend:
-            def ListApplication(self, req):  # noqa: N802
+            def ListApplications(self, req):  # noqa: N802
                 app = ApplicationProto(
                     metadata=Metadata(id="app-1", name="app"),
                     status=ApplicationStatus(state=0, creation_time=int(time.time() * 1000)),

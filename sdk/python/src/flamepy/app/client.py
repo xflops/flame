@@ -39,6 +39,7 @@ from flamepy.core import put_object as _core_put_object
 from flamepy.core.service import SessionContext
 from flamepy.core.types import (
     ApplicationAttributes,
+    ApplicationState,
     FlameContext,
     FlameError,
     FlameErrorCode,
@@ -652,7 +653,8 @@ class _Runtime:
         Args:
             name: The name of the application/package
             fail_if_exists: If True, raise an exception if the application already exists.
-                           If False (default), skip registration if the application already exists.
+                           If False (default), reuse an existing enabled application. Existing
+                           disabled applications always produce an error.
             dependencies: List of pip dependencies (e.g., ["numpy", "pandas>=2.0"]).
                          If provided and no pyproject.toml exists, one will be auto-generated.
             python_version: Python version to use for execution.
@@ -700,7 +702,13 @@ class _Runtime:
 
             logger.debug(f"Starting app runtime '{self._name}'")
 
-            if core_client.get_application(self._name) is not None:
+            application = core_client.get_application(self._name)
+            if application is not None:
+                if application.state == ApplicationState.DISABLED:
+                    raise FlameError(
+                        FlameErrorCode.INVALID_STATE,
+                        f"Application '{self._name}' is disabled and cannot be reused.",
+                    )
                 if self._fail_if_exists:
                     raise FlameError(
                         FlameErrorCode.ALREADY_EXISTS,

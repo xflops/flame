@@ -16,9 +16,9 @@ service Frontend {
   rpc UpdateApplication(UpdateApplicationRequest) returns (Result) {}
 
   rpc GetApplication(GetApplicationRequest) returns (Application) {}
-  rpc ListApplication(ListApplicationRequest) returns (ApplicationList) {}
+  rpc ListApplications(ListApplicationsRequest) returns (ApplicationList) {}
 
-  rpc ListExecutor(ListExecutorRequest) returns (ExecutorList) {}
+  rpc ListExecutors(ListExecutorsRequest) returns (ExecutorList) {}
 
   // Node operations
   rpc ListNodes(ListNodesRequest) returns (NodeList) {}
@@ -31,13 +31,13 @@ service Frontend {
   rpc CloseSession (CloseSessionRequest) returns (Session) {}
 
   rpc GetSession(GetSessionRequest) returns (Session) {}
-  rpc ListSession (ListSessionRequest) returns (SessionList) {}
+  rpc ListSessions (ListSessionsRequest) returns (SessionList) {}
 
   rpc CreateTask (CreateTaskRequest) returns (Task) {}
 
   rpc GetTask (GetTaskRequest) returns (Task) {}
   rpc WatchTask (WatchTaskRequest) returns (stream Task) {}
-  rpc ListTask (ListTaskRequest) returns (stream Task) {}
+  rpc ListTasks (ListTasksRequest) returns (stream Task) {}
 }
 
 message RegisterApplicationRequest {
@@ -58,11 +58,11 @@ message GetApplicationRequest {
   string name = 1;
 }
 
-message ListApplicationRequest {
+message ListApplicationsRequest {
   optional ApplicationState state = 1;
 }
 
-message ListExecutorRequest {
+message ListExecutorsRequest {
   
 }
 
@@ -102,7 +102,7 @@ message GetSessionRequest {
   string session_id = 1;
 }
 
-message ListSessionRequest {
+message ListSessionsRequest {
   optional string application = 1;
   optional SessionState state = 2;
 }
@@ -121,6 +121,6 @@ message WatchTaskRequest {
   string session_id = 2;
 }
 
-message ListTaskRequest {
+message ListTasksRequest {
   string session_id = 1;
 }

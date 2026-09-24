@@ -246,7 +246,7 @@ mod tests {
             assert_eq!(node_list.len(), 1);
             assert_eq!(node_list.values().next().unwrap().name, "node_1");
 
-            let exec_list = controller.list_executor()?;
+            let exec_list = controller.list_executors()?;
             // The test does not run an executor manager, so a created executor
             // remains Void. Allocate pipelines that existing Void executor on
             // later cycles instead of creating duplicates before it becomes
@@ -294,7 +294,7 @@ mod tests {
         let mut ctx = Context::new(controller.clone(), &options)?;
         tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
 
-        let executors = controller.list_executor()?;
+        let executors = controller.list_executors()?;
         assert_eq!(executors.len(), 1);
         assert_eq!(executors[0].node, "node_1");
         Ok(())
@@ -379,7 +379,7 @@ mod tests {
         let allocate = AllocateAction::new_ptr();
         tokio_test::block_on(allocate.execute(&mut ctx))?;
 
-        let executors = controller.list_executor()?;
+        let executors = controller.list_executors()?;
         assert_eq!(executors.len(), executor_count);
         assert!(executors.iter().all(|executor| {
             executor.state == common::apis::ExecutorState::Binding
@@ -529,7 +529,7 @@ mod tests {
         let alloc = AllocateAction::new_ptr();
         tokio_test::block_on(alloc.execute(&mut ctx))?;
 
-        let executors = controller.list_executor()?;
+        let executors = controller.list_executors()?;
         assert_eq!(executors.len(), 1);
         assert_eq!(executors[0].state, common::apis::ExecutorState::Idle);
         assert_eq!(executors[0].ssn_id, None);

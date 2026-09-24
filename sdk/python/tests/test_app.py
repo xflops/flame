@@ -22,7 +22,7 @@ from flamepy.app.client import (
 from flamepy.app.client import _Runtime as Runtime
 from flamepy.app.storage import CacheStorage, FileStorage, create_storage_backend
 from flamepy.app.types import ServiceContext, ServiceRequest
-from flamepy.core.types import FlameError, FlameErrorCode, Shim
+from flamepy.core.types import ApplicationState, FlameError, FlameErrorCode, Shim
 
 # App Storage Tests
 
@@ -136,7 +136,7 @@ def test_runtime_reuses_existing_application_with_noop_owner(monkeypatch):
     monkeypatch.setattr("flamepy.app.client.FlameContext", lambda: context)
     monkeypatch.setattr(
         "flamepy.app.client.core_client.get_application",
-        MagicMock(return_value=SimpleNamespace(labels=["external"], url=None)),
+        MagicMock(return_value=SimpleNamespace(state=ApplicationState.ENABLED, labels=["external"], url=None)),
     )
     monkeypatch.setattr(
         "flamepy.app.client.core_client.register_application",
@@ -159,6 +159,27 @@ def test_runtime_reuses_existing_application_with_noop_owner(monkeypatch):
 
     assert runtime._state is _RuntimeState.INACTIVE
     unregister_application.assert_not_called()
+
+
+def test_runtime_rejects_existing_disabled_application(monkeypatch):
+    context = SimpleNamespace(package=None, cache=None, app="flmrun")
+    register_application = MagicMock()
+
+    monkeypatch.setattr("flamepy.app.client.FlameContext", lambda: context)
+    monkeypatch.setattr(
+        "flamepy.app.client.core_client.get_application",
+        MagicMock(return_value=SimpleNamespace(state=ApplicationState.DISABLED)),
+    )
+    monkeypatch.setattr(
+        "flamepy.app.client.core_client.register_application",
+        register_application,
+    )
+
+    with pytest.raises(FlameError, match="Application 'disabled-app' is disabled") as error:
+        Runtime("disabled-app")
+
+    assert error.value.code == FlameErrorCode.INVALID_STATE
+    register_application.assert_not_called()
 
 
 def test_registration_race_cleans_only_attempt_package(monkeypatch, tmp_path):
