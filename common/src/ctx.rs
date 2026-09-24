@@ -117,10 +117,18 @@ struct FlameCacheYaml {
     pub network_interface: Option<String>,
     pub storage: Option<String>,
     pub eviction: Option<FlameEvictionYaml>,
+    /// Garbage collection is enabled when this section is present.
+    pub gc: Option<FlameCacheGcYaml>,
     /// TLS configuration for Object Cache (optional, independent from cluster.tls)
     pub tls: Option<FlameTlsYaml>,
     /// pprof profiling configuration
     pub pprof: Option<FlamePprofYaml>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlameCacheGcYaml {
+    pub interval: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,9 +261,16 @@ pub struct FlameCache {
     pub network_interface: String,
     pub storage: Option<String>,
     pub eviction: FlameEviction,
+    /// Garbage collection configuration. Its presence enables reconciliation.
+    pub gc: Option<FlameCacheGc>,
     /// TLS configuration for Object Cache (optional, independent from cluster.tls)
     pub tls: Option<FlameTls>,
     pub pprof: Option<FlamePprof>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlameCacheGc {
+    pub interval: std::time::Duration,
 }
 
 impl FlameCache {
@@ -560,6 +575,7 @@ impl TryFrom<FlameCacheYaml> for FlameCache {
     fn try_from(cache: FlameCacheYaml) -> Result<Self, Self::Error> {
         let tls = cache.tls.map(FlameTls::try_from).transpose()?;
         let pprof = cache.pprof.map(FlamePprof::from);
+        let gc = cache.gc.map(FlameCacheGc::try_from).transpose()?;
 
         Ok(FlameCache {
             endpoint: cache
@@ -574,9 +590,30 @@ impl TryFrom<FlameCacheYaml> for FlameCache {
                 .map(FlameEviction::try_from)
                 .transpose()?
                 .unwrap_or_default(),
+            gc,
             tls,
             pprof,
         })
+    }
+}
+
+impl TryFrom<FlameCacheGcYaml> for FlameCacheGc {
+    type Error = FlameError;
+
+    fn try_from(gc: FlameCacheGcYaml) -> Result<Self, Self::Error> {
+        let interval = humantime::parse_duration(&gc.interval).map_err(|error| {
+            FlameError::InvalidConfig(format!(
+                "invalid cache.gc.interval <{}>: {}",
+                gc.interval, error
+            ))
+        })?;
+        if interval.is_zero() {
+            return Err(FlameError::InvalidConfig(
+                "cache.gc.interval must be greater than zero".to_string(),
+            ));
+        }
+
+        Ok(Self { interval })
     }
 }
 
@@ -762,8 +799,99 @@ cache:
         assert_eq!(cache.eviction.policy, DEFAULT_EVICTION_POLICY);
         assert_eq!(cache.eviction.max_memory, 1024 * 1024 * 1024); // 1G in bytes
         assert_eq!(cache.eviction.max_objects, None);
+        assert!(cache.gc.is_none());
 
         Ok(())
+    }
+
+    #[test]
+    fn test_flame_context_with_cache_gc() -> Result<(), FlameError> {
+        let context_string = r#"---
+cluster:
+  name: flame
+  endpoint: "http://flame-session-manager:8080"
+cache:
+  gc:
+    interval: 60s
+        "#;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
+        fs::write(&tmp_file, context_string).map_err(|e| FlameError::Internal(e.to_string()))?;
+
+        let ctx = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()))?;
+        assert_eq!(
+            ctx.cache.unwrap().gc.unwrap().interval,
+            std::time::Duration::from_secs(60)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_flame_context_rejects_cache_gc_without_interval() {
+        let context_string = r#"---
+cluster:
+  name: flame
+  endpoint: "http://flame-session-manager:8080"
+cache:
+  gc: {}
+        "#;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
+        fs::write(&tmp_file, context_string).unwrap();
+
+        assert!(
+            FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string())).is_err()
+        );
+    }
+
+    #[test]
+    fn test_flame_context_rejects_invalid_cache_gc_interval() {
+        for interval in ["0s", "invalid"] {
+            let context_string = format!(
+                r#"---
+cluster:
+  name: flame
+  endpoint: "http://flame-session-manager:8080"
+cache:
+  gc:
+    interval: {interval}
+        "#
+            );
+
+            let tmp_dir = TempDir::new().unwrap();
+            let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
+            fs::write(&tmp_file, context_string).unwrap();
+
+            assert!(
+                FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()))
+                    .is_err(),
+                "interval {interval} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_flame_context_rejects_unknown_cache_gc_fields() {
+        let context_string = r#"---
+cluster:
+  name: flame
+  endpoint: "http://flame-session-manager:8080"
+cache:
+  gc:
+    interval: 60s
+    enabled: true
+        "#;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
+        fs::write(&tmp_file, context_string).unwrap();
+
+        assert!(
+            FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string())).is_err()
+        );
     }
 
     // ============================================================

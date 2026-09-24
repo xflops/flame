@@ -42,6 +42,10 @@ data:
         {{- if .Values.objectCache.eviction.maxObjects }}
         max_objects: {{ .Values.objectCache.eviction.maxObjects }}
         {{- end }}
+      {{- with .Values.objectCache.gc }}
+      gc:
+        interval: {{ .interval | quote }}
+      {{- end }}
       {{- if .Values.tls.enabled }}
       tls:
         cert_file: {{ printf "%s/%s" (include "flame.tlsCachePath" .) .Values.tls.cache.certKey | quote }}

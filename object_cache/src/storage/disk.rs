@@ -14,6 +14,7 @@ limitations under the License.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use arrow::array::{BinaryArray, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -25,8 +26,8 @@ use rayon::prelude::*;
 use common::FlameError;
 
 use crate::cache::{
-    Object, ObjectKey, ObjectMetadata, ObjectPayload, CACHE_FORMAT_ARROW_TABLE,
-    CACHE_FORMAT_METADATA_KEY, CACHE_VERSION_METADATA_KEY,
+    Object, ObjectKey, ObjectMetadata, ObjectPayload, CACHE_CREATION_TIME_METADATA_KEY,
+    CACHE_FORMAT_ARROW_TABLE, CACHE_FORMAT_METADATA_KEY, CACHE_VERSION_METADATA_KEY,
 };
 
 use super::StorageEngine;
@@ -102,10 +103,11 @@ impl StorageEngine for DiskStorage {
             }
             let base = load_object_from_file(&object_path)?;
             let deltas = read_deltas_sync(&delta_dir, base.version)?;
-            Ok(Some(Object::with_payload(
+            Ok(Some(Object::with_payload_at(
                 base.version,
                 base.payload,
                 deltas,
+                base.creation_time,
             )))
         })
         .await
@@ -176,7 +178,7 @@ impl StorageEngine for DiskStorage {
                         return Err(FlameError::Internal(format!(
                             "Failed to create delta file: {}",
                             e
-                        )))
+                        )));
                     }
                 }
             }
@@ -188,6 +190,7 @@ impl StorageEngine for DiskStorage {
                 version: 0,
                 size,
                 delta_count: index + 1,
+                creation_time: 0,
             })
         })
         .await
@@ -299,7 +302,12 @@ impl StorageEngine for DiskStorage {
                         let delta_dir = session_path.join(format!("{}.deltas", object_id));
                         let base = load_object_from_file(&object_path)?;
                         let deltas = read_deltas_sync(&delta_dir, base.version)?;
-                        let object = Object::with_payload(base.version, base.payload, deltas);
+                        let object = Object::with_payload_at(
+                            base.version,
+                            base.payload,
+                            deltas,
+                            base.creation_time,
+                        );
 
                         results.push((key, object));
                     }
@@ -391,7 +399,8 @@ fn write_object_to_file(path: &Path, object: &Object) -> Result<(), FlameError> 
         }
         ObjectPayload::ArrowTable { schema, batches } => {
             let file = fs::File::create(path)?;
-            let schema = schema_with_cache_metadata(schema.as_ref(), object.version);
+            let schema =
+                schema_with_cache_metadata(schema.as_ref(), object.version, object.creation_time);
             let batches = batches
                 .iter()
                 .map(|batch| batch_with_schema(batch, schema.clone()))
@@ -401,13 +410,17 @@ fn write_object_to_file(path: &Path, object: &Object) -> Result<(), FlameError> 
     }
 }
 
-fn schema_with_cache_metadata(schema: &Schema, version: u64) -> Arc<Schema> {
+fn schema_with_cache_metadata(schema: &Schema, version: u64, creation_time: i64) -> Arc<Schema> {
     let mut metadata = schema.metadata().clone();
     metadata.insert(
         CACHE_FORMAT_METADATA_KEY.to_string(),
         CACHE_FORMAT_ARROW_TABLE.to_string(),
     );
     metadata.insert(CACHE_VERSION_METADATA_KEY.to_string(), version.to_string());
+    metadata.insert(
+        CACHE_CREATION_TIME_METADATA_KEY.to_string(),
+        creation_time.to_string(),
+    );
     Arc::new(schema.clone().with_metadata(metadata))
 }
 
@@ -447,7 +460,14 @@ fn write_batches_to_writer(
 }
 
 fn object_to_batch(object: &Object) -> Result<RecordBatch, FlameError> {
-    let schema = get_object_schema();
+    let schema = get_object_schema().with_metadata(
+        [(
+            CACHE_CREATION_TIME_METADATA_KEY.to_string(),
+            object.creation_time.to_string(),
+        )]
+        .into_iter()
+        .collect(),
+    );
 
     let version_array = UInt64Array::from(vec![object.version]);
     let data_array = BinaryArray::from(vec![object.opaque_data()?]);
@@ -470,6 +490,7 @@ fn load_object_from_file(path: &Path) -> Result<Object, FlameError> {
     let reader = FileReader::try_new(file, None)
         .map_err(|e| FlameError::Internal(format!("Failed to create reader: {}", e)))?;
     let schema = reader.schema();
+    let creation_time = load_creation_time(path, schema.as_ref())?;
 
     // SAFETY: Skipping validation is safe because all data was written by this service
     let reader = unsafe { reader.with_skip_validation(true) };
@@ -490,14 +511,57 @@ fn load_object_from_file(path: &Path) -> Result<Object, FlameError> {
             .get(crate::cache::CACHE_VERSION_METADATA_KEY)
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
-        return Ok(Object::new_arrow_table(version, schema, batches));
+        return Ok(Object::new_arrow_table_at(
+            version,
+            schema,
+            batches,
+            creation_time,
+        ));
     }
 
     let batch = batches
         .first()
         .ok_or_else(|| FlameError::Internal("No batches in file".to_string()))?;
 
-    batch_to_object(batch)
+    batch_to_object(batch, creation_time)
+}
+
+fn load_creation_time(path: &Path, schema: &Schema) -> Result<i64, FlameError> {
+    if let Some(value) = schema.metadata().get(CACHE_CREATION_TIME_METADATA_KEY) {
+        let creation_time = value.parse::<i64>().map_err(|error| {
+            FlameError::InvalidState(format!(
+                "Invalid cache creation time '{}' in {}: {}",
+                value,
+                path.display(),
+                error
+            ))
+        })?;
+        if creation_time < 0 {
+            return Err(FlameError::InvalidState(format!(
+                "Invalid cache creation time '{}' in {}",
+                value,
+                path.display()
+            )));
+        }
+        return Ok(creation_time);
+    }
+
+    let modified = fs::metadata(path)?
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            FlameError::InvalidState(format!(
+                "Invalid modification time for legacy cache object {}: {}",
+                path.display(),
+                error
+            ))
+        })?;
+    i64::try_from(modified.as_millis()).map_err(|_| {
+        FlameError::InvalidState(format!(
+            "Modification time for legacy cache object {} is out of range",
+            path.display()
+        ))
+    })
 }
 
 fn load_native_schema_from_file(path: &Path) -> Result<Option<Arc<Schema>>, FlameError> {
@@ -524,7 +588,7 @@ fn load_native_schema_from_file(path: &Path) -> Result<Option<Arc<Schema>>, Flam
     }
 }
 
-fn batch_to_object(batch: &RecordBatch) -> Result<Object, FlameError> {
+fn batch_to_object(batch: &RecordBatch, creation_time: i64) -> Result<Object, FlameError> {
     if batch.num_rows() != 1 {
         return Err(FlameError::InvalidState(
             "Expected exactly one row".to_string(),
@@ -545,7 +609,7 @@ fn batch_to_object(batch: &RecordBatch) -> Result<Object, FlameError> {
     let version = version_col.value(0);
     let data = data_col.value(0).to_vec();
 
-    Ok(Object::new(version, data))
+    Ok(Object::new_at(version, data, creation_time))
 }
 
 #[cfg(test)]
@@ -568,13 +632,14 @@ mod tests {
         let storage = DiskStorage::new(temp_dir.path().to_path_buf()).unwrap();
 
         let key = test_key("test-app", "test-session", "obj1");
-        let object = Object::new(1, vec![1, 2, 3, 4, 5]);
+        let object = Object::new_at(1, vec![1, 2, 3, 4, 5], 1_234_567);
         storage.write_object(&key, &object).await.unwrap();
 
         let result = storage.read_object(&key).await.unwrap();
         assert!(result.is_some());
         let loaded = result.unwrap();
         assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.creation_time, 1_234_567);
         assert_eq!(loaded.opaque_data().unwrap(), &[1, 2, 3, 4, 5]);
         assert!(loaded.deltas.is_empty());
     }
@@ -590,10 +655,17 @@ mod tests {
                 Field::new("label", DataType::Utf8, false),
             ])
             .with_metadata(
-                [(
-                    CACHE_FORMAT_METADATA_KEY.to_string(),
-                    CACHE_FORMAT_ARROW_TABLE.to_string(),
-                )]
+                [
+                    (
+                        CACHE_FORMAT_METADATA_KEY.to_string(),
+                        CACHE_FORMAT_ARROW_TABLE.to_string(),
+                    ),
+                    ("user.key".to_string(), "user-value".to_string()),
+                    (
+                        CACHE_CREATION_TIME_METADATA_KEY.to_string(),
+                        "old-value".to_string(),
+                    ),
+                ]
                 .into_iter()
                 .collect(),
             ),
@@ -607,7 +679,7 @@ mod tests {
         )
         .unwrap();
         let key = test_key("test-app", "test-session", "native");
-        let object = Object::new_arrow_table(7, schema, vec![batch]);
+        let object = Object::new_arrow_table_at(7, schema, vec![batch], 7_654_321);
 
         storage.write_object(&key, &object).await.unwrap();
 
@@ -620,9 +692,21 @@ mod tests {
                 .unwrap(),
             CACHE_FORMAT_ARROW_TABLE
         );
+        assert_eq!(
+            stored_schema
+                .metadata()
+                .get(CACHE_CREATION_TIME_METADATA_KEY)
+                .unwrap(),
+            "7654321"
+        );
+        assert_eq!(
+            stored_schema.metadata().get("user.key").unwrap(),
+            "user-value"
+        );
 
         let loaded = storage.read_object(&key).await.unwrap().unwrap();
         assert_eq!(loaded.version, 7);
+        assert_eq!(loaded.creation_time, 7_654_321);
         match loaded.payload {
             ObjectPayload::ArrowTable { schema, batches } => {
                 assert_eq!(
@@ -649,12 +733,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_disk_storage_uses_file_mtime_for_legacy_opaque_object() {
+        let temp_dir = tempdir().unwrap();
+        let storage = DiskStorage::new(temp_dir.path().to_path_buf()).unwrap();
+        let key = test_key("test-app", "test-session", "legacy-opaque");
+        fs::create_dir_all(storage.session_dir(&key)).unwrap();
+
+        let schema = Arc::new(get_object_schema());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![3])),
+                Arc::new(BinaryArray::from(vec![b"legacy".as_slice()])),
+            ],
+        )
+        .unwrap();
+        let path = storage.object_path(&key);
+        write_batch_to_file(&path, &batch).unwrap();
+        let expected = fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let loaded = storage.read_object(&key).await.unwrap().unwrap();
+        assert_eq!(loaded.creation_time, expected);
+    }
+
+    #[tokio::test]
+    async fn test_disk_storage_uses_file_mtime_for_legacy_native_object() {
+        let temp_dir = tempdir().unwrap();
+        let storage = DiskStorage::new(temp_dir.path().to_path_buf()).unwrap();
+        let key = test_key("test-app", "test-session", "legacy-native");
+        fs::create_dir_all(storage.session_dir(&key)).unwrap();
+
+        let schema = Arc::new(
+            Schema::new(vec![Field::new("id", DataType::Int32, false)]).with_metadata(
+                [
+                    (
+                        CACHE_FORMAT_METADATA_KEY.to_string(),
+                        CACHE_FORMAT_ARROW_TABLE.to_string(),
+                    ),
+                    (CACHE_VERSION_METADATA_KEY.to_string(), "9".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        );
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])
+                .unwrap();
+        let path = storage.object_path(&key);
+        let file = fs::File::create(&path).unwrap();
+        write_batches_to_writer(file, schema, &[batch]).unwrap();
+        let expected = fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let loaded = storage.read_object(&key).await.unwrap().unwrap();
+        assert_eq!(loaded.creation_time, expected);
+        assert_eq!(loaded.version, 9);
+    }
+
+    #[tokio::test]
+    async fn test_disk_storage_rejects_malformed_creation_time() {
+        let temp_dir = tempdir().unwrap();
+        let storage = DiskStorage::new(temp_dir.path().to_path_buf()).unwrap();
+        let key = test_key("test-app", "test-session", "bad-time");
+        fs::create_dir_all(storage.session_dir(&key)).unwrap();
+
+        let schema = Arc::new(
+            get_object_schema().with_metadata(
+                [(
+                    CACHE_CREATION_TIME_METADATA_KEY.to_string(),
+                    "not-a-timestamp".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(BinaryArray::from(vec![b"data".as_slice()])),
+            ],
+        )
+        .unwrap();
+        write_batch_to_file(&storage.object_path(&key), &batch).unwrap();
+
+        assert!(matches!(
+            storage.read_object(&key).await,
+            Err(FlameError::InvalidState(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn test_disk_storage_patch() {
         let temp_dir = tempdir().unwrap();
         let storage = DiskStorage::new(temp_dir.path().to_path_buf()).unwrap();
 
         let key = test_key("test-app", "test-session", "obj1");
-        let object = Object::new(1, vec![1, 2, 3]);
+        let object = Object::new_at(1, vec![1, 2, 3], 42);
         storage.write_object(&key, &object).await.unwrap();
 
         let delta = Object::new(2, vec![4, 5, 6]);
@@ -662,6 +848,7 @@ mod tests {
         assert_eq!(meta.delta_count, 1);
 
         let loaded = storage.read_object(&key).await.unwrap().unwrap();
+        assert_eq!(loaded.creation_time, 42);
         assert_eq!(loaded.deltas.len(), 1);
         assert_eq!(loaded.deltas[0].version, 2);
         assert_eq!(loaded.deltas[0].opaque_data().unwrap(), &[4, 5, 6]);

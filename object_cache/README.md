@@ -29,6 +29,9 @@ cache:
   eviction:
     policy: lru
     max_memory: "8G"
+  # Optional. Presence enables stale application-data cleanup.
+  gc:
+    interval: 60s
 ```
 
 ### Client Configuration (`flame.yaml`)

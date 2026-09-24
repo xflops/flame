@@ -14,6 +14,7 @@ limitations under the License.
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{BinaryArray, RecordBatch, StringArray, UInt64Array};
 use arrow::compute::concat_batches;
@@ -39,10 +40,11 @@ use stdng::{lock_ptr, new_ptr, MutexPtr};
 use tonic::{Request, Response, Status, Streaming};
 use url::Url;
 
-use common::ctx::FlameCache;
+use common::ctx::{FlameCache, FlameCluster};
 use common::FlameError;
 
 use crate::eviction::{new_policy, EvictionConfig, EvictionPolicyPtr};
+use crate::gc::ApplicationGarbageCollector;
 
 /// Default batch size for eviction operations
 const EVICTION_BATCH_SIZE: usize = 10;
@@ -211,7 +213,16 @@ impl From<&ObjectKey> for String {
 
 pub const CACHE_FORMAT_METADATA_KEY: &str = "flame.cache.format";
 pub const CACHE_VERSION_METADATA_KEY: &str = "flame.cache.version";
+pub const CACHE_CREATION_TIME_METADATA_KEY: &str = "flame.cache.creation_time";
 pub const CACHE_FORMAT_ARROW_TABLE: &str = "arrow-table-v1";
+
+fn current_time_millis() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
 
 /// Native payload stored by object cache.
 ///
@@ -249,6 +260,7 @@ impl ObjectPayload {
 #[derive(Debug, Clone)]
 pub struct Object {
     pub version: u64,
+    pub creation_time: i64,
     pub payload: ObjectPayload,
     pub deltas: Vec<Object>,
 }
@@ -256,8 +268,13 @@ pub struct Object {
 impl Object {
     /// Create a new opaque Object with no deltas.
     pub fn new(version: u64, data: Vec<u8>) -> Self {
+        Self::new_at(version, data, current_time_millis())
+    }
+
+    pub(crate) fn new_at(version: u64, data: Vec<u8>, creation_time: i64) -> Self {
         Self {
             version,
+            creation_time,
             payload: ObjectPayload::Opaque(data),
             deltas: Vec::new(),
         }
@@ -265,8 +282,18 @@ impl Object {
 
     /// Create a native Arrow table Object with no deltas.
     pub fn new_arrow_table(version: u64, schema: Arc<Schema>, batches: Vec<RecordBatch>) -> Self {
+        Self::new_arrow_table_at(version, schema, batches, current_time_millis())
+    }
+
+    pub(crate) fn new_arrow_table_at(
+        version: u64,
+        schema: Arc<Schema>,
+        batches: Vec<RecordBatch>,
+        creation_time: i64,
+    ) -> Self {
         Self {
             version,
+            creation_time,
             payload: ObjectPayload::ArrowTable { schema, batches },
             deltas: Vec::new(),
         }
@@ -277,14 +304,21 @@ impl Object {
     pub fn with_deltas(version: u64, data: Vec<u8>, deltas: Vec<Object>) -> Self {
         Self {
             version,
+            creation_time: current_time_millis(),
             payload: ObjectPayload::Opaque(data),
             deltas,
         }
     }
 
-    pub fn with_payload(version: u64, payload: ObjectPayload, deltas: Vec<Object>) -> Self {
+    pub(crate) fn with_payload_at(
+        version: u64,
+        payload: ObjectPayload,
+        deltas: Vec<Object>,
+        creation_time: i64,
+    ) -> Self {
         Self {
             version,
+            creation_time,
             payload,
             deltas,
         }
@@ -330,6 +364,7 @@ pub struct ObjectMetadata {
     pub version: u64,
     pub size: u64,
     pub delta_count: u64,
+    pub creation_time: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -459,7 +494,13 @@ impl ObjectCache {
             let size = object.size_bytes();
             let version = object.current_version();
             let delta_count = object.deltas.len() as u64;
-            let meta = self.create_metadata(key_str.clone(), version, size, delta_count);
+            let meta = self.create_metadata(
+                key_str.clone(),
+                version,
+                size,
+                delta_count,
+                object.creation_time,
+            );
 
             objects.insert(key_str.clone(), object);
             metadata.insert(key_str.clone(), meta);
@@ -488,6 +529,7 @@ impl ObjectCache {
         version: u64,
         size: u64,
         delta_count: u64,
+        creation_time: i64,
     ) -> ObjectMetadata {
         ObjectMetadata {
             endpoint: self.endpoint.to_uri(),
@@ -495,6 +537,7 @@ impl ObjectCache {
             version,
             size,
             delta_count,
+            creation_time,
         }
     }
 
@@ -547,13 +590,15 @@ impl ObjectCache {
         };
         let new_version = current_version + 1;
 
-        let versioned_payload = version_payload(object.payload, new_version)?;
-        let versioned_object = Object::with_payload(new_version, versioned_payload, Vec::new());
+        let creation_time = current_time_millis();
+        let versioned_payload = version_payload(object.payload, new_version, creation_time)?;
+        let versioned_object =
+            Object::with_payload_at(new_version, versioned_payload, Vec::new(), creation_time);
         let size = versioned_object.size_bytes();
 
         self.storage.write_object(&key, &versioned_object).await?;
 
-        let meta = self.create_metadata(key_str.clone(), new_version, size, 0);
+        let meta = self.create_metadata(key_str.clone(), new_version, size, 0, creation_time);
 
         {
             let mut objects = lock_ptr!(self.objects)?;
@@ -597,7 +642,13 @@ impl ObjectCache {
 
                 objects.insert(key_str.clone(), object.clone());
 
-                let meta = self.create_metadata(key_str.clone(), version, size, delta_count);
+                let meta = self.create_metadata(
+                    key_str.clone(),
+                    version,
+                    size,
+                    delta_count,
+                    object.creation_time,
+                );
                 metadata.insert(key_str.clone(), meta);
             }
 
@@ -653,6 +704,7 @@ impl ObjectCache {
             })?,
         };
         let current_version = current_object.current_version();
+        let creation_time = current_object.creation_time;
         let new_version = current_version + 1;
 
         let versioned_delta = Object::new(new_version, delta.into_opaque_data()?);
@@ -666,6 +718,7 @@ impl ObjectCache {
         meta.version = new_version;
         meta.size = size;
         meta.delta_count = patched_object.deltas.len() as u64;
+        meta.creation_time = creation_time;
 
         {
             let mut objects = lock_ptr!(self.objects)?;
@@ -697,10 +750,6 @@ impl ObjectCache {
                 .collect()
         };
 
-        for k in &keys_to_remove {
-            self.eviction_policy.on_remove(k);
-        }
-
         self.storage.delete_objects(key).await?;
 
         {
@@ -711,12 +760,51 @@ impl ObjectCache {
             metadata.retain(|k, _| !key.matches(k));
         }
 
+        for k in &keys_to_remove {
+            self.eviction_policy.on_remove(k);
+        }
+
         tracing::debug!("Deleted: <{}>", key.to_prefix());
 
         Ok(())
     }
 
-    async fn list_all(&self) -> Result<Vec<ObjectMetadata>, FlameError> {
+    pub(crate) async fn delete_if_unchanged(
+        &self,
+        expected: &ObjectMetadata,
+    ) -> Result<bool, FlameError> {
+        let key = ObjectKey::try_from(expected.key.as_str())?;
+        let key_lock = self.get_key_lock(&expected.key)?;
+        let _guard = key_lock.write().await;
+
+        let unchanged = {
+            let metadata = lock_ptr!(self.metadata)?;
+            metadata
+                .get(&expected.key)
+                .map(|current| {
+                    current.version == expected.version
+                        && current.creation_time == expected.creation_time
+                })
+                .unwrap_or(false)
+        };
+        if !unchanged {
+            return Ok(false);
+        }
+
+        self.storage.delete_objects(&key).await?;
+
+        {
+            let mut objects = lock_ptr!(self.objects)?;
+            let mut metadata = lock_ptr!(self.metadata)?;
+            objects.remove(&expected.key);
+            metadata.remove(&expected.key);
+        }
+        self.eviction_policy.on_remove(&expected.key);
+
+        Ok(true)
+    }
+
+    pub(crate) async fn list_all(&self) -> Result<Vec<ObjectMetadata>, FlameError> {
         let metadata = lock_ptr!(self.metadata)?;
         Ok(metadata.values().cloned().collect())
     }
@@ -957,13 +1045,21 @@ pub fn is_native_arrow_schema(schema: &Schema) -> bool {
         .unwrap_or(false)
 }
 
-fn arrow_schema_with_cache_metadata(schema: &Schema, version: u64) -> Arc<Schema> {
+fn arrow_schema_with_cache_metadata(
+    schema: &Schema,
+    version: u64,
+    creation_time: i64,
+) -> Arc<Schema> {
     let mut metadata = schema.metadata().clone();
     metadata.insert(
         CACHE_FORMAT_METADATA_KEY.to_string(),
         CACHE_FORMAT_ARROW_TABLE.to_string(),
     );
     metadata.insert(CACHE_VERSION_METADATA_KEY.to_string(), version.to_string());
+    metadata.insert(
+        CACHE_CREATION_TIME_METADATA_KEY.to_string(),
+        creation_time.to_string(),
+    );
     Arc::new(schema.clone().with_metadata(metadata))
 }
 
@@ -972,11 +1068,15 @@ fn batch_with_schema(batch: &RecordBatch, schema: Arc<Schema>) -> Result<RecordB
         .map_err(|e| FlameError::Internal(format!("Failed to attach schema metadata: {}", e)))
 }
 
-fn version_payload(payload: ObjectPayload, version: u64) -> Result<ObjectPayload, FlameError> {
+fn version_payload(
+    payload: ObjectPayload,
+    version: u64,
+    creation_time: i64,
+) -> Result<ObjectPayload, FlameError> {
     match payload {
         ObjectPayload::Opaque(data) => Ok(ObjectPayload::Opaque(data)),
         ObjectPayload::ArrowTable { schema, batches } => {
-            let schema = arrow_schema_with_cache_metadata(schema.as_ref(), version);
+            let schema = arrow_schema_with_cache_metadata(schema.as_ref(), version, creation_time);
             let batches = batches
                 .iter()
                 .map(|batch| batch_with_schema(batch, schema.clone()))
@@ -1424,7 +1524,7 @@ impl FlightService for FlightCacheServer {
                 return Err(Status::invalid_argument(format!(
                     "Unknown action type: {}. Only DELETE is supported.",
                     action_type
-                )))
+                )));
             }
         };
 
@@ -1533,8 +1633,12 @@ impl FlightService for FlightCacheServer {
 /// Run the object cache server.
 ///
 /// # Arguments
-/// * `cache_config` - Cache configuration (includes optional TLS config)
-pub async fn run(cache_config: &FlameCache) -> Result<(), FlameError> {
+/// * `cluster_config` - FSM frontend and TLS configuration used by optional GC
+/// * `cache_config` - Cache configuration (includes optional TLS and GC config)
+pub async fn run(
+    cluster_config: &FlameCluster,
+    cache_config: &FlameCache,
+) -> Result<(), FlameError> {
     // Clients may use a Service to select a cache replica for the initial
     // request. References returned by that replica must identify the replica
     // itself because cached objects are replica-local.
@@ -1561,6 +1665,17 @@ pub async fn run(cache_config: &FlameCache) -> Result<(), FlameError> {
 
     cache.load_from_storage().await?;
 
+    let gc_handle = if let Some(gc_config) = &cache_config.gc {
+        let collector = ApplicationGarbageCollector::new(
+            Arc::clone(&cache),
+            cluster_config,
+            gc_config.interval,
+        )?;
+        Some(tokio::spawn(collector.run()))
+    } else {
+        None
+    };
+
     let server = FlightCacheServer::new(Arc::clone(&cache));
 
     tracing::info!("Starting Arrow Flight cache server at {}", address_str);
@@ -1586,7 +1701,7 @@ pub async fn run(cache_config: &FlameCache) -> Result<(), FlameError> {
         tracing::info!("TLS enabled for object cache");
     }
 
-    builder
+    let result = builder
         .add_service(
             FlightServiceServer::new(server)
                 .max_decoding_message_size(usize::MAX)
@@ -1594,9 +1709,14 @@ pub async fn run(cache_config: &FlameCache) -> Result<(), FlameError> {
         )
         .serve(addr)
         .await
-        .map_err(|e| FlameError::Internal(format!("Server error: {}", e)))?;
+        .map_err(|e| FlameError::Internal(format!("Server error: {}", e)));
 
-    Ok(())
+    if let Some(handle) = gc_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -2086,6 +2206,48 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn delete_if_unchanged_removes_only_the_expected_object() {
+            let cache = create_test_cache().await;
+
+            let key = ObjectKey::from_path("app/session").unwrap();
+            let expected = cache
+                .put(key.clone(), Object::new(0, vec![1]))
+                .await
+                .unwrap();
+            let retained = cache.put(key, Object::new(0, vec![2])).await.unwrap();
+
+            assert!(cache.delete_if_unchanged(&expected).await.unwrap());
+
+            let all = cache.list_all().await.unwrap();
+            assert_eq!(all.len(), 1);
+            assert_eq!(all[0].key, retained.key);
+        }
+
+        #[tokio::test]
+        async fn delete_if_unchanged_preserves_a_replaced_object() {
+            let cache = create_test_cache().await;
+
+            let key = ObjectKey::from_path("app/session")
+                .unwrap()
+                .with_object_id("object".to_string())
+                .unwrap();
+            let original = cache
+                .put(key.clone(), Object::new(0, vec![1]))
+                .await
+                .unwrap();
+            let replacement = cache
+                .put(key.clone(), Object::new(0, vec![2]))
+                .await
+                .unwrap();
+
+            assert!(!cache.delete_if_unchanged(&original).await.unwrap());
+
+            let current = cache.get(&key).await.unwrap();
+            assert_eq!(current.version, replacement.version);
+            assert_eq!(current.opaque_data().unwrap(), &[2]);
+        }
+
+        #[tokio::test]
         async fn list_all_returns_all_metadata() {
             let cache = create_test_cache().await;
 
@@ -2121,12 +2283,13 @@ mod tests {
             };
             let storage = crate::storage::connect("none").await.unwrap();
             let cache = ObjectCache::new(endpoint, storage, None).unwrap();
-            let meta = cache.create_metadata("app/session/key".to_string(), 1, 100, 5);
+            let meta = cache.create_metadata("app/session/key".to_string(), 1, 100, 5, 1234);
 
             assert_eq!(meta.key, "app/session/key");
             assert_eq!(meta.version, 1);
             assert_eq!(meta.size, 100);
             assert_eq!(meta.delta_count, 5);
+            assert_eq!(meta.creation_time, 1234);
             assert_eq!(meta.endpoint, "grpc://10.0.0.42:9090");
         }
     }
@@ -2223,6 +2386,7 @@ mod tests {
                     version: 0,
                     size: 0,
                     delta_count: 0,
+                    creation_time: 0,
                 })
             }
 
@@ -2266,17 +2430,21 @@ mod tests {
                 .put(key, Object::new(0, b"base".to_vec()))
                 .await
                 .unwrap();
+            assert!(meta.creation_time > 0);
+            let creation_time = meta.creation_time;
             let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
             server
                 .cache
                 .patch(&key, Object::new(0, b"patch-1".to_vec()))
                 .await
                 .unwrap();
-            server
+            let patched = server
                 .cache
                 .patch(&key, Object::new(0, b"patch-2".to_vec()))
                 .await
-                .unwrap()
+                .unwrap();
+            assert_eq!(patched.creation_time, creation_time);
+            patched
         }
 
         #[tokio::test]

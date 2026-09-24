@@ -19,6 +19,7 @@ use common::ctx::FlameClusterContext;
 
 mod cache;
 mod eviction;
+mod gc;
 mod storage;
 
 #[derive(Parser)]
@@ -46,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cache_config = ctx
         .cache
+        .as_ref()
         .ok_or("Cache configuration not found in config file")?;
 
     tracing::info!("Starting flame-object-cache server");
@@ -61,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    cache::run(&cache_config).await?;
+    cache::run(&ctx.cluster, cache_config).await?;
 
     Ok(())
 }

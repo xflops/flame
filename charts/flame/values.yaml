@@ -69,6 +69,9 @@ objectCache:
     policy: lru
     maxMemory: 1G
     maxObjects: null
+  # Garbage collection is disabled unless this section is present.
+  # gc:
+  #   interval: 60s
   resources: {}
   nodeSelector: {}
   tolerations: []

@@ -35,6 +35,14 @@
             "type": { "type": "string", "enum": ["ClusterIP"] },
             "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
           }
+        },
+        "gc": {
+          "type": "object",
+          "properties": {
+            "interval": { "type": "string", "minLength": 1 }
+          },
+          "required": ["interval"],
+          "additionalProperties": false
         }
       }
     },

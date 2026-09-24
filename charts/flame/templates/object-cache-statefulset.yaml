@@ -76,6 +76,9 @@ spec:
             - name: logs
               mountPath: /usr/local/flame/logs
             {{- if .Values.tls.enabled }}
+            - name: cluster-tls
+              mountPath: {{ include "flame.tlsClusterPath" . }}
+              readOnly: true
             - name: cache-tls
               mountPath: {{ include "flame.tlsCachePath" . }}
               readOnly: true
@@ -102,6 +105,9 @@ spec:
           emptyDir: {}
         {{- end }}
         {{- if .Values.tls.enabled }}
+        - name: cluster-tls
+          secret:
+            secretName: {{ .Values.tls.cluster.secretName }}
         - name: cache-tls
           secret:
             secretName: {{ .Values.tls.cache.secretName }}

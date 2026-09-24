@@ -62,6 +62,7 @@ impl StorageEngine for NoneStorage {
             version: 0,
             size: 0,
             delta_count: 0,
+            creation_time: 0,
         })
     }
 
