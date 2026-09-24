@@ -13,6 +13,8 @@ limitations under the License.
 
 import flamepy
 
+from tests.utils import wait_for_application_deleted
+
 
 def test_register_application():
     flamepy.register_application(
@@ -28,7 +30,7 @@ def test_register_application():
 
 
 def test_list_application():
-    apps = flamepy.list_applications()
+    apps = [app for app in flamepy.list_applications() if app.state == flamepy.ApplicationState.ENABLED]
     assert len(apps) == 3
 
     for app in apps:
@@ -113,6 +115,7 @@ def test_register_application_no_shim():
 
     # Clean up
     flamepy.unregister_application(app_name)
+    wait_for_application_deleted(app_name)
 
     # Verify cleanup
     app_after_cleanup = flamepy.get_application(app_name)

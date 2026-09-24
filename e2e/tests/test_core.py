@@ -24,7 +24,7 @@ from e2e.helpers import (
     serialize_common_data,
     serialize_request,
 )
-from tests.utils import random_string
+from tests.utils import random_string, wait_for_application_deleted
 
 FLM_TEST_SVC_APP = "flme2e-core-svc"
 TASK_FAILED_EVENT_CODE = int(flamepy.TaskState.FAILED)
@@ -939,6 +939,7 @@ def setup_shim_test_app():
             flamepy.close_session(sess.id)
 
     flamepy.unregister_application(FLM_SHIM_TEST_APP)
+    wait_for_application_deleted(FLM_SHIM_TEST_APP)
 
 
 class TestShimSelectionPositive:

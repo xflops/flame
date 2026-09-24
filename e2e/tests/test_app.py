@@ -35,6 +35,7 @@ from e2e.helpers import (
     greet_func,
     sum_func,
 )
+from tests.utils import wait_for_application_deleted
 
 
 @contextmanager
@@ -76,7 +77,9 @@ def test_app_lifecycle_fixture(check_package_config, check_flmrun_app):
         app_names = [app.name for app in apps]
         assert "test-app-cm" in app_names, f"test-app-cm not found in applications: {app_names}"
 
-    # After exiting context, application should be unregistered
+    wait_for_application_deleted("test-app-cm")
+
+    # After cleanup reconciliation, the application is physically removed.
     apps = flamepy.list_applications()
     app_names = [app.name for app in apps]
     assert "test-app-cm" not in app_names, f"test-app-cm should be unregistered but found in: {app_names}"
@@ -629,6 +632,8 @@ def test_app_auto_start(check_package_config, check_flmrun_app):
     finally:
         app.destroy()
 
+    wait_for_application_deleted("test-app-auto-start")
+
     apps = flamepy.list_applications()
     app_names = [app.name for app in apps]
     assert "test-app-auto-start" not in app_names, f"test-app-auto-start should be unregistered but found in: {app_names}"
@@ -651,6 +656,8 @@ def test_app_explicit_destroy(check_package_config, check_flmrun_app):
         assert value == 12, f"Expected 12, got {value}"
     finally:
         app.destroy()
+
+    wait_for_application_deleted("test-app-explicit-destroy")
 
     apps = flamepy.list_applications()
     app_names = [app.name for app in apps]
@@ -780,6 +787,7 @@ def test_app_recursive_same_session(check_package_config, check_flmrun_app):
         assert traced_value == 4
         assert session_ids == [service._session.id] * 3
 
+    wait_for_application_deleted(shared_app_name)
     app_names = [registered.name for registered in flamepy.list_applications()]
     assert shared_app_name not in app_names
 

@@ -13,6 +13,10 @@ limitations under the License.
 
 import random
 import string
+import time
+
+import flamepy
+import pytest
 
 
 def random_string(size=16) -> str:
@@ -25,3 +29,15 @@ def random_string(size=16) -> str:
         A random string of the specified size
     """
     return "".join(random.choice(string.ascii_letters + string.digits) for _ in range(size))
+
+
+def wait_for_application_deleted(name: str, timeout: float = 10.0) -> None:
+    """Wait for FSM to physically remove a disabled application."""
+    deadline = time.monotonic() + timeout
+    application = flamepy.get_application(name)
+    while application is not None and time.monotonic() < deadline:
+        time.sleep(0.1)
+        application = flamepy.get_application(name)
+
+    if application is not None:
+        pytest.fail(f"Application '{name}' was not deleted within {timeout} seconds; last state: {application.state}")
