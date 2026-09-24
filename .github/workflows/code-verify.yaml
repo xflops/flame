@@ -3,8 +3,8 @@ on: [push, pull_request]
 env:
   CLICOLOR_FORCE: 1
 jobs:
-  ci:
-    name: Code Verify
+  rust:
+    name: Rust Code Verify
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -23,3 +23,32 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Cargo test
         run: cargo test --workspace --exclude flame-rs
+      - name: Cargo build
+        run: cargo build --workspace --exclude flame-rs
+
+  python:
+    name: Python Code Verify
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: sdk/python/uv.lock
+      - name: Ruff format
+        run: uv run --extra dev ruff format --check src tests
+      - name: Ruff lint
+        run: uv run --extra dev ruff check src tests
+      - name: Python unit tests
+        run: uv run --extra dev --with numpy pytest tests
+      - name: Python build
+        run: uv build

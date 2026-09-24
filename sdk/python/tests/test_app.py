@@ -22,7 +22,7 @@ from flamepy.app.client import (
 from flamepy.app.client import _Runtime as Runtime
 from flamepy.app.storage import CacheStorage, FileStorage, create_storage_backend
 from flamepy.app.types import ServiceContext, ServiceRequest
-from flamepy.core.types import Shim
+from flamepy.core.types import FlameError, FlameErrorCode, Shim
 
 # App Storage Tests
 
@@ -115,24 +115,28 @@ def test_app_application_inherits_template_shim(monkeypatch, tmp_path):
     monkeypatch.setattr(Runtime, "_create_package", lambda self: str(tmp_path / "app.tar.gz"))
     monkeypatch.setattr(Runtime, "_upload_package", lambda self: "grpc://cache/app.tar.gz")
     monkeypatch.setattr("flamepy.app.client.core_client.register_application", registered)
-
+    open_session = MagicMock()
+    monkeypatch.setattr("flamepy.app.client.core_client.open_session", open_session)
     runtime = Runtime("generated-app")
 
     attributes = registered.call_args.args[1]
     assert attributes.shim == Shim.CRI
+    assert attributes.labels is None
     assert runtime._state is _RuntimeState.ACTIVE
     assert isinstance(runtime._application_owner, _RuntimeApplicationOwner)
+    open_session.assert_not_called()
 
 
 def test_runtime_reuses_existing_application_with_noop_owner(monkeypatch):
     context = SimpleNamespace(package=None, cache=None, app="flmrun")
     register_application = MagicMock()
     unregister_application = MagicMock()
+    open_session = MagicMock()
 
     monkeypatch.setattr("flamepy.app.client.FlameContext", lambda: context)
     monkeypatch.setattr(
         "flamepy.app.client.core_client.get_application",
-        MagicMock(return_value=SimpleNamespace()),
+        MagicMock(return_value=SimpleNamespace(labels=["external"], url=None)),
     )
     monkeypatch.setattr(
         "flamepy.app.client.core_client.register_application",
@@ -142,17 +146,60 @@ def test_runtime_reuses_existing_application_with_noop_owner(monkeypatch):
         "flamepy.app.client.core_client.unregister_application",
         unregister_application,
     )
+    monkeypatch.setattr("flamepy.app.client.core_client.open_session", open_session)
 
     runtime = Runtime("existing-app")
 
     assert runtime._state is _RuntimeState.ACTIVE
     assert isinstance(runtime._application_owner, _NoopApplicationOwner)
     register_application.assert_not_called()
+    open_session.assert_not_called()
 
     runtime.close()
 
     assert runtime._state is _RuntimeState.INACTIVE
     unregister_application.assert_not_called()
+
+
+def test_registration_race_cleans_only_attempt_package(monkeypatch, tmp_path):
+    context = SimpleNamespace(
+        package=SimpleNamespace(storage=f"file://{tmp_path}"),
+        cache=None,
+        app="flmrun",
+    )
+    template = SimpleNamespace(
+        shim=Shim.CRI,
+        image=None,
+        command="python",
+        working_directory=None,
+        environments=None,
+        labels=None,
+        arguments=None,
+        max_instances=None,
+        delay_release=None,
+        schema=None,
+        installer=None,
+    )
+    losing_package = tmp_path / "loser.tar.gz"
+    losing_package.write_bytes(b"loser")
+    storage = MagicMock()
+    storage.upload.return_value = f"file://{losing_package}"
+    monkeypatch.setattr("flamepy.app.client.FlameContext", lambda: context)
+    monkeypatch.setattr(
+        "flamepy.app.client.core_client.get_application",
+        MagicMock(side_effect=[None, template]),
+    )
+    monkeypatch.setattr(
+        "flamepy.app.client.core_client.register_application",
+        MagicMock(side_effect=FlameError(FlameErrorCode.INTERNAL, "application already exists")),
+    )
+    monkeypatch.setattr("flamepy.app.client.create_storage_backend", lambda *args, **kwargs: storage)
+    monkeypatch.setattr(Runtime, "_create_package", lambda self: str(losing_package))
+
+    with pytest.raises(FlameError, match="application already exists"):
+        Runtime("racing-app")
+
+    storage.delete.assert_called_once_with("loser.tar.gz")
 
 
 class TestCacheStorage:
@@ -317,6 +364,32 @@ def test_process_app_lifecycle_is_idempotent_and_rejects_a_different_app(monkeyp
     assert app.destroy() is None
     assert created[0].closed == 1
     assert app_client._runtime is None
+
+
+def test_process_app_init_replaces_a_directly_closed_runtime(monkeypatch):
+    import flamepy.app as app
+
+    created = []
+
+    class FakeRuntime:
+        def __init__(self, name, **kwargs):
+            self._name = name
+            self._state = _RuntimeState.ACTIVE
+            created.append(self)
+
+        def close(self):
+            self._state = _RuntimeState.INACTIVE
+
+    monkeypatch.setattr(app_client, "_Runtime", FakeRuntime)
+    monkeypatch.setattr(app_client, "_runtime", None)
+
+    first = app.init("restartable-app")
+    first.close()
+    second = app.init("restartable-app")
+
+    assert second is not first
+    assert second._state is _RuntimeState.ACTIVE
+    assert created == [first, second]
 
 
 def test_module_facade_supports_cross_module_service_declarations(monkeypatch):

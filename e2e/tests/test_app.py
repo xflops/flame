@@ -437,8 +437,9 @@ def test_app_service_close(check_package_config, check_flmrun_app):
         result = sum_service(1, 2)
         assert result.get() == 3
 
-        # Close should be called automatically on context exit
-        # This test just verifies no errors occur
+        sum_service.close()
+        with pytest.raises(flamepy.FlameError, match="closed"):
+            sum_service(2, 3)
 
 
 def test_flame_package_dataclass():
@@ -746,8 +747,8 @@ def test_app_recursive_same_session(check_package_config, check_flmrun_app):
         class RecursiveTestService(RecursiveService):
             pass
 
-        # Use autoscale=True to allow multiple executors for recursive calls
-        # Without autoscale, a single executor would deadlock waiting for its own recursive task
+        # This test waits synchronously for nested results, so autoscaling
+        # provides executor capacity for the child tasks.
         service = RecursiveTestService()
         logger.info(f"[TEST] Service created, session_id={service._session.id}")
 
@@ -774,6 +775,10 @@ def test_app_recursive_same_session(check_package_config, check_flmrun_app):
         value2 = result2.get()
         logger.info(f"[TEST] depth=2 result={value2} ({time.time() - start_time:.2f}s)")
         assert value2 == 4, f"Expected 4 for depth=2, got {value2}"
+
+        traced_value, session_ids = service.compute_recursive(2, True).get()
+        assert traced_value == 4
+        assert session_ids == [service._session.id] * 3
 
     app_names = [registered.name for registered in flamepy.list_applications()]
     assert shared_app_name not in app_names
@@ -1420,8 +1425,8 @@ class TestDRFRetainedClassServices:
         """Test that different class handles retain separate objects."""
         with initialized_app("test-drf-retained-isolation"):
 
-            @app.service()
-            class CounterServiceOne:
+            @app.service(autoscale=False, warmup=1)
+            class CounterService:
                 def __init__(self):
                     self.count = 0
 
@@ -1436,24 +1441,8 @@ class TestDRFRetainedClassServices:
                     self.count += value
                     return self.count
 
-            @app.service()
-            class CounterServiceTwo:
-                def __init__(self):
-                    self.count = 0
-
-                def increment(self):
-                    self.count += 1
-                    return self.count
-
-                def get_count(self):
-                    return self.count
-
-                def add(self, value):
-                    self.count += value
-                    return self.count
-
-            svc1 = CounterServiceOne()
-            svc2 = CounterServiceTwo()
+            svc1 = CounterService()
+            svc2 = CounterService()
 
             svc1.add(10).wait()
             svc1.increment().wait()

@@ -201,9 +201,12 @@ Key classes and helpers:
 - `app.publish_attributes(attrs)` adds opaque `bytes` locality keys to the
   current App response; repeated calls in the response accumulate. Session
   Manager unions every response into the executor's retained set.
-- `init(name, fail_if_exists=False)` packages and initializes the application
-  and returns its runtime handle. Repeating it for the same name returns the
-  same handle.
+- `init(name, fail_if_exists=False, dependencies=None, python_version=None)`
+  packages and initializes the application and returns its runtime handle.
+  Repeating it for the same name returns the same handle. `dependencies`
+  populates an auto-generated `pyproject.toml` only when the project has no
+  existing Python package metadata. `python_version` selects the executor
+  Python version through the application template.
 - `app.service(autoscale=None, warmup=0, resreq=None)` is the canonical service
   decorator. Functions become `ServiceInstance` proxies. Decorating a class
   declares a service class without creating a session. Calling
@@ -215,6 +218,9 @@ Key classes and helpers:
   does not require a `.remote()` suffix.
 - Each constructed handle has a unique service ID and its own retained object;
   two handles created from the same decorated class do not share object state.
+  The retained object is executor-local: autoscaling may create one copy per
+  executor. Use `autoscale=False, warmup=1` when mutable state must stay on one
+  executor.
 - Public class methods must not collide with `ServiceInstance` API names such
   as `close`; handle construction rejects such definitions.
 - The handle returned by `app.init()` also exposes `service(...)` when direct
@@ -224,9 +230,14 @@ Key classes and helpers:
   calling a decorated class with its remote constructor arguments.
 - A recursive declaration may call the service decorator without `init()` and
   does not call `destroy()`; it reuses and does not own the parent session.
+  Nested submission works at any capacity. If the parent waits synchronously,
+  the session needs enough free executor capacity to run the nested task.
 - `get(futures)`, `ref(futures)`, `wait(futures)`, `select(futures)`
 - `put(obj)` stores a shared object under the active application's cache prefix.
-- `destroy()` closes services and releases the process-wide application.
+- `destroy()` closes services. If this process registered the application, it
+  also unregisters it and removes its package/cache. With
+  `fail_if_exists=False`, an existing application is borrowed and remains the
+  user's lifecycle responsibility.
 - `ObjectFuture.get()`, `ObjectFuture.ref()`, `ObjectFuture.wait()`
 
 ## Agent Session API

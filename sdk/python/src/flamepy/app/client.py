@@ -18,6 +18,7 @@ import os
 import sys
 import tarfile
 import threading
+import uuid
 from concurrent.futures import Future, as_completed
 from enum import Enum, auto
 from functools import partial, wraps
@@ -608,7 +609,7 @@ class _NoopApplicationOwner:
 
 
 class _RuntimeApplicationOwner:
-    """Own application registration and cleanup on behalf of one runtime."""
+    """Own an application registration created by this runtime."""
 
     def __init__(self, runtime: "_Runtime"):
         self._runtime = runtime
@@ -660,6 +661,7 @@ class _Runtime:
         self._name = name
         self._services: List[ServiceInstance] = []
         self._package_path: Optional[str] = None
+        self._package_filename: Optional[str] = None
         self._application_owner: _ApplicationOwner = _NoopApplicationOwner()
         self._lifecycle_lock = threading.RLock()
         self._context = FlameContext()
@@ -698,9 +700,7 @@ class _Runtime:
 
             logger.debug(f"Starting app runtime '{self._name}'")
 
-            # Check if application already exists first (before packaging)
-            existing_app = core_client.get_application(self._name)
-            if existing_app is not None:
+            if core_client.get_application(self._name) is not None:
                 if self._fail_if_exists:
                     raise FlameError(
                         FlameErrorCode.ALREADY_EXISTS,
@@ -802,11 +802,10 @@ class _Runtime:
         This method can be called explicitly or is automatically called when
         exiting the context manager. It performs the following cleanup:
         1. Closes all ServiceInstance objects.
-        2. Unregisters the application if this runtime registered it.
-        3. Deletes all cached objects for this application from flame-cache.
-        4. Deletes package artifacts owned by this runtime.
+        2. Unregisters an application created by this runtime and deletes its
+           cache and package artifacts.
 
-        If the application already existed, its registration, cache, and
+        Existing applications are borrowed; their registration, cache, and
         package are retained. Sessions opened by this runtime are still closed.
         """
         with self._lifecycle_lock:
@@ -1020,7 +1019,7 @@ class _Runtime:
 
         generated_pyproject = self._generated_pyproject_toml(cwd)
 
-        package_filename = f"{self._name}.tar.gz"
+        package_filename = f"{self._name}-{uuid.uuid4().hex}.tar.gz"
         package_path = os.path.join(dist_dir, package_filename)
 
         default_excludes = [
@@ -1138,6 +1137,7 @@ py-modules = []
             raise FlameError(FlameErrorCode.INVALID_STATE, "Storage backend is not initialized")
 
         package_filename = os.path.basename(self._package_path)
+        self._package_filename = package_filename
         try:
             return self._storage_backend.upload(self._package_path, package_filename)
         except Exception:
@@ -1147,6 +1147,10 @@ py-modules = []
     def _cleanup_package_artifacts(self) -> None:
         """Remove uploaded and local package artifacts owned by this runtime."""
         self._cleanup_storage()
+        self._cleanup_local_package()
+
+    def _cleanup_local_package(self) -> None:
+        """Remove the local package archive."""
         if self._package_path and os.path.exists(self._package_path):
             try:
                 os.remove(self._package_path)
@@ -1156,12 +1160,11 @@ py-modules = []
 
     def _cleanup_storage(self) -> None:
         """Delete the package from storage."""
-        if not self._package_path or not self._storage_backend:
+        if not self._package_filename or not self._storage_backend:
             return
 
         try:
-            package_filename = os.path.basename(self._package_path)
-            self._storage_backend.delete(package_filename)
+            self._storage_backend.delete(self._package_filename)
         except Exception as e:
             logger.error(f"Error cleaning up storage: {e}", exc_info=True)
 
@@ -1191,11 +1194,18 @@ def init(
     with _runtime_lock:
         if _runtime is not None:
             if _runtime._name == name:
-                return _runtime
-            raise FlameError(
-                FlameErrorCode.INVALID_STATE,
-                f"Flame app '{_runtime._name}' is already initialized; call flamepy.app.destroy() first",
-            )
+                if getattr(_runtime, "_state", None) is not _RuntimeState.INACTIVE:
+                    return _runtime
+                # A handle returned by init() may be closed directly (including
+                # by a with block). Do not leave that inactive handle installed
+                # as the process-wide runtime: a subsequent init starts a fresh
+                # lifecycle with new service sessions and ownership state.
+                _runtime = None
+            else:
+                raise FlameError(
+                    FlameErrorCode.INVALID_STATE,
+                    f"Flame app '{_runtime._name}' is already initialized; call flamepy.app.destroy() first",
+                )
 
         runtime = _Runtime(
             name,

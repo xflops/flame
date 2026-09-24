@@ -308,12 +308,14 @@ class RecursiveService:
     using the open_session API.
     """
 
-    def compute_recursive(self, depth: int) -> int:
+    def compute_recursive(self, depth: int, include_session_ids: bool = False):
         """Compute recursively by declaring another proxy for this session.
 
         At depth 0, returns 1.
         At depth > 0, declares a service with the existing session context,
         calls compute_recursive(depth - 1), then multiplies by 2.
+        When include_session_ids is true, also returns the session ID observed
+        at every recursion level so callers can verify session reuse.
         """
         import logging
 
@@ -325,6 +327,8 @@ class RecursiveService:
 
         if depth <= 0:
             logger.info("[RecursiveService] Base case reached, returning 1")
+            if include_session_ids:
+                return 1, [session_context.session_id]
             return 1
 
         try:
@@ -341,10 +345,15 @@ class RecursiveService:
             logger.info(f"[RecursiveService] Inner service created, session_id={inner_service._session.id}")
 
             logger.info(f"[RecursiveService] Calling compute_recursive({depth - 1}) on inner service")
-            result = inner_service.compute_recursive(depth - 1)
+            result = inner_service.compute_recursive(depth - 1, include_session_ids)
             logger.info("[RecursiveService] Got result future, calling get()")
             inner_value = result.get()
             logger.info(f"[RecursiveService] Inner value = {inner_value}")
+
+            if include_session_ids:
+                value, session_ids = inner_value
+                final_result = value * 2
+                return final_result, [session_context.session_id, *session_ids]
 
             final_result = inner_value * 2
             logger.info(f"[RecursiveService] Returning {final_result}")

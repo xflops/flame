@@ -211,16 +211,22 @@ app.destroy()
 
 App returns `ObjectFuture` values. Use `future.get()` to fetch a concrete result, `future.ref()` to get the `ObjectRef`, `app.wait()` to wait for a batch, and `app.select()` to iterate as results complete.
 
-`app.init()` initializes the process-wide application and returns its runtime
-handle for callers that need direct access. Calling it again with the same name
-returns that handle. `app.service()` is the canonical decorator and must run
-after initialization. Functions become `ServiceInstance` proxies. Decorating a
-class declares a service class without creating a session. Calling the
-decorated class creates its service handle and session; `flmrun` runs the class
-constructor, including its arguments, in the executor:
+`app.init(name, fail_if_exists=False, dependencies=None,
+python_version=None)` initializes the process-wide application and returns its
+runtime handle. Calling it again with the same name returns that handle. Set
+`fail_if_exists=True` when an existing registration should be an error.
+`dependencies` is used only to generate a `pyproject.toml` when the packaged
+project has no Python package metadata; otherwise, declare dependencies in the
+project's existing metadata. `python_version` selects the executor Python
+version through the application template. `app.service()` is the canonical
+decorator and must run after initialization. Functions become
+`ServiceInstance` proxies. Decorating a class declares a service class without
+creating a session. Calling the decorated class creates its service handle and
+session; `flmrun` runs the class constructor, including its arguments, in the
+executor:
 
 ```python
-@app.service(warmup=1)
+@app.service(autoscale=False, warmup=1)
 class Counter:
     def __init__(self, value=0):
         self.value = value
@@ -237,9 +243,17 @@ counter.increment()
 Class-level calls such as `Counter.increment()` are not supported. Flame method
 calls remain direct Python calls—use `counter.increment()`, without a
 `.remote()` suffix. The decorator options configure the session created by each
-class construction. `app.destroy()` owns session cleanup. Application execution
+class construction. `app.destroy()` closes the sessions created by this
+process. If this process registered the application, `app.destroy()` also
+unregisters it and removes its package and cache. With `fail_if_exists=False`,
+an existing application is borrowed and its lifecycle remains the user's
+responsibility; `app.destroy()` does not unregister it. Application execution
 objects are functions or classes; already constructed objects are not accepted.
-Each constructed handle has a unique service ID and its own retained object.
+Each constructed handle has a unique service ID. With one fixed executor, as
+in the counter above, each handle has one retained object and predictable
+mutable state. With autoscaling enabled (the default), every executor retains
+its own copy, so mutable fields are replica-local rather than a distributed
+singleton.
 Constructing the same decorated class twice does not share object state. Public
 class methods must not collide with `ServiceInstance` API names such as `close`.
 
@@ -258,7 +272,9 @@ to the normal lifecycle ordering: it needs neither `app.init()` nor
 session. Nested declarations must remain in the invocation's execution context
 and do not accept `autoscale`, `warmup`, or `resreq`, because those settings
 cannot change an existing session. Nested calls must complete before the parent
-invocation returns.
+invocation returns when the parent waits for their result. Submission itself is
+valid at any capacity; synchronous waiting requires enough free executor
+capacity to run the nested task.
 
 The App process retains a constructed service object by service ID on its
 executor and reuses it across bindings for that service. Separate constructed

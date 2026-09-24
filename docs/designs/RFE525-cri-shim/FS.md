@@ -208,7 +208,7 @@ spec:
     - python${FLAME_PYTHON_VERSION}
     - python
     - -m
-    - flamepy.runner.runpy
+    - flamepy.app.runpy
   environments:
     FLAME_HOME: /usr/local/flame
     FLAME_PYTHON_VERSION: "3.12"
