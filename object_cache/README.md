@@ -29,10 +29,12 @@ cache:
   eviction:
     policy: lru
     max_memory: "8G"
-  # Optional. Presence enables stale application-data cleanup.
   gc:
     interval: 60s
 ```
+
+Stale application-data garbage collection is always enabled. The `gc` section
+only overrides its 60-second default interval.
 
 ### Client Configuration (`flame.yaml`)
 

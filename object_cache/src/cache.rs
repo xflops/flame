@@ -1665,16 +1665,12 @@ pub async fn run(
 
     cache.load_from_storage().await?;
 
-    let gc_handle = if let Some(gc_config) = &cache_config.gc {
-        let collector = ApplicationGarbageCollector::new(
-            Arc::clone(&cache),
-            cluster_config,
-            gc_config.interval,
-        )?;
-        Some(tokio::spawn(collector.run()))
-    } else {
-        None
-    };
+    let collector = ApplicationGarbageCollector::new(
+        Arc::clone(&cache),
+        cluster_config,
+        cache_config.gc.interval,
+    )?;
+    let gc_handle = tokio::spawn(collector.run());
 
     let server = FlightCacheServer::new(Arc::clone(&cache));
 
@@ -1711,10 +1707,8 @@ pub async fn run(
         .await
         .map_err(|e| FlameError::Internal(format!("Server error: {}", e)));
 
-    if let Some(handle) = gc_handle {
-        handle.abort();
-        let _ = handle.await;
-    }
+    gc_handle.abort();
+    let _ = gc_handle.await;
 
     result
 }

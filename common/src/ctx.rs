@@ -117,7 +117,6 @@ struct FlameCacheYaml {
     pub network_interface: Option<String>,
     pub storage: Option<String>,
     pub eviction: Option<FlameEvictionYaml>,
-    /// Garbage collection is enabled when this section is present.
     pub gc: Option<FlameCacheGcYaml>,
     /// TLS configuration for Object Cache (optional, independent from cluster.tls)
     pub tls: Option<FlameTlsYaml>,
@@ -128,7 +127,7 @@ struct FlameCacheYaml {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FlameCacheGcYaml {
-    pub interval: String,
+    pub interval: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,8 +260,7 @@ pub struct FlameCache {
     pub network_interface: String,
     pub storage: Option<String>,
     pub eviction: FlameEviction,
-    /// Garbage collection configuration. Its presence enables reconciliation.
-    pub gc: Option<FlameCacheGc>,
+    pub gc: FlameCacheGc,
     /// TLS configuration for Object Cache (optional, independent from cluster.tls)
     pub tls: Option<FlameTls>,
     pub pprof: Option<FlamePprof>,
@@ -271,6 +269,16 @@ pub struct FlameCache {
 #[derive(Debug, Clone)]
 pub struct FlameCacheGc {
     pub interval: std::time::Duration,
+}
+
+const DEFAULT_CACHE_GC_INTERVAL_SECS: u64 = 60;
+
+impl Default for FlameCacheGc {
+    fn default() -> Self {
+        Self {
+            interval: std::time::Duration::from_secs(DEFAULT_CACHE_GC_INTERVAL_SECS),
+        }
+    }
 }
 
 impl FlameCache {
@@ -575,7 +583,11 @@ impl TryFrom<FlameCacheYaml> for FlameCache {
     fn try_from(cache: FlameCacheYaml) -> Result<Self, Self::Error> {
         let tls = cache.tls.map(FlameTls::try_from).transpose()?;
         let pprof = cache.pprof.map(FlamePprof::from);
-        let gc = cache.gc.map(FlameCacheGc::try_from).transpose()?;
+        let gc = cache
+            .gc
+            .map(FlameCacheGc::try_from)
+            .transpose()?
+            .unwrap_or_default();
 
         Ok(FlameCache {
             endpoint: cache
@@ -601,10 +613,13 @@ impl TryFrom<FlameCacheGcYaml> for FlameCacheGc {
     type Error = FlameError;
 
     fn try_from(gc: FlameCacheGcYaml) -> Result<Self, Self::Error> {
-        let interval = humantime::parse_duration(&gc.interval).map_err(|error| {
+        let Some(interval) = gc.interval else {
+            return Ok(Self::default());
+        };
+        let interval = humantime::parse_duration(&interval).map_err(|error| {
             FlameError::InvalidConfig(format!(
                 "invalid cache.gc.interval <{}>: {}",
-                gc.interval, error
+                interval, error
             ))
         })?;
         if interval.is_zero() {
@@ -799,7 +814,10 @@ cache:
         assert_eq!(cache.eviction.policy, DEFAULT_EVICTION_POLICY);
         assert_eq!(cache.eviction.max_memory, 1024 * 1024 * 1024); // 1G in bytes
         assert_eq!(cache.eviction.max_objects, None);
-        assert!(cache.gc.is_none());
+        assert_eq!(
+            cache.gc.interval,
+            std::time::Duration::from_secs(DEFAULT_CACHE_GC_INTERVAL_SECS)
+        );
 
         Ok(())
     }
@@ -812,7 +830,7 @@ cluster:
   endpoint: "http://flame-session-manager:8080"
 cache:
   gc:
-    interval: 60s
+    interval: 30s
         "#;
 
         let tmp_dir = TempDir::new().unwrap();
@@ -821,15 +839,15 @@ cache:
 
         let ctx = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()))?;
         assert_eq!(
-            ctx.cache.unwrap().gc.unwrap().interval,
-            std::time::Duration::from_secs(60)
+            ctx.cache.unwrap().gc.interval,
+            std::time::Duration::from_secs(30)
         );
 
         Ok(())
     }
 
     #[test]
-    fn test_flame_context_rejects_cache_gc_without_interval() {
+    fn test_flame_context_defaults_cache_gc_without_interval() {
         let context_string = r#"---
 cluster:
   name: flame
@@ -842,8 +860,11 @@ cache:
         let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
         fs::write(&tmp_file, context_string).unwrap();
 
-        assert!(
-            FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string())).is_err()
+        let ctx =
+            FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string())).unwrap();
+        assert_eq!(
+            ctx.cache.unwrap().gc.interval,
+            std::time::Duration::from_secs(DEFAULT_CACHE_GC_INTERVAL_SECS)
         );
     }
 

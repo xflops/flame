@@ -253,8 +253,8 @@ available for explicit cache operations but is not used by GC.
 
 ### Configuration
 
-FOC reuses existing cluster endpoint and TLS configuration. Add only the GC
-timing section:
+FOC reuses existing cluster endpoint and TLS configuration. Garbage collection
+is always enabled. The optional timing override is:
 
 ```yaml
 cache:
@@ -262,11 +262,11 @@ cache:
     interval: 60s
 ```
 
-The presence of `cache.gc` enables reconciliation; omitting the section
-disables it. There is no separate `enabled` flag or artifact-cleanup policy.
-`interval` is the only GC setting and must be non-zero. The five-second RPC
-deadline and 10-second stale-data safety window are implementation constants.
-No additional endpoint or certificate configuration is required.
+Omitting `cache.gc` or its `interval` uses the 60-second default. There is no
+`enabled` flag or artifact-cleanup policy. `interval` is the only GC setting
+and must be non-zero when specified. The five-second RPC deadline and 10-second
+stale-data safety window are implementation constants. No additional endpoint
+or certificate configuration is required.
 
 ### Failure handling
 
@@ -297,12 +297,12 @@ labels.
 
 ## 4. Compatibility and Rollout
 
-The change is additive to FOC and requires no FSM or SDK rollout. Deploy FOC
-without `cache.gc` first if operators want a staged rollout, then add the
-section with the desired interval after verifying that the fixed safety window
-covers expected package-registration time and clock behavior. Existing disk
-objects without a stored creation time use their migration fallback
-immediately.
+The change is additive to FOC and requires no FSM or SDK rollout. New FOC
+starts reconciliation with a 60-second interval by default; operators may set
+`cache.gc.interval` to another non-zero duration. Before rollout, verify that
+the fixed safety window covers expected package-registration time and clock
+behavior. Existing disk objects without a stored creation time use their
+migration fallback immediately.
 
 Old FOC continues serving normally. New FOC uses the existing FSM frontend and
 cache key formats. Rolling back FOC stops reconciliation; no wire or storage
