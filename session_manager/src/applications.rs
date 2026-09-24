@@ -18,12 +18,102 @@ use std::ffi::OsString;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
-use common::apis::{Application, ApplicationAttributes};
+use async_trait::async_trait;
+use common::apis::{Application, ApplicationAttributes, ApplicationState, ExecutorState};
 use common::application::parse_application_manifests;
+use common::ctx::FlameClusterContext;
 use common::{FlameError, FLAME_HOME};
 
+use crate::controller::ControllerPtr;
+use crate::model::{ApplicationFilter, ExecutorFilter, SessionFilter};
+use crate::storage::StoragePtr;
+use crate::FlameThread;
+
 const DEFAULT_FLAME_HOME: &str = "/usr/local/flame";
+const APPLICATION_MANAGER_INTERVAL: Duration = Duration::from_secs(1);
+
+pub(crate) struct ApplicationManager {
+    controller: ControllerPtr,
+    storage: StoragePtr,
+}
+
+impl ApplicationManager {
+    pub(crate) fn new(controller: ControllerPtr, storage: StoragePtr) -> Arc<Self> {
+        Arc::new(Self {
+            controller,
+            storage,
+        })
+    }
+
+    pub(crate) async fn reconcile_once(&self) -> Result<(), FlameError> {
+        let filter = ApplicationFilter::by_state(ApplicationState::Disabled);
+        let applications = self.controller.list_application(Some(&filter)).await?;
+
+        for application in applications {
+            if let Err(error) = self.reconcile_application(&application.name).await {
+                tracing::warn!(
+                    "Failed to reconcile disabled application <{}>: {}",
+                    application.name,
+                    error
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn reconcile_application(&self, name: &str) -> Result<(), FlameError> {
+        let application = match self.controller.get_application(name.to_string()).await {
+            Ok(application) => application,
+            Err(FlameError::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if application.state != ApplicationState::Disabled {
+            return Ok(());
+        }
+        let open_sessions = SessionFilter::by_application_state(
+            application.name.clone(),
+            common::apis::SessionState::Open,
+        );
+        if self.storage.count_session(&open_sessions)? > 0 {
+            return Ok(());
+        }
+
+        let idle_executors = self
+            .storage
+            .list_executor(Some(&ExecutorFilter::by_state(ExecutorState::Idle)))?
+            .into_iter()
+            .filter(|executor| executor.application == application.name)
+            .map(|executor| executor.id)
+            .collect::<Vec<_>>();
+        for executor_id in idle_executors {
+            if let Err(error) = self.controller.release_executor(executor_id.clone()).await {
+                tracing::warn!(
+                    "Failed to release Idle executor <{}> while removing application <{}>: {}",
+                    executor_id,
+                    application.name,
+                    error
+                );
+            }
+        }
+
+        self.storage.delete_application(application.name).await
+    }
+}
+
+#[async_trait]
+impl FlameThread for ApplicationManager {
+    async fn run(&self, _ctx: FlameClusterContext) -> Result<(), FlameError> {
+        loop {
+            tokio::time::sleep(APPLICATION_MANAGER_INTERVAL).await;
+            if let Err(error) = self.reconcile_once().await {
+                tracing::warn!("Failed to reconcile disabled applications: {}", error);
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ConfiguredApplication {
@@ -196,9 +286,82 @@ mod tests {
     use std::fs;
     use std::sync::{Arc, Mutex};
 
+    use common::apis::{ApplicationState, SessionAttributes};
     use tempfile::tempdir;
 
     use super::*;
+
+    async fn application_manager() -> (Arc<ApplicationManager>, ControllerPtr) {
+        let mut context = FlameClusterContext::default();
+        context.cluster.storage = "none".to_string();
+        let storage = crate::storage::new_ptr(&context).await.unwrap();
+        let controller = crate::controller::new_ptr(storage.clone());
+        (
+            ApplicationManager::new(controller.clone(), storage),
+            controller,
+        )
+    }
+
+    #[tokio::test]
+    async fn manager_waits_for_open_sessions_before_removing_application() {
+        let (manager, controller) = application_manager().await;
+        controller
+            .register_application("draining-app".to_string(), ApplicationAttributes::default())
+            .await
+            .unwrap();
+        controller
+            .create_session(SessionAttributes {
+                id: "draining-session".to_string(),
+                application: "draining-app".to_string(),
+                ..SessionAttributes::default()
+            })
+            .await
+            .unwrap();
+        controller
+            .unregister_application("draining-app".to_string())
+            .await
+            .unwrap();
+
+        manager.reconcile_once().await.unwrap();
+        assert_eq!(
+            controller
+                .get_application("draining-app".to_string())
+                .await
+                .unwrap()
+                .state,
+            ApplicationState::Disabled
+        );
+
+        controller
+            .close_session("draining-session".to_string())
+            .await
+            .unwrap();
+        manager.reconcile_once().await.unwrap();
+        assert!(matches!(
+            controller.get_application("draining-app".to_string()).await,
+            Err(FlameError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn manager_ignores_enabled_applications() {
+        let (manager, controller) = application_manager().await;
+        controller
+            .register_application("enabled-app".to_string(), ApplicationAttributes::default())
+            .await
+            .unwrap();
+
+        manager.reconcile_once().await.unwrap();
+
+        assert_eq!(
+            controller
+                .get_application("enabled-app".to_string())
+                .await
+                .unwrap()
+                .state,
+            ApplicationState::Enabled
+        );
+    }
 
     #[test]
     fn manifest_directory_is_under_flame_home() {

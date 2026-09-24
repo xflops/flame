@@ -62,6 +62,11 @@ async fn main() -> Result<(), FlameError> {
     storage.load_data().await?;
 
     let controller = controller::new_ptr(storage.clone());
+    let application_manager = applications::ApplicationManager::new(controller.clone(), storage);
+
+    // Resume durable application removals before configured applications are
+    // reconciled or any request-serving task starts.
+    application_manager.reconcile_once().await?;
 
     // Application manifests are authoritative for the names they define. Apps
     // absent from the directory are left untouched.
@@ -80,6 +85,9 @@ async fn main() -> Result<(), FlameError> {
                 let controller = controller.clone();
                 async move {
                     let current = controller.get_application(name.clone()).await?;
+                    if current.state == common::apis::ApplicationState::Disabled {
+                        return Ok(());
+                    }
                     if applications::matches_attributes(&current, &attributes) {
                         return Ok(());
                     }
@@ -89,6 +97,14 @@ async fn main() -> Result<(), FlameError> {
         },
     )
     .await?;
+
+    // Start application lifecycle reconciliation.
+    {
+        let application_manager = application_manager.clone();
+        let ctx = ctx.clone();
+        let handler = tokio::spawn(async move { application_manager.run(ctx).await });
+        handlers.push(handler);
+    }
 
     // Start provider task.
     #[allow(clippy::let_underscore_future)]

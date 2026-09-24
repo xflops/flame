@@ -59,7 +59,7 @@ message GetApplicationRequest {
 }
 
 message ListApplicationRequest {
-
+  optional ApplicationState state = 1;
 }
 
 message ListExecutorRequest {
@@ -103,7 +103,8 @@ message GetSessionRequest {
 }
 
 message ListSessionRequest {
-
+  optional string application = 1;
+  optional SessionState state = 2;
 }
 
 message CreateTaskRequest {

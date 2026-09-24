@@ -275,12 +275,14 @@ impl Frontend for Flame {
 
     async fn list_application(
         &self,
-        _: Request<ListApplicationRequest>,
+        request: Request<ListApplicationRequest>,
     ) -> Result<Response<ApplicationList>, Status> {
         trace_fn!("Frontend::list_application");
+        let filter = crate::model::ApplicationFilter::try_from(request.into_inner())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let app_list = self
             .controller
-            .list_application()
+            .list_application(Some(&filter))
             .await
             .map_err(Status::from)?;
 
@@ -475,10 +477,15 @@ impl Frontend for Flame {
     }
     async fn list_session(
         &self,
-        _: Request<ListSessionRequest>,
+        request: Request<ListSessionRequest>,
     ) -> Result<Response<SessionList>, Status> {
         trace_fn!("Frontend::list_session");
-        let ssn_list = self.controller.list_session().map_err(Status::from)?;
+        let filter = crate::model::SessionFilter::try_from(request.into_inner())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let ssn_list = self
+            .controller
+            .list_session(Some(&filter))
+            .map_err(Status::from)?;
 
         let sessions = ssn_list.iter().map(Session::from).collect();
 

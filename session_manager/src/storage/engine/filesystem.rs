@@ -57,7 +57,7 @@ use common::apis::{
 };
 use common::{FlameError, FLAME_HOME};
 
-use crate::model::Executor;
+use crate::model::{ApplicationFilter, Executor, SessionFilter};
 use crate::storage::engine::{Engine, EnginePtr};
 
 /// Task metadata stored in tasks.bin with fixed-size records.
@@ -377,6 +377,48 @@ impl FilesystemEngine {
         })?;
         serde_json::from_str(&content)
             .map_err(|e| FlameError::Storage(format!("Failed to parse session metadata: {e}")))
+    }
+
+    fn find_session_metadata(
+        &self,
+        filter: Option<&SessionFilter>,
+    ) -> Result<Vec<(SessionID, SessionMetadata)>, FlameError> {
+        let sessions_dir = self.base_path.join("sessions");
+        let entries = match fs::read_dir(&sessions_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(FlameError::Storage(format!(
+                    "Failed to list sessions: {error}"
+                )))
+            }
+        };
+
+        let mut sessions = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                FlameError::Storage(format!("Failed to read a session directory entry: {error}"))
+            })?;
+            let session_id = entry.file_name().to_string_lossy().to_string();
+            let metadata = self.read_session_metadata(&session_id)?;
+            let matches = filter.is_none_or(|filter| {
+                filter
+                    .application
+                    .as_ref()
+                    .is_none_or(|application| metadata.application == *application)
+                    && filter
+                        .state
+                        .is_none_or(|state| metadata.state == state as i32)
+                    && filter
+                        .ids
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(&session_id))
+            });
+            if matches {
+                sessions.push((session_id, metadata));
+            }
+        }
+        Ok(sessions)
     }
 
     /// Write session metadata to disk atomically.
@@ -910,22 +952,51 @@ impl Engine for FilesystemEngine {
         Self::application_from_metadata(&meta)
     }
 
-    async fn unregister_application(&self, name: String) -> Result<(), FlameError> {
+    async fn update_application_state(
+        &self,
+        name: ApplicationID,
+        state: ApplicationState,
+    ) -> Result<Application, FlameError> {
         let _guard = lock_app!(self)?;
+        let mut meta = self.read_application_metadata(&name)?;
+        if meta.state == state as i32 {
+            return Self::application_from_metadata(&meta);
+        }
 
-        let sessions_dir = self.base_path.join("sessions");
-        if let Ok(entries) = fs::read_dir(&sessions_dir) {
-            for entry in entries.flatten() {
-                let session_id = entry.file_name().to_string_lossy().to_string();
-                if let Ok(meta) = self.read_session_metadata(&session_id) {
-                    if meta.application == name && meta.state == SessionState::Open as i32 {
-                        return Err(FlameError::Storage(format!(
-                            "Cannot unregister application '{}': has open sessions",
-                            name
-                        )));
-                    }
-                }
-            }
+        meta.state = state as i32;
+        meta.version += 1;
+        self.write_application_metadata(&name, &meta)?;
+        Self::application_from_metadata(&meta)
+    }
+
+    async fn delete_application(&self, name: ApplicationID) -> Result<(), FlameError> {
+        let mut locks = lock_app!(self)?;
+        let app = self.read_application_metadata(&name)?;
+        if app.state != ApplicationState::Disabled as i32 {
+            return Err(FlameError::InvalidState(format!(
+                "application <{name}> is not disabled"
+            )));
+        }
+
+        let filter = SessionFilter {
+            application: Some(name.clone()),
+            ..SessionFilter::default()
+        };
+        let sessions = self.find_session_metadata(Some(&filter))?;
+        if sessions
+            .iter()
+            .any(|(_, metadata)| metadata.state == SessionState::Open as i32)
+        {
+            return Err(FlameError::InvalidState(format!(
+                "application <{name}> has open sessions"
+            )));
+        }
+
+        for (session_id, _) in sessions {
+            fs::remove_dir_all(self.session_path(&session_id)).map_err(|e| {
+                FlameError::Storage(format!("Failed to delete session '{session_id}': {e}"))
+            })?;
+            locks.remove(&session_id);
         }
 
         let app_dir = self.application_path(&name);
@@ -944,20 +1015,22 @@ impl Engine for FilesystemEngine {
         let _guard = lock_app!(self)?;
 
         let mut meta = self.read_application_metadata(&name)?;
+        if meta.state != ApplicationState::Enabled as i32 {
+            return Err(FlameError::InvalidState(format!(
+                "application <{name}> is not enabled"
+            )));
+        }
 
-        let sessions_dir = self.base_path.join("sessions");
-        if let Ok(entries) = fs::read_dir(&sessions_dir) {
-            for entry in entries.flatten() {
-                let session_id = entry.file_name().to_string_lossy().to_string();
-                if let Ok(ssn_meta) = self.read_session_metadata(&session_id) {
-                    if ssn_meta.application == name && ssn_meta.state == SessionState::Open as i32 {
-                        return Err(FlameError::Storage(format!(
-                            "Cannot update application '{}': has open sessions",
-                            name
-                        )));
-                    }
-                }
-            }
+        let filter = SessionFilter {
+            application: Some(name.clone()),
+            state: Some(SessionState::Open),
+            ..SessionFilter::default()
+        };
+        if !self.find_session_metadata(Some(&filter))?.is_empty() {
+            return Err(FlameError::Storage(format!(
+                "Cannot update application '{}': has open sessions",
+                name
+            )));
         }
 
         let schema = attr.schema.map(|s| ApplicationSchemaMetadata {
@@ -990,7 +1063,10 @@ impl Engine for FilesystemEngine {
         Self::application_from_metadata(&meta)
     }
 
-    async fn find_application(&self) -> Result<Vec<Application>, FlameError> {
+    async fn find_application(
+        &self,
+        filter: Option<&ApplicationFilter>,
+    ) -> Result<Vec<Application>, FlameError> {
         let mut apps = Vec::new();
         let apps_dir = self.base_path.join("applications");
 
@@ -999,7 +1075,12 @@ impl Engine for FilesystemEngine {
                 let app_name = entry.file_name().to_string_lossy().to_string();
                 if let Ok(meta) = self.read_application_metadata(&app_name) {
                     if let Ok(app) = Self::application_from_metadata(&meta) {
-                        apps.push(app);
+                        let matches = filter.is_none_or(|filter| {
+                            filter.state.is_none_or(|state| app.state == state)
+                        });
+                        if matches {
+                            apps.push(app);
+                        }
                     }
                 }
             }
@@ -1208,23 +1289,18 @@ impl Engine for FilesystemEngine {
         Ok(session)
     }
 
-    async fn find_session(&self) -> Result<Vec<Session>, FlameError> {
+    async fn find_session(
+        &self,
+        filter: Option<&SessionFilter>,
+    ) -> Result<Vec<Session>, FlameError> {
         let mut sessions = Vec::new();
-        let sessions_dir = self.base_path.join("sessions");
-
-        if let Ok(entries) = fs::read_dir(&sessions_dir) {
-            for entry in entries.flatten() {
-                let session_id = entry.file_name().to_string_lossy().to_string();
-                if let Ok(meta) = self.read_session_metadata(&session_id) {
-                    if let Ok(session) = self.session_from_metadata(&meta) {
-                        {
-                            let mut locks = lock_app!(self)?;
-                            locks.insert(session_id.clone(), Arc::new(Mutex::new(())));
-                        }
-                        sessions.push(session);
-                    }
-                }
+        for (session_id, metadata) in self.find_session_metadata(filter)? {
+            let session = self.session_from_metadata(&metadata)?;
+            {
+                let mut locks = lock_app!(self)?;
+                locks.insert(session_id, Arc::new(Mutex::new(())));
             }
+            sessions.push(session);
         }
 
         Ok(sessions)
@@ -1817,7 +1893,7 @@ mod tests {
         assert_eq!(app2.name, "test-app");
 
         // Find applications
-        let apps = engine.find_application().await.unwrap();
+        let apps = engine.find_application(None).await.unwrap();
         assert_eq!(apps.len(), 1);
 
         // Update application
@@ -1836,15 +1912,121 @@ mod tests {
         assert_eq!(app3.image.as_deref(), Some("updated-image"));
         assert_eq!(app3.version, 2);
 
-        // Unregister application
+        let result = engine.delete_application("test-app".to_string()).await;
+        assert!(matches!(result, Err(FlameError::InvalidState(_))));
+
+        let disabled = engine
+            .update_application_state("test-app".to_string(), ApplicationState::Disabled)
+            .await
+            .unwrap();
+        assert_eq!(disabled.version, 3);
+        let unchanged = engine
+            .update_application_state("test-app".to_string(), ApplicationState::Disabled)
+            .await
+            .unwrap();
+        assert_eq!(unchanged.version, disabled.version);
+
+        let result = engine
+            .update_application(
+                "test-app".to_string(),
+                ApplicationAttributes {
+                    image: Some("must-not-be-written".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(FlameError::InvalidState(_))));
+        let unchanged = engine
+            .get_application("test-app".to_string())
+            .await
+            .unwrap();
+        assert_eq!(unchanged.version, disabled.version);
+        assert_eq!(unchanged.image, disabled.image);
+
+        let filter = ApplicationFilter::by_state(ApplicationState::Disabled);
+        let disabled_apps = engine.find_application(Some(&filter)).await.unwrap();
+        assert_eq!(disabled_apps.len(), 1);
+        assert_eq!(disabled_apps[0].name, "test-app");
+
         engine
-            .unregister_application("test-app".to_string())
+            .delete_application("test-app".to_string())
             .await
             .unwrap();
 
         // Verify it's gone
         let result = engine.get_application("test-app".to_string()).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_application_deletion_waits_for_open_sessions() {
+        let (engine, _temp_dir) = create_test_engine().await;
+        engine
+            .register_application("test-app".to_string(), ApplicationAttributes::default())
+            .await
+            .unwrap();
+        engine
+            .create_session(SessionAttributes {
+                id: "test-session".to_string(),
+                application: "test-app".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine
+            .update_application_state("test-app".to_string(), ApplicationState::Disabled)
+            .await
+            .unwrap();
+
+        let open_sessions = SessionFilter::by_application_state("test-app", SessionState::Open);
+        assert_eq!(
+            engine
+                .find_session(Some(&open_sessions))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let result = engine.delete_application("test-app".to_string()).await;
+        assert!(matches!(result, Err(FlameError::InvalidState(_))));
+
+        engine
+            .close_session("test-session".to_string())
+            .await
+            .unwrap();
+        engine
+            .delete_application("test-app".to_string())
+            .await
+            .unwrap();
+        assert!(matches!(
+            engine.get_session("test-session".to_string()).await,
+            Err(FlameError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_application_deletion_fails_closed_on_unreadable_session() {
+        let (engine, _temp_dir) = create_test_engine().await;
+        engine
+            .register_application("test-app".to_string(), ApplicationAttributes::default())
+            .await
+            .unwrap();
+        engine
+            .update_application_state("test-app".to_string(), ApplicationState::Disabled)
+            .await
+            .unwrap();
+        fs::create_dir_all(engine.session_path("incomplete-session")).unwrap();
+
+        let sessions = SessionFilter {
+            application: Some("test-app".to_string()),
+            ..SessionFilter::default()
+        };
+        assert!(engine.find_session(Some(&sessions)).await.is_err());
+        assert!(engine
+            .delete_application("test-app".to_string())
+            .await
+            .is_err());
+        assert!(engine.get_application("test-app".to_string()).await.is_ok());
     }
 
     #[tokio::test]
@@ -1896,7 +2078,7 @@ mod tests {
         assert_eq!(session2.id, "test-session");
 
         // Find sessions
-        let sessions = engine.find_session().await.unwrap();
+        let sessions = engine.find_session(None).await.unwrap();
         assert_eq!(sessions.len(), 1);
 
         // Close session (should work since no tasks)

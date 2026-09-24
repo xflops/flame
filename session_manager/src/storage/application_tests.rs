@@ -45,7 +45,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let apps = storage.list_application().await.unwrap();
+            let apps = storage.list_application(None).await.unwrap();
             assert_eq!(apps.len(), 1);
             assert_eq!(apps[0].name, "test-app");
         }
@@ -65,7 +65,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let apps = storage.list_application().await.unwrap();
+            let apps = storage.list_application(None).await.unwrap();
             assert_eq!(apps.len(), 2);
         }
 
@@ -126,6 +126,7 @@ mod tests {
 
     mod update_application {
         use super::*;
+        use common::apis::ApplicationState;
 
         #[tokio::test]
         async fn updates_existing_application() {
@@ -153,11 +154,44 @@ mod tests {
                 .unwrap();
             assert_eq!(app.image, Some("new-image:v2".to_string()));
         }
+
+        #[tokio::test]
+        async fn rejects_updates_to_disabled_application() {
+            let storage = storage::new_ptr(&test_context()).await.unwrap();
+            storage
+                .register_application("disabled-app".to_string(), create_app_attr())
+                .await
+                .unwrap();
+            let disabled = storage
+                .update_application_state("disabled-app".to_string(), ApplicationState::Disabled)
+                .await
+                .unwrap();
+
+            let result = storage
+                .update_application(
+                    "disabled-app".to_string(),
+                    ApplicationAttributes {
+                        image: Some("must-not-be-written".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(matches!(result, Err(common::FlameError::InvalidState(_))));
+
+            let unchanged = storage
+                .get_application("disabled-app".to_string())
+                .await
+                .unwrap();
+            assert_eq!(unchanged.version, disabled.version);
+            assert_eq!(unchanged.image, disabled.image);
+        }
     }
 
-    mod unregister_application {
+    mod application_lifecycle {
         use super::*;
-        use common::apis::{ResourceRequirement, SessionAttributes};
+        use common::apis::{
+            ApplicationState, ResourceRequirement, SessionAttributes, SessionState,
+        };
 
         fn create_session_attr(id: &str, app: &str) -> SessionAttributes {
             SessionAttributes {
@@ -173,7 +207,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn removes_application() {
+        async fn updates_state_idempotently_and_removes_disabled_application() {
             let ctx = test_context();
             let storage = storage::new_ptr(&ctx).await.unwrap();
 
@@ -183,17 +217,30 @@ mod tests {
                 .await
                 .unwrap();
 
+            let disabled = storage
+                .update_application_state("unregister-app".to_string(), ApplicationState::Disabled)
+                .await
+                .unwrap();
+            assert_eq!(disabled.state, ApplicationState::Disabled);
+            assert_eq!(disabled.version, 2);
+
+            let unchanged = storage
+                .update_application_state("unregister-app".to_string(), ApplicationState::Disabled)
+                .await
+                .unwrap();
+            assert_eq!(unchanged.version, disabled.version);
+
             storage
-                .unregister_application("unregister-app".to_string())
+                .delete_application("unregister-app".to_string())
                 .await
                 .unwrap();
 
-            let apps = storage.list_application().await.unwrap();
+            let apps = storage.list_application(None).await.unwrap();
             assert!(apps.is_empty());
         }
 
         #[tokio::test]
-        async fn removes_sessions_associated_with_application() {
+        async fn rejects_deletion_until_open_sessions_close() {
             let ctx = test_context();
             let storage = storage::new_ptr(&ctx).await.unwrap();
 
@@ -206,14 +253,43 @@ mod tests {
             let ssn_attr = create_session_attr("cleanup-ssn", "cleanup-app");
             storage.create_session(ssn_attr).await.unwrap();
 
-            assert_eq!(storage.list_session().unwrap().len(), 1);
+            assert_eq!(storage.list_session(None).unwrap().len(), 1);
 
             storage
-                .unregister_application("cleanup-app".to_string())
+                .update_application_state("cleanup-app".to_string(), ApplicationState::Disabled)
                 .await
                 .unwrap();
 
-            assert_eq!(storage.list_session().unwrap().len(), 0);
+            let open_sessions = crate::model::SessionFilter::by_application_state(
+                "cleanup-app",
+                SessionState::Open,
+            );
+            assert_eq!(storage.count_session(&open_sessions).unwrap(), 1);
+            let result = storage.delete_application("cleanup-app".to_string()).await;
+            assert!(matches!(result, Err(common::FlameError::InvalidState(_))));
+
+            storage
+                .close_session("cleanup-ssn".to_string())
+                .await
+                .unwrap();
+            storage
+                .delete_application("cleanup-app".to_string())
+                .await
+                .unwrap();
+
+            assert_eq!(storage.list_session(None).unwrap().len(), 0);
+        }
+
+        #[tokio::test]
+        async fn rejects_deleting_an_enabled_application() {
+            let storage = storage::new_ptr(&test_context()).await.unwrap();
+            storage
+                .register_application("enabled-app".to_string(), create_app_attr())
+                .await
+                .unwrap();
+
+            let result = storage.delete_application("enabled-app".to_string()).await;
+            assert!(matches!(result, Err(common::FlameError::InvalidState(_))));
         }
     }
 
@@ -225,7 +301,7 @@ mod tests {
             let ctx = test_context();
             let storage = storage::new_ptr(&ctx).await.unwrap();
 
-            let apps = storage.list_application().await.unwrap();
+            let apps = storage.list_application(None).await.unwrap();
             assert!(apps.is_empty());
         }
 
@@ -242,13 +318,39 @@ mod tests {
                     .unwrap();
             }
 
-            let apps = storage.list_application().await.unwrap();
+            let apps = storage.list_application(None).await.unwrap();
             assert_eq!(apps.len(), 3);
 
             let names: Vec<_> = apps.iter().map(|a| a.name.as_str()).collect();
             assert!(names.contains(&"list-app-0"));
             assert!(names.contains(&"list-app-1"));
             assert!(names.contains(&"list-app-2"));
+        }
+
+        #[tokio::test]
+        async fn filters_by_application_state() {
+            let storage = storage::new_ptr(&test_context()).await.unwrap();
+            storage
+                .register_application("enabled-app".to_string(), create_app_attr())
+                .await
+                .unwrap();
+            storage
+                .register_application("disabled-app".to_string(), create_app_attr())
+                .await
+                .unwrap();
+            storage
+                .update_application_state(
+                    "disabled-app".to_string(),
+                    common::apis::ApplicationState::Disabled,
+                )
+                .await
+                .unwrap();
+
+            let filter =
+                crate::model::ApplicationFilter::by_state(common::apis::ApplicationState::Disabled);
+            let apps = storage.list_application(Some(&filter)).await.unwrap();
+            assert_eq!(apps.len(), 1);
+            assert_eq!(apps[0].name, "disabled-app");
         }
     }
 }

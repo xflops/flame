@@ -14,7 +14,8 @@ limitations under the License.
 //! None Storage Engine - A minimal engine for non-recoverable workloads.
 //!
 //! This engine does NOT persist any data. The controller's in-memory cache is the
-//! source of truth. The NoneEngine only maintains task ID counters for allocation.
+//! source of truth. The NoneEngine retains only the application/session metadata needed for
+//! lifecycle checks plus task ID counters for allocation.
 //!
 //! Use cases:
 //! - Real-time processing where task results are consumed immediately
@@ -34,25 +35,27 @@ use chrono::Utc;
 
 use stdng::{lock_ptr, MutexPtr};
 
-use crate::model::Executor;
+use crate::model::{ApplicationFilter, Executor, SessionFilter};
 use crate::FlameError;
 use common::apis::{
-    Application, ApplicationAttributes, ApplicationID, ExecutorID, ExecutorState, Node, Session,
-    SessionAttributes, SessionID, SessionState, SessionStatus, Task, TaskGID, TaskID, TaskInput,
-    TaskOptions, TaskOutput, TaskResult, TaskState,
+    Application, ApplicationAttributes, ApplicationID, ApplicationState, ExecutorID, ExecutorState,
+    Node, Session, SessionAttributes, SessionID, SessionState, SessionStatus, Task, TaskGID,
+    TaskID, TaskInput, TaskOptions, TaskOutput, TaskResult, TaskState,
 };
 
 use super::{Engine, EnginePtr};
 
-/// None Storage Engine - stores nothing, only allocates task IDs.
+/// None Storage Engine - stores lifecycle metadata in memory and allocates task IDs.
 ///
 /// The controller cache is the source of truth for all data.
-/// This engine only maintains per-session task ID counters.
+/// This engine also maintains the minimal application/session index needed for lifecycle guards.
 pub struct NoneEngine {
     /// Per-session task ID counters for allocation
     task_counters: MutexPtr<HashMap<SessionID, Arc<AtomicI64>>>,
     /// In-memory application cache (required for get_application)
     applications: MutexPtr<HashMap<ApplicationID, Application>>,
+    /// In-memory session metadata used by lifecycle reconciliation.
+    sessions: MutexPtr<HashMap<SessionID, Session>>,
 }
 
 impl NoneEngine {
@@ -62,6 +65,7 @@ impl NoneEngine {
         Ok(Arc::new(Self {
             task_counters: stdng::new_ptr(HashMap::new()),
             applications: stdng::new_ptr(HashMap::new()),
+            sessions: stdng::new_ptr(HashMap::new()),
         }))
     }
 
@@ -102,7 +106,7 @@ impl Engine for NoneEngine {
         let app = Application {
             name: name.clone(),
             version: 1,
-            state: common::apis::ApplicationState::Enabled,
+            state: ApplicationState::Enabled,
             creation_time: Utc::now(),
             shim: attr.shim,
             image: attr.image,
@@ -120,14 +124,65 @@ impl Engine for NoneEngine {
         };
 
         let mut apps = lock_ptr!(self.applications)?;
+        if apps.contains_key(&name) {
+            return Err(FlameError::AlreadyExist(format!(
+                "application <{name}> already exists"
+            )));
+        }
         apps.insert(name, app.clone());
 
         Ok(app)
     }
 
-    async fn unregister_application(&self, id: String) -> Result<(), FlameError> {
+    async fn update_application_state(
+        &self,
+        id: ApplicationID,
+        state: ApplicationState,
+    ) -> Result<Application, FlameError> {
         let mut apps = lock_ptr!(self.applications)?;
+        let app = apps
+            .get_mut(&id)
+            .ok_or_else(|| FlameError::NotFound(format!("application <{id}>")))?;
+        if app.state != state {
+            app.state = state;
+            app.version += 1;
+        }
+        Ok(app.clone())
+    }
+
+    async fn delete_application(&self, id: ApplicationID) -> Result<(), FlameError> {
+        let mut apps = lock_ptr!(self.applications)?;
+        let app = apps
+            .get(&id)
+            .ok_or_else(|| FlameError::NotFound(format!("application <{id}>")))?;
+        if app.state != ApplicationState::Disabled {
+            return Err(FlameError::InvalidState(format!(
+                "application <{id}> is not disabled"
+            )));
+        }
+
+        let mut sessions = lock_ptr!(self.sessions)?;
+        if sessions
+            .values()
+            .any(|session| session.application == id && session.status.state == SessionState::Open)
+        {
+            return Err(FlameError::InvalidState(format!(
+                "application <{id}> has open sessions"
+            )));
+        }
+
+        let removed_session_ids: Vec<_> = sessions
+            .values()
+            .filter(|session| session.application == id)
+            .map(|session| session.id.clone())
+            .collect();
+        sessions.retain(|_, session| session.application != id);
         apps.remove(&id);
+        drop(sessions);
+        drop(apps);
+        for session_id in removed_session_ids {
+            self.remove_task_counter(&session_id)?;
+        }
         Ok(())
     }
 
@@ -140,6 +195,11 @@ impl Engine for NoneEngine {
         let app = apps
             .get(&id)
             .ok_or_else(|| FlameError::NotFound(format!("application <{}>", id)))?;
+        if app.state != ApplicationState::Enabled {
+            return Err(FlameError::InvalidState(format!(
+                "application <{id}> is not enabled"
+            )));
+        }
 
         let updated = Application {
             name: id.clone(),
@@ -172,17 +232,24 @@ impl Engine for NoneEngine {
             .ok_or_else(|| FlameError::NotFound(format!("application <{}>", id)))
     }
 
-    async fn find_application(&self) -> Result<Vec<Application>, FlameError> {
+    async fn find_application(
+        &self,
+        filter: Option<&ApplicationFilter>,
+    ) -> Result<Vec<Application>, FlameError> {
         let apps = lock_ptr!(self.applications)?;
-        Ok(apps.values().cloned().collect())
+        Ok(apps
+            .values()
+            .filter(|app| {
+                filter.is_none_or(|filter| filter.state.is_none_or(|state| app.state == state))
+            })
+            .cloned()
+            .collect())
     }
 
     // ========== Session operations ==========
 
     async fn create_session(&self, attr: SessionAttributes) -> Result<Session, FlameError> {
-        self.init_task_counter(&attr.id)?;
-
-        Ok(Session {
+        let session = Session {
             id: attr.id,
             application: attr.application,
             common_data: attr.common_data,
@@ -201,11 +268,14 @@ impl Engine for NoneEngine {
             tasks_index: HashMap::new(),
             events: vec![],
             retry_count: 0,
-        })
+        };
+        lock_ptr!(self.sessions)?.insert(session.id.clone(), session.clone());
+        self.init_task_counter(&session.id)?;
+        Ok(session)
     }
 
     async fn get_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        Err(FlameError::NotFound(format!("session <{}>", id)))
+        Err(FlameError::NotFound(format!("session <{id}>")))
     }
 
     async fn open_session(
@@ -215,20 +285,31 @@ impl Engine for NoneEngine {
     ) -> Result<Session, FlameError> {
         match spec {
             Some(attr) => self.create_session(attr).await,
-            None => Err(FlameError::NotFound(format!("session <{}>", id))),
+            None => Err(FlameError::NotFound(format!("session <{id}>"))),
         }
     }
 
     async fn close_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        Err(FlameError::NotFound(format!("session <{}>", id)))
+        if let Some(session) = lock_ptr!(self.sessions)?.get_mut(&id) {
+            if session.status.state == SessionState::Open {
+                session.status.state = SessionState::Closed;
+                session.completion_time = Some(Utc::now());
+                session.version += 1;
+            }
+        }
+        Err(FlameError::NotFound(format!("session <{id}>")))
     }
 
     async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError> {
+        lock_ptr!(self.sessions)?.remove(&id);
         self.remove_task_counter(&id)?;
-        Err(FlameError::NotFound(format!("session <{}>", id)))
+        Err(FlameError::NotFound(format!("session <{id}>")))
     }
 
-    async fn find_session(&self) -> Result<Vec<Session>, FlameError> {
+    async fn find_session(
+        &self,
+        _filter: Option<&SessionFilter>,
+    ) -> Result<Vec<Session>, FlameError> {
         Ok(vec![])
     }
 
@@ -376,7 +457,7 @@ mod tests {
     async fn test_none_engine_find_session_returns_empty() {
         let engine = NoneEngine::new_ptr("none").await.unwrap();
 
-        let sessions = engine.find_session().await.unwrap();
+        let sessions = engine.find_session(None).await.unwrap();
         assert!(sessions.is_empty());
     }
 

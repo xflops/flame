@@ -39,12 +39,12 @@ use common::{
     FlameError,
 };
 
-use crate::model::Executor;
+use crate::model::{ApplicationFilter, Executor, SessionFilter};
 use crate::storage::engine::types::{
     AppSchemaDao, ApplicationDao, EventDao, ExecutorDao, NodeDao, SessionDao, TaskDao,
 };
 
-use crate::storage::engine::{Engine, EnginePtr};
+use crate::storage::engine::{matches_session_filter, Engine, EnginePtr};
 
 const SQLITE_SQL: &str = "migrations/sqlite";
 
@@ -330,6 +330,22 @@ impl Engine for SqliteEngine {
             .await
             .map_err(|e| FlameError::Storage(format!("failed to begin TX: {e}")))?;
 
+        let state: i32 = sqlx::query_scalar("SELECT state FROM applications WHERE name=?")
+            .bind(&name)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::RowNotFound => {
+                    FlameError::NotFound(format!("application <{name}> not found"))
+                }
+                _ => FlameError::Storage(e.to_string()),
+            })?;
+        if state != ApplicationState::Enabled as i32 {
+            return Err(FlameError::InvalidState(format!(
+                "application <{name}> is not enabled"
+            )));
+        }
+
         let count = self._count_open_sessions(&mut tx, name.clone()).await?;
         if count > 0 {
             return Err(FlameError::Storage(format!(
@@ -355,7 +371,7 @@ impl Engine for SqliteEngine {
                         url=?,
                         installer=?,
                         version=version+1
-                    WHERE name=?
+                    WHERE name=? AND state=?
                     RETURNING *"#;
 
         let app: ApplicationDao = sqlx::query_as(sql)
@@ -372,10 +388,16 @@ impl Engine for SqliteEngine {
             .bind(attr.delay_release.num_seconds())
             .bind(attr.url)
             .bind(attr.installer)
-            .bind(name)
+            .bind(&name)
+            .bind(ApplicationState::Enabled as i32)
             .fetch_one(&mut *tx)
             .await
-            .map_err(|e| FlameError::Storage(format!("failed to update application: {e}")))?;
+            .map_err(|e| match e {
+                sqlx::Error::RowNotFound => {
+                    FlameError::InvalidState(format!("application <{name}> is not enabled"))
+                }
+                _ => FlameError::Storage(format!("failed to update application: {e}")),
+            })?;
 
         tx.commit()
             .await
@@ -384,8 +406,12 @@ impl Engine for SqliteEngine {
         Ok(app.try_into()?)
     }
 
-    async fn unregister_application(&self, name: String) -> Result<(), FlameError> {
-        trace_fn!("Sqlite::unregister_application");
+    async fn update_application_state(
+        &self,
+        name: ApplicationID,
+        state: ApplicationState,
+    ) -> Result<Application, FlameError> {
+        trace_fn!("Sqlite::update_application_state");
 
         let mut tx = self
             .pool
@@ -393,10 +419,69 @@ impl Engine for SqliteEngine {
             .await
             .map_err(|e| FlameError::Storage(format!("failed to begin TX: {e}")))?;
 
+        let current: ApplicationDao = sqlx::query_as("SELECT * FROM applications WHERE name=?")
+            .bind(&name)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::RowNotFound => {
+                    FlameError::NotFound(format!("application <{name}> not found"))
+                }
+                _ => FlameError::Storage(e.to_string()),
+            })?;
+
+        if current.state == state as i32 {
+            tx.commit()
+                .await
+                .map_err(|e| FlameError::Storage(format!("failed to commit TX: {e}")))?;
+            return current.try_into();
+        }
+
+        let updated: ApplicationDao = sqlx::query_as(
+            "UPDATE applications SET state=?, version=version+1 WHERE name=? RETURNING *",
+        )
+        .bind(state as i32)
+        .bind(&name)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| FlameError::Storage(format!("failed to update application state: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to commit TX: {e}")))?;
+
+        updated.try_into()
+    }
+
+    async fn delete_application(&self, name: ApplicationID) -> Result<(), FlameError> {
+        trace_fn!("Sqlite::delete_application");
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to begin TX: {e}")))?;
+
+        let state: i32 = sqlx::query_scalar("SELECT state FROM applications WHERE name=?")
+            .bind(&name)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::RowNotFound => {
+                    FlameError::NotFound(format!("application <{name}> not found"))
+                }
+                _ => FlameError::Storage(e.to_string()),
+            })?;
+        if state != ApplicationState::Disabled as i32 {
+            return Err(FlameError::InvalidState(format!(
+                "application <{name}> is not disabled"
+            )));
+        }
+
         let count = self._count_open_sessions(&mut tx, name.clone()).await?;
         if count > 0 {
-            return Err(FlameError::Storage(format!(
-                "{count} open sessions in the application"
+            return Err(FlameError::InvalidState(format!(
+                "application <{name}> has {count} open sessions"
             )));
         }
 
@@ -409,7 +494,7 @@ impl Engine for SqliteEngine {
 
         tx.commit()
             .await
-            .map_err(|e| FlameError::Storage(format!("failed to unregister application: {e}")))?;
+            .map_err(|e| FlameError::Storage(format!("failed to delete application: {e}")))?;
 
         Ok(())
     }
@@ -440,18 +525,30 @@ impl Engine for SqliteEngine {
         app.try_into()
     }
 
-    async fn find_application(&self) -> Result<Vec<Application>, FlameError> {
+    async fn find_application(
+        &self,
+        filter: Option<&ApplicationFilter>,
+    ) -> Result<Vec<Application>, FlameError> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
-        let sql = "SELECT * FROM applications";
-        let app: Vec<ApplicationDao> = sqlx::query_as(sql)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
+        let app: Vec<ApplicationDao> = match filter.and_then(|filter| filter.state) {
+            Some(state) => {
+                sqlx::query_as("SELECT * FROM applications WHERE state=?")
+                    .bind(state as i32)
+                    .fetch_all(&mut *tx)
+                    .await
+            }
+            None => {
+                sqlx::query_as("SELECT * FROM applications")
+                    .fetch_all(&mut *tx)
+                    .await
+            }
+        }
+        .map_err(|e| FlameError::Storage(e.to_string()))?;
 
         tx.commit()
             .await
@@ -613,7 +710,10 @@ impl Engine for SqliteEngine {
         ssn.try_into()
     }
 
-    async fn find_session(&self) -> Result<Vec<Session>, FlameError> {
+    async fn find_session(
+        &self,
+        filter: Option<&SessionFilter>,
+    ) -> Result<Vec<Session>, FlameError> {
         let mut tx = self
             .pool
             .begin()
@@ -634,6 +734,7 @@ impl Engine for SqliteEngine {
             .iter()
             .map(Session::try_from)
             .filter_map(Result::ok)
+            .filter(|session| filter.is_none_or(|filter| matches_session_filter(session, filter)))
             .collect())
     }
 
@@ -1329,6 +1430,52 @@ mod tests {
     }
 
     #[test]
+    fn test_application_state_update_and_filter() -> Result<(), FlameError> {
+        let url = common::temp_sqlite_url("flame_test_application_state_update_and_filter");
+        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
+        tokio_test::block_on(
+            storage
+                .register_application("enabled-app".to_string(), ApplicationAttributes::default()),
+        )?;
+        tokio_test::block_on(
+            storage
+                .register_application("disabled-app".to_string(), ApplicationAttributes::default()),
+        )?;
+
+        let disabled = tokio_test::block_on(
+            storage
+                .update_application_state("disabled-app".to_string(), ApplicationState::Disabled),
+        )?;
+        assert_eq!(disabled.version, 2);
+        let unchanged = tokio_test::block_on(
+            storage
+                .update_application_state("disabled-app".to_string(), ApplicationState::Disabled),
+        )?;
+        assert_eq!(unchanged.version, disabled.version);
+
+        let result = tokio_test::block_on(storage.update_application(
+            "disabled-app".to_string(),
+            ApplicationAttributes {
+                image: Some("must-not-be-written".to_string()),
+                ..Default::default()
+            },
+        ));
+        assert!(matches!(result, Err(FlameError::InvalidState(_))));
+        let unchanged = tokio_test::block_on(storage.get_application("disabled-app".to_string()))?;
+        assert_eq!(unchanged.version, disabled.version);
+        assert_eq!(unchanged.image, disabled.image);
+
+        let filter = ApplicationFilter::by_state(ApplicationState::Disabled);
+        let apps = tokio_test::block_on(storage.find_application(Some(&filter)))?;
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "disabled-app");
+
+        let result = tokio_test::block_on(storage.delete_application("enabled-app".to_string()));
+        assert!(matches!(result, Err(FlameError::InvalidState(_))));
+        Ok(())
+    }
+
+    #[test]
     fn test_unregister_application() -> Result<(), FlameError> {
         let url = common::temp_sqlite_url("flame_test_unregister_application");
         let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
@@ -1355,7 +1502,7 @@ mod tests {
 
         let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id, None, None))?;
         assert_eq!(task_1_1.id, 1);
-        let res = tokio_test::block_on(storage.unregister_application("flmexec".to_string()));
+        let res = tokio_test::block_on(storage.delete_application("flmexec".to_string()));
         assert!(res.is_err());
 
         let task_1_1 = tokio_test::block_on(storage.get_task(task_1_1.gid()))?;
@@ -1368,19 +1515,22 @@ mod tests {
         ))?;
         assert_eq!(task_1_1.state, TaskState::Succeed);
 
-        let res = tokio_test::block_on(storage.unregister_application("flmexec".to_string()));
+        let res = tokio_test::block_on(storage.delete_application("flmexec".to_string()));
         assert!(res.is_err());
 
         let ssn_1 = tokio_test::block_on(storage.close_session(ssn_1_id.clone()))?;
         assert_eq!(ssn_1.status.state, SessionState::Closed);
 
-        let res = tokio_test::block_on(storage.unregister_application("flmexec".to_string()));
+        tokio_test::block_on(
+            storage.update_application_state("flmexec".to_string(), ApplicationState::Disabled),
+        )?;
+        let res = tokio_test::block_on(storage.delete_application("flmexec".to_string()));
         assert!(res.is_ok());
 
         let app_1 = tokio_test::block_on(storage.get_application("flmexec".to_string()));
         assert!(app_1.is_err());
 
-        let list_ssn = tokio_test::block_on(storage.find_session())?;
+        let list_ssn = tokio_test::block_on(storage.find_session(None))?;
         assert_eq!(list_ssn.len(), 0);
 
         Ok(())
@@ -1797,7 +1947,7 @@ mod tests {
         ))?;
         assert_eq!(task_2_2.state, TaskState::Succeed);
 
-        let ssn_list = tokio_test::block_on(storage.find_session())?;
+        let ssn_list = tokio_test::block_on(storage.find_session(None))?;
         assert_eq!(ssn_list.len(), 2);
 
         let ssn_1 = tokio_test::block_on(storage.close_session(ssn_1_id.clone()))?;

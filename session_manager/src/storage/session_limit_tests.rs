@@ -55,7 +55,7 @@ mod tests {
             storage.close_session(format!("ssn-{}", i)).await.unwrap();
         }
 
-        let sessions = storage.list_session().unwrap();
+        let sessions = storage.list_session(None).unwrap();
         assert_eq!(sessions.len(), 5);
     }
 
@@ -78,12 +78,12 @@ mod tests {
             storage.create_session(attr).await.unwrap();
         }
 
-        let sessions_before = storage.list_session().unwrap();
+        let sessions_before = storage.list_session(None).unwrap();
         assert_eq!(sessions_before.len(), 3);
 
         storage.close_session("ssn-0".to_string()).await.unwrap();
 
-        let sessions_after = storage.list_session().unwrap();
+        let sessions_after = storage.list_session(None).unwrap();
         assert_eq!(sessions_after.len(), 2);
 
         let session_ids: Vec<_> = sessions_after.iter().map(|s| s.id.as_str()).collect();
@@ -111,7 +111,7 @@ mod tests {
 
         storage.close_session("ssn-0".to_string()).await.unwrap();
 
-        let sessions = storage.list_session().unwrap();
+        let sessions = storage.list_session(None).unwrap();
         assert_eq!(sessions.len(), 3);
     }
 
@@ -136,7 +136,7 @@ mod tests {
 
         storage.close_session("ssn-1".to_string()).await.unwrap();
 
-        let sessions = storage.list_session().unwrap();
+        let sessions = storage.list_session(None).unwrap();
         assert_eq!(sessions.len(), 2);
 
         let open_count = sessions

@@ -361,7 +361,8 @@ mod tests {
     use crate::model::{AppInfo, ExecutorInfo, NodeInfo, SessionInfo, SnapShot};
     use chrono::{DateTime, Duration, Utc};
     use common::apis::{
-        ExecutorState, NodeState, ResourceRequirement, SessionState, Shim, TaskState,
+        ApplicationState, ExecutorState, NodeState, ResourceRequirement, SessionState, Shim,
+        TaskState,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -438,6 +439,7 @@ mod tests {
     fn create_test_app(name: &str) -> Arc<AppInfo> {
         Arc::new(AppInfo {
             name: name.to_string(),
+            state: ApplicationState::Enabled,
             shim: Shim::Host,
             max_instances: 0,
             delay_release: chrono::Duration::zero(),

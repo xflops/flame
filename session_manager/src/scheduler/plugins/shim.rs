@@ -113,7 +113,9 @@ mod tests {
 
     use crate::model::{AppInfo, ExecutorInfo, SessionInfo};
     use chrono::Duration;
-    use common::apis::{ExecutorState, ResourceRequirement, SessionState, Shim, TaskState};
+    use common::apis::{
+        ApplicationState, ExecutorState, ResourceRequirement, SessionState, Shim, TaskState,
+    };
 
     fn create_test_snapshot() -> SnapShot {
         SnapShot::new()
@@ -122,6 +124,7 @@ mod tests {
     fn create_app_info(name: &str, shim: Shim) -> AppInfoPtr {
         Arc::new(AppInfo {
             name: name.to_string(),
+            state: ApplicationState::Enabled,
             shim,
             max_instances: 100,
             delay_release: Duration::seconds(60),

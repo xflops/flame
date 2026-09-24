@@ -802,8 +802,8 @@ class _Runtime:
         This method can be called explicitly or is automatically called when
         exiting the context manager. It performs the following cleanup:
         1. Closes all ServiceInstance objects.
-        2. Unregisters an application created by this runtime and deletes its
-           cache and package artifacts.
+        2. Unregisters an application created by this runtime. Remote package
+           garbage collection is owned by Flame Object Cache.
 
         Existing applications are borrowed; their registration, cache, and
         package are retained. Sessions opened by this runtime are still closed.
@@ -846,21 +846,12 @@ class _Runtime:
             self._state = _RuntimeState.INACTIVE
 
     def _unregister_application(self) -> None:
-        """Release the registration and artifacts owned by this runtime."""
+        """Release the registration owned by this runtime."""
         logger.debug(f"Closing app runtime '{self._name}'")
 
         core_client.unregister_application(self._name)
         logger.debug(f"Unregistered application '{self._name}'")
-
-        try:
-            from flamepy.core.cache import ObjectKey, delete_objects
-
-            delete_objects(ObjectKey.for_all_sessions(self._name).to_prefix())
-            logger.debug(f"Deleted cached objects for '{self._name}'")
-        except Exception as e:
-            logger.error(f"Error deleting cached objects: {e}", exc_info=True)
-
-        self._cleanup_package_artifacts()
+        self._cleanup_local_package()
 
     def service(
         self,

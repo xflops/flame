@@ -15,9 +15,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use common::apis::{
-    Application, ApplicationAttributes, ApplicationID, CommonData, Event, EventOwner, ExecutorID,
-    ExecutorState, FlameResult, Node, NodeState, Session, SessionAttributes, SessionID, SessionPtr,
-    SessionState, Task, TaskGID, TaskID, TaskInput, TaskOptions, TaskPtr, TaskResult, TaskState,
+    Application, ApplicationAttributes, ApplicationID, ApplicationState, CommonData, Event,
+    EventOwner, ExecutorID, ExecutorState, FlameResult, Node, NodeState, Session,
+    SessionAttributes, SessionID, SessionPtr, SessionState, Task, TaskGID, TaskID, TaskInput,
+    TaskOptions, TaskPtr, TaskResult, TaskState,
 };
 
 use common::FlameError;
@@ -400,6 +401,7 @@ impl Controller {
 
     pub async fn create_session(&self, attr: SessionAttributes) -> Result<Session, FlameError> {
         trace_fn!("Controller::create_session");
+        self.require_enabled_application(&attr.application).await?;
         self.storage.create_session(attr).await
     }
 
@@ -409,7 +411,22 @@ impl Controller {
         spec: Option<SessionAttributes>,
     ) -> Result<Session, FlameError> {
         trace_fn!("Controller::open_session");
+        let application = match spec.as_ref() {
+            Some(attr) => attr.application.clone(),
+            None => self.storage.session_application(id.clone()).await?,
+        };
+        self.require_enabled_application(&application).await?;
         self.storage.open_session(id, spec).await
+    }
+
+    async fn require_enabled_application(&self, name: &str) -> Result<(), FlameError> {
+        let application = self.storage.get_application(name.to_string()).await?;
+        if application.state != ApplicationState::Enabled {
+            return Err(FlameError::InvalidState(format!(
+                "application <{name}> is disabled"
+            )));
+        }
+        Ok(())
     }
 
     pub async fn close_session(&self, id: SessionID) -> Result<Session, FlameError> {
@@ -432,8 +449,11 @@ impl Controller {
         Ok(session)
     }
 
-    pub fn list_session(&self) -> Result<Vec<Session>, FlameError> {
-        self.storage.list_session()
+    pub fn list_session(
+        &self,
+        filter: Option<&crate::model::SessionFilter>,
+    ) -> Result<Vec<Session>, FlameError> {
+        self.storage.list_session(filter)
     }
 
     pub async fn create_task(
@@ -541,27 +561,9 @@ impl Controller {
 
     pub async fn unregister_application(&self, name: String) -> Result<(), FlameError> {
         trace_fn!("Controller::unregister_application");
-        let idle_executor_ids = self
-            .storage
-            .list_executor(Some(&ExecutorFilter::by_state(ExecutorState::Idle)))?
-            .into_iter()
-            .filter(|executor| executor.application == name)
-            .map(|executor| executor.id)
-            .collect::<Vec<_>>();
-
-        self.storage.unregister_application(name.clone()).await?;
-
-        for executor_id in idle_executor_ids {
-            if let Err(error) = self.release_executor(executor_id.clone()).await {
-                tracing::warn!(
-                    "Failed to release Idle executor <{}> after unregistering application <{}>: {}",
-                    executor_id,
-                    name,
-                    error
-                );
-            }
-        }
-
+        self.storage
+            .update_application_state(name, ApplicationState::Disabled)
+            .await?;
         Ok(())
     }
 
@@ -575,9 +577,12 @@ impl Controller {
         self.storage.update_application(name, attr).await
     }
 
-    pub async fn list_application(&self) -> Result<Vec<Application>, FlameError> {
+    pub async fn list_application(
+        &self,
+        filter: Option<&crate::model::ApplicationFilter>,
+    ) -> Result<Vec<Application>, FlameError> {
         trace_fn!("Controller::list_application");
-        self.storage.list_application().await
+        self.storage.list_application(filter).await
     }
 
     pub async fn watch_task(&self, gid: TaskGID) -> Result<Task, FlameError> {
@@ -1467,7 +1472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unregister_application_releases_its_idle_executors() {
+    async fn unregister_application_only_disables_application() {
         let storage = create_test_storage().await;
         let controller = new_ptr(storage);
         let ssn_id = "unregister-releases-idle";
@@ -1506,8 +1511,67 @@ mod tests {
 
         assert_eq!(
             controller.get_executor(executor_id).unwrap().state,
-            ExecutorState::Releasing
+            ExecutorState::Idle
         );
+        assert_eq!(
+            controller
+                .get_application("test-app".to_string())
+                .await
+                .unwrap()
+                .state,
+            ApplicationState::Disabled
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_application_rejects_create_and_open() {
+        let storage = create_test_storage().await;
+        let controller = new_ptr(storage);
+        controller
+            .register_application("disabled-app".to_string(), ApplicationAttributes::default())
+            .await
+            .unwrap();
+
+        let attributes = SessionAttributes {
+            id: "disabled-session".to_string(),
+            application: "disabled-app".to_string(),
+            ..SessionAttributes::default()
+        };
+        controller.create_session(attributes.clone()).await.unwrap();
+        controller
+            .close_session(attributes.id.clone())
+            .await
+            .unwrap();
+        controller
+            .unregister_application("disabled-app".to_string())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            controller
+                .create_session(SessionAttributes {
+                    id: "new-disabled-session".to_string(),
+                    ..attributes.clone()
+                })
+                .await,
+            Err(FlameError::InvalidState(_))
+        ));
+        assert!(matches!(
+            controller.open_session(attributes.id.clone(), None).await,
+            Err(FlameError::InvalidState(_))
+        ));
+        assert!(matches!(
+            controller
+                .open_session(
+                    "missing-disabled-session".to_string(),
+                    Some(SessionAttributes {
+                        id: "missing-disabled-session".to_string(),
+                        ..attributes
+                    })
+                )
+                .await,
+            Err(FlameError::InvalidState(_))
+        ));
     }
 
     // ========================================================================

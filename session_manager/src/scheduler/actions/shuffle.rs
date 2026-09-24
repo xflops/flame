@@ -200,7 +200,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shuffle_releases_executor_that_becomes_idle_after_application_unregister() {
+    async fn shuffle_does_not_treat_disabled_application_as_absent() {
         let config = FlameClusterContext {
             cluster: FlameCluster {
                 storage: "none".to_string(),
@@ -282,7 +282,7 @@ mod tests {
 
         assert_eq!(
             controller.get_executor(executor.id).unwrap().state,
-            ExecutorState::Releasing
+            ExecutorState::Idle
         );
     }
 }

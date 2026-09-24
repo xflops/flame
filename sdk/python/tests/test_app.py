@@ -2361,6 +2361,25 @@ def test_unregister_failure_preserves_cache_and_package_artifacts(monkeypatch):
     runtime._cleanup_package_artifacts.assert_not_called()
 
 
+def test_unregister_leaves_registered_package_cleanup_to_object_cache(monkeypatch):
+    """Successful teardown does not delete the remotely registered package."""
+    runtime = object.__new__(Runtime)
+    runtime._name = "draining-app"
+    runtime._cleanup_local_package = MagicMock()
+    runtime._cleanup_storage = MagicMock()
+    unregister = MagicMock()
+    delete_objects = MagicMock()
+    monkeypatch.setattr("flamepy.app.client.core_client.unregister_application", unregister)
+    monkeypatch.setattr("flamepy.core.cache.delete_objects", delete_objects)
+
+    runtime._unregister_application()
+
+    unregister.assert_called_once_with("draining-app")
+    runtime._cleanup_local_package.assert_called_once_with()
+    runtime._cleanup_storage.assert_not_called()
+    delete_objects.assert_not_called()
+
+
 def test_runtime_close_serializes_with_service_creation(monkeypatch):
     """Closing concurrently with service creation cannot orphan its session."""
     import threading

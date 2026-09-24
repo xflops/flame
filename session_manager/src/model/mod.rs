@@ -26,8 +26,8 @@ use chrono::{DateTime, Duration, Utc};
 use stdng::{lock_ptr, MutexPtr};
 
 use common::apis::{
-    Application, ExecutorID, ExecutorState, Node, NodeState, ResourceRequirement, Session,
-    SessionID, SessionState, Shim, Task, TaskID, TaskState,
+    Application, ApplicationID, ApplicationState, ExecutorID, ExecutorState, Node, NodeState,
+    ResourceRequirement, Session, SessionID, SessionState, Shim, Task, TaskID, TaskState,
 };
 use common::{ctx::DEFAULT_SESSION_RETRY_LIMITS, FlameError};
 use rpc::flame::v1 as rpc;
@@ -181,6 +181,7 @@ pub struct NodeInfo {
 #[derive(Clone, Debug, Default)]
 pub struct AppInfo {
     pub name: String,
+    pub state: ApplicationState,
     pub shim: Shim, // Required shim type for the application
     pub max_instances: u32,
     pub delay_release: Duration,
@@ -206,6 +207,7 @@ impl From<&Application> for AppInfo {
     fn from(app: &Application) -> Self {
         AppInfo {
             name: app.name.to_string(),
+            state: app.state,
             shim: app.shim, // Get shim from application
             max_instances: app.max_instances,
             delay_release: app.delay_release,
@@ -288,6 +290,8 @@ impl TryFrom<&Session> for SessionInfo {
 /// - `None` = ignore this filter (match all)
 /// - `Some(value)` = match exactly (empty vec matches nothing)
 pub struct SessionFilter {
+    /// Filter by owning application
+    pub application: Option<ApplicationID>,
     /// Filter by session state
     pub state: Option<SessionState>,
     /// Filter by session IDs
@@ -300,6 +304,7 @@ impl SessionFilter {
     /// Creates a new empty filter (matches all sessions).
     pub const fn new() -> Self {
         Self {
+            application: None,
             state: None,
             ids: None,
             predicate: None,
@@ -309,6 +314,7 @@ impl SessionFilter {
     /// Creates a filter for a specific state.
     pub const fn by_state(state: SessionState) -> Self {
         Self {
+            application: None,
             state: Some(state),
             ids: None,
             predicate: None,
@@ -318,8 +324,22 @@ impl SessionFilter {
     /// Creates a filter for specific session IDs.
     pub fn by_ids(ids: Vec<SessionID>) -> Self {
         Self {
+            application: None,
             state: None,
             ids: Some(ids),
+            predicate: None,
+        }
+    }
+
+    /// Creates a filter for an application's sessions in a specific state.
+    pub fn by_application_state(
+        application: impl Into<ApplicationID>,
+        state: SessionState,
+    ) -> Self {
+        Self {
+            application: Some(application.into()),
+            state: Some(state),
+            ids: None,
             predicate: None,
         }
     }
@@ -334,6 +354,19 @@ impl SessionFilter {
 impl Default for SessionFilter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl TryFrom<rpc::ListSessionRequest> for SessionFilter {
+    type Error = FlameError;
+
+    fn try_from(request: rpc::ListSessionRequest) -> Result<Self, Self::Error> {
+        Ok(Self {
+            application: request.application,
+            state: request.state.map(SessionState::try_from).transpose()?,
+            ids: None,
+            predicate: None,
+        })
     }
 }
 
@@ -461,31 +494,41 @@ pub const ALL_EXECUTOR: Option<ExecutorFilter> = None;
 /// Filter for listing applications.
 /// All fields are Option:
 /// - `None` = ignore this filter (match all)
-/// - `Some(value)` = match exactly (empty vec matches nothing)
-pub struct AppFilter {
-    /// Filter by application names
-    pub names: Option<Vec<String>>,
+/// - `Some(value)` = match exactly
+pub struct ApplicationFilter {
+    /// Filter by application state
+    pub state: Option<ApplicationState>,
 }
 
-impl AppFilter {
+impl ApplicationFilter {
     /// Creates a new empty filter (matches all applications).
     pub const fn new() -> Self {
-        Self { names: None }
+        Self { state: None }
     }
 
-    /// Creates a filter for specific application names.
-    pub fn by_names(names: Vec<String>) -> Self {
-        Self { names: Some(names) }
+    /// Creates a filter for a specific application state.
+    pub const fn by_state(state: ApplicationState) -> Self {
+        Self { state: Some(state) }
     }
 }
 
-impl Default for AppFilter {
+impl Default for ApplicationFilter {
     fn default() -> Self {
         Self::new()
     }
 }
 
-pub const ALL_APPLICATION: Option<AppFilter> = None;
+impl TryFrom<rpc::ListApplicationRequest> for ApplicationFilter {
+    type Error = FlameError;
+
+    fn try_from(request: rpc::ListApplicationRequest) -> Result<Self, Self::Error> {
+        Ok(Self {
+            state: request.state.map(ApplicationState::try_from).transpose()?,
+        })
+    }
+}
+
+pub const ALL_APPLICATION: Option<ApplicationFilter> = None;
 
 impl SnapShot {
     pub fn find_nodes(
@@ -547,7 +590,7 @@ impl SnapShot {
 
     pub fn find_applications(
         &self,
-        filter: Option<AppFilter>,
+        filter: Option<ApplicationFilter>,
     ) -> Result<HashMap<String, AppInfoPtr>, FlameError> {
         match filter {
             Some(filter) => self.find_applications_by_filter(filter),
@@ -557,16 +600,15 @@ impl SnapShot {
 
     fn find_applications_by_filter(
         &self,
-        filter: AppFilter,
+        filter: ApplicationFilter,
     ) -> Result<HashMap<String, AppInfoPtr>, FlameError> {
         let apps = lock_ptr!(self.applications)?;
 
-        // Apply names filter if specified
-        let filtered: Vec<AppInfoPtr> = match filter.names {
+        let filtered: Vec<AppInfoPtr> = match filter.state {
             None => apps.values().cloned().collect(),
-            Some(ref names) => apps
+            Some(state) => apps
                 .values()
-                .filter(|app| names.contains(&app.name))
+                .filter(|app| app.state == state)
                 .cloned()
                 .collect(),
         };
@@ -623,6 +665,14 @@ impl SnapShot {
             Some(ref ids) => candidates
                 .into_iter()
                 .filter(|ssn| ids.contains(&ssn.id))
+                .collect(),
+        };
+
+        let filtered: Vec<SessionInfoPtr> = match filter.application {
+            None => filtered,
+            Some(ref application) => filtered
+                .into_iter()
+                .filter(|ssn| ssn.application == *application)
                 .collect(),
         };
 
@@ -1005,6 +1055,44 @@ mod tests {
     use chrono::Utc;
 
     #[test]
+    fn application_filter_maps_rpc_state() {
+        let filter = ApplicationFilter::try_from(rpc::ListApplicationRequest {
+            state: Some(rpc::ApplicationState::Disabled as i32),
+        })
+        .unwrap();
+
+        assert_eq!(filter.state, Some(ApplicationState::Disabled));
+    }
+
+    #[test]
+    fn application_filter_rejects_unknown_rpc_state() {
+        assert!(
+            ApplicationFilter::try_from(rpc::ListApplicationRequest { state: Some(99) }).is_err()
+        );
+    }
+
+    #[test]
+    fn session_filter_maps_rpc_fields() {
+        let filter = SessionFilter::try_from(rpc::ListSessionRequest {
+            application: Some("test-app".to_string()),
+            state: Some(rpc::SessionState::Open as i32),
+        })
+        .unwrap();
+
+        assert_eq!(filter.application.as_deref(), Some("test-app"));
+        assert_eq!(filter.state, Some(SessionState::Open));
+    }
+
+    #[test]
+    fn session_filter_rejects_unknown_rpc_state() {
+        assert!(SessionFilter::try_from(rpc::ListSessionRequest {
+            application: None,
+            state: Some(99),
+        })
+        .is_err());
+    }
+
+    #[test]
     fn executor_rpc_round_trip_preserves_application() {
         let executor = Executor {
             application: "test-app".to_string(),
@@ -1248,6 +1336,7 @@ mod tests {
         // Register the application so `pipelined_executors` can look up its shim.
         ss.add_application(Arc::new(AppInfo {
             name: "test-app".to_string(),
+            state: ApplicationState::Enabled,
             shim: Shim::Host,
             max_instances: 0,
             delay_release: chrono::Duration::zero(),

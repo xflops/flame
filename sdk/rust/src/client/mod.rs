@@ -659,7 +659,12 @@ impl Connection {
 
     pub async fn list_session(&self) -> Result<Vec<Session>, FlameError> {
         let mut client = FlameClient::new(self.channel.clone());
-        let ssn_list = client.list_session(ListSessionRequest {}).await?;
+        let ssn_list = client
+            .list_session(ListSessionRequest {
+                application: None,
+                state: None,
+            })
+            .await?;
 
         let inner = ssn_list.into_inner();
         inner
@@ -811,7 +816,9 @@ impl Connection {
 
     pub async fn list_application(&self) -> Result<Vec<Application>, FlameError> {
         let mut client = FlameClient::new(self.channel.clone());
-        let app_list = client.list_application(ListApplicationRequest {}).await?;
+        let app_list = client
+            .list_application(ListApplicationRequest { state: None })
+            .await?;
 
         app_list
             .into_inner()

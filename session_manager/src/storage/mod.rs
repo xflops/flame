@@ -20,17 +20,17 @@ use uuid::Uuid;
 use stdng::{lock_ptr, logs::TraceFn, trace_fn, MutexPtr};
 
 use common::apis::{
-    Application, ApplicationAttributes, ApplicationID, ApplicationPtr, CommonData, Event,
-    EventOwner, ExecutorID, ExecutorState, Node, NodePtr, Session, SessionAttributes, SessionID,
-    SessionPtr, SessionState, Shim, Task, TaskGID, TaskID, TaskInput, TaskOptions, TaskOutput,
-    TaskPtr, TaskResult, TaskState,
+    Application, ApplicationAttributes, ApplicationID, ApplicationPtr, ApplicationState,
+    CommonData, Event, EventOwner, ExecutorID, ExecutorState, Node, NodePtr, Session,
+    SessionAttributes, SessionID, SessionPtr, SessionState, Shim, Task, TaskGID, TaskID, TaskInput,
+    TaskOptions, TaskOutput, TaskPtr, TaskResult, TaskState,
 };
 use common::ctx::FlameClusterContext;
 use common::FlameError;
 
 use crate::model::{
-    AppInfo, Executor, ExecutorFilter, ExecutorInfo, ExecutorPtr, NodeInfo, NodeInfoPtr,
-    SessionInfo, SessionInfoPtr, SnapShot, SnapShotPtr,
+    AppInfo, ApplicationFilter, Executor, ExecutorFilter, ExecutorInfo, ExecutorPtr, NodeInfo,
+    NodeInfoPtr, SessionFilter, SessionInfo, SessionInfoPtr, SnapShot, SnapShotPtr,
 };
 
 use crate::events::{EventManagerPtr, FsEventManager, MemoryEventManager};
@@ -141,7 +141,7 @@ impl Storage {
     }
 
     pub async fn load_data(&self) -> Result<(), FlameError> {
-        let ssn_list = self.engine.find_session().await?;
+        let ssn_list = self.engine.find_session(None).await?;
         for ssn in ssn_list {
             let task_list = self.engine.find_tasks(ssn.id.clone()).await?;
             let mut ssn = ssn.clone();
@@ -158,7 +158,7 @@ impl Storage {
             ssn_map.insert(ssn.id.clone(), SessionPtr::new(ssn.into()));
         }
 
-        let app_list = self.engine.find_application().await?;
+        let app_list = self.engine.find_application(None).await?;
         for app in app_list {
             let mut app_map = lock_ptr!(self.applications)?;
             app_map.insert(app.name.clone(), ApplicationPtr::new(app.into()));
@@ -642,7 +642,7 @@ impl Storage {
         Ok(ssn)
     }
 
-    pub fn list_session(&self) -> Result<Vec<Session>, FlameError> {
+    pub fn list_session(&self, filter: Option<&SessionFilter>) -> Result<Vec<Session>, FlameError> {
         let mut ssn_list = vec![];
         let ssn_map = lock_ptr!(self.sessions)?;
 
@@ -652,6 +652,26 @@ impl Storage {
             ssn.events = self
                 .event_manager
                 .find_events(EventOwner::session(ssn.id.clone()))?;
+            let matches = filter.is_none_or(|filter| {
+                filter
+                    .application
+                    .as_ref()
+                    .is_none_or(|application| ssn.application == *application)
+                    && filter.state.is_none_or(|state| ssn.status.state == state)
+                    && filter.ids.as_ref().is_none_or(|ids| ids.contains(&ssn.id))
+            });
+            if !matches {
+                continue;
+            }
+            if let Some(predicate) = filter.and_then(|filter| filter.predicate) {
+                let session_info = SessionInfo::try_from(&ssn)?;
+                if !predicate(
+                    &session_info,
+                    self.context.cluster.recovery.session.retry_limits,
+                ) {
+                    continue;
+                }
+            }
             ssn_list.push(ssn);
         }
 
@@ -804,8 +824,23 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn unregister_application(&self, name: String) -> Result<(), FlameError> {
-        self.engine.unregister_application(name.clone()).await?;
+    pub async fn update_application_state(
+        &self,
+        name: ApplicationID,
+        state: ApplicationState,
+    ) -> Result<Application, FlameError> {
+        let app = self
+            .engine
+            .update_application_state(name.clone(), state)
+            .await?;
+
+        let mut app_map = lock_ptr!(self.applications)?;
+        app_map.insert(name, stdng::new_ptr(app.clone()));
+        Ok(app)
+    }
+
+    pub async fn delete_application(&self, name: ApplicationID) -> Result<(), FlameError> {
+        self.engine.delete_application(name.clone()).await?;
 
         {
             let mut app_map = lock_ptr!(self.applications)?;
@@ -838,8 +873,27 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn list_application(&self) -> Result<Vec<Application>, FlameError> {
-        self.engine.find_application().await
+    pub async fn list_application(
+        &self,
+        filter: Option<&ApplicationFilter>,
+    ) -> Result<Vec<Application>, FlameError> {
+        self.engine.find_application(filter).await
+    }
+
+    pub async fn session_application(&self, id: SessionID) -> Result<ApplicationID, FlameError> {
+        let cached = {
+            let ssn_map = lock_ptr!(self.sessions)?;
+            ssn_map.get(&id).cloned()
+        };
+        if let Some(ssn) = cached {
+            return Ok(lock_ptr!(ssn)?.application.clone());
+        }
+
+        Ok(self.engine.get_session(id).await?.application)
+    }
+
+    pub fn count_session(&self, filter: &SessionFilter) -> Result<usize, FlameError> {
+        Ok(self.list_session(Some(filter))?.len())
     }
 
     pub async fn update_task_state(
