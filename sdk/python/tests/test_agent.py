@@ -2,6 +2,7 @@
 
 import importlib
 import json
+import threading
 from concurrent.futures import Future
 from dataclasses import FrozenInstanceError
 from unittest.mock import patch
@@ -11,6 +12,7 @@ import pytest
 from flamepy import FlameError, FlameErrorCode, ResourceRequirement
 from flamepy.agent import Session, SessionOutput, open_session
 from flamepy.agent.session import _decode_output, _encode_options, _encode_script, _SessionOptions
+from flamepy.core.client import _LazyTaskFuture
 
 
 class FakeSession:
@@ -158,6 +160,41 @@ def test_submit_code_decodes_future():
     assert isinstance(result, SessionOutput)
     assert result.text() == "ok\n"
     assert agent_session._session.invoked[0][0] == "run"
+
+
+def test_submit_code_completion_is_not_blocked_by_user_callbacks():
+    release_callbacks = threading.Event()
+    all_callbacks_started = threading.Event()
+    started = 0
+    started_lock = threading.Lock()
+
+    def blocked_callback(_):
+        nonlocal started
+        with started_lock:
+            started += 1
+            if started == 8:
+                all_callbacks_started.set()
+        release_callbacks.wait(timeout=5)
+
+    class PendingSession(FakeSession):
+        def run(self, payload):
+            self.raw_future = _LazyTaskFuture(None, "submit-task")
+            return self.raw_future
+
+    try:
+        for index in range(8):
+            future = _LazyTaskFuture(None, str(index))
+            future.add_done_callback(blocked_callback)
+            future.set_result(b"done")
+        assert all_callbacks_started.wait(timeout=2)
+
+        core_session = PendingSession()
+        agent_session = Session(core_session, _SessionOptions(language="python"))
+        mapped = agent_session.submit_code("print(1)")
+        core_session.raw_future.set_result(core_session.invoke_result)
+        assert mapped.result(timeout=2).text() == "ok\n"
+    finally:
+        release_callbacks.set()
 
 
 def test_open_restores_options():

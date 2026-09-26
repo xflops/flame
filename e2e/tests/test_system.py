@@ -771,7 +771,7 @@ def test_app_fuzzed_task_workload():
             }
 
         futures = [
-            service(
+            service.remote(
                 task_spec.input_value,
                 task_spec.output_value,
                 task_spec.common_data,

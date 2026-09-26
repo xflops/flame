@@ -1,6 +1,8 @@
 """Tests for flamepy core client and types."""
 
+import asyncio
 import json
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -693,3 +695,432 @@ def test_flame_context_reads_scalar_app_template(tmp_path, monkeypatch):
     )
 
     assert FlameContext().app == "custom-flmrun"
+
+
+def _task_watch_test_session(watch_frontend):
+    from flamepy.proto.types_pb2 import Metadata, TaskSpec, TaskStatus
+    from flamepy.proto.types_pb2 import Task as TaskProto
+
+    class Frontend:
+        next_id = 0
+
+        def CreateTask(self, request):  # noqa: N802
+            self.next_id += 1
+            return TaskProto(
+                metadata=Metadata(id=str(self.next_id)),
+                spec=TaskSpec(session_id=request.task.session_id),
+                status=TaskStatus(state=0, creation_time=0),
+            )
+
+    conn = client.Connection("http://unused", DummyChannel("unused"), Frontend())
+    conn._watch_frontend = watch_frontend
+    session = client.Session(
+        connection=conn,
+        id="session-1",
+        application="test-app",
+        state=SessionState.OPEN,
+        creation_time=datetime.now(timezone.utc),
+        pending=0,
+        running=0,
+        succeed=0,
+        failed=0,
+        completion_time=None,
+    )
+    return conn, session
+
+
+def test_run_fails_when_watch_stream_ends_before_terminal_update():
+    class WatchFrontend:
+        async def WatchTasks(self, requests):  # noqa: N802
+            if False:
+                yield requests
+
+    conn, session = _task_watch_test_session(WatchFrontend())
+    try:
+        future = session.run(b"input")
+        with pytest.raises(FlameError, match="watch stream ended before session session-1 tasks completed"):
+            future.result(timeout=2)
+    finally:
+        conn.close()
+
+
+def test_run_fails_when_task_is_cancelled():
+    from flamepy.proto.types_pb2 import Metadata, TaskSpec, TaskStatus
+    from flamepy.proto.types_pb2 import Task as TaskProto
+
+    class WatchFrontend:
+        async def WatchTasks(self, requests):  # noqa: N802
+            async for request in requests:
+                yield TaskProto(
+                    metadata=Metadata(id=request.task_id),
+                    spec=TaskSpec(session_id=request.session_id),
+                    status=TaskStatus(state=4, creation_time=0),
+                )
+
+    conn, session = _task_watch_test_session(WatchFrontend())
+    try:
+        with pytest.raises(FlameError, match="Task was cancelled"):
+            session.run(b"input").result(timeout=2)
+    finally:
+        conn.close()
+
+
+def test_close_session_waits_for_pending_task_cancellation():
+    from flamepy.proto.types_pb2 import Metadata, SessionSpec, SessionStatus, TaskSpec, TaskStatus
+    from flamepy.proto.types_pb2 import Session as SessionProto
+    from flamepy.proto.types_pb2 import Task as TaskProto
+
+    closed = threading.Event()
+    watching = threading.Event()
+
+    class WatchFrontend:
+        async def WatchTasks(self, requests):  # noqa: N802
+            async for request in requests:
+                watching.set()
+                await asyncio.to_thread(closed.wait)
+                yield TaskProto(
+                    metadata=Metadata(id=request.task_id),
+                    spec=TaskSpec(session_id=request.session_id),
+                    status=TaskStatus(state=TaskState.CANCELLED, creation_time=0),
+                )
+
+    conn, session = _task_watch_test_session(WatchFrontend())
+
+    def close_session(request):
+        closed.set()
+        return SessionProto(
+            metadata=Metadata(id=request.session_id),
+            spec=SessionSpec(application="test-app"),
+            status=SessionStatus(state=SessionState.CLOSED, creation_time=0),
+        )
+
+    conn._frontend.CloseSession = close_session
+    try:
+        future = session.run(b"input")
+        assert watching.wait(timeout=2)
+        session.close()
+        with pytest.raises(FlameError, match="Task was cancelled"):
+            future.result(timeout=2)
+        deadline = time.monotonic() + 2
+        while session.id in conn._session_watches and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert session.id not in conn._session_watches
+    finally:
+        closed.set()
+        conn.close()
+
+
+def test_close_session_waits_for_task_watch_registration_in_flight():
+    from flamepy.proto.types_pb2 import Metadata, SessionSpec, SessionStatus, TaskSpec, TaskStatus
+    from flamepy.proto.types_pb2 import Session as SessionProto
+    from flamepy.proto.types_pb2 import Task as TaskProto
+
+    creating = threading.Event()
+    release_create = threading.Event()
+
+    class WatchFrontend:
+        async def WatchTasks(self, requests):  # noqa: N802
+            async for request in requests:
+                yield TaskProto(
+                    metadata=Metadata(id=request.task_id),
+                    spec=TaskSpec(session_id=request.session_id),
+                    status=TaskStatus(state=TaskState.CANCELLED, creation_time=0),
+                )
+
+    conn, session = _task_watch_test_session(WatchFrontend())
+
+    def create_task(request):
+        creating.set()
+        assert release_create.wait(timeout=2)
+        return TaskProto(
+            metadata=Metadata(id="1"),
+            spec=TaskSpec(session_id=request.task.session_id),
+            status=TaskStatus(state=TaskState.PENDING, creation_time=0),
+        )
+
+    def close_session(request):
+        return SessionProto(
+            metadata=Metadata(id=request.session_id),
+            spec=SessionSpec(application="test-app"),
+            status=SessionStatus(state=SessionState.CLOSED, creation_time=0),
+        )
+
+    conn._frontend.CreateTask = create_task
+    conn._frontend.CloseSession = close_session
+    submitted = []
+    worker = threading.Thread(target=lambda: submitted.append(session.run(b"input")))
+    try:
+        worker.start()
+        assert creating.wait(timeout=2)
+        session.close()
+        release_create.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        with pytest.raises(FlameError, match="Task was cancelled"):
+            submitted[0].result(timeout=2)
+    finally:
+        release_create.set()
+        worker.join(timeout=2)
+        conn.close()
+
+
+def test_close_session_keeps_watch_open_when_another_task_is_being_created():
+    from flamepy.proto.types_pb2 import Metadata, SessionSpec, SessionStatus, TaskSpec, TaskStatus
+    from flamepy.proto.types_pb2 import Session as SessionProto
+    from flamepy.proto.types_pb2 import Task as TaskProto
+
+    closed = threading.Event()
+    watching_first = threading.Event()
+    creating_second = threading.Event()
+    release_second = threading.Event()
+
+    class WatchFrontend:
+        async def WatchTasks(self, requests):  # noqa: N802
+            async for request in requests:
+                if request.task_id == "1":
+                    watching_first.set()
+                    await asyncio.to_thread(closed.wait)
+                yield TaskProto(
+                    metadata=Metadata(id=request.task_id),
+                    spec=TaskSpec(session_id=request.session_id),
+                    status=TaskStatus(state=TaskState.CANCELLED, creation_time=0),
+                )
+
+    conn, session = _task_watch_test_session(WatchFrontend())
+    next_id = 0
+
+    def create_task(request):
+        nonlocal next_id
+        next_id += 1
+        if next_id == 2:
+            creating_second.set()
+            assert release_second.wait(timeout=2)
+        return TaskProto(
+            metadata=Metadata(id=str(next_id)),
+            spec=TaskSpec(session_id=request.task.session_id),
+            status=TaskStatus(state=TaskState.PENDING, creation_time=0),
+        )
+
+    def close_session(request):
+        closed.set()
+        return SessionProto(
+            metadata=Metadata(id=request.session_id),
+            spec=SessionSpec(application="test-app"),
+            status=SessionStatus(state=SessionState.CLOSED, creation_time=0),
+        )
+
+    conn._frontend.CreateTask = create_task
+    conn._frontend.CloseSession = close_session
+    submitted = []
+    worker = threading.Thread(target=lambda: submitted.append(session.run(b"second")))
+    try:
+        first = session.run(b"first")
+        assert watching_first.wait(timeout=2)
+        worker.start()
+        assert creating_second.wait(timeout=2)
+        session.close()
+        with pytest.raises(FlameError, match="Task was cancelled"):
+            first.result(timeout=2)
+        assert session.id in conn._session_watches
+        release_second.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        with pytest.raises(FlameError, match="Task was cancelled"):
+            submitted[0].result(timeout=2)
+    finally:
+        release_second.set()
+        closed.set()
+        worker.join(timeout=2)
+        conn.close()
+
+
+def test_short_task_completes_with_ten_long_watches():
+    from flamepy.proto.types_pb2 import Metadata, TaskSpec, TaskStatus
+    from flamepy.proto.types_pb2 import Task as TaskProto
+
+    class WatchFrontend:
+        def __init__(self):
+            self.started = threading.Event()
+            self.long_watches = 0
+            self.streams = 0
+
+        async def WatchTasks(self, requests):  # noqa: N802
+            self.streams += 1
+            async for request in requests:
+                if request.task_id != "11":
+                    self.long_watches += 1
+                    if self.long_watches == 10:
+                        self.started.set()
+                else:
+                    yield TaskProto(
+                        metadata=Metadata(id="11"),
+                        spec=TaskSpec(session_id=request.session_id, output=b"short"),
+                        status=TaskStatus(state=2, creation_time=0),
+                    )
+
+    watch_frontend = WatchFrontend()
+    conn, session = _task_watch_test_session(watch_frontend)
+    try:
+        long_futures = [session.run(b"long") for _ in range(10)]
+        assert watch_frontend.started.wait(timeout=2)
+        short_future = session.run(b"short")
+        assert short_future.result(timeout=2) == b"short"
+        assert all(not future.done() for future in long_futures)
+        assert watch_frontend.streams == 1
+    finally:
+        conn.close()
+    assert all(future.done() for future in long_futures)
+
+
+def test_future_callback_waiting_on_another_task_does_not_block_watches():
+    from flamepy.proto.types_pb2 import Metadata, TaskSpec, TaskStatus
+    from flamepy.proto.types_pb2 import Task as TaskProto
+
+    callback_started = threading.Event()
+    callback_done = threading.Event()
+    callback_result = []
+
+    class WatchFrontend:
+        async def WatchTasks(self, requests):  # noqa: N802
+            async for request in requests:
+                if request.task_id == "2":
+                    while not callback_started.is_set():
+                        await asyncio.sleep(0.001)
+                yield TaskProto(
+                    metadata=Metadata(id=request.task_id),
+                    spec=TaskSpec(session_id=request.session_id, output=request.task_id.encode()),
+                    status=TaskStatus(state=2, creation_time=0),
+                )
+
+    conn, session = _task_watch_test_session(WatchFrontend())
+    try:
+        first = session.run(b"first")
+        second = session.run(b"second")
+
+        def wait_for_second(_):
+            callback_started.set()
+            try:
+                callback_result.append(second.result(timeout=2))
+            finally:
+                callback_done.set()
+
+        first.add_done_callback(wait_for_second)
+        assert callback_done.wait(timeout=2)
+        assert callback_result == [b"2"]
+        assert first.result(timeout=2) == b"1"
+    finally:
+        conn.close()
+
+
+def test_task_completion_does_not_wait_for_saturated_callback_workers():
+    from flamepy.proto.types_pb2 import Metadata, TaskSpec, TaskStatus
+    from flamepy.proto.types_pb2 import Task as TaskProto
+
+    class WatchFrontend:
+        async def WatchTasks(self, requests):  # noqa: N802
+            async for request in requests:
+                yield TaskProto(
+                    metadata=Metadata(id=request.task_id),
+                    spec=TaskSpec(session_id=request.session_id, output=b"done"),
+                    status=TaskStatus(state=2, creation_time=0),
+                )
+
+    blocked = threading.Event()
+    all_started = threading.Event()
+    started = 0
+    started_lock = threading.Lock()
+
+    def slow_callback(_):
+        nonlocal started
+        with started_lock:
+            started += 1
+            if started == 8:
+                all_started.set()
+        blocked.wait(timeout=3)
+
+    conn, session = _task_watch_test_session(WatchFrontend())
+    try:
+        for _ in range(8):
+            session.run(b"blocked callback").add_done_callback(slow_callback)
+        assert all_started.wait(timeout=2)
+        assert session.run(b"unblocked future").result(timeout=2) == b"done"
+    finally:
+        blocked.set()
+        conn.close()
+
+
+def test_connection_close_cancels_pending_watches_and_is_idempotent():
+    class WatchFrontend:
+        started = threading.Event()
+
+        async def WatchTasks(self, requests):  # noqa: N802
+            async for request in requests:
+                self.started.set()
+                await asyncio.Future()
+                if False:
+                    yield request
+
+    watch_frontend = WatchFrontend()
+    conn, session = _task_watch_test_session(watch_frontend)
+    future = session.run(b"input")
+    assert watch_frontend.started.wait(timeout=2)
+    closer = threading.Thread(target=conn.close)
+    closer.start()
+    conn.close()
+    closer.join(timeout=2)
+    assert not closer.is_alive()
+    with pytest.raises(FlameError, match="connection closed before task completed"):
+        future.result(timeout=2)
+
+
+def test_run_watches_task_over_grpc_aio_channel():
+    """The async watcher must work with the generated gRPC frontend stub."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    import grpc
+
+    from flamepy.proto.frontend_pb2_grpc import FrontendServicer, add_FrontendServicer_to_server
+    from flamepy.proto.types_pb2 import Metadata, TaskSpec, TaskStatus
+    from flamepy.proto.types_pb2 import Task as TaskProto
+
+    class Frontend(FrontendServicer):
+        def CreateTask(self, request, context):  # noqa: N802
+            return TaskProto(
+                metadata=Metadata(id="task-1"),
+                spec=TaskSpec(session_id=request.task.session_id),
+                status=TaskStatus(state=0, creation_time=0),
+            )
+
+        def WatchTasks(self, requests, context):  # noqa: N802
+            for request in requests:
+                yield TaskProto(
+                    metadata=Metadata(id=request.task_id),
+                    spec=TaskSpec(session_id=request.session_id, output=b"done"),
+                    status=TaskStatus(state=2, creation_time=0),
+                )
+
+    server = grpc.server(ThreadPoolExecutor(max_workers=2))
+    add_FrontendServicer_to_server(Frontend(), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    conn = None
+    try:
+        conn = client.Connection.connect(f"http://127.0.0.1:{port}")
+        session = client.Session(
+            connection=conn,
+            id="session-1",
+            application="test-app",
+            state=SessionState.OPEN,
+            creation_time=datetime.now(timezone.utc),
+            pending=0,
+            running=0,
+            succeed=0,
+            failed=0,
+            completion_time=None,
+        )
+        assert session.run(b"input").result(timeout=2) == b"done"
+        assert [task.output for task in session.watch_task("task-1")] == [b"done"]
+    finally:
+        if conn is not None:
+            conn.close()
+        server.stop(0).wait(timeout=2)

@@ -75,7 +75,10 @@ outputs = [future.result() for future in futures]
 session.close()
 ```
 
-Use `session.create_task()`, `session.get_task()`, `session.list_tasks()`, and `session.watch_task()` when callers need explicit task objects or streamed task updates.
+Use `session.create_task()`, `session.get_task()`, `session.list_tasks()`, and
+`session.watch_task()` when callers need explicit task objects or streamed task
+updates. `watch_task()` first yields the task's current status, which may already
+be terminal, then yields later updates until the task reaches a terminal state.
 
 ## Register Applications
 
@@ -204,7 +207,7 @@ def square(value: int) -> int:
     return value * value
 
 
-futures = [square(idx) for idx in range(8)]
+futures = [square.remote(idx) for idx in range(8)]
 print(app.get(futures))
 app.destroy()
 ```
@@ -220,11 +223,12 @@ disabled existing application is never reused and always produces an error.
 project has no Python package metadata; otherwise, declare dependencies in the
 project's existing metadata. `python_version` selects the executor Python
 version through the application template. `app.service()` is the canonical
-decorator and must run after initialization. Functions become
-`ServiceInstance` proxies. Decorating a class declares a service class without
-creating a session. Calling the decorated class creates its service handle and
-session; `flmrun` runs the class constructor, including its arguments, in the
-executor:
+decorator and must run after initialization. Decorated functions and classes
+run locally when called directly. `fn.remote(*args, **kwargs)` submits a remote
+function call on a shared session and returns an `ObjectFuture`. Use
+`app.remote(fn)` to create a separate function proxy and session. For a class,
+`Clazz.remote(*args, **kwargs)` or `app.remote(Clazz, *args, **kwargs)` creates
+a proxy and passes constructor arguments to `flmrun`:
 
 ```python
 @app.service(autoscale=False, warmup=1)
@@ -237,16 +241,16 @@ class Counter:
         return self.value
 
 
-counter = Counter(10)     # creates a handle; flmrun constructs Counter(10)
+counter = Counter.remote(10)  # creates a proxy; flmrun constructs Counter(10)
 counter.increment()
 ```
 
-Class-level calls such as `Counter.increment()` are not supported. Flame method
-calls remain direct Python calls—use `counter.increment()`, without a
-`.remote()` suffix. The decorator options configure the session created by each
-class construction. `app.destroy()` closes the sessions created by this
-process. If this process registered the application, `app.destroy()` also
-unregisters it and removes its package and cache. With `fail_if_exists=False`,
+Class-level calls such as `Counter.increment()` are not supported. Call methods
+on the remote proxy with `counter.increment()`. The decorator options configure
+the session created by each `.remote()` call. `app.destroy()` closes the
+sessions created by this process. If this process registered the application,
+`app.destroy()` also unregisters it and removes its package and cache. With
+`fail_if_exists=False`,
 an existing application is borrowed and its lifecycle remains the user's
 responsibility; `app.destroy()` does not unregister it. Application execution
 objects are functions or classes; already constructed objects are not accepted.
@@ -255,8 +259,9 @@ in the counter above, each handle has one retained object and predictable
 mutable state. With autoscaling enabled (the default), every executor retains
 its own copy, so mutable fields are replica-local rather than a distributed
 singleton.
-Constructing the same decorated class twice does not share object state. Public
-class methods must not collide with `ServiceInstance` API names such as `close`.
+Creating two remote proxies from the same decorated class does not share
+object state. Public class methods must not collide with `ServiceInstance`
+API names such as `close`.
 
 During an App invocation, `app.session_context()` returns the active session
 context, while `app.publish_attributes(attrs)` adds opaque `bytes` keys to the
@@ -266,9 +271,10 @@ into the executor's retained attribute set. Task calls can request a matching
 instance with `TaskOptions(affinity={key})`.
 
 The returned service-side context is the core `flamepy.SessionContext`. An inner
-`@app.service()` declaration made during a service invocation automatically
-reuses that invocation's session. This recursive declaration is the exception
-to the normal lifecycle ordering: it needs neither `app.init()` nor
+`@app.service()` declaration made during a service invocation can call
+`fn.remote(...)` or `Clazz.remote()` to reuse that invocation's session. This
+recursive path is the
+exception to the normal lifecycle ordering: it needs neither `app.init()` nor
 `app.destroy()`, because it owns neither the parent application nor the reused
 session. Nested declarations must remain in the invocation's execution context
 and do not accept `autoscale`, `warmup`, or `resreq`, because those settings

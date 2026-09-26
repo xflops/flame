@@ -24,6 +24,7 @@ install_dependencies() {
         containernetworking-plugins \
         curl \
         gnupg \
+        jq \
         protobuf-compiler
     if ! command -v containerd >/dev/null; then
         sudo apt-get install -y containerd

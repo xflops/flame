@@ -31,7 +31,7 @@ service Frontend {
   // Task Operations
   rpc CreateTask(CreateTaskRequest) returns (Task) {}
   rpc GetTask(GetTaskRequest) returns (Task) {}
-  rpc WatchTask(WatchTaskRequest) returns (stream Task) {}
+  rpc WatchTasks(stream WatchTaskRequest) returns (stream Task) {}
   rpc ListTasks(ListTasksRequest) returns (stream Task) {}
 }
 ```
@@ -232,15 +232,22 @@ Retrieves task details.
 
 **Response:** [Task](types.md#task)
 
-### WatchTask
+### WatchTasks
 
-Streams task status updates until completion.
+Registers task IDs on one bidirectional stream and returns status updates for
+those tasks. The first response for each registered task is its current status,
+which may already be terminal. The stream then sends later status updates until
+the task reaches a terminal state. Intermediate updates may be coalesced under
+load, so callers should use the latest received status rather than expect every
+transition. All registrations on a stream must use the same session ID.
+Closing the request side after registration still allows outstanding task
+updates to arrive.
 
-**Request:** `WatchTaskRequest`
+**Request:** `stream WatchTaskRequest`
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `task_id` | string | Task ID to watch |
+| `task_id` | string | Task ID to register |
 | `session_id` | string | Session ID |
 
 **Response:** `stream` [Task](types.md#task)
@@ -248,6 +255,7 @@ Streams task status updates until completion.
 **Example:**
 ```python
 for update in session.watch_task(task.id):
+    # The first update is the current status, not necessarily Pending.
     print(f"State: {update.state}")
     if update.is_completed():
         break

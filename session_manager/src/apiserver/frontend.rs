@@ -10,12 +10,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use std::collections::HashSet;
 use std::path::Path;
 use std::pin::Pin;
 
 use async_trait::async_trait;
 use common::apis::{ApplicationAttributes, SessionAttributes};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use serde_json::Value;
 use stdng::trace_fn;
 use tokio::sync::mpsc;
@@ -94,10 +95,125 @@ fn validate_working_directory(working_dir: &Option<String>) -> Result<(), FlameE
     Ok(())
 }
 
+async fn forward_task_update(
+    controller: &crate::controller::ControllerPtr,
+    ssn_id: &apis::SessionID,
+    task_id: apis::TaskID,
+    registered_tasks: &mut HashSet<apis::TaskID>,
+    tx: &mpsc::Sender<Result<Task, Status>>,
+) -> Result<(), Status> {
+    let mut task = controller
+        .get_task_metadata(ssn_id.clone(), task_id)
+        .map_err(Status::from)?;
+    if task.is_completed() {
+        // Terminal updates carry failure details in task events. Load those
+        // once, after the state snapshot, instead of on every watch update.
+        task = controller
+            .get_task(ssn_id.clone(), task_id)
+            .map_err(Status::from)?;
+        registered_tasks.remove(&task_id);
+    }
+    tx.send(Ok(Task::from(&task)))
+        .await
+        .map_err(|_| Status::cancelled("task watch stream closed"))?;
+    Ok(())
+}
+
+async fn watch_task_stream<S>(
+    controller: crate::controller::ControllerPtr,
+    ssn_id: apis::SessionID,
+    task_id: apis::TaskID,
+    mut requests: S,
+    tx: mpsc::Sender<Result<Task, Status>>,
+) -> Result<(), Status>
+where
+    S: Stream<Item = Result<WatchTaskRequest, Status>> + Unpin,
+{
+    // Subscribe before checking the first task, so a completion between the
+    // check and the next recv cannot be missed.
+    let mut updates = controller.subscribe(&ssn_id).map_err(Status::from)?;
+    let mut registered_tasks = HashSet::new();
+    registered_tasks.insert(task_id);
+    forward_task_update(&controller, &ssn_id, task_id, &mut registered_tasks, &tx).await?;
+    let mut requests_closed = false;
+
+    loop {
+        if requests_closed && registered_tasks.is_empty() {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = tx.closed() => return Ok(()),
+            request = requests.next(), if !requests_closed => {
+                match request {
+                    Some(Ok(request)) => {
+                        if request.session_id != ssn_id {
+                            return Err(Status::invalid_argument("all watched tasks must be in one session"));
+                        }
+                        let task_id = request.task_id.parse::<apis::TaskID>()
+                            .map_err(|_| Status::invalid_argument("invalid task id"))?;
+                        registered_tasks.insert(task_id);
+                        forward_task_update(&controller, &ssn_id, task_id, &mut registered_tasks, &tx).await?;
+                    }
+                    Some(Err(status)) => return Err(status),
+                    None => requests_closed = true,
+                }
+            }
+            update = updates.recv() => {
+                match update {
+                    Ok(task_id) => {
+                        if registered_tasks.contains(&task_id) {
+                            forward_task_update(&controller, &ssn_id, task_id, &mut registered_tasks, &tx).await?;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // The bounded broadcast may coalesce history under load.
+                        // Reconcile only registered tasks, not the whole session.
+                        for task_id in registered_tasks.iter().copied().collect::<Vec<_>>() {
+                            forward_task_update(&controller, &ssn_id, task_id, &mut registered_tasks, &tx).await?;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(Status::not_found("session task watch closed"));
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Frontend for Flame {
-    type WatchTaskStream = Pin<Box<dyn Stream<Item = Result<Task, Status>> + Send>>;
+    type WatchTasksStream = Pin<Box<dyn Stream<Item = Result<Task, Status>> + Send>>;
     type ListTasksStream = Pin<Box<dyn Stream<Item = Result<Task, Status>> + Send>>;
+
+    async fn watch_tasks(
+        &self,
+        req: Request<tonic::Streaming<WatchTaskRequest>>,
+    ) -> Result<Response<Self::WatchTasksStream>, Status> {
+        let mut requests = req.into_inner();
+        let first = requests
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("at least one task is required"))?;
+        let ssn_id = first
+            .session_id
+            .parse::<apis::SessionID>()
+            .map_err(|_| Status::invalid_argument("invalid session id"))?;
+        let task_id = first
+            .task_id
+            .parse::<apis::TaskID>()
+            .map_err(|_| Status::invalid_argument("invalid task id"))?;
+        let (tx, rx) = mpsc::channel(128);
+        let controller = self.controller.clone();
+        tokio::spawn(async move {
+            if let Err(status) =
+                watch_task_stream(controller, ssn_id, task_id, requests, tx.clone()).await
+            {
+                let _ = tx.send(Err(status)).await;
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
 
     async fn list_tasks(
         &self,
@@ -127,7 +243,7 @@ impl Frontend for Flame {
 
         let output_stream = ReceiverStream::new(rx);
         Ok(Response::new(
-            Box::pin(output_stream) as Self::WatchTaskStream
+            Box::pin(output_stream) as Self::ListTasksStream
         ))
     }
 
@@ -522,54 +638,6 @@ impl Frontend for Flame {
 
         Ok(Response::new(task))
     }
-    async fn watch_task(
-        &self,
-        req: Request<WatchTaskRequest>,
-    ) -> Result<Response<Self::WatchTaskStream>, Status> {
-        let req = req.into_inner();
-        let gid = apis::TaskGID {
-            ssn_id: req
-                .session_id
-                .parse::<apis::SessionID>()
-                .map_err(|_| Status::invalid_argument("invalid session id"))?,
-
-            task_id: req
-                .task_id
-                .parse::<apis::TaskID>()
-                .map_err(|_| Status::invalid_argument("invalid task id"))?,
-        };
-
-        let (tx, rx) = mpsc::channel(128);
-
-        let controller = self.controller.clone();
-        tokio::spawn(async move {
-            loop {
-                match controller.watch_task(gid.clone()).await {
-                    Ok(task) => {
-                        tracing::debug!("Task <{}> state is <{}>", task.id, task.state as i32);
-                        if let Err(e) = tx.send(Result::<_, Status>::Ok(Task::from(&task))).await {
-                            tracing::debug!("Failed to send Task <{gid}>: {e}");
-                            break;
-                        }
-                        if task.is_completed() {
-                            tracing::debug!("Task <{}> is completed, exit.", task.id);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Failed to watch Task <{gid}>: {e}");
-                        break;
-                    }
-                }
-            }
-        });
-
-        let output_stream = ReceiverStream::new(rx);
-        Ok(Response::new(
-            Box::pin(output_stream) as Self::WatchTaskStream
-        ))
-    }
-
     async fn get_task(&self, req: Request<GetTaskRequest>) -> Result<Response<Task>, Status> {
         let req = req.into_inner();
         let ssn_id = req
@@ -595,6 +663,292 @@ impl Frontend for Flame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn watch_test_storage_and_controller(
+    ) -> (crate::storage::StoragePtr, crate::controller::ControllerPtr) {
+        let config = common::ctx::FlameClusterContext {
+            cluster: common::ctx::FlameCluster {
+                storage: "none".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let storage = crate::storage::new_ptr(&config).await.unwrap();
+        let controller = crate::controller::new_ptr(storage.clone());
+        controller
+            .register_application("test-app".to_string(), ApplicationAttributes::default())
+            .await
+            .unwrap();
+        controller
+            .create_session(SessionAttributes {
+                id: "watch-test-session".to_string(),
+                application: "test-app".to_string(),
+                resreq: Some(ResourceRequirement {
+                    cpu: 1,
+                    memory: 1024,
+                    gpu: 0,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        (storage, controller)
+    }
+
+    async fn watch_test_controller() -> crate::controller::ControllerPtr {
+        let (_, controller) = watch_test_storage_and_controller().await;
+        controller
+    }
+
+    fn watch_request(task_id: apis::TaskID) -> WatchTaskRequest {
+        WatchTaskRequest {
+            session_id: "watch-test-session".to_string(),
+            task_id: task_id.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_tasks_omits_event_history_until_terminal_state() {
+        let controller = watch_test_controller().await;
+        let task = controller
+            .create_task("watch-test-session".to_string(), None, None)
+            .await
+            .unwrap();
+        assert!(!controller
+            .get_task("watch-test-session".to_string(), task.id)
+            .unwrap()
+            .events
+            .is_empty());
+
+        let (_requests_tx, requests_rx) = mpsc::channel::<Result<WatchTaskRequest, Status>>(1);
+        let (tx, mut rx) = mpsc::channel(1);
+        let watcher = tokio::spawn(watch_task_stream(
+            controller,
+            "watch-test-session".to_string(),
+            task.id,
+            ReceiverStream::new(requests_rx),
+            tx,
+        ));
+        let reported = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let status = reported.status.unwrap();
+        assert_eq!(status.state, rpc::TaskState::Pending as i32);
+        assert!(status.events.is_empty());
+        drop(rx);
+        watcher.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn watch_tasks_includes_failed_task_event_message() {
+        use common::apis::{TaskGID, TaskResult, TaskState};
+
+        let (storage, controller) = watch_test_storage_and_controller().await;
+        let task = controller
+            .create_task("watch-test-session".to_string(), None, None)
+            .await
+            .unwrap();
+        let ssn_ptr = storage
+            .get_session_ptr("watch-test-session".to_string())
+            .unwrap();
+        let task_ptr = storage
+            .get_task_ptr(TaskGID {
+                ssn_id: "watch-test-session".to_string(),
+                task_id: task.id,
+            })
+            .unwrap();
+        storage
+            .update_task_result(
+                ssn_ptr,
+                task_ptr,
+                TaskResult {
+                    state: TaskState::Failed,
+                    message: Some("task failed on worker".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let (_requests_tx, requests_rx) = mpsc::channel::<Result<WatchTaskRequest, Status>>(1);
+        let (tx, mut rx) = mpsc::channel(1);
+        let watcher = tokio::spawn(watch_task_stream(
+            controller,
+            "watch-test-session".to_string(),
+            task.id,
+            ReceiverStream::new(requests_rx),
+            tx,
+        ));
+        let reported = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let status = reported.status.unwrap();
+        assert_eq!(status.state, rpc::TaskState::Failed as i32);
+        assert!(status
+            .events
+            .iter()
+            .any(|event| { event.message.as_deref() == Some("task failed on worker") }));
+        drop(rx);
+        watcher.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn watch_tasks_rejects_unknown_first_task() {
+        let controller = watch_test_controller().await;
+        let (_requests_tx, requests_rx) = mpsc::channel::<Result<WatchTaskRequest, Status>>(1);
+        let (tx, _rx) = mpsc::channel(1);
+        let result = watch_task_stream(
+            controller,
+            "watch-test-session".to_string(),
+            999,
+            ReceiverStream::new(requests_rx),
+            tx,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn watch_tasks_reports_completion_before_registration() {
+        let controller = watch_test_controller().await;
+        let task = controller
+            .create_task("watch-test-session".to_string(), None, None)
+            .await
+            .unwrap();
+        controller
+            .close_session("watch-test-session".to_string())
+            .await
+            .unwrap();
+
+        let (_requests_tx, requests_rx) = mpsc::channel::<Result<WatchTaskRequest, Status>>(1);
+        let (tx, mut rx) = mpsc::channel(1);
+        let watcher = tokio::spawn(watch_task_stream(
+            controller,
+            "watch-test-session".to_string(),
+            task.id,
+            ReceiverStream::new(requests_rx),
+            tx,
+        ));
+        let reported = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reported.metadata.unwrap().id, task.id.to_string());
+        assert_eq!(
+            reported.status.unwrap().state,
+            rpc::TaskState::Cancelled as i32
+        );
+        drop(rx);
+        watcher.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn watch_tasks_reports_only_registered_ids_on_one_stream() {
+        let controller = watch_test_controller().await;
+        let first = controller
+            .create_task("watch-test-session".to_string(), None, None)
+            .await
+            .unwrap();
+        let second = controller
+            .create_task("watch-test-session".to_string(), None, None)
+            .await
+            .unwrap();
+
+        let (requests_tx, requests_rx) = mpsc::channel::<Result<WatchTaskRequest, Status>>(1);
+        let (tx, mut rx) = mpsc::channel(2);
+        let watcher = tokio::spawn(watch_task_stream(
+            controller.clone(),
+            "watch-test-session".to_string(),
+            first.id,
+            ReceiverStream::new(requests_rx),
+            tx,
+        ));
+        let initial = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.metadata.unwrap().id, first.id.to_string());
+        assert_eq!(
+            initial.status.unwrap().state,
+            rpc::TaskState::Pending as i32
+        );
+        // The second task exists in the session but has not been registered.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await
+                .is_err()
+        );
+
+        requests_tx
+            .send(Ok(watch_request(second.id)))
+            .await
+            .unwrap();
+        drop(requests_tx);
+        let second_initial = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_initial.metadata.unwrap().id, second.id.to_string());
+        assert_eq!(
+            second_initial.status.unwrap().state,
+            rpc::TaskState::Pending as i32
+        );
+
+        controller
+            .close_session("watch-test-session".to_string())
+            .await
+            .unwrap();
+        let mut completed = HashSet::new();
+        for _ in 0..2 {
+            let reported = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                reported.status.unwrap().state,
+                rpc::TaskState::Cancelled as i32
+            );
+            completed.insert(reported.metadata.unwrap().id);
+        }
+        assert_eq!(
+            completed,
+            HashSet::from([first.id.to_string(), second.id.to_string()])
+        );
+        watcher.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn watch_tasks_stops_when_response_stream_is_dropped() {
+        let controller = watch_test_controller().await;
+        let task = controller
+            .create_task("watch-test-session".to_string(), None, None)
+            .await
+            .unwrap();
+        let (_requests_tx, requests_rx) = mpsc::channel::<Result<WatchTaskRequest, Status>>(1);
+        let (tx, rx) = mpsc::channel(1);
+        let watcher = tokio::spawn(watch_task_stream(
+            controller,
+            "watch-test-session".to_string(),
+            task.id,
+            ReceiverStream::new(requests_rx),
+            tx,
+        ));
+        tokio::task::yield_now().await;
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(1), watcher)
+            .await
+            .expect("watch must stop after response stream closes")
+            .unwrap()
+            .unwrap();
+    }
 
     fn rr(cpu: u64, memory: u64, gpu: i32) -> ResourceRequirement {
         ResourceRequirement { cpu, memory, gpu }

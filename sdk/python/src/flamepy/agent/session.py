@@ -19,6 +19,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Optional
 
+from flamepy.core.client import _LazyTaskFuture
 from flamepy.core.client import create_session as _create_core_session
 from flamepy.core.client import open_session as _open_core_session
 from flamepy.core.types import FlameError, FlameErrorCode, ResourceRequirement
@@ -182,7 +183,10 @@ class Session:
             except Exception as exc:
                 mapped.set_exception(exc)
 
-        raw_future.add_done_callback(complete)
+        if isinstance(raw_future, _LazyTaskFuture):
+            raw_future._add_internal_done_callback(complete)
+        else:
+            raw_future.add_done_callback(complete)
         return mapped
 
     def close(self) -> None:

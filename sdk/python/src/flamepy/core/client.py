@@ -11,9 +11,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import asyncio
 import logging
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
@@ -66,6 +68,13 @@ from flamepy.proto.types_pb2 import ApplicationSpec, Environment, SessionSpec, T
 from flamepy.proto.types_pb2 import ResourceRequirement as ResourceRequirementProto
 
 logger = logging.getLogger(__name__)
+
+# A watch completes its Future on the gRPC event loop. Future callbacks can run
+# arbitrary user code, so dispatch them away from that loop. The pool is shared
+# across connections so closing a connection never waits for a user callback and
+# callbacks added to an already completed Future still have a live dispatcher.
+_task_callback_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="flamepy-task-callback")
+_internal_callback_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="flamepy-internal-callback")
 
 
 def _optional_field(message: Any, field: str) -> Any:
@@ -252,14 +261,34 @@ class ConnectionInstance:
             return cls._connection
 
 
+class _SessionTaskWatch:
+    """One stream and its outstanding task futures for a session."""
+
+    def __init__(self, session_id: SessionID):
+        self.session_id = session_id
+        self.pending: Dict[TaskID, "_FutureTaskInformer"] = {}
+        self.requests: Optional[asyncio.Queue] = None
+        self.call: Optional[Future] = None
+        self.closing = False
+
+
 class Connection:
     """Connection to the Flame service."""
 
-    def __init__(self, addr: str, channel: grpc.Channel, frontend: FrontendStub):
+    def __init__(self, addr: str, channel: grpc.Channel, frontend: FrontendStub, credentials: Optional[grpc.ChannelCredentials] = None):
         self.addr = addr
         self._channel = channel
         self._frontend = frontend
-        self._executor = ThreadPoolExecutor(max_workers=10)
+        self._watch_credentials = credentials
+        self._watch_target = None
+        self._watch_lock = threading.Lock()
+        self._watch_loop = None
+        self._watch_thread = None
+        self._watch_channel = None
+        self._watch_frontend = None
+        self._session_watches: Dict[SessionID, _SessionTaskWatch] = {}
+        self._task_submissions: Dict[SessionID, int] = {}
+        self._closed = False
 
     @staticmethod
     def _grpc_error_to_flame_error(e: grpc.RpcError, operation: str) -> FlameError:
@@ -328,7 +357,9 @@ class Connection:
             # Create frontend stub
             frontend = FrontendStub(channel)
 
-            return cls(addr, channel, frontend)
+            connection = cls(addr, channel, frontend, credentials if use_tls else None)
+            connection._watch_target = f"{host}:{port}"
+            return connection
 
         except FlameError:
             raise
@@ -337,8 +368,152 @@ class Connection:
 
     def close(self) -> None:
         """Close the connection."""
-        self._executor.shutdown(wait=True)
+        with self._watch_lock:
+            if self._closed:
+                return
+            self._closed = True
+            loop = self._watch_loop
+            thread = self._watch_thread
+            watches = tuple((watch, tuple(watch.pending.values())) for watch in self._session_watches.values())
+        for watch, pending in watches:
+            for informer in pending:
+                informer.on_error(FlameError(FlameErrorCode.INTERNAL, "connection closed before task completed"))
+            if watch.call is not None:
+                watch.call.cancel()
+        if loop is not None:
+
+            async def shutdown():
+                pending = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                if self._watch_channel is not None:
+                    await self._watch_channel.close()
+
+            shutdown_call = asyncio.run_coroutine_threadsafe(shutdown(), loop)
+            if threading.current_thread() is not thread:
+                shutdown_call.result()
+                loop.call_soon_threadsafe(loop.stop)
+                thread.join()
+            else:
+                shutdown_call.add_done_callback(lambda _: loop.call_soon_threadsafe(loop.stop))
         self._channel.close()
+
+    def _begin_task_submission(self, session_id: SessionID) -> None:
+        with self._watch_lock:
+            if self._closed:
+                raise FlameError(FlameErrorCode.INVALID_STATE, "connection is closed")
+            self._task_submissions[session_id] = self._task_submissions.get(session_id, 0) + 1
+
+    def _finish_task_submission(self, session_id: SessionID) -> None:
+        with self._watch_lock:
+            remaining = self._task_submissions[session_id] - 1
+            if remaining:
+                self._task_submissions[session_id] = remaining
+            else:
+                self._task_submissions.pop(session_id)
+            watch = self._session_watches.get(session_id)
+            stop_watch = watch is not None and watch.closing and not watch.pending and not remaining
+            if stop_watch and watch is not None and watch.call is None:
+                self._session_watches.pop(session_id)
+        if stop_watch and watch is not None and watch.call is not None:
+            watch.call.cancel()
+
+    def _schedule_task_watch(self, session_id: SessionID, task_id: TaskID, informer: "_FutureTaskInformer") -> None:
+        with self._watch_lock:
+            if self._closed:
+                raise FlameError(FlameErrorCode.INVALID_STATE, "connection is closed")
+            if self._watch_loop is None:
+                self._watch_loop = asyncio.new_event_loop()
+                self._watch_thread = threading.Thread(target=self._run_watch_loop, name="flamepy-task-watches", daemon=True)
+                self._watch_thread.start()
+            watch = self._session_watches.get(session_id)
+            if watch is None:
+                watch = _SessionTaskWatch(session_id)
+                self._session_watches[session_id] = watch
+            if watch.call is None:
+                watch.call = asyncio.run_coroutine_threadsafe(self._watch_session_tasks(watch), self._watch_loop)
+            watch.pending[task_id] = informer
+            if watch.requests is not None:
+                self._watch_loop.call_soon_threadsafe(watch.requests.put_nowait, WatchTaskRequest(task_id=task_id, session_id=session_id))
+
+    def _close_task_watch(self, session_id: SessionID) -> None:
+        with self._watch_lock:
+            watch = self._session_watches.get(session_id)
+            if watch is None and self._task_submissions.get(session_id):
+                watch = _SessionTaskWatch(session_id)
+                self._session_watches[session_id] = watch
+            if watch is not None:
+                watch.closing = True
+                cancel = not watch.pending and not self._task_submissions.get(session_id)
+                if cancel and watch.call is None:
+                    self._session_watches.pop(session_id)
+            else:
+                cancel = False
+        if watch is not None and cancel and watch.call is not None:
+            watch.call.cancel()
+
+    def _run_watch_loop(self) -> None:
+        loop = self._watch_loop
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+        loop.close()
+
+    async def _watch_session_tasks(self, watch: _SessionTaskWatch) -> None:
+        session_id = watch.session_id
+        error = FlameError(FlameErrorCode.INTERNAL, f"watch stream ended before session {session_id} tasks completed")
+        try:
+            if self._watch_frontend is None:
+                target = self._watch_target or urlparse(self.addr).netloc
+                if self._watch_credentials is None:
+                    self._watch_channel = grpc.aio.insecure_channel(target)
+                else:
+                    self._watch_channel = grpc.aio.secure_channel(target, self._watch_credentials)
+                self._watch_frontend = FrontendStub(self._watch_channel)
+
+            requests = asyncio.Queue()
+            with self._watch_lock:
+                watch.requests = requests
+                initial_ids = tuple(watch.pending)
+            for task_id in initial_ids:
+                requests.put_nowait(WatchTaskRequest(task_id=task_id, session_id=session_id))
+
+            async def registrations():
+                while True:
+                    yield await requests.get()
+
+            stream = self._watch_frontend.WatchTasks(registrations())
+            async for response in stream:
+                task = _task_from_proto(response, session_id)
+                if task.is_completed() or task.is_failed():
+                    with self._watch_lock:
+                        informer = watch.pending.pop(task.id, None)
+                        close_watch = watch.closing and not watch.pending and not self._task_submissions.get(session_id)
+                    if informer is not None:
+                        informer.on_update(task)
+                    if close_watch:
+                        if hasattr(stream, "cancel"):
+                            stream.cancel()
+                        return
+        except asyncio.CancelledError:
+            error = FlameError(FlameErrorCode.INTERNAL, f"watch for session {session_id} was cancelled")
+            raise
+        except Exception as e:
+            if isinstance(e, FlameError):
+                error = e
+            elif isinstance(e, grpc.RpcError):
+                error = FlameError(FlameErrorCode.INTERNAL, f"failed to watch session tasks: {e.details()}")
+            else:
+                error = FlameError(FlameErrorCode.INTERNAL, f"Watch failed: {e}")
+        finally:
+            with self._watch_lock:
+                if self._session_watches.get(session_id) is watch:
+                    self._session_watches.pop(session_id)
+                pending = tuple(watch.pending.values())
+                watch.pending.clear()
+            for informer in pending:
+                informer.on_error(error)
 
     def register_application(self, name: str, app_attrs: Union[ApplicationAttributes, Dict[str, Any]]) -> None:
         """Register a new application."""
@@ -625,6 +800,7 @@ class Connection:
 
         try:
             response = self._frontend.CloseSession(request)
+            self._close_task_watch(session_id)
 
             # Common data is bytes in core API
             common_data_bytes = response.spec.common_data if response.spec.HasField("common_data") else None
@@ -772,7 +948,7 @@ class Session:
             raise FlameError(FlameErrorCode.INTERNAL, f"failed to list tasks: {e.details()}")
 
     def watch_task(self, task_id: TaskID, timeout: Optional[float] = None) -> "TaskWatcher":
-        """Watch a task for updates.
+        """Yield the current task status, then later updates until terminal.
 
         Args:
             task_id: The ID of the task to watch
@@ -785,9 +961,8 @@ class Session:
         request = WatchTaskRequest(task_id=task_id, session_id=self.id)
 
         try:
-            stream = self.connection._frontend.WatchTask(request)
+            stream = self.connection._frontend.WatchTasks(iter((request,)))
             return TaskWatcher(stream, timeout=timeout)
-
         except grpc.RpcError as e:
             raise FlameError(FlameErrorCode.INTERNAL, f"failed to watch task: {e.details()}")
 
@@ -829,25 +1004,16 @@ class Session:
             >>> wait(futures)
             >>> results = [f.result() for f in futures]
         """
-        task = self.create_task(input_data, option=option)
-        future = _LazyTaskFuture(self, task.id)
-        future_informer = _FutureTaskInformer(future)
+        self.connection._begin_task_submission(self.id)
+        try:
+            task = self.create_task(input_data, option=option)
+            future = _LazyTaskFuture(self, task.id)
+            future_informer = _FutureTaskInformer(future)
 
-        def _watch():
-            try:
-                watcher = self.watch_task(task.id)
-                for t in watcher:
-                    future_informer.on_update(t)
-                    if t.is_completed() or t.is_failed():
-                        return
-            except Exception as e:
-                if isinstance(e, FlameError):
-                    future_informer.on_error(e)
-                else:
-                    future_informer.on_error(FlameError(FlameErrorCode.INTERNAL, f"Watch failed: {str(e)}"))
-
-        self.connection._executor.submit(_watch)
-        return future
+            self.connection._schedule_task_watch(self.id, task.id, future_informer)
+            return future
+        finally:
+            self.connection._finish_task_submission(self.id)
 
     def close(self) -> None:
         """Close the session."""
@@ -932,6 +1098,36 @@ class _LazyTaskFuture(Future):
         super().__init__()
         self._session = session
         self._task_id = task_id
+        self._callback_lock = threading.Lock()
+        self._callback_queue = deque()
+        self._callback_running = False
+
+    def add_done_callback(self, fn) -> None:
+        """Run callbacks off the watch loop, in registration order per Future."""
+        super().add_done_callback(lambda future: self._queue_callback(fn, future))
+
+    def _add_internal_done_callback(self, fn) -> None:
+        """Dispatch SDK completion work independently of user callbacks."""
+        super().add_done_callback(lambda future: _internal_callback_executor.submit(fn, future))
+
+    def _queue_callback(self, fn, future) -> None:
+        with self._callback_lock:
+            self._callback_queue.append((fn, future))
+            if not self._callback_running:
+                self._callback_running = True
+                _task_callback_executor.submit(self._run_callbacks)
+
+    def _run_callbacks(self) -> None:
+        while True:
+            with self._callback_lock:
+                if not self._callback_queue:
+                    self._callback_running = False
+                    return
+                fn, future = self._callback_queue.popleft()
+            try:
+                fn(future)
+            except Exception:
+                logger.exception("exception calling callback for %r", self)
 
 
 class _FutureTaskInformer(TaskInformer):
@@ -939,21 +1135,26 @@ class _FutureTaskInformer(TaskInformer):
 
     def __init__(self, future: Future):
         self._future = future
+        self._lock = threading.RLock()
 
     def on_update(self, task: Task) -> None:
         """Called when task status changes."""
-        if self._future.done():
-            return
-        if task.is_failed():
-            for event in task.events:
-                if event.code == TaskState.FAILED:
-                    self._future.set_exception(FlameError(FlameErrorCode.INTERNAL, f"{event.message}"))
-                    return
-            self._future.set_exception(FlameError(FlameErrorCode.INTERNAL, "Task failed without error message"))
-        elif task.is_completed():
-            self._future.set_result(task.output)
+        with self._lock:
+            if self._future.done():
+                return
+            if task.is_cancelled():
+                self._future.set_exception(FlameError(FlameErrorCode.INVALID_STATE, "Task was cancelled"))
+            elif task.is_failed():
+                for event in task.events:
+                    if event.code == TaskState.FAILED:
+                        self._future.set_exception(FlameError(FlameErrorCode.INTERNAL, f"{event.message}"))
+                        return
+                self._future.set_exception(FlameError(FlameErrorCode.INTERNAL, "Task failed without error message"))
+            elif task.is_completed():
+                self._future.set_result(task.output)
 
     def on_error(self, error: FlameError) -> None:
         """Called when watch stream encounters an error."""
-        if not self._future.done():
-            self._future.set_exception(error)
+        with self._lock:
+            if not self._future.done():
+                self._future.set_exception(error)

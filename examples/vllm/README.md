@@ -27,7 +27,7 @@ cluster:
 
 It performs this sequence:
 
-1. Construct a handle for an autoscaled class service with the default zero
+1. Construct a remote proxy for an autoscaled class service with the default zero
    warmup.
 2. Initialize `facebook/opt-125m` in `VllmEngine.__init__`, finish one task,
    and publish the prompt's affinity key.
@@ -39,10 +39,10 @@ It performs this sequence:
 
 `VllmEngine` is decorated directly in the importable `engine.py` module after
 that module initializes the App. Decoration only declares the service class;
-constructing `VllmEngine()` creates its service handle and session. `flmrun`
+calling `VllmEngine.remote(MODEL)` creates its service proxy and session. `flmrun`
 runs `VllmEngine.__init__()` when an executor binds the session, so the client
-never constructs or serializes an `LLM` object. Calls use the handle directly,
-for example `engine.generate(...)`, without a `.remote()` suffix.
+never constructs or serializes an `LLM` object. Calls use the proxy directly,
+for example `engine.generate(...)`.
 
 App retains the constructed service object on its executor, so the model
 remains an ordinary instance field. When the executor rebinds the service

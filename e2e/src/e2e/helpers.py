@@ -341,7 +341,7 @@ class RecursiveService:
             class InnerRecursiveService(type(self)):
                 pass
 
-            inner_service = InnerRecursiveService()
+            inner_service = InnerRecursiveService.remote()
             logger.info(f"[RecursiveService] Inner service created, session_id={inner_service._session.id}")
 
             logger.info(f"[RecursiveService] Calling compute_recursive({depth - 1}) on inner service")

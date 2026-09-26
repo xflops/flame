@@ -37,10 +37,14 @@ pub async fn run(
     )
     .await?;
     match (application, session, task, node) {
-        (Some(application), None, None, None) => view_application(conn, application).await,
+        (Some(application), None, None, None) => {
+            view_application(conn, output_format, application).await
+        }
         (None, Some(session), None, None) => view_session(conn, output_format, session).await,
-        (None, Some(session), Some(task), None) => view_task(conn, session, task).await,
-        (None, None, None, Some(node)) => view_node(conn, node).await,
+        (None, Some(session), Some(task), None) => {
+            view_task(conn, output_format, session, task).await
+        }
+        (None, None, None, Some(node)) => view_node(conn, output_format, node).await,
         _ => Err(Box::new(FlameError::InvalidConfig(
             "unsupported parameters".to_string(),
         ))),
@@ -49,11 +53,16 @@ pub async fn run(
 
 async fn view_task(
     conn: client::Connection,
+    output_format: &Option<String>,
     ssn_id: &String,
     task_id: &String,
 ) -> Result<(), Box<dyn Error>> {
     let session = conn.get_session(ssn_id).await?;
     let task = session.get_task(task_id).await?;
+    if output_format.as_deref() == Some("json") {
+        println!("{}", serde_json::to_string_pretty(&task)?);
+        return Ok(());
+    }
 
     println!("{:<15}{}", "Task:", task.id);
     println!("{:<15}{}", "Session:", session.id);
@@ -131,16 +140,21 @@ fn format_events(events: &[client::Event]) -> String {
 }
 
 fn view_session_json(session: &client::Session) -> Result<(), Box<dyn Error>> {
-    let json = serde_json::to_string_pretty(session).unwrap();
+    let json = serde_json::to_string_pretty(session)?;
     println!("{json}");
     Ok(())
 }
 
 async fn view_application(
     conn: client::Connection,
+    output_format: &Option<String>,
     application: &str,
 ) -> Result<(), Box<dyn Error>> {
     let application = conn.get_application(application).await?;
+    if output_format.as_deref() == Some("json") {
+        println!("{}", serde_json::to_string_pretty(&application)?);
+        return Ok(());
+    }
     println!("{:<15}{}", "Name:", application.name);
     println!(
         "{:<15}{}",
@@ -218,8 +232,16 @@ async fn view_application(
     Ok(())
 }
 
-async fn view_node(conn: client::Connection, node_name: &str) -> Result<(), Box<dyn Error>> {
+async fn view_node(
+    conn: client::Connection,
+    output_format: &Option<String>,
+    node_name: &str,
+) -> Result<(), Box<dyn Error>> {
     let node = conn.get_node(node_name).await?;
+    if output_format.as_deref() == Some("json") {
+        println!("{}", serde_json::to_string_pretty(&node)?);
+        return Ok(());
+    }
 
     let status = match node.state {
         NodeState::Ready => "Ready",

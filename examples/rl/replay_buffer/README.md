@@ -25,8 +25,8 @@ class CollectorService:
         return Collector(env_name).collect(buffer, num_steps)
 # Create ReplayBuffer (creates ObjectRef under the active app)
 buffer = ReplayBuffer()
-buffer_service = BufferService()
-collector_service = CollectorService()
+buffer_service = BufferService.remote()
+collector_service = CollectorService.remote()
 
 # Pass the SAME buffer object to collectors (pickled with its ObjectRef)
 collect_futures = [

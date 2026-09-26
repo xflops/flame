@@ -230,6 +230,7 @@ class ServiceInstance:
         self._future_lock = threading.Lock()
         self._state_changed = threading.Condition(self._future_lock)
         self._pending_futures: set[Future] = set()
+        self._submissions_in_flight = 0
         self._state = _ServiceState.OPEN
         self._session_context: Optional[SessionContext] = None
 
@@ -416,11 +417,21 @@ class ServiceInstance:
             # Supports lightweight test doubles built without __init__.
             return self._session.run(request, option=option)
 
-        with future_lock:
+        with self._state_changed:
             if self._state is not _ServiceState.OPEN:
                 raise FlameError(FlameErrorCode.INVALID_STATE, "App service is closed")
+            self._submissions_in_flight += 1
+
+        future = None
+        try:
             future = self._session.run(request, option=option)
-            self._pending_futures.add(future)
+        finally:
+            with self._state_changed:
+                if future is not None:
+                    self._pending_futures.add(future)
+                self._submissions_in_flight -= 1
+                if self._submissions_in_flight == 0:
+                    self._state_changed.notify_all()
 
         def discard(completed: Future) -> None:
             with self._future_lock:
@@ -469,6 +480,8 @@ class ServiceInstance:
             if self._state is _ServiceState.CLOSED:
                 return
             self._state = _ServiceState.CLOSING
+            while self._submissions_in_flight:
+                self._state_changed.wait()
             pending = tuple(self._pending_futures)
 
         try:
@@ -508,6 +521,7 @@ def _restore_service_instance(
     instance._future_lock = threading.Lock()
     instance._state_changed = threading.Condition(instance._future_lock)
     instance._pending_futures = set()
+    instance._submissions_in_flight = 0
     instance._state = _ServiceState.OPEN
     instance._session_context = None
     instance._session = core_client.open_session(session_id=session_id)
@@ -532,6 +546,7 @@ def _nested_service_instance(
     instance._future_lock = threading.Lock()
     instance._state_changed = threading.Condition(instance._future_lock)
     instance._pending_futures = set()
+    instance._submissions_in_flight = 0
     instance._state = _ServiceState.OPEN
     instance._session_context = session_context
     instance._session = core_client.open_session(session_id=session_context.session_id)
@@ -540,50 +555,123 @@ def _nested_service_instance(
     return instance
 
 
-def _service_class_factory(
+class ServiceDefinition:
+    """A local callable with remote invocation for functions and classes."""
+
+    def __init__(
+        self,
+        app_name: str,
+        execution_object: Any,
+        *,
+        autoscale: Optional[bool],
+        warmup: int,
+        resreq: Optional[str],
+        runtime: Optional["_Runtime"] = None,
+    ):
+        self._app_name = app_name
+        self._execution_object = execution_object
+        self._autoscale = autoscale
+        self._warmup = warmup
+        self._resreq = resreq
+        self._runtime = runtime
+        self._shared_lock = threading.Lock()
+        self._shared_remote: Optional[ServiceInstance] = None
+        wraps(execution_object, updated=())(self)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Execute the original function or construct the original class locally."""
+        return self._execution_object(*args, **kwargs)
+
+    def remote(self, *args: Any, **kwargs: Any) -> Any:
+        """Call a function remotely or construct a remote class proxy."""
+        if inspect.isclass(self._execution_object):
+            return self._remote_instance(args=args, kwargs=kwargs)
+        return self._shared_instance()(*args, **kwargs)
+
+    def _shared_instance(self) -> ServiceInstance:
+        """Return the shared function proxy, or borrow the current invocation."""
+        try:
+            _context.session_context()
+        except RuntimeError:
+            pass
+        else:
+            return self._remote_instance()
+
+        self._active_runtime()
+        with self._shared_lock:
+            current = self._shared_remote
+            if current is not None:
+                if current._state is _ServiceState.OPEN:
+                    return current
+                if current._state is not _ServiceState.CLOSED:
+                    raise FlameError(FlameErrorCode.INVALID_STATE, "Shared App service is closing or failed to close")
+            self._shared_remote = self._remote_instance()
+            return self._shared_remote
+
+    def _remote_instance(
+        self,
+        *,
+        args: tuple[Any, ...] = (),
+        kwargs: Optional[dict[str, Any]] = None,
+    ) -> ServiceInstance:
+        """Create a session-bound proxy for this declaration."""
+        is_class = inspect.isclass(self._execution_object)
+        kwargs = kwargs or {}
+
+        try:
+            session_context = _context.session_context()
+        except RuntimeError:
+            session_context = None
+        if session_context is not None:
+            if self._autoscale is not None or self._warmup != 0 or self._resreq is not None:
+                raise FlameError(
+                    FlameErrorCode.INVALID_ARGUMENT,
+                    "Nested services reuse the current session and do not accept autoscale, warmup, or resreq",
+                )
+            if args or kwargs:
+                raise TypeError("Nested class services reuse the current execution object and do not accept constructor arguments")
+            return _nested_service_instance(session_context, self._execution_object)
+
+        runtime = self._active_runtime()
+
+        return runtime._create_service_instance(
+            self._execution_object,
+            autoscale=self._autoscale,
+            warmup=self._warmup,
+            resreq=self._resreq,
+            constructor_args=args if is_class else None,
+            constructor_kwargs=kwargs if is_class else None,
+        )
+
+    def _active_runtime(self) -> "_Runtime":
+        runtime = self._runtime or _require_runtime()
+        if runtime._name != self._app_name:
+            raise FlameError(FlameErrorCode.INVALID_STATE, "The Flame app that declared this service is not active")
+        if runtime._state is not _RuntimeState.ACTIVE:
+            raise FlameError(FlameErrorCode.INVALID_STATE, "The Flame app that declared this service is not active")
+        return runtime
+
+    def __reduce__(self):
+        return (
+            _restore_service_definition,
+            (self._app_name, self._execution_object, self._autoscale, self._warmup, self._resreq),
+        )
+
+
+def _restore_service_definition(
     app_name: str,
-    execution_class: type,
-    *,
+    execution_object: Any,
     autoscale: Optional[bool],
     warmup: int,
     resreq: Optional[str],
-) -> Callable[..., ServiceInstance]:
-    """Return a class-like factory that creates executor-constructed services."""
-    _validate_service_class(execution_class)
-
-    @wraps(execution_class, updated=())
-    def create_service(*args: Any, **kwargs: Any) -> ServiceInstance:
-        with _runtime_lock:
-            try:
-                session_context = _context.session_context()
-            except RuntimeError:
-                session_context = None
-            if session_context is not None:
-                if autoscale is not None or warmup != 0 or resreq is not None:
-                    raise FlameError(
-                        FlameErrorCode.INVALID_ARGUMENT,
-                        "Nested services reuse the current session and do not accept autoscale, warmup, or resreq",
-                    )
-                if args or kwargs:
-                    raise TypeError("Nested class services reuse the current execution object and do not accept constructor arguments")
-                return _nested_service_instance(session_context, execution_class)
-
-            runtime = _runtime
-            if runtime is None or runtime._name != app_name or runtime._state is not _RuntimeState.ACTIVE:
-                raise FlameError(
-                    FlameErrorCode.INVALID_STATE,
-                    "The Flame app that declared this service class is not active",
-                )
-            return runtime._create_service_instance(
-                execution_class,
-                autoscale=autoscale,
-                warmup=warmup,
-                resreq=resreq,
-                constructor_args=args,
-                constructor_kwargs=kwargs,
-            )
-
-    return create_service
+) -> ServiceDefinition:
+    return ServiceDefinition(
+        app_name,
+        execution_object,
+        autoscale=autoscale,
+        warmup=warmup,
+        resreq=resreq,
+    )
 
 
 class _RuntimeState(Enum):
@@ -868,7 +956,7 @@ class _Runtime:
         warmup: int = 0,
         resreq: Optional[str] = None,
     ) -> Callable[[Any], Any]:
-        """Decorate an execution object and return its remote service proxy.
+        """Decorate an execution object with local and remote call forms.
 
         Args:
             autoscale: Functions, builtins, and classes can autoscale; their
@@ -882,8 +970,9 @@ class _Runtime:
                     cluster.resource_requirement (or its fallback).
 
         Returns:
-            A decorator that accepts a function or class. Functions become a
-            ServiceInstance; classes become factories for ServiceInstance values.
+            A decorator that accepts a function or class. Calling the decorated
+            object runs locally. Function ``.remote(...)`` submits a call on a
+            shared session; class ``.remote(...)`` creates a proxy.
 
         Raises:
             TypeError: If the decorated object is not a function or class.
@@ -892,22 +981,21 @@ class _Runtime:
 
         def decorator(execution_object: Any) -> Any:
             logger.debug(f"Creating service for {type(execution_object).__name__} (autoscale={autoscale}, warmup={warmup})")
+            if not inspect.isclass(execution_object) and not _is_function(execution_object):
+                raise TypeError("app.service() supports a function or class only")
             if inspect.isclass(execution_object):
-                return _service_class_factory(
+                _validate_service_class(execution_object)
+            with self._lifecycle_lock:
+                if self._state is not _RuntimeState.ACTIVE:
+                    raise FlameError(FlameErrorCode.INVALID_STATE, f"Flame app '{self._name}' is not active")
+                return ServiceDefinition(
                     self._name,
                     execution_object,
                     autoscale=autoscale,
                     warmup=warmup,
                     resreq=resreq,
+                    runtime=self,
                 )
-            if not _is_function(execution_object):
-                raise TypeError("app.service() supports a function or class only")
-            return self._create_service_instance(
-                execution_object,
-                autoscale=autoscale,
-                warmup=warmup,
-                resreq=resreq,
-            )
 
         return decorator
 
@@ -1256,17 +1344,15 @@ def service(
                         FlameErrorCode.INVALID_ARGUMENT,
                         "Nested services reuse the current session and do not accept autoscale, warmup, or resreq",
                     )
-                if inspect.isclass(execution_object):
-                    return _service_class_factory(
-                        session_context.application.name,
-                        execution_object,
-                        autoscale=autoscale,
-                        warmup=warmup,
-                        resreq=resreq,
-                    )
-                if not _is_function(execution_object):
+                if not inspect.isclass(execution_object) and not _is_function(execution_object):
                     raise TypeError("app.service() supports a function or class only")
-                return _nested_service_instance(session_context, execution_object)
+                return ServiceDefinition(
+                    session_context.application.name,
+                    execution_object,
+                    autoscale=autoscale,
+                    warmup=warmup,
+                    resreq=resreq,
+                )
             if _runtime is None:
                 raise FlameError(
                     FlameErrorCode.INVALID_STATE,
@@ -1275,6 +1361,21 @@ def service(
             return _runtime.service(autoscale=autoscale, warmup=warmup, resreq=resreq)(execution_object)
 
     return decorator
+
+
+def remote(service: ServiceDefinition, *args: Any, **kwargs: Any) -> ServiceInstance:
+    """Create an independent proxy for a decorated function or class."""
+    if not isinstance(service, ServiceDefinition):
+        raise TypeError("app.remote() requires a decorated function or class")
+    if not inspect.isclass(service._execution_object) and (args or kwargs):
+        raise TypeError("app.remote() takes no function invocation arguments; call the returned proxy")
+    try:
+        _context.session_context()
+    except RuntimeError:
+        pass
+    else:
+        raise FlameError(FlameErrorCode.INVALID_STATE, "app.remote() cannot create an independent session inside an App invocation")
+    return service._remote_instance(args=args, kwargs=kwargs)
 
 
 def get(futures: List[ObjectFuture]) -> List[Any]:
@@ -1303,6 +1404,7 @@ def put(obj: Any) -> ObjectRef:
 
 
 __all__ = [
+    "ServiceDefinition",
     "ServiceInstance",
     "ObjectFuture",
     "ObjectFutureIterator",

@@ -30,7 +30,7 @@ use crate::model::{
     ConnectionCallbacks, ConnectionState, Executor, ExecutorFilter, ExecutorPtr, NodeConnectionPtr,
     NodeConnectionReceiver, NodeConnectionSender, NodeInfoPtr, SessionInfoPtr, SnapShotPtr,
 };
-use crate::notify::{NotifyManager, NotifyManagerPtr};
+use crate::notify::{NotifyManager, NotifyManagerPtr, TaskSubscription};
 use crate::storage::StoragePtr;
 
 mod connections;
@@ -469,13 +469,21 @@ impl Controller {
             .storage
             .create_task(ssn_id.clone(), task_input, options)
             .await?;
-        let _ = self.notifier.tasks.notify(&ssn_id, 0);
+        let _ = self.notifier.tasks.notify(&ssn_id, task.id);
         self.notify_scheduler();
         Ok(task)
     }
 
+    pub fn subscribe(&self, ssn_id: &SessionID) -> Result<TaskSubscription, FlameError> {
+        self.notifier.tasks.subscribe(ssn_id)
+    }
+
     pub fn get_task(&self, ssn_id: SessionID, id: TaskID) -> Result<Task, FlameError> {
         self.storage.get_task(ssn_id, id)
+    }
+
+    pub fn get_task_metadata(&self, ssn_id: SessionID, id: TaskID) -> Result<Task, FlameError> {
+        self.storage.get_task_metadata(ssn_id, id)
     }
 
     pub fn list_tasks(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
@@ -583,61 +591,6 @@ impl Controller {
     ) -> Result<Vec<Application>, FlameError> {
         trace_fn!("Controller::list_applications");
         self.storage.list_applications(filter).await
-    }
-
-    pub async fn watch_task(&self, gid: TaskGID) -> Result<Task, FlameError> {
-        trace_fn!("Controller::watch_task");
-        let initial_state = {
-            let task_ptr = self.storage.get_task_ptr(gid.clone())?;
-            let task = lock_ptr!(task_ptr)?;
-            task.state
-        };
-
-        tracing::debug!(
-            "watch_task: task={}/{}, initial_state={:?}",
-            gid.ssn_id,
-            gid.task_id,
-            initial_state
-        );
-
-        let mut rx = self.notifier.tasks.subscribe(&gid.ssn_id, gid.task_id)?;
-
-        loop {
-            {
-                let task_ptr = self.storage.get_task_ptr(gid.clone())?;
-                let task = lock_ptr!(task_ptr)?;
-                tracing::debug!(
-                    "watch_task: task={}/{}, current_state={:?}, is_completed={}",
-                    gid.ssn_id,
-                    gid.task_id,
-                    task.state,
-                    task.is_completed()
-                );
-                if initial_state != task.state || task.is_completed() {
-                    tracing::debug!(
-                        "watch_task: returning task={}/{}, state={:?}",
-                        gid.ssn_id,
-                        gid.task_id,
-                        task.state
-                    );
-                    return Ok((*task).clone());
-                }
-            }
-
-            tracing::debug!(
-                "watch_task: task={}/{}, waiting for notification",
-                gid.ssn_id,
-                gid.task_id
-            );
-            if rx.changed().await.is_err() {
-                return Err(FlameError::Internal("watch channel closed".to_string()));
-            }
-            tracing::debug!(
-                "watch_task: task={}/{}, got notification",
-                gid.ssn_id,
-                gid.task_id
-            );
-        }
     }
 
     pub async fn wait_for_session(&self, id: ExecutorID) -> Result<Option<Session>, FlameError> {
@@ -839,7 +792,7 @@ impl Controller {
         let delay_secs = app.delay_release.num_seconds().max(0) as u64;
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(delay_secs);
 
-        let mut rx = self.notifier.tasks.subscribe(ssn_id, 0)?;
+        let mut rx = self.notifier.tasks.subscribe(ssn_id)?;
 
         loop {
             {
@@ -857,8 +810,11 @@ impl Controller {
                 return Ok(None);
             }
 
-            if tokio::time::timeout(remaining, rx.changed()).await.is_err() {
-                return Ok(None);
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Err(_) | Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    return Ok(None);
+                }
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
             }
         }
     }

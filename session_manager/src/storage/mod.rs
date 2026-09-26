@@ -780,24 +780,26 @@ impl Storage {
     }
 
     pub fn get_task(&self, ssn_id: SessionID, id: TaskID) -> Result<Task, FlameError> {
-        let ssn_map = lock_ptr!(self.sessions)?;
-
-        let ssn = ssn_map
-            .get(&ssn_id)
-            .ok_or(FlameError::NotFound(ssn_id.to_string()))?;
-
-        let ssn = lock_ptr!(ssn)?;
-        let task = ssn
-            .tasks
-            .get(&id)
-            .ok_or(FlameError::NotFound(id.to_string()))?;
-        let mut task = lock_ptr!(task)?;
+        let mut task = self.get_task_metadata(ssn_id, id)?;
         let events = self
             .event_manager
             .find_events(EventOwner::from(task.gid()))?;
         task.events = events;
 
-        Ok(task.clone())
+        Ok(task)
+    }
+
+    /// Clone the current task state without loading historical events from disk.
+    /// Nonterminal watch updates need current state without serializing
+    /// unrelated sessions behind event storage I/O.
+    pub fn get_task_metadata(&self, ssn_id: SessionID, id: TaskID) -> Result<Task, FlameError> {
+        let task_ptr = self.get_task_ptr(TaskGID {
+            ssn_id,
+            task_id: id,
+        })?;
+        let mut task = lock_ptr!(task_ptr)?.clone();
+        task.events.clear();
+        Ok(task)
     }
 
     pub fn list_tasks(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {

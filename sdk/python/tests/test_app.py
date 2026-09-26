@@ -3,7 +3,7 @@
 import sys
 import tarfile
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -481,6 +481,151 @@ def test_module_service_decorator_is_supported_after_init(monkeypatch):
     runtime.service.assert_called_once_with(autoscale=None, warmup=0, resreq=None)
 
 
+def test_decorated_function_runs_locally_until_remote_is_called(monkeypatch):
+    import flamepy.app as app
+    from flamepy.app import ServiceInstance
+
+    runtime = object.__new__(Runtime)
+    runtime._name = "local-function-app"
+    runtime._services = []
+    runtime._state = _RuntimeState.ACTIVE
+    runtime._lifecycle_lock = threading.RLock()
+    monkeypatch.setattr(app_client, "_runtime", runtime)
+    monkeypatch.setattr(
+        "flamepy.app.client._core_put_object",
+        lambda *args, **kwargs: MagicMock(encode=MagicMock(return_value=b"context")),
+    )
+    sessions = [MagicMock(id="first"), MagicMock(id="second"), MagicMock(id="third")]
+    open_session = MagicMock(side_effect=sessions)
+    monkeypatch.setattr("flamepy.app.client.core_client.open_session", open_session)
+
+    @app.service()
+    def echo(value, shared=None):
+        return value
+
+    assert echo("local") == "local"
+    assert cloudpickle.loads(cloudpickle.dumps(echo))("restored") == "restored"
+    assert runtime._services == []
+    open_session.assert_not_called()
+    with pytest.raises(TypeError, match="decorated function or class"):
+        app.remote(lambda value: value)
+    with pytest.raises(TypeError, match="takes no function invocation arguments"):
+        app.remote(echo, "input")
+
+    first_call = echo.remote("input")
+    first = echo._shared_remote
+    second_call = echo.remote("other", shared="user-arg")
+    assert isinstance(first_call, app.ObjectFuture)
+    assert isinstance(second_call, app.ObjectFuture)
+    second_request = cloudpickle.loads(sessions[0].run.call_args_list[1].args[0])
+    assert second_request.args == ("other",)
+    assert second_request.kwargs == {"shared": "user-arg"}
+    assert echo._shared_remote is first
+    assert open_session.call_count == 1
+    second = app.remote(echo)
+    assert isinstance(first, ServiceInstance)
+    assert isinstance(second, ServiceInstance)
+    assert first is not second
+    assert [service._session.id for service in runtime._services] == ["first", "second"]
+    first.close()
+    sessions[0].close.assert_called_once_with()
+    sessions[1].close.assert_not_called()
+    third_call = echo.remote("third")
+    third = echo._shared_remote
+    assert isinstance(third_call, app.ObjectFuture)
+    assert third is not first
+    assert open_session.call_count == 3
+    second.close()
+    runtime._state = _RuntimeState.INACTIVE
+    with pytest.raises(FlameError, match="not active"):
+        echo.remote("after-shutdown")
+    third.close()
+    sessions[1].close.assert_called_once_with()
+    sessions[2].close.assert_called_once_with()
+
+
+def test_concurrent_function_remote_calls_share_one_session(monkeypatch):
+    runtime = object.__new__(Runtime)
+    runtime._name = "concurrent-shared-app"
+    runtime._services = []
+    runtime._state = _RuntimeState.ACTIVE
+    runtime._lifecycle_lock = threading.RLock()
+    monkeypatch.setattr(app_client, "_runtime", runtime)
+    monkeypatch.setattr(
+        "flamepy.app.client._core_put_object",
+        lambda *args, **kwargs: MagicMock(encode=MagicMock(return_value=b"context")),
+    )
+    open_session = MagicMock(return_value=MagicMock(id="shared-session"))
+    monkeypatch.setattr("flamepy.app.client.core_client.open_session", open_session)
+
+    definition = runtime.service()(lambda index: index)
+    barrier = threading.Barrier(8)
+
+    def remote_after_barrier(index):
+        barrier.wait()
+        return definition.remote(index)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = list(pool.map(remote_after_barrier, range(8)))
+
+    assert all(isinstance(future, app_client.ObjectFuture) for future in futures)
+    assert definition._shared_remote is not None
+    assert open_session.return_value.run.call_count == 8
+    open_session.assert_called_once()
+
+
+def test_remote_api_opens_expected_number_of_sessions(monkeypatch):
+    import flamepy.app as app
+
+    runtime = object.__new__(Runtime)
+    runtime._name = "session-count-app"
+    runtime._services = []
+    runtime._state = _RuntimeState.ACTIVE
+    runtime._lifecycle_lock = threading.RLock()
+    monkeypatch.setattr(app_client, "_runtime", runtime)
+    monkeypatch.setattr(
+        "flamepy.app.client._core_put_object",
+        lambda *args, **kwargs: MagicMock(encode=MagicMock(return_value=b"context")),
+    )
+    sessions = [MagicMock(id=f"session-{index}") for index in range(5)]
+    open_session = MagicMock(side_effect=sessions)
+    monkeypatch.setattr("flamepy.app.client.core_client.open_session", open_session)
+
+    @app.service()
+    def echo(value):
+        return value
+
+    @app.service()
+    class Counter:
+        def read(self):
+            return 0
+
+    assert echo("local") == "local"
+    assert Counter().read() == 0
+    open_session.assert_not_called()
+
+    echo.remote(1)
+    echo.remote(2)
+    assert open_session.call_count == 1
+
+    first_function = app.remote(echo)
+    second_function = app.remote(echo)
+    assert open_session.call_count == 3
+    assert first_function._session is sessions[1]
+    assert second_function._session is sessions[2]
+
+    first_class = Counter.remote()
+    second_class = app.remote(Counter)
+    assert open_session.call_count == 5
+    assert first_class._session is sessions[3]
+    assert second_class._session is sessions[4]
+    assert [service._session.id for service in runtime._services] == [session.id for session in sessions]
+
+    for service in runtime._services:
+        service.close()
+    assert all(session.close.call_count == 1 for session in sessions)
+
+
 def test_module_put_uses_the_active_runtime(monkeypatch):
     import flamepy.app as app
 
@@ -619,7 +764,13 @@ def test_recursive_service_declaration_reuses_context_without_init(monkeypatch):
             def invoke(self):
                 return None
 
-        recursive_service = RecursiveService()
+        local_service = RecursiveService()
+        assert type(local_service).__name__ == "RecursiveService"
+        assert local_service.invoke() is None
+        open_session.assert_not_called()
+        with pytest.raises(FlameError, match="cannot create an independent session"):
+            app.remote(RecursiveService)
+        recursive_service = RecursiveService.remote()
 
     assert recursive_service._app == "recursive-app"
     assert recursive_service._session is session
@@ -655,7 +806,7 @@ def test_recursive_service_declaration_prefers_invocation_context(monkeypatch):
             def invoke(self):
                 return None
 
-        recursive_service = RecursiveService()
+        recursive_service = RecursiveService.remote()
 
     runtime.service.assert_not_called()
     open_session.assert_called_once_with(session_id="recursive-session")
@@ -711,6 +862,8 @@ def test_recursive_service_declaration_requires_existing_session(monkeypatch):
             @app.service()
             def recursive_service():
                 return None
+
+            recursive_service.remote()
 
     put_context.assert_not_called()
     open_session.assert_called_once_with(session_id="missing-session")
@@ -1014,6 +1167,7 @@ def test_app_service_instance_close_drains_pending_tasks():
     rs._state_changed = threading.Condition(rs._future_lock)
     pending = MagicMock()
     rs._pending_futures = {pending}
+    rs._submissions_in_flight = 0
     rs._state = _ServiceState.OPEN
     rs._session = MagicMock()
     rs._session_owner = _ServiceSessionOwner(rs._session)
@@ -1023,6 +1177,110 @@ def test_app_service_instance_close_drains_pending_tasks():
     pending.result.assert_called_once_with()
     rs._session.close.assert_called_once_with()
     assert rs._state is _ServiceState.CLOSED
+
+
+def test_app_service_instance_submits_concurrently():
+    """A slow CreateTask RPC must not serialize other submissions."""
+    from flamepy.app import ServiceInstance
+
+    service = object.__new__(ServiceInstance)
+    service._future_lock = threading.Lock()
+    service._state_changed = threading.Condition(service._future_lock)
+    service._pending_futures = set()
+    service._submissions_in_flight = 0
+    service._state = _ServiceState.OPEN
+    both_submitting = threading.Barrier(2)
+
+    def run(*args, **kwargs):
+        both_submitting.wait(timeout=2)
+        future = Future()
+        future.set_result(None)
+        return future
+
+    service._session = MagicMock(run=run)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        submitted = list(pool.map(lambda _: service._submit(b"request", None), range(2)))
+
+    assert len(submitted) == 2
+    assert all(future.done() for future in submitted)
+    assert service._submissions_in_flight == 0
+
+
+def test_app_service_instance_close_waits_for_submission_and_task():
+    """Close must include a future returned by an in-flight CreateTask RPC."""
+    from flamepy.app import ServiceInstance
+
+    service = object.__new__(ServiceInstance)
+    service._app = "test-app"
+    service._future_lock = threading.Lock()
+    service._state_changed = threading.Condition(service._future_lock)
+    service._pending_futures = set()
+    service._submissions_in_flight = 0
+    service._state = _ServiceState.OPEN
+    run_entered = threading.Event()
+    release_run = threading.Event()
+    close_done = threading.Event()
+    task = Future()
+
+    def run(*args, **kwargs):
+        run_entered.set()
+        assert release_run.wait(timeout=2)
+        return task
+
+    service._session = MagicMock(run=run)
+    service._session_owner = _ServiceSessionOwner(service._session)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        submission = pool.submit(service._submit, b"request", None)
+        assert run_entered.wait(timeout=2)
+        closing = pool.submit(lambda: (service.close(), close_done.set()))
+        also_closing = pool.submit(service.close)
+        assert not close_done.wait(timeout=0.05)
+        release_run.set()
+        assert submission.result(timeout=2) is task
+        assert not close_done.wait(timeout=0.05)
+        service._session.close.assert_not_called()
+        task.set_result(None)
+        closing.result(timeout=2)
+        also_closing.result(timeout=2)
+
+    service._session.close.assert_called_once_with()
+    assert service._state is _ServiceState.CLOSED
+
+
+def test_app_service_instance_failed_submission_does_not_block_close():
+    """A failed CreateTask RPC releases its in-flight close reservation."""
+    from flamepy.app import ServiceInstance
+
+    service = object.__new__(ServiceInstance)
+    service._app = "test-app"
+    service._future_lock = threading.Lock()
+    service._state_changed = threading.Condition(service._future_lock)
+    service._pending_futures = set()
+    service._submissions_in_flight = 0
+    service._state = _ServiceState.OPEN
+    run_entered = threading.Event()
+    release_run = threading.Event()
+
+    def run(*args, **kwargs):
+        run_entered.set()
+        assert release_run.wait(timeout=2)
+        raise RuntimeError("CreateTask failed")
+
+    service._session = MagicMock(run=run)
+    service._session_owner = _ServiceSessionOwner(service._session)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        submission = pool.submit(service._submit, b"request", None)
+        assert run_entered.wait(timeout=2)
+        closing = pool.submit(service.close)
+        release_run.set()
+        with pytest.raises(RuntimeError, match="CreateTask failed"):
+            submission.result(timeout=2)
+        closing.result(timeout=2)
+
+    assert service._submissions_in_flight == 0
+    service._session.close.assert_called_once_with()
 
 
 def test_app_service_rejects_method_name_collisions():
@@ -1099,7 +1357,7 @@ def test_runtime_service_owns_session_despite_execution_object_attribute(monkeyp
     runtime._lifecycle_lock = threading.RLock()
     monkeypatch.setattr(app_client, "_runtime", runtime)
     service_factory = runtime.service()(RecursiveService)
-    service = service_factory()
+    service = service_factory.remote()
 
     assert isinstance(service._session_owner, _ServiceSessionOwner)
     service.close()
@@ -1190,7 +1448,9 @@ def test_app_service_passes_public_options(monkeypatch):
     decorator = app.service(autoscale=False, warmup=2, resreq=resreq)
     decorated = decorator(sample_func)
 
-    assert isinstance(decorated, FakeServiceInstance)
+    assert decorated() == "ok"
+    assert calls == []
+    app_client.remote(decorated)
 
     assert calls == [
         (
@@ -1256,17 +1516,30 @@ def test_decorated_class_creates_session_only_when_constructed(monkeypatch):
     assert runtime._services == []
     open_session.assert_not_called()
 
-    worker = worker_factory("remote", replicas=3)
+    local_worker = worker_factory("local", replicas=2)
+    assert isinstance(local_worker, Worker)
+    assert local_worker.run() == "local"
+    assert Worker.constructions == [("local", 2)]
+    open_session.assert_not_called()
+
+    worker = worker_factory.remote("remote", replicas=3)
 
     assert isinstance(worker, ServiceInstance)
     assert worker._execution_object is Worker
-    assert Worker.constructions == []
+    assert Worker.constructions == [("local", 2)]
     assert runtime._services == [worker]
     assert open_session.call_count == 1
 
     context = cloudpickle.loads(serialized_contexts[0])
     assert context.constructor_args == ("remote",)
     assert context.constructor_kwargs == {"replicas": 3}
+
+    other_worker = app_client.remote(worker_factory, "other", replicas=4)
+    assert isinstance(other_worker, ServiceInstance)
+    assert other_worker is not worker
+    other_context = cloudpickle.loads(serialized_contexts[1])
+    assert other_context.constructor_args == ("other",)
+    assert other_context.constructor_kwargs == {"replicas": 4}
 
 
 def test_decorated_class_has_no_class_level_remote_methods(monkeypatch):
@@ -1306,8 +1579,9 @@ def test_decorated_class_factory_rejects_calls_after_runtime_is_inactive(
     worker_factory = runtime.service()(Worker)
     runtime._state = _RuntimeState.INACTIVE
 
-    with pytest.raises(FlameError, match="declared this service class is not active"):
-        worker_factory()
+    assert worker_factory().run() == "ok"
+    with pytest.raises(FlameError, match="not active"):
+        worker_factory.remote()
 
 
 def test_decorated_class_carries_constructor_arguments_without_local_construction(
@@ -1335,10 +1609,11 @@ def test_decorated_class_carries_constructor_arguments_without_local_constructio
     class Worker:
         constructions = 0
 
-        def __init__(self, name, *, replicas):
+        def __init__(self, name, *, replicas, shared):
             type(self).constructions += 1
             self.name = name
             self.replicas = replicas
+            self.shared = shared
 
         def run(self):
             return None
@@ -1350,13 +1625,13 @@ def test_decorated_class_carries_constructor_arguments_without_local_constructio
     runtime._lifecycle_lock = threading.RLock()
     monkeypatch.setattr(app_client, "_runtime", runtime)
     worker_factory = runtime.service(autoscale=True, warmup=2)(Worker)
-    worker_factory("remote", replicas=4)
+    worker_factory.remote("remote", replicas=4, shared="constructor-value")
 
     assert Worker.constructions == 0
     context = cloudpickle.loads(serialized_contexts[0])
     assert context.execution_object.__name__ == "Worker"
     assert context.constructor_args == ("remote",)
-    assert context.constructor_kwargs == {"replicas": 4}
+    assert context.constructor_kwargs == {"replicas": 4, "shared": "constructor-value"}
     assert context.autoscale is True
     assert context.warmup == 2
     assert context.min_instances == 2
@@ -1398,8 +1673,8 @@ def test_decorated_class_preserves_resources_and_runtime_closes_all_instances(
     assert runtime._services == []
     open_session.assert_not_called()
 
-    first_worker = worker_factory()
-    second_worker = worker_factory()
+    first_worker = worker_factory.remote()
+    second_worker = worker_factory.remote()
 
     assert runtime._services == [first_worker, second_worker]
     requirements = [call.kwargs["spec"].resreq for call in open_session.call_args_list]
@@ -1457,7 +1732,7 @@ def test_decorated_class_instance_is_pickled_by_defining_module(monkeypatch):
     worker_factory = runtime.service()(original_class)
     service_module.Worker = worker_factory
 
-    worker_factory(7)
+    worker_factory.remote(7)
     monkeypatch.delitem(sys.modules, module_name)
     restored = cloudpickle.loads(serialized_contexts[-1])
 
@@ -1757,7 +2032,7 @@ def test_runpy_binds_recursive_service_to_current_session(monkeypatch):
                 def run(self):
                     return None
 
-            recursive_proxy = RecursiveProxy()
+            recursive_proxy = RecursiveProxy.remote()
             captured["proxy"] = recursive_proxy
             captured["execution_object"] = recursive_proxy._execution_object
             return recursive_proxy._session.id
@@ -2330,6 +2605,7 @@ def test_service_instance_close_retries_after_session_close_failure():
     service._future_lock = threading.Lock()
     service._state_changed = threading.Condition(service._future_lock)
     service._pending_futures = set()
+    service._submissions_in_flight = 0
     service._state = _ServiceState.OPEN
     service._session_owner = owner
 
@@ -2430,7 +2706,7 @@ def test_runtime_close_serializes_with_service_creation(monkeypatch):
 
     def create_service():
         try:
-            runtime.service()(execution_object)
+            app_client.remote(runtime.service()(execution_object))
         except Exception as error:
             creation_errors.append(error)
 

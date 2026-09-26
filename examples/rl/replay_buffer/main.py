@@ -80,8 +80,8 @@ def run_distributed(
         from distributed import BufferService, CollectorService
 
         buffer = ReplayBuffer(force_full_get=force_full_get)
-        buffer_service = BufferService()
-        collector_service = CollectorService()
+        buffer_service = BufferService.remote()
+        collector_service = CollectorService.remote()
 
         for iteration in range(num_iterations):
             iteration_start = time.time()

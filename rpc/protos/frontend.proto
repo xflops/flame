@@ -36,7 +36,7 @@ service Frontend {
   rpc CreateTask (CreateTaskRequest) returns (Task) {}
 
   rpc GetTask (GetTaskRequest) returns (Task) {}
-  rpc WatchTask (WatchTaskRequest) returns (stream Task) {}
+  rpc WatchTasks (stream WatchTaskRequest) returns (stream Task) {}
   rpc ListTasks (ListTasksRequest) returns (stream Task) {}
 }
 

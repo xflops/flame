@@ -130,18 +130,18 @@ def run_app_e2e(
                     def value(self) -> int:
                         return self._value
 
-                square_futures = [square_service(index) for index in range(tasks)]
+                square_futures = [square_service.remote(index) for index in range(tasks)]
                 function_results = app.get(square_futures)
                 expected_results = [index * index for index in range(tasks)]
                 if function_results != expected_results:
                     raise RuntimeError(f"function App check failed: expected {expected_results}, got {function_results}")
 
-                chained_result = add_service(square_service(tasks), square_service(tasks + 1)).get()
+                chained_result = add_service.remote(square_service.remote(tasks), square_service.remote(tasks + 1)).get()
                 expected_chained = (tasks * tasks) + ((tasks + 1) * (tasks + 1))
                 if chained_result != expected_chained:
                     raise RuntimeError(f"ObjectFuture chaining check failed: expected {expected_chained}, got {chained_result}")
 
-                counter: Any = Counter()
+                counter: Any = Counter.remote()
                 counter.add(2).wait()
                 counter.add(4).wait()
                 class_result = counter.value().get()
