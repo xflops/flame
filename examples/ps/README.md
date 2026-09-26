@@ -103,13 +103,14 @@ class ParameterServerService(ParameterServer):
 class DataWorkerService(DataWorker):
     pass
 
-ps_svc = ParameterServerService()
-worker_svc = DataWorkerService()
+ps_svc = ParameterServerService.remote()
+worker_svc = DataWorkerService.remote()
 workers_svc = [worker_svc, worker_svc]
 ```
 
 `app.init()` initializes the application used by module-level service helpers.
-Services can be instantiated from any Python class.
+Call a decorated class directly to construct a local object, or call `.remote()`
+to create its remote service proxy.
 
 ### 2. Asynchronous Remote Calls
 

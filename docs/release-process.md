@@ -17,7 +17,7 @@ export DOCKER_TAG="${RELEASE_TAG}"
 export RELEASE_BRANCH=release-0.6
 export IMAGE_REGISTRY=docker.io/xflops
 export RELEASE_IMAGE_PLATFORMS=linux/amd64,linux/arm64
-export RUST_BUILDER_IMAGE=docker.io/library/rust:1.95
+export RUST_BUILDER_IMAGE=docker.io/library/rust:1.98.1
 export UBUNTU_BASE_IMAGE=docker.io/library/ubuntu:24.04
 # Optional override; Makefile auto-detects usable podman first, then docker.
 # export CONTAINER_CLI=podman

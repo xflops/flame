@@ -19,6 +19,7 @@ use comfy_table::Table;
 use flame_rs as flame;
 use flame_rs::apis::{FlameContext, FlameError, SessionState};
 use flame_rs::client::{Connection, Executor, NodeState};
+use serde::Serialize;
 
 use crate::utils::{format_memory, format_resreq};
 
@@ -28,6 +29,7 @@ pub async fn run(
     session: bool,
     executor: bool,
     node: bool,
+    output_format: &str,
 ) -> Result<(), Box<dyn Error>> {
     let current_ctx = ctx.get_current_context()?;
     let conn = flame::client::connect_with_tls(
@@ -36,18 +38,26 @@ pub async fn run(
     )
     .await?;
     match (application, session, executor, node) {
-        (true, _, _, _) => list_applications(conn).await,
-        (_, true, _, _) => list_sessions(conn).await,
-        (_, _, true, _) => list_executors(conn).await,
-        (_, _, _, true) => list_nodes(conn).await,
+        (true, _, _, _) => list_applications(conn, output_format).await,
+        (_, true, _, _) => list_sessions(conn, output_format).await,
+        (_, _, true, _) => list_executors(conn, output_format).await,
+        (_, _, _, true) => list_nodes(conn, output_format).await,
         _ => Err(Box::new(FlameError::InvalidConfig(
             "unsupported parameters".to_string(),
         ))),
     }
 }
 
-async fn list_applications(conn: Connection) -> Result<(), Box<dyn Error>> {
+fn format_json<T: Serialize>(items: &[T]) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(items)
+}
+
+async fn list_applications(conn: Connection, output_format: &str) -> Result<(), Box<dyn Error>> {
     let app_list = conn.list_applications().await?;
+    if output_format == "json" {
+        println!("{}", format_json(&app_list)?);
+        return Ok(());
+    }
 
     let mut table = Table::new();
     table
@@ -73,8 +83,12 @@ async fn list_applications(conn: Connection) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn list_sessions(conn: Connection) -> Result<(), Box<dyn Error>> {
+async fn list_sessions(conn: Connection, output_format: &str) -> Result<(), Box<dyn Error>> {
     let mut ssn_list = conn.list_sessions().await?;
+    if output_format == "json" {
+        println!("{}", format_json(&ssn_list)?);
+        return Ok(());
+    }
     let mut table = Table::new();
     table.load_preset(NOTHING).set_header(vec![
         "ID",
@@ -121,8 +135,12 @@ async fn list_sessions(conn: Connection) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn list_executors(conn: Connection) -> Result<(), Box<dyn Error>> {
+async fn list_executors(conn: Connection, output_format: &str) -> Result<(), Box<dyn Error>> {
     let executor_list = conn.list_executors().await?;
+    if output_format == "json" {
+        println!("{}", format_json(&executor_list)?);
+        return Ok(());
+    }
     let table = executor_table(&executor_list);
 
     println!("{table}");
@@ -149,8 +167,12 @@ fn executor_table(executors: &[Executor]) -> Table {
     table
 }
 
-async fn list_nodes(conn: Connection) -> Result<(), Box<dyn Error>> {
+async fn list_nodes(conn: Connection, output_format: &str) -> Result<(), Box<dyn Error>> {
     let node_list = conn.list_nodes().await?;
+    if output_format == "json" {
+        println!("{}", format_json(&node_list)?);
+        return Ok(());
+    }
     let mut table = Table::new();
     table.load_preset(NOTHING).set_header(vec![
         "NAME", "HOSTNAME", "STATUS", "CPU", "MEMORY", "ARCH", "OS",
@@ -197,5 +219,22 @@ mod tests {
 
         assert!(table.contains("App"));
         assert!(table.contains("app-1"));
+    }
+
+    #[test]
+    fn executor_json_is_an_array_with_state() {
+        let json = format_json(&[Executor {
+            id: "executor-1".to_string(),
+            application: "app-1".to_string(),
+            state: ExecutorState::Idle,
+            session_id: None,
+            node: "node-1".to_string(),
+        }])
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value[0]["id"], "executor-1");
+        assert_eq!(value[0]["state"], "Idle");
+        assert_eq!(value[0]["application"], "app-1");
     }
 }

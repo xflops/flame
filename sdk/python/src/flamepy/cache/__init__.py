@@ -13,6 +13,8 @@ limitations under the License.
 
 from flamepy.core.cache import (
     ObjectRef,
+    Ref,
+    ValueRef,
     delete_objects,
     get_object,
     patch_object,
@@ -22,6 +24,8 @@ from flamepy.core.cache import (
 
 __all__ = [
     "ObjectRef",
+    "Ref",
+    "ValueRef",
     "delete_objects",
     "get_object",
     "patch_object",

@@ -10,10 +10,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Compare synchronous and asyncio core task throughput on an in-process server.
+Compare blocking, pipelined, and asyncio core task throughput on an in-process server.
 
 Run from sdk/python with: uv run python benchmarks/core_aio.py
-The same script can be run against main to measure its synchronous baseline.
 """
 
 import asyncio
@@ -45,8 +44,9 @@ class EchoFrontend(FrontendServicer):
         self.task_id += 1
         return self._task(str(self.task_id), request.task.input)
 
-    async def WatchTask(self, request, context):  # noqa: N802
-        yield self._task(request.task_id, b"ping")
+    async def WatchTasks(self, requests, context):  # noqa: N802
+        async for request in requests:
+            yield self._task(request.task_id, b"ping")
 
     @staticmethod
     def _task(task_id: str, payload: bytes):
@@ -82,14 +82,15 @@ class Server:
         self.thread.join()
 
 
-def bench_sync(endpoint: str, tasks: int, samples: int) -> tuple[list[float], int]:
+def bench_sync(endpoint: str, tasks: int, samples: int, method_name: str) -> tuple[list[float], int]:
     connection = core.connect(endpoint)
     try:
         session = connection.create_session(SessionAttributes(application="benchmark"))
         elapsed = []
+        run_task = getattr(session, method_name)
         for _ in range(samples):
             start = time.perf_counter()
-            futures = [session.run(b"ping") for _ in range(tasks)]
+            futures = [run_task(b"ping") for _ in range(tasks)]
             wait(futures)
             assert all(future.result() == b"ping" for future in futures)
             elapsed.append(time.perf_counter() - start)
@@ -106,7 +107,7 @@ async def bench_aio(endpoint: str, tasks: int, samples: int) -> tuple[list[float
         elapsed = []
         for _ in range(samples):
             start = time.perf_counter()
-            futures = await asyncio.gather(*(session.run(b"ping") for _ in range(tasks)))
+            futures = [session.submit(b"ping") for _ in range(tasks)]
             results = await asyncio.gather(*futures)
             assert all(result == b"ping" for result in results)
             elapsed.append(time.perf_counter() - start)
@@ -119,7 +120,10 @@ def main():
     try:
         print("Mode\tTasks\tSamples\tMedian ms\tTasks/s\tThreads")
         for tasks, samples in ((1, 30), (100, 5), (1000, 3)):
-            modes = [("sync", bench_sync(endpoint, tasks, samples))]
+            modes = [
+                ("sync-run", bench_sync(endpoint, tasks, samples, "run")),
+                ("sync-submit", bench_sync(endpoint, tasks, samples, "submit")),
+            ]
             try:
                 modes.append(("aio", asyncio.run(bench_aio(endpoint, tasks, samples))))
             except ImportError:

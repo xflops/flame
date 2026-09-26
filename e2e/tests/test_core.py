@@ -870,16 +870,18 @@ class TestTaskWatchTimeout:
             request_bytes = serialize_request(request)
             task = session.create_task(request_bytes)
 
-            # Watch for updates
-            updates = []
+            # The first response is the current status; the task may have
+            # advanced before the watch starts.
             watcher = session.watch_task(task.id)
-            for task_update in watcher:
-                updates.append(task_update.state)
-                if task_update.is_completed() or task_update.is_failed():
-                    break
+            first_update = next(watcher)
+            assert first_update.id == task.id
+            updates = [first_update.state]
+            if not first_update.is_completed():
+                for task_update in watcher:
+                    updates.append(task_update.state)
+                    if task_update.is_completed():
+                        break
 
-            # Should have received at least one update
-            assert len(updates) >= 1
             # Final state should be SUCCEED
             assert updates[-1] == TaskState.SUCCEED
 
@@ -900,11 +902,13 @@ class TestTaskWatchTimeout:
             tasks = list(session.list_tasks())
             assert len(tasks) >= 1
 
-            # Watch completed task - should return final state immediately
+            # A completed task's current status is already terminal.
             watcher = session.watch_task(tasks[0].id)
-            for task_update in watcher:
-                assert task_update.state == TaskState.SUCCEED
-                break
+            first_update = next(watcher)
+            assert first_update.id == tasks[0].id
+            assert first_update.state == TaskState.SUCCEED
+            with pytest.raises(StopIteration):
+                next(watcher)
 
         finally:
             session.close()

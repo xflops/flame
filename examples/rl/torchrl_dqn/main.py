@@ -265,8 +265,8 @@ def train_distributed(
     try:
         from distributed import CollectorService, ReplaySamplerService
 
-        collector_service = CollectorService()
-        replay_sampler_service = ReplaySamplerService()
+        collector_service = CollectorService.remote()
+        replay_sampler_service = ReplaySamplerService.remote()
         replay_buffers = create_flame_replay_buffers(
             replay=replay,
             buffer_size=buffer_size,

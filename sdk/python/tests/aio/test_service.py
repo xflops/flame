@@ -277,12 +277,15 @@ def test_aio_app_worker_awaits_function_and_class_method(monkeypatch):
         service._load_app_context = load_context
         await service.on_session_enter(SessionContext(None, "session", ApplicationContext("app")))
         result = await service.on_task_invoke(TaskContext("task", "session", cloudpickle.dumps(request)))
-        assert result == b"ref"
+        from flamepy.app import ServiceResponse
+        from flamepy.core import ValueRef
+
+        assert cloudpickle.loads(result) in (ServiceResponse(ValueRef(5)), ServiceResponse(ValueRef(10)))
         await service.on_session_leave()
 
     asyncio.run(exercise(function, ServiceRequest(args=(4,))))
     asyncio.run(exercise(Worker, ServiceRequest(method="add", args=(3,)), constructor_args=(7,)))
-    assert stored == [("app/session", 5), ("app/session", 10)]
+    assert stored == []
 
 
 def test_aio_app_worker_retains_class_across_session_bindings(monkeypatch):
@@ -321,12 +324,15 @@ def test_aio_app_worker_retains_class_across_session_bindings(monkeypatch):
                     cloudpickle.dumps(ServiceRequest(method="call")),
                 )
             )
-            assert result == b"ref"
+            from flamepy.app import ServiceResponse
+            from flamepy.core import ValueRef
+
+            assert cloudpickle.loads(result) == ServiceResponse(ValueRef(1 if session_id == "first" else 2))
             await service.on_session_leave()
 
     asyncio.run(exercise())
     assert Worker.creations == 1
-    assert stored == [("app/first", 1), ("app/second", 2)]
+    assert stored == []
 
 
 def test_aio_app_worker_isolates_invocation_attributes(monkeypatch):

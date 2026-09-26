@@ -40,7 +40,7 @@ session = flamepy.create_session(
     min_instances=1,
     resreq=flamepy.ResourceRequirement.from_string("cpu=1,mem=1g"),
 )
-output = session.invoke(b"hello")
+output = session.run(b"hello")
 session.close()
 ```
 
@@ -67,12 +67,15 @@ Methods:
 - `get_task(task_id) -> Task`
 - `list_tasks() -> Iterator[Task]`
 - `watch_task(task_id, timeout=None) -> TaskWatcher`
-- `invoke(input_data) -> bytes | None`
-- `run(input_data) -> concurrent.futures.Future`
+- `run(input_data) -> bytes`
+- `submit(input_data) -> TaskFuture`
 - `close() -> None`
 - `common_data() -> bytes | None`
 
-`create_task()` expects bytes. `run()` creates a task, watches it in the background, and resolves the returned `Future` with the task output.
+`create_task()` expects bytes. `run()` blocks until the task completes and
+returns its output. `submit()` returns immediately with a `TaskFuture`, a
+`concurrent.futures.Future` subclass that resolves with the task output and
+dispatches user completion callbacks away from the shared aio loop.
 
 ## Data Classes
 
@@ -257,8 +260,8 @@ Key classes and methods:
 - `open_session(*, ssn_id=None, language="python", runtime=None, min_instances=0, max_instances=None, resreq=None)`
 - `open_session()` creates a Python session using the server-default runtime
 - `open_session(ssn_id="...")` reopens a session by ID
-- `Session.run_code(code, input=None)`
-- `Session.submit_code(code, input=None)`
+- `Session.run_code(code, input=None) -> SessionOutput` blocks for output
+- `Session.submit_code(code, input=None) -> Future[SessionOutput]` returns immediately
 - `Session.close()`
 - `ssn.id`, `ssn.attr`
 - `SessionOutput.data`, `SessionOutput.text()`

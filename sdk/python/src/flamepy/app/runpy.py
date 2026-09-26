@@ -25,8 +25,9 @@ from flamepy.app._context import (
     _stage_response_attributes,
     _take_response_attributes,
 )
-from flamepy.app.types import ServiceContext, ServiceRequest
-from flamepy.core import ObjectRef
+from flamepy.app.client import ObjectFuture
+from flamepy.app.types import INLINE_PAYLOAD_LIMIT, ServiceContext, ServiceRequest, ServiceResponse
+from flamepy.core import ObjectRef, Ref, ValueRef
 from flamepy.core.aio.service import FlameService as AioFlameService
 from flamepy.core.service import SessionContext, TaskContext
 from flamepy.core.types import TaskOutput
@@ -80,33 +81,21 @@ class FlameRunpyService(AioFlameService):
         self._app_context = service_context
         self._execution_object = execution_object
 
-    def _collect_object_refs(self, args: Tuple, kwargs: Dict[str, Any]) -> List[Tuple[str, ObjectRef]]:
-        """Collect all ObjectRefs from args and kwargs for parallel resolution.
+    def _collect_refs(self, args: Tuple, kwargs: Dict[str, Any]) -> List[Tuple[str, Ref]]:
+        """Collect all Refs from args and kwargs for parallel resolution.
 
-        Returns (location, object_ref) pairs where location
+        Returns (location, ref) pairs where location
         is either 'arg:N' for positional args or 'kwarg:key' for keyword args.
         """
         refs = []
 
         for i, value in enumerate(args):
-            if isinstance(value, ObjectRef):
+            if isinstance(value, Ref):
                 refs.append((f"arg:{i}", value))
-            elif isinstance(value, bytes):
-                try:
-                    object_ref = ObjectRef.decode(value)
-                    refs.append((f"arg:{i}", object_ref))
-                except Exception:
-                    pass
 
         for key, value in kwargs.items():
-            if isinstance(value, ObjectRef):
+            if isinstance(value, Ref):
                 refs.append((f"kwarg:{key}", value))
-            elif isinstance(value, bytes):
-                try:
-                    object_ref = ObjectRef.decode(value)
-                    refs.append((f"kwarg:{key}", object_ref))
-                except Exception:
-                    pass
 
         return refs
 
@@ -118,10 +107,8 @@ class FlameRunpyService(AioFlameService):
 
         logger.debug(f"Execution object type: {type(execution_object)}")
 
-        # Decode the request sent by the App client.
         if context.input is None:
             raise ValueError("Task input is None")
-
         request = cloudpickle.loads(context.input)
         if not isinstance(request, ServiceRequest):
             raise ValueError(f"Expected ServiceRequest in task input, got {type(request)}")
@@ -169,8 +156,8 @@ class FlameRunpyService(AioFlameService):
         return method, raw_args, raw_kwargs, session_context
 
     async def _resolve_object_refs(self, args: Tuple, kwargs: Dict[str, Any]) -> Tuple[Tuple, Dict[str, Any]]:
-        """Fetch App arguments concurrently through the aio object cache."""
-        refs = self._collect_object_refs(args, kwargs)
+        """Resolve App references concurrently through the aio cache API."""
+        refs = self._collect_refs(args, kwargs)
         if not refs:
             return args, kwargs
 
@@ -181,7 +168,7 @@ class FlameRunpyService(AioFlameService):
                 try:
                     return location, await aio_core.get_object(object_ref)
                 except Exception as exc:
-                    raise ValueError(f"Failed to resolve ObjectRef at {location}: {exc}") from exc
+                    raise ValueError(f"Failed to resolve Ref at {location}: {exc}") from exc
 
         fetches = [asyncio.create_task(fetch(location, ref)) for location, ref in refs]
         try:
@@ -211,6 +198,16 @@ class FlameRunpyService(AioFlameService):
         self._ssn_ctx = context
         return True
 
+    @staticmethod
+    def _encode_result(result: Any) -> TaskOutput:
+        if isinstance(result, ObjectFuture):
+            raise TypeError("App services cannot return ObjectFuture; return a value or ObjectRef")
+        response = ServiceResponse(result if isinstance(result, (ValueRef, ObjectRef)) else ValueRef(result))
+        result_bytes = cloudpickle.dumps(response, protocol=cloudpickle.DEFAULT_PROTOCOL)
+        if len(result_bytes) > INLINE_PAYLOAD_LIMIT:
+            raise ValueError(f"App task output exceeds {INLINE_PAYLOAD_LIMIT} bytes; cache large results explicitly")
+        return TaskOutput(result_bytes)
+
     async def on_task_invoke(self, context: TaskContext) -> Optional[TaskOutput]:
         method, raw_args, raw_kwargs, session_context = await asyncio.to_thread(self._prepare_task, context)
         args, kwargs = await self._resolve_object_refs(raw_args, raw_kwargs)
@@ -218,16 +215,22 @@ class FlameRunpyService(AioFlameService):
             try:
                 if inspect.iscoroutinefunction(method):
                     result = await method(*args, **kwargs)
+                    output = await asyncio.to_thread(self._encode_result, result)
                 else:
-                    result = await asyncio.to_thread(method, *args, **kwargs)
-                    if inspect.isawaitable(result):
-                        result = await result
+                    # Keep synchronous user code and serialization in one thread hop.
+                    def invoke_and_encode():
+                        result = method(*args, **kwargs)
+                        if inspect.isawaitable(result):
+                            return result
+                        return self._encode_result(result)
+
+                    output = await asyncio.to_thread(invoke_and_encode)
+                    if inspect.isawaitable(output):
+                        result = await output
+                        output = await asyncio.to_thread(self._encode_result, result)
             finally:
                 _stage_response_attributes(invocation_context.attributes)
-
-        key_prefix = f"{session_context.application.name}/{session_context.session_id}"
-        result_ref = await aio_core.put_object(key_prefix, result)
-        return TaskOutput(result_ref.encode())
+        return output
 
     async def on_session_leave(self) -> bool:
         """Clear the active binding while retaining executor-scoped class instances."""

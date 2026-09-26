@@ -20,7 +20,7 @@ def main():
     session = flamepy.create_session("flmping")
     
     # Create and run a task
-    resp = session.invoke(b"task input data")
+    resp = session.run(b"task input data")
 
     # Handle the output of task
     print(resp)
@@ -82,14 +82,10 @@ Represents individual computing tasks within a session.
 from concurrent.futures import wait
 
 # Run a task synchronously (blocks until complete)
-result = session.invoke(b"input data")
+result = session.run(b"input data")
 
-# Run a task asynchronously (returns Future immediately)
-future = session.run(b"input data")
-result = future.result()  # Wait for completion
-
-# Run multiple tasks in parallel
-futures = [session.run(f"input {i}".encode()) for i in range(10)]
+# Submit multiple tasks without waiting for each CreateTask response
+futures = [session.submit(f"input {i}".encode()) for i in range(10)]
 wait(futures)  # Wait for all tasks to complete
 results = [f.result() for f in futures]
 

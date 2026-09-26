@@ -12,9 +12,9 @@ GitHub issue: https://github.com/xflops/flame/issues/499
 session = flamepy.create_session("flmexec")
 try:
     request = {"language": "python", "runtime": runtime, "code": script, "input": None}
-    raw = session.invoke(json.dumps(request).encode("utf-8"))
+    raw = session.run(json.dumps(request).encode("utf-8"))
 finally:
-    ssn.close()
+    session.close()
 
 output = bytes(json.loads(raw)["data"]).decode("utf-8")
 ```
@@ -27,7 +27,9 @@ That pattern shows up in e2e tests and agent examples. It has three problems:
 
 The purpose of Session is to simplify the Flame API for a domain and keep raw Flame APIs out of that domain. An agent imports `flamepy.agent` for Session. It may import base types such as `ResourceRequirement` and `FlameError` from `flamepy`. It should not create sessions, submit tasks, or name `flmexec`.
 
-`Runner` does not solve this. Runner packages a Python project and registers a new application on `flmrun`. Session runs scripts through the existing `flmexec` application and hides that path.
+`flamepy.app` packages Python code and registers an application on `flmrun`.
+Agent Session runs scripts through the existing `flmexec` application and
+hides that path.
 
 **Target:**
 
@@ -47,7 +49,8 @@ Success criteria:
 
 - An agent can run a remote script with `from flamepy.agent import open_session` and does not import the core `Session`, `Task`, `create_session`, or `flmexec`. `ResourceRequirement` and `FlameError` are imported from `flamepy` when needed.
 - A still-open session can be opened again by id and keep the same creation settings. `close()` destroys it.
-- Existing `flmexec`, Runner, and core Session APIs stay unchanged.
+- Agent Session reuses `flmexec` and core Session without changing App
+  packaging.
 - Unit tests cover codec, validation, create/open, and lifecycle without a cluster.
 - Cluster e2e covers python, shell, open, stdin, submit_code, and close.
 
@@ -63,14 +66,20 @@ The application name is the existing built-in `flmexec`. It is not configurable 
 
 **API:**
 
-Session lives in the `flamepy.agent` module, next to `flamepy.runner` and `flamepy.service`. It is the domain facade for script execution. Core Session/Task types stay in `flamepy` / `flamepy.core`.
+Session lives in the `flamepy.agent` module, next to `flamepy.app` and
+`flamepy.service`. It is the domain facade for script execution. Core
+Session/Task types stay in `flamepy` / `flamepy.core`.
 
 ```python
 from flamepy.agent import Session, SessionOutput, open_session
 from flamepy import ResourceRequirement, FlameError
 ```
 
-`flamepy` exports the `agent` submodule the same way it exports `runner` and `service`. `agent` must not re-export the core `Session`, `Task`, `create_session`, or the `flmexec` application name. Base types such as `ResourceRequirement` and `FlameError` stay on `flamepy`. Agent session types are not re-exported at the `flamepy` top level.
+`flamepy` exports the `agent` submodule the same way it exports `app` and
+`service`. `agent` must not re-export the core `Session`, `Task`,
+`create_session`, or the `flmexec` application name. Base types such as
+`ResourceRequirement` and `FlameError` stay on `flamepy`. Agent session
+types are not re-exported at the `flamepy` top level.
 
 ### Creation options
 
@@ -154,8 +163,8 @@ class Session:
 
 - Take only `code` and optional stdin `input`.
 - Always encode the `flmexec` request with the session's private language and runtime settings.
-- `run_code` is synchronous and maps to the underlying core `Session.invoke`.
-- `submit_code` returns a `Future[SessionOutput]` and maps to the underlying core `Session.run`, so one agent session can run scripts in parallel.
+- `run_code` is synchronous and maps to the underlying core `Session.run`.
+- `submit_code` returns a `Future[SessionOutput]` and maps to the underlying core `Session.submit`, so one agent session can run scripts in parallel.
 
 Lifecycle:
 
@@ -195,7 +204,7 @@ Task response:
 
 `data` is decoded with `bytes(response["data"])`.
 
-`None` from `Session.invoke` becomes `SessionOutput(data=b"")`.
+`None` from core `Session.run` becomes `SessionOutput(data=b"")`.
 
 Session `common_data` for the private creation settings:
 
@@ -270,8 +279,8 @@ Limitations:
 Related features:
 
 - `flmexec` application and `Script` / `ScriptOutput` JSON types. Hidden behind Session.
-- flamepy core `create_session`, `open_session`, `Session.invoke`, `Session.run`. Used only inside `flamepy.agent`.
-- `flamepy.runner`, which remains the packaging API for Python services.
+- flamepy core `create_session`, `open_session`, `Session.run`, `Session.submit`. Used only inside `flamepy.agent`.
+- `flamepy.app`, which packages Python code for remote execution.
 - `flamepy.service`, which remains the typed service-session helper.
 - Agent examples such as SRA. They should call `agent.open_session` instead of `create_session("flmexec")`.
 
@@ -293,7 +302,7 @@ user -> agent.open_session(ssn_id=id)
 
 user -> Session.run_code/submit_code
      -> encode Script JSON
-     -> core Session.invoke/run("flmexec")
+     -> core Session.run/submit("flmexec")
      -> flmexec-service
      -> PythonScript / ShellScript
      -> ScriptOutput JSON
@@ -373,12 +382,12 @@ These stay private. Call sites only need `open_session`, `run_code`, and `submit
 `run_code`:
 
 1. Encode `flmexec` request JSON from `code`, `input`, and the session's private settings.
-2. `output = self._session.invoke(payload)`.
+2. `output = self._session.run(payload)`.
 3. Decode `SessionOutput`.
 
-`submit_code` is the same path with `self._session.run(payload)` and a wrapper that decodes the future result.
+`submit_code` is the same path with `self._session.submit(payload)` and a wrapper that decodes the future result.
 
-Do not wrap the future in another thread. Decode when the caller reads the result.
+Do not wrap the future in another thread. Decode when the core future completes.
 
 **System Considerations:**
 
@@ -464,7 +473,8 @@ v1 must not add a dead `mounts` field. Document the extension only.
 
 **Related Documents:**
 
-- [RFE280 Runner](../RFE280-runner/RFE280-runner.md): packaging API. Session does not package or register applications.
+- [App setup guide](../../tutorials/app-setup.md): application packaging and
+  remote execution. Agent Session does not package or register applications.
 - [RFE352 open-session](../RFE352-open-session-enhancement/FS.md): the core `open_session` is the reopen path used by the ID form.
 - [RFE455 flame-rs API](../RFE455-simplify-flame-rs-api/FS.md): `FlameMessage` JSON is the `flmexec` payload contract.
 
@@ -481,4 +491,4 @@ v1 must not add a dead `mounts` field. Document the extension only.
 - `e2e/tests/test_flmexec.py`: current raw flamepy usage
 - `e2e/tests/test_agent.py`: Agent Session cluster coverage
 - `examples/agents/sra/readme.md`: session-reuse agent pattern
-- `sdk/python/src/flamepy/core/client.py`: `create_session`, `open_session`, `Session.invoke`, `Session.run`
+- `sdk/python/src/flamepy/core/client.py`: `create_session`, `open_session`, `Session.run`, `Session.submit`

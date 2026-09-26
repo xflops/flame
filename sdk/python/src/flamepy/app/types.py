@@ -16,6 +16,10 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
+from flamepy.core.cache import ObjectRef, Ref, ValueRef
+
+INLINE_PAYLOAD_LIMIT = 128 * 1024
+
 
 def _is_function(execution_object: Any) -> bool:
     """Return whether an execution object has function rather than object semantics."""
@@ -89,9 +93,9 @@ class ServiceRequest:
         method: The name of the method to invoke within the customized application.
                 Should be None if the execution object itself is a function or callable.
         args: A tuple containing positional arguments for the method. Optional.
-                Can contain ObjectRef instances that will be resolved at runtime.
+                Can contain ValueRef or ObjectRef instances resolved at runtime.
         kwargs: A dictionary of keyword arguments for the method. Optional.
-                Can contain ObjectRef instances that will be resolved at runtime.
+                Can contain ValueRef or ObjectRef instances resolved at runtime.
 
     Note: If both args and kwargs are None, the method will be called without arguments.
     """
@@ -108,3 +112,14 @@ class ServiceRequest:
             raise ValueError(f"args must be a tuple or list, got {type(self.args)}")
         if self.kwargs is not None and not isinstance(self.kwargs, dict):
             raise ValueError(f"kwargs must be a dict, got {type(self.kwargs)}")
+
+
+@dataclass
+class ServiceResponse:
+    """Successful App task response containing an inline or cached reference."""
+
+    result: Ref
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.result, (ValueRef, ObjectRef)):
+            raise TypeError(f"ServiceResponse result must be ValueRef or ObjectRef, got {type(self.result).__name__}")

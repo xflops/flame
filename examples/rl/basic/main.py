@@ -61,7 +61,7 @@ def train_distributed(
             weights_ref = app.put(policy.state_dict())
 
             futures = [
-                collect_episode(env_name, weights_ref)
+                collect_episode.remote(env_name, weights_ref)
                 for _ in range(episodes_per_iteration)
             ]
             episodes = app.get(futures)

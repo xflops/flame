@@ -128,7 +128,7 @@ class Session:
 
         # For service module: serialize input with cloudpickle, call core API, then deserialize output
         input_bytes = cloudpickle.dumps(req, protocol=cloudpickle.DEFAULT_PROTOCOL)
-        output_bytes = self._session.invoke(input_bytes)
+        output_bytes = self._session.run(input_bytes)
 
         if output_bytes is None:
             return None

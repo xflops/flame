@@ -44,7 +44,7 @@ server watch protocol change and can be implemented on its own branch.
 `connect`, `create_session`, `open_session`, `get_session`, `list_sessions`,
 `close_session`, application operations, `list_executors`, and `list_nodes`
 keep their names. So do `Session.create_task`, `get_task`, `list_tasks`,
-`watch_task`, `invoke`, `run`, and `close`. The aio `Connection` and `Session`
+`watch_task`, `run`, `submit`, and `close`. The aio `Connection` and `Session`
 cover the complete current synchronous frontend API.
 
 The cache functions `put_object`, `get_object`, `update_object`,
@@ -60,8 +60,9 @@ import flamepy.core as flame
 
 connection = flame.connect("http://localhost:8080")
 session = connection.create_session(attrs)
-future = session.run(b"request")
-result = future.result()
+result = session.run(b"request")
+future = session.submit(b"another request")
+later_result = future.result()
 session.close()
 connection.close()
 ```
@@ -72,15 +73,16 @@ import flamepy.core.aio as flame
 
 async with await flame.connect("http://localhost:8080") as connection:
     session = await connection.create_session(attrs)
-    future = await session.run(b"request")
-    result = await future
+    result = await session.run(b"request")
+    future = session.submit(b"another request")
+    later_result = await future
     await session.close()
 ```
 
-Synchronous `run` waits for task creation and schedules the watch, then
-returns a `concurrent.futures.Future[bytes]`. Aio `run` awaits those two
-operations and returns an `asyncio.Future[bytes]`; awaiting it waits for task
-completion. `invoke` waits for output in both namespaces. `list_tasks` and
+Synchronous `run` blocks until task completion and returns bytes. Aio `run`
+awaits completion and returns bytes. Synchronous `submit` returns a
+`TaskFuture` immediately, and aio `submit` returns an `asyncio.Task[bytes]`.
+`list_tasks` and
 `watch_task` return blocking iterators in sync and async iterators in aio.
 Both call the existing server-streaming `WatchTask` RPC for an individual
 task. The stream delivers the current status and then later updates until
@@ -180,16 +182,18 @@ running loop and use it only on that loop.
 
 The aio `Connection` owns one `grpc.aio.Channel` and its frontend stub. Aio
 `Session.watch_task()` opens the existing server-streaming `WatchTask` RPC
-for one task. `Session.run()` creates a task and starts a coroutine to consume
-that task's watch stream until completion or error, resolving a loop-owned
-future. This removes the current worker-thread-per-task watch cost without
+for one task. Aio `Session.run()` awaits task output; `Session.submit()`
+returns an asyncio task immediately. Both paths consume the watch stream
+through a loop-owned result future. This removes the current
+worker-thread-per-task watch cost without
 changing the number of server watch streams. The synchronous `TaskWatcher`
 adapts an aio iterator through a bounded handoff, so slow sync readers
 cannot block the aio event loop or grow an unbounded queue.
 
-Sync `Session.run()` maps the aio result future to a
-`concurrent.futures.Future`. The aio watch coroutine completes the result;
-user callbacks run on a bounded callback executor, outside the aio loop.
+Sync `Session.submit()` maps the aio result future to a `TaskFuture`, a
+`concurrent.futures.Future` subclass. Sync `Session.run()` waits on that
+future and returns the task output. The aio watch coroutine completes the
+result; user callbacks run on a bounded callback executor, outside the aio loop.
 The sync `list_tasks()` and `watch_task()` adapt aio iterators to blocking
 iterators without blocking the aio loop. Connection close errors remaining
 local subscribers and cancels streams. Session close follows the current

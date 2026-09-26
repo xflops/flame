@@ -11,7 +11,7 @@ from flamepy.core.aio.cache import (
 )
 from flamepy.core.aio.client import Connection, Session, TaskIterator, TaskWatcher, connect
 from flamepy.core.aio.service import FlameInstanceServer, FlameService, run
-from flamepy.core.cache import ObjectKey, ObjectRef
+from flamepy.core.cache import ObjectKey, ObjectRef, Ref, ValueRef
 from flamepy.core.types import (
     Application,
     ApplicationAttributes,
@@ -41,6 +41,8 @@ __all__ = [
     "connect",
     "ObjectKey",
     "ObjectRef",
+    "Ref",
+    "ValueRef",
     "Application",
     "ApplicationAttributes",
     "ApplicationSchema",

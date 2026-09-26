@@ -160,7 +160,22 @@ def serialize_app_service_request(request: app.ServiceRequest) -> bytes:
     Returns:
         bytes representation of the request
     """
-    return cloudpickle.dumps(request, protocol=cloudpickle.DEFAULT_PROTOCOL)
+    from flamepy.app.types import INLINE_PAYLOAD_LIMIT
+
+    data = cloudpickle.dumps(request, protocol=cloudpickle.DEFAULT_PROTOCOL)
+    if len(data) > INLINE_PAYLOAD_LIMIT:
+        raise ValueError(f"App task input exceeds {INLINE_PAYLOAD_LIMIT} bytes")
+    return data
+
+
+def deserialize_app_service_output(data: bytes):
+    """Read an inline App result from a task RPC."""
+    from flamepy.app import ServiceResponse
+
+    response = cloudpickle.loads(data)
+    if not isinstance(response, ServiceResponse):
+        raise TypeError(f"Expected ServiceResponse, got {type(response).__name__}")
+    return get_object(response.result)
 
 
 def serialize_common_data(common_data: Optional[TestContext], app_name: str) -> Optional[bytes]:
@@ -297,7 +312,7 @@ def invoke_task(session, request: TestRequest) -> TestResponse:
         TestResponse object
     """
     request_bytes = serialize_request(request)
-    response_bytes = session.invoke(request_bytes)
+    response_bytes = session.run(request_bytes)
     return deserialize_response(response_bytes)
 
 
@@ -341,7 +356,7 @@ class RecursiveService:
             class InnerRecursiveService(type(self)):
                 pass
 
-            inner_service = InnerRecursiveService()
+            inner_service = InnerRecursiveService.remote()
             logger.info(f"[RecursiveService] Inner service created, session_id={inner_service._session.id}")
 
             logger.info(f"[RecursiveService] Calling compute_recursive({depth - 1}) on inner service")

@@ -17,8 +17,8 @@ from typing import Any, Dict, Optional
 
 import cloudpickle
 
-from flamepy.app.types import ServiceRequest
-from flamepy.core import ObjectRef, get_object
+from flamepy.app.types import ServiceRequest, ServiceResponse
+from flamepy.core import ObjectRef, Ref, ValueRef, get_object
 
 
 class ErrorType(Enum):
@@ -142,15 +142,10 @@ def get_data(data: bytes) -> Dict[str, Any]:
     decodes the data, and resolves any nested ObjectRef instances to their
     actual values.
 
-    The data can be in one of two formats:
-    1. An encoded ObjectRef (BSON format) pointing to cached data
-    2. Directly pickled data (ServiceRequest or result)
+    App task data is serialized directly in the task input or output.
 
     Args:
-        data: Raw bytes from task input or output. This can be either:
-              - An encoded ObjectRef pointing to cached data
-              - Directly pickled ServiceRequest (for task input)
-              - Directly pickled result object (for task output)
+        data: Serialized bytes from an App task input or output.
 
     Returns:
         A dictionary containing the resolved data:
@@ -191,29 +186,26 @@ def get_data(data: bytes) -> Dict[str, Any]:
         ...         output_data = get_data(task.output)
         ...         print(f"Task {task.id} output: {output_data}")
     """
-    # Try to determine the data format and decode accordingly
     object_ref = None
-    cached_data = None
-
-    # Strategy 1: Try to decode as pickled data first if it looks like pickle
-    if _is_pickle_data(data):
-        try:
-            cached_data = cloudpickle.loads(data)
-        except Exception:
-            # Not valid pickle, try ObjectRef decode
-            pass
-
-    # Strategy 2: Try to decode as ObjectRef (BSON format)
-    if cached_data is None:
+    is_output = False
+    try:
+        cached_data = cloudpickle.loads(data)
+        if isinstance(cached_data, ServiceResponse):
+            is_output = True
+            cached_data = cached_data.result
+            if not isinstance(cached_data, (ValueRef, ObjectRef)):
+                raise Error(ErrorType.DATA_FORMAT_ERROR, "ServiceResponse result must be ValueRef or ObjectRef")
+    except Error:
+        raise
+    except Exception:
         try:
             object_ref = ObjectRef.decode(data)
         except Exception as decode_error:
-            # If both pickle and ObjectRef decode failed, raise error
             raise Error(
                 ErrorType.DECODE_ERROR,
-                f"Failed to decode data: not valid ObjectRef or pickled data: {decode_error}",
+                f"Failed to decode App task data: {decode_error}",
                 cause=decode_error,
-            )
+            ) from decode_error
 
         # Retrieve object from cache
         try:
@@ -226,23 +218,38 @@ def get_data(data: bytes) -> Dict[str, Any]:
                 key=getattr(object_ref, "key", None),
             )
 
-        # Check if cached data is serialized bytes that needs unpickling
-        if isinstance(cached_data, bytes):
+        # Cached inputs contain a serialized ServiceRequest; cached outputs
+        # retain their original Python type (which may itself be bytes).
+        if isinstance(cached_data, bytes) and _is_pickle_data(cached_data):
             try:
-                cached_data = cloudpickle.loads(cached_data)
+                decoded = cloudpickle.loads(cached_data)
             except Exception:
-                # Not pickled data, use as-is
                 pass
+            else:
+                if isinstance(decoded, ServiceRequest):
+                    cached_data = decoded
 
     # Determine type and process accordingly
-    if isinstance(cached_data, ServiceRequest):
+    if isinstance(cached_data, ServiceRequest) and not is_output:
         # This is task input
         return _process_app_request(cached_data, object_ref)
     else:
-        # This is task output (result)
+        # This is task output (result).
         metadata = {}
         if object_ref is not None:
             metadata["object_ref_key"] = object_ref.key
+        if isinstance(cached_data, Ref):
+            if isinstance(cached_data, ObjectRef):
+                metadata["object_ref_key"] = cached_data.key
+            try:
+                cached_data = get_object(cached_data)
+            except Exception as exc:
+                raise Error(
+                    ErrorType.CACHE_RETRIEVAL_ERROR,
+                    f"Failed to retrieve object from cache: {exc}",
+                    cause=exc,
+                    key=metadata.get("object_ref_key"),
+                ) from exc
         output_data = TaskOutputData(
             result=cached_data,
             metadata=metadata,
@@ -304,8 +311,8 @@ def _resolve_value(value: Any, max_depth: int = 10, _current_depth: int = 0) -> 
     if _current_depth > max_depth:
         return value
 
-    # Handle ObjectRef directly
-    if isinstance(value, ObjectRef):
+    # Handle inline and cache-backed references directly.
+    if isinstance(value, Ref):
         try:
             return get_object(value)
         except Exception as e:

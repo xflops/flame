@@ -4,6 +4,7 @@
 # ruff: noqa: N802
 
 import asyncio
+import threading
 
 import grpc
 import pytest
@@ -17,10 +18,13 @@ from flamepy.proto.frontend_pb2_grpc import FrontendServicer, add_FrontendServic
 class FrontendFixture(FrontendServicer):
     def __init__(self):
         self.watches = 0
+        self.watch_requests = []
         self.release = asyncio.Event()
         self.requests = []
         self.reject_close = False
         self.reject_create_task = False
+        self.create_task_gate = None
+        self.create_task_started = threading.Event()
 
     def _session(self, session_id="sess-1"):
         return pb.Session(
@@ -82,6 +86,9 @@ class FrontendFixture(FrontendServicer):
         return self._session(request.session_id)
 
     async def CreateTask(self, request, context):
+        if self.create_task_gate is not None:
+            self.create_task_started.set()
+            await self.create_task_gate.wait()
         if self.reject_create_task:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "task rejected")
         self.requests.append(request)
@@ -94,17 +101,39 @@ class FrontendFixture(FrontendServicer):
     async def ListTasks(self, request, context):
         yield self._task()
 
-    async def WatchTask(self, request, context):
+    async def WatchTasks(self, requests, context):
         self.watches += 1
-        if request.task_id == "hold":
-            yield self._task("hold", TaskState.PENDING)
+        updates = asyncio.Queue()
+        release_tasks = []
+
+        async def after_release(task_id):
             await self.release.wait()
-            yield self._task("hold")
-        elif request.task_id == "error":
-            yield self._task("error", TaskState.PENDING)
-            await context.abort(grpc.StatusCode.INTERNAL, "watch failed")
-        else:
-            yield self._task(request.task_id)
+            await updates.put(self._task(task_id))
+
+        async def receive():
+            async for request in requests:
+                self.watch_requests.append(request.task_id)
+                if request.task_id == "hold":
+                    await updates.put(self._task("hold", TaskState.PENDING))
+                    release_tasks.append(asyncio.create_task(after_release("hold")))
+                elif request.task_id == "error":
+                    await updates.put(self._task("error", TaskState.PENDING))
+                    await updates.put(None)
+                else:
+                    await updates.put(self._task(request.task_id))
+
+        reader = asyncio.create_task(receive())
+        try:
+            while True:
+                update = await updates.get()
+                if update is None:
+                    await context.abort(grpc.StatusCode.INTERNAL, "watch failed")
+                yield update
+        finally:
+            reader.cancel()
+            for task in release_tasks:
+                task.cancel()
+            await asyncio.gather(reader, *release_tasks, return_exceptions=True)
 
 
 @pytest.fixture

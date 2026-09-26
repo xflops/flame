@@ -12,13 +12,15 @@ limitations under the License.
 """
 
 from flamepy.app._context import publish_attributes, session_context
-from flamepy.app.types import ServiceContext, ServiceRequest
+from flamepy.app.types import ServiceContext, ServiceRequest, ServiceResponse
+from flamepy.core import Ref, ValueRef
 
 # The private restoration hook remains available for older serialized proxies
 # but stays outside ``__all__``.
 from flamepy.app.client import (  # isort: skip
     ObjectFuture,
     ObjectFutureIterator,
+    ServiceDefinition,
     ServiceInstance,
     _restore_service_instance as _restore_service_instance,
     destroy,
@@ -26,6 +28,7 @@ from flamepy.app.client import (  # isort: skip
     init,
     put,
     ref,
+    remote,
     select,
     service,
     wait,
@@ -34,15 +37,20 @@ from flamepy.app.client import (  # isort: skip
 __all__ = [
     "ObjectFuture",
     "ObjectFutureIterator",
+    "Ref",
     "ServiceContext",
+    "ServiceDefinition",
     "ServiceInstance",
     "ServiceRequest",
+    "ServiceResponse",
+    "ValueRef",
     "destroy",
     "get",
     "init",
     "put",
     "publish_attributes",
     "ref",
+    "remote",
     "select",
     "service",
     "session_context",

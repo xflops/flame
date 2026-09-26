@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Union
 
 from flamepy.core._bridge import LoopThread
@@ -126,7 +126,7 @@ class Connection:
         self._close_lock = threading.Lock()
         self._callback_lock = threading.Lock()
         self._callback_closed = False
-        self._pending: set[Future] = set()
+        self._pending: set[TaskFuture] = set()
         self._pending_lock = threading.Lock()
         self._closed = False
 
@@ -152,11 +152,7 @@ class Connection:
     def _dispatch_callbacks(self, callbacks, future: Future, *, has_slot: bool = False) -> None:
         def invoke() -> None:
             try:
-                for callback in callbacks:
-                    try:
-                        callback(future)
-                    except Exception:
-                        logger.exception("Flame task completion callback failed")
+                self._invoke_callbacks(callbacks, future)
             finally:
                 if has_slot:
                     self._release_callback_slot()
@@ -171,6 +167,14 @@ class Connection:
             threading.Thread(target=invoke, name="flamepy-late-callback", daemon=True).start()
         else:
             invoke()
+
+    @staticmethod
+    def _invoke_callbacks(callbacks, future: Future) -> None:
+        for callback in callbacks:
+            try:
+                callback(future)
+            except Exception:
+                logger.exception("Flame task completion callback failed")
 
     def close(self) -> None:
         with self._close_lock:
@@ -281,11 +285,16 @@ class Session:
 
         return TaskWatcher(self.connection._bridge, self.connection._call(start()))
 
-    def invoke(self, input_data: bytes, option: Optional[TaskOptions] = None) -> bytes:
-        return self.run(input_data, option).result()
+    def run(self, input_data: bytes, option: Optional[TaskOptions] = None) -> bytes:
+        """Run a task and return its output when it completes."""
+        return self.submit(input_data, option).result()
 
-    def run(self, input_data: bytes, option: Optional[TaskOptions] = None) -> Future:
-        result = _LazyTaskFuture(self)
+    def submit(self, input_data: bytes, option: Optional[TaskOptions] = None) -> "TaskFuture":
+        """Schedule a task without waiting for CreateTask to acknowledge it."""
+        return self._start_task(input_data, option)
+
+    def _start_task(self, input_data: bytes, option: Optional[TaskOptions]) -> "TaskFuture":
+        result = TaskFuture(self.connection)
         with self.connection._pending_lock:
             self.connection._pending.add(result)
 
@@ -295,7 +304,10 @@ class Session:
 
         result._add_internal_callback(remove_pending)
 
-        async def start() -> None:
+        async def start() -> Future:
+            if result.done():
+                return result
+
             async def before_result() -> bool:
                 await self.connection._callback_slots.acquire()
                 if result._hold_callback_slot():
@@ -303,13 +315,16 @@ class Session:
                 self.connection._callback_slots.release()
                 return False
 
-            aio_future = await self._aio.run(
+            aio_future = await self._aio._start_task(
                 input_data,
                 option,
                 _defer_watch=True,
                 _before_result=before_result,
                 _discard_result_slot=result._release_held_callback_slot,
             )
+            if result.done():
+                aio_future.cancel()
+                return result
 
             def completed(done: asyncio.Future) -> None:
                 if result.done():
@@ -332,13 +347,31 @@ class Session:
                         pass
 
             result._add_internal_callback(cancelled)
+            return result
 
         try:
-            self.connection._call(start())
+            submission = self.connection._bridge.submit(start())
         except BaseException:
             with self.connection._pending_lock:
                 self.connection._pending.discard(result)
             raise
+
+        def submitted(done: Future) -> None:
+            try:
+                done.result()
+            except CancelledError:
+                if not result.done():
+                    message = "connection closed during task submission" if self.connection._closed else "task submission cancelled"
+                    result.set_exception(FlameError(FlameErrorCode.INTERNAL, message))
+            except BaseException as error:
+                if not result.done():
+                    if self.connection._closed:
+                        result.set_exception(FlameError(FlameErrorCode.INTERNAL, "connection closed during task submission"))
+                    else:
+                        result.set_exception(error)
+
+        submission.add_done_callback(submitted)
+        result._add_internal_callback(lambda done: submission.cancel() if done.cancelled() else None)
         return result
 
     def close(self) -> None:
@@ -385,30 +418,34 @@ class TaskIterator(_AsyncIteratorFacade):
     """Blocking iterator for a session's tasks."""
 
 
-class _LazyTaskFuture(Future):
-    """Thread-safe completion handle for a remotely running task."""
+class TaskFuture(Future):
+    """Task result Future that dispatches user callbacks off the aio loop."""
 
-    def __init__(self, session: Session):
+    def __init__(self, connection: Connection):
         super().__init__()
-        self._session = session
+        self._connection = connection
         self._user_callbacks = []
         self._user_callback_lock = threading.Lock()
         self._has_callback_slot = False
         self._close_callbacks_deferred = False
         super().add_done_callback(self._dispatch_registered_callbacks)
 
-    def _dispatch_registered_callbacks(self, _future: Future) -> None:
+    def _take_callbacks(self, *, deferred: bool = False):
         with self._user_callback_lock:
-            if self._close_callbacks_deferred:
-                return
-            callbacks = self._user_callbacks
-            self._user_callbacks = []
-            has_slot = self._has_callback_slot
-            self._has_callback_slot = False
+            if self._close_callbacks_deferred and not deferred:
+                return [], False
+            callbacks, self._user_callbacks = self._user_callbacks, []
+            has_slot, self._has_callback_slot = self._has_callback_slot, False
+            if deferred:
+                self._close_callbacks_deferred = False
+        return callbacks, has_slot
+
+    def _dispatch_registered_callbacks(self, _future: Future) -> None:
+        callbacks, has_slot = self._take_callbacks()
         if callbacks:
-            self._session.connection._dispatch_callbacks(callbacks, self, has_slot=has_slot)
+            self._connection._dispatch_callbacks(callbacks, self, has_slot=has_slot)
         elif has_slot:
-            self._session.connection._release_callback_slot()
+            self._connection._release_callback_slot()
 
     def _hold_callback_slot(self) -> bool:
         with self._user_callback_lock:
@@ -422,28 +459,19 @@ class _LazyTaskFuture(Future):
             has_slot = self._has_callback_slot
             self._has_callback_slot = False
         if has_slot:
-            self._session.connection._release_callback_slot()
+            self._connection._release_callback_slot()
 
     def _defer_close_callbacks(self) -> None:
         with self._user_callback_lock:
             self._close_callbacks_deferred = True
 
     def _run_deferred_callbacks(self) -> None:
-        with self._user_callback_lock:
-            callbacks = self._user_callbacks
-            self._user_callbacks = []
-            self._close_callbacks_deferred = False
-            has_slot = self._has_callback_slot
-            self._has_callback_slot = False
+        callbacks, has_slot = self._take_callbacks(deferred=True)
         try:
-            for callback in callbacks:
-                try:
-                    callback(self)
-                except Exception:
-                    logger.exception("Flame task completion callback failed")
+            self._connection._invoke_callbacks(callbacks, self)
         finally:
             if has_slot:
-                self._session.connection._release_callback_slot()
+                self._connection._release_callback_slot()
 
     def _add_internal_callback(self, callback) -> None:
         super().add_done_callback(callback)
@@ -451,7 +479,7 @@ class _LazyTaskFuture(Future):
     def cancel(self) -> bool:
         if self.done():
             return False
-        if self._session.connection._bridge.is_loop_thread():
+        if self._connection._bridge.is_loop_thread():
             raise RuntimeError("synchronous Future.cancel cannot run on its aio loop")
         # Future.cancel() normally invokes callbacks inline on its caller.
         # Preserve that behavior so cancellation never queues callbacks or

@@ -16,6 +16,8 @@ from .cache import (
     WILDCARD_SESSION,
     ObjectKey,
     ObjectRef,
+    Ref,
+    ValueRef,
     delete_objects,
     download_object,
     get_object,
@@ -31,6 +33,7 @@ from .client import (
     Connection,
     ConnectionInstance,
     Session,
+    TaskFuture,
     TaskWatcher,
     close_session,
     connect,
@@ -157,6 +160,7 @@ __all__ = [
     "ConnectionInstance",
     "Connection",
     "Session",
+    "TaskFuture",
     "TaskWatcher",
     # Service constants
     "FLAME_INSTANCE_ENDPOINT",
@@ -175,6 +179,8 @@ __all__ = [
     "WILDCARD_SESSION",
     "ObjectKey",
     "ObjectRef",
+    "Ref",
+    "ValueRef",
     # Cache functions
     "download_object",
     "delete_objects",

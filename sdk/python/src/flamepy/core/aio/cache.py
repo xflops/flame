@@ -28,7 +28,7 @@ import grpc
 import pyarrow as pa
 
 from flamepy.core import cache as common
-from flamepy.core.cache import Deserializer, FetchMode, FetchResult, Object, ObjectKey, ObjectRef, Patch
+from flamepy.core.cache import Deserializer, FetchMode, FetchResult, Object, ObjectKey, ObjectRef, Patch, Ref, ValueRef
 from flamepy.core.types import FlameClientCache, FlameClientTls
 from flamepy.proto import cache_pb2, cache_pb2_grpc
 
@@ -190,7 +190,11 @@ async def _fetch_object_data(ref: ObjectRef, cached_version: int) -> Optional[Fe
     return await asyncio.to_thread(_decode_parts, header, parts)
 
 
-async def get_object(ref: ObjectRef, deserializer: Optional[Deserializer] = None) -> Any:
+async def get_object(ref: Ref, deserializer: Optional[Deserializer] = None) -> Any:
+    if isinstance(ref, ValueRef):
+        return ref.value if deserializer is None else await asyncio.to_thread(deserializer, ref.value, [])
+    if not isinstance(ref, ObjectRef):
+        raise TypeError(f"Expected ValueRef or ObjectRef, got {type(ref).__name__}")
     ObjectKey.from_key(ref.key)
     cache_key = (ref.endpoint, ref.key)
     cached = None if ref.version == 0 else common._cache_get(cache_key)
@@ -213,6 +217,8 @@ async def get_object(ref: ObjectRef, deserializer: Optional[Deserializer] = None
             cached = common._cache_put(cache_key, cached)
     else:
         raise ValueError(f"Unexpected object fetch mode: {result.mode}")
+    if deserializer is None:
+        return cached.data
     return await asyncio.to_thread(common._materialize_object, cached, deserializer)
 
 
@@ -319,4 +325,4 @@ async def download_object(ref: ObjectRef, dest_path: str) -> None:
         raise ValueError(f"Failed to download file from cache server: {exc}") from exc
 
 
-__all__ = ["ObjectRef", "ObjectKey", "put_object", "get_object", "update_object", "patch_object", "delete_objects", "upload_object", "download_object", "close"]
+__all__ = ["Ref", "ValueRef", "ObjectRef", "ObjectKey", "put_object", "get_object", "update_object", "patch_object", "delete_objects", "upload_object", "download_object", "close"]

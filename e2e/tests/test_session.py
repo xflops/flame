@@ -350,7 +350,7 @@ class TestTaskStateTransitions:
             request_bytes = _serialize_request(request)
             task = session.create_task(request_bytes)
 
-            # Task starts in PENDING state
+            # The task may advance before this status read.
             initial_task = session.get_task(task.id)
             assert initial_task.state in [TaskState.PENDING, TaskState.RUNNING, TaskState.SUCCEED]
 
@@ -696,7 +696,7 @@ class TestConcurrentTasks:
         futures = []
         for i in range(task_num):
             request = TestRequest(input=f"parallel_task_{i}")
-            future = session.run(serialize_request(request))
+            future = session.submit(serialize_request(request))
             futures.append(future)
 
         wait(futures)

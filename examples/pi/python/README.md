@@ -24,9 +24,11 @@ The Pi example demonstrates how to use the `flamepy.app` API to perform a distri
 
 - **Parallel Batching with App**: Instead of estimating with a single massive batch, the workload is split into multiple batches (`num_batches`), each consisting of `samples_per_batch` points. This enables parallel execution.
 
-- **Distributed Execution**: Call `app.init()` once, then use `@app.service()`
-  to turn `estimate_batch` into a remote service. Each invocation can run in
-  parallel across the available compute resources in the Flame cluster.
+- **Distributed Execution**: Call `app.init()` once, declare `estimate_batch`
+  with `@app.service()`, then call `estimate_batch.remote(samples_per_batch)`
+  to submit a task on its shared session.
+  Calls through the shared session can run in parallel across the available
+  compute resources in the Flame cluster.
 
 - **Aggregation**: Results from all batches are collected and summed. The final estimate for π is computed based on the total points inside the circle versus all samples.
 

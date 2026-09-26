@@ -1,7 +1,9 @@
 """Tests for the Flame synchronous core facade and shared types."""
 
+import asyncio
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import pytest
@@ -58,7 +60,7 @@ def test_sync_frontend_api_parity(frontend_server):
         assert session.get_task(task.id).input == b""
         assert [item.id for item in session.list_tasks()] == ["task-1"]
         assert next(session.watch_task(task.id)).output == b"done"
-        assert session.invoke(b"input") == b"done"
+        assert session.run(b"input") == b"done"
         assert connection.close_session(session.id).id == session.id
         created = [req for req in service.requests if req.DESCRIPTOR.name == "CreateSessionRequest"]
         assert created[0].session.resreq.cpu == 2
@@ -94,14 +96,129 @@ def test_run_reports_create_task_error_before_return(frontend_server):
         connection.close()
 
 
+def test_submit_reports_create_task_error_on_future(frontend_server):
+    endpoint, service, _ = frontend_server
+    connection = client.connect(endpoint)
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        service.reject_create_task = True
+        future = session.submit(b"input")
+        with pytest.raises(FlameError, match="task rejected"):
+            future.result(timeout=3)
+        assert service.watches == 0
+    finally:
+        connection.close()
+
+
+def test_run_returns_task_output(frontend_server):
+    endpoint, service, server_loop = frontend_server
+    connection = client.connect(endpoint)
+    service.create_task_gate = asyncio.Event()
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            output = pool.submit(session.run, b"hold")
+            try:
+                assert service.create_task_started.wait(3)
+                assert not output.done()
+            finally:
+                server_loop.loop.call_soon_threadsafe(service.create_task_gate.set)
+                server_loop.call(_release(service))
+            assert output.result(timeout=3) == b"done"
+    finally:
+        connection.close()
+
+
+def test_submit_pipelines_create_task_requests(frontend_server):
+    endpoint, service, server_loop = frontend_server
+    connection = client.connect(endpoint)
+    service.create_task_gate = asyncio.Event()
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            batch = pool.submit(lambda: [session.submit(b"input") for _ in range(20)])
+            try:
+                futures = batch.result(timeout=3)
+                assert service.create_task_started.wait(3)
+                assert all(not future.done() for future in futures)
+            finally:
+                server_loop.loop.call_soon_threadsafe(service.create_task_gate.set)
+        assert [future.result(timeout=3) for future in futures] == [b"done"] * 20
+    finally:
+        connection.close()
+
+
+def test_submit_cancel_before_create_task_does_not_send_rpc(frontend_server):
+    endpoint, service, _ = frontend_server
+    connection = client.connect(endpoint)
+    release_loop = threading.Event()
+    loop_blocked = threading.Event()
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        before = len(service.requests)
+
+        def block_loop():
+            loop_blocked.set()
+            release_loop.wait(timeout=3)
+
+        connection._bridge.loop.call_soon_threadsafe(block_loop)
+        assert loop_blocked.wait(3)
+        future = session.submit(b"input")
+        assert future.cancel()
+        release_loop.set()
+        connection._call(asyncio.sleep(0.05))
+        assert len(service.requests) == before
+        assert future.cancelled()
+    finally:
+        release_loop.set()
+        connection.close()
+
+
+def test_submit_cancel_during_create_task_does_not_start_watch(frontend_server):
+    endpoint, service, server_loop = frontend_server
+    connection = client.connect(endpoint)
+    service.create_task_gate = asyncio.Event()
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        future = session.submit(b"input")
+        assert service.create_task_started.wait(3)
+        assert future.cancel()
+        server_loop.loop.call_soon_threadsafe(service.create_task_gate.set)
+        connection._call(asyncio.sleep(0.05))
+        assert future.cancelled()
+        assert service.watches == 0
+    finally:
+        server_loop.loop.call_soon_threadsafe(service.create_task_gate.set)
+        connection.close()
+
+
+def test_submit_close_during_create_task_errors_future(frontend_server):
+    endpoint, service, server_loop = frontend_server
+    connection = client.connect(endpoint)
+    service.create_task_gate = asyncio.Event()
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        future = session.submit(b"input")
+        assert service.create_task_started.wait(3)
+        connection.close()
+        with pytest.raises(FlameError, match="connection closed"):
+            future.result(timeout=3)
+        assert service.watches == 0
+    finally:
+        server_loop.loop.call_soon_threadsafe(service.create_task_gate.set)
+        connection.close()
+
+
 def test_watch_current_then_update_and_sync_callback_off_loop(frontend_server):
     endpoint, service, server_loop = frontend_server
     connection = client.connect(endpoint)
     try:
         session = connection.create_session(SessionAttributes(application="app"))
-        watcher = session.watch_task("hold")
+        watcher = session.watch_task("hold", timeout=3)
         assert next(watcher).state == TaskState.PENDING
-        future = session.run(b"hold")
+        future = session.submit(b"hold")
+        assert isinstance(future, flamepy_core.TaskFuture)
+        assert flamepy.TaskFuture is flamepy_core.TaskFuture
         callback_threads = []
         completed = threading.Event()
 
@@ -111,7 +228,12 @@ def test_watch_current_then_update_and_sync_callback_off_loop(frontend_server):
 
         future.add_done_callback(callback)
         server_loop.call(_release(service))
-        assert next(watcher).state == TaskState.SUCCEED
+        # A second registration on the shared stream can replay a fresh
+        # Pending snapshot before the terminal update reaches this watcher.
+        update = next(watcher)
+        while update.state == TaskState.PENDING:
+            update = next(watcher)
+        assert update.state == TaskState.SUCCEED
         assert future.result(timeout=3) == b"done"
         assert completed.wait(3)
         assert callback_threads == ["flamepy-callback_0"]
@@ -123,7 +245,7 @@ def test_close_errors_pending_watches_without_per_task_threads(frontend_server):
     endpoint, service, _ = frontend_server
     connection = client.connect(endpoint)
     session = connection.create_session(SessionAttributes(application="app"))
-    futures = [session.run(b"hold") for _ in range(20)]
+    futures = [session.submit(b"hold") for _ in range(20)]
     assert len([thread for thread in threading.enumerate() if thread.name == "flamepy-aio"]) == 1
     connection.close()
     for future in futures:
@@ -135,7 +257,7 @@ def test_result_callback_can_close_connection(frontend_server):
     endpoint, service, server_loop = frontend_server
     connection = client.connect(endpoint)
     session = connection.create_session(SessionAttributes(application="app"))
-    result = session.run(b"hold")
+    result = session.submit(b"hold")
     closed = threading.Event()
     errors = []
 
@@ -159,7 +281,7 @@ def test_blocked_callbacks_do_not_starve_task_completion(frontend_server):
     connection = client.connect(endpoint)
     try:
         session = connection.create_session(SessionAttributes(application="app"))
-        blockers = [session.run(b"hold") for _ in range(4)]
+        blockers = [session.submit(b"hold") for _ in range(4)]
         dependents = []
         ready = threading.Event()
         all_started = threading.Event()
@@ -190,7 +312,7 @@ def test_blocked_callbacks_do_not_starve_task_completion(frontend_server):
             blocker.add_done_callback(lambda future, index=index: callback(future, index))
         server_loop.call(_release(service))
         assert all_started.wait(3)
-        dependents.extend(session.run(b"input") for _ in range(4))
+        dependents.extend(session.submit(b"input") for _ in range(4))
         ready.set()
         assert [future.result(timeout=1) for future in dependents] == [b"done"] * 4
         assert all_done.wait(3)
@@ -204,7 +326,7 @@ def test_callbacks_keep_registration_order(frontend_server):
     connection = client.connect(endpoint)
     try:
         session = connection.create_session(SessionAttributes(application="app"))
-        future = session.run(b"hold")
+        future = session.submit(b"hold")
         order = []
         completed = threading.Event()
         future.add_done_callback(lambda _future: order.append(1))
@@ -234,7 +356,7 @@ def test_slow_callbacks_bound_completion_jobs_without_blocking_aio(frontend_serv
     callback_lock = threading.Lock()
     try:
         session = connection.create_session(SessionAttributes(application="app"))
-        futures = [session.run(b"hold") for _ in range(20)]
+        futures = [session.submit(b"hold") for _ in range(20)]
 
         def callback(_future):
             nonlocal callback_count, callback_started
@@ -273,7 +395,7 @@ def test_close_drains_many_blocked_callbacks_with_fixed_workers(frontend_server,
     callback_count = 0
     callback_lock = threading.Lock()
     session = connection.create_session(SessionAttributes(application="app"))
-    futures = [session.run(b"hold") for _ in range(20)]
+    futures = [session.submit(b"hold") for _ in range(20)]
 
     def callback(_future):
         nonlocal callback_count
@@ -312,7 +434,7 @@ def test_mass_cancellation_runs_callbacks_inline_without_queueing(frontend_serve
     cancel_thread = None
     try:
         session = connection.create_session(SessionAttributes(application="app"))
-        futures = [session.run(b"hold") for _ in range(20)]
+        futures = [session.submit(b"hold") for _ in range(20)]
 
         def callback(_future):
             nonlocal callback_count
@@ -355,8 +477,8 @@ def test_callback_worker_can_cancel_another_future_at_capacity(frontend_server, 
     connection = client.connect(endpoint)
     try:
         session = connection.create_session(SessionAttributes(application="app"))
-        first = [session.run(b"hold") for _ in range(4)]
-        second = [session.run(b"hold") for _ in range(4)]
+        first = [session.submit(b"hold") for _ in range(4)]
+        second = [session.submit(b"hold") for _ in range(4)]
         all_workers = threading.Barrier(4)
         all_nested = threading.Event()
         callback_count = 0

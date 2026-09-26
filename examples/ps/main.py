@@ -22,8 +22,8 @@ if __name__ == "__main__":
     print("Running synchronous parameter server training.")
 
     try:
-        ps_svc = ParameterServerService()
-        worker_svc = DataWorkerService()
+        ps_svc = ParameterServerService.remote()
+        worker_svc = DataWorkerService.remote()
         workers_svc = [worker_svc, worker_svc]
 
         current_weights = ps_svc.get_weights().get()

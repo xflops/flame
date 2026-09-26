@@ -43,6 +43,8 @@ from .core import (  # Type aliases; Constants; Enums; Exception classes; Data c
     FlameService,
     Message,
     ObjectRef,
+    Ref,
+    ValueRef,
     ResourceRequirement,
     Session,
     SessionAttributes,
@@ -52,6 +54,7 @@ from .core import (  # Type aliases; Constants; Enums; Exception classes; Data c
     Shim,
     Task,
     TaskContext,
+    TaskFuture,
     TaskID,
     TaskInformer,
     TaskOption,
@@ -132,6 +135,7 @@ __all__ = [
     # Client classes
     "Connection",
     "Session",
+    "TaskFuture",
     "TaskWatcher",
     # Service constants
     "FLAME_INSTANCE_ENDPOINT",
@@ -145,6 +149,8 @@ __all__ = [
     "run",
     # Cache classes
     "ObjectRef",
+    "Ref",
+    "ValueRef",
     # Cache functions
     "get_object",
     "put_object",

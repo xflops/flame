@@ -42,7 +42,7 @@ Use `https://` for the session-manager endpoint when TLS is enabled. Use `grpcs:
 1. Start a Flame cluster with Docker Compose or `flmadm`.
 2. Deploy or register an application service.
 3. Create a session for that application from a client.
-4. Submit tasks with `invoke()` or `run()`.
+4. Run tasks with `run()` or submit them with `submit()`.
 5. Close the session when no more work will be submitted.
 
 The SDKs wrap the gRPC APIs documented in [Flame API Reference](../api/index.md). Use the SDK pages for common application code and the API reference when implementing lower-level protocol integrations.

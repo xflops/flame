@@ -87,8 +87,19 @@ class FetchMode(str, Enum):
     PATCHES = "patches"
 
 
+class Ref:
+    """Base type for inline and cache-backed object references."""
+
+
 @dataclass
-class ObjectRef:
+class ValueRef(Ref):
+    """A value carried directly in a task response or request."""
+
+    value: Any
+
+
+@dataclass
+class ObjectRef(Ref):
     """Object reference for remote cached objects.
 
     Version semantics:
@@ -677,7 +688,11 @@ def put_object(key_prefix: str, obj: Any) -> ObjectRef:
     return _call_aio_cache("put_object", key_prefix, obj)
 
 
-def get_object(ref: ObjectRef, deserializer: Optional[Deserializer] = None) -> Any:
+def get_object(ref: Ref, deserializer: Optional[Deserializer] = None) -> Any:
+    if isinstance(ref, ValueRef):
+        return ref.value if deserializer is None else deserializer(ref.value, [])
+    if not isinstance(ref, ObjectRef):
+        raise TypeError(f"Expected ValueRef or ObjectRef, got {type(ref).__name__}")
     return _call_aio_cache("get_object", ref, deserializer)
 
 

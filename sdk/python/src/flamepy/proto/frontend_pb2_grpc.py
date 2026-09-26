@@ -118,8 +118,8 @@ class FrontendStub(object):
                 request_serializer=frontend__pb2.GetTaskRequest.SerializeToString,
                 response_deserializer=types__pb2.Task.FromString,
                 _registered_method=True)
-        self.WatchTask = channel.unary_stream(
-                '/flame.v1.Frontend/WatchTask',
+        self.WatchTasks = channel.stream_stream(
+                '/flame.v1.Frontend/WatchTasks',
                 request_serializer=frontend__pb2.WatchTaskRequest.SerializeToString,
                 response_deserializer=types__pb2.Task.FromString,
                 _registered_method=True)
@@ -233,7 +233,7 @@ class FrontendServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def WatchTask(self, request, context):
+    def WatchTasks(self, request_iterator, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -328,8 +328,8 @@ def add_FrontendServicer_to_server(servicer, server):
                     request_deserializer=frontend__pb2.GetTaskRequest.FromString,
                     response_serializer=types__pb2.Task.SerializeToString,
             ),
-            'WatchTask': grpc.unary_stream_rpc_method_handler(
-                    servicer.WatchTask,
+            'WatchTasks': grpc.stream_stream_rpc_method_handler(
+                    servicer.WatchTasks,
                     request_deserializer=frontend__pb2.WatchTaskRequest.FromString,
                     response_serializer=types__pb2.Task.SerializeToString,
             ),
@@ -785,7 +785,7 @@ class Frontend(object):
             _registered_method=True)
 
     @staticmethod
-    def WatchTask(request,
+    def WatchTasks(request_iterator,
             target,
             options=(),
             channel_credentials=None,
@@ -795,10 +795,10 @@ class Frontend(object):
             wait_for_ready=None,
             timeout=None,
             metadata=None):
-        return grpc.experimental.unary_stream(
-            request,
+        return grpc.experimental.stream_stream(
+            request_iterator,
             target,
-            '/flame.v1.Frontend/WatchTask',
+            '/flame.v1.Frontend/WatchTasks',
             frontend__pb2.WatchTaskRequest.SerializeToString,
             types__pb2.Task.FromString,
             options,

@@ -3,7 +3,7 @@
 import sys
 import tarfile
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -21,7 +21,8 @@ from flamepy.app.client import (
 )
 from flamepy.app.client import _Runtime as Runtime
 from flamepy.app.storage import CacheStorage, FileStorage, create_storage_backend
-from flamepy.app.types import ServiceContext, ServiceRequest
+from flamepy.app.types import ServiceContext, ServiceRequest, ServiceResponse
+from flamepy.core import ValueRef
 from flamepy.core.types import ApplicationState, FlameError, FlameErrorCode, Shim
 
 # App Storage Tests
@@ -481,6 +482,151 @@ def test_module_service_decorator_is_supported_after_init(monkeypatch):
     runtime.service.assert_called_once_with(autoscale=None, warmup=0, resreq=None)
 
 
+def test_decorated_function_runs_locally_until_remote_is_called(monkeypatch):
+    import flamepy.app as app
+    from flamepy.app import ServiceInstance
+
+    runtime = object.__new__(Runtime)
+    runtime._name = "local-function-app"
+    runtime._services = []
+    runtime._state = _RuntimeState.ACTIVE
+    runtime._lifecycle_lock = threading.RLock()
+    monkeypatch.setattr(app_client, "_runtime", runtime)
+    monkeypatch.setattr(
+        "flamepy.app.client._core_put_object",
+        lambda *args, **kwargs: MagicMock(encode=MagicMock(return_value=b"context")),
+    )
+    sessions = [MagicMock(id="first"), MagicMock(id="second"), MagicMock(id="third")]
+    open_session = MagicMock(side_effect=sessions)
+    monkeypatch.setattr("flamepy.app.client.core_client.open_session", open_session)
+
+    @app.service()
+    def echo(value, shared=None):
+        return value
+
+    assert echo("local") == "local"
+    assert cloudpickle.loads(cloudpickle.dumps(echo))("restored") == "restored"
+    assert runtime._services == []
+    open_session.assert_not_called()
+    with pytest.raises(TypeError, match="decorated function or class"):
+        app.remote(lambda value: value)
+    with pytest.raises(TypeError, match="takes no function invocation arguments"):
+        app.remote(echo, "input")
+
+    first_call = echo.remote("input")
+    first = echo._shared_remote
+    second_call = echo.remote("other", shared="user-arg")
+    assert isinstance(first_call, app.ObjectFuture)
+    assert isinstance(second_call, app.ObjectFuture)
+    second_request = cloudpickle.loads(sessions[0].submit.call_args_list[1].args[0])
+    assert second_request.args == ("other",)
+    assert second_request.kwargs == {"shared": "user-arg"}
+    assert echo._shared_remote is first
+    assert open_session.call_count == 1
+    second = app.remote(echo)
+    assert isinstance(first, ServiceInstance)
+    assert isinstance(second, ServiceInstance)
+    assert first is not second
+    assert [service._session.id for service in runtime._services] == ["first", "second"]
+    first.close()
+    sessions[0].close.assert_called_once_with()
+    sessions[1].close.assert_not_called()
+    third_call = echo.remote("third")
+    third = echo._shared_remote
+    assert isinstance(third_call, app.ObjectFuture)
+    assert third is not first
+    assert open_session.call_count == 3
+    second.close()
+    runtime._state = _RuntimeState.INACTIVE
+    with pytest.raises(FlameError, match="not active"):
+        echo.remote("after-shutdown")
+    third.close()
+    sessions[1].close.assert_called_once_with()
+    sessions[2].close.assert_called_once_with()
+
+
+def test_concurrent_function_remote_calls_share_one_session(monkeypatch):
+    runtime = object.__new__(Runtime)
+    runtime._name = "concurrent-shared-app"
+    runtime._services = []
+    runtime._state = _RuntimeState.ACTIVE
+    runtime._lifecycle_lock = threading.RLock()
+    monkeypatch.setattr(app_client, "_runtime", runtime)
+    monkeypatch.setattr(
+        "flamepy.app.client._core_put_object",
+        lambda *args, **kwargs: MagicMock(encode=MagicMock(return_value=b"context")),
+    )
+    open_session = MagicMock(return_value=MagicMock(id="shared-session"))
+    monkeypatch.setattr("flamepy.app.client.core_client.open_session", open_session)
+
+    definition = runtime.service()(lambda index: index)
+    barrier = threading.Barrier(8)
+
+    def remote_after_barrier(index):
+        barrier.wait()
+        return definition.remote(index)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = list(pool.map(remote_after_barrier, range(8)))
+
+    assert all(isinstance(future, app_client.ObjectFuture) for future in futures)
+    assert definition._shared_remote is not None
+    assert open_session.return_value.submit.call_count == 8
+    open_session.assert_called_once()
+
+
+def test_remote_api_opens_expected_number_of_sessions(monkeypatch):
+    import flamepy.app as app
+
+    runtime = object.__new__(Runtime)
+    runtime._name = "session-count-app"
+    runtime._services = []
+    runtime._state = _RuntimeState.ACTIVE
+    runtime._lifecycle_lock = threading.RLock()
+    monkeypatch.setattr(app_client, "_runtime", runtime)
+    monkeypatch.setattr(
+        "flamepy.app.client._core_put_object",
+        lambda *args, **kwargs: MagicMock(encode=MagicMock(return_value=b"context")),
+    )
+    sessions = [MagicMock(id=f"session-{index}") for index in range(5)]
+    open_session = MagicMock(side_effect=sessions)
+    monkeypatch.setattr("flamepy.app.client.core_client.open_session", open_session)
+
+    @app.service()
+    def echo(value):
+        return value
+
+    @app.service()
+    class Counter:
+        def read(self):
+            return 0
+
+    assert echo("local") == "local"
+    assert Counter().read() == 0
+    open_session.assert_not_called()
+
+    echo.remote(1)
+    echo.remote(2)
+    assert open_session.call_count == 1
+
+    first_function = app.remote(echo)
+    second_function = app.remote(echo)
+    assert open_session.call_count == 3
+    assert first_function._session is sessions[1]
+    assert second_function._session is sessions[2]
+
+    first_class = Counter.remote()
+    second_class = app.remote(Counter)
+    assert open_session.call_count == 5
+    assert first_class._session is sessions[3]
+    assert second_class._session is sessions[4]
+    assert [service._session.id for service in runtime._services] == [session.id for session in sessions]
+
+    for service in runtime._services:
+        service.close()
+    assert all(session.close.call_count == 1 for session in sessions)
+
+
 def test_module_put_uses_the_active_runtime(monkeypatch):
     import flamepy.app as app
 
@@ -531,7 +677,7 @@ def test_service_proxy_captured_by_service_reopens_existing_session(monkeypatch)
     reopened_fn_a_session = MagicMock(id="fn-a-session")
     nested_future = Future()
     nested_future.set_result(b"result")
-    reopened_fn_a_session.run.return_value = nested_future
+    reopened_fn_a_session.submit.return_value = nested_future
     open_session = MagicMock(side_effect=[fn_a_session, fn_b_session, reopened_fn_a_session])
     monkeypatch.setattr("flamepy.app.client._core_put_object", put_context)
     monkeypatch.setattr("flamepy.app.client.core_client.open_session", open_session)
@@ -550,7 +696,7 @@ def test_service_proxy_captured_by_service_reopens_existing_session(monkeypatch)
 
     assert isinstance(result, ObjectFuture)
     open_session.assert_called_with(session_id="fn-a-session")
-    reopened_fn_a_session.run.assert_called_once()
+    reopened_fn_a_session.submit.assert_called_once()
     captured_proxy = restored_context.execution_object.__closure__[0].cell_contents
     assert isinstance(captured_proxy._session_owner, _NoopSessionOwner)
     captured_proxy.close()
@@ -607,7 +753,7 @@ def test_recursive_service_declaration_reuses_context_without_init(monkeypatch):
     monkeypatch.setattr("flamepy.app.client._core_put_object", put_context)
     session = MagicMock(id="recursive-session")
     pending = MagicMock(spec=Future)
-    session.run.return_value = pending
+    session.submit.return_value = pending
     open_session = MagicMock(return_value=session)
     monkeypatch.setattr("flamepy.app.client.core_client.open_session", open_session)
     session_context = SessionContext(None, "recursive-session", ApplicationContext("recursive-app"))
@@ -619,7 +765,13 @@ def test_recursive_service_declaration_reuses_context_without_init(monkeypatch):
             def invoke(self):
                 return None
 
-        recursive_service = RecursiveService()
+        local_service = RecursiveService()
+        assert type(local_service).__name__ == "RecursiveService"
+        assert local_service.invoke() is None
+        open_session.assert_not_called()
+        with pytest.raises(FlameError, match="cannot create an independent session"):
+            app.remote(RecursiveService)
+        recursive_service = RecursiveService.remote()
 
     assert recursive_service._app == "recursive-app"
     assert recursive_service._session is session
@@ -628,7 +780,7 @@ def test_recursive_service_declaration_reuses_context_without_init(monkeypatch):
     put_context.assert_not_called()
     open_session.assert_called_once_with(session_id="recursive-session")
     recursive_service.invoke()
-    session.run.assert_called_once()
+    session.submit.assert_called_once()
     recursive_service.close()
     pending.result.assert_called_once_with()
     session.close.assert_not_called()
@@ -655,7 +807,7 @@ def test_recursive_service_declaration_prefers_invocation_context(monkeypatch):
             def invoke(self):
                 return None
 
-        recursive_service = RecursiveService()
+        recursive_service = RecursiveService.remote()
 
     runtime.service.assert_not_called()
     open_session.assert_called_once_with(session_id="recursive-session")
@@ -712,64 +864,168 @@ def test_recursive_service_declaration_requires_existing_session(monkeypatch):
             def recursive_service():
                 return None
 
+            recursive_service.remote()
+
     put_context.assert_not_called()
     open_session.assert_called_once_with(session_id="missing-session")
 
 
-class DummyObjectRef:
-    """Mock ObjectRef for testing."""
+def test_objectfuture_ref_returns_inline_valueref():
+    from flamepy.app import ObjectFuture, ValueRef
 
-    def __init__(self, data=b"ref-data"):
-        self._data = data
-
-    @classmethod
-    def decode(cls, data: bytes) -> "DummyObjectRef":
-        return cls(data)
-
-    def encode(self) -> bytes:
-        return self._data
+    future = Future()
+    future.set_result(cloudpickle.dumps(ServiceResponse(ValueRef("inline"))))
+    result = ObjectFuture(future)
+    assert result.ref() == ValueRef("inline")
+    assert result.get() == "inline"
 
 
-def test_objectfuture_ref_decodes_bytes():
-    """Test ObjectFuture.ref() decodes bytes to ObjectRef."""
+def test_service_response_requires_a_supported_ref():
+    from flamepy.core import ObjectRef
+
+    assert ServiceResponse(ValueRef(None)).result == ValueRef(None)
+    cached = ObjectRef(endpoint="grpc://host:9090", key="app/session/value", version=1)
+    assert ServiceResponse(cached).result == cached
+    with pytest.raises(TypeError, match="ValueRef or ObjectRef"):
+        ServiceResponse("raw value")
+
     from flamepy.app import ObjectFuture
 
     future = Future()
-    future.set_result(b"encoded-ref")
-
-    with patch("flamepy.app.client.ObjectRef", DummyObjectRef):
-        of = ObjectFuture(future)
-        ref = of.ref()
-        assert isinstance(ref, DummyObjectRef)
-        assert ref._data == b"encoded-ref"
+    future.set_result(cloudpickle.dumps("raw value"))
+    with pytest.raises(TypeError, match="Expected ServiceResponse"):
+        ObjectFuture(future).ref()
 
 
-def test_objectfuture_ref_returns_existing_objectref():
-    """Test ObjectFuture.ref() returns ObjectRef if already decoded."""
+def test_objectfuture_ref_returns_explicit_objectref():
     from flamepy.app import ObjectFuture
+    from flamepy.core import ObjectRef
 
-    dummy_ref = DummyObjectRef(b"already-ref")
+    reference = ObjectRef(endpoint="grpc://host:9090", key="app/session/value", version=1)
     future = Future()
-    future.set_result(dummy_ref)
+    future.set_result(cloudpickle.dumps(ServiceResponse(reference)))
 
-    with patch("flamepy.app.client.ObjectRef", DummyObjectRef):
-        of = ObjectFuture(future)
-        ref = of.ref()
-        assert ref is dummy_ref
+    result = ObjectFuture(future)
+    with patch("flamepy.app.client.get_object", return_value={"cached": True}) as get_object:
+        assert result.get() == {"cached": True}
+        assert result.ref() == reference
+    get_object.assert_called_once_with(reference)
 
 
-def test_objectfuture_get_retrieves_object():
-    """Test ObjectFuture.get() retrieves actual object from cache."""
+def test_objectfuture_get_cached_none_and_chains_reference_without_client_fetch():
+    from flamepy.app import ObjectFuture, ServiceInstance
+    from flamepy.core import ObjectRef
+
+    reference = ObjectRef(endpoint="grpc://host:9090", key="app/session/value", version=1)
+    future = Future()
+    future.set_result(cloudpickle.dumps(ServiceResponse(reference)))
+    result = ObjectFuture(future)
+    with patch("flamepy.app.client.get_object", return_value=None) as get_object:
+        assert result.get() is None
+        get_object.assert_called_once_with(reference)
+
+    service = object.__new__(ServiceInstance)
+    service._app = "app"
+    service._session = MagicMock(id="session")
+    service._submit = MagicMock(return_value=Future())
+    service._create_function_wrapper()
+    with patch("flamepy.app.client.get_object") as get_object:
+        service(result)
+    get_object.assert_not_called()
+    request = cloudpickle.loads(service._submit.call_args.args[0])
+    assert request.args == (reference,)
+
+
+def test_objectfuture_get_decodes_inline_result():
+    from flamepy.app import ObjectFuture, ValueRef
+
+    future = Future()
+    future.set_result(cloudpickle.dumps(ServiceResponse(ValueRef({"key": "value"}))))
+    assert ObjectFuture(future).get() == {"key": "value"}
+
+
+def test_app_task_input_rejects_more_than_128_kib():
+    from flamepy.app import ServiceInstance
+    from flamepy.app.types import INLINE_PAYLOAD_LIMIT
+
+    instance = object.__new__(ServiceInstance)
+    instance._app = "app"
+    instance._session = MagicMock(id="session")
+    assert instance._task_input(b"x" * INLINE_PAYLOAD_LIMIT) == b"x" * INLINE_PAYLOAD_LIMIT
+    with pytest.raises(ValueError, match="App task input exceeds"):
+        instance._task_input(b"x" * (INLINE_PAYLOAD_LIMIT + 1))
+
+
+def test_inline_objectfuture_get_does_not_upload_to_cache():
+    from flamepy.app import ObjectFuture, ValueRef
+
+    future = Future()
+    future.set_result(cloudpickle.dumps(ServiceResponse(ValueRef({"answer": 42}))))
+    result = ObjectFuture(future)
+    with patch("flamepy.app.client._core_put_object") as put:
+        assert result.get() == {"answer": 42}
+        assert result.get() == {"answer": 42}
+        assert result.ref() == ValueRef({"answer": 42})
+    put.assert_not_called()
+
+
+def test_app_get_multiple_inline_results():
+    from flamepy.app import ObjectFuture, ValueRef
+    from flamepy.app.client import _Runtime as Runtime
+
+    first = Future()
+    first.set_result(cloudpickle.dumps(ServiceResponse(ValueRef(None))))
+    second = Future()
+    second.set_result(cloudpickle.dumps(ServiceResponse(ValueRef("value"))))
+    assert object.__new__(Runtime).get([ObjectFuture(first), ObjectFuture(second)]) == [None, "value"]
+
+
+def test_app_get_mixed_value_and_object_references():
     from flamepy.app import ObjectFuture
+    from flamepy.core import ObjectRef
 
-    future = Future()
-    future.set_result(b"encoded-ref")
+    inline = Future()
+    inline.set_result(cloudpickle.dumps(ServiceResponse(ValueRef("inline"))))
+    reference = ObjectRef(endpoint="grpc://host:9090", key="app/session/value", version=1)
+    cached = Future()
+    cached.set_result(cloudpickle.dumps(ServiceResponse(reference)))
 
-    with patch("flamepy.app.client.ObjectRef", DummyObjectRef):
-        with patch("flamepy.app.client.get_object", return_value={"key": "value"}):
-            of = ObjectFuture(future)
-            result = of.get()
-            assert result == {"key": "value"}
+    async def get_object(value):
+        if isinstance(value, ValueRef):
+            return value.value
+        assert value == reference
+        return None
+
+    with patch("flamepy.core.aio.cache.get_object", side_effect=get_object) as fetch:
+        assert object.__new__(Runtime).get([ObjectFuture(inline), ObjectFuture(cached)]) == ["inline", None]
+    assert fetch.call_count == 2
+
+
+def test_get_data_reads_inline_none_and_cached_request():
+    from flamepy.app.helper import get_data
+    from flamepy.core import ObjectRef
+
+    assert get_data(cloudpickle.dumps(ServiceResponse(ValueRef(None)))) == {
+        "type": "output",
+        "result": None,
+        "metadata": {},
+    }
+    ref = ObjectRef(endpoint="grpc://host:9090", key="app/session/request", version=1)
+    request = ServiceRequest(args=(b"payload",))
+    with patch("flamepy.app.helper.get_object", return_value=cloudpickle.dumps(request)) as get:
+        value = get_data(ref.encode())
+    get.assert_called_once_with(ref)
+    assert value["type"] == "input"
+    assert value["args"] == (b"payload",)
+    assert value["metadata"] == {"object_ref_key": ref.key}
+
+    with patch("flamepy.app.helper.get_object", return_value=None) as get:
+        output = get_data(cloudpickle.dumps(ServiceResponse(ref)))
+    get.assert_called_once_with(ref)
+    assert output == {"type": "output", "result": None, "metadata": {"object_ref_key": ref.key}}
+
+    output = get_data(cloudpickle.dumps(ServiceResponse(ValueRef(request))))
+    assert output == {"type": "output", "result": request, "metadata": {}}
 
 
 def test_objectfuture_wait_blocks_until_done():
@@ -931,7 +1187,7 @@ def test_app_service_instance_generates_method_wrappers():
     rs._function_wrapper = None
 
     mock_session = MagicMock()
-    mock_session.run = MagicMock(return_value=Future())
+    mock_session.submit = MagicMock(return_value=Future())
     rs._session = mock_session
 
     rs._generate_wrappers()
@@ -956,7 +1212,7 @@ def test_app_service_instance_callable_for_function():
     mock_session = MagicMock()
     f = Future()
     f.set_result(b"result")
-    mock_session.run = MagicMock(return_value=f)
+    mock_session.submit = MagicMock(return_value=f)
     rs._session = mock_session
 
     rs._generate_wrappers()
@@ -1014,6 +1270,7 @@ def test_app_service_instance_close_drains_pending_tasks():
     rs._state_changed = threading.Condition(rs._future_lock)
     pending = MagicMock()
     rs._pending_futures = {pending}
+    rs._submissions_in_flight = 0
     rs._state = _ServiceState.OPEN
     rs._session = MagicMock()
     rs._session_owner = _ServiceSessionOwner(rs._session)
@@ -1023,6 +1280,160 @@ def test_app_service_instance_close_drains_pending_tasks():
     pending.result.assert_called_once_with()
     rs._session.close.assert_called_once_with()
     assert rs._state is _ServiceState.CLOSED
+
+
+def test_app_service_instance_submits_concurrently():
+    """A slow local submit call must not serialize other submissions."""
+    from flamepy.app import ServiceInstance
+
+    service = object.__new__(ServiceInstance)
+    service._future_lock = threading.Lock()
+    service._state_changed = threading.Condition(service._future_lock)
+    service._pending_futures = set()
+    service._submissions_in_flight = 0
+    service._state = _ServiceState.OPEN
+    both_submitting = threading.Barrier(2)
+
+    def submit(*args, **kwargs):
+        both_submitting.wait(timeout=2)
+        future = Future()
+        future.set_result(None)
+        return future
+
+    service._session = MagicMock(submit=submit)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        submitted = list(pool.map(lambda _: service._submit(b"request", None), range(2)))
+
+    assert len(submitted) == 2
+    assert all(future.done() for future in submitted)
+    assert service._submissions_in_flight == 0
+
+
+def test_app_service_instance_close_waits_for_submission_and_task():
+    """Close must include a future returned by in-flight submission scheduling."""
+    from flamepy.app import ServiceInstance
+
+    service = object.__new__(ServiceInstance)
+    service._app = "test-app"
+    service._future_lock = threading.Lock()
+    service._state_changed = threading.Condition(service._future_lock)
+    service._pending_futures = set()
+    service._submissions_in_flight = 0
+    service._state = _ServiceState.OPEN
+    run_entered = threading.Event()
+    release_run = threading.Event()
+    close_done = threading.Event()
+    task = Future()
+
+    def submit(*args, **kwargs):
+        run_entered.set()
+        assert release_run.wait(timeout=2)
+        return task
+
+    service._session = MagicMock(submit=submit)
+    service._session_owner = _ServiceSessionOwner(service._session)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        submission = pool.submit(service._submit, b"request", None)
+        assert run_entered.wait(timeout=2)
+        closing = pool.submit(lambda: (service.close(), close_done.set()))
+        also_closing = pool.submit(service.close)
+        assert not close_done.wait(timeout=0.05)
+        release_run.set()
+        assert submission.result(timeout=2) is task
+        assert not close_done.wait(timeout=0.05)
+        service._session.close.assert_not_called()
+        task.set_result(None)
+        closing.result(timeout=2)
+        also_closing.result(timeout=2)
+
+    service._session.close.assert_called_once_with()
+    assert service._state is _ServiceState.CLOSED
+
+
+def test_app_service_instance_failed_submission_does_not_block_close():
+    """A synchronous scheduling failure releases the close reservation."""
+    from flamepy.app import ServiceInstance
+
+    service = object.__new__(ServiceInstance)
+    service._app = "test-app"
+    service._future_lock = threading.Lock()
+    service._state_changed = threading.Condition(service._future_lock)
+    service._pending_futures = set()
+    service._submissions_in_flight = 0
+    service._state = _ServiceState.OPEN
+    run_entered = threading.Event()
+    release_run = threading.Event()
+
+    def submit(*args, **kwargs):
+        run_entered.set()
+        assert release_run.wait(timeout=2)
+        raise RuntimeError("CreateTask failed")
+
+    service._session = MagicMock(submit=submit)
+    service._session_owner = _ServiceSessionOwner(service._session)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        submission = pool.submit(service._submit, b"request", None)
+        assert run_entered.wait(timeout=2)
+        closing = pool.submit(service.close)
+        release_run.set()
+        with pytest.raises(RuntimeError, match="CreateTask failed"):
+            submission.result(timeout=2)
+        closing.result(timeout=2)
+
+    assert service._submissions_in_flight == 0
+    service._session.close.assert_called_once_with()
+
+
+def test_app_service_instance_async_submission_failure_is_on_future():
+    """An acknowledged scheduling call leaves remote errors on the Future."""
+    from flamepy.app import ServiceInstance
+
+    service = object.__new__(ServiceInstance)
+    service._app = "test-app"
+    service._future_lock = threading.Lock()
+    service._state_changed = threading.Condition(service._future_lock)
+    service._pending_futures = set()
+    service._submissions_in_flight = 0
+    service._state = _ServiceState.OPEN
+    task = Future()
+    service._session = MagicMock(submit=MagicMock(return_value=task))
+    service._session_owner = _ServiceSessionOwner(service._session)
+
+    returned = service._submit(b"request", None)
+    assert returned is task
+    service._session.submit.assert_called_once_with(b"request", option=None)
+    task.set_exception(RuntimeError("CreateTask failed"))
+    with pytest.raises(RuntimeError, match="CreateTask failed"):
+        returned.result()
+    service.close()
+    service._session.close.assert_called_once_with()
+
+
+def test_app_service_pending_cleanup_uses_internal_callback():
+    from flamepy.app import ServiceInstance
+
+    class CoreFuture(Future):
+        def add_done_callback(self, callback):
+            raise AssertionError("App cleanup must not dispatch a user callback")
+
+        def _add_internal_callback(self, callback):
+            super().add_done_callback(callback)
+
+    service = object.__new__(ServiceInstance)
+    service._future_lock = threading.Lock()
+    service._state_changed = threading.Condition(service._future_lock)
+    service._pending_futures = set()
+    service._submissions_in_flight = 0
+    service._state = _ServiceState.OPEN
+    task = CoreFuture()
+    service._session = MagicMock(submit=MagicMock(return_value=task))
+
+    assert service._submit(b"request", None) is task
+    assert task in service._pending_futures
+    task.set_result(b"done")
+    assert task not in service._pending_futures
 
 
 def test_app_service_rejects_method_name_collisions():
@@ -1099,7 +1510,7 @@ def test_runtime_service_owns_session_despite_execution_object_attribute(monkeyp
     runtime._lifecycle_lock = threading.RLock()
     monkeypatch.setattr(app_client, "_runtime", runtime)
     service_factory = runtime.service()(RecursiveService)
-    service = service_factory()
+    service = service_factory.remote()
 
     assert isinstance(service._session_owner, _ServiceSessionOwner)
     service.close()
@@ -1190,7 +1601,9 @@ def test_app_service_passes_public_options(monkeypatch):
     decorator = app.service(autoscale=False, warmup=2, resreq=resreq)
     decorated = decorator(sample_func)
 
-    assert isinstance(decorated, FakeServiceInstance)
+    assert decorated() == "ok"
+    assert calls == []
+    app_client.remote(decorated)
 
     assert calls == [
         (
@@ -1256,17 +1669,30 @@ def test_decorated_class_creates_session_only_when_constructed(monkeypatch):
     assert runtime._services == []
     open_session.assert_not_called()
 
-    worker = worker_factory("remote", replicas=3)
+    local_worker = worker_factory("local", replicas=2)
+    assert isinstance(local_worker, Worker)
+    assert local_worker.run() == "local"
+    assert Worker.constructions == [("local", 2)]
+    open_session.assert_not_called()
+
+    worker = worker_factory.remote("remote", replicas=3)
 
     assert isinstance(worker, ServiceInstance)
     assert worker._execution_object is Worker
-    assert Worker.constructions == []
+    assert Worker.constructions == [("local", 2)]
     assert runtime._services == [worker]
     assert open_session.call_count == 1
 
     context = cloudpickle.loads(serialized_contexts[0])
     assert context.constructor_args == ("remote",)
     assert context.constructor_kwargs == {"replicas": 3}
+
+    other_worker = app_client.remote(worker_factory, "other", replicas=4)
+    assert isinstance(other_worker, ServiceInstance)
+    assert other_worker is not worker
+    other_context = cloudpickle.loads(serialized_contexts[1])
+    assert other_context.constructor_args == ("other",)
+    assert other_context.constructor_kwargs == {"replicas": 4}
 
 
 def test_decorated_class_has_no_class_level_remote_methods(monkeypatch):
@@ -1306,8 +1732,9 @@ def test_decorated_class_factory_rejects_calls_after_runtime_is_inactive(
     worker_factory = runtime.service()(Worker)
     runtime._state = _RuntimeState.INACTIVE
 
-    with pytest.raises(FlameError, match="declared this service class is not active"):
-        worker_factory()
+    assert worker_factory().run() == "ok"
+    with pytest.raises(FlameError, match="not active"):
+        worker_factory.remote()
 
 
 def test_decorated_class_carries_constructor_arguments_without_local_construction(
@@ -1335,10 +1762,11 @@ def test_decorated_class_carries_constructor_arguments_without_local_constructio
     class Worker:
         constructions = 0
 
-        def __init__(self, name, *, replicas):
+        def __init__(self, name, *, replicas, shared):
             type(self).constructions += 1
             self.name = name
             self.replicas = replicas
+            self.shared = shared
 
         def run(self):
             return None
@@ -1350,13 +1778,13 @@ def test_decorated_class_carries_constructor_arguments_without_local_constructio
     runtime._lifecycle_lock = threading.RLock()
     monkeypatch.setattr(app_client, "_runtime", runtime)
     worker_factory = runtime.service(autoscale=True, warmup=2)(Worker)
-    worker_factory("remote", replicas=4)
+    worker_factory.remote("remote", replicas=4, shared="constructor-value")
 
     assert Worker.constructions == 0
     context = cloudpickle.loads(serialized_contexts[0])
     assert context.execution_object.__name__ == "Worker"
     assert context.constructor_args == ("remote",)
-    assert context.constructor_kwargs == {"replicas": 4}
+    assert context.constructor_kwargs == {"replicas": 4, "shared": "constructor-value"}
     assert context.autoscale is True
     assert context.warmup == 2
     assert context.min_instances == 2
@@ -1398,8 +1826,8 @@ def test_decorated_class_preserves_resources_and_runtime_closes_all_instances(
     assert runtime._services == []
     open_session.assert_not_called()
 
-    first_worker = worker_factory()
-    second_worker = worker_factory()
+    first_worker = worker_factory.remote()
+    second_worker = worker_factory.remote()
 
     assert runtime._services == [first_worker, second_worker]
     requirements = [call.kwargs["spec"].resreq for call in open_session.call_args_list]
@@ -1457,7 +1885,7 @@ def test_decorated_class_instance_is_pickled_by_defining_module(monkeypatch):
     worker_factory = runtime.service()(original_class)
     service_module.Worker = worker_factory
 
-    worker_factory(7)
+    worker_factory.remote(7)
     monkeypatch.delitem(sys.modules, module_name)
     restored = cloudpickle.loads(serialized_contexts[-1])
 
@@ -1641,6 +2069,242 @@ def test_app_service_serializes_by_value_under_process_wide_lock(monkeypatch):
     assert active_registrations == 0
 
 
+@pytest.mark.asyncio
+async def test_runpy_resolves_object_ref_to_cached_none():
+    """Test cached None is a valid ObjectRef value, not a retrieval miss."""
+    from flamepy.app.runpy import FlameRunpyService
+    from flamepy.core.cache import ObjectRef
+
+    svc = FlameRunpyService()
+    ref = ObjectRef(endpoint="grpc://host:9090", key="app/session/object", version=1)
+
+    with patch("flamepy.app.runpy.aio_core.get_object", return_value=None):
+        args, kwargs = await svc._resolve_object_refs((ref,), {"value": ref})
+        assert args == (None,)
+        assert kwargs == {"value": None}
+
+
+@pytest.mark.asyncio
+async def test_runpy_binds_session_context_and_publishes_invocation_attributes():
+    import flamepy.app as app
+    from flamepy.app.runpy import FlameRunpyService
+    from flamepy.core.service import ApplicationContext, SessionContext, TaskContext
+
+    class Worker:
+        def run(self):
+            app.publish_attributes({b"b"})
+            app.publish_attributes({b"c"})
+            return app.session_context().session_id
+
+    svc = FlameRunpyService()
+
+    async def load_context(_context):
+        return ServiceContext(Worker, constructor_args=())
+
+    svc._load_app_context = load_context
+    session = SessionContext(None, "session", ApplicationContext("app"))
+
+    await svc.on_session_enter(session)
+    assert list(svc._take_attributes().attr) == []
+
+    request = ServiceRequest(method="run")
+    object_ref = SimpleNamespace(encode=lambda: b"result-ref")
+    with patch("flamepy.app.runpy.aio_core.put_object", return_value=object_ref) as put:
+        result = await svc.on_task_invoke(TaskContext("task", "session", cloudpickle.dumps(request)))
+
+    assert cloudpickle.loads(result) == ServiceResponse(ValueRef("session"))
+    put.assert_not_called()
+    assert set(svc._take_attributes().attr) == {b"b", b"c"}
+
+
+@pytest.mark.asyncio
+async def test_runpy_keeps_concurrent_invocation_attributes_with_their_response():
+    import asyncio
+
+    import flamepy.app as app
+    from flamepy.app.runpy import FlameRunpyService
+    from flamepy.core.aio.service import FlameInstanceServicer
+    from flamepy.core.service import ApplicationContext, SessionContext
+    from flamepy.proto import shim_pb2
+
+    invocation_barrier = threading.Barrier(2, timeout=5)
+
+    class Worker:
+        def run(self, attribute):
+            app.publish_attributes({attribute})
+            invocation_barrier.wait()
+            return attribute
+
+    svc = FlameRunpyService()
+
+    async def load_context(_context):
+        return ServiceContext(Worker, constructor_args=())
+
+    svc._load_app_context = load_context
+    await svc.on_session_enter(SessionContext(None, "session", ApplicationContext("app")))
+    servicer = FlameInstanceServicer(svc)
+
+    async def invoke(index):
+        attribute = f"invocation-{index}".encode()
+        request = shim_pb2.TaskContext(
+            task_id=f"task-{index}",
+            session_id="session",
+            input=cloudpickle.dumps(ServiceRequest(method="run", args=(attribute,))),
+        )
+        return await servicer.OnTaskInvoke(request, MagicMock())
+
+    result_ref = SimpleNamespace(encode=lambda: b"result-ref")
+    with patch("flamepy.app.runpy.aio_core.put_object", return_value=result_ref):
+        responses = await asyncio.wait_for(asyncio.gather(invoke(0), invoke(1)), timeout=10)
+
+    assert [set(response.attributes.attr) for response in responses] == [
+        {b"invocation-0"},
+        {b"invocation-1"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runpy_binds_recursive_service_to_current_session(monkeypatch):
+    import flamepy.app as app
+    from flamepy import FlameError
+    from flamepy.app.runpy import FlameRunpyService
+    from flamepy.core.service import ApplicationContext, SessionContext, TaskContext
+
+    captured = {}
+
+    class Worker:
+        def run(self):
+            @app.service()
+            class RecursiveProxy:
+                def run(self):
+                    return None
+
+            recursive_proxy = RecursiveProxy.remote()
+            captured["proxy"] = recursive_proxy
+            captured["execution_object"] = recursive_proxy._execution_object
+            return recursive_proxy._session.id
+
+    monkeypatch.setattr(app_client, "_runtime", None)
+    put_context = MagicMock()
+    monkeypatch.setattr("flamepy.app.client._core_put_object", put_context)
+    borrowed_session = MagicMock(id="recursive-session")
+    open_session = MagicMock(return_value=borrowed_session)
+    monkeypatch.setattr("flamepy.app.client.core_client.open_session", open_session)
+
+    svc = FlameRunpyService()
+
+    async def load_context(_context):
+        return ServiceContext(Worker, constructor_args=())
+
+    svc._load_app_context = load_context
+    session_context = SessionContext(None, "recursive-session", ApplicationContext("recursive-app"))
+    await svc.on_session_enter(session_context)
+
+    request = ServiceRequest(method="run")
+    result_ref = SimpleNamespace(encode=lambda: b"result-ref")
+    with patch("flamepy.app.runpy.aio_core.put_object", return_value=result_ref):
+        result = await svc.on_task_invoke(TaskContext("task", "recursive-session", cloudpickle.dumps(request)))
+
+    assert cloudpickle.loads(result) == ServiceResponse(ValueRef("recursive-session"))
+    assert captured["proxy"]._session_context is session_context
+    assert "_session_context" not in captured["execution_object"].__dict__
+    put_context.assert_not_called()
+    open_session.assert_called_once_with(session_id="recursive-session")
+    with pytest.raises(RuntimeError, match="not running in a Flame invocation"):
+        app.session_context()
+
+    captured["proxy"].close()
+    borrowed_session.close.assert_not_called()
+
+    with pytest.raises(FlameError, match="flamepy.app.init"):
+
+        @app.service()
+        def outside_invocation():
+            return None
+
+
+@pytest.mark.asyncio
+async def test_runpy_resets_recursive_session_context_after_failure(monkeypatch):
+    import flamepy.app as app
+    from flamepy import FlameError
+    from flamepy.app.runpy import FlameRunpyService
+    from flamepy.core.service import ApplicationContext, SessionContext, TaskContext
+
+    class Worker:
+        def run(self):
+            @app.service()
+            def recursive_proxy():
+                return None
+
+            raise RuntimeError("service failed")
+
+    monkeypatch.setattr(app_client, "_runtime", None)
+    monkeypatch.setattr(
+        "flamepy.app.client.core_client.open_session",
+        MagicMock(return_value=MagicMock(id="recursive-session")),
+    )
+
+    svc = FlameRunpyService()
+
+    async def load_context(_context):
+        return ServiceContext(Worker, constructor_args=())
+
+    svc._load_app_context = load_context
+    await svc.on_session_enter(SessionContext(None, "recursive-session", ApplicationContext("recursive-app")))
+    request = ServiceRequest(method="run")
+
+    with pytest.raises(RuntimeError, match="service failed"):
+        await svc.on_task_invoke(TaskContext("task", "recursive-session", cloudpickle.dumps(request)))
+
+    with pytest.raises(RuntimeError, match="not running in a Flame invocation"):
+        app.session_context()
+    with pytest.raises(FlameError, match="flamepy.app.init"):
+
+        @app.service()
+        def outside_invocation():
+            return None
+
+
+@pytest.mark.asyncio
+async def test_app_runtime_helpers_are_invocation_scoped():
+    import flamepy.app as app
+    from flamepy.app.runpy import FlameRunpyService
+    from flamepy.core.service import ApplicationContext, SessionContext, TaskContext
+
+    class Worker:
+        def run(self):
+            app.publish_attributes({b"initial"})
+            app.publish_attributes({b"initial", b"next"})
+            return app.session_context().session_id
+
+        def invalid(self):
+            app.publish_attributes({"invalid"})
+
+    with pytest.raises(RuntimeError, match="not running in a Flame invocation"):
+        app.session_context()
+    with pytest.raises(RuntimeError, match="not running in a Flame invocation"):
+        app.publish_attributes({b"outside"})
+
+    svc = FlameRunpyService()
+
+    async def load_context(_context):
+        return ServiceContext(Worker, constructor_args=())
+
+    svc._load_app_context = load_context
+    session = SessionContext(None, "session", ApplicationContext("app"))
+    await svc.on_session_enter(session)
+
+    result_ref = SimpleNamespace(encode=lambda: b"result-ref")
+    with patch("flamepy.app.runpy.aio_core.put_object", return_value=result_ref):
+        result = await svc.on_task_invoke(TaskContext("task", "session", cloudpickle.dumps(ServiceRequest(method="run"))))
+    assert cloudpickle.loads(result) == ServiceResponse(ValueRef("session"))
+    assert set(svc._take_attributes().attr) == {b"initial", b"next"}
+
+    with pytest.raises(TypeError, match="must contain bytes"):
+        await svc.on_task_invoke(TaskContext("task", "session", cloudpickle.dumps(ServiceRequest(method="invalid"))))
+    assert list(svc._take_attributes().attr) == []
+
+
 def test_app_service_validates_combined_publication_limit():
     import flamepy.app as app
     from flamepy.app._context import _bind_invocation_context
@@ -1666,16 +2330,65 @@ def test_app_get_resolves_futures():
 
     f1 = Future()
     f2 = Future()
-    f1.set_result(b"ref1")
-    f2.set_result(b"ref2")
+    f1.set_result(cloudpickle.dumps(ServiceResponse(ValueRef({"a": 1}))))
+    f2.set_result(cloudpickle.dumps(ServiceResponse(ValueRef({"b": 2}))))
+    assert app.get([ObjectFuture(f1), ObjectFuture(f2)]) == [{"a": 1}, {"b": 2}]
 
-    with patch("flamepy.app.client.ObjectRef", DummyObjectRef):
-        with patch("flamepy.app.client.get_object", side_effect=[{"a": 1}, {"b": 2}]):
-            of1 = ObjectFuture(f1)
-            of2 = ObjectFuture(f2)
 
-            results = app.get([of1, of2])
-            assert results == [{"a": 1}, {"b": 2}]
+def test_app_get_keeps_duplicate_results():
+    from flamepy.app import ObjectFuture
+    from flamepy.app.client import _Runtime as Runtime
+
+    app = object.__new__(Runtime)
+    futures = []
+    for index in range(40):
+        future = Future()
+        future.set_result(cloudpickle.dumps(ServiceResponse(ValueRef(str(index).encode()))))
+        futures.append(ObjectFuture(future))
+    futures.append(futures[0])
+
+    assert app.get(futures) == [str(index).encode() for index in range(40)] + [b"0"]
+
+
+def test_app_get_error_does_not_cancel_later_tasks():
+    from flamepy.app import ObjectFuture
+    from flamepy.app.client import _Runtime as Runtime
+
+    app = object.__new__(Runtime)
+    failed = Future()
+    failed.set_exception(ValueError("task failed"))
+    pending = Future()
+
+    with pytest.raises(ValueError, match="task failed"):
+        app.get([ObjectFuture(failed), ObjectFuture(pending)])
+    assert not pending.cancelled()
+    pending.set_result(b"still-running")
+
+
+def test_app_get_waits_for_pending_future_without_callback():
+    from flamepy.app import ObjectFuture
+    from flamepy.app.client import _Runtime as Runtime
+
+    registered = threading.Event()
+
+    class CoreFuture(Future):
+        def _add_internal_callback(self, callback):
+            super().add_done_callback(callback)
+            registered.set()
+
+        def add_done_callback(self, callback):
+            raise AssertionError("App batch Get must not dispatch user callbacks")
+
+    first = CoreFuture()
+    second = Future()
+    second.set_result(cloudpickle.dumps(ServiceResponse(ValueRef(b"second"))))
+    worker = threading.Thread(target=lambda: (registered.wait(timeout=5), first.set_result(cloudpickle.dumps(ServiceResponse(ValueRef(b"first"))))))
+    worker.start()
+
+    try:
+        assert object.__new__(Runtime).get([ObjectFuture(first), ObjectFuture(second)]) == [b"first", b"second"]
+    finally:
+        worker.join(timeout=1)
 
 
 def test_app_wait_waits_for_all_futures():
@@ -1705,16 +2418,12 @@ def test_app_ref_returns_objectrefs():
 
     f1 = Future()
     f2 = Future()
-    f1.set_result(b"ref1")
-    f2.set_result(b"ref2")
+    from flamepy.core import ObjectRef
 
-    with patch("flamepy.app.client.ObjectRef", DummyObjectRef):
-        of1 = ObjectFuture(f1)
-        of2 = ObjectFuture(f2)
-
-        refs = app.ref([of1, of2])
-        assert len(refs) == 2
-        assert all(isinstance(r, DummyObjectRef) for r in refs)
+    refs = [ObjectRef(endpoint="grpc://host:9090", key=f"app/session/{index}", version=1) for index in range(2)]
+    f1.set_result(cloudpickle.dumps(ServiceResponse(refs[0])))
+    f2.set_result(cloudpickle.dumps(ServiceResponse(refs[1])))
+    assert app.ref([ObjectFuture(f1), ObjectFuture(f2)]) == refs
 
 
 # App Type Tests
@@ -1938,6 +2647,7 @@ def test_service_instance_close_retries_after_session_close_failure():
     service._future_lock = threading.Lock()
     service._state_changed = threading.Condition(service._future_lock)
     service._pending_futures = set()
+    service._submissions_in_flight = 0
     service._state = _ServiceState.OPEN
     service._session_owner = owner
 
@@ -2038,7 +2748,7 @@ def test_runtime_close_serializes_with_service_creation(monkeypatch):
 
     def create_service():
         try:
-            runtime.service()(execution_object)
+            app_client.remote(runtime.service()(execution_object))
         except Exception as error:
             creation_errors.append(error)
 

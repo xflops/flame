@@ -168,12 +168,12 @@ class Session:
     def run_code(self, code: str, input: Optional[bytes] = None) -> SessionOutput:
         self._ensure_open()
         payload = _encode_script(self._options.language, self._options.runtime, code, input)
-        return _decode_output(self._session.invoke(payload))
+        return _decode_output(self._session.run(payload))
 
     def submit_code(self, code: str, input: Optional[bytes] = None) -> Future:
         self._ensure_open()
         payload = _encode_script(self._options.language, self._options.runtime, code, input)
-        raw_future = self._session.run(payload)
+        raw_future = self._session.submit(payload)
         mapped: Future = Future()
 
         def complete(done: Future) -> None:
@@ -182,7 +182,8 @@ class Session:
             except Exception as exc:
                 mapped.set_exception(exc)
 
-        raw_future.add_done_callback(complete)
+        register = getattr(raw_future, "_add_internal_callback", raw_future.add_done_callback)
+        register(complete)
         return mapped
 
     def close(self) -> None:

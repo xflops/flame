@@ -29,6 +29,7 @@ mod frontend;
 const DEFAULT_PORT: u16 = 8080;
 const ALL_HOST_ADDRESS: &str = "0.0.0.0";
 
+#[derive(Clone)]
 pub struct Flame {
     controller: ControllerPtr,
     /// Cluster-wide default `resreq` (from `cluster.resreq`

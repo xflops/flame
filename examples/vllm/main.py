@@ -19,7 +19,7 @@ def main() -> None:
         "computation while retaining normal fallback scheduling. "
     ) * 4
     try:
-        engine = VllmEngine(MODEL)
+        engine = VllmEngine.remote(MODEL)
         first = engine.generate(prompt).get()
         print(first.text)
 

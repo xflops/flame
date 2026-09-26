@@ -559,7 +559,7 @@ class FakeSession:
         self.application = "myapp"
         self.id = "sess-1"
 
-    def invoke(self, input_bytes):
+    def run(self, input_bytes):
         return cloudpickle.dumps("OK")
 
     def common_data(self):
@@ -644,7 +644,7 @@ class TestSessionOperations:
 
     def test_session_invoke_returns_none_for_none_output(self, monkeypatch):
         class NoneOutputSession(FakeSession):
-            def invoke(self, input_bytes):
+            def run(self, input_bytes):
                 return None
 
         monkeypatch.setattr(service_client, "create_session", lambda **kwargs: NoneOutputSession())
