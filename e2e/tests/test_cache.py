@@ -13,11 +13,60 @@ limitations under the License.
 
 import time
 import uuid
+from contextlib import contextmanager
+from urllib.parse import urlparse
 
 import flamepy.core.cache as cache_module
+import grpc
 import pyarrow as pa
 import pytest
 from flamepy.core import FlameContext, ObjectRef, get_object, patch_object, put_object, update_object
+from flamepy.proto import cache_pb2, cache_pb2_grpc
+
+
+@contextmanager
+def _remote_cache_client(ref: ObjectRef):
+    """Use a separate gRPC client so remote writes do not touch the SDK cache."""
+    endpoint, authority = cache_module._resolve_cache_endpoint(ref.endpoint)
+    parsed = urlparse(endpoint)
+    options = list(cache_module.GRPC_OPTIONS)
+    if authority:
+        options.append(("grpc.default_authority", authority))
+    if parsed.scheme in ("grpcs", "grpc+tls", "grpcs-proxy"):
+        tls = cache_module._get_cache_tls_config()
+        roots = None
+        if tls and tls.ca_file:
+            with open(tls.ca_file, "rb") as roots_file:
+                roots = roots_file.read()
+        channel = grpc.secure_channel(parsed.netloc, grpc.ssl_channel_credentials(root_certificates=roots), options=options)
+    else:
+        channel = grpc.insecure_channel(parsed.netloc, options=options)
+    with channel:
+        yield cache_pb2_grpc.ObjectCacheServiceStub(channel)
+
+
+def _remote_metadata(ref: ObjectRef):
+    with _remote_cache_client(ref) as client:
+        return client.GetMetadata(cache_pb2.CacheGetMetadataRequest(key=ref.key))
+
+
+def _remote_write(ref: ObjectRef, data_type: str, data: bytes, *, patch: bool = False) -> ObjectRef:
+    def requests():
+        yield cache_pb2.CacheWriteRequest(header=cache_pb2.CacheWriteHeader(key=ref.key, data_type=data_type))
+        for offset in range(0, len(data), cache_module._UPLOAD_CHUNK_SIZE):
+            yield cache_pb2.CacheWriteRequest(data=data[offset : offset + cache_module._UPLOAD_CHUNK_SIZE])
+
+    with _remote_cache_client(ref) as client:
+        metadata = (client.Patch if patch else client.Put)(requests())
+    return ObjectRef(endpoint=metadata.endpoint, key=metadata.key, version=metadata.version)
+
+
+def _remote_get(ref: ObjectRef, client_version: int):
+    with _remote_cache_client(ref) as client:
+        responses = list(client.Get(cache_pb2.CacheGetRequest(key=ref.key, client_version=client_version)))
+    assert responses and responses[0].WhichOneof("payload") == "header"
+    assert all(response.WhichOneof("payload") == "chunk" for response in responses[1:])
+    return responses[0].header, [response.chunk for response in responses[1:]]
 
 
 def test_cache_put_and_get():
@@ -44,8 +93,7 @@ def test_cache_cloudpickle_object_and_patch_remain_raw():
     delta = {"text": "another-repeat" * 2000}
 
     ref = put_object(key_prefix, base)
-    client = cache_module._get_cache_client(ref.endpoint, cache_module._get_cache_tls_config())
-    metadata = client.GetMetadata(cache_module.cache_pb2.CacheGetMetadataRequest(key=ref.key))
+    metadata = _remote_metadata(ref)
     assert metadata.data_type == "cloudpickle"
     patched = patch_object(ref, delta)
     result = get_object(patched, deserializer=lambda value, patches: (value, patches))
@@ -59,8 +107,7 @@ def test_cache_zstd_arrow_table():
     table = pa.table({"item": ["repeat-me"] * 1000})
 
     ref = put_object(key_prefix, table)
-    client = cache_module._get_cache_client(ref.endpoint, cache_module._get_cache_tls_config())
-    metadata = client.GetMetadata(cache_module.cache_pb2.CacheGetMetadataRequest(key=ref.key))
+    metadata = _remote_metadata(ref)
     assert metadata.data_type == "arrow.table.zstd"
 
     assert get_object(ref).equals(table)
@@ -163,16 +210,14 @@ def _raw_deserializer(base, deltas):
 
 def _remote_patch_without_local_cache_invalidation(ref: ObjectRef, delta):
     """Patch through gRPC directly to emulate another client process."""
-    client = cache_module._get_cache_client(ref.endpoint, cache_module._get_cache_tls_config())
     data_type, data = cache_module._serialize_object_data(delta)
-    return cache_module._write_remote(client, ref.key, data_type, cache_module._byte_chunks(data), patch=True)
+    return _remote_write(ref, data_type, data, patch=True)
 
 
 def _remote_update_without_local_cache_invalidation(ref: ObjectRef, new_obj):
     """Update through gRPC directly to emulate another client process."""
-    client = cache_module._get_cache_client(ref.endpoint, cache_module._get_cache_tls_config())
     data_type, data = cache_module._serialize_object_data(new_obj)
-    return cache_module._write_remote(client, ref.key, data_type, cache_module._byte_chunks(data))
+    return _remote_write(ref, data_type, data)
 
 
 def _cached_object(ref: ObjectRef):
@@ -234,11 +279,10 @@ def test_incremental_get_applies_remote_patch_only_response():
     assert get_object(ref, deserializer=_raw_deserializer) == {"base": base_data, "deltas": []}
 
     patched_ref = _remote_patch_without_local_cache_invalidation(ref, delta_data_1)
-    fetch_result = cache_module._fetch_object_data(ref, ref.version)
-
-    assert fetch_result.mode == cache_module.FetchMode.PATCHES
-    assert fetch_result.version == patched_ref.version
-    assert [patch.data for patch in fetch_result.patches] == [delta_data_1]
+    header, chunks = _remote_get(ref, ref.version)
+    assert header.mode == cache_pb2.CACHE_GET_MODE_PATCHES
+    assert header.version == patched_ref.version
+    assert [(chunk.kind, chunk.version) for chunk in chunks] == [(cache_pb2.CACHE_CHUNK_KIND_PATCH, patched_ref.version)]
 
     result = get_object(ref, deserializer=_raw_deserializer)
     assert result == {"base": base_data, "deltas": [delta_data_1]}
@@ -248,11 +292,10 @@ def test_incremental_get_applies_remote_patch_only_response():
     assert [patch.data for patch in cached.patches] == [delta_data_1]
 
     patched_ref_2 = _remote_patch_without_local_cache_invalidation(ref, delta_data_2)
-    second_fetch_result = cache_module._fetch_object_data(ref, cached.version)
-
-    assert second_fetch_result.mode == cache_module.FetchMode.PATCHES
-    assert second_fetch_result.version == patched_ref_2.version
-    assert [patch.data for patch in second_fetch_result.patches] == [delta_data_2]
+    header, chunks = _remote_get(ref, cached.version)
+    assert header.mode == cache_pb2.CACHE_GET_MODE_PATCHES
+    assert header.version == patched_ref_2.version
+    assert [(chunk.kind, chunk.version) for chunk in chunks] == [(cache_pb2.CACHE_CHUNK_KIND_PATCH, patched_ref_2.version)]
 
     result = get_object(ref, deserializer=_raw_deserializer)
     assert result == {"base": base_data, "deltas": [delta_data_1, delta_data_2]}
@@ -273,12 +316,10 @@ def test_version_zero_forces_full_response_with_cached_object():
     patched_ref = _remote_patch_without_local_cache_invalidation(ref, delta_data)
 
     forced_ref = ObjectRef(endpoint=ref.endpoint, key=ref.key, version=0)
-    fetch_result = cache_module._fetch_object_data(forced_ref, 0)
-
-    assert fetch_result.mode == cache_module.FetchMode.FULL
-    assert fetch_result.version == patched_ref.version
-    assert fetch_result.base == base_data
-    assert [patch.data for patch in fetch_result.patches] == [delta_data]
+    header, chunks = _remote_get(forced_ref, 0)
+    assert header.mode == cache_pb2.CACHE_GET_MODE_FULL
+    assert header.version == patched_ref.version
+    assert [(chunk.kind, chunk.version) for chunk in chunks] == [(cache_pb2.CACHE_CHUNK_KIND_BASE, ref.version), (cache_pb2.CACHE_CHUNK_KIND_PATCH, patched_ref.version)]
 
     result = get_object(forced_ref, deserializer=_raw_deserializer)
     assert result == {"base": base_data, "deltas": [delta_data]}
@@ -294,12 +335,10 @@ def test_incremental_get_falls_back_to_full_after_remote_update():
     assert get_object(ref, deserializer=_raw_deserializer) == {"base": base_data, "deltas": []}
 
     updated_ref = _remote_update_without_local_cache_invalidation(ref, updated_data)
-    fetch_result = cache_module._fetch_object_data(ref, ref.version)
-
-    assert fetch_result.mode == cache_module.FetchMode.FULL
-    assert fetch_result.version == updated_ref.version
-    assert fetch_result.base == updated_data
-    assert fetch_result.patches == []
+    header, chunks = _remote_get(ref, ref.version)
+    assert header.mode == cache_pb2.CACHE_GET_MODE_FULL
+    assert header.version == updated_ref.version
+    assert [(chunk.kind, chunk.version) for chunk in chunks] == [(cache_pb2.CACHE_CHUNK_KIND_BASE, updated_ref.version)]
 
     result = get_object(ref, deserializer=_raw_deserializer)
     assert result == {"base": updated_data, "deltas": []}
