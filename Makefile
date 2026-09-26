@@ -11,7 +11,7 @@ CONTAINER_RUNTIME ?= $(CONTAINER_CLI)
 DOCKER_REGISTRY ?= xflops
 FSM_TAG ?= $(shell cargo get --entry session_manager/ package.version --pretty)
 FEM_TAG ?= $(shell cargo get --entry executor_manager/ package.version --pretty)
-CONSOLE_TAG ?= latest
+CONSOLE_TAG ?= $(FSM_TAG)
 
 # Docker image names
 FSM_IMAGE = $(DOCKER_REGISTRY)/flame-session-manager
@@ -162,11 +162,9 @@ e2e-local: e2e-py-local e2e-rs ## Run all E2E tests against local cluster
 # Docker build targets
 docker-build-fsm: update_protos ## Build session manager Docker image
 	$(CONTAINER_CLI) build -t $(FSM_IMAGE):$(FSM_TAG) -f $(FSM_DOCKERFILE) .
-	$(CONTAINER_CLI) tag $(FSM_IMAGE):$(FSM_TAG) $(FSM_IMAGE):latest
 
 docker-build-fem: update_protos ## Build executor manager Docker image
 	$(CONTAINER_CLI) build -t $(FEM_IMAGE):$(FEM_TAG) -f $(FEM_DOCKERFILE) .
-	$(CONTAINER_CLI) tag $(FEM_IMAGE):$(FEM_TAG) $(FEM_IMAGE):latest
 
 docker-build-console: update_protos ## Build console Docker image
 	$(CONTAINER_CLI) build -t $(CONSOLE_IMAGE):$(CONSOLE_TAG) -f $(CONSOLE_DOCKERFILE) .
@@ -176,10 +174,12 @@ docker-build: docker-build-fsm docker-build-fem docker-build-console ## Build al
 # Docker push targets
 docker-push-fsm: docker-build-fsm ## Push session manager Docker image
 	$(CONTAINER_CLI) push $(FSM_IMAGE):$(FSM_TAG)
+	$(CONTAINER_CLI) tag $(FSM_IMAGE):$(FSM_TAG) $(FSM_IMAGE):latest
 	$(CONTAINER_CLI) push $(FSM_IMAGE):latest
 
 docker-push-fem: docker-build-fem ## Push executor manager Docker image
 	$(CONTAINER_CLI) push $(FEM_IMAGE):$(FEM_TAG)
+	$(CONTAINER_CLI) tag $(FEM_IMAGE):$(FEM_TAG) $(FEM_IMAGE):latest
 	$(CONTAINER_CLI) push $(FEM_IMAGE):latest
 
 docker-push-console: docker-build-console ## Push console Docker image
@@ -260,10 +260,10 @@ release-images-pull-bases: ## Pull release base images with the detected contain
 		$(CONTAINER_CLI) pull --platform "$$platform" "$(UBUNTU_BASE_IMAGE)"; \
 	done
 
-ci-image: update_protos ## Build images for CI (without version tags)
-	$(CONTAINER_CLI) build -t $(FSM_IMAGE) -f $(FSM_DOCKERFILE) .
-	$(CONTAINER_CLI) build -t $(FEM_IMAGE) -f $(FEM_DOCKERFILE) .
-	$(CONTAINER_CLI) build -t $(CONSOLE_IMAGE) -f $(CONSOLE_DOCKERFILE) .
+ci-image: update_protos ## Build images for CI with local ci tags
+	$(CONTAINER_CLI) build -t $(FSM_IMAGE):ci -f $(FSM_DOCKERFILE) .
+	$(CONTAINER_CLI) build -t $(FEM_IMAGE):ci -f $(FEM_DOCKERFILE) .
+	$(CONTAINER_CLI) build -t $(CONSOLE_IMAGE):ci -f $(CONSOLE_DOCKERFILE) .
 
 # Cleanup targets
 docker-clean: ## Remove all flame Docker images
@@ -276,13 +276,13 @@ docker-clean-all: ## Remove all Docker images and containers (use with caution)
 
 # Development targets
 docker-run-fsm: docker-build-fsm ## Run session manager container
-	$(CONTAINER_CLI) run --rm -it $(FSM_IMAGE):latest
+	$(CONTAINER_CLI) run --rm -it $(FSM_IMAGE):$(FSM_TAG)
 
 docker-run-fem: docker-build-fem ## Run executor manager container
-	$(CONTAINER_CLI) run --rm -it $(FEM_IMAGE):latest
+	$(CONTAINER_CLI) run --rm -it $(FEM_IMAGE):$(FEM_TAG)
 
 docker-run-console: docker-build-console ## Run console container
-	$(CONTAINER_CLI) run --rm -it $(CONSOLE_IMAGE):latest
+	$(CONTAINER_CLI) run --rm -it $(CONSOLE_IMAGE):$(CONSOLE_TAG)
 
 # Utility targets
 docker-images: ## List all flame Docker images

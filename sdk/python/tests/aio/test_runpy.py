@@ -84,7 +84,7 @@ async def test_runpy_binds_recursive_service_to_current_session(monkeypatch):
                 def run(self):
                     return None
 
-            recursive_proxy = RecursiveProxy()
+            recursive_proxy = RecursiveProxy.remote()
             captured["proxy"] = recursive_proxy
             captured["execution_object"] = recursive_proxy._execution_object
             return recursive_proxy._session.id

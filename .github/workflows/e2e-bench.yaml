@@ -43,7 +43,23 @@ jobs:
           FLAME_BENCHMARK_RUNTIME: Host Shim
           FLAME_BENCHMARK_EXECUTORS: 4
         run: |
+          docker compose exec -T -w /opt/e2e flame-console bash -c \
+            'source /usr/local/flame/sbin/flmenv.sh && bash benchmarks/wait_for_idle.sh'
           cargo test -p flame-rs --test benchmark_test -- --nocapture
+
+      - name: Run flamepy.core flmping control
+        timeout-minutes: 15
+        run: |
+          docker compose exec -T -w /opt/e2e flame-console bash -c \
+            'source /usr/local/flame/sbin/flmenv.sh && bash benchmarks/wait_for_idle.sh && python3 benchmarks/core.py' \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run flamepy.app benchmark
+        timeout-minutes: 20
+        run: |
+          docker compose exec -T -w /opt/e2e flame-console bash -c \
+            'source /usr/local/flame/sbin/flmenv.sh && bash benchmarks/wait_for_idle.sh && PYTHONPATH=/opt/e2e/src:$PYTHONPATH python3 benchmarks/app.py' \
+            | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Show logs on failure
         if: failure()
@@ -95,10 +111,21 @@ jobs:
           FLAME_BENCHMARK_RUNTIME: CRI Shim
           FLAME_BENCHMARK_EXECUTORS: 4
         run: |
+          bash e2e/benchmarks/wait_for_idle.sh
           cargo test -p flame-rs --test benchmark_test -- --nocapture
 
-      - name: Verify Flame-owned CRI workloads
-        run: ci/cri/e2e.sh verify-workloads
+      - name: Run flamepy.core flmping control
+        timeout-minutes: 15
+        run: |
+          bash e2e/benchmarks/wait_for_idle.sh
+          python3 e2e/benchmarks/core.py | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run flamepy.app benchmark
+        timeout-minutes: 20
+        run: |
+          bash e2e/benchmarks/wait_for_idle.sh
+          cd e2e
+          python3 benchmarks/app.py | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Print CRI and Flame diagnostics
         if: always()

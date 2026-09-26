@@ -90,7 +90,8 @@ def sum_fn(a: int, b: int) -> int:
     return a + b
 
 
-result = sum_fn(1, 3)
+print(sum_fn(1, 3))  # local call
+result = sum_fn.remote(1, 3)
 print(result.get())
 app.destroy()
 ```
@@ -118,7 +119,7 @@ class Counter:
     def get(self) -> int:
         return self._count
 
-counter = Counter(10)
+counter = Counter.remote(10)
 counter.add(1).wait()
 counter.add(3).wait()
 counter.add(5).wait()
@@ -127,11 +128,11 @@ app.destroy()
 ```
 
 Decorating `Counter` declares the service class but does not create a session.
-`Counter(10)` creates the service handle and session, and `flmrun` runs
-`Counter.__init__(10)` in the executor. Call methods directly on the handle;
-Flame does not add a `.remote()` suffix. Class-level calls such as
+`Counter(10)` constructs a local object. `Counter.remote(10)` creates the remote
+proxy and session, and `flmrun` runs `Counter.__init__(10)` in the executor.
+Call methods directly on the proxy; class-level calls such as
 `Counter.add(...)` are not supported. The options on `@app.service(...)` apply
-to the session created for the handle.
+to the session created for the proxy.
 
 ### Passing ObjectFuture Values
 
@@ -154,8 +155,8 @@ def add(a: int, b: int) -> int:
     return a + b
 
 
-first = double(21)
-total = add(first, 8)
+first = double.remote(21)
+total = add.remote(first, 8)
 print(total.get())
 app.destroy()
 ```
@@ -169,9 +170,15 @@ def fn_a(value: int) -> int:
     return value * 2
 
 
+fn_a_service = app.remote(fn_a)
+
+
 @app.service()
 def fn_b(value: int) -> int:
-    return fn_a(value).get()
+    return fn_a_service(value).get()
+
+
+print(fn_b.remote(21).get())
 ```
 
 ## API Reference
@@ -193,9 +200,12 @@ flamepy.app.init(name, fail_if_exists=False)
 Top-level functions:
 
 - `app.service(autoscale=None, warmup=0, resreq=None)`: canonical decorator.
-  Functions become service proxies after `app.init()`. For classes, decoration
-  declares the service without creating a session; calling the decorated class
-  creates a handle and session, and its constructor runs in the executor.
+  Decoration declares a function or class service without creating a session.
+  Call the decorated object directly for local execution. For functions,
+  `fn.remote(*args, **kwargs)` submits a remote call on a shared session.
+  `app.remote(fn)` creates an independent function proxy. For classes,
+  `Clazz.remote(*args, **kwargs)` or `app.remote(Clazz, *args, **kwargs)`
+  creates a proxy and passes constructor arguments to the executor.
 - `get(futures)`: resolve multiple `ObjectFuture` values to concrete objects.
 - `ref(futures)`: resolve multiple `ObjectFuture` values to `ObjectRef` values.
 - `wait(futures)`: wait for multiple futures without fetching objects.
@@ -203,11 +213,13 @@ Top-level functions:
 - `flamepy.app.put(obj)`: store a shared object under the active application prefix.
 - `destroy()`: close services, unregister the application, delete cached objects, and remove the uploaded package.
 
-Recursive services are the lifecycle exception. An `@app.service()` declaration
-made while service code is running automatically borrows that invocation's
-existing session. It requires neither `app.init()` nor `app.destroy()` and does
-not own or close the parent session. Nested declarations reuse the existing
-session configuration, so they do not accept `autoscale`, `warmup`, or `resreq`.
+Recursive services are the lifecycle exception. A function call through
+`.remote(...)` on a declaration made while service code is running borrows
+that invocation's existing session. A nested class `.remote(...)` call creates
+a borrowed proxy. These calls require neither `app.init()` nor `app.destroy()`
+and do not own or close the parent session. Nested
+declarations reuse the existing session configuration, so they do not accept
+`autoscale`, `warmup`, or `resreq`.
 They must remain in the invocation's execution context, and nested calls must
 complete before the parent invocation returns.
 
@@ -226,16 +238,20 @@ def add(left: int, right: int) -> int:
 
 ### ServiceInstance
 
-`app.service()` is the canonical decorator. A decorated function immediately
-becomes a `ServiceInstance`. A decorated class becomes a service factory;
-calling it creates a `ServiceInstance` and sends the constructor arguments to
-the executor. Each constructed handle has its own service ID and retained
-object; constructing the same decorated class twice does not share object
-state. `app.destroy()` closes those service sessions.
+`app.service()` is the canonical decorator. Calling a decorated function or
+class directly executes it locally. `fn.remote(*args, **kwargs)` submits a
+remote function call on a shared session and returns `ObjectFuture`.
+`app.remote(fn)` creates an independent `ServiceInstance` that can be called
+repeatedly. `Clazz.remote(*args, **kwargs)` and
+`app.remote(Clazz, *args, **kwargs)` each create a `ServiceInstance` and send
+constructor arguments to the executor. Each
+remote class proxy has its own service ID and retained object; creating two
+proxies from the same decorated class does not share object state.
+`app.destroy()` closes those service sessions.
 
 Public methods on a decorated class must not use names reserved by
-`ServiceInstance`, such as `close`. A collision is rejected when the handle is
-created rather than silently hiding the user method.
+`ServiceInstance`, such as `close`. A collision is rejected when the service is
+declared rather than silently hiding the user method.
 
 When declarations live in another module, initialize the application before
 importing that module so its decorators execute against the active application:
@@ -248,13 +264,15 @@ app.init("pipeline-app")
 # pipeline.services uses @app.service() for its declarations.
 from pipeline import services  # noqa: E402
 
-result = services.transform("input")
+result = services.transform.remote("input")
 print(result.get())
 app.destroy()
 ```
 
-- Function services are callable directly.
-- Constructed class handles expose one wrapper method for each public method.
+- Decorated functions and classes are callable locally.
+- Function proxies from `app.remote(fn)` and class proxies from either remote
+  factory run calls remotely.
+- Class proxies expose one wrapper method for each public method.
 - Every remote call returns `ObjectFuture`.
 
 Default service behavior with `warmup=0`:
@@ -318,8 +336,8 @@ class TargetCache(CacheBase):
 
 
 key = b"model:block:7"
-warm_cache = WarmCache()
-target_cache = TargetCache()
+warm_cache = WarmCache.remote()
+target_cache = TargetCache.remote()
 warm_cache.store(key, "value").wait()
 warm_cache.close()
 result = target_cache.load(key, option=TaskOptions(affinity={key}))

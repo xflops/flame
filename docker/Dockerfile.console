@@ -20,7 +20,7 @@ RUN ./target/release/flmadm install \
 
 FROM ubuntu:24.04
 
-RUN apt-get update && apt-get install -y wget vim iputils-ping ssh curl python3 python3-pip && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y wget vim iputils-ping ssh curl jq python3 python3-pip && rm -rf /var/lib/apt/lists/*
 
 # Copy the entire installation from builder (includes lib/ with flamepy and sbin/flmenv.sh)
 COPY --from=builder /usr/local/flame /usr/local/flame

@@ -213,6 +213,8 @@ async def get_object(ref: ObjectRef, deserializer: Optional[Deserializer] = None
             cached = common._cache_put(cache_key, cached)
     else:
         raise ValueError(f"Unexpected object fetch mode: {result.mode}")
+    if deserializer is None:
+        return cached.data
     return await asyncio.to_thread(common._materialize_object, cached, deserializer)
 
 

@@ -68,20 +68,41 @@ session = flamepy.create_session(
 output = session.invoke(b"hello")
 print(output)
 
-futures = [session.run(f"task {idx}".encode()) for idx in range(10)]
+futures = [session.submit(f"task {idx}".encode()) for idx in range(10)]
 wait(futures)
 outputs = [future.result() for future in futures]
 
 session.close()
 ```
 
-Use `session.create_task()`, `session.get_task()`, `session.list_tasks()`, and `session.watch_task()` when callers need explicit task objects or streamed task updates.
+`submit()` returns a Future before the `CreateTask` RPC replies, so tasks can
+be submitted concurrently; submission and execution errors surface through
+`future.result()`. `run()` waits for the `CreateTask` reply before returning
+its Future, so it raises submission errors immediately.
+
+Use `session.create_task()`, `session.get_task()`, `session.list_tasks()`, and
+`session.watch_task()` when callers need explicit task objects or streamed task
+updates. `watch_task()` first yields the latest available status, which may
+already be terminal, then yields updates until the task reaches a terminal
+state. Intermediate updates may be coalesced when the iterator is not read.
+
+The Python SDK uses one task watch stream per session. Calls to `run()`,
+`submit()`, and `watch_task()` register their task IDs on that stream;
+multiple watchers of the same task share incoming updates. Each registration
+asks the frontend for its current task status, then receives later updates.
+The SDK retains each Future and watcher until its task finishes or the stream
+closes.
+A terminal update removes that task's registration, and a stream error is
+delivered to every remaining Future and watcher. If you stop reading a
+watcher before its task finishes, the SDK still retains it until that task
+finishes or the stream closes.
 
 ### AsyncIO Core Client
 
 Use `flamepy.core.aio` for native asyncio calls. It has the same core object
 and method names as `flamepy.core`; I/O methods use `await`, and task streams
-use `async for`:
+use `async for`. `Session.submit()` returns an `asyncio.Task` immediately;
+await that task for the result:
 
 ```python
 import asyncio
@@ -94,9 +115,7 @@ async def main():
         session = await connection.create_session(
             flame_aio.SessionAttributes(application="flmping", min_instances=1)
         )
-        futures = await asyncio.gather(
-            *(session.run(f"task {idx}".encode()) for idx in range(10))
-        )
+        futures = [session.submit(f"task {idx}".encode()) for idx in range(10)]
         outputs = await asyncio.gather(*futures)
         await session.close()
         return outputs
@@ -242,7 +261,7 @@ def square(value: int) -> int:
     return value * value
 
 
-futures = [square(idx) for idx in range(8)]
+futures = [square.remote(idx) for idx in range(8)]
 print(app.get(futures))
 app.destroy()
 ```
@@ -262,11 +281,12 @@ disabled existing application is never reused and always produces an error.
 project has no Python package metadata; otherwise, declare dependencies in the
 project's existing metadata. `python_version` selects the executor Python
 version through the application template. `app.service()` is the canonical
-decorator and must run after initialization. Functions become
-`ServiceInstance` proxies. Decorating a class declares a service class without
-creating a session. Calling the decorated class creates its service handle and
-session; `flmrun` runs the class constructor, including its arguments, in the
-executor:
+decorator and must run after initialization. Decorated functions and classes
+run locally when called directly. `fn.remote(*args, **kwargs)` submits a remote
+function call on a shared session and returns an `ObjectFuture`. Use
+`app.remote(fn)` to create a separate function proxy and session. For a class,
+`Clazz.remote(*args, **kwargs)` or `app.remote(Clazz, *args, **kwargs)` creates
+a proxy and passes constructor arguments to `flmrun`:
 
 ```python
 @app.service(autoscale=False, warmup=1)
@@ -279,16 +299,16 @@ class Counter:
         return self.value
 
 
-counter = Counter(10)     # creates a handle; flmrun constructs Counter(10)
+counter = Counter.remote(10)  # creates a proxy; flmrun constructs Counter(10)
 counter.increment()
 ```
 
-Class-level calls such as `Counter.increment()` are not supported. Flame method
-calls remain direct Python calls—use `counter.increment()`, without a
-`.remote()` suffix. The decorator options configure the session created by each
-class construction. `app.destroy()` closes the sessions created by this
-process. If this process registered the application, `app.destroy()` also
-unregisters it and removes its package and cache. With `fail_if_exists=False`,
+Class-level calls such as `Counter.increment()` are not supported. Call methods
+on the remote proxy with `counter.increment()`. The decorator options configure
+the session created by each `.remote()` call. `app.destroy()` closes the
+sessions created by this process. If this process registered the application,
+`app.destroy()` also unregisters it and removes its package and cache. With
+`fail_if_exists=False`,
 an existing application is borrowed and its lifecycle remains the user's
 responsibility; `app.destroy()` does not unregister it. Application execution
 objects are functions or classes; already constructed objects are not accepted.
@@ -297,8 +317,9 @@ in the counter above, each handle has one retained object and predictable
 mutable state. With autoscaling enabled (the default), every executor retains
 its own copy, so mutable fields are replica-local rather than a distributed
 singleton.
-Constructing the same decorated class twice does not share object state. Public
-class methods must not collide with `ServiceInstance` API names such as `close`.
+Creating two remote proxies from the same decorated class does not share
+object state. Public class methods must not collide with `ServiceInstance`
+API names such as `close`.
 
 During an App invocation, `app.session_context()` returns the active session
 context, while `app.publish_attributes(attrs)` adds opaque `bytes` keys to the
@@ -308,9 +329,10 @@ into the executor's retained attribute set. Task calls can request a matching
 instance with `TaskOptions(affinity={key})`.
 
 The returned service-side context is the core `flamepy.SessionContext`. An inner
-`@app.service()` declaration made during a service invocation automatically
-reuses that invocation's session. This recursive declaration is the exception
-to the normal lifecycle ordering: it needs neither `app.init()` nor
+`@app.service()` declaration made during a service invocation can call
+`fn.remote(...)` or `Clazz.remote()` to reuse that invocation's session. This
+recursive path is the
+exception to the normal lifecycle ordering: it needs neither `app.init()` nor
 `app.destroy()`, because it owns neither the parent application nor the reused
 session. Nested declarations must remain in the invocation's execution context
 and do not accept `autoscale`, `warmup`, or `resreq`, because those settings
@@ -342,7 +364,7 @@ The repository-level check validates the `flmrun` template, App package upload/i
 |------|------------|
 | Connect | `flamepy.connect()` |
 | Sessions | `create_session()`, `open_session()`, `get_session()`, `list_sessions()`, `close_session()` |
-| Tasks | `Session.invoke()`, `Session.run()`, `Session.create_task()`, `Session.watch_task()` |
+| Tasks | `Session.invoke()`, `Session.run()`, `Session.submit()`, `Session.create_task()`, `Session.watch_task()` |
 | Applications | `register_application()`, `unregister_application()`, `get_application()`, `list_applications()` |
 | Services | `FlameService`, `flamepy.run()`, `flamepy.service.FlameInstance`, `flamepy.service.Session` |
 | Objects | `put_object()`, `get_object()`, `update_object()`, `patch_object()`, `upload_object()`, `download_object()` |

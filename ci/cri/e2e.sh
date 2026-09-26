@@ -24,6 +24,7 @@ install_dependencies() {
         containernetworking-plugins \
         curl \
         gnupg \
+        jq \
         protobuf-compiler
     if ! command -v containerd >/dev/null; then
         sudo apt-get install -y containerd
@@ -191,8 +192,16 @@ verify_workloads() {
     : > /tmp/flame-cri-containers
     local container
     for container in $(sudo ctr --namespace k8s.io containers list -q); do
-        sudo ctr --namespace k8s.io containers info "$container" \
-            | tee -a /tmp/flame-cri-containers
+        if ! sudo ctr --namespace k8s.io containers info "$container" \
+            2> /tmp/flame-cri-container-info-error | tee -a /tmp/flame-cri-containers; then
+            # Executors may be released between list and info after tests finish.
+            if grep -Fq "container \"$container\" in namespace \"k8s.io\": not found" \
+                /tmp/flame-cri-container-info-error; then
+                continue
+            fi
+            cat /tmp/flame-cri-container-info-error >&2
+            return 1
+        fi
     done
     grep -Eq '"io.xflops.flame.managed-by"[[:space:]]*:[[:space:]]*"executor-manager"' \
         /tmp/flame-cri-containers

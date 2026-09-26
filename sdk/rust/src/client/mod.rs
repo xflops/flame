@@ -18,10 +18,11 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use chrono::{DateTime, Duration, Utc};
-use futures::TryFutureExt;
 // use serde::{Deserialize, Serialize};
 use serde_derive::{Deserialize, Serialize};
 use stdng::{lock_ptr, trace_fn};
+use tokio::sync::{mpsc, watch};
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
@@ -102,7 +103,10 @@ pub async fn connect_with_tls(
         FlameError::InvalidConfig(format!("failed to connect to <{}>: {}", addr, e))
     })?;
 
-    Ok(Connection { channel })
+    Ok(Connection {
+        channel,
+        watch_managers: Arc::default(),
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,6 +120,7 @@ pub struct Event {
 #[derive(Clone)]
 pub struct Connection {
     pub(crate) channel: Channel,
+    watch_managers: Arc<Mutex<HashMap<SessionID, Arc<WatchManager>>>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -499,6 +504,8 @@ pub enum NodeState {
 pub struct Session {
     #[serde(skip)]
     pub(crate) client: Option<FlameClient>,
+    #[serde(skip)]
+    connection: Option<Connection>,
 
     pub id: SessionID,
     pub application: String,
@@ -518,6 +525,136 @@ pub struct Session {
     pub priority: u32,
     #[serde(default)]
     pub resreq: Option<ResourceRequirement>,
+}
+
+#[derive(Default)]
+struct WatchManager {
+    state: tokio::sync::Mutex<WatchState>,
+}
+
+struct WatchStream {
+    requests: mpsc::Sender<WatchTaskRequest>,
+    task: tokio::task::AbortHandle,
+}
+
+#[derive(Default)]
+struct WatchState {
+    // Keep the stream and task registrations under one lock so register,
+    // finish, and close update the same watch lifecycle atomically.
+    stream: Option<WatchStream>,
+    task_watcher: HashMap<TaskID, watch::Sender<Option<Result<Task, FlameError>>>>,
+}
+
+impl WatchManager {
+    async fn register(
+        self: &Arc<Self>,
+        client: FlameClient,
+        session_id: SessionID,
+        task_id: TaskID,
+    ) -> Result<watch::Receiver<Option<Result<Task, FlameError>>>, FlameError> {
+        let (requests, receiver) = {
+            let mut state = self.state.lock().await;
+            let receiver = if let Some(waiter) = state.task_watcher.get(&task_id) {
+                waiter.subscribe()
+            } else {
+                let (reply, receiver) = watch::channel(None);
+                state.task_watcher.insert(task_id.clone(), reply);
+                receiver
+            };
+            let requests = match state.stream.as_ref() {
+                Some(stream) => stream.requests.clone(),
+                None => {
+                    let (requests, stream) = mpsc::channel(128);
+                    let task = tokio::spawn(watch_task_stream(
+                        self.clone(),
+                        client,
+                        ReceiverStream::new(stream),
+                    ));
+                    state.stream = Some(WatchStream {
+                        requests: requests.clone(),
+                        task: task.abort_handle(),
+                    });
+                    requests
+                }
+            };
+            (requests, receiver)
+        };
+        if requests
+            .send(WatchTaskRequest {
+                session_id,
+                task_id,
+            })
+            .await
+            .is_err()
+        {
+            // The stream task reports its error to every registered waiter.
+            return Err(FlameError::Network("task watch stream closed".to_string()));
+        }
+        Ok(receiver)
+    }
+
+    async fn finish(&self, error: FlameError) {
+        let mut state = self.state.lock().await;
+        state.stream = None;
+        for (_, waiter) in state.task_watcher.drain() {
+            waiter.send_replace(Some(Err(error.clone())));
+        }
+    }
+
+    async fn deliver(&self, task: Task) {
+        let mut state = self.state.lock().await;
+        if task.is_completed() {
+            if let Some(reply) = state.task_watcher.remove(&task.id) {
+                reply.send_replace(Some(Ok(task)));
+            }
+        } else if let Some(reply) = state.task_watcher.get(&task.id) {
+            reply.send_replace(Some(Ok(task)));
+        }
+    }
+
+    async fn close(&self) {
+        let mut state = self.state.lock().await;
+        if let Some(stream) = state.stream.take() {
+            stream.task.abort();
+        }
+        for (_, waiter) in state.task_watcher.drain() {
+            waiter.send_replace(Some(Err(FlameError::Network(
+                "session is closed".to_string(),
+            ))));
+        }
+    }
+}
+
+async fn next_watch_update(
+    receiver: &mut watch::Receiver<Option<Result<Task, FlameError>>>,
+) -> Option<Result<Task, FlameError>> {
+    receiver.changed().await.ok()?;
+    receiver.borrow_and_update().clone()
+}
+
+async fn watch_task_stream(
+    manager: Arc<WatchManager>,
+    mut client: FlameClient,
+    requests: ReceiverStream<WatchTaskRequest>,
+) {
+    let result: Result<(), FlameError> = async {
+        let mut tasks = client.watch_tasks(requests).await?.into_inner();
+        while let Some(update) = tasks.next().await {
+            let task = Task::try_from(&update?)?;
+            manager.deliver(task).await;
+        }
+        Err(FlameError::Network(
+            "task watch stream ended before all tasks completed".to_string(),
+        ))
+    }
+    .await;
+    manager
+        .finish(
+            result
+                .err()
+                .unwrap_or_else(|| FlameError::Network("task watch stream closed".to_string())),
+        )
+        .await;
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -625,6 +762,28 @@ where
 }
 
 impl Connection {
+    fn watch_manager(&self, session_id: &SessionID) -> Arc<WatchManager> {
+        let mut managers = self
+            .watch_managers
+            .lock()
+            .expect("watch manager lock poisoned");
+        managers
+            .entry(session_id.clone())
+            .or_insert_with(|| Arc::new(WatchManager::default()))
+            .clone()
+    }
+
+    fn attach_session(
+        &self,
+        response: &rpc::Session,
+        client: FlameClient,
+    ) -> Result<Session, FlameError> {
+        let mut session = Session::try_from(response)?;
+        session.connection = Some(self.clone());
+        session.client = Some(client);
+        Ok(session)
+    }
+
     pub async fn create_session_with(
         &self,
         options: impl Into<SessionOptions>,
@@ -652,9 +811,7 @@ impl Connection {
         let mut client = FlameClient::new(self.channel.clone());
         let ssn = client.create_session(create_ssn_req).await?;
         let inner_ssn = ssn.into_inner();
-        let mut ssn = Session::try_from(&inner_ssn)?;
-        ssn.client = Some(client);
-        Ok(ssn)
+        self.attach_session(&inner_ssn, client)
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<Session>, FlameError> {
@@ -670,7 +827,7 @@ impl Connection {
         inner
             .sessions
             .iter()
-            .map(Session::try_from)
+            .map(|session| self.attach_session(session, client.clone()))
             .collect::<Result<Vec<Session>, FlameError>>()
     }
 
@@ -683,9 +840,7 @@ impl Connection {
             .await?;
 
         let inner_ssn = ssn.into_inner();
-        let mut ssn = Session::try_from(&inner_ssn)?;
-        ssn.client = Some(client);
-        Ok(ssn)
+        self.attach_session(&inner_ssn, client)
     }
 
     pub async fn open_session(
@@ -711,9 +866,7 @@ impl Connection {
         let mut client = FlameClient::new(self.channel.clone());
         let ssn = client.open_session(open_ssn_req).await?;
         let inner_ssn = ssn.into_inner();
-        let mut ssn = Session::try_from(&inner_ssn)?;
-        ssn.client = Some(client);
-        Ok(ssn)
+        self.attach_session(&inner_ssn, client)
     }
 
     pub async fn open_or_create_session_with(
@@ -745,6 +898,15 @@ impl Connection {
                 session_id: id.to_string(),
             })
             .await?;
+
+        let manager = self
+            .watch_managers
+            .lock()
+            .expect("watch manager lock poisoned")
+            .remove(id);
+        if let Some(manager) = manager {
+            manager.close().await;
+        }
 
         Ok(())
     }
@@ -876,6 +1038,24 @@ impl Connection {
 }
 
 impl Session {
+    async fn register_task_watch(
+        &self,
+        task_id: TaskID,
+    ) -> Result<watch::Receiver<Option<Result<Task, FlameError>>>, FlameError> {
+        let client = self
+            .client
+            .clone()
+            .ok_or_else(|| FlameError::Internal("no flame client".to_string()))?;
+        let connection = self
+            .connection
+            .as_ref()
+            .ok_or_else(|| FlameError::Internal("no flame connection".to_string()))?;
+        connection
+            .watch_manager(&self.id)
+            .register(client, self.id.clone(), task_id)
+            .await
+    }
+
     pub async fn invoke<I, O>(&self, input: I) -> Result<TaskHandle<O>, FlameError>
     where
         I: IntoTaskInput,
@@ -918,14 +1098,17 @@ impl Session {
         let task = self
             .create_task_with_options(input.into_task_input()?, option)
             .await?;
-        let session = self.clone();
-        let session_id = session.id.clone();
         let task_id = task.id;
-        let future_task_id = task_id.clone();
+        let mut receiver = self.register_task_watch(task_id.clone()).await?;
 
         let future = Box::pin(async move {
-            let task = session.wait_task(session_id, future_task_id).await?;
-            TaskResult::from_task(task)
+            while let Some(update) = next_watch_update(&mut receiver).await {
+                let task = update?;
+                if task.is_completed() {
+                    return TaskResult::from_task(task);
+                }
+            }
+            Err(FlameError::Network("task watch stopped".to_string()))
         });
 
         Ok(TaskFuture { task_id, future })
@@ -1017,9 +1200,51 @@ impl Session {
         informer_ptr: TaskInformerPtr,
     ) -> Result<(), FlameError> {
         trace_fn!("Session::run_task");
-        self.create_task(input)
-            .and_then(|task| self.watch_task(task.ssn_id.clone(), task.id, informer_ptr))
+        let task = self.create_task(input).await?;
+        let registration = self.register_task_watch(task.id).await;
+        let mut updates = match registration {
+            Ok(updates) => updates,
+            Err(error) => {
+                let callback = informer_ptr.clone();
+                let reported = error.clone();
+                tokio::task::spawn_blocking(move || -> Result<(), FlameError> {
+                    lock_ptr!(callback)?.on_error(reported);
+                    Ok(())
+                })
+                .await
+                .map_err(|error| FlameError::Internal(error.to_string()))??;
+                return Err(error);
+            }
+        };
+        while let Some(update) = next_watch_update(&mut updates).await {
+            let completed = update.as_ref().map(Task::is_completed).unwrap_or(true);
+            let callback = informer_ptr.clone();
+            let result = update.as_ref().map(|_| ()).map_err(Clone::clone);
+            tokio::task::spawn_blocking(move || -> Result<(), FlameError> {
+                let mut informer = lock_ptr!(callback)?;
+                match update {
+                    Ok(task) => informer.on_update(task),
+                    Err(error) => informer.on_error(error),
+                }
+                Ok(())
+            })
             .await
+            .map_err(|error| FlameError::Internal(error.to_string()))??;
+            result?;
+            if completed {
+                return Ok(());
+            }
+        }
+        let error = FlameError::Network("task watch stopped".to_string());
+        let callback = informer_ptr;
+        let reported = error.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), FlameError> {
+            lock_ptr!(callback)?.on_error(reported);
+            Ok(())
+        })
+        .await
+        .map_err(|error| FlameError::Internal(error.to_string()))??;
+        Err(error)
     }
 
     pub async fn watch_task(
@@ -1029,76 +1254,46 @@ impl Session {
         informer_ptr: TaskInformerPtr,
     ) -> Result<(), FlameError> {
         trace_fn!("Session::watch_task");
-        let mut client = self
-            .client
-            .clone()
-            .ok_or(FlameError::Internal("no flame client".to_string()))?;
-
-        let watch_task_req = WatchTaskRequest {
-            session_id,
-            task_id,
+        if session_id != self.id {
+            return Err(FlameError::InvalidConfig(
+                "task watch session does not match this session".to_string(),
+            ));
+        }
+        let registration = self.register_task_watch(task_id).await;
+        let mut updates = match registration {
+            Ok(updates) => updates,
+            Err(error) => {
+                lock_ptr!(informer_ptr)?.on_error(error.clone());
+                return Err(error);
+            }
         };
-        let mut task_stream = client.watch_task(watch_task_req).await?.into_inner();
-        while let Some(task) = task_stream.next().await {
-            match task {
-                Ok(t) => {
-                    let mut informer = lock_ptr!(informer_ptr)?;
-                    match Task::try_from(&t) {
-                        Ok(parsed) => informer.on_update(parsed),
-                        Err(err) => informer.on_error(err),
+        while let Some(update) = next_watch_update(&mut updates).await {
+            match update {
+                Ok(task) => {
+                    let completed = task.is_completed();
+                    lock_ptr!(informer_ptr)?.on_update(task);
+                    if completed {
+                        return Ok(());
                     }
                 }
-                Err(e) => {
-                    let mut informer = lock_ptr!(informer_ptr)?;
-                    informer.on_error(FlameError::from(e.clone()));
+                Err(error) => {
+                    lock_ptr!(informer_ptr)?.on_error(error.clone());
+                    return Err(error);
                 }
             }
         }
-        Ok(())
-    }
-
-    async fn wait_task(&self, session_id: SessionID, task_id: TaskID) -> Result<Task, FlameError> {
-        trace_fn!("Session::wait_task");
-        let mut client = self
-            .client
-            .clone()
-            .ok_or(FlameError::Internal("no flame client".to_string()))?;
-
-        let watch_task_req = WatchTaskRequest {
-            session_id,
-            task_id: task_id.clone(),
-        };
-        let mut task_stream = client.watch_task(watch_task_req).await?.into_inner();
-        let mut last_task = None;
-
-        while let Some(task) = task_stream.next().await {
-            let parsed = Task::try_from(&task?)?;
-            if parsed.is_completed() {
-                return Ok(parsed);
-            }
-            last_task = Some(parsed);
-        }
-
-        match last_task {
-            Some(task) if task.is_completed() => Ok(task),
-            _ => self.get_task(&task_id).await,
-        }
+        let error = FlameError::Network("task watch stopped".to_string());
+        lock_ptr!(informer_ptr)?.on_error(error.clone());
+        Err(error)
     }
 
     pub async fn close(&self) -> Result<(), FlameError> {
         trace_fn!("Session::close");
-        let mut client = self
-            .client
-            .clone()
-            .ok_or(FlameError::Internal("no flame client".to_string()))?;
-
-        let close_ssn_req = CloseSessionRequest {
-            session_id: self.id.clone(),
-        };
-
-        client.close_session(close_ssn_req).await?;
-
-        Ok(())
+        self.connection
+            .as_ref()
+            .ok_or_else(|| FlameError::Internal("no flame connection".to_string()))?
+            .close_session(&self.id)
+            .await
     }
 }
 
@@ -1249,6 +1444,7 @@ impl TryFrom<&rpc::Session> for Session {
 
         Ok(Session {
             client: None,
+            connection: None,
             id: metadata.id,
             application: spec.application,
             common_data: spec.common_data.map(CommonData::from),
@@ -1551,6 +1747,389 @@ mod tests {
             affinity: HashSet::new(),
             events: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn connection_shares_watch_manager_across_session_handles() {
+        let channel = Endpoint::from_static("http://127.0.0.1:0").connect_lazy();
+        let connection = Connection {
+            channel: channel.clone(),
+            watch_managers: Arc::default(),
+        };
+        let response = rpc::Session {
+            metadata: Some(rpc::Metadata {
+                id: "ssn-1".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(rpc::SessionSpec {
+                application: "app".to_string(),
+                ..Default::default()
+            }),
+            status: Some(rpc::SessionStatus {
+                state: rpc::SessionState::Open as i32,
+                ..Default::default()
+            }),
+        };
+        let first = connection
+            .attach_session(&response, FlameClient::new(channel.clone()))
+            .unwrap();
+        let second = connection
+            .clone()
+            .attach_session(&response, FlameClient::new(channel))
+            .unwrap();
+        assert!(connection.watch_managers.lock().unwrap().is_empty());
+        let first_manager = first.connection.as_ref().unwrap().watch_manager(&first.id);
+        let second_manager = second
+            .connection
+            .as_ref()
+            .unwrap()
+            .watch_manager(&second.id);
+        assert!(Arc::ptr_eq(&first_manager, &second_manager));
+        assert!(second.client.is_some());
+        assert!(!Arc::ptr_eq(
+            &first_manager,
+            &connection.watch_manager(&"ssn-2".to_string())
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_session_handles_share_one_watch_manager() {
+        let connection = Connection {
+            channel: Endpoint::from_static("http://127.0.0.1:0").connect_lazy(),
+            watch_managers: Arc::default(),
+        };
+        let managers = (0..16)
+            .map(|_| {
+                let connection = connection.clone();
+                std::thread::spawn(move || connection.watch_manager(&"ssn-1".to_string()))
+            })
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(managers
+            .iter()
+            .all(|manager| Arc::ptr_eq(manager, &managers[0])));
+    }
+
+    #[tokio::test]
+    async fn connection_retains_watch_manager_until_removed() {
+        let connection = Connection {
+            channel: Endpoint::from_static("http://127.0.0.1:0").connect_lazy(),
+            watch_managers: Arc::default(),
+        };
+        let live = connection.watch_manager(&"ssn-1".to_string());
+        let weak = Arc::downgrade(&live);
+        drop(live);
+        assert_eq!(connection.watch_managers.lock().unwrap().len(), 1);
+        assert!(weak.upgrade().is_some());
+        let manager = connection
+            .watch_managers
+            .lock()
+            .unwrap()
+            .remove("ssn-1")
+            .unwrap();
+        assert!(Arc::ptr_eq(&manager, &weak.upgrade().unwrap()));
+        drop(manager);
+        assert!(weak.upgrade().is_none());
+    }
+
+    struct ErrorRecorder(Arc<Mutex<Vec<String>>>);
+
+    impl TaskInformer for ErrorRecorder {
+        fn on_update(&mut self, _task: Task) {}
+
+        fn on_error(&mut self, error: FlameError) {
+            self.0.lock().unwrap().push(error.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_registration_error_reaches_informer() {
+        let channel = Endpoint::from_static("http://127.0.0.1:0").connect_lazy();
+        let connection = Connection {
+            channel: channel.clone(),
+            watch_managers: Arc::default(),
+        };
+        let session = Session {
+            client: Some(FlameClient::new(channel)),
+            connection: Some(connection.clone()),
+            id: "ssn-1".to_string(),
+            application: "test-app".to_string(),
+            common_data: None,
+            creation_time: Utc::now(),
+            state: SessionState::Open,
+            pending: 0,
+            running: 0,
+            succeed: 0,
+            failed: 0,
+            events: Vec::new(),
+            tasks: None,
+            priority: 0,
+            resreq: None,
+        };
+        let (requests, request_rx) = mpsc::channel(1);
+        drop(request_rx);
+        let stream = tokio::spawn(std::future::pending::<()>());
+        connection
+            .watch_manager(&session.id)
+            .state
+            .lock()
+            .await
+            .stream = Some(WatchStream {
+            requests,
+            task: stream.abort_handle(),
+        });
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let informer: TaskInformerPtr = Arc::new(Mutex::new(ErrorRecorder(errors.clone())));
+
+        assert!(session
+            .watch_task("ssn-1".to_string(), "task-1".to_string(), informer)
+            .await
+            .is_err());
+        assert_eq!(errors.lock().unwrap().len(), 1);
+        stream.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_watch_routes_terminal_tasks_independently() {
+        let manager = WatchManager::default();
+        let (first_tx, mut first_rx) = watch::channel(None);
+        let (second_tx, mut second_rx) = watch::channel(None);
+        {
+            let mut state = manager.state.lock().await;
+            state.task_watcher.insert("first".to_string(), first_tx);
+            state.task_watcher.insert("second".to_string(), second_tx);
+        }
+
+        manager
+            .deliver(test_task("first", TaskState::Running))
+            .await;
+        assert_eq!(
+            next_watch_update(&mut first_rx)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Running
+        );
+        manager
+            .deliver(test_task("second", TaskState::Succeed))
+            .await;
+        assert_eq!(
+            next_watch_update(&mut second_rx).await.unwrap().unwrap().id,
+            "second"
+        );
+        manager.deliver(test_task("first", TaskState::Failed)).await;
+        assert_eq!(
+            next_watch_update(&mut first_rx)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Failed
+        );
+        assert!(manager.state.lock().await.task_watcher.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shared_watch_registers_each_waiter_for_fresh_frontend_snapshot() {
+        let manager = Arc::new(WatchManager::default());
+        let (requests, mut request_rx) = mpsc::channel(2);
+        manager.state.lock().await.stream = Some(WatchStream {
+            requests,
+            task: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+        });
+        let client = FlameClient::new(Endpoint::from_static("http://127.0.0.1:0").connect_lazy());
+        let mut first = manager
+            .register(client.clone(), "ssn-1".to_string(), "task-1".to_string())
+            .await
+            .unwrap();
+        manager
+            .deliver(test_task("task-1", TaskState::Running))
+            .await;
+        let mut second = manager
+            .register(client, "ssn-1".to_string(), "task-1".to_string())
+            .await
+            .unwrap();
+        assert_eq!(request_rx.try_recv().unwrap().task_id, "task-1");
+        assert_eq!(request_rx.try_recv().unwrap().task_id, "task-1");
+        assert!(request_rx.try_recv().is_err());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            next_watch_update(&mut second)
+        )
+        .await
+        .is_err());
+
+        // A later frontend snapshot, rather than the locally cached Running
+        // state, is delivered to the second waiter.
+        manager
+            .deliver(test_task("task-1", TaskState::Pending))
+            .await;
+        assert_eq!(
+            next_watch_update(&mut second).await.unwrap().unwrap().state,
+            TaskState::Pending
+        );
+
+        manager
+            .deliver(test_task("task-1", TaskState::Succeed))
+            .await;
+        assert_eq!(
+            next_watch_update(&mut first).await.unwrap().unwrap().state,
+            TaskState::Succeed
+        );
+        assert_eq!(
+            next_watch_update(&mut second).await.unwrap().unwrap().state,
+            TaskState::Succeed
+        );
+        assert!(manager.state.lock().await.task_watcher.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shared_watch_coalesces_updates_but_preserves_terminal_state() {
+        let manager = WatchManager::default();
+        let (reply, mut receiver) = watch::channel(None);
+        manager
+            .state
+            .lock()
+            .await
+            .task_watcher
+            .insert("first".to_string(), reply);
+
+        for _ in 0..1000 {
+            manager
+                .deliver(test_task("first", TaskState::Running))
+                .await;
+        }
+        manager
+            .deliver(test_task("first", TaskState::Succeed))
+            .await;
+        assert_eq!(
+            next_watch_update(&mut receiver)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Succeed
+        );
+        assert!(next_watch_update(&mut receiver).await.is_none());
+        assert!(manager.state.lock().await.task_watcher.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shared_watch_removes_dropped_receiver_on_completion() {
+        let manager = WatchManager::default();
+        let (reply, receiver) = watch::channel(None);
+        manager
+            .state
+            .lock()
+            .await
+            .task_watcher
+            .insert("first".to_string(), reply);
+        drop(receiver);
+        manager
+            .deliver(test_task("first", TaskState::Running))
+            .await;
+        assert_eq!(manager.state.lock().await.task_watcher.len(), 1);
+        manager
+            .deliver(test_task("first", TaskState::Succeed))
+            .await;
+        assert!(manager.state.lock().await.task_watcher.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closing_shared_watch_fails_all_task_watchers() {
+        let manager = WatchManager::default();
+        let (reply, mut receiver) = watch::channel(None);
+        let watch = tokio::spawn(std::future::pending::<()>());
+        let (requests, _request_rx) = mpsc::channel(1);
+        {
+            let mut state = manager.state.lock().await;
+            state.stream = Some(WatchStream {
+                requests,
+                task: watch.abort_handle(),
+            });
+            state.task_watcher.insert("first".to_string(), reply);
+        }
+        manager.close().await;
+        assert!(next_watch_update(&mut receiver).await.unwrap().is_err());
+        assert!(manager.state.lock().await.stream.is_none());
+        assert!(watch.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn stopped_shared_watch_errors_waiters_and_allows_replacement() {
+        let manager = WatchManager::default();
+        let (reply, mut receiver) = watch::channel(None);
+        manager
+            .state
+            .lock()
+            .await
+            .task_watcher
+            .insert("first".to_string(), reply);
+
+        manager
+            .finish(FlameError::Network("watch stream disconnected".to_string()))
+            .await;
+        assert!(matches!(
+            next_watch_update(&mut receiver).await,
+            Some(Err(FlameError::Network(message))) if message == "watch stream disconnected"
+        ));
+        let state = manager.state.lock().await;
+        assert!(state.stream.is_none());
+        assert!(state.task_watcher.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_session_close_keeps_shared_watch_open() {
+        let channel = Endpoint::from_static("http://127.0.0.1:0").connect_lazy();
+        let connection = Connection {
+            channel: channel.clone(),
+            watch_managers: Arc::default(),
+        };
+        let session = Session {
+            client: Some(FlameClient::new(channel)),
+            connection: Some(connection.clone()),
+            id: "ssn-1".to_string(),
+            application: "test-app".to_string(),
+            common_data: None,
+            creation_time: Utc::now(),
+            state: SessionState::Open,
+            pending: 0,
+            running: 0,
+            succeed: 0,
+            failed: 0,
+            events: Vec::new(),
+            tasks: None,
+            priority: 0,
+            resreq: None,
+        };
+        let (reply, mut receiver) = watch::channel(None);
+        let manager = connection.watch_manager(&session.id);
+        manager
+            .state
+            .lock()
+            .await
+            .task_watcher
+            .insert("first".to_string(), reply);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), session.close())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(manager.state.lock().await.task_watcher.len(), 1);
+        manager
+            .deliver(test_task("first", TaskState::Succeed))
+            .await;
+        assert_eq!(
+            next_watch_update(&mut receiver)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Succeed
+        );
     }
 
     #[test]

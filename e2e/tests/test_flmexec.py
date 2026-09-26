@@ -72,7 +72,7 @@ def test_flmexec_python_script_starts_app_without_project_metadata(check_flmexec
                 def service(value):
                     return value * value
 
-                result = app.get([service(10), service(20)])
+                result = app.get([service.remote(10), service.remote(20)])
             finally:
                 app.destroy()
 
@@ -119,7 +119,7 @@ def test_flmexec_python_script_starts_app_with_numpy_dependency(check_flmexec_ap
                         "sum": int(values.sum()),
                     }}
 
-                result = service(5).get()
+                result = service.remote(5).get()
             finally:
                 app.destroy()
 

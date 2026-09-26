@@ -2,6 +2,7 @@
 
 import importlib
 import json
+import threading
 from concurrent.futures import Future
 from dataclasses import FrozenInstanceError
 from unittest.mock import patch
@@ -11,6 +12,9 @@ import pytest
 from flamepy import FlameError, FlameErrorCode, ResourceRequirement
 from flamepy.agent import Session, SessionOutput, open_session
 from flamepy.agent.session import _decode_output, _encode_options, _encode_script, _SessionOptions
+from flamepy.core import client as core_client
+from flamepy.core.client import _LazyTaskFuture
+from flamepy.core.types import SessionAttributes
 
 
 class FakeSession:
@@ -158,6 +162,45 @@ def test_submit_code_decodes_future():
     assert isinstance(result, SessionOutput)
     assert result.text() == "ok\n"
     assert agent_session._session.invoked[0][0] == "run"
+
+
+def test_submit_code_completion_is_not_blocked_by_user_callbacks(frontend_server):
+    endpoint, _, _ = frontend_server
+    connection = core_client.connect(endpoint)
+    core_session = connection.create_session(SessionAttributes(application="flmexec"))
+    release_callbacks = threading.Event()
+    all_callbacks_started = threading.Event()
+    started = 0
+    started_lock = threading.Lock()
+
+    def blocked_callback(_):
+        nonlocal started
+        with started_lock:
+            started += 1
+            if started == 4:
+                all_callbacks_started.set()
+        release_callbacks.wait(timeout=5)
+
+    class PendingSession(FakeSession):
+        def run(self, payload):
+            self.raw_future = _LazyTaskFuture(core_session)
+            return self.raw_future
+
+    try:
+        for _ in range(4):
+            future = _LazyTaskFuture(core_session)
+            future.add_done_callback(blocked_callback)
+            future.set_result(b"done")
+        assert all_callbacks_started.wait(timeout=2)
+
+        core_session = PendingSession()
+        agent_session = Session(core_session, _SessionOptions(language="python"))
+        mapped = agent_session.submit_code("print(1)")
+        core_session.raw_future.set_result(core_session.invoke_result)
+        assert mapped.result(timeout=2).text() == "ok\n"
+    finally:
+        release_callbacks.set()
+        connection.close()
 
 
 def test_open_restores_options():

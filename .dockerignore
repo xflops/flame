@@ -1,52 +1,46 @@
-# Ignore test data
-flame.db*
+# The images build Flame from source. Keep the context to Cargo workspace
+# members and files used by flmadm install; runtime examples and E2E files are
+# mounted by Compose instead of copied into the image.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!common/
+!config/
+!cri/
+!executor_manager/
+!examples/
+!flmadm/
+!flmctl/
+!flmexec/
+!flmping/
+!migrations/
+!object_cache/
+!rpc/
+!sdk/
+!session_manager/
+!stdng/
 
-# Ignore local build & ci
-target/
-!target/
-target/*
-!target/release/
-target/release/*
-!target/release/flmadm
-!target/release/flame-executor-manager
-!target/release/flmexec-service
-!target/release/flmping-service
-ci/
-.git/
-tmp/
-logs/
-certs/
-tasks/
-
-# Ignore logs
-**/*.log
-
-# Ignore Python related stuff
+# Build outputs, local environments, caches, and tests are not image inputs.
+**/target/
+**/.git/
 **/.venv/
+**/venv/
+**/node_modules/
 **/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+**/.tox/
+**/.uv/
+**/.pip/
+**/build/
+**/dist/
+**/tests/
+**/*.egg-info/
 **/*.pyc
 **/*.pyo
 **/*.pyd
-**/.Python
-**/.pytest_cache
-**/*.egg-info/
-**/*.egg/
-**/.uv/
-**/.pip/
-
-# Ignore build related stuff
-**/build/
-**/dist/
-work/
-.mypy_cache/
-.ruff_cache/
-
-# Ignore IDE related stuff
-.vscode/
-.idea/
-.DS_Store
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+**/*.log
+**/*.out
+**/*.err

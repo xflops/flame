@@ -1,6 +1,7 @@
 services:
   flame-session-manager:
-    image: xflops/flame-session-manager:latest
+    image: xflops/flame-session-manager:${FLAME_IMAGE_TAG:-dev}
+    pull_policy: build
     build:
       context: .
       dockerfile: docker/Dockerfile.fsm
@@ -16,7 +17,8 @@ services:
       - flame-net
 
   flame-object-cache:
-    image: xflops/flame-object-cache:latest
+    image: xflops/flame-object-cache:${FLAME_IMAGE_TAG:-dev}
+    pull_policy: build
     build:
       context: .
       dockerfile: docker/Dockerfile.foc
@@ -37,7 +39,8 @@ services:
           memory: 12G
 
   flame-executor-manager:
-    image: xflops/flame-executor-manager:latest
+    image: xflops/flame-executor-manager:${FLAME_IMAGE_TAG:-dev}
+    pull_policy: build
     build:
       context: .
       dockerfile: docker/Dockerfile.fem
@@ -69,7 +72,8 @@ services:
       - flame-net
 
   flame-console:
-    image: xflops/flame-console:latest
+    image: xflops/flame-console:${FLAME_IMAGE_TAG:-dev}
+    pull_policy: build
     build:
       context: .
       dockerfile: docker/Dockerfile.console

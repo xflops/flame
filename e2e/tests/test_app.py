@@ -93,8 +93,10 @@ def test_app_with_function(check_package_config, check_flmrun_app):
         def sum_service(left, right):
             return left + right
 
+        assert sum_service(1, 3) == 4
+
         # Call the function remotely
-        result = sum_service(1, 3)
+        result = sum_service.remote(1, 3)
 
         # Verify result is an ObjectFuture
         assert isinstance(result, app.ObjectFuture), f"Expected ObjectFuture, got {type(result)}"
@@ -105,7 +107,7 @@ def test_app_with_function(check_package_config, check_flmrun_app):
 
 
 def test_app_with_class(check_package_config, check_flmrun_app):
-    """Test Case 3: Test App with a class (auto-instantiation)."""
+    """Test Case 3: Test App with a remotely constructed class."""
     with initialized_app("test-app-class"):
 
         @app.service()
@@ -119,7 +121,8 @@ def test_app_with_class(check_package_config, check_flmrun_app):
             def subtract(self, a, b):
                 return a - b
 
-        calculator = CalculatorService()
+        assert CalculatorService().multiply(2, 3) == 6
+        calculator = CalculatorService.remote()
         res_r = calculator.multiply(2, 3)
 
         # Get the result
@@ -127,11 +130,11 @@ def test_app_with_class(check_package_config, check_flmrun_app):
         assert value == 6, f"Expected 6, got {value}"
 
 
-def test_decorated_class_creates_service_instance(
+def test_remote_class_creates_service_instance(
     check_package_config,
     check_flmrun_app,
 ):
-    """Constructing a decorated class creates an executor-backed instance."""
+    """Calling remote() on a decorated class creates an executor-backed instance."""
     with initialized_app("test-app-class-instance"):
 
         @app.service(autoscale=False, warmup=1)
@@ -146,7 +149,7 @@ def test_decorated_class_creates_service_instance(
             def get_count(self):
                 return self.count
 
-        counter = CounterService(10)
+        counter = CounterService.remote(10)
         assert counter.increment().get() == 11
         assert counter.get_count().get() == 11
 
@@ -178,7 +181,7 @@ def test_app_data_aware_scheduling(check_package_config, check_flmrun_app):
                     time.sleep(delay)
                 return value, self.instance_key, self.executor_id
 
-        warm_service = WarmDataService()
+        warm_service = WarmDataService.remote()
         warm_session_id = warm_service._session.id
         bound = wait_for_executors(lambda executor: executor.status.state == ExecutorBound and executor.status.session_id == warm_session_id)
 
@@ -213,7 +216,7 @@ def test_app_data_aware_scheduling(check_package_config, check_flmrun_app):
                         time.sleep(delay)
                     return value, self.instance_key, self.executor_id
 
-            return TargetDataService()
+            return TargetDataService.remote()
 
         services = [declare_data_service() for _ in targets]
         warm_service.close()
@@ -261,7 +264,7 @@ def test_app_with_instance(check_package_config, check_flmrun_app):
                 self.count += value
                 return self.count
 
-        cnt_os = CounterService()
+        cnt_os = CounterService.remote()
 
         # Apply state changes sequentially so the expected total is deterministic.
         cnt_os.increment().wait()
@@ -293,7 +296,7 @@ def test_app_with_objectfuture_args(check_package_config, check_flmrun_app):
                 self.count += value
                 return self.count
 
-        cnt_os = CounterService()
+        cnt_os = CounterService.remote()
 
         # Apply state changes sequentially so ObjectFuture chaining starts from
         # a deterministic counter value.
@@ -330,8 +333,8 @@ def test_app_multiple_services(check_package_config, check_flmrun_app):
                 return a - b
 
         # Call methods on different services
-        result1 = sum_service(5, 3)
-        result2 = CalculatorService().multiply(4, 7)
+        result1 = sum_service.remote(5, 3)
+        result2 = CalculatorService.remote().multiply(4, 7)
 
         # Get results
         value1, value2 = app.get([result1, result2])
@@ -349,10 +352,10 @@ def test_app_with_kwargs(check_package_config, check_flmrun_app):
             return f"{greeting}, {name}!"
 
         # Call with keyword arguments
-        result = greet_service(name="World", greeting="Hi")
+        result = greet_service.remote(name="World", greeting="Hi")
 
         # Call with partial kwargs (uses default)
-        result2 = greet_service(name="Python")
+        result2 = greet_service.remote(name="Python")
 
         value1, value2 = app.get([result, result2])
         assert value1 == "Hi, World!", f"Expected 'Hi, World!', got {value1}"
@@ -396,7 +399,7 @@ def test_objectfuture_ref_method(check_package_config, check_flmrun_app):
             return left + right
 
         # Get an ObjectFuture
-        result = sum_service(10, 20)
+        result = sum_service.remote(10, 20)
 
         # Get the ObjectRef
         obj_ref = result.ref()
@@ -416,9 +419,9 @@ def test_objectfuture_iterator(check_package_config, check_flmrun_app):
             return left + right
 
         results = [
-            sum_service(1, 2),
-            sum_service(5, 7),
-            sum_service(3, 4),
+            sum_service.remote(1, 2),
+            sum_service.remote(5, 7),
+            sum_service.remote(3, 4),
         ]
 
         values = []
@@ -435,6 +438,8 @@ def test_app_service_close(check_package_config, check_flmrun_app):
         @app.service()
         def sum_service(left, right):
             return left + right
+
+        sum_service = app.remote(sum_service)
 
         # Use the service
         result = sum_service(1, 2)
@@ -495,7 +500,7 @@ def test_app_retained_class_handle(check_package_config, check_flmrun_app):
                 self.count += value
                 return self.count
 
-        cnt_service = CounterService()
+        cnt_service = CounterService.remote()
 
         # Call methods
         cnt_service.add(5).wait()
@@ -516,7 +521,7 @@ def test_app_stateless_function(check_package_config, check_flmrun_app):
             return left + right
 
         # Call the function multiple times
-        results = [sum_service(i, i + 1) for i in range(5)]
+        results = [sum_service.remote(i, i + 1) for i in range(5)]
         values = app.get(results)
 
         # Verify results
@@ -540,7 +545,7 @@ def test_app_class_single_instance(check_package_config, check_flmrun_app):
                 return a - b
 
         # Call methods
-        calculator = CalculatorService()
+        calculator = CalculatorService.remote()
         result1 = calculator.add(10, 5)
         result2 = calculator.multiply(3, 4)
 
@@ -557,7 +562,7 @@ def test_app_defaults_function(check_package_config, check_flmrun_app):
             return left + right
 
         # Verify it works (defaults should be applied automatically)
-        result = sum_service(100, 200)
+        result = sum_service.remote(100, 200)
         value = result.get()
         assert value == 300, f"Expected 300, got {value}"
 
@@ -577,7 +582,7 @@ def test_app_defaults_class(check_package_config, check_flmrun_app):
             def subtract(self, a, b):
                 return a - b
 
-        result = CalculatorService().add(10, 1)
+        result = CalculatorService.remote().add(10, 1)
 
         value = result.get()
         assert value == 11, f"Expected 11, got {value}"
@@ -603,7 +608,7 @@ def test_app_defaults_instance(check_package_config, check_flmrun_app):
                 self.count += value
                 return self.count
 
-        counter_service = CounterService()
+        counter_service = CounterService.remote()
 
         counter_service.add(5).wait()
         counter_service.increment().wait()
@@ -626,7 +631,7 @@ def test_app_auto_start(check_package_config, check_flmrun_app):
 
             return left + right
 
-        result = sum_service(10, 20)
+        result = sum_service.remote(10, 20)
         value = result.get()
         assert value == 30, f"Expected 30, got {value}"
     finally:
@@ -651,7 +656,7 @@ def test_app_explicit_destroy(check_package_config, check_flmrun_app):
         def sum_service(left, right):
             return left + right
 
-        result = sum_service(5, 7)
+        result = sum_service.remote(5, 7)
         value = result.get()
         assert value == 12, f"Expected 12, got {value}"
     finally:
@@ -687,7 +692,7 @@ def test_app_repeated_init_reuses_active_app(check_package_config, check_flmrun_
 
             return left + right
 
-        result = sum_service(3, 4)
+        result = sum_service.remote(3, 4)
         value = result.get()
         assert value == 7, f"Expected 7, got {value}"
 
@@ -707,7 +712,7 @@ def test_app_destroy_idempotent(check_package_config, check_flmrun_app):
         def sum_service(left, right):
             return left + right
 
-        result = sum_service(1, 1)
+        result = sum_service.remote(1, 1)
         assert result.get() == 2
     finally:
         app.destroy()
@@ -756,7 +761,7 @@ def test_app_recursive_same_session(check_package_config, check_flmrun_app):
 
         # This test waits synchronously for nested results, so autoscaling
         # provides executor capacity for the child tasks.
-        service = RecursiveTestService()
+        service = RecursiveTestService.remote()
         logger.info(f"[TEST] Service created, session_id={service._session.id}")
 
         # Test with depth=0 (base case)
@@ -981,6 +986,8 @@ class TestGetData:
             def sum_service(left, right):
                 return left + right
 
+            sum_service = app.remote(sum_service)
+
             result = sum_service(5, 3)
             value = result.get()
             assert value == 8, f"Expected 8, got {value}"
@@ -1007,6 +1014,8 @@ class TestGetData:
             @app.service()
             def multiply_service(left, right):
                 return left * right
+
+            multiply_service = app.remote(multiply_service)
 
             result = multiply_service(4, 7)
             value = result.get()
@@ -1060,7 +1069,7 @@ class TestGetData:
                 def subtract(self, a, b):
                     return a - b
 
-            calc_service = CalculatorService()
+            calc_service = CalculatorService.remote()
 
             result = calc_service.add(15, 25)
             value = result.get()
@@ -1097,11 +1106,11 @@ class TestParallelExecution:
                 return left + right
 
             results = [
-                sum_service(1, 1),
-                sum_service(2, 2),
-                sum_service(3, 3),
-                sum_service(4, 4),
-                sum_service(5, 5),
+                sum_service.remote(1, 1),
+                sum_service.remote(2, 2),
+                sum_service.remote(3, 3),
+                sum_service.remote(4, 4),
+                sum_service.remote(5, 5),
             ]
 
             values = app.get(results)
@@ -1116,7 +1125,7 @@ class TestParallelExecution:
                 return left + right
 
             num_tasks = 50
-            results = [sum_service(i, i) for i in range(num_tasks)]
+            results = [sum_service.remote(i, i) for i in range(num_tasks)]
             values = app.get(results)
 
             expected = [i * 2 for i in range(num_tasks)]
@@ -1141,12 +1150,12 @@ class TestParallelExecution:
                 def subtract(self, a, b):
                     return a - b
 
-            calc_service = CalculatorService()
+            calc_service = CalculatorService.remote()
 
             results = [
-                sum_service(10, 5),
+                sum_service.remote(10, 5),
                 calc_service.multiply(3, 4),
-                sum_service(20, 10),
+                sum_service.remote(20, 10),
                 calc_service.subtract(15, 5),
             ]
 
@@ -1162,9 +1171,9 @@ class TestParallelExecution:
                 return left + right
 
             results = [
-                sum_service(1, 2),
-                sum_service(3, 4),
-                sum_service(5, 6),
+                sum_service.remote(1, 2),
+                sum_service.remote(3, 4),
+                sum_service.remote(5, 6),
             ]
 
             completed_values = []
@@ -1197,7 +1206,7 @@ class TestTaskChaining:
                     self.count += value
                     return self.count
 
-            cnt_service = CounterService()
+            cnt_service = CounterService.remote()
 
             cnt_service.add(10).wait()
             cnt_service.add(5).wait()
@@ -1227,7 +1236,7 @@ class TestTaskChaining:
                     self.count += value
                     return self.count
 
-            cnt_service = CounterService()
+            cnt_service = CounterService.remote()
 
             cnt_service.add(10).wait()
             intermediate = cnt_service.get_count()
@@ -1246,14 +1255,14 @@ class TestTaskChaining:
             def sum_service(left, right):
                 return left + right
 
-            a = sum_service(1, 2)
-            b = sum_service(3, 4)
+            a = sum_service.remote(1, 2)
+            b = sum_service.remote(3, 4)
 
             val_a, val_b = app.get([a, b])
             assert val_a == 3
             assert val_b == 7
 
-            c = sum_service(val_a, val_b)
+            c = sum_service.remote(val_a, val_b)
             val_c = c.get()
             assert val_c == 10, f"Expected 10, got {val_c}"
 
@@ -1276,7 +1285,7 @@ class TestMapReducePattern:
                 def subtract(self, a, b):
                     return a - b
 
-            calc_service = CalculatorService()
+            calc_service = CalculatorService.remote()
 
             inputs = [2, 3, 4, 5, 6]
             mapped_results = [calc_service.multiply(x, x) for x in inputs]
@@ -1295,13 +1304,13 @@ class TestMapReducePattern:
             values = [10, 20, 30, 40]
 
             level1 = [
-                sum_service(values[0], values[1]),
-                sum_service(values[2], values[3]),
+                sum_service.remote(values[0], values[1]),
+                sum_service.remote(values[2], values[3]),
             ]
             level1_values = app.get(level1)
             assert level1_values == [30, 70]
 
-            result = sum_service(level1_values[0], level1_values[1])
+            result = sum_service.remote(level1_values[0], level1_values[1])
             final = result.get()
             assert final == 100, f"Reduce phase failed: {final}"
 
@@ -1320,7 +1329,7 @@ class TestMapReducePattern:
                 def subtract(self, a, b):
                     return a - b
 
-            calc_service = CalculatorService()
+            calc_service = CalculatorService.remote()
 
             @app.service()
             def sum_service(left, right):
@@ -1333,12 +1342,12 @@ class TestMapReducePattern:
             assert squared == [1, 4, 9, 16], f"Map failed: {squared}"
 
             level1 = [
-                sum_service(squared[0], squared[1]),
-                sum_service(squared[2], squared[3]),
+                sum_service.remote(squared[0], squared[1]),
+                sum_service.remote(squared[2], squared[3]),
             ]
             level1_values = app.get(level1)
 
-            final = sum_service(level1_values[0], level1_values[1])
+            final = sum_service.remote(level1_values[0], level1_values[1])
             result = final.get()
             assert result == 30, f"MapReduce result should be 30, got {result}"
 
@@ -1357,10 +1366,10 @@ class TestDRFErrorHandling:
                     raise ValueError(f"Negative value not allowed: {x}")
                 return x * 2
 
-            result = failing_func(5)
+            result = failing_func.remote(5)
             assert result.get() == 10
 
-            error_result = failing_func(-1)
+            error_result = failing_func.remote(-1)
             with pytest.raises(Exception):
                 error_result.get()
 
@@ -1376,10 +1385,10 @@ class TestDRFErrorHandling:
                 return x * 10
 
             results = [
-                conditional_fail(1),
-                conditional_fail(2),
-                conditional_fail(3),
-                conditional_fail(4),
+                conditional_fail.remote(1),
+                conditional_fail.remote(2),
+                conditional_fail.remote(3),
+                conditional_fail.remote(4),
             ]
 
             successful_values = []
@@ -1418,7 +1427,7 @@ class TestDRFRetainedClassServices:
                     self.count += value
                     return self.count
 
-            cnt_service = CounterService()
+            cnt_service = CounterService.remote()
 
             cnt_service.add(100).wait()
             cnt_service.increment().wait()
@@ -1449,8 +1458,8 @@ class TestDRFRetainedClassServices:
                     self.count += value
                     return self.count
 
-            svc1 = CounterService()
-            svc2 = CounterService()
+            svc1 = CounterService.remote()
+            svc2 = CounterService.remote()
 
             svc1.add(10).wait()
             svc1.increment().wait()
@@ -1477,6 +1486,8 @@ class TestDRFSessionManagement:
             def sum_service(left, right):
                 return left + right
 
+            sum_service = app.remote(sum_service)
+
             result = sum_service(1, 2)
             assert result.get() == 3
 
@@ -1497,7 +1508,7 @@ class TestDRFSessionManagement:
             def svc1(left, right):
                 return left + right
 
-            r1 = svc1(10, 20)
+            r1 = svc1.remote(10, 20)
             val1 = r1.get()
             assert val1 == 30
 
@@ -1507,7 +1518,7 @@ class TestDRFSessionManagement:
             def svc2(left, right):
                 return left + right
 
-            r2 = svc2(100, 200)
+            r2 = svc2.remote(100, 200)
             val2 = r2.get()
             assert val2 == 300
 
@@ -1528,7 +1539,7 @@ class TestDRFPerformance:
             start_time = time_module.time()
 
             num_tasks = 100
-            results = [sum_service(i, 1) for i in range(num_tasks)]
+            results = [sum_service.remote(i, 1) for i in range(num_tasks)]
             values = app.get(results)
 
             elapsed = time_module.time() - start_time
@@ -1552,7 +1563,7 @@ class TestDRFEdgeCases:
             def get_constant() -> int:
                 return 42
 
-            result = get_constant()
+            result = get_constant.remote()
             value = result.get()
             assert value == 42
 
@@ -1565,7 +1576,7 @@ class TestDRFEdgeCases:
             def handle_none(x) -> str:
                 return "none" if x is None else "not-none"
 
-            result = handle_none(None)
+            result = handle_none.remote(None)
             value = result.get()
             assert value == "none"
 
@@ -1578,7 +1589,7 @@ class TestDRFEdgeCases:
             def create_large_list(n: int) -> list:
                 return list(range(n))
 
-            result = create_large_list(10000)
+            result = create_large_list.remote(10000)
             value = result.get()
             assert len(value) == 10000
             assert value[0] == 0
@@ -1598,7 +1609,7 @@ class TestDRFEdgeCases:
                 }
 
             input_data = {"key": "value", "list": [1, 2, 3]}
-            result = process_nested(input_data)
+            result = process_nested.remote(input_data)
             value = result.get()
 
             assert value["processed"] is True
@@ -1618,7 +1629,7 @@ class TestDRFConcurrentAccess:
                 return left + right
 
             num_calls = 30
-            results = [sum_service(i, i + 1) for i in range(num_calls)]
+            results = [sum_service.remote(i, i + 1) for i in range(num_calls)]
 
             values = app.get(results)
             expected = [i + (i + 1) for i in range(num_calls)]
@@ -1643,11 +1654,11 @@ class TestDRFConcurrentAccess:
                 def subtract(self, a, b):
                     return a - b
 
-            calc_service = CalculatorService()
+            calc_service = CalculatorService.remote()
 
             results = []
             for i in range(10):
-                results.append(sum_service(i, 1))
+                results.append(sum_service.remote(i, 1))
                 results.append(calc_service.multiply(i, 2))
 
             values = app.get(results)

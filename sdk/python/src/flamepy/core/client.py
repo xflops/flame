@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Union
 
 from flamepy.core._bridge import LoopThread
@@ -285,6 +285,16 @@ class Session:
         return self.run(input_data, option).result()
 
     def run(self, input_data: bytes, option: Optional[TaskOptions] = None) -> Future:
+        """Run a task, raising a CreateTask error before returning its future."""
+        _, submission = self._start_task(input_data, option)
+        return submission.result()
+
+    def submit(self, input_data: bytes, option: Optional[TaskOptions] = None) -> Future:
+        """Schedule a task without waiting for CreateTask to acknowledge it."""
+        result, _ = self._start_task(input_data, option)
+        return result
+
+    def _start_task(self, input_data: bytes, option: Optional[TaskOptions]) -> tuple[Future, Future]:
         result = _LazyTaskFuture(self)
         with self.connection._pending_lock:
             self.connection._pending.add(result)
@@ -295,7 +305,10 @@ class Session:
 
         result._add_internal_callback(remove_pending)
 
-        async def start() -> None:
+        async def start() -> Future:
+            if result.done():
+                return result
+
             async def before_result() -> bool:
                 await self.connection._callback_slots.acquire()
                 if result._hold_callback_slot():
@@ -310,6 +323,9 @@ class Session:
                 _before_result=before_result,
                 _discard_result_slot=result._release_held_callback_slot,
             )
+            if result.done():
+                aio_future.cancel()
+                return result
 
             def completed(done: asyncio.Future) -> None:
                 if result.done():
@@ -332,14 +348,32 @@ class Session:
                         pass
 
             result._add_internal_callback(cancelled)
+            return result
 
         try:
-            self.connection._call(start())
+            submission = self.connection._bridge.submit(start())
         except BaseException:
             with self.connection._pending_lock:
                 self.connection._pending.discard(result)
             raise
-        return result
+
+        def submitted(done: Future) -> None:
+            try:
+                done.result()
+            except CancelledError:
+                if not result.done():
+                    message = "connection closed during task submission" if self.connection._closed else "task submission cancelled"
+                    result.set_exception(FlameError(FlameErrorCode.INTERNAL, message))
+            except BaseException as error:
+                if not result.done():
+                    if self.connection._closed:
+                        result.set_exception(FlameError(FlameErrorCode.INTERNAL, "connection closed during task submission"))
+                    else:
+                        result.set_exception(error)
+
+        submission.add_done_callback(submitted)
+        result._add_internal_callback(lambda done: submission.cancel() if done.cancelled() else None)
+        return result, submission
 
     def close(self) -> None:
         self.connection.close_session(self.id)

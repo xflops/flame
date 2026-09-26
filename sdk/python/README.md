@@ -84,12 +84,12 @@ from concurrent.futures import wait
 # Run a task synchronously (blocks until complete)
 result = session.invoke(b"input data")
 
-# Run a task asynchronously (returns Future immediately)
+# Run a task and receive a Future after CreateTask succeeds
 future = session.run(b"input data")
 result = future.result()  # Wait for completion
 
-# Run multiple tasks in parallel
-futures = [session.run(f"input {i}".encode()) for i in range(10)]
+# Submit multiple tasks without waiting for each CreateTask response
+futures = [session.submit(f"input {i}".encode()) for i in range(10)]
 wait(futures)  # Wait for all tasks to complete
 results = [f.result() for f in futures]
 

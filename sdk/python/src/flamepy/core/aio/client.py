@@ -171,8 +171,10 @@ class Connection:
         self._frontend = frontend
         self._loop = asyncio.get_running_loop()
         self._closed = False
+        self._submissions: set[asyncio.Task] = set()
         self._watches: set[asyncio.Task] = set()
         self._results: set[asyncio.Future] = set()
+        self._session_watches: Dict[SessionID, _SessionWatch] = {}
 
     @classmethod
     async def connect(cls, addr: str, tls_config: Optional[FlameClientTls] = None) -> "Connection":
@@ -224,6 +226,8 @@ class Connection:
         if self._closed:
             return
         self._closed = True
+        for session_watch in tuple(self._session_watches.values()):
+            session_watch.close(FlameError(FlameErrorCode.INTERNAL, "connection closed during task watch"))
         watches = list(self._watches)
         for watch in watches:
             watch.cancel()
@@ -233,6 +237,8 @@ class Connection:
             if not result.done():
                 result.set_exception(FlameError(FlameErrorCode.INTERNAL, "connection closed during task watch"))
         await self._channel.close()
+        if self._submissions:
+            await asyncio.gather(*tuple(self._submissions), return_exceptions=True)
 
     async def _rpc(self, method: str, request, operation: str):
         self._check_loop()
@@ -310,7 +316,18 @@ class Connection:
 
     async def close_session(self, session_id: SessionID) -> "Session":
         response = await self._rpc("CloseSession", CloseSessionRequest(session_id=session_id), "failed to close session")
+        session_watch = self._session_watches.get(session_id)
+        if session_watch is not None:
+            session_watch.close(FlameError(FlameErrorCode.INTERNAL, "session closed during task watch"))
         return _session_from_proto(self, response)
+
+    def _watch_task(self, session_id: SessionID, task_id: TaskID, timeout: Optional[float]) -> "TaskWatcher":
+        self._check_loop()
+        session_watch = self._session_watches.get(session_id)
+        if session_watch is None:
+            session_watch = _SessionWatch(self, session_id)
+            self._session_watches[session_id] = session_watch
+        return session_watch.register(task_id, timeout)
 
 
 class Session:
@@ -358,12 +375,31 @@ class Session:
         return TaskIterator(stream, self.id)
 
     def watch_task(self, task_id: TaskID, timeout: Optional[float] = None) -> "TaskWatcher":
-        self.connection._check_loop()
-        stream = self.connection._frontend.WatchTask(WatchTaskRequest(task_id=task_id, session_id=self.id))
-        return TaskWatcher(stream, self.id, timeout)
+        return self.connection._watch_task(self.id, task_id, timeout)
 
     async def invoke(self, input_data: bytes, option: Optional[TaskOptions] = None) -> bytes:
         return await (await self.run(input_data, option))
+
+    def submit(self, input_data: bytes, option: Optional[TaskOptions] = None) -> asyncio.Task[bytes]:
+        """Schedule a task and return an awaitable before CreateTask replies."""
+        self.connection._check_loop()
+
+        async def start() -> bytes:
+            try:
+                return await self.invoke(input_data, option)
+            except asyncio.CancelledError:
+                if self.connection._closed:
+                    raise FlameError(FlameErrorCode.INTERNAL, "connection closed during task submission") from None
+                raise
+            except Exception as error:
+                if self.connection._closed:
+                    raise FlameError(FlameErrorCode.INTERNAL, "connection closed during task submission") from error
+                raise
+
+        task = asyncio.create_task(start())
+        self.connection._submissions.add(task)
+        task.add_done_callback(self.connection._submissions.discard)
+        return task
 
     async def run(self, input_data: bytes, option: Optional[TaskOptions] = None, *, _defer_watch: bool = False, _before_result=None, _discard_result_slot=None) -> asyncio.Future:
         response, _ = await self._create_task_response(input_data, option)
@@ -431,16 +467,105 @@ class Session:
         await self.connection.close_session(self.id)
 
 
-class TaskWatcher(AsyncIterator[Task]):
-    """A single-task async status stream with an optional overall timeout."""
+class _SessionWatch:
+    """One bidirectional WatchTasks stream shared by a session's subscribers."""
 
-    def __init__(self, stream, session_id: str, timeout: Optional[float] = None):
-        self._stream = stream
-        self._responses = stream.__aiter__()
+    def __init__(self, connection: Connection, session_id: SessionID):
+        self._connection = connection
         self._session_id = session_id
+        self._requests: asyncio.Queue[Optional[TaskID]] = asyncio.Queue()
+        self._subscribers: Dict[TaskID, set[TaskWatcher]] = {}
+        self._stream = None
+        self._closed = False
+        self._reader = asyncio.create_task(self._read())
+
+    def register(self, task_id: TaskID, timeout: Optional[float]) -> "TaskWatcher":
+        watcher = TaskWatcher(self, task_id, timeout)
+        subscribers = self._subscribers.get(task_id)
+        if subscribers is None:
+            subscribers = set()
+            self._subscribers[task_id] = subscribers
+        subscribers.add(watcher)
+        # Each registration asks the frontend for a current snapshot. Reusing
+        # a locally cached status could return stale task metadata.
+        self._requests.put_nowait(task_id)
+        return watcher
+
+    def unregister(self, watcher: "TaskWatcher") -> None:
+        subscribers = self._subscribers.get(watcher._task_id)
+        if subscribers is not None:
+            subscribers.discard(watcher)
+
+    async def _request_stream(self):
+        while True:
+            task_id = await self._requests.get()
+            if task_id is None:
+                return
+            yield WatchTaskRequest(task_id=task_id, session_id=self._session_id)
+
+    async def _read(self) -> None:
+        error = FlameError(FlameErrorCode.INTERNAL, "task watch stream closed before completion")
+        try:
+            self._stream = self._connection._frontend.WatchTasks(self._request_stream())
+            async for response in self._stream:
+                task = _task_from_proto(response, self._session_id)
+                subscribers = self._subscribers.get(task.id)
+                if subscribers is None:
+                    continue
+                if task.is_completed() or task.is_failed():
+                    self._subscribers.pop(task.id, None)
+                for watcher in tuple(subscribers):
+                    watcher._deliver(task)
+        except asyncio.CancelledError:
+            return
+        except grpc.RpcError as exc:
+            error = _grpc_error(exc, "failed to watch session tasks")
+        except Exception as exc:
+            error = FlameError(FlameErrorCode.INTERNAL, f"Watch failed: {exc}")
+        finally:
+            self.close(error)
+
+    def close(self, error: FlameError) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._connection._session_watches.get(self._session_id) is self:
+            self._connection._session_watches.pop(self._session_id)
+        for subscribers in self._subscribers.values():
+            for watcher in tuple(subscribers):
+                watcher._fail(error)
+        self._subscribers.clear()
+        self._requests.put_nowait(None)
+        if self._stream is not None:
+            self._stream.cancel()
+        if self._reader is not asyncio.current_task():
+            self._reader.cancel()
+
+
+class TaskWatcher(AsyncIterator[Task]):
+    """A task's latest status followed by updates from its session stream."""
+
+    def __init__(self, session_watch: _SessionWatch, task_id: TaskID, timeout: Optional[float] = None):
+        self._session_watch = session_watch
+        self._task_id = task_id
+        self._updates: asyncio.Queue[Union[Task, FlameError]] = asyncio.Queue(maxsize=1)
         self._loop = asyncio.get_running_loop()
         self._timeout = timeout
         self._deadline = asyncio.get_running_loop().time() + timeout if timeout is not None else None
+        self._closed = False
+
+    def _put(self, update: Union[Task, FlameError]) -> None:
+        if self._closed:
+            return
+        if self._updates.full():
+            self._updates.get_nowait()
+        self._updates.put_nowait(update)
+
+    def _deliver(self, task: Task) -> None:
+        self._put(task)
+
+    def _fail(self, error: FlameError) -> None:
+        self._put(error)
 
     def __aiter__(self) -> "TaskWatcher":
         return self
@@ -448,25 +573,32 @@ class TaskWatcher(AsyncIterator[Task]):
     async def __anext__(self) -> Task:
         if asyncio.get_running_loop() is not self._loop:
             raise RuntimeError("aio task watch used from another event loop")
+        if self._closed:
+            raise StopAsyncIteration
         try:
             if self._deadline is not None:
                 remaining = self._deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     raise asyncio.TimeoutError
-                response = await asyncio.wait_for(self._responses.__anext__(), remaining)
+                update = await asyncio.wait_for(self._updates.get(), remaining)
             else:
-                response = await self._responses.__anext__()
-            return _task_from_proto(response, self._session_id)
+                update = await self._updates.get()
+            if isinstance(update, FlameError):
+                self.close()
+                raise update
+            if update.is_completed() or update.is_failed():
+                self.close()
+            return update
         except asyncio.TimeoutError as error:
             self.close()
             raise TimeoutError(f"watch_task timed out after {self._timeout} seconds") from error
-        except grpc.RpcError as error:
-            raise _grpc_error(error, "failed to watch task") from error
 
     def close(self) -> None:
         if asyncio.get_running_loop() is not self._loop:
             raise RuntimeError("aio task watch used from another event loop")
-        self._stream.cancel()
+        if not self._closed:
+            self._closed = True
+            self._session_watch.unregister(self)
 
 
 class TaskIterator(AsyncIterator[Task]):

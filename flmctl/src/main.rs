@@ -65,7 +65,7 @@ enum Commands {
         node: Option<String>,
 
         /// The output format of the view
-        #[arg(short, long)]
+        #[arg(short, long, value_parser = ["table", "json"])]
         output_format: Option<String>,
     },
     /// Update the object of Flame
@@ -88,6 +88,9 @@ enum Commands {
         /// List the nodes of Flame
         #[arg(short, long)]
         node: bool,
+        /// Output format for the list
+        #[arg(short, long, default_value = "table", value_parser = ["table", "json"])]
+        output_format: String,
     },
     /// Close the session in Flame
     Close {
@@ -153,7 +156,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             session,
             executor,
             node,
-        }) => list::run(&ctx, *application, *session, *executor, *node).await?,
+            output_format,
+        }) => {
+            list::run(
+                &ctx,
+                *application,
+                *session,
+                *executor,
+                *node,
+                output_format,
+            )
+            .await?
+        }
         Some(Commands::Close { session }) => close::run(&ctx, session).await?,
         Some(Commands::Create {
             app,

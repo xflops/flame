@@ -48,7 +48,7 @@ def main():
 
     try:
         # Submit all batch computations
-        results = [estimate_batch(samples_per_batch) for _ in range(num_batches)]
+        results = [estimate_batch.remote(samples_per_batch) for _ in range(num_batches)]
 
         # Collect results
         insides = app.get(results)

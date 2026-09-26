@@ -53,6 +53,7 @@ class TaskState(IntEnum):
     RUNNING = 1
     SUCCEED = 2
     FAILED = 3
+    CANCELLED = 4
 
 
 @dataclass
@@ -246,11 +247,15 @@ class Task:
 
     def is_completed(self) -> bool:
         """Check if the task is completed."""
-        return self.state in (TaskState.SUCCEED, TaskState.FAILED)
+        return self.state in (TaskState.SUCCEED, TaskState.FAILED, TaskState.CANCELLED)
 
     def is_failed(self) -> bool:
         """Check if the task is failed."""
         return self.state == TaskState.FAILED
+
+    def is_cancelled(self) -> bool:
+        """Check if the task was cancelled."""
+        return self.state == TaskState.CANCELLED
 
 
 @dataclass
