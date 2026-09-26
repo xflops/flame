@@ -77,6 +77,38 @@ session.close()
 
 Use `session.create_task()`, `session.get_task()`, `session.list_tasks()`, and `session.watch_task()` when callers need explicit task objects or streamed task updates.
 
+### AsyncIO Core Client
+
+Use `flamepy.core.aio` for native asyncio calls. It has the same core object
+and method names as `flamepy.core`; I/O methods use `await`, and task streams
+use `async for`:
+
+```python
+import asyncio
+
+import flamepy.core.aio as flame_aio
+
+
+async def main():
+    async with await flame_aio.connect("http://127.0.0.1:8080") as connection:
+        session = await connection.create_session(
+            flame_aio.SessionAttributes(application="flmping", min_instances=1)
+        )
+        futures = await asyncio.gather(
+            *(session.run(f"task {idx}".encode()) for idx in range(10))
+        )
+        outputs = await asyncio.gather(*futures)
+        await session.close()
+        return outputs
+
+
+print(asyncio.run(main()))
+```
+
+The synchronous core uses the aio implementation through a private loop
+thread. Aio connections belong to the event loop that created them; close
+them before that loop exits.
+
 ## Register Applications
 
 Most users deploy applications with `flmctl deploy`. The SDK can also register an application directly:
@@ -188,6 +220,12 @@ Object references are versioned. `version=0` forces a fresh download. Nonzero ve
 
 Lower-level helpers under `flamepy.core` and `flamepy.cache` also expose `ObjectKey`, `patch_object()`, `upload_object()`, `download_object()`, and `delete_objects()`.
 
+For asyncio callers, `flamepy.core.aio.cache` exposes awaitable versions of
+these cache operations with the same names. Import it as `aio_cache` and call
+`await aio_cache.close()` before the owning event loop exits to close its
+channels. Synchronous cache helpers use this aio transport through a private
+loop thread.
+
 ## Use App
 
 App packages the current Python project, registers a Flame application based on the configured app template, and exposes Python functions or classes as remote services:
@@ -210,6 +248,10 @@ app.destroy()
 ```
 
 App returns `ObjectFuture` values. Use `future.get()` to fetch a concrete result, `future.ref()` to get the `ObjectRef`, `app.wait()` to wait for a batch, and `app.select()` to iterate as results complete.
+
+App result retrieval remains synchronous through `future.get()` or
+`app.get(futures)`. Remote service functions and class methods may be defined
+with `async def`; the worker awaits them before storing the result.
 
 `app.init(name, fail_if_exists=False, dependencies=None,
 python_version=None)` initializes the process-wide application and returns its

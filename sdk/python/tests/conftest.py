@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 
 import pytest
 
+from tests.test_fixture import frontend_server as frontend_server
+
 
 class _FakeChannel:
     def __init__(self, location: str):

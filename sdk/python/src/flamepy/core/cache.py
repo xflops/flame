@@ -11,10 +11,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import io
-import logging
+import atexit
+import os
 import sys
 import threading
+import types
 import uuid
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
@@ -24,11 +25,9 @@ from urllib.parse import urlparse
 
 import bson
 import cloudpickle
-import grpc
 import pyarrow as pa
 
 from flamepy.core.types import FlameClientCache, FlameClientTls, FlameContext
-from flamepy.proto import cache_pb2, cache_pb2_grpc
 
 if TYPE_CHECKING:
     import numpy as np
@@ -77,8 +76,6 @@ try:
 except ImportError:
     pl = None  # type: ignore[assignment]
     _HAS_POLARS = False
-
-logger = logging.getLogger(__name__)
 
 Deserializer = Callable[[Any, List[Any]], Any]
 
@@ -143,16 +140,23 @@ class FetchResult:
 
 
 class _IdentityKey:
-    __slots__ = ("value",)
+    __slots__ = ("value", "function")
 
     def __init__(self, value: Any):
-        self.value = value
+        # A fresh bound method object is created on every attribute access.
+        # Keep those cache keys stable without invoking user-defined equality.
+        if isinstance(value, types.MethodType):
+            self.value = value.__self__
+            self.function = value.__func__
+        else:
+            self.value = value
+            self.function = None
 
     def __hash__(self) -> int:
-        return id(self.value)
+        return hash((id(self.value), id(self.function)))
 
     def __eq__(self, other: Any) -> bool:
-        return isinstance(other, _IdentityKey) and self.value is other.value
+        return isinstance(other, _IdentityKey) and self.value is other.value and self.function is other.function
 
 
 # Client-side LRU cache with max size limit (O(1) operations using OrderedDict)
@@ -170,15 +174,20 @@ def _cache_get(key: tuple) -> Optional[Object]:
         return _object_cache[key]
 
 
-def _cache_put(key: tuple, obj: Object) -> None:
+def _cache_put(key: tuple, obj: Object) -> Object:
     """Put to cache with LRU eviction (O(1) with OrderedDict)."""
     with _cache_lock:
+        current = _object_cache.get(key)
+        if current is not None and current.version > obj.version:
+            _object_cache.move_to_end(key)
+            return current
         if key in _object_cache:
             _object_cache.move_to_end(key)
         _object_cache[key] = obj
 
         while len(_object_cache) > _CACHE_MAX_SIZE:
             _object_cache.popitem(last=False)
+        return obj
 
 
 def _cache_remove(key: tuple) -> None:
@@ -198,26 +207,26 @@ def _cache_remove_matching(object_key: "ObjectKey") -> None:
 def _materialized_cache_key(deserializer: Optional[Deserializer]) -> Any:
     if deserializer is None:
         return None
-
-    try:
-        hash(deserializer)
-    except TypeError:
-        return _IdentityKey(deserializer)
-    return deserializer
+    return _IdentityKey(deserializer)
 
 
 def _materialize_object(obj: Object, deserializer: Optional[Deserializer] = None) -> Any:
     materialized_key = _materialized_cache_key(deserializer)
-    if materialized_key in obj.materialized:
-        return obj.materialized[materialized_key]
+    while True:
+        with _cache_lock:
+            if materialized_key in obj.materialized:
+                return obj.materialized[materialized_key]
+            version = obj.version
+            base = obj.data
+            patches = [patch.data for patch in obj.patches]
 
-    if deserializer is None:
-        data = obj.data
-    else:
-        data = deserializer(obj.data, [patch.data for patch in obj.patches])
-
-    obj.materialized[materialized_key] = data
-    return data
+        # A user deserializer may be slow or may call another cache operation.
+        # Never hold the cache lock while invoking it.
+        data = base if deserializer is None else deserializer(base, patches)
+        with _cache_lock:
+            if obj.version != version:
+                continue
+            return obj.materialized.setdefault(materialized_key, data)
 
 
 def _cache_apply_patches(
@@ -524,9 +533,6 @@ def _encode_object_data(obj: Any) -> tuple[str, bytes]:
     return data_type, data
 
 
-_client_pool: Dict[tuple[str, Optional[str]], cache_pb2_grpc.ObjectCacheServiceStub] = {}
-_client_pool_lock = threading.Lock()
-
 _context_cache: Optional[FlameContext] = None
 _context_cache_lock = threading.Lock()
 
@@ -556,29 +562,6 @@ GRPC_OPTIONS = [
     ("grpc.max_send_message_length", -1),
     ("grpc.max_receive_message_length", -1),
 ]
-
-
-def _create_cache_client(
-    location: str,
-    tls_config: Optional[FlameClientTls] = None,
-    authority: Optional[str] = None,
-) -> cache_pb2_grpc.ObjectCacheServiceStub:
-    parsed = urlparse(location)
-    if parsed.scheme not in ("grpc", "grpcs", "grpc+tls", "grpcs-proxy") or not parsed.netloc:
-        raise ValueError(f"Invalid object cache endpoint: {location}")
-    options = list(GRPC_OPTIONS)
-    if authority:
-        options.append(("grpc.default_authority", authority))
-    if parsed.scheme in ("grpcs", "grpc+tls", "grpcs-proxy"):
-        roots = None
-        if tls_config and tls_config.ca_file:
-            with open(tls_config.ca_file, "rb") as f:
-                roots = f.read()
-        credentials = grpc.ssl_channel_credentials(root_certificates=roots)
-        channel = grpc.secure_channel(parsed.netloc, credentials, options=options)
-    else:
-        channel = grpc.insecure_channel(parsed.netloc, options=options)
-    return cache_pb2_grpc.ObjectCacheServiceStub(channel)
 
 
 def _cache_proxy_endpoint() -> Optional[str]:
@@ -614,30 +597,7 @@ def _resolve_cache_endpoint(endpoint: str) -> tuple[str, Optional[str]]:
     return endpoint, None
 
 
-def _get_cache_client(endpoint: str, tls_config: Optional[FlameClientTls] = None) -> cache_pb2_grpc.ObjectCacheServiceStub:
-    location, authority = _resolve_cache_endpoint(endpoint)
-    pool_key = (location, authority)
-    with _client_pool_lock:
-        if pool_key not in _client_pool:
-            _client_pool[pool_key] = _create_cache_client(location, tls_config, authority)
-        return _client_pool[pool_key]
-
-
-def _write_requests(key: str, data_type: str, chunks: Any):
-    yield cache_pb2.CacheWriteRequest(header=cache_pb2.CacheWriteHeader(key=key, data_type=data_type))
-    for chunk in chunks:
-        yield cache_pb2.CacheWriteRequest(data=chunk)
-
-
-def _write_remote(client: cache_pb2_grpc.ObjectCacheServiceStub, key: str, data_type: str, chunks: Any, patch: bool = False, timeout: Optional[int] = None) -> ObjectRef:
-    rpc = client.Patch if patch else client.Put
-    metadata = rpc(_write_requests(key, data_type, chunks), timeout=timeout)
-    return ObjectRef(endpoint=metadata.endpoint, key=metadata.key, version=metadata.version)
-
-
-def _byte_chunks(data: bytes):
-    for start in range(0, len(data), _UPLOAD_CHUNK_SIZE):
-        yield data[start : start + _UPLOAD_CHUNK_SIZE]
+_UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
 
 
 def _get_cache_tls_config() -> Optional[FlameClientTls]:
@@ -660,412 +620,82 @@ def _get_cache_tls_config() -> Optional[FlameClientTls]:
     return None
 
 
-def put_object(key_prefix: str, obj: Any) -> "ObjectRef":
-    """Put an object into the cache.
+# Public synchronous calls use the aio cache transport.
+_aio_bridge = None
+_aio_bridge_pid = None
+_aio_bridge_lock = threading.Lock()
 
-    Args:
-        key_prefix: Key prefix in format "<app>/<session>"
-        obj: The object to cache
 
-    Returns:
-        ObjectRef pointing to the cached object
+def _reset_aio_bridge_after_fork() -> None:
+    global _aio_bridge, _aio_bridge_pid, _aio_bridge_lock
+    _aio_bridge = None
+    _aio_bridge_pid = None
+    _aio_bridge_lock = threading.Lock()
 
-    Raises:
-        ValueError: If key_prefix format is invalid or cache not configured
-    """
 
-    object_key = ObjectKey.from_prefix(key_prefix)
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_aio_bridge_after_fork)
 
-    context = _get_cached_context()
-    cache_config = context.cache
 
-    if cache_config is None:
-        raise ValueError("Cache configuration not found")
+def _get_aio_bridge():
+    global _aio_bridge, _aio_bridge_pid
+    from flamepy.core._bridge import LoopThread
 
-    if isinstance(cache_config, str):
-        cache_endpoint, cache_tls = cache_config, None
-    elif isinstance(cache_config, FlameClientCache):
-        cache_endpoint, cache_tls = cache_config.endpoint, cache_config.tls
-    else:
-        cache_endpoint, cache_tls = cache_config.get("endpoint"), None
-    if not cache_endpoint:
-        raise ValueError("Cache endpoint not configured")
+    pid = os.getpid()
+    with _aio_bridge_lock:
+        if _aio_bridge is None or _aio_bridge_pid != pid:
+            _aio_bridge = LoopThread(name="flamepy-cache-aio")
+            _aio_bridge_pid = pid
+        return _aio_bridge
 
-    client = _get_cache_client(cache_endpoint, cache_tls)
-    data_type, data = _encode_object_data(obj)
-    ref = _write_remote(client, object_key.to_prefix(), data_type, _byte_chunks(data))
-    logger.debug("put_object: key=%s, version=%s", ref.key, ref.version)
-    return ref
+
+def _call_aio_cache(name: str, *args: Any, **kwargs: Any) -> Any:
+    from flamepy.core.aio import cache as aio_cache
+
+    return _get_aio_bridge().call(getattr(aio_cache, name)(*args, **kwargs))
+
+
+def _close_aio_bridge() -> None:
+    global _aio_bridge, _aio_bridge_pid
+    with _aio_bridge_lock:
+        bridge = _aio_bridge
+        _aio_bridge = None
+        _aio_bridge_pid = None
+    if bridge is not None:
+        from flamepy.core.aio import cache as aio_cache
+
+        try:
+            bridge.call(aio_cache.close())
+        finally:
+            bridge.close()
+
+
+atexit.register(_close_aio_bridge)
+
+
+def put_object(key_prefix: str, obj: Any) -> ObjectRef:
+    return _call_aio_cache("put_object", key_prefix, obj)
 
 
 def get_object(ref: ObjectRef, deserializer: Optional[Deserializer] = None) -> Any:
-    """Get an object from the cache.
-
-    Uses client-side caching with version checking to avoid unnecessary downloads.
-    To force a fresh download, set ref.version = 0 before calling.
-
-    Args:
-        ref: ObjectRef pointing to the cached object
-        deserializer: Optional function to combine base and deltas.
-            Signature: (base: Any, deltas: List[Any]) -> Any
-            If None, returns just the base object (backward compatible).
-
-    Returns:
-        The deserialized object. If deserializer is provided, returns
-        deserializer(base, deltas). Otherwise returns the base object.
-
-    Raises:
-        ValueError: If key format is invalid or request fails
-    """
-    ObjectKey.from_key(ref.key)
-    cache_key = (ref.endpoint, ref.key)
-
-    if ref.version == 0:
-        cached_version = 0
-    else:
-        cached = _cache_get(cache_key)
-        cached_version = cached.version if cached else 0
-
-    logger.debug(f"get_object: key={ref.key}, cached_version={cached_version}")
-    result = _fetch_object_data(ref, cached_version)
-
-    if result is None:
-        if cached_version > 0:
-            cached = _cache_get(cache_key)
-            if cached is not None:
-                logger.debug(f"get_object: not_modified, returning cached for key={ref.key}")
-                return _materialize_object(cached, deserializer)
-        logger.error(f"get_object: cache miss after not_modified! key={ref.key}, cached_version={cached_version}")
-        raise ValueError(f"Object not found: {ref.key}")
-
-    if result.mode == FetchMode.FULL:
-        cached = Object(
-            version=result.version,
-            data=result.base,
-            patches=result.patches,
-        )
-        _cache_put(cache_key, cached)
-    elif result.mode == FetchMode.PATCHES:
-        cached = _cache_apply_patches(
-            cache_key,
-            expected_version=cached_version,
-            new_version=result.version,
-            patches=result.patches,
-        )
-        if cached is None:
-            full_result = _fetch_object_data(ref, 0)
-            if full_result is None or full_result.mode != FetchMode.FULL:
-                raise ValueError(f"Object not found: {ref.key}")
-            cached = Object(
-                version=full_result.version,
-                data=full_result.base,
-                patches=full_result.patches,
-            )
-            _cache_put(cache_key, cached)
-    else:
-        raise ValueError(f"Unexpected object fetch mode: {result.mode}")
-
-    logger.debug(f"get_object: key={ref.key}, version={cached.version}")
-    return _materialize_object(cached, deserializer)
+    return _call_aio_cache("get_object", ref, deserializer)
 
 
-def _read_get_parts(responses: Any):
-    """Yield a validated header and completed base/patch payloads."""
-    iterator = iter(responses)
-    try:
-        first = next(iterator)
-    except StopIteration as exc:
-        raise ValueError("Cache Get returned no header") from exc
-    if first.WhichOneof("payload") != "header":
-        raise ValueError("Cache Get must start with a header")
-    header = first.header
-    parts = []
-    kind = None
-    version = None
-    data = bytearray()
-    for response in iterator:
-        if response.WhichOneof("payload") != "chunk":
-            raise ValueError("Unexpected Cache Get header after data")
-        chunk = response.chunk
-        if kind is None:
-            kind, version = chunk.kind, chunk.version
-        elif (chunk.kind, chunk.version) != (kind, version):
-            parts.append((kind, version, bytes(data)))
-            kind, version = chunk.kind, chunk.version
-            data.clear()
-        data.extend(chunk.data)
-    if kind is not None:
-        parts.append((kind, version, bytes(data)))
-    return header, parts
+def update_object(ref: ObjectRef, new_obj: Any) -> ObjectRef:
+    return _call_aio_cache("update_object", ref, new_obj)
 
 
-def _fetch_object_data(ref: ObjectRef, cached_version: int) -> Optional[FetchResult]:
-    client = _get_cache_client(ref.endpoint, _get_cache_tls_config())
-    header, parts = _read_get_parts(client.Get(cache_pb2.CacheGetRequest(key=ref.key, client_version=cached_version)))
-    if header.mode == cache_pb2.CACHE_GET_MODE_NOT_MODIFIED:
-        if parts:
-            raise ValueError("NOT_MODIFIED response included data")
-        return None
-    if header.mode not in (cache_pb2.CACHE_GET_MODE_FULL, cache_pb2.CACHE_GET_MODE_PATCHES):
-        raise ValueError(f"Invalid Cache Get mode: {header.mode}")
-    data_type, compression = _type_and_compression(header.data_type)
-    if header.mode == cache_pb2.CACHE_GET_MODE_FULL:
-        if not parts or parts[0][0] != cache_pb2.CACHE_CHUNK_KIND_BASE:
-            raise ValueError("Full object response must start with a base")
-        base = _deserialize_object_data(data_type, _decompress_data(parts[0][2], compression))
-        patch_parts = parts[1:]
-        mode = FetchMode.FULL
-    else:
-        base = None
-        patch_parts = parts
-        mode = FetchMode.PATCHES
-    if any(kind != cache_pb2.CACHE_CHUNK_KIND_PATCH for kind, _, _ in patch_parts):
-        raise ValueError("Cache Get response has an unexpected part kind")
-    patch_versions = [version for _, version, _ in patch_parts]
-    if patch_versions != sorted(set(patch_versions)):
-        raise ValueError("Patch response versions must be unique and increasing")
-    patches = [Patch(version=version, data=_deserialize_object_data(data_type, _decompress_data(data, compression))) for _, version, data in patch_parts]
-    return FetchResult(mode=mode, version=header.version, base=base, patches=patches)
-
-
-def update_object(ref: ObjectRef, new_obj: Any) -> "ObjectRef":
-    """Update an object in the cache.
-
-    This replaces the entire object (base + all deltas) with the new object as base.
-
-    Args:
-        ref: ObjectRef pointing to the cached object to update
-        new_obj: The new object to encode and store
-
-    Returns:
-        Updated ObjectRef with new version from server
-
-    Raises:
-        ValueError: If key format is invalid or request fails
-    """
-    ObjectKey.from_key(ref.key)
-
-    client = _get_cache_client(ref.endpoint, _get_cache_tls_config())
-    data_type, data = _encode_object_data(new_obj)
-    new_ref = _write_remote(client, ref.key, data_type, _byte_chunks(data))
-    _cache_remove((ref.endpoint, ref.key))
-    return new_ref
-
-
-def patch_object(ref: ObjectRef, delta: Any) -> "ObjectRef":
-    """Append delta data to an existing cached object.
-
-    This appends the delta to the object's delta list without modifying the base.
-    The delta will be included in subsequent get_object() calls.
-
-    Args:
-        ref: ObjectRef pointing to the cached object to patch
-        delta: The delta data to encode and append
-
-    Returns:
-        Updated ObjectRef with new version from server
-
-    Raises:
-        ValueError: If key format invalid or object doesn't exist
-    """
-    ObjectKey.from_key(ref.key)
-
-    client = _get_cache_client(ref.endpoint, _get_cache_tls_config())
-    metadata = client.GetMetadata(cache_pb2.CacheGetMetadataRequest(key=ref.key))
-    stored_type, compression = _type_and_compression(metadata.data_type)
-    data_type, data = _serialize_object_data(delta)
-    if data_type != stored_type:
-        raise ValueError(f"Patch data type {data_type!r} does not match cached object type {stored_type!r}")
-    new_ref = _write_remote(client, ref.key, metadata.data_type, _byte_chunks(_compress_data(data, compression)), patch=True)
-    _cache_remove((ref.endpoint, ref.key))
-    return new_ref
+def patch_object(ref: ObjectRef, delta: Any) -> ObjectRef:
+    return _call_aio_cache("patch_object", ref, delta)
 
 
 def delete_objects(key_prefix: str) -> None:
-    """Delete objects matching a key or key prefix from the cache.
-
-    This deletes all objects matching the key or prefix pattern from the server.
-    Also clears any matching entries from the client-side cache.
-
-    Args:
-        key_prefix: Key in format "<app>/<session>/<object>" or key prefix in
-            format "<app>/*" (all sessions) or "<app>/<session>"
-
-    Raises:
-        ValueError: If key_prefix format is invalid or cache not configured
-    """
-    object_key = ObjectKey.from_path(key_prefix)
-
-    context = _get_cached_context()
-    cache_config = context.cache
-
-    if cache_config is None:
-        raise ValueError("Cache configuration not found")
-
-    if isinstance(cache_config, str):
-        cache_endpoint = cache_config
-        cache_tls = None
-    elif isinstance(cache_config, FlameClientCache):
-        cache_endpoint = cache_config.endpoint
-        cache_tls = cache_config.tls
-    else:
-        cache_endpoint = cache_config.get("endpoint")
-        cache_tls = None
-
-    if not cache_endpoint:
-        raise ValueError("Cache endpoint not configured")
-
-    client = _get_cache_client(cache_endpoint, cache_tls)
-    client.Delete(cache_pb2.CacheDeleteRequest(key=str(object_key)))
-    _cache_remove_matching(object_key)
-
-
-_UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
-
-
-class _ChunkReader(io.RawIOBase):
-    """Expose a validated gRPC chunk iterator to Arrow's streaming decoder."""
-
-    def __init__(self, chunks: Any):
-        self._chunks = iter(chunks)
-        self._pending = memoryview(b"")
-
-    def readable(self) -> bool:
-        return True
-
-    def readinto(self, buffer: Any) -> int:
-        target = memoryview(buffer)
-        if not target:
-            return 0
-        while not self._pending:
-            try:
-                self._pending = memoryview(next(self._chunks))
-            except StopIteration:
-                return 0
-        size = min(len(target), len(self._pending))
-        target[:size] = self._pending[:size]
-        self._pending = self._pending[size:]
-        return size
+    _call_aio_cache("delete_objects", key_prefix)
 
 
 def upload_object(key_or_prefix: str, file_path: str, endpoint: Optional[str] = None) -> ObjectRef:
-    """Upload a file to the cache using streaming gRPC.
-
-    Args:
-        key_or_prefix: Either full key (e.g., "myapp/pkg/myapp-1.0.0.tar.gz")
-                       or key prefix (e.g., "myapp/pkg"). If prefix, server
-                       generates a UUID for the object_id.
-        file_path: Path to the local file to upload
-        endpoint: Optional cache endpoint override. When omitted, the endpoint
-                  is loaded from the current Flame context.
-
-    Returns:
-        ObjectRef pointing to the uploaded file
-
-    Raises:
-        ValueError: If cache not configured or upload fails
-        FileNotFoundError: If file_path does not exist
-    """
-    import os
-
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
-
-    object_key = ObjectKey.from_path(key_or_prefix)
-    if object_key.is_all_sessions():
-        raise ValueError(f"Invalid key format: {key_or_prefix}")
-
-    if endpoint is None:
-        cache_config = _get_cached_context().cache
-    else:
-        # An explicit endpoint is sufficient for public-root TLS and plaintext
-        # connections. Reuse context TLS settings when available, but do not
-        # make an otherwise self-contained endpoint depend on global config.
-        try:
-            cache_config = _get_cached_context().cache
-        except Exception:
-            cache_config = None
-
-    if cache_config is None and endpoint is None:
-        raise ValueError("Cache configuration not found")
-
-    cache_tls = cache_config.tls if isinstance(cache_config, FlameClientCache) else None
-    if endpoint is not None:
-        cache_endpoint = endpoint
-    elif isinstance(cache_config, str):
-        cache_endpoint = cache_config
-    elif isinstance(cache_config, FlameClientCache):
-        cache_endpoint = cache_config.endpoint
-    else:
-        cache_endpoint = cache_config.get("endpoint")
-
-    if not cache_endpoint:
-        raise ValueError("Cache endpoint not configured")
-
-    client = _get_cache_client(cache_endpoint, cache_tls)
-    file_size = os.path.getsize(file_path)
-
-    def chunks():
-        with open(file_path, "rb") as source:
-            while chunk := source.read(_UPLOAD_CHUNK_SIZE):
-                yield chunk
-
-    try:
-        ref = _write_remote(client, str(object_key), _TYPE_RAW, chunks(), timeout=300)
-        logger.debug("upload_object: key=%s, version=%s, size=%s", ref.key, ref.version, file_size)
-        return ref
-    except Exception as exc:
-        raise ValueError(f"Failed to upload file to cache server: {exc}") from exc
+    return _call_aio_cache("upload_object", key_or_prefix, file_path, endpoint)
 
 
 def download_object(ref: ObjectRef, dest_path: str) -> None:
-    """Download a file from the cache using streaming gRPC.
-
-    Args:
-        ref: ObjectRef pointing to the cached file
-        dest_path: Local path to save the downloaded file
-
-    Raises:
-        ValueError: If object not found or download fails
-    """
-    import os
-
-    ObjectKey.from_key(ref.key)
-    client = _get_cache_client(ref.endpoint, _get_cache_tls_config())
-    dest_dir = os.path.dirname(dest_path)
-    if dest_dir:
-        os.makedirs(dest_dir, exist_ok=True)
-
-    try:
-        responses = iter(client.Get(cache_pb2.CacheGetRequest(key=ref.key, client_version=0)))
-        first = next(responses)
-        if first.WhichOneof("payload") != "header" or first.header.mode != cache_pb2.CACHE_GET_MODE_FULL:
-            raise ValueError("Expected full object response")
-        data_type, compression = _type_and_compression(first.header.data_type)
-        saw_base = False
-
-        def chunks():
-            nonlocal saw_base
-            for response in responses:
-                if response.WhichOneof("payload") != "chunk":
-                    raise ValueError("Unexpected Cache Get header")
-                chunk = response.chunk
-                if chunk.kind != cache_pb2.CACHE_CHUNK_KIND_BASE or data_type != _TYPE_RAW:
-                    raise ValueError("download_object expected raw base chunks only")
-                saw_base = True
-                yield chunk.data
-
-        with open(dest_path, "wb") as output:
-            if compression == _COMPRESSION_NONE:
-                for chunk in chunks():
-                    output.write(chunk)
-            else:
-                with pa.CompressedInputStream(pa.input_stream(_ChunkReader(chunks())), _COMPRESSION_ZSTD) as stream:
-                    while data := stream.read(_UPLOAD_CHUNK_SIZE):
-                        output.write(data)
-        if not saw_base:
-            raise ValueError("Cache Get response omitted the base")
-    except Exception as exc:
-        if os.path.exists(dest_path):
-            os.remove(dest_path)
-        raise ValueError(f"Failed to download file from cache server: {exc}") from exc
+    _call_aio_cache("download_object", ref, dest_path)

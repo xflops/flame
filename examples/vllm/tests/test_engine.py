@@ -1,5 +1,6 @@
 """Unit tests for the vLLM DAS example without loading a real model."""
 
+import asyncio
 import sys
 import types
 import unittest
@@ -41,9 +42,7 @@ fake_vllm = types.SimpleNamespace(LLM=FakeLLM, SamplingParams=FakeSamplingParams
 with (
     patch.dict(sys.modules, {"vllm": fake_vllm}),
     patch("flamepy.app.init"),
-    patch(
-        "flamepy.app.service", return_value=lambda execution_object: execution_object
-    ),
+    patch("flamepy.app.service", return_value=lambda execution_object: execution_object),
 ):
     from engine import MODEL, VllmEngine, kv_key
 
@@ -54,9 +53,7 @@ class VllmEngineTest(unittest.TestCase):
 
     def test_service_publishes_prompt_keys(self) -> None:
         service = FlameRunpyService()
-        service._set_execution_from_context(
-            ServiceContext(VllmEngine, constructor_args=(MODEL,))
-        )
+        service._set_execution_from_context(ServiceContext(VllmEngine, constructor_args=(MODEL,)))
         execution_object = service._execution_object
         session = SessionContext(None, "session", ApplicationContext("vllm-das"))
         with _bind_invocation_context(session) as invocation_context:
@@ -83,7 +80,7 @@ class VllmEngineTest(unittest.TestCase):
         service.publish(invocation_context.attributes)
         service._take_attributes()
 
-        service.on_session_leave()
+        asyncio.run(service.on_session_leave())
         service._set_execution_from_context(context)
         second_execution_object = service._execution_object
         with _bind_invocation_context(session) as invocation_context:

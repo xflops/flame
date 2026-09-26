@@ -1,7 +1,7 @@
-"""Tests for flamepy core client and types."""
+"""Tests for the Flame synchronous core facade and shared types."""
 
 import json
-import time
+import threading
 from datetime import datetime, timezone
 
 import pytest
@@ -27,445 +27,412 @@ from flamepy.core.types import (
     short_name,
 )
 
-# Client Tests
 
-
-class DummyChannel:
-    def __init__(self, location):
-        self.location = location
-
-    def close(self):
-        pass
-
-
-class DummyFrontend:
-    def __init__(self):
-        pass
-
-
-def test_connection_connect_http(monkeypatch):
-    import grpc
-
-    monkeypatch.setattr(grpc, "insecure_channel", lambda loc: DummyChannel(loc))
-
-    class DummyFuture:
-        def result(self, timeout=None):
-            return None
-
-    monkeypatch.setattr(grpc, "channel_ready_future", lambda ch: DummyFuture())
-    monkeypatch.setattr(grpc, "secure_channel", lambda loc, creds=None: DummyChannel(loc))
-    monkeypatch.setattr(grpc, "ssl_channel_credentials", lambda root_certificates=None: b"certs")
-    monkeypatch.setattr("flamepy.core.client.FrontendStub", lambda channel: DummyFrontend())
-
-    conn = client.Connection.connect("http://localhost:1234")
-    assert isinstance(conn, client.Connection)
-    conn.close()
-
-
-def test_connection_connect_https_with_tls(monkeypatch, tmp_path):
-    import grpc
-
-    monkeypatch.setattr(grpc, "insecure_channel", lambda loc: DummyChannel(loc))
-
-    class DummyFuture:
-        def result(self, timeout=None):
-            return None
-
-    monkeypatch.setattr(grpc, "channel_ready_future", lambda ch: DummyFuture())
-    monkeypatch.setattr(grpc, "secure_channel", lambda loc, creds=None: DummyChannel(loc))
-    called = {"ok": False}
-
-    def fake_ssl_credentials(*args, **kwargs):
-        called["ok"] = True
-        return b"certs"
-
-    monkeypatch.setattr(grpc, "ssl_channel_credentials", fake_ssl_credentials)
-    monkeypatch.setattr("flamepy.core.client.FrontendStub", lambda channel: DummyFrontend())
-
-    tls = client.FlameClientTls(ca_file=str(tmp_path / "ca.pem"))
-    (tmp_path / "ca.pem").write_text("CERT")
-    tls.ca_file = str(tmp_path / "ca.pem")
-    conn = client.Connection.connect("https://localhost:1234", tls_config=tls)
-    assert isinstance(conn, client.Connection)
-    assert called["ok"]
-    conn.close()
-
-
-def test_session_create_task_with_mocked_frontend(monkeypatch):
-
-    class DummyFrontend:
-        def CreateTask(self, req):  # noqa: N802
-            class StatusMock:
-                state = 0
-                creation_time = int(time.time() * 1000)
-                completion_time = int(time.time() * 1000)
-                events = []
-
-                def HasField(self, name):  # noqa: N802
-                    return name == "completion_time"
-
-            class Resp:
-                metadata = type("M", (), {"id": "tid-1"})
-                status = StatusMock()
-
-            return Resp()
-
-    class DummyConnection:
-        def __init__(self):
-            self._frontend = DummyFrontend()
-            import concurrent.futures
-
-            self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-
-        def close(self):
-            pass
-
-    fake_conn = DummyConnection()
-    from flamepy.core.client import Session, SessionState
-
-    s = Session(connection=fake_conn, id="sess-1", application="app", state=SessionState.OPEN, creation_time=datetime.now(timezone.utc), pending=0, running=0, succeed=0, failed=0, completion_time=None)
-
-    t = s.create_task(b"input")
-    assert t.session_id == s.id
-    assert t.id is not None
-
-
-class TestConnectionValidation:
-    def test_connection_rejects_empty_address(self):
-        with pytest.raises(FlameError) as exc_info:
-            client.Connection.connect("")
-        assert exc_info.value.code == FlameErrorCode.INVALID_CONFIG
-
-    def test_connection_handles_timeout(self, monkeypatch):
-        import grpc
-
-        monkeypatch.setattr(grpc, "insecure_channel", lambda loc: DummyChannel(loc))
-
-        class TimeoutFuture:
-            def result(self, timeout=None):
-                raise grpc.FutureTimeoutError()
-
-        monkeypatch.setattr(grpc, "channel_ready_future", lambda ch: TimeoutFuture())
-
-        with pytest.raises(FlameError) as exc_info:
-            client.Connection.connect("http://localhost:1234")
-        assert "timeout" in str(exc_info.value).lower()
-
-
-class TestSessionOperations:
-    def create_test_session(self, connection=None):
-        from flamepy.core.client import Session, SessionState
-
-        if connection is None:
-            connection = type("Conn", (), {"_frontend": DummyFrontend(), "_executor": None, "close": lambda self: None})()
-
-        return Session(
-            connection=connection,
-            id="sess-test",
-            application="test-app",
-            state=SessionState.OPEN,
-            creation_time=datetime.now(timezone.utc),
-            pending=0,
-            running=0,
-            succeed=0,
-            failed=0,
-            completion_time=None,
+def test_sync_frontend_api_parity(frontend_server):
+    endpoint, service, server_loop = frontend_server
+    connection = client.connect(endpoint)
+    try:
+        connection.register_application(
+            "app",
+            ApplicationAttributes(
+                schema=ApplicationSchema(input="bytes"),
+            ),
         )
+        connection.unregister_application("app")
+        apps = connection.list_applications()
+        assert len(apps) == 1 and apps[0].image == ""
+        assert apps[0].schema.input == ""
+        assert connection.get_application("missing") is None
+        assert connection.list_executors() == []
+        assert connection.list_nodes() == []
 
-    def test_session_common_data_returns_none_by_default(self):
-        session = self.create_test_session()
-        assert session.common_data() is None
-
-    def test_session_common_data_returns_bytes(self):
-        from flamepy.core.client import Session, SessionState
-
-        connection = type("Conn", (), {"_frontend": DummyFrontend(), "_executor": None, "close": lambda self: None})()
-        session = Session(
-            connection=connection,
-            id="sess-test",
-            application="test-app",
-            state=SessionState.OPEN,
-            creation_time=datetime.now(timezone.utc),
-            pending=0,
-            running=0,
-            succeed=0,
-            failed=0,
-            completion_time=None,
-            common_data=b"test-data",
-        )
-        assert session.common_data() == b"test-data"
-
-    def test_get_session_preserves_events(self):
-        from flamepy.proto.types_pb2 import Event as EventProto
-        from flamepy.proto.types_pb2 import Metadata, SessionSpec, SessionStatus
-        from flamepy.proto.types_pb2 import Session as SessionProto
-
-        event_time = int(time.time() * 1000)
-
-        class DummyFrontendWithSession:
-            def GetSession(self, req):  # noqa: N802
-                return SessionProto(
-                    metadata=Metadata(id=req.session_id),
-                    spec=SessionSpec(application="test-app"),
-                    status=SessionStatus(
-                        state=SessionState.OPEN,
-                        creation_time=event_time,
-                        events=[
-                            EventProto(
-                                code=1001,
-                                message="failed to bind session",
-                                creation_time=event_time,
-                            )
-                        ],
-                    ),
-                )
-
-        connection = client.Connection("http://localhost:1234", DummyChannel("http://localhost:1234"), DummyFrontendWithSession())
-        try:
-            session = connection.get_session("sess-events")
-        finally:
-            connection.close()
-
-        assert len(session.events) == 1
+        attrs = SessionAttributes(application="app", id="sess-1", common_data=b"", resreq=ResourceRequirement(cpu=2))
+        session = connection.create_session(attrs)
+        assert session.id == "sess-1" and session.common_data() == b""
         assert session.events[0].code == 1001
-        assert session.events[0].message == "failed to bind session"
-
-    def test_session_get_task_preserves_empty_optional_bytes(self):
-        from flamepy.core.client import Session, SessionState
-        from flamepy.proto.types_pb2 import Metadata, Task, TaskSpec, TaskStatus
-
-        class DummyFrontendWithTask:
-            def GetTask(self, req):  # noqa: N802
-                task = Task(
-                    metadata=Metadata(id="task-1"),
-                    spec=TaskSpec(session_id=req.session_id, input=b"", output=b""),
-                    status=TaskStatus(state=2, creation_time=int(time.time() * 1000)),
-                )
-                return task
-
-        connection = type("Conn", (), {"_frontend": DummyFrontendWithTask(), "_executor": None, "close": lambda self: None})()
-        session = Session(
-            connection=connection,
-            id="sess-test",
-            application="test-app",
-            state=SessionState.OPEN,
-            creation_time=datetime.now(timezone.utc),
-            pending=0,
-            running=0,
-            succeed=0,
-            failed=0,
-            completion_time=None,
-        )
-
-        task = session.get_task("task-1")
-
-        assert task.input == b""
-        assert task.output == b""
-
-    def test_session_create_task_rejects_non_bytes(self):
-        session = self.create_test_session()
-        with pytest.raises(FlameError) as exc_info:
-            session.create_task("not bytes")
-        assert exc_info.value.code == FlameErrorCode.INVALID_ARGUMENT
+        assert connection.open_session("sess-1").id == session.id
+        assert connection.get_session("sess-1").id == session.id
+        assert len(connection.list_sessions()) == 1
+        task = session.create_task(b"input")
+        assert task.id == "task-1"
+        assert session.get_task(task.id).input == b""
+        assert [item.id for item in session.list_tasks()] == ["task-1"]
+        assert next(session.watch_task(task.id)).output == b"done"
+        assert session.invoke(b"input") == b"done"
+        assert connection.close_session(session.id).id == session.id
+        created = [req for req in service.requests if req.DESCRIPTOR.name == "CreateSessionRequest"]
+        assert created[0].session.resreq.cpu == 2
+    finally:
+        connection.close()
 
 
-class TestGrpcErrorMapping:
-    def test_not_found_error_mapping(self):
-        import grpc
-
-        class FakeRpcError(grpc.RpcError):
-            def code(self):
-                return grpc.StatusCode.NOT_FOUND
-
-            def details(self):
-                return "Resource not found"
-
-        error = client.Connection._grpc_error_to_flame_error(FakeRpcError(), "test operation")
-        assert error.code == FlameErrorCode.NOT_FOUND
-
-    def test_already_exists_error_mapping(self):
-        import grpc
-
-        class FakeRpcError(grpc.RpcError):
-            def code(self):
-                return grpc.StatusCode.ALREADY_EXISTS
-
-            def details(self):
-                return "Already exists"
-
-        error = client.Connection._grpc_error_to_flame_error(FakeRpcError(), "test operation")
-        assert error.code == FlameErrorCode.ALREADY_EXISTS
-
-    def test_invalid_argument_error_mapping(self):
-        import grpc
-
-        class FakeRpcError(grpc.RpcError):
-            def code(self):
-                return grpc.StatusCode.INVALID_ARGUMENT
-
-            def details(self):
-                return "Invalid argument"
-
-        error = client.Connection._grpc_error_to_flame_error(FakeRpcError(), "test operation")
-        assert error.code == FlameErrorCode.INVALID_ARGUMENT
-
-    def test_failed_precondition_error_mapping(self):
-        import grpc
-
-        class FakeRpcError(grpc.RpcError):
-            def code(self):
-                return grpc.StatusCode.FAILED_PRECONDITION
-
-            def details(self):
-                return "Precondition failed"
-
-        error = client.Connection._grpc_error_to_flame_error(FakeRpcError(), "test operation")
-        assert error.code == FlameErrorCode.INVALID_STATE
-
-    def test_unknown_error_mapping(self):
-        import grpc
-
-        class FakeRpcError(grpc.RpcError):
-            def code(self):
-                return grpc.StatusCode.UNKNOWN
-
-            def details(self):
-                return "Unknown error"
-
-        error = client.Connection._grpc_error_to_flame_error(FakeRpcError(), "test operation")
-        assert error.code == FlameErrorCode.INTERNAL
+def test_failed_close_can_be_retried(frontend_server):
+    endpoint, service, _ = frontend_server
+    connection = client.connect(endpoint)
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        service.reject_close = True
+        with pytest.raises(FlameError, match="close rejected"):
+            session.close()
+        assert connection.get_session(session.id).id == session.id
+        service.reject_close = False
+        session.close()
+    finally:
+        connection.close()
 
 
-class TestApplicationConversion:
-    def test_register_application_raises_on_failed_result(self):
-        from flamepy.proto.types_pb2 import Result as ResultProto
+def test_run_reports_create_task_error_before_return(frontend_server):
+    endpoint, service, _ = frontend_server
+    connection = client.connect(endpoint)
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        service.reject_create_task = True
+        with pytest.raises(FlameError, match="task rejected"):
+            session.run(b"input")
+        assert service.watches == 0
+    finally:
+        connection.close()
 
-        class Frontend:
-            def RegisterApplication(self, req):  # noqa: N802
-                return ResultProto(return_code=-1, message="registration rejected")
 
-        conn = client.Connection("http://unused", DummyChannel("unused"), Frontend())
+def test_watch_current_then_update_and_sync_callback_off_loop(frontend_server):
+    endpoint, service, server_loop = frontend_server
+    connection = client.connect(endpoint)
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        watcher = session.watch_task("hold")
+        assert next(watcher).state == TaskState.PENDING
+        future = session.run(b"hold")
+        callback_threads = []
+        completed = threading.Event()
+
+        def callback(_future):
+            callback_threads.append(threading.current_thread().name)
+            completed.set()
+
+        future.add_done_callback(callback)
+        server_loop.call(_release(service))
+        assert next(watcher).state == TaskState.SUCCEED
+        assert future.result(timeout=3) == b"done"
+        assert completed.wait(3)
+        assert callback_threads == ["flamepy-callback_0"]
+    finally:
+        connection.close()
+
+
+def test_close_errors_pending_watches_without_per_task_threads(frontend_server):
+    endpoint, service, _ = frontend_server
+    connection = client.connect(endpoint)
+    session = connection.create_session(SessionAttributes(application="app"))
+    futures = [session.run(b"hold") for _ in range(20)]
+    assert len([thread for thread in threading.enumerate() if thread.name == "flamepy-aio"]) == 1
+    connection.close()
+    for future in futures:
+        with pytest.raises(FlameError, match="connection closed"):
+            future.result(timeout=3)
+
+
+def test_result_callback_can_close_connection(frontend_server):
+    endpoint, service, server_loop = frontend_server
+    connection = client.connect(endpoint)
+    session = connection.create_session(SessionAttributes(application="app"))
+    result = session.run(b"hold")
+    closed = threading.Event()
+    errors = []
+
+    def close_from_callback(_future):
         try:
-            with pytest.raises(FlameError, match="registration rejected"):
-                conn.register_application("app", ApplicationAttributes())
+            connection.close()
+        except Exception as error:
+            errors.append(error)
         finally:
-            conn.close()
+            closed.set()
 
-    def test_unregister_application_raises_on_failed_result(self):
-        from flamepy.proto.types_pb2 import Result as ResultProto
-
-        class Frontend:
-            def UnregisterApplication(self, req):  # noqa: N802
-                return ResultProto(return_code=-1, message="unregistration rejected")
-
-        conn = client.Connection("http://unused", DummyChannel("unused"), Frontend())
-        try:
-            with pytest.raises(FlameError, match="unregistration rejected"):
-                conn.unregister_application("app")
-        finally:
-            conn.close()
-
-    def test_list_applications_preserves_absent_optional_fields(self):
-        from flamepy.proto.types_pb2 import Application as ApplicationProto
-        from flamepy.proto.types_pb2 import ApplicationList, ApplicationStatus, Metadata
-
-        class Frontend:
-            def ListApplications(self, req):  # noqa: N802
-                app = ApplicationProto(
-                    metadata=Metadata(id="app-1", name="app"),
-                    status=ApplicationStatus(state=0, creation_time=int(time.time() * 1000)),
-                )
-                return ApplicationList(applications=[app])
-
-        conn = client.Connection("http://unused", DummyChannel("unused"), Frontend())
-        try:
-            apps = conn.list_applications()
-        finally:
-            conn.close()
-
-        assert len(apps) == 1
-        app = apps[0]
-        assert app.image is None
-        assert app.command is None
-        assert app.working_directory is None
-        assert app.max_instances is None
-        assert app.delay_release is None
-        assert app.schema is None
-        assert app.url is None
-        assert app.installer is None
-
-    def test_get_application_preserves_present_empty_optional_fields(self):
-        from flamepy.proto.types_pb2 import Application as ApplicationProto
-        from flamepy.proto.types_pb2 import ApplicationSchema, ApplicationStatus, Metadata
-
-        class Frontend:
-            def GetApplication(self, req):  # noqa: N802
-                app = ApplicationProto(
-                    metadata=Metadata(id="app-1", name=req.name),
-                    status=ApplicationStatus(state=0, creation_time=int(time.time() * 1000)),
-                )
-                app.spec.image = ""
-                app.spec.schema.CopyFrom(ApplicationSchema(input=""))
-                return app
-
-        conn = client.Connection("http://unused", DummyChannel("unused"), Frontend())
-        try:
-            app = conn.get_application("app")
-        finally:
-            conn.close()
-
-        assert app.image == ""
-        assert app.command is None
-        assert app.schema is not None
-        assert app.schema.input == ""
-        assert app.schema.output is None
+    result.add_done_callback(close_from_callback)
+    server_loop.call(_release(service))
+    assert result.result(timeout=3) == b"done"
+    assert closed.wait(3)
+    assert errors == []
 
 
-class TestTaskWatcher:
-    def test_task_watcher_iteration(self):
-        from flamepy.core.client import TaskWatcher
+def test_blocked_callbacks_do_not_starve_task_completion(frontend_server):
+    endpoint, service, server_loop = frontend_server
+    connection = client.connect(endpoint)
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        blockers = [session.run(b"hold") for _ in range(4)]
+        dependents = []
+        ready = threading.Event()
+        all_started = threading.Event()
+        all_done = threading.Event()
+        lock = threading.Lock()
+        started = 0
+        finished = 0
+        callback_errors = []
 
-        class FakeStream:
-            def __init__(self):
-                self.items = []
-                self.index = 0
+        def callback(_future, index):
+            nonlocal started, finished
+            with lock:
+                started += 1
+                if started == 4:
+                    all_started.set()
+            try:
+                assert ready.wait(3)
+                assert dependents[index].result(timeout=2) == b"done"
+            except Exception as error:
+                callback_errors.append(error)
+            finally:
+                with lock:
+                    finished += 1
+                    if finished == 4:
+                        all_done.set()
 
-            def __next__(self):
-                if self.index >= len(self.items):
-                    raise StopIteration
-                item = self.items[self.index]
-                self.index += 1
-                return item
-
-        stream = FakeStream()
-        watcher = TaskWatcher(stream)
-        assert iter(watcher) is watcher
-
-    def test_task_watcher_timeout_check(self):
-        from flamepy.core.client import TaskWatcher
-
-        class EmptyStream:
-            def __next__(self):
-                raise StopIteration
-
-        watcher = TaskWatcher(EmptyStream(), timeout=0.001)
-        import time as time_module
-
-        time_module.sleep(0.01)
-        with pytest.raises(TimeoutError):
-            next(watcher)
+        for index, blocker in enumerate(blockers):
+            blocker.add_done_callback(lambda future, index=index: callback(future, index))
+        server_loop.call(_release(service))
+        assert all_started.wait(3)
+        dependents.extend(session.run(b"input") for _ in range(4))
+        ready.set()
+        assert [future.result(timeout=1) for future in dependents] == [b"done"] * 4
+        assert all_done.wait(3)
+        assert callback_errors == []
+    finally:
+        connection.close()
 
 
-class TestTaskIterator:
-    def test_task_iterator_is_iterable(self):
-        from flamepy.core.client import TaskIterator
+def test_callbacks_keep_registration_order(frontend_server):
+    endpoint, service, server_loop = frontend_server
+    connection = client.connect(endpoint)
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        future = session.run(b"hold")
+        order = []
+        completed = threading.Event()
+        future.add_done_callback(lambda _future: order.append(1))
 
-        class FakeStream:
-            def __next__(self):
-                raise StopIteration
+        def last_callback(_future):
+            order.append(2)
+            completed.set()
 
-        iterator = TaskIterator(FakeStream(), "sess-1")
-        assert iter(iterator) is iterator
+        future.add_done_callback(last_callback)
+        server_loop.call(_release(service))
+        assert future.result(timeout=3) == b"done"
+        assert completed.wait(3)
+        assert order == [1, 2]
+    finally:
+        connection.close()
+
+
+def test_slow_callbacks_bound_completion_jobs_without_blocking_aio(frontend_server, monkeypatch):
+    endpoint, service, server_loop = frontend_server
+    monkeypatch.setattr(client, "_MAX_CALLBACK_JOBS", 4)
+    connection = client.connect(endpoint)
+    release_callbacks = threading.Event()
+    workers_started = threading.Event()
+    all_callbacks = threading.Event()
+    callback_count = 0
+    callback_started = 0
+    callback_lock = threading.Lock()
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        futures = [session.run(b"hold") for _ in range(20)]
+
+        def callback(_future):
+            nonlocal callback_count, callback_started
+            with callback_lock:
+                callback_started += 1
+                if callback_started == 4:
+                    workers_started.set()
+            release_callbacks.wait(3)
+            with callback_lock:
+                callback_count += 1
+                if callback_count == len(futures):
+                    all_callbacks.set()
+
+        for future in futures:
+            future.add_done_callback(callback)
+        server_loop.call(_release(service))
+        assert workers_started.wait(3)
+        assert session.get_task("task-1").id == "task-1"
+        # The four occupied callback slots keep later watch tasks from
+        # resolving; they do not create another unbounded completion queue.
+        assert sum(future.done() for future in futures) <= 4
+    finally:
+        release_callbacks.set()
+        assert all_callbacks.wait(3)
+        assert [future.result(timeout=3) for future in futures] == [b"done"] * 20
+        connection.close()
+
+
+def test_close_drains_many_blocked_callbacks_with_fixed_workers(frontend_server, monkeypatch):
+    endpoint, service, server_loop = frontend_server
+    monkeypatch.setattr(client, "_MAX_CALLBACK_JOBS", 4)
+    connection = client.connect(endpoint)
+    release_callbacks = threading.Event()
+    workers_started = threading.Event()
+    all_callbacks = threading.Event()
+    callback_count = 0
+    callback_lock = threading.Lock()
+    session = connection.create_session(SessionAttributes(application="app"))
+    futures = [session.run(b"hold") for _ in range(20)]
+
+    def callback(_future):
+        nonlocal callback_count
+        with callback_lock:
+            callback_count += 1
+            if callback_count == 4:
+                workers_started.set()
+            if callback_count == len(futures):
+                all_callbacks.set()
+        release_callbacks.wait(3)
+
+    for future in futures:
+        future.add_done_callback(callback)
+    try:
+        server_loop.call(_release(service))
+        assert workers_started.wait(3)
+        connection.close()
+        assert all(future.done() for future in futures)
+        assert len([thread for thread in threading.enumerate() if thread.name.startswith("flamepy-callback")]) <= 4
+    finally:
+        release_callbacks.set()
+        assert all_callbacks.wait(3)
+        assert callback_count == len(futures)
+
+
+def test_mass_cancellation_runs_callbacks_inline_without_queueing(frontend_server):
+    endpoint, _, _ = frontend_server
+    connection = client.connect(endpoint)
+    release_callbacks = threading.Event()
+    first_callback = threading.Event()
+    all_callbacks = threading.Event()
+    lock = threading.Lock()
+    callback_count = 0
+    callback_threads = []
+    futures = []
+    cancel_thread = None
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        futures = [session.run(b"hold") for _ in range(20)]
+
+        def callback(_future):
+            nonlocal callback_count
+            with lock:
+                callback_count += 1
+                callback_threads.append(threading.current_thread().name)
+                if callback_count == 1:
+                    first_callback.set()
+                if callback_count == len(futures):
+                    all_callbacks.set()
+            release_callbacks.wait(3)
+
+        for future in futures:
+            future.add_done_callback(callback)
+
+        def cancel_all():
+            for future in futures:
+                future.cancel()
+
+        cancel_thread = threading.Thread(target=cancel_all, name="test-cancel")
+        cancel_thread.start()
+        assert first_callback.wait(3)
+        assert sum(future.cancelled() for future in futures) == 1
+        assert connection.list_nodes() == []
+        assert cancel_thread.is_alive()
+    finally:
+        release_callbacks.set()
+        if cancel_thread is not None:
+            cancel_thread.join(timeout=3)
+            assert not cancel_thread.is_alive()
+        assert all_callbacks.wait(3)
+        assert all(future.cancelled() for future in futures)
+        assert callback_threads == ["test-cancel"] * 20
+        connection.close()
+
+
+def test_callback_worker_can_cancel_another_future_at_capacity(frontend_server, monkeypatch):
+    endpoint, _, _ = frontend_server
+    monkeypatch.setattr(client, "_MAX_CALLBACK_JOBS", 4)
+    connection = client.connect(endpoint)
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        first = [session.run(b"hold") for _ in range(4)]
+        second = [session.run(b"hold") for _ in range(4)]
+        all_workers = threading.Barrier(4)
+        all_nested = threading.Event()
+        callback_count = 0
+        callback_lock = threading.Lock()
+        errors = []
+
+        def nested_callback(_future):
+            nonlocal callback_count
+            with callback_lock:
+                callback_count += 1
+                if callback_count == 4:
+                    all_nested.set()
+
+        def cancel_second(_future, index):
+            try:
+                all_workers.wait(timeout=3)
+                assert second[index].cancel()
+            except Exception as error:
+                errors.append(error)
+
+        for index in range(4):
+            second[index].add_done_callback(nested_callback)
+            first[index].add_done_callback(lambda future, index=index: cancel_second(future, index))
+        cancel_threads = [threading.Thread(target=future.cancel) for future in first]
+        for thread in cancel_threads:
+            thread.start()
+        assert all_nested.wait(3)
+        for thread in cancel_threads:
+            thread.join(timeout=3)
+            assert not thread.is_alive()
+        assert callback_count == 4
+        assert errors == []
+        assert all(future.cancelled() for future in second)
+    finally:
+        connection.close()
+
+
+async def _release(service):
+    service.release.set()
+
+
+def test_connection_rejects_empty_address():
+    with pytest.raises(FlameError) as error:
+        client.connect("")
+    assert error.value.code == FlameErrorCode.INVALID_CONFIG
+
+
+def test_module_connection_reopens_after_close(frontend_server, monkeypatch):
+    endpoint, _, _ = frontend_server
+    first = client.connect(endpoint)
+    monkeypatch.setattr(client.ConnectionInstance, "_connection", first)
+    monkeypatch.setattr(client, "FlameContext", lambda: type("Context", (), {"endpoint": endpoint, "tls": None})())
+    assert client.ConnectionInstance.instance() is first
+    first.close()
+    second = client.ConnectionInstance.instance()
+    try:
+        assert second is not first
+        assert second.list_nodes() == []
+    finally:
+        second.close()
+
+
+def test_module_connection_resets_lock_and_handle_after_fork(monkeypatch):
+    old_lock = threading.Lock()
+    old_lock.acquire()
+    monkeypatch.setattr(client.ConnectionInstance, "_lock", old_lock)
+    monkeypatch.setattr(client.ConnectionInstance, "_connection", object())
+    monkeypatch.setattr(client.ConnectionInstance, "_context", object())
+    try:
+        client.ConnectionInstance._reset_after_fork()
+        assert client.ConnectionInstance._connection is None
+        assert client.ConnectionInstance._context is None
+        assert client.ConnectionInstance._lock.acquire(blocking=False)
+        client.ConnectionInstance._lock.release()
+    finally:
+        old_lock.release()
 
 
 # Type Tests

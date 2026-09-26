@@ -11,12 +11,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import asyncio
 import logging
-import os
 import sys
 import threading
 from abc import abstractmethod
-from concurrent import futures
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import FrozenSet, Iterable, Optional
 
@@ -32,16 +32,10 @@ else:
             return func
 
 
-import grpc
-
 from flamepy.core.types import FlameError, FlameErrorCode, TaskOutput
-from flamepy.proto.shim_pb2 import OnSessionEnterResponse, OnTaskInvokeResponse
-from flamepy.proto.shim_pb2_grpc import InstanceServicer, add_InstanceServicer_to_server
 from flamepy.proto.types_pb2 import (
     ExecutorAttributes,
-    Result,
 )
-from flamepy.proto.types_pb2 import TaskResult as TaskResultProto
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +69,9 @@ class _Publisher:
             self._attributes = set()
             self._attribute_bytes = 0
             return ExecutorAttributes(attr=list(attributes))
+
+
+_active_response_publisher: ContextVar[Optional[_Publisher]] = ContextVar("flamepy_active_response_publisher", default=None)
 
 
 def _validate_attributes(attributes: Iterable[bytes]) -> FrozenSet[bytes]:
@@ -139,6 +136,9 @@ class FlameService:
     """Base class for implementing Flame services."""
 
     def _publisher(self) -> _Publisher:
+        active = _active_response_publisher.get()
+        if active is not None:
+            return active
         publisher = getattr(self, "_flame_publisher", None)
         if publisher is None:
             publisher = _Publisher()
@@ -189,145 +189,78 @@ class FlameService:
         pass
 
 
-class FlameInstanceServicer(InstanceServicer):
-    """gRPC servicer implementation for GrpcShim service."""
+class FlameInstanceServicer:
+    """Compatibility adapter for direct synchronous shim calls.
+
+    The network server uses ``flamepy.core.aio.service.FlameInstanceServicer``
+    directly. This adapter retains the old direct-call surface for callers that
+    invoke the servicer without starting a server.
+    """
 
     def __init__(self, service: FlameService):
-        self._service = service
-        self._service._publisher()
+        from flamepy.core._bridge import LoopThread
+        from flamepy.core.aio.service import FlameInstanceServicer as AioFlameInstanceServicer
 
-    @override
+        self._loop_thread = LoopThread("flame-shim-adapter")
+
+        async def create():
+            return AioFlameInstanceServicer(service)
+
+        self._aio = self._loop_thread.call(create())
+
     def OnSessionEnter(self, request, context):  # noqa: N802
-        """Handle OnSessionEnter RPC call."""
-        _trace_fn = TraceFn("OnSessionEnter")
+        return self._loop_thread.call(self._aio.OnSessionEnter(request, context))
 
-        try:
-            logger.debug(f"OnSessionEnter request: {request}")
-
-            # Convert protobuf request to SessionContext
-            app_context = ApplicationContext(
-                name=request.application.name,
-                image=(request.application.image if request.application.HasField("image") else None),
-                command=(request.application.command if request.application.HasField("command") else None),
-                working_directory=(request.application.working_directory if request.application.HasField("working_directory") else None),
-                url=(request.application.url if request.application.HasField("url") else None),
-            )
-
-            logger.debug(f"app_context: {app_context}")
-
-            # Common data is bytes in core API
-            common_data_bytes = request.common_data if request.HasField("common_data") else None
-
-            session_context = SessionContext(
-                _common_data=common_data_bytes,
-                session_id=request.session_id,
-                application=app_context,
-            )
-
-            logger.debug(f"session_context: {session_context}")
-
-            # Call the service implementation
-            self._service.on_session_enter(session_context)
-            logger.debug("on_session_enter completed successfully")
-
-            # Return result
-            return OnSessionEnterResponse(
-                result=Result(return_code=0),
-                attributes=self._service._take_attributes(),
-            )
-
-        except Exception as e:
-            logger.error(f"Error in OnSessionEnter: {e}")
-            return OnSessionEnterResponse(result=Result(return_code=-1, message=f"{str(e)}"))
-
-    @override
     def OnTaskInvoke(self, request, context):  # noqa: N802
-        """Handle OnTaskInvoke RPC call."""
-        _trace_fn = TraceFn("OnTaskInvoke")
+        return self._loop_thread.call(self._aio.OnTaskInvoke(request, context))
 
-        try:
-            # Convert protobuf request to TaskContext
-            # Task input is bytes in core API
-            input_bytes = request.input if request.HasField("input") else None
-
-            task_context = TaskContext(
-                task_id=request.task_id,
-                session_id=request.session_id,
-                input=input_bytes,
-            )
-
-            logger.debug(f"task_context: {task_context}")
-
-            # Call the service implementation
-            output_data = self._service.on_task_invoke(task_context)
-            logger.debug("on_task_invoke completed successfully")
-
-            # Return task output. Leave optional output unset for services that intentionally return None.
-            if output_data is None:
-                task_result = TaskResultProto(return_code=0, message=None)
-            else:
-                task_result = TaskResultProto(return_code=0, output=output_data, message=None)
-            return OnTaskInvokeResponse(
-                task_result=task_result,
-                attributes=self._service._take_attributes(),
-            )
-
-        except Exception as e:
-            logger.error(f"Error in OnTaskInvoke: {e}")
-            return OnTaskInvokeResponse(
-                task_result=TaskResultProto(return_code=-1, output=None, message=f"{str(e)}"),
-                attributes=self._service._take_attributes(),
-            )
-
-    @override
     def OnSessionLeave(self, request, context):  # noqa: N802
-        """Handle OnSessionLeave RPC call."""
-        _trace_fn = TraceFn("OnSessionLeave")
+        return self._loop_thread.call(self._aio.OnSessionLeave(request, context))
 
+    def close(self):
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         try:
-            # Call the service implementation
-            self._service.on_session_leave()
-            logger.debug("on_session_leave completed successfully")
+            self._loop_thread.call(self._aio.close())
+        finally:
+            self._loop_thread.close()
 
-            # Return result
-            return Result(
-                return_code=0,
-            )
-
-        except Exception as e:
-            logger.error(f"Error in OnSessionLeave: {e}")
-            return Result(return_code=-1, message=f"{str(e)}")
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class FlameInstanceServer:
-    """Server for gRPC shim services."""
+    """Blocking facade over the asyncio shim server."""
 
     def __init__(self, service: FlameService):
         self._service = service
         self._server = None
+        self._loop = None
+        self._loop_thread = None
+        self._stop_requested = threading.Event()
 
     def start(self):
-        """Start the gRPC server."""
+        """Start the shim server and block until it terminates."""
+        from flamepy.core.aio.service import FlameInstanceServer as AioFlameInstanceServer
+
+        async def serve():
+            self._loop = asyncio.get_running_loop()
+            self._loop_thread = threading.current_thread()
+            self._server = AioFlameInstanceServer(self._service)
+            await self._server.start()
+            try:
+                if self._stop_requested.is_set():
+                    await self._server.stop()
+                await self._server.wait_for_termination()
+            finally:
+                await self._server.stop()
+
         try:
-            # Create gRPC server
-            self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-
-            # Add servicer to server
-            add_InstanceServicer_to_server(FlameInstanceServicer(self._service), self._server)
-
-            # Listen on Unix socket
-            endpoint = os.getenv(FLAME_INSTANCE_ENDPOINT)
-            if endpoint is not None:
-                self._server.add_insecure_port(f"unix://{endpoint}")
-                logger.debug(f"Flame Python instance service started on Unix socket: {endpoint}")
-            else:
-                raise FlameError(FlameErrorCode.INVALID_CONFIG, "FLAME_INSTANCE_ENDPOINT not found")
-
-            # Start server
-            self._server.start()
-            # Keep server running
-            self._server.wait_for_termination()
-
+            asyncio.run(serve())
         except Exception as e:
             raise FlameError(
                 FlameErrorCode.INTERNAL,
@@ -335,9 +268,12 @@ class FlameInstanceServer:
             )
 
     def stop(self):
-        """Stop the gRPC server."""
-        if self._server:
-            self._server.stop(grace=5)
+        """Stop the asyncio shim server from another thread."""
+        self._stop_requested.set()
+        if self._server and self._loop and self._loop.is_running():
+            if threading.current_thread() is self._loop_thread:
+                raise RuntimeError("Cannot stop the blocking shim server from its event-loop thread")
+            asyncio.run_coroutine_threadsafe(self._server.stop(), self._loop).result()
             logger.info("gRPC instance server stopped")
 
 

@@ -154,6 +154,40 @@ def test_concurrent_servicers_publish_to_their_own_instance():
     assert set(responses[1].attributes.attr) == {b"instance-b"}
 
 
+def test_direct_servicer_uses_one_loop_for_concurrent_calls():
+    barrier = threading.Barrier(2)
+
+    class Service(service.FlameService):
+        def on_session_enter(self, context):
+            pass
+
+        def on_task_invoke(self, context):
+            barrier.wait(timeout=2)
+            return context.task_id.encode()
+
+        def on_session_leave(self):
+            pass
+
+    servicer = service.FlameInstanceServicer(Service())
+    loop_thread = servicer._loop_thread
+    responses = [None, None]
+
+    def invoke(index):
+        responses[index] = servicer.OnTaskInvoke(shim_pb2.TaskContext(task_id=str(index), session_id="session"), DummyContext())
+
+    threads = [threading.Thread(target=invoke, args=(index,)) for index in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+        assert all(not thread.is_alive() for thread in threads)
+        assert [response.task_result.output for response in responses] == [b"0", b"1"]
+    finally:
+        servicer.close()
+    assert not loop_thread._thread.is_alive()
+
+
 def test_servicer_wraps_enter_and_task_publication():
     class PublishingService(service.FlameService):
         def on_session_enter(self, context):
@@ -195,7 +229,7 @@ def test_servicer_wraps_enter_and_task_publication():
     assert set(failed_response.attributes.attr) == {b"error-key"}
 
 
-def test_failed_session_enter_does_not_consume_pending_publication():
+def test_failed_session_enter_does_not_leak_publication():
     class FailFirstEnterService(service.FlameService):
         def on_session_enter(self, context):
             if context.session_id == "failed-session":
@@ -222,7 +256,7 @@ def test_failed_session_enter_does_not_consume_pending_publication():
 
     succeeded = servicer.OnSessionEnter(request("next-session"), DummyContext())
     assert succeeded.result.return_code == 0
-    assert set(succeeded.attributes.attr) == {b"failed-enter-key"}
+    assert list(succeeded.attributes.attr) == []
 
     empty = servicer.OnSessionEnter(request("empty-session"), DummyContext())
     assert empty.HasField("attributes")
@@ -462,39 +496,24 @@ def test_service_preserves_empty_optional_bytes():  # noqa: N802
 
 
 def test_flame_instance_server_start_and_stop(monkeypatch, tmp_path):
-    # Fake grpc server and helper to intercept calls
-    started = {"start": False, "stop": False}
+    from flamepy.core.aio import service as aio_service
+
+    calls = []
 
     class FakeServer:
-        def __init__(self, *args, **kwargs):
-            self._stopped = False
+        def __init__(self, implementation):
+            calls.append(("init", implementation))
 
-        def add_insecure_port(self, addr):
-            # Accept the unix socket address; just store for verification
-            self._port = addr
+        async def start(self):
+            calls.append(("start",))
 
-        def start(self):
-            started["start"] = True
+        async def wait_for_termination(self):
+            calls.append(("wait",))
 
-        def wait_for_termination(self):
-            # Immediately return to avoid blocking
-            return None
+        async def stop(self):
+            calls.append(("stop",))
 
-        def stop(self, grace=None):
-            started["stop"] = True
-            self._stopped = True
-
-    fake_grpc = type("fake_grpc", (), {})()
-    fake_grpc.server = lambda executor=None: FakeServer()
-
-    # Patch grpc in the service module
-    monkeypatch.setattr(service, "grpc", fake_grpc)
-    # Patch add_InstanceServicer_to_server to a no-op
-    called = {"added": None}
-    monkeypatch.setattr(service, "add_InstanceServicer_to_server", lambda servicer, srv: called.__setitem__("added", (servicer, srv)))
-
-    # Ensure endpoint is set
-    os.environ[service.FLAME_INSTANCE_ENDPOINT] = "/tmp/flame.sock"
+    monkeypatch.setattr(aio_service, "FlameInstanceServer", FakeServer)
 
     class DummyService(service.FlameService):
         def on_session_enter(self, context):
@@ -508,11 +527,9 @@ def test_flame_instance_server_start_and_stop(monkeypatch, tmp_path):
 
     s = service.FlameInstanceServer(DummyService())
     s.start()
-    # Verify server was started and added to server
-    assert started["start"] is True
-    # Stop should call server.stop
+    assert [call[0] for call in calls] == ["init", "start", "wait", "stop"]
     s.stop()
-    assert started["stop"] is True
+    assert [call[0] for call in calls] == ["init", "start", "wait", "stop"]
 
 
 def test_flame_instance_server_start_without_endpoint_raises():

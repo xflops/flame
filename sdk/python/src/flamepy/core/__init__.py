@@ -16,6 +16,7 @@ from .cache import (
     WILDCARD_SESSION,
     ObjectKey,
     ObjectRef,
+    delete_objects,
     download_object,
     get_object,
     patch_object,
@@ -176,6 +177,7 @@ __all__ = [
     "ObjectRef",
     # Cache functions
     "download_object",
+    "delete_objects",
     "get_object",
     "patch_object",
     "put_object",
