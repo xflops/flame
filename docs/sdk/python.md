@@ -35,10 +35,6 @@ contexts:
       endpoint: "http://127.0.0.1:8080"
     cache:
       endpoint: "grpc://127.0.0.1:9090"
-    package:
-      excludes:
-        - "*.log"
-        - "*.pkl"
 ```
 
 Environment variables override the file:
@@ -130,7 +126,47 @@ them before that loop exits.
 
 ## Register Applications
 
-Most users deploy applications with `flmctl deploy`. The SDK can also register an application directly:
+Most users deploy applications with `flmctl deploy`. Pass a project directory
+to package it as a `.tar.gz`, upload it to object cache, and register the
+application:
+
+```bash
+flmctl deploy --name agent-app --application ./agent-app
+```
+
+The directory should provide a detectable command, such as a matching
+`[project.scripts]` entry in `pyproject.toml`. Otherwise pass `--command`
+explicitly. Put `.flmignore` or `.flameignore` in the directory to omit files
+from its archive. Both use Gitignore-style patterns and also apply to
+`flamepy.app.init()` packages.
+
+A directory can also provide an application profile in `flame.yaml` or
+`flm.yaml`, using the same `metadata` and `spec` fields as `flmctl register`:
+
+```yaml
+metadata:
+  name: agent-app
+spec:
+  installer: python
+  command: python3
+  arguments: [-m, agent_app]
+```
+
+With this profile, `flmctl deploy --application ./agent-app` gets the name and
+runtime settings from the file. Explicit CLI options override profile fields;
+`--env` updates matching environment variables while retaining the others.
+The cache URL always comes from the newly uploaded package. If both profile
+filenames exist, `flame.yaml` takes precedence. A standalone script can also
+be deployed:
+
+```bash
+flmctl deploy --name script-app --application ./main.py
+```
+
+This packages `main.py` as `main.py.tar.gz` and runs it with `python3` without
+installing project dependencies. Use a directory with Python package metadata
+when the script needs dependencies. The SDK can also register an application
+directly:
 
 ```python
 import flamepy
@@ -187,14 +223,14 @@ with every response. Keys are nonempty `bytes` values of at most 256 bytes. One
 publication round supports at most 1,024 distinct keys and 64 KiB after
 deduplication.
 
-## Use The Service Helper
+## Use The Serving Helper
 
-For object-oriented or agent-style applications, `flamepy.service` provides a higher-level API that serializes Python objects through object cache:
+For object-oriented or agent-style applications, `flamepy.serving` provides a higher-level API that serializes Python objects through object cache:
 
 ```python
-from flamepy import service
+from flamepy import serving
 
-instance = service.FlameInstance()
+instance = serving.Instance()
 
 
 @instance.entrypoint
@@ -209,17 +245,23 @@ if __name__ == "__main__":
     instance.run()
 ```
 
-Clients use `flamepy.service.Session` with the deployed application name:
+Clients use `flamepy.serving.open_session()` with the deployed application name:
 
 ```python
-from flamepy.service import Session
+from flamepy.serving import open_session
 
-with Session("agent-app", ctx=[]) as session:
-    print(session.invoke("hello"))
+with open_session("agent-app", ctx=[]) as session:
+    print(session.run("hello"))
+    future = session.submit("another request")
+    print(future.result())
     print(session.context())
 ```
 
-Use this helper when request, response, or session context objects are easier to model as Python objects than raw bytes. Use the core `FlameService` API when you need explicit byte-level protocol control.
+`run()` waits for a deserialized Python result. `submit()` returns a future whose
+`result()` returns that same Python result; task failures surface through the
+future. Use this helper when request, response, or session context objects are
+easier to model as Python objects than raw bytes. Use the core `FlameService`
+API when you need explicit byte-level protocol control.
 
 ## Use Object Cache
 
@@ -372,7 +414,7 @@ The repository-level check validates the `flmrun` template, App package upload/i
 | Sessions | `create_session()`, `open_session()`, `get_session()`, `list_sessions()`, `close_session()` |
 | Tasks | `Session.run()`, `Session.submit()`, `Session.create_task()`, `Session.watch_task()` |
 | Applications | `register_application()`, `unregister_application()`, `get_application()`, `list_applications()` |
-| Services | `FlameService`, `flamepy.run()`, `flamepy.service.FlameInstance`, `flamepy.service.Session` |
+| Services | `FlameService`, `flamepy.run()`, `flamepy.serving.Instance`, `flamepy.serving.open_session()` |
 | Objects | `put_object()`, `get_object()`, `update_object()`, `patch_object()`, `upload_object()`, `download_object()` |
 | App | `flamepy.app.init()`, `flamepy.app.service()`, `flamepy.app.destroy()`, `flamepy.app.session_context()`, `flamepy.app.publish_attributes()`, `ServiceInstance`, `ObjectFuture` |
 

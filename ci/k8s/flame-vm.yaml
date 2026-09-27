@@ -8,8 +8,3 @@ contexts:
       endpoint: grpcs-proxy://${CACHE_GATEWAY_HOST}:${CACHE_GATEWAY_NODE_PORT}
       tls:
         ca_file: ${CACHE_CA_FILE}
-    package:
-      excludes:
-        - "*.log"
-        - "*.pkl"
-        - "*.tmp"

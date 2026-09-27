@@ -27,6 +27,7 @@ from functools import partial, wraps
 from typing import Any, Callable, List, Optional, Protocol
 
 import cloudpickle
+from pathspec import GitIgnoreSpec
 
 from flamepy.app import _context
 from flamepy.app.storage import StorageBackend, create_storage_backend
@@ -1122,7 +1123,7 @@ class _Runtime:
     def _create_package(self) -> str:
         """Create a .tar.gz package of the current working directory.
 
-        Applies exclusion patterns from FlameContext.package.excludes.
+        Applies built-in exclusions and project .flmignore/.flameignore files.
 
         Returns:
             Path to the created package file
@@ -1135,8 +1136,6 @@ class _Runtime:
 
         # Create dist directory if it doesn't exist
         os.makedirs(dist_dir, exist_ok=True)
-
-        generated_pyproject = self._generated_pyproject_toml(cwd)
 
         package_filename = f"{self._name}-{uuid.uuid4().hex}.tar.gz"
         package_path = os.path.join(dist_dir, package_filename)
@@ -1157,27 +1156,13 @@ class _Runtime:
             ".DS_Store",
         ]
 
-        user_excludes = self._context.package.excludes if self._context.package else []
-        excludes = list(set(default_excludes + user_excludes))
-
-        logger.debug(f"Creating package with excludes: {excludes}")
+        logger.debug(f"Creating package with built-in excludes: {default_excludes}")
 
         try:
             with tarfile.open(package_path, "w:gz") as tar:
-                # Add files while respecting exclusions
-                for item in os.listdir(cwd):
-                    # Skip the dist directory (where the package is created)
-                    if item == "dist":
-                        continue
+                self._add_package_tree(tar, cwd, "", [], default_excludes)
 
-                    # Check if item matches any exclusion pattern
-                    if self._should_exclude(item, excludes):
-                        logger.debug(f"Excluding: {item}")
-                        continue
-
-                    item_path = os.path.join(cwd, item)
-                    tar.add(item_path, arcname=item, recursive=True, filter=lambda tarinfo: None if self._should_exclude(tarinfo.name, excludes) else tarinfo)
-
+                generated_pyproject = self._generated_pyproject_toml(set(tar.getnames()))
                 if generated_pyproject is not None:
                     data = generated_pyproject.encode("utf-8")
                     tarinfo = tarfile.TarInfo("pyproject.toml")
@@ -1193,6 +1178,36 @@ class _Runtime:
                 os.remove(package_path)
             raise FlameError(FlameErrorCode.INTERNAL, f"Failed to create package: {str(e)}")
 
+    def _add_package_tree(self, tar, root: str, relative: str, rules, default_excludes: List[str]) -> None:
+        directory = os.path.join(root, relative)
+        rules = list(rules)
+        for priority, filename in enumerate((".flmignore", ".flameignore")):
+            ignore_file = os.path.join(directory, filename)
+            if os.path.isfile(ignore_file):
+                with open(ignore_file, encoding="utf-8") as source:
+                    rules.append((priority, relative, GitIgnoreSpec.from_lines(source)))
+        rules.sort(key=lambda rule: (0 if not rule[1] else rule[1].count(os.sep) + 1, rule[0]))
+
+        for name in sorted(os.listdir(directory)):
+            if not relative and name == "dist":
+                continue
+            child = os.path.join(relative, name) if relative else name
+            if self._should_exclude(child, default_excludes):
+                continue
+            path = os.path.join(root, child)
+            is_dir = os.path.isdir(path) and not os.path.islink(path)
+            ignored = False
+            for _, base, spec in rules:
+                scoped_path = os.path.relpath(child, base) if base else child
+                match = spec.check_file(scoped_path.replace(os.sep, "/") + ("/" if is_dir else ""))
+                if match.include is not None:
+                    ignored = match.include
+            if ignored:
+                continue
+            tar.add(path, arcname=child, recursive=False)
+            if is_dir:
+                self._add_package_tree(tar, root, child, rules, default_excludes)
+
     def _should_exclude(self, name: str, patterns: List[str]) -> bool:
         import fnmatch
 
@@ -1201,13 +1216,13 @@ class _Runtime:
                 return True
         return False
 
-    def _generated_pyproject_toml(self, cwd: str) -> Optional[str]:
-        """Return generated package metadata when the source tree needs it."""
-        if os.path.exists(os.path.join(cwd, "pyproject.toml")):
+    def _generated_pyproject_toml(self, packaged_names: set) -> Optional[str]:
+        """Return generated metadata when the packaged files need it."""
+        if "pyproject.toml" in packaged_names:
             logger.debug("pyproject.toml already exists, skipping generated metadata")
             return None
 
-        has_legacy_metadata = os.path.exists(os.path.join(cwd, "setup.py")) or os.path.exists(os.path.join(cwd, "setup.cfg"))
+        has_legacy_metadata = "setup.py" in packaged_names or "setup.cfg" in packaged_names
         if has_legacy_metadata:
             if self._dependencies:
                 logger.warning("Python package metadata (setup.py/setup.cfg) already exists. Skipping pyproject.toml generation to avoid conflicting with existing metadata. Please specify dependencies in your setup.py or setup.cfg.")

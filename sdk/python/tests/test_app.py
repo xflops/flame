@@ -337,7 +337,7 @@ def test_app_exports_use_the_package_implementation():
 
     assert not hasattr(flamepy, "App")
     assert not hasattr(flamepy, "init")
-    assert not callable(flamepy.service)
+    assert not callable(flamepy.serving)
     assert not hasattr(flamepy, "destroy")
     assert callable(app.init)
     assert callable(app.service)
@@ -1079,6 +1079,50 @@ def test_app_should_exclude_handles_nested_paths():
 
     assert app._should_exclude("src/__pycache__/module.pyc", ["*.pyc"])
     assert app._should_exclude("tests/data/file.tmp", ["*.tmp"])
+
+
+def test_app_package_applies_root_and_nested_ignore_files(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test-run'\n")
+    (tmp_path / ".flmignore").write_text("*.log\n")
+    (tmp_path / ".flameignore").write_text("!keep.log\nsrc/keep.tmp\n")
+    (tmp_path / ".gitignore").write_text("*.py\n")
+    (tmp_path / "drop.log").write_text("drop")
+    (tmp_path / "keep.log").write_text("keep")
+    (tmp_path / "main.py").write_text("print('ok')\n")
+    nested = tmp_path / "src"
+    nested.mkdir()
+    (nested / ".flmignore").write_text("*.tmp\n!keep.tmp\n")
+    (nested / "drop.tmp").write_text("drop")
+    (nested / "keep.tmp").write_text("keep")
+    (nested / "keep.py").write_text("print('ok')\n")
+
+    app = object.__new__(Runtime)
+    app._name = "test-run"
+    app._dependencies = None
+    app._context = SimpleNamespace(package=None)
+
+    with tarfile.open(app._create_package(), "r:gz") as package:
+        names = set(package.getnames())
+
+    assert {"keep.log", "main.py", "src/keep.py", "src/keep.tmp"} <= names
+    assert not {"drop.log", "src/drop.tmp"} & names
+
+
+def test_app_package_generates_metadata_when_project_file_is_ignored(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'ignored'\n")
+    (tmp_path / ".flmignore").write_text("pyproject.toml\n")
+    (tmp_path / "main.py").write_text("print('ok')\n")
+
+    app = object.__new__(Runtime)
+    app._name = "test-run"
+    app._dependencies = None
+    app._context = SimpleNamespace(package=None)
+
+    with tarfile.open(app._create_package(), "r:gz") as package:
+        metadata = package.extractfile("pyproject.toml").read().decode("utf-8")
+    assert 'name = "test-run"' in metadata
 
 
 def test_app_package_generates_metadata_without_dependencies(tmp_path, monkeypatch):

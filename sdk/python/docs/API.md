@@ -15,10 +15,6 @@ contexts:
       endpoint: "http://127.0.0.1:8080"
     cache:
       endpoint: "grpc://127.0.0.1:9090"
-    package:
-      excludes:
-        - "*.log"
-        - "*.pkl"
 ```
 
 Environment variables override the file:

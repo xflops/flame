@@ -18,7 +18,7 @@ limitations under the License.
 from flamepy import proto  # noqa: F401
 
 # Import domain submodules (only as submodules)
-from . import agent, app, service, util
+from . import agent, app, serving, util
 
 # Export all core classes/types at top level
 from .core import (  # Type aliases; Constants; Enums; Exception classes; Data classes; Context and utility classes; Client functions; Client classes; Service constants; Service context classes; Service base classes; Service functions
@@ -158,6 +158,6 @@ __all__ = [
     # Submodules
     "agent",
     "app",
-    "service",
+    "serving",
     "util",
 ]

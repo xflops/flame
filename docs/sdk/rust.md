@@ -246,6 +246,9 @@ cargo run -p pi --bin pi -- --app pi
 ```
 
 Use the exact deployed application name in `SessionOptions::new(...)`.
+`flmctl deploy --application` also accepts a directory or regular file. It
+packages the input as `<source-name>.tar.gz` before upload. Directory inputs
+honor nested `.flmignore` and `.flameignore` files with Gitignore-style rules.
 
 ## API Map
 

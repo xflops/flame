@@ -32,11 +32,6 @@ contexts:
       endpoint: "http://127.0.0.1:8080"
     cache:
       endpoint: "grpc://127.0.0.1:9090"
-    package:
-      excludes:
-        - "*.log"
-        - "*.pkl"
-        - "*.tmp"
 ```
 
 `package.storage` is optional. When it is absent, App uploads packages to the Flame object cache through `cache.endpoint`.
@@ -52,10 +47,6 @@ Example with explicit HTTP package storage:
 ```yaml
 package:
   storage: "http://127.0.0.1:5050/packages"
-  excludes:
-    - "*.log"
-    - "data/"
-    - "models/"
 ```
 
 The optional `app` field defaults to `flmrun`. Set it only when the cluster
@@ -398,7 +389,21 @@ Default exclusions include:
 - `*.pyc`, `*.pyo`
 - `.DS_Store`
 
-Additional `package.excludes` patterns from `~/.flame/flame.yaml` are merged with those defaults.
+Add `.flmignore` or `.flameignore` to the project directory for more exclusions.
+Both files use Gitignore patterns, including `!` negation and rules in nested
+directories. For example:
+
+```gitignore
+*.log
+!important.log
+*.pkl
+data/
+```
+
+Place the file in the project directory that `app.init()` packages. When both
+names exist in the same directory, `.flameignore` takes precedence. The same
+files control `flmctl deploy --application <directory>`; `.gitignore` and
+global Git exclusions do not affect either archive.
 
 ## Working Directory
 

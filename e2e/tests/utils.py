@@ -13,10 +13,48 @@ limitations under the License.
 
 import random
 import string
+import subprocess
 import time
+from pathlib import Path
+from typing import Mapping, Optional, Sequence
 
 import flamepy
 import pytest
+
+E2E_PROJECT = Path(__file__).resolve().parents[1]
+
+
+def deploy_e2e_application(
+    name: str,
+    *,
+    command: Optional[str] = None,
+    arguments: Optional[Sequence[str]] = None,
+    description: Optional[str] = None,
+    shim: Optional[str] = None,
+    image: Optional[str] = None,
+    environments: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Deploy the E2E project through the same package path as user applications."""
+    args = ["flmctl", "deploy", "--name", name, "--application", str(E2E_PROJECT)]
+    if command is not None:
+        args.extend(["--command", command])
+    if arguments is not None:
+        args.extend(f"--argument={argument}" for argument in arguments)
+    if description is not None:
+        args.extend(["--description", description])
+    if shim is not None:
+        args.extend(["--shim", shim])
+    if image is not None:
+        args.extend(["--image", image])
+    if environments is not None:
+        args.extend(f"--env={key}={value}" for key, value in environments.items())
+
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        pytest.fail(f"Could not run flmctl deploy: {exc}")
+    if result.returncode:
+        pytest.fail(f"E2E package deployment failed: {result.stderr or result.stdout}")
 
 
 def random_string(size=16) -> str:

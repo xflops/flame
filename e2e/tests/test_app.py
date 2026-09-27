@@ -35,7 +35,7 @@ from e2e.helpers import (
     greet_func,
     sum_func,
 )
-from tests.utils import wait_for_application_deleted
+from tests.utils import deploy_e2e_application, wait_for_application_deleted
 
 
 @contextmanager
@@ -377,10 +377,11 @@ def test_app_package_excludes(check_package_config, check_flmrun_app):
             Path("main.py").write_text("print('hello')")
             Path("test.log").write_text("log content")
             Path("data.pkl").write_text("pickle content")
+            Path(".flmignore").write_text("*.log\n*.pkl\n")
             os.makedirs("__pycache__", exist_ok=True)
             Path("__pycache__/test.pyc").write_text("compiled")
 
-            # Use App (should exclude .log, .pkl, __pycache__)
+            # Use App with project ignore rules and built-in __pycache__ exclusion.
             with initialized_app("test-app-excludes"):
                 # Just verify it works - the exclusion is tested by successful packaging
                 pass
@@ -464,18 +465,9 @@ def test_app_service_close(check_package_config, check_flmrun_app):
 
 
 def test_flame_package_dataclass():
-    """Test Case 12: Test FlamePackage dataclass."""
-    # Test with defaults
-    pkg1 = flamepy.FlamePackage(storage="file:///tmp/test")
-    assert pkg1.storage == "file:///tmp/test"
-    assert ".venv" in pkg1.excludes
-    assert "__pycache__" in pkg1.excludes
-    assert "*.pyc" in pkg1.excludes
-
-    # Test with custom excludes
-    pkg2 = flamepy.FlamePackage(storage="file:///tmp/test", excludes=["*.log", "*.tmp"])
-    assert pkg2.storage == "file:///tmp/test"
-    assert pkg2.excludes == ["*.log", "*.tmp"]
+    """Test package storage configuration."""
+    package = flamepy.FlamePackage(storage="file:///tmp/test")
+    assert package.storage == "file:///tmp/test"
 
 
 def test_app_error_no_storage_config():
@@ -815,32 +807,21 @@ def test_app_recursive_same_session(check_package_config, check_flmrun_app):
 # =============================================================================
 
 
-@pytest.fixture
+@pytest.fixture(scope="class")
 def setup_flmrun_with_e2e():
-    """
-    Fixture to register a flmrun application with e2e modules available.
-
-    This registers a custom flmrun application with PYTHONPATH set to include
-    the e2e package, making e2e modules available to the app.
-    """
-    import os
-
-    if not os.path.exists("/opt/e2e"):
-        pytest.skip("Requires /opt/e2e directory (Docker E2E environment only)")
+    """Deploy the E2E package with the flmrun launch command."""
 
     flmrun = flamepy.get_application("flmrun")
     app_name = f"flmrun-e2e-{uuid.uuid4().hex[:8]}"
 
-    flamepy.register_application(
+    deploy_e2e_application(
         app_name,
-        flamepy.ApplicationAttributes(
-            working_directory="/opt/e2e",
-            command=flmrun.command,
-            arguments=flmrun.arguments,
-            environments={"PYTHONPATH": "/opt/e2e/src"},
-            installer="python",
-            description="Flmrun with e2e modules available",
-        ),
+        command=flmrun.command,
+        arguments=flmrun.arguments,
+        description="Flmrun with e2e modules available",
+        shim=flmrun.shim.name.lower() if flmrun.shim is not None else None,
+        image=flmrun.image,
+        environments=flmrun.environments,
     )
 
     yield app_name
@@ -848,7 +829,6 @@ def setup_flmrun_with_e2e():
     flamepy.unregister_application(app_name)
 
 
-@pytest.mark.skipif(not os.path.exists("/opt/e2e"), reason="Requires Docker E2E environment")
 class TestFlmrunApplication:
     """Tests for flmrun application functionality."""
 

@@ -5,17 +5,18 @@ import logging
 import os
 import threading
 import types
+from concurrent.futures import Future
 
 import cloudpickle
 import pytest
 
 import flamepy.core.service as service
-import flamepy.service.client as service_client
+import flamepy.serving.client as serving_client
 from flamepy.core.service import ApplicationContext, SessionContext, TaskContext
 from flamepy.core.types import TaskOutput
 from flamepy.proto import shim_pb2
 from flamepy.proto.types_pb2 import Result as ResultProto
-from flamepy.service.instance import FlameInstance
+from flamepy.serving import Instance, open_session
 
 
 class _NoopService(service.FlameService):
@@ -91,7 +92,7 @@ def test_publish_calls_are_unioned_and_sent_once():
     republished = publisher._take_attributes()
     assert list(republished.attr) == []
 
-    instance = FlameInstance()
+    instance = Instance()
     instance.publish({b"instance-key"})
     assert instance._take_attributes().attr == [b"instance-key"]
 
@@ -559,8 +560,11 @@ class FakeSession:
         self.application = "myapp"
         self.id = "sess-1"
 
-    def run(self, input_bytes):
-        return cloudpickle.dumps("OK")
+    def submit(self, input_bytes):
+        self.input_bytes = input_bytes
+        future = Future()
+        future.set_result(cloudpickle.dumps("OK"))
+        return future
 
     def common_data(self):
         return None
@@ -569,13 +573,13 @@ class FakeSession:
         pass
 
 
-def test_session_init_and_invoke(monkeypatch):
+def test_session_init_and_run(monkeypatch):
     # Patch create_session to return fake session
-    monkeypatch.setattr(service_client, "create_session", lambda **kwargs: FakeSession())
-    session = service_client.Session(name="myapp")
-    # Patch the session to return a known value on invoke
-    result = session.invoke("hello")
+    monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: FakeSession())
+    session = open_session(name="myapp")
+    result = session.run("hello")
     assert result == "OK"
+    assert cloudpickle.loads(session._session.input_bytes) == "hello"
 
 
 def test_cloudpickle_serialization_of_callable():
@@ -590,22 +594,22 @@ def test_cloudpickle_serialization_of_callable():
 class TestSessionInitialization:
     def test_session_requires_name_or_session_id(self):
         with pytest.raises(ValueError, match="Either 'name' or 'session_id' must be provided"):
-            service_client.Session()
+            open_session()
 
     def test_session_rejects_both_name_and_session_id(self):
         with pytest.raises(ValueError, match="Cannot provide both"):
-            service_client.Session(name="myapp", session_id="sess-1")
+            open_session(name="myapp", session_id="sess-1")
 
     def test_session_with_session_id_opens_existing(self, monkeypatch):
         fake_session = FakeSession()
-        monkeypatch.setattr(service_client, "open_session", lambda session_id: fake_session)
-        session = service_client.Session(session_id="sess-1")
+        monkeypatch.setattr(serving_client, "open_core_session", lambda session_id: fake_session)
+        session = open_session(session_id="sess-1")
         assert session._name == "myapp"
         assert session._session is fake_session
 
     def test_session_with_name_creates_new_session(self, monkeypatch):
-        monkeypatch.setattr(service_client, "create_session", lambda **kwargs: FakeSession())
-        session = service_client.Session(name="myapp")
+        monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: FakeSession())
+        session = open_session(name="myapp")
         assert session._name == "myapp"
         assert session._session is not None
 
@@ -616,8 +620,8 @@ class TestSessionInitialization:
             captured_kwargs.update(kwargs)
             return FakeSession()
 
-        monkeypatch.setattr(service_client, "create_session", capture_create_session)
-        service_client.Session(name="myapp", resreq={"cpu": 4, "memory": "8g", "gpu": 1})
+        monkeypatch.setattr(serving_client, "create_session", capture_create_session)
+        open_session(name="myapp", resreq={"cpu": 4, "memory": "8g", "gpu": 1})
         assert captured_kwargs.get("resreq") is not None
         assert captured_kwargs["resreq"].cpu == 4
         assert captured_kwargs["resreq"].gpu == 1
@@ -625,49 +629,94 @@ class TestSessionInitialization:
 
 class TestSessionOperations:
     def test_session_id_returns_session_id(self, monkeypatch):
-        monkeypatch.setattr(service_client, "create_session", lambda **kwargs: FakeSession())
-        session = service_client.Session(name="myapp")
+        monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: FakeSession())
+        session = open_session(name="myapp")
         assert session.id() == "sess-1"
 
     def test_session_id_returns_none_when_no_session(self, monkeypatch):
-        monkeypatch.setattr(service_client, "create_session", lambda **kwargs: FakeSession())
-        session = service_client.Session(name="myapp")
+        monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: FakeSession())
+        session = open_session(name="myapp")
         session._session = None
         assert session.id() is None
 
-    def test_session_invoke_raises_when_no_session(self, monkeypatch):
-        monkeypatch.setattr(service_client, "create_session", lambda **kwargs: FakeSession())
-        session = service_client.Session(name="myapp")
+    def test_session_run_raises_when_no_session(self, monkeypatch):
+        monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: FakeSession())
+        session = open_session(name="myapp")
         session._session = None
         with pytest.raises(RuntimeError, match="not initialized"):
-            session.invoke("test")
+            session.run("test")
 
-    def test_session_invoke_returns_none_for_none_output(self, monkeypatch):
+    def test_session_run_returns_none_for_none_output(self, monkeypatch):
         class NoneOutputSession(FakeSession):
-            def run(self, input_bytes):
-                return None
+            def submit(self, input_bytes):
+                future = Future()
+                future.set_result(None)
+                return future
 
-        monkeypatch.setattr(service_client, "create_session", lambda **kwargs: NoneOutputSession())
-        session = service_client.Session(name="myapp")
-        result = session.invoke("test")
+        monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: NoneOutputSession())
+        session = open_session(name="myapp")
+        result = session.run("test")
         assert result is None
 
+    def test_session_submit_deserializes_result(self, monkeypatch):
+        class PendingSession(FakeSession):
+            def submit(self, input_bytes):
+                self.input_bytes = input_bytes
+                self.future = Future()
+                return self.future
+
+        fake_session = PendingSession()
+        monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: fake_session)
+        session = open_session(name="myapp")
+
+        future = session.submit({"value": 3})
+
+        assert isinstance(future, Future)
+        assert not future.done()
+        fake_session.future.set_result(cloudpickle.dumps({"answer": 6}))
+        assert future.result() == {"answer": 6}
+        assert cloudpickle.loads(fake_session.input_bytes) == {"value": 3}
+
+    def test_session_submit_propagates_task_failure(self, monkeypatch):
+        class FailedSession(FakeSession):
+            def submit(self, input_bytes):
+                future = Future()
+                future.set_exception(ValueError("task failed"))
+                return future
+
+        monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: FailedSession())
+        future = open_session(name="myapp").submit("test")
+        with pytest.raises(ValueError, match="task failed"):
+            future.result()
+
+    def test_session_submit_cancellation_cancels_task(self, monkeypatch):
+        class PendingSession(FakeSession):
+            def submit(self, input_bytes):
+                self.future = Future()
+                return self.future
+
+        fake_session = PendingSession()
+        monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: fake_session)
+        future = open_session(name="myapp").submit("test")
+        assert future.cancel()
+        assert fake_session.future.cancelled()
+
     def test_session_context_returns_none_when_no_session(self, monkeypatch):
-        monkeypatch.setattr(service_client, "create_session", lambda **kwargs: FakeSession())
-        session = service_client.Session(name="myapp")
+        monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: FakeSession())
+        session = open_session(name="myapp")
         session._session = None
         assert session.context() is None
 
     def test_session_context_returns_none_when_no_common_data(self, monkeypatch):
-        monkeypatch.setattr(service_client, "create_session", lambda **kwargs: FakeSession())
-        session = service_client.Session(name="myapp")
+        monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: FakeSession())
+        session = open_session(name="myapp")
         assert session.context() is None
 
 
 class TestSessionContextManager:
     def test_session_context_manager_enter(self, monkeypatch):
-        monkeypatch.setattr(service_client, "create_session", lambda **kwargs: FakeSession())
-        session = service_client.Session(name="myapp")
+        monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: FakeSession())
+        session = open_session(name="myapp")
         result = session.__enter__()
         assert result is session
 
@@ -678,8 +727,8 @@ class TestSessionContextManager:
             def close(self):
                 closed["called"] = True
 
-        monkeypatch.setattr(service_client, "create_session", lambda **kwargs: TrackingSession())
-        session = service_client.Session(name="myapp")
+        monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: TrackingSession())
+        session = open_session(name="myapp")
         session.__exit__(None, None, None)
         assert closed["called"]
 
@@ -690,8 +739,8 @@ class TestSessionContextManager:
             def close(self):
                 closed["called"] = True
 
-        monkeypatch.setattr(service_client, "create_session", lambda **kwargs: TrackingSession())
-        with service_client.Session(name="myapp") as session:
+        monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: TrackingSession())
+        with open_session(name="myapp") as session:
             assert session._session is not None
         assert closed["called"]
 
@@ -702,8 +751,8 @@ class TestSessionContextManager:
             def close(self):
                 close_count["count"] += 1
 
-        monkeypatch.setattr(service_client, "create_session", lambda **kwargs: CountingSession())
-        session = service_client.Session(name="myapp")
+        monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: CountingSession())
+        session = open_session(name="myapp")
         session.close()
         session.close()
         assert close_count["count"] == 1
@@ -727,44 +776,44 @@ class DummyObjectRef:
 
 
 @pytest.fixture
-def flame_instance():
-    """Create a fresh FlameInstance for testing."""
-    return FlameInstance()
+def instance():
+    """Create a fresh serving Instance for testing."""
+    return Instance()
 
 
-def test_flameinstance_init(flame_instance):
-    """Test FlameInstance initializes with correct defaults."""
-    assert flame_instance._entrypoint is None
-    assert flame_instance._parameter is None
-    assert flame_instance._object_ref is None
+def test_serving_instance_init(instance):
+    """Test serving Instance initializes with correct defaults."""
+    assert instance._entrypoint is None
+    assert instance._parameter is None
+    assert instance._object_ref is None
 
 
-def test_entrypoint_decorator_registers_function(flame_instance):
+def test_entrypoint_decorator_registers_function(instance):
     """Test that entrypoint decorator registers the function."""
 
-    @flame_instance.entrypoint
+    @instance.entrypoint
     def my_handler(data):
         return data
 
-    assert flame_instance._entrypoint is my_handler
-    assert flame_instance._parameter is not None
-    assert flame_instance._parameter.name == "data"
+    assert instance._entrypoint is my_handler
+    assert instance._parameter is not None
+    assert instance._parameter.name == "data"
 
 
-def test_entrypoint_decorator_zero_params(flame_instance):
+def test_entrypoint_decorator_zero_params(instance):
     """Test entrypoint decorator with zero-parameter function."""
 
-    @flame_instance.entrypoint
+    @instance.entrypoint
     def no_params():
         return "done"
 
-    assert flame_instance._entrypoint is no_params
-    assert flame_instance._parameter is None
+    assert instance._entrypoint is no_params
+    assert instance._parameter is None
 
 
 def test_entrypoint_decorator_rejects_multiple_params():
     """Test entrypoint decorator rejects functions with multiple params."""
-    fi = FlameInstance()
+    fi = Instance()
 
     with pytest.raises(AssertionError):
 
@@ -773,12 +822,12 @@ def test_entrypoint_decorator_rejects_multiple_params():
             pass
 
 
-def test_on_session_enter_decodes_object_ref(flame_instance, monkeypatch):
+def test_on_session_enter_decodes_object_ref(instance, monkeypatch):
     """Test on_session_enter decodes ObjectRef from common_data."""
     dummy_ref = DummyObjectRef(b"session-data")
 
     monkeypatch.setattr(
-        "flamepy.service.instance.ObjectRef",
+        "flamepy.serving.instance.ObjectRef",
         types.SimpleNamespace(decode=lambda data: dummy_ref),
     )
 
@@ -789,11 +838,11 @@ def test_on_session_enter_decodes_object_ref(flame_instance, monkeypatch):
         application=app_ctx,
     )
 
-    flame_instance.on_session_enter(session_ctx)
-    assert flame_instance._object_ref is dummy_ref
+    instance.on_session_enter(session_ctx)
+    assert instance._object_ref is dummy_ref
 
 
-def test_on_session_enter_handles_none_common_data(flame_instance):
+def test_on_session_enter_handles_none_common_data(instance):
     """Test on_session_enter handles None common_data."""
     app_ctx = ApplicationContext(name="test-app")
     session_ctx = SessionContext(
@@ -802,21 +851,21 @@ def test_on_session_enter_handles_none_common_data(flame_instance):
         application=app_ctx,
     )
 
-    flame_instance.on_session_enter(session_ctx)
-    assert flame_instance._object_ref is None
+    instance.on_session_enter(session_ctx)
+    assert instance._object_ref is None
 
 
-def test_on_task_invoke_calls_entrypoint(flame_instance, monkeypatch):
+def test_on_task_invoke_calls_entrypoint(instance, monkeypatch):
     """Test on_task_invoke calls registered entrypoint with deserialized input."""
     received_input = []
 
-    @flame_instance.entrypoint
+    @instance.entrypoint
     def handler(data):
         received_input.append(data)
         return {"result": "ok"}
 
     monkeypatch.setattr(
-        "flamepy.service.instance.cloudpickle",
+        "flamepy.serving.instance.cloudpickle",
         types.SimpleNamespace(
             loads=lambda x: {"key": "value"},
             dumps=cloudpickle.dumps,
@@ -830,18 +879,18 @@ def test_on_task_invoke_calls_entrypoint(flame_instance, monkeypatch):
         input=b"serialized-input",
     )
 
-    result = flame_instance.on_task_invoke(task_ctx)
+    result = instance.on_task_invoke(task_ctx)
 
     assert len(received_input) == 1
     assert received_input[0] == {"key": "value"}
     assert isinstance(result, TaskOutput)
 
 
-def test_on_task_invoke_with_none_input(flame_instance, monkeypatch):
+def test_on_task_invoke_with_none_input(instance, monkeypatch):
     """Test on_task_invoke with None input."""
     received_input = []
 
-    @flame_instance.entrypoint
+    @instance.entrypoint
     def handler(data):
         received_input.append(data)
         return None
@@ -852,13 +901,13 @@ def test_on_task_invoke_with_none_input(flame_instance, monkeypatch):
         input=None,
     )
 
-    flame_instance.on_task_invoke(task_ctx)
+    instance.on_task_invoke(task_ctx)
 
     assert len(received_input) == 1
     assert received_input[0] is None
 
 
-def test_on_task_invoke_without_entrypoint(flame_instance):
+def test_on_task_invoke_without_entrypoint(instance):
     """Test on_task_invoke returns None when no entrypoint is registered."""
     task_ctx = TaskContext(
         task_id="task-1",
@@ -866,19 +915,19 @@ def test_on_task_invoke_without_entrypoint(flame_instance):
         input=b"data",
     )
 
-    result = flame_instance.on_task_invoke(task_ctx)
+    result = instance.on_task_invoke(task_ctx)
     assert result is None
 
 
-def test_on_task_invoke_with_zero_param_entrypoint(flame_instance, monkeypatch):
+def test_on_task_invoke_with_zero_param_entrypoint(instance, monkeypatch):
     """Test on_task_invoke with zero-parameter entrypoint."""
 
-    @flame_instance.entrypoint
+    @instance.entrypoint
     def no_params():
         return "done"
 
     monkeypatch.setattr(
-        "flamepy.service.instance.cloudpickle",
+        "flamepy.serving.instance.cloudpickle",
         types.SimpleNamespace(
             loads=lambda x: "ignored",
             dumps=cloudpickle.dumps,
@@ -892,78 +941,78 @@ def test_on_task_invoke_with_zero_param_entrypoint(flame_instance, monkeypatch):
         input=b"ignored",
     )
 
-    result = flame_instance.on_task_invoke(task_ctx)
+    result = instance.on_task_invoke(task_ctx)
     assert isinstance(result, TaskOutput)
 
 
-def test_on_session_leave_clears_object_ref(flame_instance):
+def test_on_session_leave_clears_object_ref(instance):
     """Test on_session_leave clears the object reference."""
-    flame_instance._object_ref = DummyObjectRef()
+    instance._object_ref = DummyObjectRef()
 
-    flame_instance.on_session_leave()
+    instance.on_session_leave()
 
-    assert flame_instance._object_ref is None
+    assert instance._object_ref is None
 
 
-def test_context_returns_deserialized_data(flame_instance, monkeypatch):
+def test_context_returns_deserialized_data(instance, monkeypatch):
     """Test context() returns deserialized data from cache."""
-    flame_instance._object_ref = DummyObjectRef()
+    instance._object_ref = DummyObjectRef()
 
     monkeypatch.setattr(
-        "flamepy.service.instance.get_object",
+        "flamepy.serving.instance.get_object",
         lambda ref: b"serialized-ctx",
     )
     monkeypatch.setattr(
-        "flamepy.service.instance.cloudpickle",
+        "flamepy.serving.instance.cloudpickle",
         types.SimpleNamespace(loads=lambda x: {"ctx_key": "ctx_value"}),
     )
 
-    result = flame_instance.context()
+    result = instance.context()
     assert result == {"ctx_key": "ctx_value"}
 
 
-def test_context_returns_none_when_no_ref(flame_instance):
+def test_context_returns_none_when_no_ref(instance):
     """Test context() returns None when no object_ref."""
-    flame_instance._object_ref = None
+    instance._object_ref = None
 
-    result = flame_instance.context()
+    result = instance.context()
     assert result is None
 
 
-def test_update_context_serializes_and_updates(flame_instance, monkeypatch):
+def test_update_context_serializes_and_updates(instance, monkeypatch):
     """Test update_context() serializes data and updates cache."""
-    flame_instance._object_ref = DummyObjectRef()
+    instance._object_ref = DummyObjectRef()
     updated_refs = []
 
     def mock_update(ref, data):
         updated_refs.append((ref, data))
         return DummyObjectRef(data)
 
-    monkeypatch.setattr("flamepy.service.instance.update_object", mock_update)
+    monkeypatch.setattr("flamepy.serving.instance.update_object", mock_update)
     monkeypatch.setattr(
-        "flamepy.service.instance.cloudpickle",
+        "flamepy.serving.instance.cloudpickle",
         types.SimpleNamespace(
             dumps=lambda x, protocol=None: b"serialized:" + str(x).encode(),
             DEFAULT_PROTOCOL=4,
         ),
     )
 
-    flame_instance.update_context({"new": "data"})
+    instance.update_context({"new": "data"})
 
     assert len(updated_refs) == 1
     assert updated_refs[0][1] == b"serialized:{'new': 'data'}"
 
 
-def test_update_context_noop_when_no_ref(flame_instance, monkeypatch):
+def test_update_context_noop_when_no_ref(instance, monkeypatch):
     """Test update_context() does nothing when no object_ref."""
-    flame_instance._object_ref = None
+    instance._object_ref = None
     called = []
 
     monkeypatch.setattr(
-        "flamepy.service.instance.update_object",
+        "flamepy.serving.instance.update_object",
         lambda ref, data: called.append(True),
     )
 
-    flame_instance.update_context({"data": 1})
+    instance.update_context({"data": 1})
 
     assert len(called) == 0

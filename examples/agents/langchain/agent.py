@@ -1,4 +1,4 @@
-from flamepy import service
+from flamepy import serving
 
 from langchain_deepseek import ChatDeepSeek
 from langchain.agents import create_agent
@@ -6,7 +6,7 @@ from langchain.messages import HumanMessage, SystemMessage
 
 from apis import Question, Answer, SysPrompt
 
-ins = service.FlameInstance()
+ins = serving.Instance()
 
 llm = ChatDeepSeek(
     model="deepseek-chat",

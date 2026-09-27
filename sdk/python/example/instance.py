@@ -12,7 +12,7 @@ Example usage of the Flame Python SDK instance functionality.
 
 from dataclasses import dataclass
 
-from flamepy import service
+from flamepy import serving
 
 
 @dataclass
@@ -31,7 +31,7 @@ class Summary:
     summary: str
 
 
-ins = service.FlameInstance()
+ins = serving.Instance()
 
 
 @ins.entrypoint

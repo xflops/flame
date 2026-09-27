@@ -24,7 +24,6 @@ This module tests:
 """
 
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 
 import flamepy
@@ -33,7 +32,7 @@ from flamepy import SessionState, TaskState
 
 from e2e.api import TestRequest
 from e2e.helpers import invoke_task, serialize_request
-from tests.utils import random_string
+from tests.utils import deploy_e2e_application, random_string
 
 FLM_TEST_SVC_APP = "flme2e-session-svc"
 
@@ -41,16 +40,7 @@ FLM_TEST_SVC_APP = "flme2e-session-svc"
 @pytest.fixture(scope="module", autouse=True)
 def setup_test_env():
     """Setup test environment with BasicTestService."""
-    flamepy.register_application(
-        FLM_TEST_SVC_APP,
-        flamepy.ApplicationAttributes(
-            command="python3",
-            working_directory="/opt/e2e",
-            environments={"FLAME_LOG_LEVEL": "DEBUG", "PYTHONPATH": "/opt/e2e/src"},
-            arguments=["src/e2e/basic_svc.py", "src/e2e/api.py"],
-            installer="python",
-        ),
-    )
+    deploy_e2e_application(FLM_TEST_SVC_APP)
 
     yield
 
@@ -705,6 +695,7 @@ class TestConcurrentTasks:
         assert len(results) == task_num
 
         session.close()
+
 
 # =============================================================================
 # Helper Functions

@@ -94,9 +94,6 @@ pub struct FlamePackage {
     /// Storage URL for the package (e.g., "file:///var/lib/flame/packages")
     #[serde(default)]
     pub storage: Option<String>,
-    /// Patterns to exclude from the package
-    #[serde(default)]
-    pub excludes: Vec<String>,
 }
 
 /// A named context containing cluster, cache, and package configurations.

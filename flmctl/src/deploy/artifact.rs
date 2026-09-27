@@ -19,6 +19,7 @@ use flame_rs::apis::FlameError;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::{Compression, GzBuilder};
+use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, EntryType, Header};
 use tempfile::TempDir;
@@ -28,6 +29,7 @@ const PACKAGE_EXTENSIONS: [&str; 2] = [".tar.gz", ".tgz"];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationInputKind {
     ExecutableFile,
+    File,
     TarGz,
     Directory,
 }
@@ -36,6 +38,7 @@ impl std::fmt::Display for ApplicationInputKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ExecutableFile => write!(f, "executable-file"),
+            Self::File => write!(f, "file"),
             Self::TarGz => write!(f, "tar.gz"),
             Self::Directory => write!(f, "directory"),
         }
@@ -51,25 +54,13 @@ pub struct PreparedApplication {
 }
 
 impl PreparedApplication {
-    pub fn filename(&self, app_name: &str) -> String {
-        match self.kind {
-            ApplicationInputKind::ExecutableFile => format!("{}.tar.gz", app_name),
-            ApplicationInputKind::TarGz | ApplicationInputKind::Directory => {
-                format!("{}-{}.tar.gz", app_name, &self.sha256[..16])
-            }
-        }
-    }
-
     pub fn object_key(&self, app_name: &str) -> String {
-        let object_name = match self.kind {
-            ApplicationInputKind::ExecutableFile => {
-                format!("{}-{}.tar.gz", app_name, &self.sha256[..16])
-            }
-            ApplicationInputKind::TarGz | ApplicationInputKind::Directory => {
-                self.filename(app_name)
-            }
-        };
-        format!("{}/pkg/{}", app_name, object_name)
+        format!(
+            "{}/pkg/{}-{}.tar.gz",
+            app_name,
+            app_name,
+            &self.sha256[..16]
+        )
     }
 }
 
@@ -82,7 +73,7 @@ pub fn prepare_application(path: &Path) -> Result<PreparedApplication, FlameErro
     let temp_dir = TempDir::new()
         .map_err(|e| FlameError::Internal(format!("failed to create temp dir: {}", e)))?;
 
-    let detection_root = match kind {
+    let source_root = match kind {
         ApplicationInputKind::ExecutableFile => {
             let root = temp_dir.path().join("binary");
             let bin_dir = root.join("bin");
@@ -97,6 +88,19 @@ pub fn prepare_application(path: &Path) -> Result<PreparedApplication, FlameErro
             })?;
             root
         }
+        ApplicationInputKind::File => {
+            let root = temp_dir.path().join("file");
+            fs::create_dir(&root).map_err(|e| {
+                FlameError::Internal(format!("failed to create file package dir: {}", e))
+            })?;
+            let filename = input_path.file_name().ok_or_else(|| {
+                FlameError::InvalidConfig(format!("invalid file path: {}", input_path.display()))
+            })?;
+            fs::copy(&input_path, root.join(filename)).map_err(|e| {
+                FlameError::Internal(format!("failed to copy file into package dir: {}", e))
+            })?;
+            root
+        }
         ApplicationInputKind::TarGz => {
             let root = temp_dir.path().join("extract");
             fs::create_dir_all(&root).map_err(|e| {
@@ -105,12 +109,41 @@ pub fn prepare_application(path: &Path) -> Result<PreparedApplication, FlameErro
             unpack_tar_gz(&input_path, &root)?;
             select_detection_root(&root)?
         }
-        ApplicationInputKind::Directory => input_path,
+        ApplicationInputKind::Directory => input_path.clone(),
     };
 
-    let package_path = temp_dir.path().join("application.tar.gz");
-    package_directory(&detection_root, &package_path)?;
+    let input_name = input_path
+        .file_name()
+        .ok_or_else(|| FlameError::InvalidConfig("application path has no name".to_string()))?
+        .to_string_lossy();
+    let package_name = match kind {
+        ApplicationInputKind::TarGz if input_name.ends_with(".tar.gz") => input_name.into_owned(),
+        ApplicationInputKind::TarGz => format!("{}.tar.gz", input_name.trim_end_matches(".tgz")),
+        ApplicationInputKind::Directory
+        | ApplicationInputKind::ExecutableFile
+        | ApplicationInputKind::File => {
+            format!("{}.tar.gz", input_name)
+        }
+    };
+    let package_path = temp_dir.path().join(package_name);
+    package_directory(
+        &source_root,
+        &package_path,
+        kind == ApplicationInputKind::Directory,
+    )?;
     let sha256 = sha256_file(&package_path)?;
+
+    // Detect against the exact files the executor will receive. Ignore rules
+    // can remove a pyproject or executable from a directory package.
+    let detection_root = if kind == ApplicationInputKind::Directory {
+        let root = temp_dir.path().join("detection");
+        fs::create_dir(&root)
+            .map_err(|e| FlameError::Internal(format!("failed to create detection dir: {}", e)))?;
+        unpack_tar_gz(&package_path, &root)?;
+        root
+    } else {
+        source_root
+    };
 
     Ok(PreparedApplication {
         kind,
@@ -130,12 +163,20 @@ pub fn classify_application(path: &Path) -> Result<ApplicationInputKind, FlameEr
         return Ok(ApplicationInputKind::TarGz);
     }
 
+    if path.is_file() && path.extension().is_some_and(|ext| ext == "py") {
+        return Ok(ApplicationInputKind::File);
+    }
+
     if path.is_file() && is_executable(path)? {
         return Ok(ApplicationInputKind::ExecutableFile);
     }
 
+    if path.is_file() {
+        return Ok(ApplicationInputKind::File);
+    }
+
     Err(FlameError::InvalidConfig(format!(
-        "{} must be a directory, .tar.gz/.tgz package, or executable file",
+        "{} must be a directory or regular file",
         path.display()
     )))
 }
@@ -164,7 +205,11 @@ pub fn is_executable(path: &Path) -> Result<bool, FlameError> {
     }
 }
 
-fn package_directory(src_root: &Path, dest_path: &Path) -> Result<(), FlameError> {
+fn package_directory(
+    src_root: &Path,
+    dest_path: &Path,
+    use_ignore_rules: bool,
+) -> Result<(), FlameError> {
     let file = fs::File::create(dest_path).map_err(|e| {
         FlameError::Internal(format!(
             "failed to create package {}: {}",
@@ -185,7 +230,11 @@ fn package_directory(src_root: &Path, dest_path: &Path) -> Result<(), FlameError
     })?;
 
     let mut entries = Vec::new();
-    collect_entries(&root, Path::new(""), &root, &mut entries)?;
+    if use_ignore_rules {
+        collect_deploy_entries(&root, &mut entries)?;
+    } else {
+        collect_entries(&root, Path::new(""), &root, &mut entries)?;
+    }
     entries.sort();
 
     for relative in entries {
@@ -199,6 +248,54 @@ fn package_directory(src_root: &Path, dest_path: &Path) -> Result<(), FlameError
     encoder
         .finish()
         .map_err(|e| FlameError::Internal(format!("failed to finish gzip archive: {}", e)))?;
+    Ok(())
+}
+
+fn collect_deploy_entries(root: &Path, entries: &mut Vec<PathBuf>) -> Result<(), FlameError> {
+    let mut walker = WalkBuilder::new(root);
+    walker
+        .standard_filters(false)
+        .add_custom_ignore_filename(".flmignore")
+        .add_custom_ignore_filename(".flameignore");
+
+    for result in walker.build() {
+        let entry = result.map_err(|e| {
+            FlameError::InvalidConfig(format!("failed to walk application directory: {}", e))
+        })?;
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+        if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        if entry.file_type().is_some_and(|kind| kind.is_symlink()) {
+            let target = path.canonicalize().map_err(|e| {
+                FlameError::InvalidConfig(format!(
+                    "failed to resolve symlink {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+            if !target.starts_with(root) {
+                return Err(FlameError::InvalidConfig(format!(
+                    "symlink {} points outside application root",
+                    path.display()
+                )));
+            }
+            if target.is_dir() {
+                return Err(FlameError::InvalidConfig(format!(
+                    "symlinked directories are not supported: {}",
+                    path.display()
+                )));
+            }
+        }
+        let relative = path.strip_prefix(root).map_err(|e| {
+            FlameError::Internal(format!("failed to relativize {}: {}", path.display(), e))
+        })?;
+        entries.push(relative.to_path_buf());
+    }
+
     Ok(())
 }
 
@@ -445,7 +542,7 @@ mod tests {
         let prepared = prepare_application(&bin).unwrap();
         assert_eq!(prepared.kind, ApplicationInputKind::ExecutableFile);
         assert!(prepared.detection_root.join("bin/service").exists());
-        assert_eq!(prepared.filename("demo"), "demo.tar.gz");
+        assert_eq!(prepared.package_path.file_name().unwrap(), "service.tar.gz");
         assert_eq!(
             prepared.object_key("demo"),
             format!("demo/pkg/demo-{}.tar.gz", &prepared.sha256[..16])
@@ -523,19 +620,89 @@ mod tests {
     #[test]
     fn directory_package_is_content_addressed() {
         let temp = TempDir::new().unwrap();
-        let file = temp.path().join("app.py");
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let file = source.join("app.py");
         let mut f = fs::File::create(file).unwrap();
         writeln!(f, "print('hello')").unwrap();
 
-        let prepared = prepare_application(temp.path()).unwrap();
+        let prepared = prepare_application(&source).unwrap();
         assert!(prepared.package_path.exists());
-        assert_eq!(
-            prepared.filename("demo").len(),
-            "demo-".len() + 16 + ".tar.gz".len()
-        );
+        assert_eq!(prepared.package_path.file_name().unwrap(), "source.tar.gz");
+        let package = fs::File::open(&prepared.package_path).unwrap();
+        let mut archive = Archive::new(GzDecoder::new(package));
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().unwrap().unwrap();
+        assert_eq!(entry.path().unwrap().as_ref(), Path::new("app.py"));
+        let mut contents = String::new();
+        entry.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "print('hello')\n");
+        assert!(entries.next().is_none());
         assert_eq!(
             prepared.object_key("demo"),
-            format!("demo/pkg/{}", prepared.filename("demo"))
+            format!("demo/pkg/demo-{}.tar.gz", &prepared.sha256[..16])
         );
+    }
+
+    #[test]
+    fn directory_ignore_files_filter_archive_and_detection_root() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("source");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".flmignore"), "*.log\npyproject.toml\n").unwrap();
+        fs::write(root.join(".flameignore"), "!keep.log\nsrc/keep.tmp\n").unwrap();
+        fs::write(root.join(".gitignore"), "*.py\n").unwrap();
+        fs::write(root.join("pyproject.toml"), "[project]\nname='demo'\n").unwrap();
+        fs::write(root.join("drop.log"), "drop").unwrap();
+        fs::write(root.join("keep.log"), "keep").unwrap();
+        fs::write(root.join("src/.flmignore"), "*.tmp\n!keep.tmp\n").unwrap();
+        fs::write(root.join("src/drop.tmp"), "drop").unwrap();
+        fs::write(root.join("src/keep.tmp"), "keep").unwrap();
+        fs::write(root.join("src/main.py"), "print('ok')\n").unwrap();
+
+        let prepared = prepare_application(&root).unwrap();
+        let package = fs::File::open(&prepared.package_path).unwrap();
+        let mut archive = Archive::new(GzDecoder::new(package));
+        let paths: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect();
+        assert!(paths.contains(&PathBuf::from("keep.log")));
+        assert!(paths.contains(&PathBuf::from("src/main.py")));
+        assert!(paths.contains(&PathBuf::from("src/keep.tmp")));
+        assert!(!paths.contains(&PathBuf::from("drop.log")));
+        assert!(!paths.contains(&PathBuf::from("src/drop.tmp")));
+        assert!(!paths.contains(&PathBuf::from("pyproject.toml")));
+        assert!(!prepared.detection_root.join("pyproject.toml").exists());
+    }
+
+    #[test]
+    fn regular_file_package_uses_full_filename() {
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("main.py");
+        fs::write(&script, "print('ok')\n").unwrap();
+        make_executable(&script);
+
+        let prepared = prepare_application(&script).unwrap();
+        assert_eq!(prepared.kind, ApplicationInputKind::File);
+        assert_eq!(prepared.package_path.file_name().unwrap(), "main.py.tar.gz");
+        let package = fs::File::open(&prepared.package_path).unwrap();
+        let mut archive = Archive::new(GzDecoder::new(package));
+        let entry = archive.entries().unwrap().next().unwrap().unwrap();
+        assert_eq!(entry.path().unwrap().as_ref(), Path::new("main.py"));
+    }
+
+    #[test]
+    fn tar_gz_input_keeps_its_filename() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("app.py"), "print('ok')\n").unwrap();
+        let input = temp.path().join("bundle.tar.gz");
+        package_directory(&source, &input, false).unwrap();
+
+        let prepared = prepare_application(&input).unwrap();
+        assert_eq!(prepared.package_path.file_name().unwrap(), "bundle.tar.gz");
     }
 }

@@ -1,0 +1,10 @@
+metadata:
+  name: flme2e
+spec:
+  installer: python
+  command: python3
+  arguments:
+    - -m
+    - e2e.basic_svc
+  environments:
+    FLAME_LOG_LEVEL: DEBUG

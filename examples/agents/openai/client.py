@@ -12,7 +12,7 @@
 import argparse
 from typing import Optional
 
-from flamepy.service import Session
+from flamepy.serving import open_session
 from apis import MyContext, Question
 
 OPENAI_APP_NAME = "openai-agent"
@@ -20,12 +20,12 @@ OPENAI_APP_NAME = "openai-agent"
 
 def main(message: str, ssn_id: Optional[str] = None):
     if ssn_id:
-        session = Session(session_id=ssn_id)
+        session = open_session(session_id=ssn_id)
     else:
         sys_prompt = """You are a weather forecaster.
         If you are asked to fetch the weather, you should use the fetch_weather tool after confirming the location with the user.
         """
-        session = Session(OPENAI_APP_NAME, ctx=MyContext(prompt=sys_prompt))
+        session = open_session(OPENAI_APP_NAME, ctx=MyContext(prompt=sys_prompt))
 
     print(f"{'=' * 30}")
     print(f"Conversation <{session.id()}>")
@@ -33,7 +33,7 @@ def main(message: str, ssn_id: Optional[str] = None):
 
     print(f"User: {message}")
 
-    output = session.invoke(Question(question=message))
+    output = session.run(Question(question=message))
 
     print(f"Agent: {output.answer}")
 

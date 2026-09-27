@@ -24,7 +24,7 @@ from agents import (
     set_default_openai_api,
 )
 
-from flamepy import service
+from flamepy import serving
 from apis import MyContext, Question, Answer, MyCustomSession
 
 logger = logging.getLogger(__name__)
@@ -38,8 +38,8 @@ set_tracing_disabled(True)
 enable_verbose_stdout_logging()
 set_default_openai_api("chat_completions")
 
-# Creat a FlameInstance
-ins = service.FlameInstance()
+# Create a serving instance
+ins = serving.Instance()
 
 
 class Location(TypedDict):

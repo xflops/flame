@@ -81,6 +81,233 @@ fn deploy_dry_run_python_directory_through_cli() {
 }
 
 #[test]
+fn deploy_dry_run_python_file_through_cli() {
+    let temp = TempDir::new().unwrap();
+    let config = write_config(temp.path());
+    let script = temp.path().join("main.py");
+    fs::write(&script, "print('hello')\n").unwrap();
+
+    let json = run_deploy_json(&config, &script, "demo-app");
+
+    assert_eq!(json_string(&json, "/input_kind"), "file");
+    assert_eq!(json_string(&json, "/installer"), "binary");
+    assert_eq!(json_string(&json, "/command"), "python3");
+    assert_eq!(
+        json.pointer("/arguments/0").and_then(Value::as_str),
+        Some("main.py")
+    );
+    assert_content_addressed_package_key(json_string(&json, "/object_key"), "demo-app");
+}
+
+#[test]
+fn deploy_uses_directory_profile_and_cli_overrides() {
+    let temp = TempDir::new().unwrap();
+    let config = write_config(temp.path());
+    let app_dir = temp.path().join("app");
+    fs::create_dir(&app_dir).unwrap();
+    fs::write(
+        app_dir.join("pyproject.toml"),
+        "[project]\nname = 'demo'\n[project.scripts]\ndemo = 'demo:main'\n",
+    )
+    .unwrap();
+    fs::write(
+        app_dir.join("flm.yaml"),
+        "metadata:\n  name: fallback\nspec:\n  command: fallback-command\n",
+    )
+    .unwrap();
+    fs::write(
+        app_dir.join("flame.yaml"),
+        r#"metadata:
+  name: demo
+spec:
+  shim: cri
+  image: example/runner:v1
+  description: profile description
+  labels: [profile]
+  installer: binary
+  command: profile-command
+  arguments: [profile-arg]
+  environments:
+    KEEP: from-profile
+    CHANGE: from-profile
+  working_directory: /profile
+  max_instances: 3
+  delay_release: 30
+  schema:
+    input: profile-input
+    output: profile-output
+  url: grpc://old-cache/old
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flmctl"))
+        .arg("--config")
+        .arg(config)
+        .arg("deploy")
+        .arg("--application")
+        .arg(&app_dir)
+        .arg("--dry-run")
+        .arg("-o")
+        .arg("json")
+        .arg("--command")
+        .arg("cli-command")
+        .arg("--argument")
+        .arg("cli-arg")
+        .arg("--env")
+        .arg("CHANGE=from-cli")
+        .arg("--schema-output")
+        .arg("cli-output")
+        .env_remove("FLAME_ENDPOINT")
+        .env_remove("FLAME_CACHE_ENDPOINT")
+        .env_remove("FLAME_CA_FILE")
+        .output()
+        .unwrap();
+    let json = assert_success(output);
+    assert_eq!(json_string(&json, "/name"), "demo");
+    assert_eq!(json_string(&json, "/installer"), "binary");
+    assert_eq!(json_string(&json, "/command"), "cli-command");
+    assert_eq!(json_string(&json, "/application/spec/shim"), "Cri");
+    assert_eq!(
+        json_string(&json, "/application/spec/image"),
+        "example/runner:v1"
+    );
+    assert_eq!(
+        json_string(&json, "/application/spec/description"),
+        "profile description"
+    );
+    assert_eq!(
+        json_string(&json, "/application/spec/environments/KEEP"),
+        "from-profile"
+    );
+    assert_eq!(
+        json_string(&json, "/application/spec/environments/CHANGE"),
+        "from-cli"
+    );
+    assert_eq!(
+        json_string(&json, "/application/spec/schema/input"),
+        "profile-input"
+    );
+    assert_eq!(
+        json_string(&json, "/application/spec/schema/output"),
+        "cli-output"
+    );
+    assert_eq!(
+        json_string(&json, "/application/spec/working_directory"),
+        "/profile"
+    );
+    assert_eq!(
+        json.pointer("/application/spec/max_instances")
+            .and_then(Value::as_u64),
+        Some(3)
+    );
+    assert_eq!(
+        json.pointer("/application/spec/delay_release")
+            .and_then(Value::as_i64),
+        Some(30)
+    );
+    assert_eq!(
+        json.pointer("/arguments/0").and_then(Value::as_str),
+        Some("cli-arg")
+    );
+    assert_eq!(
+        json_string(&json, "/application/spec/url"),
+        json_string(&json, "/url")
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flmctl"))
+        .arg("--config")
+        .arg(temp.path().join("flame.yaml"))
+        .arg("deploy")
+        .arg("--application")
+        .arg(&app_dir)
+        .arg("--name")
+        .arg("cli-name")
+        .arg("--installer")
+        .arg("python")
+        .arg("--shim")
+        .arg("host")
+        .arg("--dry-run")
+        .arg("-o")
+        .arg("json")
+        .env_remove("FLAME_ENDPOINT")
+        .env_remove("FLAME_CACHE_ENDPOINT")
+        .env_remove("FLAME_CA_FILE")
+        .output()
+        .unwrap();
+    let overridden = assert_success(output);
+    assert_eq!(json_string(&overridden, "/name"), "cli-name");
+    assert_eq!(json_string(&overridden, "/installer"), "python");
+    assert_eq!(json_string(&overridden, "/application/spec/shim"), "Host");
+}
+
+#[test]
+fn deploy_uses_flm_yaml_when_flame_yaml_absent() {
+    let temp = TempDir::new().unwrap();
+    let config = write_config(temp.path());
+    let app_dir = temp.path().join("app");
+    fs::create_dir(&app_dir).unwrap();
+    fs::write(app_dir.join("script.py"), "print('hello')\n").unwrap();
+    fs::write(
+        app_dir.join("flm.yaml"),
+        "metadata:\n  name: from-flm\nspec:\n  command: python3\n  arguments: [-m, script]\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_flmctl"))
+        .arg("--config")
+        .arg(config)
+        .arg("deploy")
+        .arg("--application")
+        .arg(app_dir)
+        .arg("--dry-run")
+        .arg("-o")
+        .arg("json")
+        .env_remove("FLAME_ENDPOINT")
+        .env_remove("FLAME_CACHE_ENDPOINT")
+        .env_remove("FLAME_CA_FILE")
+        .output()
+        .unwrap();
+    let json = assert_success(output);
+    assert_eq!(json_string(&json, "/name"), "from-flm");
+    assert_eq!(json_string(&json, "/command"), "python3");
+}
+
+#[test]
+fn deploy_rejects_missing_name_and_invalid_profile() {
+    let temp = TempDir::new().unwrap();
+    let config = write_config(temp.path());
+    let app_dir = temp.path().join("app");
+    fs::create_dir(&app_dir).unwrap();
+    fs::write(app_dir.join("script.py"), "print('hello')\n").unwrap();
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_flmctl"));
+        command
+            .arg("--config")
+            .arg(&config)
+            .arg("deploy")
+            .arg("--application")
+            .arg(&app_dir)
+            .arg("--dry-run")
+            .env_remove("FLAME_ENDPOINT")
+            .env_remove("FLAME_CACHE_ENDPOINT")
+            .env_remove("FLAME_CA_FILE");
+        command
+    };
+    let output = command().output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("application name required"));
+
+    fs::write(
+        app_dir.join("flame.yaml"),
+        "metadata:\n  name: demo\nspec:\n  commmand: typo\n",
+    )
+    .unwrap();
+    let output = command().output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("commmand"));
+}
+
+#[test]
 fn deploy_dry_run_summary_formats_delay_release() {
     let temp = TempDir::new().unwrap();
     let config = write_config(temp.path());

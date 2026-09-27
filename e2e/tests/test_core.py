@@ -24,7 +24,7 @@ from e2e.helpers import (
     serialize_common_data,
     serialize_request,
 )
-from tests.utils import random_string, wait_for_application_deleted
+from tests.utils import deploy_e2e_application, random_string, wait_for_application_deleted
 
 FLM_TEST_SVC_APP = "flme2e-core-svc"
 TASK_FAILED_EVENT_CODE = int(flamepy.TaskState.FAILED)
@@ -78,16 +78,7 @@ def _wait_for_session_event(session_id, event_code, timeout_seconds=60):
 @pytest.fixture(scope="module", autouse=True)
 def setup_test_env():
     """Setup test environment with BasicTestService."""
-    flamepy.register_application(
-        FLM_TEST_SVC_APP,
-        flamepy.ApplicationAttributes(
-            command="python3",
-            working_directory="/opt/e2e",
-            environments={"FLAME_LOG_LEVEL": "DEBUG", "PYTHONPATH": "/opt/e2e/src"},
-            arguments=["src/e2e/basic_svc.py", "src/e2e/api.py"],
-            installer="python",
-        ),
-    )
+    deploy_e2e_application(FLM_TEST_SVC_APP)
 
     yield
 
@@ -183,7 +174,7 @@ def test_application_context_info():
     assert response.application_context is not None
     assert response.application_context.name == FLM_TEST_SVC_APP
     assert response.application_context.command == "python3"
-    assert response.application_context.working_directory == "/opt/e2e"
+    assert response.application_context.working_directory is None
 
     session.close()
 
@@ -222,7 +213,7 @@ def test_all_context_info():
     # Check application context details
     assert response.application_context.name == FLM_TEST_SVC_APP
     assert response.application_context.command == "python3"
-    assert response.application_context.working_directory == "/opt/e2e"
+    assert response.application_context.working_directory is None
 
     session.close()
 
@@ -924,16 +915,7 @@ FLM_SHIM_TEST_APP = "flme2e-shim-test"
 @pytest.fixture(scope="class")
 def setup_shim_test_app():
     """Setup test application for shim selection tests."""
-    flamepy.register_application(
-        FLM_SHIM_TEST_APP,
-        flamepy.ApplicationAttributes(
-            command="python3",
-            working_directory="/opt/e2e",
-            environments={"FLAME_LOG_LEVEL": "DEBUG", "PYTHONPATH": "/opt/e2e/src"},
-            arguments=["src/e2e/basic_svc.py", "src/e2e/api.py"],
-            installer="python",
-        ),
-    )
+    deploy_e2e_application(FLM_SHIM_TEST_APP)
 
     yield
 

@@ -5,11 +5,11 @@ from urllib.parse import urljoin, urlparse
 import markitdown
 import requests
 from bs4 import BeautifulSoup
-from flamepy import service
+from flamepy import serving
 
 from apis import Summary, WebPage
 
-ins = service.FlameInstance()
+ins = serving.Instance()
 
 headers = {"User-Agent": "Xflops Crawler 1.0", "From": "support@xflops.io"}
 

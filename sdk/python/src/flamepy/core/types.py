@@ -306,20 +306,9 @@ class FlamePackage:
 
     Attributes:
         storage: The URL specifying where the application package should be persisted.
-                 Currently, only the file:// schema is supported.
-        excludes: A list of custom patterns to exclude from the package.
-                  By default, includes .venv, __pycache__, .gitignore, and *.pyc.
     """
 
     storage: str
-    excludes: List[str] = field(
-        default_factory=lambda: [
-            ".venv",
-            "__pycache__",
-            ".gitignore",
-            "*.pyc",
-        ]
-    )
 
 
 @dataclass
@@ -445,11 +434,7 @@ class FlameContext:
                         if package_config is not None:
                             storage = package_config.get("storage")
                             if storage is not None:
-                                excludes = package_config.get("excludes", [])
-                                # Merge with default excludes
-                                default_excludes = [".venv", "__pycache__", ".gitignore", "*.pyc"]
-                                all_excludes = list(set(default_excludes + excludes))
-                                self._package = FlamePackage(storage=storage, excludes=all_excludes)
+                                self._package = FlamePackage(storage=storage)
 
                         # Parse the application template if present.
                         self._app = ctx.get("app", DEFAULT_FLAME_APP_TEMPLATE)

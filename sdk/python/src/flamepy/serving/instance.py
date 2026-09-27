@@ -36,7 +36,7 @@ from flamepy.core.types import TaskOutput
 debug_service = None
 
 
-class FlameInstance(FlameService):
+class Instance(FlameService):
     def __init__(self):
         self._entrypoint = None
         self._parameter = None
@@ -155,7 +155,7 @@ class FlameInstance(FlameService):
             logger.error(f"\n❌ Error: {e}")
 
 
-def run_debug_service(instance: FlameInstance):
+def run_debug_service(instance: Instance):
     global debug_service
     debug_service = FastAPI()
     debug_service.state.instance = instance

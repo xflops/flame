@@ -68,9 +68,4 @@ data:
           tls:
             ca_file: {{ printf "%s/%s" (include "flame.tlsCachePath" .) .Values.tls.cache.caKey | quote }}
           {{- end }}
-        package:
-          excludes:
-            {{- range .Values.clientConfig.package.excludes }}
-            - {{ . | quote }}
-            {{- end }}
   {{- end }}

@@ -61,6 +61,29 @@ pub fn detect_application(
                 })?;
             Ok(DetectedApplication::executable(command))
         }
+        ApplicationInputKind::File => {
+            let file = fs::read_dir(root)
+                .map_err(|e| {
+                    FlameError::Internal(format!("failed to read file package dir: {}", e))
+                })?
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .find(|path| path.is_file())
+                .ok_or_else(|| FlameError::InvalidConfig("file package is empty".to_string()))?;
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            if file.extension().is_some_and(|ext| ext == "py") {
+                Ok(DetectedApplication {
+                    installer: Some("binary".to_string()),
+                    command: Some("python3".to_string()),
+                    arguments: vec![name],
+                })
+            } else {
+                Ok(DetectedApplication {
+                    installer: Some("binary".to_string()),
+                    command: None,
+                    arguments: Vec::new(),
+                })
+            }
+        }
         ApplicationInputKind::Directory | ApplicationInputKind::TarGz => {
             detect_from_directory(app_name, root)
         }

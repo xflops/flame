@@ -15,10 +15,12 @@ mod artifact;
 mod detect;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use chrono::Duration;
 use clap::Args;
+use common::application::{parse_application_manifests, ApplicationManifest};
 use common::net::host_for_uri;
 use flame_rs as flame;
 use flame_rs::apis::{FlameContext, FlameError, Shim};
@@ -33,11 +35,11 @@ use crate::utils::format_duration;
 
 #[derive(Debug, Clone, Args)]
 pub struct Options {
-    /// Application name.
+    /// Application name. Defaults to metadata.name in the directory profile.
     #[arg(long)]
-    pub name: String,
+    pub name: Option<String>,
 
-    /// Application path. Can be an executable file, .tar.gz/.tgz, or directory.
+    /// Application path. Directories may contain flame.yaml or flm.yaml.
     #[arg(long)]
     pub application: PathBuf,
 
@@ -181,19 +183,22 @@ struct RenderedSchema {
 pub async fn run(ctx: &FlameContext, options: &Options) -> Result<(), FlameError> {
     let plan = build_plan(ctx, options)?;
     let object_key = plan.prepared.object_key(&plan.app_name);
-    let mut uploaded_key = object_key.clone();
-
-    if !plan.dry_run {
+    let (uploaded_key, package_endpoint) = if plan.dry_run {
+        (object_key, plan.cache_endpoint.clone())
+    } else {
         let object_ref = flame::object::upload_object_with_context(
             ctx,
             &object_key,
             &plan.prepared.package_path,
         )
         .await?;
-        uploaded_key = object_ref.key;
-    }
+        (
+            object_ref.key,
+            normalize_cache_endpoint(&object_ref.endpoint)?,
+        )
+    };
 
-    let url = object_url(&plan.cache_endpoint, &uploaded_key);
+    let url = object_url(&package_endpoint, &uploaded_key);
 
     let mut attributes = plan.attributes.clone();
     attributes.url = Some(url.clone());
@@ -227,7 +232,13 @@ pub async fn run(ctx: &FlameContext, options: &Options) -> Result<(), FlameError
 }
 
 fn build_plan(ctx: &FlameContext, options: &Options) -> Result<DeployPlan, FlameError> {
-    validate_name(&options.name)?;
+    let profile = load_profile(&options.application)?;
+    let app_name = options
+        .name
+        .clone()
+        .or_else(|| profile.as_ref().map(|profile| profile.metadata.name.clone()))
+        .ok_or_else(|| FlameError::InvalidConfig("application name required; pass --name or add metadata.name to flame.yaml or flm.yaml".to_string()))?;
+    validate_name(&app_name)?;
     let current_ctx = ctx.get_current_context()?;
     let cache_config = current_ctx
         .cache
@@ -240,11 +251,11 @@ fn build_plan(ctx: &FlameContext, options: &Options) -> Result<DeployPlan, Flame
         .and_then(normalize_cache_endpoint)?;
 
     let prepared = prepare_application(&options.application)?;
-    let detected = detect_application(&options.name, prepared.kind, &prepared.detection_root)?;
-    let attributes = build_attributes(options, &detected)?;
+    let detected = detect_application(&app_name, prepared.kind, &prepared.detection_root)?;
+    let attributes = build_attributes(options, profile.as_ref(), &detected)?;
 
     Ok(DeployPlan {
-        app_name: options.name.clone(),
+        app_name,
         cache_endpoint,
         prepared,
         attributes,
@@ -253,14 +264,46 @@ fn build_plan(ctx: &FlameContext, options: &Options) -> Result<DeployPlan, Flame
     })
 }
 
+fn load_profile(application: &Path) -> Result<Option<ApplicationManifest>, FlameError> {
+    if !application.is_dir() {
+        return Ok(None);
+    }
+    let path = ["flame.yaml", "flm.yaml"]
+        .iter()
+        .map(|name| application.join(name))
+        .find(|path| path.exists());
+    let Some(path) = path else { return Ok(None) };
+    let contents = fs::read_to_string(&path).map_err(|error| {
+        FlameError::InvalidConfig(format!("failed to read {}: {}", path.display(), error))
+    })?;
+    let mut manifests = parse_application_manifests(&contents).map_err(|error| {
+        FlameError::InvalidConfig(format!("invalid {}: {}", path.display(), error))
+    })?;
+    if manifests.len() != 1 {
+        return Err(FlameError::InvalidConfig(format!(
+            "{} must contain exactly one application manifest",
+            path.display()
+        )));
+    }
+    Ok(manifests.pop())
+}
+
 fn build_attributes(
     options: &Options,
+    profile: Option<&ApplicationManifest>,
     detected: &DetectedApplication,
 ) -> Result<ApplicationAttributes, FlameError> {
-    let shim = parse_shim(options.shim.as_deref())?;
+    let spec = profile.map(|profile| &profile.spec);
+    let shim = parse_shim(
+        options
+            .shim
+            .as_deref()
+            .or_else(|| spec.and_then(|spec| spec.shim.as_deref())),
+    )?;
     let installer = options
         .installer
         .clone()
+        .or_else(|| spec.and_then(|spec| spec.installer.clone()))
         .or_else(|| detected.installer.clone())
         .ok_or_else(|| {
             FlameError::InvalidConfig(
@@ -270,7 +313,11 @@ fn build_attributes(
         })?;
     validate_installer(&installer)?;
 
-    let command = options.command.clone().or_else(|| detected.command.clone());
+    let command = options
+        .command
+        .clone()
+        .or_else(|| spec.and_then(|spec| spec.command.clone()))
+        .or_else(|| detected.command.clone());
     if command.is_none() {
         return Err(FlameError::InvalidConfig(
             "unable to detect command; pass --command".to_string(),
@@ -280,35 +327,71 @@ fn build_attributes(
     let arguments = if !options.argument.is_empty() {
         options.argument.clone()
     } else {
-        detected.arguments.clone()
+        spec.and_then(|spec| spec.arguments.clone())
+            .unwrap_or_else(|| detected.arguments.clone())
     };
 
-    let schema = if options.schema_input.is_some()
+    let profile_schema = spec.and_then(|spec| spec.schema.as_ref());
+    let schema = if profile_schema.is_some()
+        || options.schema_input.is_some()
         || options.schema_output.is_some()
         || options.schema_common_data.is_some()
     {
         Some(ApplicationSchema {
-            input: options.schema_input.clone(),
-            output: options.schema_output.clone(),
-            common_data: options.schema_common_data.clone(),
+            input: options
+                .schema_input
+                .clone()
+                .or_else(|| profile_schema.and_then(|schema| schema.input.clone())),
+            output: options
+                .schema_output
+                .clone()
+                .or_else(|| profile_schema.and_then(|schema| schema.output.clone())),
+            common_data: options
+                .schema_common_data
+                .clone()
+                .or_else(|| profile_schema.and_then(|schema| schema.common_data.clone())),
         })
     } else {
         None
     };
 
+    let mut environments = spec
+        .and_then(|spec| spec.environments.clone())
+        .unwrap_or_default();
+    environments.extend(parse_envs(&options.env)?);
+
     Ok(ApplicationAttributes {
         shim,
-        image: options.image.clone(),
-        description: options.description.clone(),
-        labels: options.label.clone(),
+        image: options
+            .image
+            .clone()
+            .or_else(|| spec.and_then(|spec| spec.image.clone())),
+        description: options
+            .description
+            .clone()
+            .or_else(|| spec.and_then(|spec| spec.description.clone())),
+        labels: if options.label.is_empty() {
+            spec.and_then(|spec| spec.labels.clone())
+                .unwrap_or_default()
+        } else {
+            options.label.clone()
+        },
         command,
         arguments,
-        environments: parse_envs(&options.env)?,
-        working_directory: options.working_directory.clone(),
-        max_instances: options.max_instances,
-        delay_release: options.delay_release.map(Duration::seconds),
+        environments,
+        working_directory: options
+            .working_directory
+            .clone()
+            .or_else(|| spec.and_then(|spec| spec.working_directory.clone())),
+        max_instances: options
+            .max_instances
+            .or_else(|| spec.and_then(|spec| spec.max_instances)),
+        delay_release: options
+            .delay_release
+            .or_else(|| spec.and_then(|spec| spec.delay_release))
+            .map(Duration::seconds),
         schema,
-        url: None,
+        url: spec.and_then(|spec| spec.url.clone()),
         installer: Some(installer),
     })
 }
@@ -363,12 +446,31 @@ fn validate_name(name: &str) -> Result<(), FlameError> {
 fn normalize_cache_endpoint(raw: &str) -> Result<String, FlameError> {
     let parsed = Url::parse(raw)
         .map_err(|e| FlameError::InvalidConfig(format!("invalid cache endpoint: {}", e)))?;
-    let scheme = parsed.scheme();
-    if scheme != "grpc" && scheme != "grpcs" {
-        return Err(FlameError::InvalidConfig(format!(
-            "unsupported cache endpoint scheme <{}>; expected grpc or grpcs",
-            scheme
-        )));
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(FlameError::InvalidConfig(
+            "cache endpoint must not contain credentials, a path, query, or fragment".to_string(),
+        ));
+    }
+    let scheme = match parsed.scheme() {
+        "grpc" => "grpc",
+        "grpcs" | "grpc+tls" => "grpcs",
+        "grpcs-proxy" => "grpcs-proxy",
+        scheme => {
+            return Err(FlameError::InvalidConfig(format!(
+                "unsupported cache endpoint scheme <{}>; expected grpc, grpcs, grpc+tls, or grpcs-proxy",
+                scheme
+            )));
+        }
+    };
+    if scheme == "grpcs-proxy" && parsed.port().is_none() {
+        return Err(FlameError::InvalidConfig(
+            "grpcs-proxy endpoint requires an explicit port".to_string(),
+        ));
     }
     let host = parsed
         .host_str()
@@ -482,8 +584,24 @@ mod tests {
     }
 
     #[test]
+    fn accepts_proxy_endpoint_for_dry_run_url() {
+        let endpoint = normalize_cache_endpoint("grpcs-proxy://gateway.example.com:9443").unwrap();
+        assert_eq!(endpoint, "grpcs-proxy://gateway.example.com:9443");
+        assert_eq!(
+            object_url(&endpoint, "app/pkg/app.tar.gz"),
+            "grpcs-proxy://gateway.example.com:9443/app/pkg/app.tar.gz"
+        );
+        assert_eq!(
+            normalize_cache_endpoint("grpc+tls://cache.example.com").unwrap(),
+            "grpcs://cache.example.com:9090"
+        );
+    }
+
+    #[test]
     fn rejects_non_cache_endpoint_scheme() {
         assert!(normalize_cache_endpoint("http://cache:9090").is_err());
+        assert!(normalize_cache_endpoint("grpcs-proxy://gateway.example.com").is_err());
+        assert!(normalize_cache_endpoint("grpcs-proxy://gateway.example.com:9443/path").is_err());
     }
 
     #[test]
@@ -496,7 +614,7 @@ mod tests {
     #[test]
     fn explicit_options_override_detection() {
         let options = Options {
-            name: "demo".to_string(),
+            name: Some("demo".to_string()),
             application: PathBuf::from("."),
             dry_run: true,
             output: "summary".to_string(),
@@ -516,7 +634,7 @@ mod tests {
             schema_common_data: None,
         };
         let detected = DetectedApplication::executable("service".to_string());
-        let attributes = build_attributes(&options, &detected).unwrap();
+        let attributes = build_attributes(&options, None, &detected).unwrap();
         assert_eq!(attributes.command.as_deref(), Some("python"));
         assert_eq!(attributes.arguments, vec!["-m", "demo"]);
         assert_eq!(attributes.installer.as_deref(), Some("python"));

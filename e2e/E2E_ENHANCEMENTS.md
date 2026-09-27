@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the enhancements made to the e2e test suite to support both `FlameInstance` and `FlameService` implementations with comprehensive context information testing.
+This document describes the enhancements made to the e2e test suite to support both `serving.Instance` and `FlameService` implementations with comprehensive context information testing.
 
 ## Changes Summary
 
@@ -21,13 +21,13 @@ e2e/tests/
 **After:**
 ```
 e2e/src/e2e/
-  - instance_svc.py    (FlameInstance-based, renamed from service.py)
+  - instance_svc.py    (serving.Instance-based, renamed from service.py)
   - basic_svc.py       (NEW: FlameService-based)
   - api.py             (ENHANCED with context info classes)
 e2e/tests/
-  - test_ins_session.py (tests for instance_svc.py)
-  - test_svc_session.py (NEW: tests for basic_svc.py)
-  - test_application.py
+  - test_service.py     (tests for instance_svc.py)
+  - test_core.py        (tests for basic_svc.py)
+  - test_app.py
 ```
 
 ### 2. Enhanced API (api.py)
@@ -95,15 +95,15 @@ class TestResponse:
 
 ### 3. Services
 
-#### instance_svc.py (FlameInstance-based)
+#### instance_svc.py (serving.Instance-based)
 - Renamed from `service.py`
-- Uses `FlameInstance` with `@instance.entrypoint` decorator
+- Uses `serving.Instance` with `@instance.entrypoint` decorator
 - Simple implementation for basic request/response testing
 - Focuses on common data management
 - **No context introspection capabilities**
 
 ```python
-instance = flamepy.FlameInstance()
+instance = flamepy.serving.Instance()
 
 @instance.entrypoint
 def e2e_service_entrypoint(req: TestRequest) -> TestResponse:
@@ -142,7 +142,7 @@ class BasicTestService(flamepy.FlameService):
 
 ### 4. Test Coverage
 
-#### test_ins_session.py (Instance Tests)
+#### test_service.py (Instance Tests)
 Tests for `instance_svc.py` focusing on:
 - Session creation and closure
 - Task invocation
@@ -150,7 +150,7 @@ Tests for `instance_svc.py` focusing on:
 - Multiple concurrent tasks
 - Futures-based task execution
 
-#### test_svc_session.py (Service Tests)
+#### test_core.py (Service Tests)
 NEW comprehensive tests for `basic_svc.py`:
 
 1. **Basic Functionality**
@@ -172,9 +172,9 @@ NEW comprehensive tests for `basic_svc.py`:
    - `test_common_data_with_session_context()`: Common data in session context
    - `test_update_common_data()`: Updating common data
 
-## Key Differences: FlameInstance vs FlameService
+## Key Differences: serving.Instance vs FlameService
 
-| Feature | FlameInstance | FlameService |
+| Feature | serving.Instance | FlameService |
 |---------|--------------|--------------|
 | **Usage** | Simple decorator-based | Full lifecycle control |
 | **Implementation** | `@instance.entrypoint` | Implement 3 methods |
@@ -188,14 +188,13 @@ NEW comprehensive tests for `basic_svc.py`:
 
 ## Usage Examples
 
-### Using instance_svc.py (FlameInstance)
+### Using instance_svc.py (serving.Instance)
 ```python
-session = flamepy.create_session(
-    application="flme2e", 
-    common_data=TestContext(common_data="initial")
-)
+from flamepy.serving import open_session
 
-response = session.invoke(TestRequest(input="hello"))
+session = open_session(name="flme2e", ctx=TestContext(common_data="initial"))
+
+response = session.run(TestRequest(input="hello"))
 print(response.output)  # "hello"
 print(response.common_data)  # "initial"
 
@@ -204,12 +203,14 @@ session.close()
 
 ### Using basic_svc.py (FlameService with Context Info)
 ```python
+from e2e.helpers import invoke_task, serialize_common_data
+
 session = flamepy.create_session(
-    application="flme2esvc",
-    common_data=TestContext(common_data="data")
+    application="flme2e-core-svc",
+    common_data=serialize_common_data(TestContext(common_data="data"), "flme2e-core-svc")
 )
 
-response = session.invoke(TestRequest(
+response = invoke_task(session, TestRequest(
     input="hello",
     request_task_context=True,
     request_session_context=True,
@@ -233,18 +234,18 @@ session.close()
 pytest e2e/tests/ -v
 
 # Run instance-based tests only
-pytest e2e/tests/test_ins_session.py -v
+pytest e2e/tests/test_service.py -v
 
 # Run service-based tests only
-pytest e2e/tests/test_svc_session.py -v
+pytest e2e/tests/test_core.py -v
 
 # Run specific test
-pytest e2e/tests/test_svc_session.py::test_all_context_info -v
+pytest e2e/tests/test_core.py::test_all_context_info -v
 ```
 
 ## Benefits
 
-1. **Comprehensive Testing**: Both FlameInstance and FlameService implementations are tested
+1. **Comprehensive Testing**: Both serving.Instance and FlameService implementations are tested
 2. **Context Introspection**: Full visibility into Flame's context system
 3. **Debugging Aid**: Detailed context information helps debug issues
 4. **Documentation**: Demonstrates both service implementation patterns

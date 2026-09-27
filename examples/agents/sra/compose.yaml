@@ -35,7 +35,6 @@ services:
     volumes:
       - ./ci/docker/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
       - ./examples:/opt/examples
-      - ./e2e:/opt/e2e
       - flame-work:/usr/local/flame/work
 
   flame-console:
@@ -51,7 +50,6 @@ services:
     volumes:
       - ./ci/docker/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
       - ./examples:/opt/examples
-      - ./e2e:/opt/e2e
 
   qdrant:
     image: qdrant/qdrant:v1.16.1

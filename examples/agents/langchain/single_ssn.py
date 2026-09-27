@@ -1,4 +1,4 @@
-from flamepy.service import Session
+from flamepy.serving import open_session
 from apis import SysPrompt, Question
 
 LANGCHAIN_AGENT_NAME = "langchain-agent"
@@ -8,8 +8,8 @@ def ask_agent():
     sys_prompt = SysPrompt(prompt="You are a weather forecaster.")
     question = Question(question="Who are you?")
 
-    session = Session(LANGCHAIN_AGENT_NAME, ctx=sys_prompt)
-    output = session.invoke(question)
+    session = open_session(LANGCHAIN_AGENT_NAME, ctx=sys_prompt)
+    output = session.run(question)
 
     print(output.answer)
     session.close()

@@ -13,30 +13,23 @@ limitations under the License.
 
 # ruff: noqa: I001
 
+from concurrent.futures import Future
 from typing import Any, Dict, Optional, Union
 
 import cloudpickle
 
 from flamepy.core import ObjectRef, get_object, put_object
-from flamepy.core.client import Session as CoreSession, create_session, open_session
+from flamepy.core.client import Session as CoreSession, create_session, open_session as open_core_session
 from flamepy.core.types import ResourceRequirement, short_name
 
 
 class Session:
-    """A streamlined interface for building and interacting with service sessions.
+    """A streamlined interface for interacting with serving sessions.
 
     The Session class is a thin wrapper around core.Session, where the service name
     corresponds to the application's name.
 
-    Example:
-        Direct instantiation:
-            >>> session = Session("test", ctx)
-            >>> resp = session.invoke(req)
-            >>> session.close()
-
-        Context manager:
-            >>> with Session("test", ctx) as session:
-            ...     resp = session.invoke(req)
+    Use :func:`open_session` to create or reopen a session.
     """
 
     def __init__(
@@ -80,13 +73,13 @@ class Session:
 
         if session_id is not None:
             # Open an existing session
-            self._session = open_session(session_id)
+            self._session = open_core_session(session_id)
             # Update name from the opened session if not provided
             if self._name is None:
                 self._name = self._session.application
         else:
-            # Create a new session using flamepy.create_session
-            # For service module: serialize ctx with cloudpickle, put in cache to get ObjectRef,
+            # Create a new session using the core API
+            # For serving module: serialize ctx with cloudpickle, put in cache to get ObjectRef,
             # then encode ObjectRef to bytes for core API
             common_data_bytes = None
             temp_session_id = None
@@ -108,8 +101,8 @@ class Session:
                 resreq=resreq,
             )
 
-    def invoke(self, req: Any) -> Any:
-        """Invoke the service session with a request.
+    def run(self, req: Any) -> Any:
+        """Run a request and return its result when the task completes.
 
         The request and response objects should exactly match the service entrypoint
         signature defined on the service side.
@@ -121,20 +114,34 @@ class Session:
             The response object matching the service entrypoint signature
 
         Example:
-            >>> resp = session.invoke(req)
+            >>> resp = session.run(req)
         """
+        return self.submit(req).result()
+
+    def submit(self, req: Any) -> Future:
+        """Submit a request and return a future for its deserialized result."""
         if self._session is None:
             raise RuntimeError("Service session is not initialized")
 
-        # For service module: serialize input with cloudpickle, call core API, then deserialize output
         input_bytes = cloudpickle.dumps(req, protocol=cloudpickle.DEFAULT_PROTOCOL)
-        output_bytes = self._session.run(input_bytes)
+        raw_future = self._session.submit(input_bytes)
+        result: Future = Future()
 
-        if output_bytes is None:
-            return None
+        def complete(done: Future) -> None:
+            if result.done():
+                return
+            try:
+                output_bytes = done.result()
+                output = None if output_bytes is None else cloudpickle.loads(output_bytes)
+                result.set_result(output)
+            except Exception as exc:
+                if not result.done():
+                    result.set_exception(exc)
 
-        # Deserialize output using cloudpickle
-        return cloudpickle.loads(output_bytes)
+        register = getattr(raw_future, "_add_internal_callback", raw_future.add_done_callback)
+        register(complete)
+        result.add_done_callback(lambda done: raw_future.cancel() if done.cancelled() else None)
+        return result
 
     def context(self) -> Any:
         """Get the current service session context.
@@ -151,7 +158,7 @@ class Session:
         if self._session is None:
             return None
 
-        # For service module: get bytes from core API, decode to ObjectRef, get from cache, then deserialize
+        # For serving module: get bytes from core API, decode to ObjectRef, get from cache, then deserialize
         common_data_bytes = self._session.common_data()
         if common_data_bytes is None:
             return None
@@ -194,3 +201,13 @@ class Session:
         """Exit the context manager and close the session."""
         self.close()
         return False
+
+
+def open_session(
+    name: Optional[str] = None,
+    ctx: Optional[Any] = None,
+    session_id: Optional[str] = None,
+    resreq: Optional[Union[ResourceRequirement, Dict[str, Any]]] = None,
+) -> Session:
+    """Create a serving session by application name, or reopen one by session ID."""
+    return Session(name=name, ctx=ctx, session_id=session_id, resreq=resreq)

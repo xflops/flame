@@ -1,18 +1,18 @@
-import flamepy
+from flamepy.serving import open_session
 from datetime import datetime
 
-from apis import Question, Answer
+from apis import Question
 
 
 def build_research_report():
-    sra = flamepy.create_session("sra")
+    sra = open_session("sra")
 
     topic = "Write a report about 2025 Nvidia stock performance and predict the stock price in 2026"
 
     print(f"Building research report for topic: {topic}")
 
-    output = sra.invoke(Question(topic=topic))
-    answer = Answer.from_json(output)
+    output = sra.run(Question(topic=topic))
+    answer = output
 
     report_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_name = f"sra_report_{report_timestamp}.md"

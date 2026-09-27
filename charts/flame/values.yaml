@@ -120,11 +120,6 @@ securityContext: {}
 
 clientConfig:
   enabled: true
-  package:
-    excludes:
-      - "*.log"
-      - "*.pkl"
-      - "*.tmp"
 
 tests:
   enabled: true

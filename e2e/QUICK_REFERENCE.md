@@ -6,21 +6,21 @@
 e2e/
 ├── src/e2e/
 │   ├── api.py              # Shared API definitions with context info classes
-│   ├── instance_svc.py     # FlameInstance-based service (simple)
+│   ├── instance_svc.py     # serving.Instance-based service (simple)
 │   └── basic_svc.py        # FlameService-based service (with context info)
 │
 └── tests/
-    ├── test_application.py  # Application management tests
-    ├── test_ins_session.py  # Tests for instance_svc.py
-    └── test_svc_session.py  # Tests for basic_svc.py (with context info)
+    ├── test_app.py          # Application management tests
+    ├── test_service.py      # Tests for instance_svc.py
+    └── test_core.py         # Tests for basic_svc.py (with context info)
 ```
 
 ## Service Comparison
 
-### instance_svc.py (FlameInstance)
+### instance_svc.py (serving.Instance)
 ```python
 # Simple decorator-based approach
-instance = flamepy.FlameInstance()
+instance = flamepy.serving.Instance()
 
 @instance.entrypoint
 def e2e_service_entrypoint(req: TestRequest) -> TestResponse:
@@ -31,7 +31,7 @@ if __name__ == "__main__":
 ```
 
 **Application Name:** `flme2e`
-**Test File:** `test_ins_session.py`
+**Test File:** `test_service.py`
 **Features:**
 - ✅ Simple request/response
 - ✅ Common data management
@@ -55,8 +55,8 @@ if __name__ == "__main__":
     flamepy.run(BasicTestService())
 ```
 
-**Application Name:** `flme2esvc`
-**Test File:** `test_svc_session.py`
+**Application Name:** `flme2e-core-svc`
+**Test File:** `test_core.py`
 **Features:**
 - ✅ Full context access (Task, Session, Application)
 - ✅ Service state tracking
@@ -93,8 +93,8 @@ app_context = ApplicationContextInfo(
     shim="Shim.Host",              # Shim type
     image=None,                    # Container image
     command="uv",                  # Command
-    working_directory="/opt/e2e",  # Working directory
-    url=None                       # Application URL
+    working_directory=None,       # Executor chooses a work directory
+    url="grpcs://cache/...",      # Deployed package URL
 )
 ```
 
@@ -134,17 +134,17 @@ response = TestResponse(
 # All e2e tests
 pytest e2e/tests/ -v
 
-# Instance tests only (FlameInstance-based)
-pytest e2e/tests/test_ins_session.py -v
+# Instance tests only (serving.Instance-based)
+pytest e2e/tests/test_service.py -v
 
 # Service tests only (FlameService-based with context)
-pytest e2e/tests/test_svc_session.py -v
+pytest e2e/tests/test_core.py -v
 
 # Specific test
-pytest e2e/tests/test_svc_session.py::test_all_context_info -v
+pytest e2e/tests/test_core.py::test_all_context_info -v
 ```
 
-## Test Categories in test_svc_session.py
+## Test Categories in test_core.py
 
 | Category | Tests |
 |----------|-------|
@@ -159,7 +159,7 @@ pytest e2e/tests/test_svc_session.py::test_all_context_info -v
 
 ## When to Use Which?
 
-### Use instance_svc.py (FlameInstance) when:
+### Use instance_svc.py (serving.Instance) when:
 - Building simple request/response services
 - Prototyping quickly
 - Don't need context introspection
@@ -176,12 +176,11 @@ pytest e2e/tests/test_svc_session.py::test_all_context_info -v
 
 ### Example 1: Simple Instance-based Service
 ```python
-session = flamepy.create_session(
-    application="flme2e",
-    common_data=TestContext(common_data="data")
-)
+from flamepy.serving import open_session
 
-response = session.invoke(TestRequest(input="hello"))
+session = open_session(name="flme2e", ctx=TestContext(common_data="data"))
+
+response = session.run(TestRequest(input="hello"))
 print(response.output)       # "hello"
 print(response.common_data)  # "data"
 
@@ -190,12 +189,14 @@ session.close()
 
 ### Example 2: Service-based with Full Context
 ```python
+from e2e.helpers import invoke_task, serialize_common_data
+
 session = flamepy.create_session(
-    application="flme2esvc",
-    common_data=TestContext(common_data="data")
+    application="flme2e-core-svc",
+    common_data=serialize_common_data(TestContext(common_data="data"), "flme2e-core-svc")
 )
 
-response = session.invoke(TestRequest(
+response = invoke_task(session, TestRequest(
     input="hello",
     request_task_context=True,
     request_session_context=True,
@@ -215,7 +216,7 @@ session.close()
 ### Example 3: Selective Context Request
 ```python
 # Only request what you need to reduce overhead
-response = session.invoke(TestRequest(
+response = invoke_task(session, TestRequest(
     input="data",
     request_application_context=True,  # Only app context
 ))

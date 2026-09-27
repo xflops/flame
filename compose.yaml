@@ -60,7 +60,6 @@ services:
       - ./ci/docker/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
       - ./ci/docker/certs:/etc/flame/certs:ro
       - ./examples:/opt/examples
-      - ./e2e:/opt/e2e
       - type: volume
         source: flame-work
         target: /usr/local/flame/work

@@ -1,4 +1,4 @@
-from flamepy.service import Session
+import flamepy
 from openai import OpenAI
 import os
 
@@ -43,7 +43,7 @@ def send_messages(messages):
 
 
 def main():
-    session = Session("flmexec")
+    session = flamepy.create_session("flmexec")
 
     # 1. Ask DeepSeek to generate a script
     messages = [
@@ -66,7 +66,7 @@ def main():
 
     # 3. Call the tool to run the script and get the result for DeepSeek to see
     input = tool.function.arguments.encode("utf-8")
-    result = session.invoke(input)
+    result = session.run(input)
 
     # 4. Ask DeepSeek to summarize the result
     messages.append(

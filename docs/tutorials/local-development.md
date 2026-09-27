@@ -88,11 +88,6 @@ contexts:
       endpoint: "http://127.0.0.1:8080"
     cache:
       endpoint: "grpc://127.0.0.1:9090"
-    package:
-      excludes:
-        - "*.log"
-        - "*.pkl"
-        - "*.tmp"
 ```
 
 `package.storage` is optional. When it is absent, App packages are uploaded to the object cache through `cache.endpoint`.

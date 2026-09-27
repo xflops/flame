@@ -6,8 +6,3 @@ contexts:
       endpoint: "http://10.250.0.1:8080"
     cache:
       endpoint: "grpc://10.250.0.1:9090"
-    package:
-      excludes:
-        - "*.log"
-        - "*.pkl"
-        - "*.tmp"

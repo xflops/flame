@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from .client import Session
-from .instance import FlameInstance
+from .client import Session, open_session
+from .instance import Instance
 
-__all__ = ["FlameInstance", "Session"]
+__all__ = ["Instance", "Session", "open_session"]
