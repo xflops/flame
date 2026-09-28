@@ -591,7 +591,7 @@ struct CacheEndpoint {
     scheme: String,
     host: String,
     port: u16,
-    target_cache: Option<String>,
+    target: Option<String>,
 }
 
 impl CacheEndpoint {
@@ -637,7 +637,7 @@ impl CacheEndpoint {
             scheme,
             host,
             port,
-            target_cache: None,
+            target: None,
         })
     }
 
@@ -646,14 +646,14 @@ impl CacheEndpoint {
     }
 
     fn proxy_for(mut self, origin: &Self) -> Self {
-        self.target_cache = Some(format!("{}:{}", origin.uri_host(), origin.port));
+        self.target = Some(format!("{}:{}", origin.uri_host(), origin.port));
         self
     }
 }
 
 fn cache_request<T>(endpoint: &CacheEndpoint, message: T) -> Result<Request<T>, FlameError> {
     let mut request = Request::new(message);
-    if let Some(target) = endpoint.target_cache.as_deref() {
+    if let Some(target) = endpoint.target.as_deref() {
         let value = target.parse().map_err(|e| {
             FlameError::InvalidConfig(format!("invalid cache proxy target <{}>: {}", target, e))
         })?;
@@ -1146,7 +1146,7 @@ mod tests {
         assert_eq!(endpoint.scheme, "grpcs");
         assert_eq!(endpoint.host, "cache.example.com");
         assert_eq!(endpoint.port, 9443);
-        assert!(endpoint.target_cache.is_none());
+        assert!(endpoint.target.is_none());
     }
 
     #[test]
@@ -1157,7 +1157,7 @@ mod tests {
         assert_eq!(routed.scheme, "grpcs-proxy");
         assert_eq!(routed.host, "gateway.example.com");
         assert_eq!(routed.port, 9090);
-        assert_eq!(routed.target_cache.as_deref(), Some("cache-0.cache:9090"));
+        assert_eq!(routed.target.as_deref(), Some("cache-0.cache:9090"));
         let request = cache_request(&routed, CacheGetRequest::default()).unwrap();
         assert_eq!(
             request.metadata().get(CACHE_TARGET_HEADER).unwrap(),
@@ -1215,7 +1215,7 @@ mod tests {
         }
         let endpoint = endpoint_for_reference("grpc://cache-0.cache:9090").unwrap();
         assert_eq!(endpoint.host, "gateway.example.com");
-        assert_eq!(endpoint.target_cache.as_deref(), Some("cache-0.cache:9090"));
+        assert_eq!(endpoint.target.as_deref(), Some("cache-0.cache:9090"));
         let tls = current_cache_tls().unwrap().unwrap();
         assert_eq!(tls.cert_file.as_deref(), Some("client.crt"));
         assert_eq!(tls.key_file.as_deref(), Some("client.key"));
