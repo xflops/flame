@@ -8,3 +8,5 @@ contexts:
       endpoint: grpcs-proxy://${CACHE_GATEWAY_HOST}:${CACHE_GATEWAY_NODE_PORT}
       tls:
         ca_file: ${CACHE_CA_FILE}
+        cert_file: ${CACHE_CERT_FILE}
+        key_file: ${CACHE_KEY_FILE}

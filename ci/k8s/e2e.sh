@@ -384,8 +384,10 @@ configure_host_client() {
 
     mkdir -p "$config_dir"
     export CACHE_CA_FILE="$ca_file"
+    export CACHE_CERT_FILE="$cert_file"
+    export CACHE_KEY_FILE="$key_file"
     export RELEASE SESSION_NODE_PORT CACHE_GATEWAY_HOST CACHE_GATEWAY_NODE_PORT
-    envsubst '${RELEASE} ${SESSION_NODE_PORT} ${CACHE_GATEWAY_HOST} ${CACHE_GATEWAY_NODE_PORT} ${CACHE_CA_FILE}' \
+    envsubst '${RELEASE} ${SESSION_NODE_PORT} ${CACHE_GATEWAY_HOST} ${CACHE_GATEWAY_NODE_PORT} ${CACHE_CA_FILE} ${CACHE_CERT_FILE} ${CACHE_KEY_FILE}' \
         <"$VM_CLIENT_CONFIG_TEMPLATE" >"$config_file"
 
     export HOME="${CLIENT_ROOT}/home"
