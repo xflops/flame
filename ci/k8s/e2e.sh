@@ -32,10 +32,15 @@ GATEWAY="${RELEASE}-cache"
 ENVOY_PROXY="${RELEASE}-cache-nodeport"
 CACHE_BOOTSTRAP_ROUTE="${RELEASE}-cache-bootstrap"
 CACHE_OWNER_ROUTE="${RELEASE}-cache-owner"
+CACHE_HOST_REWRITE_FILTER="${RELEASE}-cache-host-rewrite"
 CACHE_BACKEND="${RELEASE}-cache-owner"
 CACHE_SECURITY_POLICY="${RELEASE}-cache-owner"
+CACHE_CLIENT_POLICY="${RELEASE}-cache-client-mtls"
 CACHE_CA_SECRET="${RELEASE}-cache-ca"
 CACHE_TLS_SECRET="${RELEASE}-cache-tls"
+CACHE_CLIENT_CA_SECRET="${RELEASE}-cache-client-ca"
+CACHE_CLIENT_TRUST_SECRET="${RELEASE}-cache-client-trust"
+CACHE_CLIENT_TLS_SECRET="${RELEASE}-cache-client-tls"
 
 EXTERNAL_ACCESS_TEMPLATE="${ROOT_DIR}/ci/k8s/external-access.yaml"
 VM_CLIENT_CONFIG_TEMPLATE="${ROOT_DIR}/ci/k8s/flame-vm.yaml"
@@ -178,6 +183,24 @@ wait_security_policy_accepted() {
     return 1
 }
 
+wait_client_policy_accepted() {
+    local deadline=$((SECONDS + 300))
+    local accepted=""
+
+    while (( SECONDS < deadline )); do
+        accepted="$(kubectl -n "$NAMESPACE" get clienttrafficpolicy "$CACHE_CLIENT_POLICY" \
+            -o 'jsonpath={.status.ancestors[0].conditions[?(@.type=="Accepted")].status}' 2>/dev/null || true)"
+        if [[ "$accepted" == "True" ]]; then
+            return 0
+        fi
+        sleep 2
+    done
+
+    log "ClientTrafficPolicy/${CACHE_CLIENT_POLICY} was not accepted"
+    kubectl -n "$NAMESPACE" get clienttrafficpolicy "$CACHE_CLIENT_POLICY" -o yaml || true
+    return 1
+}
+
 install_external_infrastructure() {
     log "Installing cert-manager ${CERT_MANAGER_VERSION}"
     helm upgrade --install cert-manager oci://quay.io/jetstack/charts/cert-manager \
@@ -226,8 +249,8 @@ create_external_access() {
     local cache_service="$1"
     local session_frontend_port="$2"
     local cache_grpc_port="$3"
-    local cache_authority_expression=""
-    local cache_certificate_ips=""
+    local cache_target_expression=""
+    local client_ca_file=""
     local pod_ip=""
     local -a cache_pod_ips=()
 
@@ -241,35 +264,44 @@ create_external_access() {
     fi
 
     for pod_ip in "${cache_pod_ips[@]}"; do
-        if [[ -n "$cache_authority_expression" ]]; then
-            cache_authority_expression+=" || "
+        if [[ -n "$cache_target_expression" ]]; then
+            cache_target_expression+=" || "
         fi
-        cache_authority_expression+="request.host == '${pod_ip}:${cache_grpc_port}'"
-        if [[ -n "$cache_certificate_ips" ]]; then
-            cache_certificate_ips+=$'\n'
-        fi
-        cache_certificate_ips+="    - ${pod_ip}"
+        cache_target_expression+="request.headers['x-flame-object-cache'] == '${pod_ip}:${cache_grpc_port}'"
     done
-    : "${cache_authority_expression:?no object-cache pod IPs found}"
-    : "${cache_certificate_ips:?no object-cache certificate IPs found}"
+    : "${cache_target_expression:?no object-cache pod IPs found}"
 
     export EXTERNAL_SESSION_SERVICE NAMESPACE RELEASE SESSION_NODE_PORT
     export CACHE_GATEWAY_NODE_PORT CACHE_GATEWAY_HOST GATEWAY_CLASS GATEWAY
-    export ENVOY_PROXY CACHE_BOOTSTRAP_ROUTE CACHE_OWNER_ROUTE CACHE_BACKEND
-    export CACHE_SECURITY_POLICY CACHE_CA_SECRET CACHE_TLS_SECRET
+    export ENVOY_PROXY CACHE_BOOTSTRAP_ROUTE CACHE_OWNER_ROUTE CACHE_BACKEND CACHE_HOST_REWRITE_FILTER
+    export CACHE_SECURITY_POLICY CACHE_CLIENT_POLICY CACHE_CA_SECRET CACHE_TLS_SECRET
+    export CACHE_CLIENT_CA_SECRET CACHE_CLIENT_TRUST_SECRET CACHE_CLIENT_TLS_SECRET
     export CACHE_SERVICE="$cache_service"
     export SESSION_FRONTEND_PORT="$session_frontend_port"
     export CACHE_GRPC_PORT="$cache_grpc_port"
-    export CACHE_AUTHORITY_EXPRESSION="$cache_authority_expression"
-    export CACHE_CERTIFICATE_IPS="$cache_certificate_ips"
+    export CACHE_TARGET_EXPRESSION="$cache_target_expression"
 
     log "Creating CI-owned session NodePort and cache Gateway resources"
-    envsubst '${EXTERNAL_SESSION_SERVICE} ${NAMESPACE} ${RELEASE} ${SESSION_FRONTEND_PORT} ${SESSION_NODE_PORT} ${CACHE_CA_SECRET} ${CACHE_TLS_SECRET} ${CACHE_GATEWAY_HOST} ${CACHE_CERTIFICATE_IPS} ${ENVOY_PROXY} ${CACHE_GATEWAY_NODE_PORT} ${GATEWAY_CLASS} ${GATEWAY} ${CACHE_BOOTSTRAP_ROUTE} ${CACHE_SERVICE} ${CACHE_GRPC_PORT} ${CACHE_BACKEND} ${CACHE_OWNER_ROUTE} ${CACHE_SECURITY_POLICY} ${CACHE_AUTHORITY_EXPRESSION}' \
+    envsubst '${EXTERNAL_SESSION_SERVICE} ${NAMESPACE} ${RELEASE} ${SESSION_FRONTEND_PORT} ${SESSION_NODE_PORT} ${CACHE_CA_SECRET} ${CACHE_TLS_SECRET} ${CACHE_CLIENT_CA_SECRET} ${CACHE_CLIENT_TRUST_SECRET} ${CACHE_CLIENT_TLS_SECRET} ${CACHE_CLIENT_POLICY} ${CACHE_GATEWAY_HOST} ${ENVOY_PROXY} ${CACHE_GATEWAY_NODE_PORT} ${GATEWAY_CLASS} ${GATEWAY} ${CACHE_BOOTSTRAP_ROUTE} ${CACHE_SERVICE} ${CACHE_GRPC_PORT} ${CACHE_BACKEND} ${CACHE_OWNER_ROUTE} ${CACHE_HOST_REWRITE_FILTER} ${CACHE_SECURITY_POLICY} ${CACHE_TARGET_EXPRESSION}' \
         <"$EXTERNAL_ACCESS_TEMPLATE" >"$RENDERED_EXTERNAL_ACCESS"
     kubectl apply -f "$RENDERED_EXTERNAL_ACCESS"
 
     kubectl -n "$NAMESPACE" wait \
+        --for=condition=Ready "certificate/${RELEASE}-cache-client-ca" \
+        --timeout="$TIMEOUT"
+    client_ca_file="$(mktemp "${TMPDIR:-/tmp}/flame-cache-client-ca.XXXXXX")"
+    kubectl -n "$NAMESPACE" get secret "$CACHE_CLIENT_CA_SECRET" \
+        -o jsonpath='{.data.tls\.crt}' | base64 --decode >"$client_ca_file"
+    kubectl -n "$NAMESPACE" create secret generic "$CACHE_CLIENT_TRUST_SECRET" \
+        --from-file=ca.crt="$client_ca_file" --dry-run=client -o yaml \
+        | kubectl apply -f -
+    rm -f -- "$client_ca_file"
+
+    kubectl -n "$NAMESPACE" wait \
         --for=condition=Ready "certificate/${RELEASE}-cache-server" \
+        --timeout="$TIMEOUT"
+    kubectl -n "$NAMESPACE" wait \
+        --for=condition=Ready "certificate/${RELEASE}-cache-client" \
         --timeout="$TIMEOUT"
     kubectl -n "$NAMESPACE" wait \
         --for=condition=Programmed "gateway/${GATEWAY}" \
@@ -278,6 +310,7 @@ create_external_access() {
     wait_route_ready "$CACHE_BOOTSTRAP_ROUTE"
     wait_route_ready "$CACHE_OWNER_ROUTE"
     wait_security_policy_accepted
+    wait_client_policy_accepted
 
     # Confirm the generated Service has the fixed NodePort mapped by ci/k8s/kind.yaml.
     kubectl -n "$ENVOY_GATEWAY_NAMESPACE" get service \
@@ -286,8 +319,8 @@ create_external_access() {
         | grep -qx "${CACHE_GATEWAY_NODE_PORT}"
 
     # Referencing the internal Service above is intentional for bootstrap calls.
-    # Object refs carry podIP:port authorities, which the second route resolves
-    # dynamically and the SecurityPolicy restricts to current cache replicas.
+    # Object refs carry podIP:port in x-flame-object-cache. The second route
+    # rewrites the upstream host and restricts targets to current cache replicas.
 }
 
 configure_external_access() {
@@ -334,11 +367,20 @@ extract_host_client() {
 
 configure_host_client() {
     local ca_file="${CLIENT_ROOT}/cache-ca.crt"
+    local client_ca_file="${CLIENT_ROOT}/cache-client-ca.crt"
+    local cert_file="${CLIENT_ROOT}/cache-client.crt"
+    local key_file="${CLIENT_ROOT}/cache-client.key"
     local config_dir="${CLIENT_ROOT}/home/.flame"
     local config_file="${config_dir}/flame.yaml"
 
     kubectl -n "$NAMESPACE" get secret "$CACHE_CA_SECRET" \
         -o jsonpath='{.data.tls\.crt}' | base64 --decode >"$ca_file"
+    kubectl -n "$NAMESPACE" get secret "$CACHE_CLIENT_TLS_SECRET" \
+        -o jsonpath='{.data.tls\.crt}' | base64 --decode >"$cert_file"
+    kubectl -n "$NAMESPACE" get secret "$CACHE_CLIENT_CA_SECRET" \
+        -o jsonpath='{.data.tls\.crt}' | base64 --decode >"$client_ca_file"
+    (umask 077; kubectl -n "$NAMESPACE" get secret "$CACHE_CLIENT_TLS_SECRET" \
+        -o jsonpath='{.data.tls\.key}' | base64 --decode >"$key_file")
 
     mkdir -p "$config_dir"
     export CACHE_CA_FILE="$ca_file"
@@ -350,6 +392,8 @@ configure_host_client() {
     export FLAME_ENDPOINT="http://127.0.0.1:${SESSION_NODE_PORT}"
     export FLAME_CACHE_ENDPOINT="grpcs-proxy://${CACHE_GATEWAY_HOST}:${CACHE_GATEWAY_NODE_PORT}"
     export FLAME_CA_FILE="$ca_file"
+    export FLAME_CERT_FILE="$cert_file"
+    export FLAME_KEY_FILE="$key_file"
 
     if ! grep -qwF "$CACHE_GATEWAY_HOST" /etc/hosts; then
         printf '127.0.0.1 %s\n' "$CACHE_GATEWAY_HOST" \
@@ -357,8 +401,32 @@ configure_host_client() {
     fi
 }
 
+verify_gateway_mtls() {
+    local gateway_url="https://${CACHE_GATEWAY_HOST}:${CACHE_GATEWAY_NODE_PORT}/"
+
+    if ! curl --silent --show-error --noproxy '*' --max-time 10 \
+        --cacert "$FLAME_CA_FILE" --cert "$FLAME_CERT_FILE" \
+        --key "$FLAME_KEY_FILE" --output /dev/null "$gateway_url"; then
+        log "Gateway rejected the configured client certificate"
+        return 1
+    fi
+    if curl --silent --show-error --noproxy '*' --max-time 10 \
+        --cacert "$FLAME_CA_FILE" --output /dev/null "$gateway_url"; then
+        log "Gateway accepted a connection without a client certificate"
+        return 1
+    fi
+    if curl --silent --show-error --noproxy '*' --max-time 10 \
+        --cacert "${CLIENT_ROOT}/cache-client-ca.crt" \
+        --cert "$FLAME_CERT_FILE" --key "$FLAME_KEY_FILE" \
+        --output /dev/null "$gateway_url"; then
+        log "Gateway certificate was accepted with an unrelated CA"
+        return 1
+    fi
+}
+
 run_smoke_tests() {
     log "Running Flame smoke tests directly from the VM"
+    verify_gateway_mtls
     flmctl --config "${HOME}/.flame/flame.yaml" list -a
     flmctl --config "${HOME}/.flame/flame.yaml" list -n
     flmping -t "$FLMPING_TASKS"

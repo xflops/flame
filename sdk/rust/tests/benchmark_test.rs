@@ -453,6 +453,7 @@ async fn benchmark_task_matrix() -> Result<(), FlameError> {
 
     let tls_config = FlameClientTls {
         ca_file: Some(get_ca_cert_path()),
+        ..Default::default()
     };
     let conn = flame::client::connect_with_tls(&benchmark_endpoint(), Some(&tls_config)).await?;
 

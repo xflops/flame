@@ -17,7 +17,8 @@ Both SDKs use the same Flame concepts:
 
 ## Configuration
 
-Both SDKs read Flame configuration from `~/.flame/flame.yaml` and accept environment overrides from the Flame runtime:
+Both SDKs read Flame configuration from `~/.flame/flame.yaml` and accept
+environment settings from the Flame runtime:
 
 ```yaml
 current-context: flame
@@ -29,13 +30,19 @@ contexts:
       endpoint: "grpc://127.0.0.1:9090"
 ```
 
-Common environment overrides:
+Common environment settings:
 
 - `FLAME_ENDPOINT`
 - `FLAME_CACHE_ENDPOINT`
 - `FLAME_CA_FILE`
+- `FLAME_CERT_FILE`
+- `FLAME_KEY_FILE`
 
 Use `https://` for the session-manager endpoint when TLS is enabled. Use `grpcs://` for the object-cache endpoint when cache TLS is enabled.
+For a client certificate, set both `cert_file` and `key_file` under the
+relevant `cluster.tls` or `cache.tls` section. An external cache proxy uses
+`grpcs-proxy://host:port`; reference requests carry the owning cache address
+in `x-flame-object-cache` metadata while TLS verifies the public proxy host.
 
 ## Typical Workflow
 

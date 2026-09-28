@@ -1,5 +1,10 @@
 # RFE523: Helm External Access and Object-Cache gRPC Proxy
 
+> The cache-owner routing contract in this design is superseded by
+> [RFE552](../RFE552-cache-client-mtls/FS.md): current SDKs keep the public
+> proxy as HTTP/2 `:authority` and send the owner in
+> `x-flame-object-cache` metadata.
+
 GitHub issue: https://github.com/xflops/flame/issues/523
 
 ## Summary

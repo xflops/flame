@@ -782,3 +782,33 @@ def test_flame_context_reads_scalar_app_template(tmp_path, monkeypatch):
     )
 
     assert FlameContext().app == "custom-flmrun"
+
+
+def test_flame_context_reads_client_identity(tmp_path, monkeypatch):
+    fake_home = tmp_path / ".home"
+    conf_dir = fake_home / ".flame"
+    conf_dir.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+    (conf_dir / "flame.yaml").write_text(
+        json.dumps(
+            {
+                "current-context": "flame",
+                "contexts": [
+                    {
+                        "name": "flame",
+                        "cluster": {"endpoint": "https://cluster:8080", "tls": {"ca_file": "cluster-ca", "cert_file": "cluster-cert", "key_file": "cluster-key"}},
+                        "cache": {"endpoint": "grpcs-proxy://gateway:443", "tls": {"ca_file": "cache-ca", "cert_file": "cache-cert", "key_file": "cache-key"}},
+                    }
+                ],
+            }
+        )
+    )
+    ctx = FlameContext()
+    assert (ctx.tls.ca_file, ctx.tls.cert_file, ctx.tls.key_file) == ("cluster-ca", "cluster-cert", "cluster-key")
+    assert (ctx.cache.tls.ca_file, ctx.cache.tls.cert_file, ctx.cache.tls.key_file) == ("cache-ca", "cache-cert", "cache-key")
+
+    monkeypatch.setenv("FLAME_CERT_FILE", "env-cert")
+    monkeypatch.setenv("FLAME_KEY_FILE", "env-key")
+    ctx = FlameContext()
+    assert (ctx.tls.cert_file, ctx.tls.key_file) == ("cluster-cert", "cluster-key")
+    assert (ctx.cache.tls.cert_file, ctx.cache.tls.key_file) == ("cache-cert", "cache-key")

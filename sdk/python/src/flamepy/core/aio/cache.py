@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # Explicit close() is required before the owning loop exits. A channel can
 # retain its loop, so weak loop keys would not make forgotten channels safe.
-_clients: dict[asyncio.AbstractEventLoop, dict[tuple[str, Optional[str], Optional[str]], tuple[grpc.aio.Channel, Any]]] = {}
+_clients: dict[asyncio.AbstractEventLoop, dict[tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]], tuple[grpc.aio.Channel, Any]]] = {}
 _clients_lock = threading.Lock()
 
 
@@ -50,32 +50,61 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_clients_after_fork)
 
 
-def _create_client(location: str, tls_config: Optional[FlameClientTls], authority: Optional[str]):
+def _create_client(location: str, tls_config: Optional[FlameClientTls], target: Optional[str]):
     parsed = urlparse(location)
     if parsed.scheme not in ("grpc", "grpcs", "grpc+tls", "grpcs-proxy") or not parsed.netloc:
         raise ValueError(f"Invalid object cache endpoint: {location}")
     options = list(common.GRPC_OPTIONS)
-    if authority:
-        options.append(("grpc.default_authority", authority))
     if parsed.scheme in ("grpcs", "grpc+tls", "grpcs-proxy"):
+        if tls_config is not None:
+            tls_config.validate_identity()
+        if parsed.scheme == "grpcs-proxy":
+            common._validate_proxy_endpoint(location)
         roots = None
         if tls_config and tls_config.ca_file:
             with open(tls_config.ca_file, "rb") as source:
                 roots = source.read()
-        credentials = grpc.ssl_channel_credentials(root_certificates=roots)
+        private_key = certificate_chain = None
+        if tls_config and tls_config.cert_file:
+            with open(tls_config.key_file, "rb") as source:
+                private_key = source.read()
+            with open(tls_config.cert_file, "rb") as source:
+                certificate_chain = source.read()
+        credentials = grpc.ssl_channel_credentials(root_certificates=roots, private_key=private_key, certificate_chain=certificate_chain)
         channel = grpc.aio.secure_channel(parsed.netloc, credentials, options=options)
     else:
         channel = grpc.aio.insecure_channel(parsed.netloc, options=options)
-    return channel, cache_pb2_grpc.ObjectCacheServiceStub(channel)
+    stub = cache_pb2_grpc.ObjectCacheServiceStub(channel)
+    if target is not None:
+        stub = _RoutedCacheStub(stub, target)
+    return channel, stub
+
+
+class _RoutedCacheStub:
+    """Add the owner route to proxy RPCs without changing TLS authority."""
+
+    def __init__(self, stub: Any, target: str):
+        self._stub = stub
+        self._target = target
+
+    def __getattr__(self, name: str):
+        rpc = getattr(self._stub, name)
+
+        def invoke(*args, **kwargs):
+            metadata = list(kwargs.pop("metadata", ()) or ())
+            metadata.append(("x-flame-object-cache", self._target))
+            return rpc(*args, metadata=metadata, **kwargs)
+
+        return invoke
 
 
 def _get_client(endpoint: str, tls_config: Optional[FlameClientTls] = None):
-    location, authority = common._resolve_cache_endpoint(endpoint)
-    key = (location, authority, tls_config.ca_file if tls_config else None)
+    location, target = common._resolve_cache_endpoint(endpoint)
+    key = (location, target, tls_config.ca_file if tls_config else None, tls_config.cert_file if tls_config else None, tls_config.key_file if tls_config else None)
     with _clients_lock:
         pool = _clients.setdefault(asyncio.get_running_loop(), {})
         if key not in pool:
-            pool[key] = _create_client(location, tls_config, authority)
+            pool[key] = _create_client(location, tls_config, target)
         return pool[key][1]
 
 

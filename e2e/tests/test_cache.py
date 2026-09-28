@@ -27,27 +27,32 @@ from flamepy.proto import cache_pb2, cache_pb2_grpc
 @contextmanager
 def _remote_cache_client(ref: ObjectRef):
     """Use a separate gRPC client so remote writes do not touch the SDK cache."""
-    endpoint, authority = cache_module._resolve_cache_endpoint(ref.endpoint)
+    endpoint, target = cache_module._resolve_cache_endpoint(ref.endpoint)
     parsed = urlparse(endpoint)
     options = list(cache_module.GRPC_OPTIONS)
-    if authority:
-        options.append(("grpc.default_authority", authority))
+    metadata = (("x-flame-object-cache", target),) if target else ()
     if parsed.scheme in ("grpcs", "grpc+tls", "grpcs-proxy"):
         tls = cache_module._get_cache_tls_config()
         roots = None
+        cert = key = None
         if tls and tls.ca_file:
             with open(tls.ca_file, "rb") as roots_file:
                 roots = roots_file.read()
-        channel = grpc.secure_channel(parsed.netloc, grpc.ssl_channel_credentials(root_certificates=roots), options=options)
+        if tls and tls.cert_file and tls.key_file:
+            with open(tls.cert_file, "rb") as cert_file:
+                cert = cert_file.read()
+            with open(tls.key_file, "rb") as key_file:
+                key = key_file.read()
+        channel = grpc.secure_channel(parsed.netloc, grpc.ssl_channel_credentials(root_certificates=roots, private_key=key, certificate_chain=cert), options=options)
     else:
         channel = grpc.insecure_channel(parsed.netloc, options=options)
     with channel:
-        yield cache_pb2_grpc.ObjectCacheServiceStub(channel)
+        yield cache_pb2_grpc.ObjectCacheServiceStub(channel), metadata
 
 
 def _remote_metadata(ref: ObjectRef):
-    with _remote_cache_client(ref) as client:
-        return client.GetMetadata(cache_pb2.CacheGetMetadataRequest(key=ref.key))
+    with _remote_cache_client(ref) as (client, metadata):
+        return client.GetMetadata(cache_pb2.CacheGetMetadataRequest(key=ref.key), metadata=metadata)
 
 
 def _remote_write(ref: ObjectRef, data_type: str, data: bytes, *, patch: bool = False) -> ObjectRef:
@@ -56,14 +61,14 @@ def _remote_write(ref: ObjectRef, data_type: str, data: bytes, *, patch: bool = 
         for offset in range(0, len(data), cache_module._UPLOAD_CHUNK_SIZE):
             yield cache_pb2.CacheWriteRequest(data=data[offset : offset + cache_module._UPLOAD_CHUNK_SIZE])
 
-    with _remote_cache_client(ref) as client:
-        metadata = (client.Patch if patch else client.Put)(requests())
-    return ObjectRef(endpoint=metadata.endpoint, key=metadata.key, version=metadata.version)
+    with _remote_cache_client(ref) as (client, routing):
+        response = (client.Patch if patch else client.Put)(requests(), metadata=routing)
+    return ObjectRef(endpoint=response.endpoint, key=response.key, version=response.version)
 
 
 def _remote_get(ref: ObjectRef, client_version: int):
-    with _remote_cache_client(ref) as client:
-        responses = list(client.Get(cache_pb2.CacheGetRequest(key=ref.key, client_version=client_version)))
+    with _remote_cache_client(ref) as (client, metadata):
+        responses = list(client.Get(cache_pb2.CacheGetRequest(key=ref.key, client_version=client_version), metadata=metadata))
     assert responses and responses[0].WhichOneof("payload") == "header"
     assert all(response.WhichOneof("payload") == "chunk" for response in responses[1:])
     return responses[0].header, [response.chunk for response in responses[1:]]

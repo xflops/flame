@@ -53,14 +53,48 @@ spec:
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
+  name: ${RELEASE}-cache-client-ca
+  namespace: ${NAMESPACE}
+spec:
+  isCA: true
+  commonName: ${RELEASE}-cache-client-e2e-ca
+  secretName: ${CACHE_CLIENT_CA_SECRET}
+  issuerRef:
+    name: ${RELEASE}-cache-selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ${RELEASE}-cache-client-ca
+  namespace: ${NAMESPACE}
+spec:
+  ca:
+    secretName: ${CACHE_CLIENT_CA_SECRET}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ${RELEASE}-cache-client
+  namespace: ${NAMESPACE}
+spec:
+  commonName: ${RELEASE}-cache-e2e-client
+  secretName: ${CACHE_CLIENT_TLS_SECRET}
+  usages:
+    - client auth
+  issuerRef:
+    name: ${RELEASE}-cache-client-ca
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
   name: ${RELEASE}-cache-server
   namespace: ${NAMESPACE}
 spec:
   secretName: ${CACHE_TLS_SECRET}
   dnsNames:
     - ${CACHE_GATEWAY_HOST}
-  ipAddresses:
-${CACHE_CERTIFICATE_IPS}
   issuerRef:
     name: ${RELEASE}-cache-ca
     kind: Issuer
@@ -146,6 +180,34 @@ spec:
   appProtocols:
     - gateway.envoyproxy.io/h2c
 ---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: ${CACHE_CLIENT_POLICY}
+  namespace: ${NAMESPACE}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: ${GATEWAY}
+  tls:
+    clientValidation:
+      caCertificateRefs:
+        - group: ""
+          kind: Secret
+          name: ${CACHE_CLIENT_TRUST_SECRET}
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: HTTPRouteFilter
+metadata:
+  name: ${CACHE_HOST_REWRITE_FILTER}
+  namespace: ${NAMESPACE}
+spec:
+  urlRewrite:
+    hostname:
+      type: Header
+      header: x-flame-object-cache
+---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
@@ -155,8 +217,21 @@ spec:
   parentRefs:
     - name: ${GATEWAY}
       sectionName: cache
+  hostnames:
+    - ${CACHE_GATEWAY_HOST}
   rules:
-    - backendRefs:
+    - matches:
+        - headers:
+            - name: x-flame-object-cache
+              type: RegularExpression
+              value: '.+'
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.envoyproxy.io
+            kind: HTTPRouteFilter
+            name: ${CACHE_HOST_REWRITE_FILTER}
+      backendRefs:
         - group: gateway.envoyproxy.io
           kind: Backend
           name: ${CACHE_BACKEND}
@@ -176,4 +251,4 @@ spec:
     rules:
       - name: flame-cache-pods
         action: Allow
-        cel: "${CACHE_AUTHORITY_EXPRESSION}"
+        cel: "${CACHE_TARGET_EXPRESSION}"

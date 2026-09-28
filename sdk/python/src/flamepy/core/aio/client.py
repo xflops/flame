@@ -188,10 +188,18 @@ class Connection:
             target = f"{host}:{port}"
             if parsed.scheme == "https":
                 roots = None
+                private_key = certificate_chain = None
+                if tls_config is not None:
+                    tls_config.validate_identity()
                 if tls_config is not None and tls_config.ca_file:
                     with open(tls_config.ca_file, "rb") as file:
                         roots = file.read()
-                channel = grpc.aio.secure_channel(target, grpc.ssl_channel_credentials(root_certificates=roots))
+                if tls_config is not None and tls_config.cert_file:
+                    with open(tls_config.key_file, "rb") as file:
+                        private_key = file.read()
+                    with open(tls_config.cert_file, "rb") as file:
+                        certificate_chain = file.read()
+                channel = grpc.aio.secure_channel(target, grpc.ssl_channel_credentials(root_certificates=roots, private_key=private_key, certificate_chain=certificate_chain))
             else:
                 channel = grpc.aio.insecure_channel(target)
             await asyncio.wait_for(channel.channel_ready(), timeout=10)

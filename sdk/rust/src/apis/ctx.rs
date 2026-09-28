@@ -16,7 +16,7 @@ use std::env;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tonic::transport::{Certificate, ClientTlsConfig};
+use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 
 use crate::apis::FlameError;
 
@@ -24,6 +24,8 @@ const DEFAULT_FLAME_CONF: &str = "flame.yaml";
 const FLAME_ENDPOINT: &str = "FLAME_ENDPOINT";
 const FLAME_CACHE_ENDPOINT: &str = "FLAME_CACHE_ENDPOINT";
 const FLAME_CA_FILE: &str = "FLAME_CA_FILE";
+const FLAME_CERT_FILE: &str = "FLAME_CERT_FILE";
+const FLAME_KEY_FILE: &str = "FLAME_KEY_FILE";
 
 /// Client TLS configuration for connecting to Flame services.
 ///
@@ -34,6 +36,12 @@ pub struct FlameClientTls {
     /// Path to CA certificate for server verification
     #[serde(default)]
     pub ca_file: Option<String>,
+    /// Path to the PEM client certificate chain sent to the TLS server.
+    #[serde(default)]
+    pub cert_file: Option<String>,
+    /// Path to the PEM private key for cert_file.
+    #[serde(default)]
+    pub key_file: Option<String>,
 }
 
 impl FlameClientTls {
@@ -42,6 +50,11 @@ impl FlameClientTls {
     /// If ca_file is specified, use it; otherwise use system CA bundle.
     /// The domain parameter is used for server name verification.
     pub fn client_tls_config(&self, domain: &str) -> Result<ClientTlsConfig, FlameError> {
+        if self.cert_file.is_some() != self.key_file.is_some() {
+            return Err(FlameError::InvalidConfig(
+                "client TLS requires both cert_file and key_file".to_string(),
+            ));
+        }
         let mut config = ClientTlsConfig::new()
             .domain_name(domain)
             .with_native_roots();
@@ -53,7 +66,33 @@ impl FlameClientTls {
             config = config.ca_certificate(Certificate::from_pem(ca));
         }
 
+        if let (Some(cert_file), Some(key_file)) = (&self.cert_file, &self.key_file) {
+            let cert = fs::read(cert_file).map_err(|e| {
+                FlameError::InvalidConfig(format!(
+                    "failed to read cert_file <{}>: {}",
+                    cert_file, e
+                ))
+            })?;
+            let key = fs::read(key_file).map_err(|e| {
+                FlameError::InvalidConfig(format!("failed to read key_file <{}>: {}", key_file, e))
+            })?;
+            config = config.identity(Identity::from_pem(cert, key));
+        }
+
         Ok(config)
+    }
+}
+
+fn merge_tls(target: &mut Option<FlameClientTls>, source: &FlameClientTls) {
+    let tls = target.get_or_insert_with(FlameClientTls::default);
+    if tls.ca_file.is_none() {
+        tls.ca_file.clone_from(&source.ca_file);
+    }
+    if tls.cert_file.is_none() {
+        tls.cert_file.clone_from(&source.cert_file);
+    }
+    if tls.key_file.is_none() {
+        tls.key_file.clone_from(&source.key_file);
     }
 }
 
@@ -129,6 +168,8 @@ pub struct FlameContextEntry {
 ///       endpoint: "grpcs://flame-object-cache:9090"
 ///       tls:
 ///         ca_file: "/etc/flame/certs/cache-ca.crt"
+///         cert_file: "/etc/flame/certs/client.crt"
+///         key_file: "/etc/flame/certs/client.key"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FlameContext {
@@ -158,13 +199,25 @@ impl FlameContext {
     /// - FLAME_ENDPOINT: Cluster endpoint URL
     /// - FLAME_CACHE_ENDPOINT: Cache endpoint URL  
     /// - FLAME_CA_FILE: CA certificate file path for TLS
+    /// - FLAME_CERT_FILE: Client certificate chain path for TLS
+    /// - FLAME_KEY_FILE: Client private key path for TLS
     pub fn from_env() -> Result<Self, FlameError> {
         let endpoint = env::var(FLAME_ENDPOINT).map_err(|_| {
             FlameError::InvalidConfig(format!("{} environment variable not set", FLAME_ENDPOINT))
         })?;
 
         let ca_file = env::var(FLAME_CA_FILE).ok();
-        let tls = ca_file.map(|f| FlameClientTls { ca_file: Some(f) });
+        let cert_file = env::var(FLAME_CERT_FILE).ok();
+        let key_file = env::var(FLAME_KEY_FILE).ok();
+        let tls = if ca_file.is_some() || cert_file.is_some() || key_file.is_some() {
+            Some(FlameClientTls {
+                ca_file,
+                cert_file,
+                key_file,
+            })
+        } else {
+            None
+        };
 
         let cache_endpoint = env::var(FLAME_CACHE_ENDPOINT).ok();
         let cache = cache_endpoint.map(|ep| FlameClientCache {
@@ -193,6 +246,8 @@ impl FlameContext {
     /// - FLAME_ENDPOINT: Overrides cluster endpoint
     /// - FLAME_CACHE_ENDPOINT: Overrides cache endpoint
     /// - FLAME_CA_FILE: Sets CA file if not already configured
+    /// - FLAME_CERT_FILE: Sets client certificate if not already configured
+    /// - FLAME_KEY_FILE: Sets client private key if not already configured
     pub fn from_file_with_env(fp: Option<String>) -> Result<Self, FlameError> {
         let mut ctx = Self::from_file(fp)?;
         ctx.apply_env_overrides();
@@ -207,30 +262,21 @@ impl FlameContext {
                 current.cluster.endpoint = endpoint;
             }
 
-            // Override/set CA file if FLAME_CA_FILE is set
-            if let Ok(ca_file) = env::var(FLAME_CA_FILE) {
-                // Set for cluster TLS
-                if current.cluster.tls.is_none() {
-                    current.cluster.tls = Some(FlameClientTls {
-                        ca_file: Some(ca_file.clone()),
-                    });
-                } else if let Some(ref mut tls) = current.cluster.tls {
-                    if tls.ca_file.is_none() {
-                        tls.ca_file = Some(ca_file.clone());
-                    }
-                }
-
-                // Set for cache TLS
+            let ca_file = env::var(FLAME_CA_FILE).ok();
+            let cert_file = env::var(FLAME_CERT_FILE).ok();
+            let key_file = env::var(FLAME_KEY_FILE).ok();
+            let env_tls = FlameClientTls {
+                ca_file,
+                cert_file,
+                key_file,
+            };
+            if env_tls.ca_file.is_some()
+                || env_tls.cert_file.is_some()
+                || env_tls.key_file.is_some()
+            {
+                merge_tls(&mut current.cluster.tls, &env_tls);
                 if let Some(ref mut cache) = current.cache {
-                    if cache.tls.is_none() {
-                        cache.tls = Some(FlameClientTls {
-                            ca_file: Some(ca_file.clone()),
-                        });
-                    } else if let Some(ref mut tls) = cache.tls {
-                        if tls.ca_file.is_none() {
-                            tls.ca_file = Some(ca_file);
-                        }
-                    }
+                    merge_tls(&mut cache.tls, &env_tls);
                 }
             }
 
@@ -296,5 +342,49 @@ impl Display for FlameContext {
             self.current_context,
             self.contexts.len()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_identity_requires_both_files() {
+        for tls in [
+            FlameClientTls {
+                cert_file: Some("client.crt".into()),
+                ..Default::default()
+            },
+            FlameClientTls {
+                key_file: Some("client.key".into()),
+                ..Default::default()
+            },
+        ] {
+            let error = tls.client_tls_config("gateway.example.com").unwrap_err();
+            assert!(matches!(error, FlameError::InvalidConfig(_)));
+            assert!(error.to_string().contains("both cert_file and key_file"));
+        }
+    }
+
+    #[test]
+    fn client_identity_loads_pem_files() {
+        let cert_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ci/docker/certs");
+        let tls = FlameClientTls {
+            ca_file: Some(cert_dir.join("ca.crt").to_string_lossy().into_owned()),
+            cert_file: Some(cert_dir.join("server.crt").to_string_lossy().into_owned()),
+            key_file: Some(cert_dir.join("server.key").to_string_lossy().into_owned()),
+        };
+        tls.client_tls_config("gateway.example.com").unwrap();
+    }
+
+    #[test]
+    fn client_identity_yaml_fields_round_trip() {
+        let tls: FlameClientTls =
+            serde_yaml::from_str("ca_file: ca.crt\ncert_file: client.crt\nkey_file: client.key\n")
+                .unwrap();
+        assert_eq!(tls.ca_file.as_deref(), Some("ca.crt"));
+        assert_eq!(tls.cert_file.as_deref(), Some("client.crt"));
+        assert_eq!(tls.key_file.as_deref(), Some("client.key"));
     }
 }

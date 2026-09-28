@@ -82,8 +82,10 @@ The object-cache proxy must:
 - present a certificate valid for that address;
 - route initial operations carrying the public proxy authority to the Flame
   object-cache Service on `objectCache.service.port`; and
-- accept an owning cache endpoint from an object reference in the HTTP/2
-  `:authority` header and route it to that specific cache replica.
+- accept an owning cache endpoint from an object reference in the
+  `x-flame-object-cache` gRPC metadata header and route it to that specific
+  cache replica, while keeping the public proxy name in the client request's
+  HTTP/2 `:authority` header.
 
 The gateway must restrict replica routing to endpoints belonging to the Flame
 object-cache Service; it must not act as an unrestricted dynamic forward proxy.
@@ -92,8 +94,9 @@ not directly expose the cache StatefulSet or its pods.
 
 The external cache endpoint is
 `grpcs-proxy://<address>:<proxy-port>`. Clients dial that proxy over TLS and
-forward the owning cache replica endpoint as the gRPC authority for operations
-on a returned object reference. The chart-managed client configuration always
-uses the in-cluster Services. The site administrator creates and distributes a
-separate external configuration with the session-manager LoadBalancer endpoint
+send the owning cache replica endpoint as `x-flame-object-cache` metadata for
+operations on a returned object reference. The chart-managed client
+configuration always uses the in-cluster Services. The site administrator
+creates a separate external configuration with the session-manager
+LoadBalancer endpoint
 and this `grpcs-proxy://` endpoint; both configurations use the same schema.

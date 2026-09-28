@@ -1,4 +1,6 @@
 import asyncio
+import shutil
+import subprocess
 from types import SimpleNamespace
 
 import grpc
@@ -7,6 +9,7 @@ import pytest
 from flamepy.core import cache as cache_module
 from flamepy.core.aio import cache as aio_cache
 from flamepy.core.cache import FetchMode, FetchResult, Object, ObjectRef, Patch, _cache_lock, _object_cache
+from flamepy.core.types import FlameClientTls
 from flamepy.proto import cache_pb2, cache_pb2_grpc
 
 
@@ -32,24 +35,143 @@ class TestAioCache:
         asyncio.run(run())
         assert calls == [("cache:9090", cache_module.GRPC_OPTIONS)]
 
-    def test_proxy_preserves_authority(self, monkeypatch):
+    def test_proxy_routes_owner_in_metadata(self, monkeypatch):
         calls = []
         monkeypatch.setattr(cache_module, "_get_cached_context", lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpcs-proxy://gateway.example:443")))
-        monkeypatch.setattr(aio_cache.grpc, "ssl_channel_credentials", lambda root_certificates: object())
+        monkeypatch.setattr(aio_cache.grpc, "ssl_channel_credentials", lambda **kwargs: object())
         monkeypatch.setattr(aio_cache.grpc.aio, "secure_channel", lambda target, credentials, options: calls.append((target, options)) or object())
-        monkeypatch.setattr(aio_cache.cache_pb2_grpc, "ObjectCacheServiceStub", lambda channel: channel)
+        monkeypatch.setattr(aio_cache.cache_pb2_grpc, "ObjectCacheServiceStub", lambda channel: SimpleNamespace(Get=lambda *args, **kwargs: (args, kwargs)))
 
         async def run():
-            aio_cache._get_client("grpc://object-cache:9090")
+            stub = aio_cache._get_client("grpc://object-cache:9090")
+            assert stub.Get("request")[1]["metadata"] == [("x-flame-object-cache", "object-cache:9090")]
             aio_cache._clients.pop(asyncio.get_running_loop())
 
         asyncio.run(run())
         assert calls[0][0] == "gateway.example:443"
-        assert ("grpc.default_authority", "object-cache:9090") in calls[0][1]
+        assert not any(key == "grpc.default_authority" for key, _ in calls[0][1])
+
+    def test_proxy_initial_authority_is_public(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(cache_module, "_get_cached_context", lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpcs-proxy://gateway.example:443")))
+        monkeypatch.setattr(aio_cache.grpc, "ssl_channel_credentials", lambda **kwargs: object())
+        monkeypatch.setattr(aio_cache.grpc.aio, "secure_channel", lambda target, credentials, options: calls.append((target, options)) or object())
+        monkeypatch.setattr(aio_cache.cache_pb2_grpc, "ObjectCacheServiceStub", lambda channel: SimpleNamespace(Get=lambda *args, **kwargs: (args, kwargs)))
+
+        async def run():
+            stub = aio_cache._get_client("grpcs-proxy://gateway.example:443")
+            assert stub.Get("request")[1] == {}
+            aio_cache._clients.pop(asyncio.get_running_loop())
+
+        asyncio.run(run())
+        assert not any(key == "grpc.default_authority" for key, _ in calls[0][1])
+
+    def test_proxy_client_identity_and_owner_metadata(self, monkeypatch, tmp_path):
+        ca = tmp_path / "ca.pem"
+        cert = tmp_path / "client.pem"
+        key = tmp_path / "client-key.pem"
+        ca.write_bytes(b"ca")
+        cert.write_bytes(b"certificate")
+        key.write_bytes(b"private key")
+        credentials = []
+        channels = []
+        monkeypatch.setattr(aio_cache.grpc, "ssl_channel_credentials", lambda **kwargs: credentials.append(kwargs) or object())
+        monkeypatch.setattr(aio_cache.grpc.aio, "secure_channel", lambda target, creds, options: channels.append((target, options)) or object())
+        methods = ("Put", "Get", "Patch", "GetMetadata", "Delete")
+        monkeypatch.setattr(aio_cache.cache_pb2_grpc, "ObjectCacheServiceStub", lambda channel: SimpleNamespace(**{method: lambda *args, **kwargs: kwargs for method in methods}))
+        tls = FlameClientTls(str(ca), str(cert), str(key))
+
+        async def run():
+            for endpoint in ("grpc://cache-0:9090", "grpcs://cache-0:9090"):
+                monkeypatch.setattr(cache_module, "_get_cached_context", lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpcs-proxy://gateway.example:443")))
+                stub = aio_cache._get_client(endpoint, tls)
+                for method in methods:
+                    assert getattr(stub, method)("request")["metadata"] == [("x-flame-object-cache", "cache-0:9090")]
+            aio_cache._clients.pop(asyncio.get_running_loop())
+
+        asyncio.run(run())
+        assert channels == [("gateway.example:443", cache_module.GRPC_OPTIONS)]
+        assert credentials == [{"root_certificates": b"ca", "private_key": b"private key", "certificate_chain": b"certificate"}]
+
+    def test_incomplete_client_identity_rejected(self):
+        with pytest.raises(ValueError, match="cert_file and key_file"):
+            FlameClientTls(cert_file="client.pem").validate_identity()
+        with pytest.raises(ValueError, match="must not be empty"):
+            FlameClientTls(cert_file="", key_file="").validate_identity()
+        with pytest.raises(ValueError, match="cert_file and key_file"):
+            aio_cache._create_client("grpcs-proxy://gateway.example:443", FlameClientTls(key_file="key.pem"), None)
+
+    def test_plaintext_direct_cache_ignores_tls_identity(self, monkeypatch):
+        monkeypatch.setattr(aio_cache.grpc.aio, "insecure_channel", lambda target, options: object())
+        monkeypatch.setattr(aio_cache.cache_pb2_grpc, "ObjectCacheServiceStub", lambda channel: channel)
+        aio_cache._create_client("grpc://cache:9090", FlameClientTls(cert_file="client.pem"), None)
+
+    def test_invalid_context_does_not_fall_back_to_direct_cache(self, monkeypatch):
+        monkeypatch.setattr(cache_module, "_get_cached_context", lambda: (_ for _ in ()).throw(ValueError("bad TLS configuration")))
+        with pytest.raises(ValueError, match="bad TLS configuration"):
+            cache_module._resolve_cache_endpoint("grpc://cache:9090")
+
+    def test_proxy_mtls_public_server_name_and_owner_route(self, tmp_path):
+        if shutil.which("openssl") is None:
+            pytest.skip("openssl is required for the TLS integration test")
+
+        def openssl(*args):
+            subprocess.run(["openssl", *map(str, args)], cwd=tmp_path, check=True, capture_output=True)
+
+        openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-days", "1", "-subj", "/CN=Test CA")
+        for name, extension in (("gateway", "subjectAltName=DNS:localhost\nextendedKeyUsage=serverAuth\n"), ("client", "extendedKeyUsage=clientAuth\n")):
+            openssl("req", "-newkey", "rsa:2048", "-nodes", "-keyout", f"{name}.key", "-out", f"{name}.csr", "-subj", f"/CN={name}")
+            (tmp_path / f"{name}.ext").write_text(extension)
+            openssl("x509", "-req", "-in", f"{name}.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-out", f"{name}.pem", "-days", "1", "-extfile", f"{name}.ext")
+
+        class Service(cache_pb2_grpc.ObjectCacheServiceServicer):
+            async def GetMetadata(self, request, context):  # noqa: N802 - gRPC method name
+                routes.append(dict(context.invocation_metadata()).get("x-flame-object-cache"))
+                return cache_pb2.CacheObjectMetadata(key=request.key)
+
+        async def run():
+            server = grpc.aio.server()
+            cache_pb2_grpc.add_ObjectCacheServiceServicer_to_server(Service(), server)
+            credentials = grpc.ssl_server_credentials(
+                [((tmp_path / "gateway.key").read_bytes(), (tmp_path / "gateway.pem").read_bytes())],
+                root_certificates=(tmp_path / "ca.pem").read_bytes(),
+                require_client_auth=True,
+            )
+            port = server.add_secure_port("localhost:0", credentials)
+            await server.start()
+            try:
+                endpoint = f"grpcs-proxy://localhost:{port}"
+                tls = FlameClientTls(str(tmp_path / "ca.pem"), str(tmp_path / "client.pem"), str(tmp_path / "client.key"))
+                channel, stub = aio_cache._create_client(endpoint, tls, "cache-0:9090")
+                try:
+                    await stub.GetMetadata(cache_pb2.CacheGetMetadataRequest(key="key"), timeout=5)
+                finally:
+                    await channel.close()
+                assert routes == ["cache-0:9090"]
+
+                for invalid_tls in (FlameClientTls(ca_file=str(tmp_path / "ca.pem")), FlameClientTls(cert_file=str(tmp_path / "client.pem"), key_file=str(tmp_path / "client.key"))):
+                    channel, stub = aio_cache._create_client(endpoint, invalid_tls, "cache-0:9090")
+                    try:
+                        with pytest.raises(grpc.aio.AioRpcError):
+                            await stub.GetMetadata(cache_pb2.CacheGetMetadataRequest(key="key"), timeout=2)
+                    finally:
+                        await channel.close()
+                assert routes == ["cache-0:9090"]
+            finally:
+                await server.stop(0)
+
+        routes = []
+        asyncio.run(run())
 
     @pytest.mark.parametrize("endpoint", ["grpcs-proxy://gateway:443/path", "grpcs-proxy://gateway"])
     def test_invalid_proxy(self, endpoint):
         with pytest.raises(ValueError, match="proxy endpoint"):
+            cache_module._resolve_cache_endpoint(endpoint)
+
+    @pytest.mark.parametrize("endpoint", ["grpc://user@cache:9090", "grpc://cache:9090/path", "grpc://cache:9090?route=other", "grpc://cache", "grpc://cache:bad"])
+    def test_invalid_owner_route(self, endpoint, monkeypatch):
+        monkeypatch.setattr(cache_module, "_get_cached_context", lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint="grpcs-proxy://gateway.example:443")))
+        with pytest.raises(ValueError, match="Invalid object cache endpoint"):
             cache_module._resolve_cache_endpoint(endpoint)
 
     def test_full_cached_patch_and_version_zero(self, monkeypatch):

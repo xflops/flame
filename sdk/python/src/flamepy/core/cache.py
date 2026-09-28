@@ -577,10 +577,7 @@ GRPC_OPTIONS = [
 
 def _cache_proxy_endpoint() -> Optional[str]:
     """Return the configured TLS gRPC proxy, if any."""
-    try:
-        cache_config = _get_cached_context().cache
-    except Exception:
-        return None
+    cache_config = _get_cached_context().cache
     if isinstance(cache_config, str):
         endpoint = cache_config
     elif isinstance(cache_config, FlameClientCache):
@@ -594,7 +591,7 @@ def _cache_proxy_endpoint() -> Optional[str]:
 
 
 def _resolve_cache_endpoint(endpoint: str) -> tuple[str, Optional[str]]:
-    """Resolve an object endpoint to its dial location and gRPC authority."""
+    """Resolve an object endpoint to its dial location and optional cache target."""
     parsed = urlparse(endpoint)
     if parsed.scheme == "grpc-proxy":
         raise ValueError("grpc-proxy:// is unsupported; use grpcs-proxy://")
@@ -602,7 +599,11 @@ def _resolve_cache_endpoint(endpoint: str) -> tuple[str, Optional[str]]:
         _validate_proxy_endpoint(endpoint)
     proxy_endpoint = _cache_proxy_endpoint()
     if parsed.scheme in ("grpc", "grpcs", "grpc+tls") and proxy_endpoint:
-        if not parsed.netloc:
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(f"Invalid object cache endpoint: {endpoint}") from exc
+        if not parsed.hostname or port is None or parsed.username or parsed.password or parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
             raise ValueError(f"Invalid object cache endpoint: {endpoint}")
         return proxy_endpoint, parsed.netloc
     return endpoint, None
@@ -621,13 +622,10 @@ def _get_cache_tls_config() -> Optional[FlameClientTls]:
     Returns:
         FlameClientTls if configured, None otherwise
     """
-    try:
-        context = _get_cached_context()
-        cache_config = context.cache
-        if isinstance(cache_config, FlameClientCache) and cache_config.tls:
-            return cache_config.tls
-    except Exception:
-        pass
+    context = _get_cached_context()
+    cache_config = context.cache
+    if isinstance(cache_config, FlameClientCache) and cache_config.tls:
+        return cache_config.tls
     return None
 
 

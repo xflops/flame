@@ -25,7 +25,8 @@ use bytes::Bytes;
 use futures::stream;
 use serde_derive::{Deserialize, Serialize as DeriveSerialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tonic::transport::{Channel, Uri};
+use tonic::transport::Channel;
+use tonic::Request;
 use url::Url;
 
 use crate::apis::flame::v1::object_cache_service_client::ObjectCacheServiceClient;
@@ -40,6 +41,7 @@ const WILDCARD_SESSION: &str = "*";
 const DEFAULT_CACHE_PORT: u16 = 9090;
 const CONNECT_TIMEOUT_SECS: u64 = 30;
 const UPLOAD_CHUNK_SIZE: usize = 1024 * 1024;
+const CACHE_TARGET_HEADER: &str = "x-flame-object-cache";
 
 /// The cache returns bytes and their client-defined type without interpreting either.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -494,10 +496,13 @@ pub async fn download_object_with_data_type(
     let tls = current_cache_tls()?;
     let mut client = ObjectCacheServiceClient::new(connect_cache(&endpoint, tls.as_ref()).await?);
     let mut stream = client
-        .get(CacheGetRequest {
-            key: reference.key.clone(),
-            client_version: 0,
-        })
+        .get(cache_request(
+            &endpoint,
+            CacheGetRequest {
+                key: reference.key.clone(),
+                client_version: 0,
+            },
+        )?)
         .await
         .map_err(|e| FlameError::Internal(format!("cache download failed: {}", e)))?
         .into_inner();
@@ -586,7 +591,7 @@ struct CacheEndpoint {
     scheme: String,
     host: String,
     port: u16,
-    authority: Option<String>,
+    target_cache: Option<String>,
 }
 
 impl CacheEndpoint {
@@ -632,7 +637,7 @@ impl CacheEndpoint {
             scheme,
             host,
             port,
-            authority: None,
+            target_cache: None,
         })
     }
 
@@ -641,9 +646,20 @@ impl CacheEndpoint {
     }
 
     fn proxy_for(mut self, origin: &Self) -> Self {
-        self.authority = Some(format!("{}:{}", origin.uri_host(), origin.port));
+        self.target_cache = Some(format!("{}:{}", origin.uri_host(), origin.port));
         self
     }
+}
+
+fn cache_request<T>(endpoint: &CacheEndpoint, message: T) -> Result<Request<T>, FlameError> {
+    let mut request = Request::new(message);
+    if let Some(target) = endpoint.target_cache.as_deref() {
+        let value = target.parse().map_err(|e| {
+            FlameError::InvalidConfig(format!("invalid cache proxy target <{}>: {}", target, e))
+        })?;
+        request.metadata_mut().insert(CACHE_TARGET_HEADER, value);
+    }
+    Ok(request)
 }
 
 fn validate_component(name: &str, value: &str, reject_wildcard: bool) -> Result<(), FlameError> {
@@ -694,26 +710,22 @@ fn cache_endpoint(cache: &FlameClientCache) -> Result<CacheEndpoint, FlameError>
 }
 
 fn current_cache_tls() -> Result<Option<FlameClientTls>, FlameError> {
-    let Ok(context) = FlameContext::from_file_with_env(None) else {
+    let Some(context) = optional_context()? else {
         return Ok(None);
     };
     Ok(context
-        .get_current_context()
-        .ok()
-        .and_then(|current| current.cache.as_ref())
+        .get_current_context()?
+        .cache
+        .as_ref()
         .and_then(|cache| cache.tls.clone()))
 }
 
 fn endpoint_for_reference(reference_endpoint: &str) -> Result<CacheEndpoint, FlameError> {
     let origin = CacheEndpoint::parse(reference_endpoint)?;
-    let Ok(context) = FlameContext::from_file_with_env(None) else {
+    let Some(context) = optional_context()? else {
         return Ok(origin);
     };
-    let Some(cache) = context
-        .get_current_context()
-        .ok()
-        .and_then(|current| current.cache.as_ref())
-    else {
+    let Some(cache) = context.get_current_context()?.cache.as_ref() else {
         return Ok(origin);
     };
     let Some(configured_endpoint) = cache.endpoint.as_deref() else {
@@ -724,6 +736,30 @@ fn endpoint_for_reference(reference_endpoint: &str) -> Result<CacheEndpoint, Fla
     }
     let proxy = CacheEndpoint::parse(configured_endpoint)?;
     Ok(proxy.proxy_for(&origin))
+}
+
+fn optional_context() -> Result<Option<FlameContext>, FlameError> {
+    let config_path = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".flame/flame.yaml");
+    if !config_path.is_file() {
+        let has_env_config = [
+            "FLAME_ENDPOINT",
+            "FLAME_CACHE_ENDPOINT",
+            "FLAME_CA_FILE",
+            "FLAME_CERT_FILE",
+            "FLAME_KEY_FILE",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+        return if has_env_config {
+            FlameContext::from_env().map(Some)
+        } else {
+            Ok(None)
+        };
+    }
+    FlameContext::from_file_with_env(Some(config_path.to_string_lossy().into_owned())).map(Some)
 }
 
 async fn connect_cache(
@@ -745,12 +781,6 @@ async fn connect_cache(
         builder = builder
             .tls_config(tls.client_tls_config(&endpoint.host)?)
             .map_err(|e| FlameError::Internal(format!("cache TLS config error: {}", e)))?;
-    }
-
-    if let Some(authority) = endpoint.authority.as_deref() {
-        let origin = Uri::from_maybe_shared(format!("http://{authority}"))
-            .map_err(|e| FlameError::Internal(format!("invalid cache proxy authority: {}", e)))?;
-        builder = builder.origin(origin);
     }
 
     builder
@@ -813,9 +843,9 @@ async fn do_put_bytes(
     let input = write_bytes_stream(key, data, data_type);
     let mut client = ObjectCacheServiceClient::new(connect_cache(endpoint, tls).await?);
     let metadata = if patch {
-        client.patch(input).await
+        client.patch(cache_request(endpoint, input)?).await
     } else {
-        client.put(input).await
+        client.put(cache_request(endpoint, input)?).await
     }
     .map_err(|e| FlameError::Internal(format!("cache upload failed: {}", e)))?
     .into_inner();
@@ -856,7 +886,7 @@ async fn do_put_file(
         }
     });
     let mut client = ObjectCacheServiceClient::new(connect_cache(endpoint, tls).await?);
-    let response = client.put(input).await;
+    let response = client.put(cache_request(endpoint, input)?).await;
     if let Some(error) = read_error
         .lock()
         .expect("upload error mutex poisoned")
@@ -910,10 +940,13 @@ pub async fn get_object_bytes(reference: &ObjectRef) -> Result<ObjectBytes, Flam
     let tls = current_cache_tls()?;
     let mut client = ObjectCacheServiceClient::new(connect_cache(&endpoint, tls.as_ref()).await?);
     let mut stream = client
-        .get(CacheGetRequest {
-            key: reference.key.clone(),
-            client_version: 0,
-        })
+        .get(cache_request(
+            &endpoint,
+            CacheGetRequest {
+                key: reference.key.clone(),
+                client_version: 0,
+            },
+        )?)
         .await
         .map_err(|e| FlameError::Internal(format!("cache get failed: {}", e)))?
         .into_inner();
@@ -1113,18 +1146,28 @@ mod tests {
         assert_eq!(endpoint.scheme, "grpcs");
         assert_eq!(endpoint.host, "cache.example.com");
         assert_eq!(endpoint.port, 9443);
-        assert!(endpoint.authority.is_none());
+        assert!(endpoint.target_cache.is_none());
     }
 
     #[test]
     fn cache_endpoint_accepts_grpcs_proxy() {
         let proxy = CacheEndpoint::parse("grpcs-proxy://gateway.example.com:9090").unwrap();
         let origin = CacheEndpoint::parse("grpc://cache-0.cache:9090").unwrap();
-        let routed = proxy.proxy_for(&origin);
+        let routed = proxy.clone().proxy_for(&origin);
         assert_eq!(routed.scheme, "grpcs-proxy");
         assert_eq!(routed.host, "gateway.example.com");
         assert_eq!(routed.port, 9090);
-        assert_eq!(routed.authority.as_deref(), Some("cache-0.cache:9090"));
+        assert_eq!(routed.target_cache.as_deref(), Some("cache-0.cache:9090"));
+        let request = cache_request(&routed, CacheGetRequest::default()).unwrap();
+        assert_eq!(
+            request.metadata().get(CACHE_TARGET_HEADER).unwrap(),
+            "cache-0.cache:9090"
+        );
+        assert!(cache_request(&proxy, CacheGetRequest::default())
+            .unwrap()
+            .metadata()
+            .get(CACHE_TARGET_HEADER)
+            .is_none());
     }
 
     #[test]
@@ -1141,6 +1184,70 @@ mod tests {
         let endpoint = CacheEndpoint::parse("grpc://[2001:db8::1]:9090").unwrap();
         assert_eq!(endpoint.host, "2001:db8::1");
         assert_eq!(endpoint.uri_host(), "[2001:db8::1]");
+    }
+
+    #[test]
+    fn env_only_context_routes_references() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("object::tests::env_only_context_child")
+            .env("FLAME_ENV_CONTEXT_CHILD", "1")
+            .env(
+                "HOME",
+                std::env::temp_dir().join("flame-env-only-no-config"),
+            )
+            .env("FLAME_ENDPOINT", "http://session.example.com:8080")
+            .env(
+                "FLAME_CACHE_ENDPOINT",
+                "grpcs-proxy://gateway.example.com:9443",
+            )
+            .env("FLAME_CERT_FILE", "client.crt")
+            .env("FLAME_KEY_FILE", "client.key")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn env_only_context_child() {
+        if std::env::var_os("FLAME_ENV_CONTEXT_CHILD").is_none() {
+            return;
+        }
+        let endpoint = endpoint_for_reference("grpc://cache-0.cache:9090").unwrap();
+        assert_eq!(endpoint.host, "gateway.example.com");
+        assert_eq!(endpoint.target_cache.as_deref(), Some("cache-0.cache:9090"));
+        let tls = current_cache_tls().unwrap().unwrap();
+        assert_eq!(tls.cert_file.as_deref(), Some("client.crt"));
+        assert_eq!(tls.key_file.as_deref(), Some("client.key"));
+    }
+
+    #[test]
+    fn incomplete_env_context_fails_closed() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("object::tests::incomplete_env_context_child")
+            .env("FLAME_INCOMPLETE_ENV_CHILD", "1")
+            .env(
+                "HOME",
+                std::env::temp_dir().join("flame-env-only-no-config"),
+            )
+            .env_remove("FLAME_ENDPOINT")
+            .env(
+                "FLAME_CACHE_ENDPOINT",
+                "grpcs-proxy://gateway.example.com:9443",
+            )
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn incomplete_env_context_child() {
+        if std::env::var_os("FLAME_INCOMPLETE_ENV_CHILD").is_none() {
+            return;
+        }
+        assert!(endpoint_for_reference("grpc://cache-0.cache:9090").is_err());
+        assert!(current_cache_tls().is_err());
     }
 
     #[test]

@@ -40,10 +40,14 @@ contexts:
       endpoint: "https://flame-session-manager:8080"
       tls:
         ca_file: "/etc/flame/certs/ca.crt"
+        cert_file: "/etc/flame/certs/client.crt"
+        key_file: "/etc/flame/certs/client.key"
     cache:
       endpoint: "grpcs://flame-object-cache:9090"
       tls:
         ca_file: "/etc/flame/certs/ca.crt"
+        cert_file: "/etc/flame/certs/client.crt"
+        key_file: "/etc/flame/certs/client.key"
 ```
 
 ## Error Handling

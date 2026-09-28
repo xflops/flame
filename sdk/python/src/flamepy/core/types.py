@@ -319,6 +319,9 @@ class FlameClientTls:
         ca_file: Path to CA certificate for server verification.
                  For self-signed certificates, this must point to the CA
                  certificate that signed the server certificate.
+        cert_file: Path to the client certificate chain (PEM).
+        key_file: Path to the matching private key (PEM). Both identity files
+                  must be set together.
 
     Note:
         To disable TLS for development, use http:// instead of https://
@@ -326,6 +329,14 @@ class FlameClientTls:
     """
 
     ca_file: Optional[str] = None
+    cert_file: Optional[str] = None
+    key_file: Optional[str] = None
+
+    def validate_identity(self) -> None:
+        if self.cert_file == "" or self.key_file == "":
+            raise ValueError("TLS cert_file and key_file must not be empty")
+        if bool(self.cert_file) != bool(self.key_file):
+            raise ValueError("TLS cert_file and key_file must be configured together")
 
 
 @dataclass
@@ -335,7 +346,7 @@ class FlameClientCache:
     Attributes:
         endpoint: Cache endpoint URL. Use ``grpc://`` or ``grpcs://`` for a
             direct connection, or ``grpcs-proxy://`` to dial a TLS gRPC proxy
-            while routing object references by their original authority.
+            while routing object references by the owning cache target.
         tls: TLS configuration for cache (optional, separate from cluster TLS).
         storage: Local storage path for cache (optional).
     """
@@ -375,6 +386,8 @@ class FlameContext:
           endpoint: "grpcs://flame-object-cache:9090"
           tls:
             ca_file: "/etc/flame/certs/cache-ca.crt"
+            cert_file: "/etc/flame/certs/client.crt"
+            key_file: "/etc/flame/certs/client.key"
         package:
           storage: "file:///var/lib/flame/packages"
     ```
@@ -413,6 +426,8 @@ class FlameContext:
                         if cluster_tls is not None:
                             self._cluster_tls = FlameClientTls(
                                 ca_file=cluster_tls.get("ca_file"),
+                                cert_file=cluster_tls.get("cert_file"),
+                                key_file=cluster_tls.get("key_file"),
                             )
 
                         # Parse cache configuration
@@ -422,6 +437,8 @@ class FlameContext:
                             if cache_tls is not None:
                                 self._cache_tls = FlameClientTls(
                                     ca_file=cache_tls.get("ca_file"),
+                                    cert_file=cache_tls.get("cert_file"),
+                                    key_file=cache_tls.get("key_file"),
                                 )
                             self._cache = FlameClientCache(
                                 endpoint=cache_config.get("endpoint"),
@@ -458,6 +475,8 @@ class FlameContext:
         - FLAME_CACHE_ENDPOINT: Cache endpoint URL
         - FLAME_CACHE_STORAGE: Cache storage path
         - FLAME_CA_FILE: CA certificate file for TLS (applies to both cluster and cache)
+        - FLAME_CERT_FILE: Client certificate chain (applies to both cluster and cache)
+        - FLAME_KEY_FILE: Client private key (applies to both cluster and cache)
         """
         # Handle FLAME_CA_FILE first so TLS config is ready for cache
         ca_file = os.getenv("FLAME_CA_FILE")
@@ -472,6 +491,24 @@ class FlameContext:
                 self._cache_tls = FlameClientTls(ca_file=ca_file)
             elif self._cache_tls.ca_file is None:
                 self._cache_tls.ca_file = ca_file
+
+        cert_file = os.getenv("FLAME_CERT_FILE")
+        key_file = os.getenv("FLAME_KEY_FILE")
+        if cert_file is not None or key_file is not None:
+            if self._cluster_tls is None:
+                self._cluster_tls = FlameClientTls()
+            if self._cache_tls is None:
+                self._cache_tls = FlameClientTls()
+            if cert_file is not None:
+                if self._cluster_tls.cert_file is None:
+                    self._cluster_tls.cert_file = cert_file
+                if self._cache_tls.cert_file is None:
+                    self._cache_tls.cert_file = cert_file
+            if key_file is not None:
+                if self._cluster_tls.key_file is None:
+                    self._cluster_tls.key_file = key_file
+                if self._cache_tls.key_file is None:
+                    self._cache_tls.key_file = key_file
 
         # Override/set endpoint
         endpoint = os.getenv("FLAME_ENDPOINT")
@@ -521,7 +558,7 @@ class FlameContext:
         """Get the cache configuration."""
         if self._cache is not None:
             return self._cache
-        return FlameClientCache(endpoint=DEFAULT_FLAME_CACHE_ENDPOINT)
+        return FlameClientCache(endpoint=DEFAULT_FLAME_CACHE_ENDPOINT, tls=self._cache_tls)
 
     @property
     def cache_endpoint(self) -> str:
