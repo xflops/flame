@@ -15,13 +15,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::model::{ApplicationFilter, Executor};
-use crate::FlameError;
-use common::apis::{
+use crate::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationState, CommonData, Event,
     ExecutorID, ExecutorState, Node, Session, SessionAttributes, SessionID, Task, TaskGID,
     TaskInput, TaskOptions, TaskOutput, TaskResult, TaskState,
 };
+use crate::apis::{ApplicationFilter, Executor};
+use crate::FlameError;
 
 mod filesystem;
 mod none;

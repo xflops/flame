@@ -13,9 +13,9 @@ limitations under the License.
 
 #[cfg(test)]
 mod tests {
+    use crate::apis::ApplicationAttributes;
+    use crate::ctx::{FlameCluster, FlameClusterContext};
     use crate::storage;
-    use common::apis::ApplicationAttributes;
-    use common::ctx::{FlameCluster, FlameClusterContext};
 
     fn test_context() -> FlameClusterContext {
         FlameClusterContext {
@@ -126,7 +126,7 @@ mod tests {
 
     mod update_application {
         use super::*;
-        use common::apis::ApplicationState;
+        use crate::apis::ApplicationState;
 
         #[tokio::test]
         async fn updates_existing_application() {
@@ -176,7 +176,7 @@ mod tests {
                     },
                 )
                 .await;
-            assert!(matches!(result, Err(common::FlameError::InvalidState(_))));
+            assert!(matches!(result, Err(crate::FlameError::InvalidState(_))));
 
             let unchanged = storage
                 .get_application("disabled-app".to_string())
@@ -189,9 +189,7 @@ mod tests {
 
     mod application_lifecycle {
         use super::*;
-        use common::apis::{
-            ApplicationState, ResourceRequirement, SessionAttributes, SessionState,
-        };
+        use crate::apis::{ApplicationState, ResourceRequirement, SessionAttributes, SessionState};
 
         fn create_session_attr(id: &str, app: &str) -> SessionAttributes {
             SessionAttributes {
@@ -260,20 +258,18 @@ mod tests {
                 .await
                 .unwrap();
 
-            let open_sessions = crate::model::SessionFilter::by_application_state(
-                "cleanup-app",
-                SessionState::Open,
-            );
+            let open_sessions =
+                crate::apis::SessionFilter::by_application_state("cleanup-app", SessionState::Open);
             assert_eq!(storage.count_session(&open_sessions).unwrap(), 1);
             let result = storage.delete_application("cleanup-app".to_string()).await;
-            assert!(matches!(result, Err(common::FlameError::InvalidState(_))));
+            assert!(matches!(result, Err(crate::FlameError::InvalidState(_))));
 
             storage
                 .close_session("cleanup-ssn".to_string())
                 .await
                 .unwrap();
             let result = storage.delete_application("cleanup-app".to_string()).await;
-            assert!(matches!(result, Err(common::FlameError::InvalidState(_))));
+            assert!(matches!(result, Err(crate::FlameError::InvalidState(_))));
             assert_eq!(storage.list_sessions(None).unwrap().len(), 1);
 
             storage
@@ -297,7 +293,7 @@ mod tests {
                 .unwrap();
 
             let result = storage.delete_application("enabled-app".to_string()).await;
-            assert!(matches!(result, Err(common::FlameError::InvalidState(_))));
+            assert!(matches!(result, Err(crate::FlameError::InvalidState(_))));
         }
     }
 
@@ -349,13 +345,13 @@ mod tests {
             storage
                 .update_application_state(
                     "disabled-app".to_string(),
-                    common::apis::ApplicationState::Disabled,
+                    crate::apis::ApplicationState::Disabled,
                 )
                 .await
                 .unwrap();
 
             let filter =
-                crate::model::ApplicationFilter::by_state(common::apis::ApplicationState::Disabled);
+                crate::apis::ApplicationFilter::by_state(crate::apis::ApplicationState::Disabled);
             let apps = storage.list_applications(Some(&filter)).await.unwrap();
             assert_eq!(apps.len(), 1);
             assert_eq!(apps[0].name, "disabled-app");

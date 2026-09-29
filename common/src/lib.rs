@@ -14,6 +14,7 @@ limitations under the License.
 pub mod apis;
 pub mod application;
 pub mod ctx;
+pub mod events;
 pub mod net;
 pub mod pprof;
 pub mod python;

@@ -13,9 +13,9 @@ limitations under the License.
 
 #[cfg(test)]
 mod tests {
+    use crate::apis::{ResourceRequirement, SessionAttributes, TaskResult, TaskState};
+    use crate::ctx::{FlameCluster, FlameClusterContext};
     use crate::storage;
-    use common::apis::{ResourceRequirement, SessionAttributes, TaskResult, TaskState};
-    use common::ctx::{FlameCluster, FlameClusterContext};
     use stdng::lock_ptr;
 
     fn test_context() -> FlameClusterContext {
@@ -93,7 +93,7 @@ mod tests {
                 .create_task(
                     "task-affinity-ssn".to_string(),
                     None,
-                    Some(common::apis::TaskOptions {
+                    Some(crate::apis::TaskOptions {
                         affinity: affinity.clone(),
                     }),
                 )
@@ -107,7 +107,7 @@ mod tests {
             let session = lock_ptr!(session).unwrap();
             let pending = session
                 .tasks_index
-                .get(&common::apis::TaskState::Pending)
+                .get(&crate::apis::TaskState::Pending)
                 .unwrap();
             assert_eq!(pending.len(), 1);
             assert_eq!(
@@ -207,7 +207,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let gid = common::apis::TaskGID {
+            let gid = crate::apis::TaskGID {
                 ssn_id: "ptr-task-ssn".to_string(),
                 task_id: created_task.id,
             };
@@ -281,7 +281,7 @@ mod tests {
             let ssn_ptr = storage
                 .get_session_ptr("update-state-ssn".to_string())
                 .unwrap();
-            let gid = common::apis::TaskGID {
+            let gid = crate::apis::TaskGID {
                 ssn_id: "update-state-ssn".to_string(),
                 task_id: task.id,
             };
@@ -314,7 +314,7 @@ mod tests {
             let ssn_ptr = storage
                 .get_session_ptr("state-msg-ssn".to_string())
                 .unwrap();
-            let gid = common::apis::TaskGID {
+            let gid = crate::apis::TaskGID {
                 ssn_id: "state-msg-ssn".to_string(),
                 task_id: task.id,
             };
@@ -354,7 +354,7 @@ mod tests {
                 .unwrap();
 
             let ssn_ptr = storage.get_session_ptr("result-ssn".to_string()).unwrap();
-            let gid = common::apis::TaskGID {
+            let gid = crate::apis::TaskGID {
                 ssn_id: "result-ssn".to_string(),
                 task_id: task.id,
             };
@@ -393,7 +393,7 @@ mod tests {
             let ssn_ptr = storage
                 .get_session_ptr("fail-result-ssn".to_string())
                 .unwrap();
-            let gid = common::apis::TaskGID {
+            let gid = crate::apis::TaskGID {
                 ssn_id: "fail-result-ssn".to_string(),
                 task_id: task.id,
             };

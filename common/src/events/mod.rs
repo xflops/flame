@@ -13,8 +13,8 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use common::apis::{Event, EventOwner, SessionID};
-use common::FlameError;
+use crate::apis::{Event, EventOwner, SessionID};
+use crate::FlameError;
 
 mod fs;
 mod memory;
