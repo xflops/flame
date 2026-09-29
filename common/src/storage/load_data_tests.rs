@@ -13,19 +13,19 @@ limitations under the License.
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
-    use chrono::Utc;
-    use common::apis::{
+    use crate::apis::{
         ApplicationAttributes, ExecutorState, Node, NodeInfo, NodeState, ResourceRequirement,
         SessionAttributes, Shim, TaskOptions,
     };
-    use common::ctx::{FlameCluster, FlameClusterContext, FlameExecutors, FlameLimits};
-    use common::FlameError;
+    use crate::ctx::{FlameCluster, FlameClusterContext, FlameExecutors, FlameLimits};
+    use crate::FlameError;
+    use bytes::Bytes;
+    use chrono::Utc;
     use std::collections::HashSet;
     use stdng::lock_ptr;
 
-    use crate::model::Executor;
-    use crate::storage::engine::{Engine, SqliteEngine};
+    use crate::apis::Executor;
+    use crate::storage::engine::SqliteEngine;
 
     fn create_test_context(db_url: &str) -> FlameClusterContext {
         FlameClusterContext {
@@ -53,7 +53,7 @@ mod tests {
 
     #[test]
     fn test_load_data_resets_binding_executor_to_idle() -> Result<(), FlameError> {
-        let url = common::temp_sqlite_url("flame_test_load_data_binding_recovery");
+        let url = crate::temp_sqlite_url("flame_test_load_data_binding_recovery");
 
         let engine = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
 
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn test_load_data_preserves_other_executor_states() -> Result<(), FlameError> {
-        let url = common::temp_sqlite_url("flame_test_load_data_preserves_states");
+        let url = crate::temp_sqlite_url("flame_test_load_data_preserves_states");
 
         let engine = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
 
@@ -217,7 +217,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_data_restores_pending_task_affinity() -> Result<(), FlameError> {
-        let url = common::temp_sqlite_url("flame_test_load_data_affinity");
+        let url = crate::temp_sqlite_url("flame_test_load_data_affinity");
         let ctx = create_test_context(&url);
         let storage = crate::storage::new_ptr(&ctx).await?;
         storage
@@ -250,7 +250,7 @@ mod tests {
         let session = lock_ptr!(session)?;
         let pending = session
             .tasks_index
-            .get(&common::apis::TaskState::Pending)
+            .get(&crate::apis::TaskState::Pending)
             .expect("recovered session must contain Pending tasks");
         assert_eq!(pending.len(), 2);
         for task in pending.values() {

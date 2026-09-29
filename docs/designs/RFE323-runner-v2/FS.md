@@ -298,11 +298,11 @@ No changes required. The executor manager continues to handle executor lifecycle
 5. **session_manager (Rust)**:
    
    **a. Database Migration:**
-   - Create `session_manager/migrations/sqlite/20260123000000_add_session_instances.sql`
+   - Create `common/migrations/sqlite/20260123000000_add_session_instances.sql`
    - Add `min_instances INTEGER NOT NULL DEFAULT 0` column
    - Add `max_instances INTEGER` column (NULL means unlimited)
    
-   **b. Storage Layer (`session_manager/src/storage/engine/`):**
+   **b. Storage Layer (`common/src/storage/engine/`):**
    - Update `SessionDao` struct in `types.rs`:
      - Add `min_instances: i64` field
      - Add `max_instances: Option<i64>` field
@@ -653,7 +653,7 @@ ADD COLUMN max_instances INTEGER;  -- NULL means unlimited
 
 **SessionDao Struct (Rust - storage layer):**
 
-Current SessionDao in `session_manager/src/storage/engine/types.rs` (after the slots-cleanup refactor; `slots: i64` was removed and replaced with `resreq_cpu` / `resreq_memory` / `resreq_gpu`):
+Current SessionDao in `common/src/storage/engine/types.rs` (after the slots-cleanup refactor; `slots: i64` was removed and replaced with `resreq_cpu` / `resreq_memory` / `resreq_gpu`):
 ```rust
 #[derive(Clone, FromRow, Debug)]
 pub struct SessionDao {
@@ -1245,16 +1245,16 @@ if let Some(max_instances) = ssn.max_instances {
 **Operational:**
 - **Deployment**: Requires database migration to add `min_instances` and `max_instances` columns to session table
 - **Database Migration**: 
-  - Migration file: `session_manager/migrations/sqlite/20260123000000_add_session_instances.sql`
+  - Migration file: `common/migrations/sqlite/20260123000000_add_session_instances.sql`
   - Add `min_instances INTEGER NOT NULL DEFAULT 0` column
   - Add `max_instances INTEGER` column (NULL for unlimited)
   - Existing sessions will automatically get default values (min=0, max=NULL) upon migration
   - Migration can be applied before deploying new session manager (forward-compatible)
   - No downtime required - SQLx handles schema evolution
 - **Code Updates**:
-  - Update `SessionDao` struct in `session_manager/src/storage/engine/types.rs`
+  - Update `SessionDao` struct in `common/src/storage/engine/types.rs`
   - Update `Session` struct in `common/src/apis.rs`
-  - Update INSERT query in `session_manager/src/storage/engine/sqlite.rs`
+  - Update INSERT query in `common/src/storage/engine/sqlite.rs`
   - Update `TryFrom<SessionDao>` implementation to map new fields
 - **Configuration**: New parameters are optional with sensible defaults
 - **Migration Path**: Existing code continues to work unchanged with defaults
@@ -1460,9 +1460,9 @@ with Runner("image-processor") as runner:
 - Core client: `sdk/python/src/flamepy/core/client.py` (create_session)
 
 **Session Manager:**
-- Migration script: `session_manager/migrations/sqlite/20260123000000_add_session_instances.sql`
-- SessionDao struct: `session_manager/src/storage/engine/types.rs`
-- SQLite storage: `session_manager/src/storage/engine/sqlite.rs` (INSERT query around line 384)
+- Migration script: `common/migrations/sqlite/20260123000000_add_session_instances.sql`
+- SessionDao struct: `common/src/storage/engine/types.rs`
+- SQLite storage: `common/src/storage/engine/sqlite.rs` (INSERT query around line 384)
 - SessionInfo struct: `session_manager/src/model/mod.rs`
 - Session manager: `session_manager/src/manager.rs`
 - Scheduler: `session_manager/src/scheduler/` (main scheduler logic)

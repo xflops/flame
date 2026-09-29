@@ -13,12 +13,12 @@ limitations under the License.
 
 #[cfg(test)]
 mod tests {
-    use crate::storage;
-    use common::apis::{
+    use crate::apis::{
         ApplicationAttributes, Node, NodeState, ResourceRequirement, SessionAttributes,
         SessionState, TaskOptions, TaskState,
     };
-    use common::ctx::{FlameCluster, FlameClusterContext};
+    use crate::ctx::{FlameCluster, FlameClusterContext};
+    use crate::storage;
     use stdng::lock_ptr;
 
     fn test_context() -> FlameClusterContext {

@@ -19,7 +19,7 @@ limitations under the License.
 
 #[cfg(test)]
 mod tests {
-    use common::apis::{Node, NodeInfo, NodeState, ResourceRequirement};
+    use crate::apis::{Node, NodeInfo, NodeState, ResourceRequirement};
 
     /// Test that node status can be properly constructed from node data.
     /// This verifies the fix in stream_handler.rs where heartbeats now include

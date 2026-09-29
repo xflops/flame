@@ -517,7 +517,7 @@ fi
 
         println!("🗄️  Installing database migrations...");
 
-        let migrations_src = src_dir.join("session_manager/migrations/sqlite");
+        let migrations_src = src_dir.join("common/migrations/sqlite");
         if !migrations_src.exists() {
             anyhow::bail!("Migrations source not found at: {:?}", migrations_src);
         }

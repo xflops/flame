@@ -15,13 +15,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::model::{ApplicationFilter, Executor};
-use crate::FlameError;
-use common::apis::{
-    Application, ApplicationAttributes, ApplicationID, ApplicationState, CommonData, Event,
-    ExecutorID, ExecutorState, Node, Session, SessionAttributes, SessionID, Task, TaskGID,
-    TaskInput, TaskOptions, TaskOutput, TaskResult, TaskState,
+use crate::apis::{
+    Application, ApplicationAttributes, ApplicationID, ApplicationState, ExecutorID, ExecutorState,
+    Node, Session, SessionAttributes, SessionID, Task, TaskGID, TaskInput, TaskOptions, TaskResult,
+    TaskState,
 };
+use crate::apis::{ApplicationFilter, Executor};
+use crate::FlameError;
 
 mod filesystem;
 mod none;
@@ -77,6 +77,7 @@ pub trait Engine: Send + Sync + 'static {
         options: Option<TaskOptions>,
     ) -> Result<Task, FlameError>;
 
+    #[allow(dead_code)]
     async fn get_task(&self, gid: TaskGID) -> Result<Task, FlameError>;
 
     async fn retry_task(&self, gid: TaskGID) -> Result<Task, FlameError>;
@@ -98,6 +99,7 @@ pub trait Engine: Send + Sync + 'static {
 
     // Node operations
     async fn create_node(&self, node: &Node) -> Result<Node, FlameError>;
+    #[allow(dead_code)]
     async fn get_node(&self, name: &str) -> Result<Option<Node>, FlameError>;
     async fn update_node(&self, node: &Node) -> Result<Node, FlameError>;
     async fn delete_node(&self, name: &str) -> Result<(), FlameError>;
@@ -105,8 +107,10 @@ pub trait Engine: Send + Sync + 'static {
 
     // Executor operations
     async fn create_executor(&self, executor: &Executor) -> Result<Executor, FlameError>;
+    #[allow(dead_code)]
     async fn get_executor(&self, id: &ExecutorID) -> Result<Option<Executor>, FlameError>;
     async fn update_executor(&self, executor: &Executor) -> Result<Executor, FlameError>;
+    #[allow(dead_code)]
     async fn update_executor_state(
         &self,
         id: &ExecutorID,

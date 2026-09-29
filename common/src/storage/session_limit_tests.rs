@@ -13,10 +13,9 @@ limitations under the License.
 
 #[cfg(test)]
 mod tests {
+    use crate::apis::{SessionAttributes, SessionState};
+    use crate::ctx::{FlameCluster, FlameClusterContext, FlameLimits};
     use crate::storage;
-    use common::apis::{SessionAttributes, SessionState};
-    use common::ctx::{FlameCluster, FlameClusterContext, FlameLimits};
-    use stdng::lock_ptr;
 
     fn test_context_with_limit(max_sessions: Option<usize>) -> FlameClusterContext {
         FlameClusterContext {

@@ -16,15 +16,15 @@ use serde::{Deserialize, Serialize};
 use sqlx::{types::Json, FromRow};
 use std::collections::{HashMap, HashSet};
 
-use crate::FlameError;
-use bytes::Bytes;
-use common::apis::{
+use crate::apis::{
     Application, ApplicationSchema, ApplicationState, ExecutorState, Node, NodeInfo, NodeState,
     ResourceRequirement, Session, SessionStatus, Shim, Task,
 };
-use common::apis::{ApplicationID, Event, ExecutorID, SessionID, TaskID};
+use crate::apis::{ApplicationID, Event, ExecutorID, SessionID, TaskID};
+use crate::FlameError;
+use bytes::Bytes;
 
-use crate::model::Executor;
+use crate::apis::Executor;
 
 #[derive(Clone, FromRow, Debug)]
 pub struct EventDao {

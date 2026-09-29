@@ -20,12 +20,11 @@ use common::FlameError;
 mod apiserver;
 mod applications;
 mod controller;
-mod events;
 mod model;
 mod notify;
 mod provider;
-pub mod scheduler;
-mod storage;
+mod scheduler;
+use common::storage;
 
 #[derive(Parser)]
 #[command(name = "flame-session-manager")]

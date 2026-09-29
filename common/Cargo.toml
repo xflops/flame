@@ -18,6 +18,9 @@ tracing-appender = { workspace = true }
 gethostname = { workspace = true }
 bincode = { workspace = true }
 async-trait = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+crc32fast = "1.3"
 
 time = { workspace = true }
 bytes = { workspace = true }
@@ -41,3 +44,5 @@ pprof = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio-test = "*"
+rand = { workspace = true }

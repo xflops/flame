@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use stdng::{lock_ptr, new_ptr, MutexPtr};
 
-use common::apis::{Event, EventOwner, SessionID, TaskID};
-use common::FlameError;
+use crate::apis::{Event, EventOwner, SessionID, TaskID};
+use crate::FlameError;
 
 use super::EventManager;
 

@@ -49,15 +49,15 @@ use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use common::apis::{
+use crate::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationSchema, ApplicationState,
     ExecutorID, ExecutorState, Node, NodeInfo, NodeState, ResourceRequirement, Session,
     SessionAttributes, SessionID, SessionState, SessionStatus, Shim, Task, TaskGID, TaskID,
-    TaskInput, TaskOptions, TaskOutput, TaskResult, TaskState,
+    TaskInput, TaskOptions, TaskResult, TaskState,
 };
-use common::{FlameError, FLAME_HOME};
+use crate::{FlameError, FLAME_HOME};
 
-use crate::model::{ApplicationFilter, Executor, SessionFilter, TaskFilter};
+use crate::apis::{ApplicationFilter, Executor, SessionFilter, TaskFilter};
 use crate::storage::engine::{Engine, EnginePtr};
 
 /// Task metadata stored in tasks.bin with fixed-size records.
@@ -2447,7 +2447,7 @@ mod tests {
         };
         engine.create_node(&node).await.unwrap();
 
-        let executor = crate::model::Executor {
+        let executor = crate::apis::Executor {
             id: "exec-1".to_string(),
             node: "exec-test-node".to_string(),
             resreq: ResourceRequirement {
@@ -2520,7 +2520,7 @@ mod tests {
         engine.create_node(&node).await.unwrap();
 
         for i in 1..=3 {
-            let executor = crate::model::Executor {
+            let executor = crate::apis::Executor {
                 id: format!("cascade-exec-{i}"),
                 node: "cascade-node".to_string(),
                 resreq: ResourceRequirement {

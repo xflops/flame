@@ -18,9 +18,9 @@ use bincode::{Decode, Encode};
 use chrono::{DateTime, Utc};
 use stdng::{lock_ptr, new_ptr, MutexPtr};
 
-use common::apis::{Event, EventOwner, SessionID, TaskID};
-use common::storage::{DataStorage, Index, Object, ObjectId, ObjectStorage};
-use common::FlameError;
+use crate::apis::{Event, EventOwner, SessionID, TaskID};
+use crate::storage::{DataStorage, Index, Object, ObjectId, ObjectStorage};
+use crate::FlameError;
 
 use super::EventManager;
 
@@ -62,7 +62,7 @@ impl FsEventManager {
     pub fn new(path: &str) -> Result<Self, FlameError> {
         fs::create_dir_all(path)?;
 
-        let mut manager = Self {
+        let manager = Self {
             storage_path: path.to_string(),
             event_storage: new_ptr(HashMap::new()),
             events: new_ptr(HashMap::new()),

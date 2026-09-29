@@ -13,13 +13,13 @@ limitations under the License.
 
 #[cfg(test)]
 mod tests {
-    use crate::model::{Executor, ExecutorFilter};
-    use crate::storage;
-    use common::apis::{
+    use crate::apis::ExecutorFilter;
+    use crate::apis::{
         ApplicationAttributes, ExecutorState, Node, NodeState, ResourceRequirement,
         SessionAttributes, Shim,
     };
-    use common::ctx::{FlameCluster, FlameClusterContext};
+    use crate::ctx::{FlameCluster, FlameClusterContext};
+    use crate::storage;
     use stdng::lock_ptr;
 
     fn test_context() -> FlameClusterContext {

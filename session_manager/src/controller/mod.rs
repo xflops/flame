@@ -11,6 +11,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod snapshot;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -27,8 +29,9 @@ use stdng::{lock_ptr, logs::TraceFn, trace_fn};
 use ::rpc::flame::v1 as rpc;
 
 use crate::model::{
-    ConnectionCallbacks, ConnectionState, Executor, ExecutorFilter, ExecutorPtr, NodeConnectionPtr,
-    NodeConnectionReceiver, NodeConnectionSender, NodeInfoPtr, SessionInfoPtr, SnapShotPtr,
+    AppInfo, ConnectionCallbacks, ConnectionState, Executor, ExecutorFilter, ExecutorInfo,
+    ExecutorPtr, NodeConnectionPtr, NodeConnectionReceiver, NodeConnectionSender, NodeInfo,
+    NodeInfoPtr, SessionInfo, SessionInfoPtr, SnapShot, SnapShotPtr,
 };
 use crate::notify::{NotifyManager, NotifyManagerPtr, TaskSubscription};
 use crate::storage::StoragePtr;
@@ -561,7 +564,25 @@ impl Controller {
     }
 
     pub fn snapshot(&self) -> Result<SnapShotPtr, FlameError> {
-        self.storage.snapshot()
+        let data = self.storage.snapshot()?;
+        let snapshot = Arc::new(SnapShot::new_with_session_retry_limits(
+            self.storage.session_retry_limits(),
+        ));
+
+        for application in &data.applications {
+            snapshot.add_application(Arc::new(AppInfo::from(application)))?;
+        }
+        for session in &data.sessions {
+            snapshot.add_session(Arc::new(SessionInfo::try_from(session)?))?;
+        }
+        for executor in &data.executors {
+            snapshot.add_executor(Arc::new(ExecutorInfo::from(executor)))?;
+        }
+        for node in &data.nodes {
+            snapshot.add_node(Arc::new(NodeInfo::from(node)))?;
+        }
+
+        Ok(snapshot)
     }
 
     pub async fn get_application(&self, id: ApplicationID) -> Result<Application, FlameError> {

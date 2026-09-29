@@ -35,13 +35,13 @@ use chrono::Utc;
 
 use stdng::{lock_ptr, MutexPtr};
 
-use crate::model::{ApplicationFilter, Executor, SessionFilter};
-use crate::FlameError;
-use common::apis::{
+use crate::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationState, ExecutorID, ExecutorState,
     Node, Session, SessionAttributes, SessionID, SessionState, SessionStatus, Task, TaskGID,
-    TaskID, TaskInput, TaskOptions, TaskOutput, TaskResult, TaskState,
+    TaskID, TaskInput, TaskOptions, TaskResult, TaskState,
 };
+use crate::apis::{ApplicationFilter, Executor};
+use crate::FlameError;
 
 use super::{Engine, EnginePtr};
 
