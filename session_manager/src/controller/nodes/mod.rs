@@ -128,7 +128,6 @@ mod tests {
                 executors: FlameExecutors {
                     shim: Shim::default(),
                 },
-                tls: None,
                 limits: FlameLimits {
                     max_sessions: None,
                     max_executors: 10,
@@ -137,6 +136,7 @@ mod tests {
                 pprof: None,
             },
             cache: None,
+            security: None,
         };
 
         crate::storage::new_ptr(&ctx).await.unwrap()

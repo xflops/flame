@@ -163,7 +163,6 @@ impl Shim for GrpcShim {
 
         if let Some(ref mut client) = self.client {
             let req = Request::new(rpc::SessionContext::from(ctx.clone()));
-            tracing::debug!("req: {:?}", req);
             let resp = client.on_session_enter(req).await?;
             let output = resp.into_inner();
             let result = output.result.unwrap_or_default();
@@ -274,7 +273,7 @@ mod tests {
             arguments: vec![],
             working_directory: None,
             environments: HashMap::new(),
-            url: None,
+            package: None,
             installer: None,
         };
 
@@ -341,7 +340,7 @@ mod tests {
                 arguments: vec![],
                 working_directory: None,
                 environments: HashMap::new(),
-                url: None,
+                package: None,
                 installer: None,
             },
             common_data: None,

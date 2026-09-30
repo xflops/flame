@@ -10,6 +10,8 @@ services:
     volumes:
       - ./ci/docker/flame-cluster.yaml:/root/.flame/flame-cluster.yaml
       - ./ci/docker/certs:/etc/flame/certs:ro
+      - ./ci/docker/applications/flmrun.yaml:/usr/local/flame/conf/applications/flmrun.yaml:ro
+      - ./ci/docker/applications/flmexec.yaml:/usr/local/flame/conf/applications/flmexec.yaml:ro
       - ./logs:/usr/local/flame/logs
     ports:
       - 8080:8080
@@ -18,6 +20,7 @@ services:
 
   flame-object-cache:
     image: xflops/flame-object-cache:${FLAME_IMAGE_TAG:-dev}
+    hostname: cache-node
     pull_policy: build
     build:
       context: .
@@ -44,6 +47,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.fem
+    entrypoint: ["/usr/bin/dumb-init", "--", "/bin/sh", "/usr/local/flame/bin/executor-manager-entrypoint.sh"]
     environment:
       - RUST_LOG=info
     deploy:

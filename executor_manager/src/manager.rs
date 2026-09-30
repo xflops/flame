@@ -44,14 +44,12 @@ impl ExecutorManager {
 
         let client = BackendClient::new(ctx).await?;
 
-        let cache_tls = match &ctx.cache {
-            Some(cache) => match &cache.tls {
-                Some(tls) => Some(tls.client_tls_config()?),
-                None => None,
-            },
-            None => None,
-        };
-        let app_manager = Arc::new(ApplicationManager::new_with_tls(cache_tls)?);
+        let executor_tls = ctx
+            .security
+            .as_ref()
+            .map(|security| security.tls.client_tls_config())
+            .transpose()?;
+        let app_manager = Arc::new(ApplicationManager::new_with_tls(executor_tls)?);
 
         Ok(Self {
             ctx: ctx.clone(),

@@ -9,6 +9,10 @@ This design updates the `grpcs-proxy://` contract in
 Python and Rust SDK connections from a client to an administrator-managed
 object-cache gateway. The gateway's connection to the cache replicas, gateway
 deployment, certificate issuance, and authorization policy are separate work.
+In a secured Flame deployment, this proxy transport carries the
+`x-flame-delegation-token` or tenant mTLS for cache data operations. Client
+mTLS is used to call `Delegate(app)`. The token and `app/session/object` key rules are specified in
+[RFE392](../RFE392-mtls-rbac/FS.md).
 
 ## 1. Motivation
 

@@ -101,6 +101,22 @@ pub struct ApplicationSchema {
     pub common_data: Option<String>,
 }
 
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Package {
+    pub url: String,
+    pub signature: String,
+}
+
+impl std::fmt::Debug for Package {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Package")
+            .field("url", &self.url)
+            .field("signature", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Application {
     pub name: String,
@@ -118,7 +134,7 @@ pub struct Application {
     pub max_instances: u32,
     pub delay_release: Duration,
     pub schema: Option<ApplicationSchema>,
-    pub url: Option<String>,
+    pub package: Option<Package>,
     pub installer: Option<String>,
 }
 
@@ -135,7 +151,7 @@ pub struct ApplicationAttributes {
     pub max_instances: u32,
     pub delay_release: Duration,
     pub schema: Option<ApplicationSchema>,
-    pub url: Option<String>,
+    pub package: Option<Package>,
     pub installer: Option<String>,
 }
 
@@ -153,7 +169,7 @@ impl Default for ApplicationAttributes {
             max_instances: DEFAULT_MAX_INSTANCES,
             delay_release: DEFAULT_DELAY_RELEASE,
             schema: Some(ApplicationSchema::default()),
-            url: None,
+            package: None,
             installer: None,
         }
     }
@@ -362,7 +378,7 @@ pub struct ApplicationContext {
     pub arguments: Vec<String>,
     pub working_directory: Option<String>,
     pub environments: HashMap<String, String>,
-    pub url: Option<String>,
+    pub package: Option<Package>,
     pub installer: Option<String>,
 }
 

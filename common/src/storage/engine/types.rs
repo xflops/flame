@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::apis::{
     Application, ApplicationSchema, ApplicationState, ExecutorState, Node, NodeInfo, NodeState,
-    ResourceRequirement, Session, SessionStatus, Shim, Task,
+    Package, ResourceRequirement, Session, SessionStatus, Shim, Task,
 };
 use crate::apis::{ApplicationID, Event, ExecutorID, SessionID, TaskID};
 use crate::FlameError;
@@ -58,6 +58,7 @@ pub struct ApplicationDao {
     pub delay_release: i64,
     pub schema: Option<Json<AppSchemaDao>>,
     pub url: Option<String>,
+    pub package_signature: Option<String>,
     pub installer: Option<String>,
     pub creation_time: i64,
     pub state: i32,
@@ -263,7 +264,10 @@ impl TryFrom<&ApplicationDao> for Application {
             max_instances: app.max_instances as u32,
             delay_release: Duration::seconds(app.delay_release),
             schema: app.schema.clone().map(|arg| arg.0.into()),
-            url: app.url.clone(),
+            package: app.url.clone().map(|url| Package {
+                url,
+                signature: app.package_signature.clone().unwrap_or_default(),
+            }),
             installer: app.installer.clone(),
         })
     }

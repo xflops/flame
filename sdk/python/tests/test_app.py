@@ -23,7 +23,14 @@ from flamepy.app.client import _Runtime as Runtime
 from flamepy.app.storage import CacheStorage, FileStorage, create_storage_backend
 from flamepy.app.types import ServiceContext, ServiceRequest, ServiceResponse
 from flamepy.core import ValueRef
-from flamepy.core.types import ApplicationState, FlameError, FlameErrorCode, Shim
+from flamepy.core.types import ApplicationPackage, ApplicationState, FlameError, FlameErrorCode, Shim
+
+
+@pytest.fixture(autouse=True)
+def _insecure_app_cache(monkeypatch):
+    """Keep app unit tests independent of the developer's flame.yaml."""
+    monkeypatch.setattr(app_client, "cache_requires_signing", lambda: False)
+
 
 # App Storage Tests
 
@@ -114,7 +121,7 @@ def test_app_application_inherits_template_shim(monkeypatch, tmp_path):
     )
     monkeypatch.setattr("flamepy.app.client.create_storage_backend", lambda *args, **kwargs: storage)
     monkeypatch.setattr(Runtime, "_create_package", lambda self: str(tmp_path / "app.tar.gz"))
-    monkeypatch.setattr(Runtime, "_upload_package", lambda self: "grpc://cache/app.tar.gz")
+    monkeypatch.setattr(Runtime, "_upload_package", lambda self: ApplicationPackage(url="grpc://cache/app.tar.gz", signature="signed-key"))
     monkeypatch.setattr("flamepy.app.client.core_client.register_application", registered)
     open_session = MagicMock()
     monkeypatch.setattr("flamepy.app.client.core_client.open_session", open_session)
@@ -122,6 +129,7 @@ def test_app_application_inherits_template_shim(monkeypatch, tmp_path):
 
     attributes = registered.call_args.args[1]
     assert attributes.shim == Shim.CRI
+    assert attributes.package == ApplicationPackage(url="grpc://cache/app.tar.gz", signature="signed-key")
     assert attributes.labels is None
     assert runtime._state is _RuntimeState.ACTIVE
     assert isinstance(runtime._application_owner, _RuntimeApplicationOwner)
@@ -243,17 +251,32 @@ class TestCacheStorage:
 
         assert url == "grpc://host:9090/myapp/pkg/myapp-1.0.0.tar.gz"
 
+    def test_upload_package_carries_signature(self, monkeypatch, tmp_path):
+        from flamepy.core.cache import ObjectRef
+
+        package_file = tmp_path / "app.tar.gz"
+        package_file.write_bytes(b"package content")
+        monkeypatch.setattr(
+            "flamepy.core.cache.upload_object",
+            lambda key, file_path, endpoint=None: ObjectRef(endpoint="grpc://host:9090", key=key, version=1, signature="signed-key"),
+        )
+
+        package = CacheStorage("grpc://host:9090", app_name="myapp").upload_package(str(package_file), package_file.name)
+        assert package == ApplicationPackage(url="grpc://host:9090/myapp/pkg/app.tar.gz", signature="signed-key")
+
     def test_upload_preserves_returned_cache_endpoint(self, monkeypatch, tmp_path):
         from flamepy.core.cache import ObjectRef
 
         test_file = tmp_path / "myapp-1.0.0.tar.gz"
         test_file.write_bytes(b"package content")
 
-        def mock_upload_object(key, file_path, endpoint=None):
+        def mock_upload_object(key, file_path, endpoint=None, *, app_token=None):
             assert endpoint == "grpcs-proxy://gateway.example:443"
+            assert app_token == "signed-app"
             return ObjectRef(endpoint="grpc://10.0.0.42:9090", key=key, version=1)
 
         monkeypatch.setattr("flamepy.core.cache.upload_object", mock_upload_object)
+        monkeypatch.setattr("flamepy.core.cache.sign_app_token", lambda app, endpoint: "signed-app")
 
         storage = CacheStorage("grpcs-proxy://gateway.example:443", app_name="myapp")
         url = storage.upload(str(test_file), "myapp-1.0.0.tar.gz")
@@ -266,16 +289,33 @@ class TestCacheStorage:
         test_file = tmp_path / "myapp-1.0.0.tar.gz"
         test_file.write_bytes(b"package content")
 
-        def mock_upload_object(key, file_path, endpoint=None):
+        def mock_upload_object(key, file_path, endpoint=None, *, app_token=None):
             assert endpoint == "grpcs://cache-service:9090"
+            assert app_token == "signed-app"
             return ObjectRef(endpoint="grpc+tls://10.0.0.42:9090", key=key, version=1)
 
         monkeypatch.setattr("flamepy.core.cache.upload_object", mock_upload_object)
+        monkeypatch.setattr("flamepy.core.cache.sign_app_token", lambda app, endpoint: "signed-app")
 
         storage = CacheStorage("grpcs://cache-service:9090", app_name="myapp")
         url = storage.upload(str(test_file), "myapp-1.0.0.tar.gz")
 
         assert url == "grpcs://10.0.0.42:9090/myapp/pkg/myapp-1.0.0.tar.gz"
+
+    def test_upload_through_gateway_without_backend_signing(self, monkeypatch, tmp_path):
+        from flamepy.core.cache import ObjectRef
+
+        package = tmp_path / "myapp.tar.gz"
+        package.write_bytes(b"package content")
+
+        def mock_upload_object(key, file_path, endpoint=None):
+            assert endpoint == "grpcs-proxy://gateway.example:443"
+            return ObjectRef(endpoint="grpc://cache:9090", key=key, version=1)
+
+        monkeypatch.setattr("flamepy.core.cache.upload_object", mock_upload_object)
+        monkeypatch.setattr("flamepy.core.cache.sign_app_token", lambda app, endpoint: "")
+        storage = CacheStorage("grpcs-proxy://gateway.example:443", app_name="myapp")
+        assert storage.upload(str(package), package.name) == "grpc://cache:9090/myapp/pkg/myapp.tar.gz"
 
     def test_download(self, monkeypatch, tmp_path):
         dest_file = tmp_path / "downloaded.tar.gz"
@@ -1508,6 +1548,24 @@ def test_app_service_instance_generates_session_id(monkeypatch):
     spec = open_session_mock.call_args.kwargs["spec"]
     assert spec.id.startswith("pi-example-")
     assert isinstance(instance._session_owner, _ServiceSessionOwner)
+
+
+def test_app_service_uses_signed_cache_token_for_upload(monkeypatch):
+    from flamepy.app import ServiceInstance
+
+    put_context = MagicMock(return_value=MagicMock(encode=MagicMock(return_value=b"context")))
+    open_session = MagicMock(return_value=MagicMock(id="generated"))
+    sign = MagicMock(return_value="signed-app-token")
+    monkeypatch.setattr(app_client, "cache_requires_signing", lambda: True)
+    monkeypatch.setattr(app_client, "sign_app_token", sign)
+    monkeypatch.setattr(app_client, "_core_put_object", put_context)
+    monkeypatch.setattr(app_client.core_client, "open_session", open_session)
+
+    ServiceInstance("pi-example", lambda: None)
+
+    sign.assert_called_once_with("pi-example")
+    assert put_context.call_args.kwargs["app_token"] == "signed-app-token"
+    assert open_session.call_args.kwargs["spec"].application == "pi-example"
 
 
 def test_app_service_instance_ignores_execution_object_session_context(monkeypatch):

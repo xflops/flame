@@ -33,17 +33,22 @@ from flamepy.core.types import FlameClientCache, FlameClientTls
 from flamepy.proto import cache_pb2, cache_pb2_grpc
 
 logger = logging.getLogger(__name__)
+DELEGATION_TOKEN_HEADER = "x-flame-delegation-token"
 
 # Explicit close() is required before the owning loop exits. A channel can
 # retain its loop, so weak loop keys would not make forgotten channels safe.
 _clients: dict[asyncio.AbstractEventLoop, dict[tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]], tuple[grpc.aio.Channel, Any]]] = {}
 _clients_lock = threading.Lock()
+_app_tokens: dict[asyncio.AbstractEventLoop, dict[tuple[str, Optional[str], Optional[str], Optional[str], str], str]] = {}
+_app_token_locks: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
 
 
 def _reset_clients_after_fork() -> None:
-    global _clients, _clients_lock
+    global _clients, _clients_lock, _app_tokens, _app_token_locks
     _clients = {}
     _clients_lock = threading.Lock()
+    _app_tokens = {}
+    _app_token_locks = {}
 
 
 if hasattr(os, "register_at_fork"):
@@ -112,6 +117,8 @@ async def close() -> None:
     """Close this event loop's cache channels before the loop stops."""
     with _clients_lock:
         pool = _clients.pop(asyncio.get_running_loop(), {})
+        _app_tokens.pop(asyncio.get_running_loop(), None)
+        _app_token_locks.pop(asyncio.get_running_loop(), None)
     for channel, _ in pool.values():
         await channel.close()
 
@@ -131,15 +138,75 @@ def _configured_endpoint():
     return endpoint, tls
 
 
-async def _write_remote(client: Any, key: str, data_type: str, chunks: AsyncIterator[bytes], *, patch: bool = False, timeout: Optional[int] = None) -> ObjectRef:
+async def sign_app_token(application: str, endpoint: Optional[str] = None) -> str:
+    """Mint an app-scoped token using the configured mTLS client certificate."""
+    if not application or "/" in application or "\\" in application or ".." in application or application == "*":
+        raise ValueError("Invalid application name for cache delegation")
+    configured_endpoint, tls = _configured_endpoint()
+    endpoint = configured_endpoint if endpoint is None else endpoint
+    location, _ = common._resolve_cache_endpoint(endpoint)
+    if urlparse(location).scheme not in ("grpcs", "grpc+tls", "grpcs-proxy"):
+        raise ValueError("Cache delegation requires a TLS endpoint")
+    if tls is None or not tls.cert_file or not tls.key_file:
+        raise ValueError("Cache delegation requires an mTLS client identity")
+    response = await _get_client(endpoint, tls).Delegate(cache_pb2.CacheDelegateRequest(key=application))
+    return response.token
+
+
+async def cached_app_token(application: str, endpoint: Optional[str] = None) -> str:
+    """Sign once per app and cache connection identity on this event loop."""
+    configured_endpoint, tls = _configured_endpoint()
+    endpoint = configured_endpoint if endpoint is None else endpoint
+    if tls is None or not tls.cert_file or not tls.key_file:
+        raise ValueError("Cache delegation requires an mTLS client identity")
+    key = (endpoint, tls.ca_file, tls.cert_file, tls.key_file, application)
+    loop = asyncio.get_running_loop()
+    with _clients_lock:
+        tokens = _app_tokens.setdefault(loop, {})
+        lock = _app_token_locks.setdefault(loop, asyncio.Lock())
+    if key in tokens:
+        return tokens[key]
+    async with lock:
+        if key not in tokens:
+            tokens[key] = await sign_app_token(application, endpoint)
+        return tokens[key]
+
+
+async def _resolved_app_token(key: ObjectKey, endpoint: str, tls: Optional[FlameClientTls], app_token: Optional[str]) -> Optional[str]:
+    token = common._current_app_token(app_token)
+    if token is not None:
+        return token
+    location, _ = common._resolve_cache_endpoint(endpoint)
+    if urlparse(location).scheme not in ("grpcs", "grpc+tls", "grpcs-proxy"):
+        return None
+    if tls is None or not tls.cert_file or not tls.key_file:
+        return None
+    return await cached_app_token(key.app_name, endpoint) or None
+
+
+def _token_metadata(app_token: Optional[str]):
+    app_token = common._current_app_token(app_token)
+    if app_token is None:
+        return None
+    if not app_token:
+        raise ValueError("Empty cache app token")
+    return ((DELEGATION_TOKEN_HEADER, app_token),)
+
+
+def _token_rpc_kwargs(app_token: Optional[str]) -> dict:
+    metadata = _token_metadata(app_token)
+    return {"metadata": metadata} if metadata is not None else {}
+
+
+async def _write_remote(client: Any, key: str, data_type: str, chunks: AsyncIterator[bytes], *, patch: bool = False, timeout: Optional[int] = None, app_token: Optional[str] = None) -> ObjectRef:
     async def requests():
         yield cache_pb2.CacheWriteRequest(header=cache_pb2.CacheWriteHeader(key=key, data_type=data_type))
         async for chunk in chunks:
             yield cache_pb2.CacheWriteRequest(data=chunk)
 
     rpc = client.Patch if patch else client.Put
-    metadata = await rpc(requests(), timeout=timeout)
-    return ObjectRef(endpoint=metadata.endpoint, key=metadata.key, version=metadata.version)
+    metadata = await rpc(requests(), timeout=timeout, **_token_rpc_kwargs(app_token))
+    return ObjectRef(endpoint=metadata.endpoint, key=metadata.key, version=metadata.version, signature=metadata.signature)
 
 
 async def _byte_chunks(data: bytes):
@@ -147,11 +214,12 @@ async def _byte_chunks(data: bytes):
         yield data[start : start + common._UPLOAD_CHUNK_SIZE]
 
 
-async def put_object(key_prefix: str, obj: Any) -> ObjectRef:
+async def put_object(key_prefix: str, obj: Any, *, app_token: Optional[str] = None) -> ObjectRef:
     object_key = ObjectKey.from_prefix(key_prefix)
     endpoint, tls = _configured_endpoint()
+    app_token = await _resolved_app_token(object_key, endpoint, tls, app_token)
     data_type, data = await asyncio.to_thread(common._encode_object_data, obj)
-    ref = await _write_remote(_get_client(endpoint, tls), object_key.to_prefix(), data_type, _byte_chunks(data))
+    ref = await _write_remote(_get_client(endpoint, tls), object_key.to_prefix(), data_type, _byte_chunks(data), app_token=app_token)
     logger.debug("put_object: key=%s, version=%s", ref.key, ref.version)
     return ref
 
@@ -213,13 +281,16 @@ def _decode_parts(header: Any, parts: list) -> Optional[FetchResult]:
     return FetchResult(mode=mode, version=header.version, base=base, patches=patches)
 
 
-async def _fetch_object_data(ref: ObjectRef, cached_version: int) -> Optional[FetchResult]:
-    client = _get_client(ref.endpoint, common._get_cache_tls_config())
-    header, parts = await _read_get_parts(client.Get(cache_pb2.CacheGetRequest(key=ref.key, client_version=cached_version)))
+async def _fetch_object_data(ref: ObjectRef, cached_version: int, app_token: Optional[str] = None) -> Optional[FetchResult]:
+    key = ObjectKey.from_key(ref.key)
+    tls = common._get_cache_tls_config()
+    app_token = await _resolved_app_token(key, ref.endpoint, tls, app_token)
+    client = _get_client(ref.endpoint, tls)
+    header, parts = await _read_get_parts(client.Get(cache_pb2.CacheGetRequest(key=ref.key, client_version=cached_version, signature=ref.signature), **_token_rpc_kwargs(app_token)))
     return await asyncio.to_thread(_decode_parts, header, parts)
 
 
-async def get_object(ref: Ref, deserializer: Optional[Deserializer] = None) -> Any:
+async def get_object(ref: Ref, deserializer: Optional[Deserializer] = None, *, app_token: Optional[str] = None) -> Any:
     if isinstance(ref, ValueRef):
         return ref.value if deserializer is None else await asyncio.to_thread(deserializer, ref.value, [])
     if not isinstance(ref, ObjectRef):
@@ -228,7 +299,7 @@ async def get_object(ref: Ref, deserializer: Optional[Deserializer] = None) -> A
     cache_key = (ref.endpoint, ref.key)
     cached = None if ref.version == 0 else common._cache_get(cache_key)
     cached_version = cached.version if cached else 0
-    result = await _fetch_object_data(ref, cached_version)
+    result = await _fetch_object_data(ref, cached_version) if app_token is None else await _fetch_object_data(ref, cached_version, app_token)
     if result is None:
         cached = common._cache_get(cache_key) if cached_version else None
         if cached is None:
@@ -239,7 +310,7 @@ async def get_object(ref: Ref, deserializer: Optional[Deserializer] = None) -> A
     elif result.mode == FetchMode.PATCHES:
         cached = common._cache_apply_patches(cache_key, cached_version, result.version, result.patches)
         if cached is None:
-            full = await _fetch_object_data(ref, 0)
+            full = await _fetch_object_data(ref, 0) if app_token is None else await _fetch_object_data(ref, 0, app_token)
             if full is None or full.mode != FetchMode.FULL:
                 raise ValueError(f"Object not found: {ref.key}")
             cached = Object(version=full.version, data=full.base, patches=full.patches)
@@ -251,36 +322,41 @@ async def get_object(ref: Ref, deserializer: Optional[Deserializer] = None) -> A
     return await asyncio.to_thread(common._materialize_object, cached, deserializer)
 
 
-async def update_object(ref: ObjectRef, new_obj: Any) -> ObjectRef:
-    ObjectKey.from_key(ref.key)
+async def update_object(ref: ObjectRef, new_obj: Any, *, app_token: Optional[str] = None) -> ObjectRef:
+    key = ObjectKey.from_key(ref.key)
+    tls = common._get_cache_tls_config()
+    app_token = await _resolved_app_token(key, ref.endpoint, tls, app_token)
     data_type, data = await asyncio.to_thread(common._encode_object_data, new_obj)
-    updated = await _write_remote(_get_client(ref.endpoint, common._get_cache_tls_config()), ref.key, data_type, _byte_chunks(data))
+    updated = await _write_remote(_get_client(ref.endpoint, tls), ref.key, data_type, _byte_chunks(data), app_token=app_token)
     common._cache_remove((ref.endpoint, ref.key))
     return updated
 
 
-async def patch_object(ref: ObjectRef, delta: Any) -> ObjectRef:
-    ObjectKey.from_key(ref.key)
-    client = _get_client(ref.endpoint, common._get_cache_tls_config())
-    metadata = await client.GetMetadata(cache_pb2.CacheGetMetadataRequest(key=ref.key))
+async def patch_object(ref: ObjectRef, delta: Any, *, app_token: Optional[str] = None) -> ObjectRef:
+    key = ObjectKey.from_key(ref.key)
+    tls = common._get_cache_tls_config()
+    app_token = await _resolved_app_token(key, ref.endpoint, tls, app_token)
+    client = _get_client(ref.endpoint, tls)
+    metadata = await client.GetMetadata(cache_pb2.CacheGetMetadataRequest(key=ref.key), **_token_rpc_kwargs(app_token))
     stored_type, compression = common._type_and_compression(metadata.data_type)
     data_type, data = await asyncio.to_thread(common._serialize_object_data, delta)
     if data_type != stored_type:
         raise ValueError(f"Patch data type {data_type!r} does not match cached object type {stored_type!r}")
     data = await asyncio.to_thread(common._compress_data, data, compression)
-    updated = await _write_remote(client, ref.key, metadata.data_type, _byte_chunks(data), patch=True)
+    updated = await _write_remote(client, ref.key, metadata.data_type, _byte_chunks(data), patch=True, app_token=app_token)
     common._cache_remove((ref.endpoint, ref.key))
     return updated
 
 
-async def delete_objects(key_prefix: str) -> None:
+async def delete_objects(key_prefix: str, *, app_token: Optional[str] = None) -> None:
     object_key = ObjectKey.from_path(key_prefix)
     endpoint, tls = _configured_endpoint()
-    await _get_client(endpoint, tls).Delete(cache_pb2.CacheDeleteRequest(key=str(object_key)))
+    app_token = await _resolved_app_token(object_key, endpoint, tls, app_token)
+    await _get_client(endpoint, tls).Delete(cache_pb2.CacheDeleteRequest(key=str(object_key)), **_token_rpc_kwargs(app_token))
     common._cache_remove_matching(object_key)
 
 
-async def upload_object(key_or_prefix: str, file_path: str, endpoint: Optional[str] = None) -> ObjectRef:
+async def upload_object(key_or_prefix: str, file_path: str, endpoint: Optional[str] = None, *, app_token: Optional[str] = None) -> ObjectRef:
     if not await asyncio.to_thread(os.path.exists, file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
     object_key = ObjectKey.from_path(key_or_prefix)
@@ -294,6 +370,7 @@ async def upload_object(key_or_prefix: str, file_path: str, endpoint: Optional[s
         except Exception:
             config = None
         tls = config.tls if isinstance(config, FlameClientCache) else None
+    app_token = await _resolved_app_token(object_key, endpoint, tls, app_token)
 
     async def chunks():
         with open(file_path, "rb") as source:
@@ -301,19 +378,21 @@ async def upload_object(key_or_prefix: str, file_path: str, endpoint: Optional[s
                 yield data
 
     try:
-        return await _write_remote(_get_client(endpoint, tls), str(object_key), common._TYPE_RAW, chunks(), timeout=300)
+        return await _write_remote(_get_client(endpoint, tls), str(object_key), common._TYPE_RAW, chunks(), timeout=300, app_token=app_token)
     except Exception as exc:
         raise ValueError(f"Failed to upload file to cache server: {exc}") from exc
 
 
 async def download_object(ref: ObjectRef, dest_path: str) -> None:
-    ObjectKey.from_key(ref.key)
-    client = _get_client(ref.endpoint, common._get_cache_tls_config())
+    key = ObjectKey.from_key(ref.key)
+    tls = common._get_cache_tls_config()
+    app_token = await _resolved_app_token(key, ref.endpoint, tls, None)
+    client = _get_client(ref.endpoint, tls)
     dest_dir = os.path.dirname(dest_path)
     if dest_dir:
         await asyncio.to_thread(os.makedirs, dest_dir, exist_ok=True)
     try:
-        responses = client.Get(cache_pb2.CacheGetRequest(key=ref.key, client_version=0)).__aiter__()
+        responses = client.Get(cache_pb2.CacheGetRequest(key=ref.key, client_version=0, signature=ref.signature), **_token_rpc_kwargs(app_token)).__aiter__()
         try:
             first = await responses.__anext__()
         except StopAsyncIteration:

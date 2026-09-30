@@ -48,6 +48,9 @@ jobs:
         run: uv run --extra dev ruff format --check src tests
       - name: Ruff lint
         run: uv run --extra dev ruff check src tests
+      - name: Generate test certificates
+        working-directory: .
+        run: bash ci/docker/generate-certs.sh -o ci/docker/certs
       - name: Python unit tests
         run: uv run --extra dev --with numpy pytest tests
       - name: Python build

@@ -62,18 +62,11 @@ impl BackendClient {
             FlameError::Network(format!("Failed to create channel for <{endpoint}>: {e}"))
         })?;
 
-        // Apply TLS if endpoint uses https://
-        if endpoint.starts_with("https://") {
-            let tls_config = if let Some(ref tls) = ctx.cluster.tls {
-                tls.client_tls_config()?
-            } else {
-                // Use default TLS config (system CA bundle)
-                tonic::transport::ClientTlsConfig::new()
-            };
+        // The node certificate identifies this executor manager to the backend.
+        if let Some(security) = &ctx.security {
             channel_builder = channel_builder
-                .tls_config(tls_config)
+                .tls_config(security.tls.client_tls_config()?)
                 .map_err(|e| FlameError::InvalidConfig(format!("TLS config error: {}", e)))?;
-            tracing::info!("TLS enabled for backend client");
         }
 
         let channel = channel_builder

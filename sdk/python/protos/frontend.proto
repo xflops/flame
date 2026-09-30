@@ -38,6 +38,11 @@ service Frontend {
   rpc GetTask (GetTaskRequest) returns (Task) {}
   rpc WatchTasks (stream WatchTaskRequest) returns (stream Task) {}
   rpc ListTasks (ListTasksRequest) returns (stream Task) {}
+
+  rpc SetRole(SetRoleRequest) returns (Role) {}
+  rpc GetRole(GetRoleRequest) returns (Role) {}
+  rpc ListRoles(ListRolesRequest) returns (RoleList) {}
+  rpc DeleteRole(DeleteRoleRequest) returns (Result) {}
 }
 
 message RegisterApplicationRequest {
@@ -123,4 +128,18 @@ message WatchTaskRequest {
 
 message ListTasksRequest {
   string session_id = 1;
+}
+
+message SetRoleRequest {
+  Role role = 1;
+}
+
+message GetRoleRequest {
+  string name = 1;
+}
+
+message ListRolesRequest {}
+
+message DeleteRoleRequest {
+  string name = 1;
 }

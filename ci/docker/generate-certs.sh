@@ -14,6 +14,8 @@
 #   ca.key     - CA private key
 #   server.crt - Server certificate (signed by CA)
 #   server.key - Server private key
+#   admin.crt/admin.key - root client identity
+#   cache.crt/cache.key - system cache user client identity
 
 set -e
 
@@ -137,6 +139,29 @@ rm -f "$OUTPUT_DIR/server.csr" "$OUTPUT_DIR/server.ext" "$OUTPUT_DIR/ca.srl"
 
 # Set restrictive permissions on private keys
 chmod 600 "$OUTPUT_DIR/ca.key" "$OUTPUT_DIR/server.key"
+
+# Clients need distinct URI identities and the clientAuth extended key usage.
+generate_client() {
+    local name="$1" identity="$2"
+    openssl genrsa -out "$OUTPUT_DIR/$name.key" 2048
+    openssl req -new -key "$OUTPUT_DIR/$name.key" -out "$OUTPUT_DIR/$name.csr" \
+        -subj "/CN=$name/O=Flame"
+    cat > "$OUTPUT_DIR/$name.ext" << EOF
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature
+extendedKeyUsage=clientAuth
+subjectAltName=URI:spiffe://flame.local/flame/$identity
+EOF
+    openssl x509 -req -in "$OUTPUT_DIR/$name.csr" \
+        -CA "$OUTPUT_DIR/ca.crt" -CAkey "$OUTPUT_DIR/ca.key" \
+        -CAcreateserial -out "$OUTPUT_DIR/$name.crt" \
+        -days "$VALID_DAYS" -extfile "$OUTPUT_DIR/$name.ext"
+    rm -f "$OUTPUT_DIR/$name.csr" "$OUTPUT_DIR/$name.ext" "$OUTPUT_DIR/ca.srl"
+    chmod 600 "$OUTPUT_DIR/$name.key"
+}
+
+generate_client admin user/root
+generate_client cache system/cache/cache-node
 
 echo ""
 echo "✓ Generated certificates in $OUTPUT_DIR:"

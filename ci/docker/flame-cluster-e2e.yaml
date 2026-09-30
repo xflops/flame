@@ -12,11 +12,6 @@ cluster:
     shim: host
   limits:
     max_executors: 10
-  # TLS Configuration for Session Manager
-  tls:
-    cert_file: "/etc/flame/certs/server.crt"
-    key_file: "/etc/flame/certs/server.key"
-    ca_file: "/etc/flame/certs/ca.crt"
 cache:
   endpoint: "grpcs://flame-object-cache:9090"
   network_interface: "eth0"
@@ -25,7 +20,8 @@ cache:
     policy: "lru"
     max_memory: "512M"
     max_objects: 10000
-  # TLS Configuration for Object Cache
+security:
+  trust_domain: flame.local
   tls:
     cert_file: "/etc/flame/certs/server.crt"
     key_file: "/etc/flame/certs/server.key"

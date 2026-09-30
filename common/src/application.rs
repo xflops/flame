@@ -19,7 +19,9 @@ use chrono::Duration;
 use serde::Deserialize as _;
 use serde_derive::{Deserialize, Serialize};
 
-use crate::apis::{validate_application_name, ApplicationAttributes, ApplicationSchema, Shim};
+use crate::apis::{
+    validate_application_name, ApplicationAttributes, ApplicationSchema, Package, Shim,
+};
 use crate::FlameError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +36,24 @@ pub struct ApplicationSchemaManifest {
     pub input: Option<String>,
     pub output: Option<String>,
     pub common_data: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageManifest {
+    pub url: String,
+    #[serde(default)]
+    pub signature: String,
+}
+
+impl std::fmt::Debug for PackageManifest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PackageManifest")
+            .field("url", &self.url)
+            .field("signature", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +71,7 @@ pub struct ApplicationSpecManifest {
     pub max_instances: Option<u32>,
     pub delay_release: Option<i64>,
     pub schema: Option<ApplicationSchemaManifest>,
+    pub package: Option<PackageManifest>,
     pub url: Option<String>,
     pub installer: Option<String>,
 }
@@ -91,7 +112,20 @@ impl ApplicationManifest {
                 .map(Duration::seconds)
                 .unwrap_or(defaults.delay_release),
             schema: self.spec.schema.clone().map(ApplicationSchema::from),
-            url: self.spec.url.clone(),
+            package: self
+                .spec
+                .package
+                .as_ref()
+                .map(|package| Package {
+                    url: package.url.clone(),
+                    signature: package.signature.clone(),
+                })
+                .or_else(|| {
+                    self.spec.url.clone().map(|url| Package {
+                        url,
+                        signature: String::new(),
+                    })
+                }),
             installer: self.spec.installer.clone(),
         })
     }

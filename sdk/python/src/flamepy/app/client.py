@@ -41,9 +41,11 @@ from flamepy.app.types import (
 from flamepy.core import ObjectRef, Ref, ValueRef, get_object
 from flamepy.core import client as core_client
 from flamepy.core import put_object as _core_put_object
+from flamepy.core.cache import cache_requires_signing, sign_app_token
 from flamepy.core.service import SessionContext
 from flamepy.core.types import (
     ApplicationAttributes,
+    ApplicationPackage,
     ApplicationState,
     FlameContext,
     FlameError,
@@ -128,8 +130,9 @@ class _ServiceState(Enum):
 class ObjectFuture:
     """A future containing an inline value or an explicit cache reference."""
 
-    def __init__(self, future: Future):
+    def __init__(self, future: Future, app_token: Optional[str] = None):
         self._future = future
+        self._app_token = app_token
 
     @staticmethod
     def _decode_ref(result_bytes: bytes) -> Ref:
@@ -146,7 +149,9 @@ class ObjectFuture:
 
     def get(self) -> Any:
         """Resolve the result through the shared cache API."""
-        return get_object(self.ref())
+        if self._app_token is None:
+            return get_object(self.ref())
+        return get_object(self.ref(), app_token=self._app_token)
 
     def wait(self) -> None:
         """Wait for the future to complete without fetching the result."""
@@ -271,10 +276,17 @@ class ServiceInstance:
             finally:
                 if register_by_value:
                     cloudpickle.unregister_pickle_by_value(execution_module)
+        # Obtain one app-scoped cache credential before storing session data.
+        cache_token = (sign_app_token(app) or None) if cache_requires_signing() else None
+        self._cache_token = cache_token
+
         # Put in cache with <app>/<session_id> key prefix
         key_prefix = f"{app}/{session_id}"
         logger.debug(f"[ServiceInstance] Putting ServiceContext in cache: key_prefix={key_prefix}, autoscale={app_context.autoscale}")
-        object_ref = _core_put_object(key_prefix, serialized_ctx)
+        if cache_token is None:
+            object_ref = _core_put_object(key_prefix, serialized_ctx)
+        else:
+            object_ref = _core_put_object(key_prefix, serialized_ctx, app_token=cache_token)
         logger.debug(f"[ServiceInstance] ServiceContext cached: key={object_ref.key}, version={object_ref.version}")
         # Encode ObjectRef to bytes for core API
         common_data_bytes = object_ref.encode()
@@ -353,7 +365,7 @@ class ServiceInstance:
             request_bytes = cloudpickle.dumps(request, protocol=cloudpickle.DEFAULT_PROTOCOL)
             # Submit task and return ObjectFuture
             future = self._submit(request_bytes, option)
-            return ObjectFuture(future)
+            return ObjectFuture(future, app_token=getattr(self, "_cache_token", None))
 
         # Store the wrapper so __call__ can use it
         self._function_wrapper = wrapper
@@ -407,7 +419,7 @@ class ServiceInstance:
             logger.info(f"[ServiceInstance] Submitting task: method={method_name}, session={self._session.id}")
             # Submit task and return ObjectFuture
             future = self._submit(request_bytes, option)
-            return ObjectFuture(future)
+            return ObjectFuture(future, app_token=getattr(self, "_cache_token", None))
 
         return wrapper
 
@@ -531,6 +543,7 @@ def _restore_service_instance(
     instance._submissions_in_flight = 0
     instance._state = _ServiceState.OPEN
     instance._session_context = None
+    instance._cache_token = None
     instance._session = core_client.open_session(session_id=session_id)
     instance._session_owner = _NoopSessionOwner()
     if is_callable:
@@ -556,6 +569,7 @@ def _nested_service_instance(
     instance._submissions_in_flight = 0
     instance._state = _ServiceState.OPEN
     instance._session_context = session_context
+    instance._cache_token = None
     instance._session = core_client.open_session(session_id=session_context.session_id)
     instance._session_owner = _NoopSessionOwner()
     instance._generate_wrappers()
@@ -832,8 +846,8 @@ class _Runtime:
         logger.debug(f"Created package: {self._package_path}")
 
         # Step 2: Upload the package to storage
-        storage_url = self._upload_package()
-        logger.debug(f"Uploaded package to: {storage_url}")
+        package = self._upload_package()
+        logger.debug("Uploaded package to: %s", package.url)
 
         # Step 3: Retrieve the application template
         # Use configured template if available, otherwise default to flmrun
@@ -870,7 +884,7 @@ class _Runtime:
                 max_instances=template_app.max_instances,
                 delay_release=template_app.delay_release,
                 schema=template_app.schema,
-                url=storage_url,
+                package=package,
                 installer=template_app.installer,
             )
 
@@ -1059,10 +1073,11 @@ class _Runtime:
             async def resolve(future: ObjectFuture) -> Any:
                 result = await _await_task_result(future._future)
                 ref = future._decode_ref(result)
+                token_kwargs = {"app_token": future._app_token} if future._app_token is not None else {}
                 if isinstance(ref, ObjectRef):
                     async with limit:
-                        return await aio_cache.get_object(ref)
-                return await aio_cache.get_object(ref)
+                        return await aio_cache.get_object(ref, **token_kwargs)
+                return await aio_cache.get_object(ref, **token_kwargs)
 
             tasks = [asyncio.create_task(resolve(future)) for future in futures]
             try:
@@ -1118,7 +1133,9 @@ class _Runtime:
         from flamepy.core.cache import ObjectKey, put_object
 
         object_key = ObjectKey.for_shared(self._name)
-        return put_object(object_key.to_prefix(), obj)
+        app_token = sign_app_token(self._name) if cache_requires_signing() else None
+        token_kwargs = {"app_token": app_token} if app_token is not None else {}
+        return put_object(object_key.to_prefix(), obj, **token_kwargs)
 
     def _create_package(self) -> str:
         """Create a .tar.gz package of the current working directory.
@@ -1253,13 +1270,13 @@ py-modules = []
         logger.info(f"Generated package pyproject.toml with dependencies: {deps}")
         return content
 
-    def _upload_package(self) -> str:
+    def _upload_package(self) -> ApplicationPackage:
         """Upload the package to the storage location.
 
         Uses the configured storage backend to upload the package.
 
         Returns:
-            The full URL to the uploaded package
+            The URL and signature of the uploaded package
 
         Raises:
             FlameError: If upload fails
@@ -1273,7 +1290,7 @@ py-modules = []
         package_filename = os.path.basename(self._package_path)
         self._package_filename = package_filename
         try:
-            return self._storage_backend.upload(self._package_path, package_filename)
+            return self._storage_backend.upload_package(self._package_path, package_filename)
         except Exception:
             self._cleanup_package_artifacts()
             raise

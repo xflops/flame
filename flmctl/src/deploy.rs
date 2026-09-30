@@ -24,7 +24,7 @@ use common::application::{parse_application_manifests, ApplicationManifest};
 use common::net::host_for_uri;
 use flame_rs as flame;
 use flame_rs::apis::{FlameContext, FlameError, Shim};
-use flame_rs::client::{ApplicationAttributes, ApplicationSchema};
+use flame_rs::client::{ApplicationAttributes, ApplicationSchema, Package};
 use serde_derive::Serialize;
 use url::Url;
 
@@ -183,8 +183,8 @@ struct RenderedSchema {
 pub async fn run(ctx: &FlameContext, options: &Options) -> Result<(), FlameError> {
     let plan = build_plan(ctx, options)?;
     let object_key = plan.prepared.object_key(&plan.app_name);
-    let (uploaded_key, package_endpoint) = if plan.dry_run {
-        (object_key, plan.cache_endpoint.clone())
+    let (uploaded_key, package_endpoint, signature) = if plan.dry_run {
+        (object_key, plan.cache_endpoint.clone(), String::new())
     } else {
         let object_ref = flame::object::upload_object_with_context(
             ctx,
@@ -195,13 +195,17 @@ pub async fn run(ctx: &FlameContext, options: &Options) -> Result<(), FlameError
         (
             object_ref.key,
             normalize_cache_endpoint(&object_ref.endpoint)?,
+            object_ref.signature,
         )
     };
 
     let url = object_url(&package_endpoint, &uploaded_key);
 
     let mut attributes = plan.attributes.clone();
-    attributes.url = Some(url.clone());
+    attributes.package = Some(Package {
+        url: url.clone(),
+        signature,
+    });
 
     let result = DeployResult {
         name: plan.app_name.clone(),
@@ -391,7 +395,20 @@ fn build_attributes(
             .or_else(|| spec.and_then(|spec| spec.delay_release))
             .map(Duration::seconds),
         schema,
-        url: spec.and_then(|spec| spec.url.clone()),
+        package: spec.and_then(|spec| {
+            spec.package
+                .as_ref()
+                .map(|package| Package {
+                    url: package.url.clone(),
+                    signature: package.signature.clone(),
+                })
+                .or_else(|| {
+                    spec.url.clone().map(|url| Package {
+                        url,
+                        signature: String::new(),
+                    })
+                })
+        }),
         installer: Some(installer),
     })
 }
@@ -504,7 +521,11 @@ fn render_application(name: &str, attributes: &ApplicationAttributes) -> Rendere
                 output: schema.output,
                 common_data: schema.common_data,
             }),
-            url: attributes.url.clone().unwrap_or_default(),
+            url: attributes
+                .package
+                .as_ref()
+                .map(|package| package.url.clone())
+                .unwrap_or_default(),
             installer: attributes.installer.clone().unwrap_or_default(),
         },
     }

@@ -544,22 +544,11 @@ fn build_environment(
 fn endpoint_ca_files(context: &FlameClusterContext) -> Vec<&str> {
     let mut files = Vec::new();
     if let Some(ca_file) = context
-        .cluster
-        .tls
+        .security
         .as_ref()
-        .and_then(|tls| tls.ca_file.as_deref())
+        .and_then(|security| security.tls.ca_file.as_deref())
     {
         files.push(ca_file);
-    }
-    if let Some(ca_file) = context
-        .cache
-        .as_ref()
-        .and_then(|cache| cache.tls.as_ref())
-        .and_then(|tls| tls.ca_file.as_deref())
-    {
-        if !files.contains(&ca_file) {
-            files.push(ca_file);
-        }
     }
     files
 }
@@ -687,7 +676,7 @@ mod tests {
             arguments: vec![],
             working_directory: None,
             environments: HashMap::new(),
-            url: None,
+            package: None,
             installer: None,
         }
     }

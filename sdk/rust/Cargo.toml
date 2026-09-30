@@ -44,6 +44,7 @@ tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
 comfy-table = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
 default = []

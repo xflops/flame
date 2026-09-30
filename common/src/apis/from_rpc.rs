@@ -11,12 +11,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Duration, Utc};
+use tonic::Status;
 
 use rpc::flame::v1 as rpc;
 
 use super::types::*;
+use crate::apis::{
+    object_kind, valid_role_name, valid_role_object, valid_role_subject, Role, RoleRule, ALL,
+    APPLICATION_PREFIX, NODE_PREFIX,
+};
 use crate::FlameError;
+
+impl From<rpc::Package> for Package {
+    fn from(package: rpc::Package) -> Self {
+        Self {
+            url: package.url,
+            signature: package.signature,
+        }
+    }
+}
 
 impl From<rpc::ResourceRequirement> for ResourceRequirement {
     fn from(req: rpc::ResourceRequirement) -> Self {
@@ -136,7 +152,12 @@ impl TryFrom<rpc::Application> for ApplicationContext {
                 .into_iter()
                 .map(|e| (e.name, e.value))
                 .collect(),
-            url: spec.url.clone(),
+            package: spec.package.clone().map(Package::from).or_else(|| {
+                spec.url.clone().map(|url| Package {
+                    url,
+                    signature: String::new(),
+                })
+            }),
             installer: spec.installer.clone(),
         })
     }
@@ -221,7 +242,12 @@ impl TryFrom<&rpc::Application> for Application {
                 .map(Duration::seconds)
                 .unwrap_or(DEFAULT_DELAY_RELEASE),
             schema: spec.schema.map(ApplicationSchema::from),
-            url: spec.url.clone(),
+            package: spec.package.clone().map(Package::from).or_else(|| {
+                spec.url.clone().map(|url| Package {
+                    url,
+                    signature: String::new(),
+                })
+            }),
             installer: spec.installer.clone(),
         })
     }
@@ -249,7 +275,12 @@ impl From<rpc::ApplicationSpec> for ApplicationAttributes {
                 .map(Duration::seconds)
                 .unwrap_or(DEFAULT_DELAY_RELEASE),
             schema: spec.schema.map(ApplicationSchema::from),
-            url: spec.url.clone(),
+            package: spec.package.clone().map(Package::from).or_else(|| {
+                spec.url.clone().map(|url| Package {
+                    url,
+                    signature: String::new(),
+                })
+            }),
             installer: spec.installer.clone(),
         }
     }
@@ -410,5 +441,190 @@ impl TryFrom<TaskResult> for rpc::TaskResult {
             output: result.output.map(TaskOutput::into),
             message: result.message,
         })
+    }
+}
+
+struct RoleObjectSelector<'a> {
+    kind: &'static str,
+    object_id: &'a str,
+}
+
+impl<'a> TryFrom<&'a str> for RoleObjectSelector<'a> {
+    type Error = Status;
+
+    fn try_from(value: &'a str) -> Result<Self, Self::Error> {
+        let (kind, object_id) = if value == ALL {
+            (ALL, ALL)
+        } else if let Some(id) = value.strip_prefix(APPLICATION_PREFIX) {
+            (object_kind::APPLICATION, id)
+        } else if let Some(id) = value.strip_prefix(NODE_PREFIX) {
+            (object_kind::NODE, id)
+        } else {
+            return Err(Status::invalid_argument("invalid role object ID"));
+        };
+        if !valid_role_object(kind, object_id) {
+            return Err(Status::invalid_argument("invalid role object ID"));
+        }
+        Ok(Self { kind, object_id })
+    }
+}
+
+impl TryFrom<rpc::Role> for Role {
+    type Error = Status;
+
+    fn try_from(value: rpc::Role) -> Result<Self, Self::Error> {
+        if !valid_role_name(&value.name) {
+            return Err(Status::invalid_argument("invalid role name"));
+        }
+        if value.users.iter().any(|user| !valid_role_subject(user)) {
+            return Err(Status::invalid_argument("invalid role user ID"));
+        }
+        let mut rules: HashMap<String, Vec<RoleRule>> = HashMap::new();
+        for rule in value.rules {
+            if rule.objects.is_empty() {
+                return Err(Status::invalid_argument("role rule requires an object"));
+            }
+            for object in rule.objects {
+                let selector = RoleObjectSelector::try_from(object.as_str())?;
+                rules
+                    .entry(selector.kind.to_string())
+                    .or_default()
+                    .push(RoleRule {
+                        object_id: selector.object_id.to_string(),
+                        operations: rule.verbs.clone(),
+                    });
+            }
+        }
+        Ok(Self {
+            name: value.name,
+            users: value.users,
+            rules,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apis::operation;
+
+    #[test]
+    fn role_object_selector_parses_rpc_forms() {
+        for (input, kind, object_id) in [
+            (ALL, ALL, ALL),
+            ("node:*", object_kind::NODE, ALL),
+            ("node:node-a", object_kind::NODE, "node-a"),
+            ("application:nodes", object_kind::APPLICATION, "nodes"),
+        ] {
+            let selector = RoleObjectSelector::try_from(input).unwrap();
+            assert_eq!((selector.kind, selector.object_id), (kind, object_id));
+        }
+        for input in [
+            "application:",
+            "application:nested/name",
+            "app:nodes",
+            "plain-app",
+            "node:",
+            "nodes",
+        ] {
+            assert!(RoleObjectSelector::try_from(input).is_err());
+        }
+    }
+
+    #[test]
+    fn role_rpc_round_trip_keeps_each_objects_operations() {
+        let rpc_role = rpc::Role {
+            name: "reader".to_string(),
+            users: vec!["alice".to_string()],
+            rules: vec![
+                rpc::RoleRule {
+                    verbs: vec![operation::VIEW.to_string()],
+                    objects: vec!["application:app-a".to_string(), "node:node-a".to_string()],
+                },
+                rpc::RoleRule {
+                    verbs: vec![operation::DELETE.to_string()],
+                    objects: vec!["application:app-b".to_string(), "node:*".to_string()],
+                },
+            ],
+        };
+        let role = Role::try_from(rpc_role).unwrap();
+        assert_eq!(role.rules[object_kind::APPLICATION].len(), 2);
+        assert_eq!(role.rules[object_kind::NODE].len(), 2);
+        assert_eq!(
+            role.rules[object_kind::APPLICATION][0],
+            RoleRule {
+                object_id: "app-a".to_string(),
+                operations: vec![operation::VIEW.to_string()],
+            }
+        );
+        assert_eq!(role.rules[object_kind::NODE][1].object_id, ALL);
+        assert_eq!(Role::try_from(rpc::Role::from(role.clone())).unwrap(), role);
+    }
+
+    #[test]
+    fn role_rpc_rejects_invalid_object_selectors() {
+        for object in [
+            "application:",
+            "application:*",
+            "app:app-a",
+            "nodes",
+            "unknown:target",
+        ] {
+            let role = rpc::Role {
+                name: "invalid".to_string(),
+                users: vec!["alice".to_string()],
+                rules: vec![rpc::RoleRule {
+                    verbs: vec![operation::VIEW.to_string()],
+                    objects: vec![object.to_string()],
+                }],
+            };
+            assert_eq!(
+                Role::try_from(role).unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
+    fn role_rpc_rejects_invalid_name_subject_and_empty_rule() {
+        let valid = rpc::Role {
+            name: "reader".to_string(),
+            users: vec!["alice".to_string()],
+            rules: vec![rpc::RoleRule {
+                verbs: vec![operation::VIEW.to_string()],
+                objects: vec!["application:app-a".to_string()],
+            }],
+        };
+        let invalid_roles = [
+            rpc::Role {
+                name: String::new(),
+                ..valid.clone()
+            },
+            rpc::Role {
+                name: "../outside".to_string(),
+                ..valid.clone()
+            },
+            rpc::Role {
+                name: ".hidden".to_string(),
+                ..valid.clone()
+            },
+            rpc::Role {
+                users: vec!["system:cache:cache-a".to_string()],
+                ..valid.clone()
+            },
+            rpc::Role {
+                rules: vec![rpc::RoleRule {
+                    objects: vec![],
+                    ..valid.rules[0].clone()
+                }],
+                ..valid
+            },
+        ];
+        for role in invalid_roles {
+            assert_eq!(
+                Role::try_from(role).unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        }
     }
 }

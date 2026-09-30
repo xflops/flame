@@ -236,7 +236,7 @@ mod tests {
         let flmping = load("flmping");
         assert_eq!(flmping.shim, Shim::Host);
         assert_eq!(
-            flmping.url.as_deref(),
+            flmping.package.as_ref().map(|package| package.url.as_str()),
             Some("file://${FLAME_HOME}/bin/flmping-service")
         );
         assert_eq!(

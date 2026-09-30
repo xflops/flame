@@ -32,14 +32,24 @@ const GRPC_MAX_MESSAGE_SIZE: usize = usize::MAX;
 
 #[async_trait]
 pub trait PackageDownloader: Send + Sync {
-    async fn download(&self, url: &url::Url, dest_path: &Path) -> Result<(), FlameError>;
+    async fn download(
+        &self,
+        url: &url::Url,
+        signature: &str,
+        dest_path: &Path,
+    ) -> Result<(), FlameError>;
 }
 
 pub struct FileDownloader;
 
 #[async_trait]
 impl PackageDownloader for FileDownloader {
-    async fn download(&self, url: &url::Url, dest_path: &Path) -> Result<(), FlameError> {
+    async fn download(
+        &self,
+        url: &url::Url,
+        _signature: &str,
+        dest_path: &Path,
+    ) -> Result<(), FlameError> {
         let src_path = url
             .to_file_path()
             .map_err(|_| FlameError::InvalidConfig(format!("invalid file url: {}", url)))?;
@@ -66,7 +76,12 @@ impl HttpDownloader {
 
 #[async_trait]
 impl PackageDownloader for HttpDownloader {
-    async fn download(&self, url: &url::Url, dest_path: &Path) -> Result<(), FlameError> {
+    async fn download(
+        &self,
+        url: &url::Url,
+        _signature: &str,
+        dest_path: &Path,
+    ) -> Result<(), FlameError> {
         let client = reqwest::Client::builder()
             .timeout(self.timeout)
             .build()
@@ -135,7 +150,12 @@ impl GrpcDownloader {
 
 #[async_trait]
 impl PackageDownloader for GrpcDownloader {
-    async fn download(&self, url: &url::Url, dest_path: &Path) -> Result<(), FlameError> {
+    async fn download(
+        &self,
+        url: &url::Url,
+        signature: &str,
+        dest_path: &Path,
+    ) -> Result<(), FlameError> {
         use tonic::transport::Channel;
 
         let host = url
@@ -177,6 +197,7 @@ impl PackageDownloader for GrpcDownloader {
             .get(CacheGetRequest {
                 key: key.to_string(),
                 client_version: 0,
+                signature: signature.to_string(),
             })
             .await
             .map_err(|e| FlameError::Internal(format!("cache get failed: {}", e)))?
@@ -367,7 +388,12 @@ impl DownloaderRegistry {
         Self { downloaders }
     }
 
-    pub async fn download(&self, url: &str, dest_path: &Path) -> Result<(), FlameError> {
+    pub async fn download(
+        &self,
+        url: &str,
+        signature: &str,
+        dest_path: &Path,
+    ) -> Result<(), FlameError> {
         let parsed_url = url::Url::parse(url)
             .map_err(|e| FlameError::InvalidConfig(format!("invalid url: {}", e)))?;
 
@@ -379,7 +405,7 @@ impl DownloaderRegistry {
             ))
         })?;
 
-        downloader.download(&parsed_url, dest_path).await
+        downloader.download(&parsed_url, signature, dest_path).await
     }
 }
 
@@ -434,7 +460,7 @@ mod tests {
         let dest_path = temp_dir.path().join("test.tar.gz");
 
         let result = registry
-            .download("ftp://host/file.tar.gz", &dest_path)
+            .download("ftp://host/file.tar.gz", "", &dest_path)
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -447,7 +473,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let dest_path = temp_dir.path().join("test.tar.gz");
 
-        let result = registry.download("not-a-valid-url", &dest_path).await;
+        let result = registry.download("not-a-valid-url", "", &dest_path).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("invalid url"));
@@ -467,7 +493,7 @@ mod tests {
         let registry = DownloaderRegistry::new();
         let url = format!("file://{}", src_path.display());
 
-        registry.download(&url, &dest_path).await.unwrap();
+        registry.download(&url, "", &dest_path).await.unwrap();
 
         assert!(dest_path.exists());
         let content = tokio::fs::read(&dest_path).await.unwrap();
@@ -482,7 +508,7 @@ mod tests {
         let registry = DownloaderRegistry::new();
         let url = format!("file://{}/nonexistent.tar.gz", temp_dir.path().display());
 
-        let result = registry.download(&url, &dest_path).await;
+        let result = registry.download(&url, "", &dest_path).await;
         assert!(result.is_err());
     }
 
@@ -493,7 +519,7 @@ mod tests {
         let dest_path = temp_dir.path().join("dest.tar.gz");
 
         let url = url::Url::parse("file://").unwrap();
-        let result = downloader.download(&url, &dest_path).await;
+        let result = downloader.download(&url, "", &dest_path).await;
         assert!(result.is_err());
     }
 
@@ -510,7 +536,7 @@ mod tests {
         let dest_path = temp_dir.path().join("dest.tar.gz");
 
         let url = url::Url::parse("http://127.0.0.1:59999/nonexistent.tar.gz").unwrap();
-        let result = downloader.download(&url, &dest_path).await;
+        let result = downloader.download(&url, "", &dest_path).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -540,7 +566,7 @@ mod tests {
         let dest_path = temp_dir.path().join("dest.tar.gz");
 
         let url = url::Url::parse("grpc:///path/to/file").unwrap();
-        let result = downloader.download(&url, &dest_path).await;
+        let result = downloader.download(&url, "", &dest_path).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("missing host"));
     }
@@ -552,7 +578,7 @@ mod tests {
         let dest_path = temp_dir.path().join("dest.tar.gz");
 
         let url = url::Url::parse("grpc://127.0.0.1:59999/app/pkg/file.tar.gz").unwrap();
-        let result = downloader.download(&url, &dest_path).await;
+        let result = downloader.download(&url, "", &dest_path).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -567,7 +593,7 @@ mod tests {
         let dest_path = temp_dir.path().join("dest.tar.gz");
 
         let url = url::Url::parse("grpcs://127.0.0.1:59999/app/pkg/file.tar.gz").unwrap();
-        let result = downloader.download(&url, &dest_path).await;
+        let result = downloader.download(&url, "", &dest_path).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -583,7 +609,7 @@ mod tests {
         let dest_path = temp_dir.path().join("dest.tar.gz");
 
         let url = url::Url::parse("grpcs://127.0.0.1:59999/app/pkg/file.tar.gz").unwrap();
-        let result = downloader.download(&url, &dest_path).await;
+        let result = downloader.download(&url, "", &dest_path).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -599,7 +625,7 @@ mod tests {
 
         let url = url::Url::parse("grpc://127.0.0.1/app/pkg/file.tar.gz").unwrap();
         assert!(url.port().is_none());
-        let result = downloader.download(&url, &dest_path).await;
+        let result = downloader.download(&url, "", &dest_path).await;
         assert!(result.is_err());
     }
 

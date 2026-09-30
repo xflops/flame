@@ -63,7 +63,9 @@ jobs:
       
       - name: Install Flame with flmadm and systemd
         run: |
-          sudo ./target/release/flmadm install --all --src-dir . --skip-build --prefix $INSTALL_PREFIX --enable
+          sudo ./target/release/flmadm install --all --src-dir . --skip-build --prefix $INSTALL_PREFIX
+          sudo install -m 0644 ci/bm/flame-cluster.yaml $INSTALL_PREFIX/conf/flame-cluster.yaml
+          sudo systemctl enable --now flame-session-manager flame-object-cache flame-executor-manager
           echo "$INSTALL_PREFIX/bin" >> $GITHUB_PATH
       
       - name: Setup local configuration

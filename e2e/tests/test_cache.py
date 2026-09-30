@@ -23,6 +23,8 @@ import pytest
 from flamepy.core import FlameContext, ObjectRef, get_object, patch_object, put_object, update_object
 from flamepy.proto import cache_pb2, cache_pb2_grpc
 
+DELEGATION_TOKEN_HEADER = "x-flame-delegation-token"
+
 
 @contextmanager
 def _remote_cache_client(ref: ObjectRef):
@@ -31,10 +33,10 @@ def _remote_cache_client(ref: ObjectRef):
     parsed = urlparse(endpoint)
     options = list(cache_module.GRPC_OPTIONS)
     metadata = (("x-flame-object-cache", target),) if target else ()
+    cert = key = None
     if parsed.scheme in ("grpcs", "grpc+tls", "grpcs-proxy"):
         tls = cache_module._get_cache_tls_config()
         roots = None
-        cert = key = None
         if tls and tls.ca_file:
             with open(tls.ca_file, "rb") as roots_file:
                 roots = roots_file.read()
@@ -47,7 +49,13 @@ def _remote_cache_client(ref: ObjectRef):
     else:
         channel = grpc.insecure_channel(parsed.netloc, options=options)
     with channel:
-        yield cache_pb2_grpc.ObjectCacheServiceStub(channel), metadata
+        client = cache_pb2_grpc.ObjectCacheServiceStub(channel)
+        if cert and key:
+            application = ref.key.split("/", 1)[0]
+            token = client.Delegate(cache_pb2.CacheDelegateRequest(key=application), metadata=metadata).token
+            if token:
+                metadata += ((DELEGATION_TOKEN_HEADER, token),)
+        yield client, metadata
 
 
 def _remote_metadata(ref: ObjectRef):
@@ -63,12 +71,12 @@ def _remote_write(ref: ObjectRef, data_type: str, data: bytes, *, patch: bool = 
 
     with _remote_cache_client(ref) as (client, routing):
         response = (client.Patch if patch else client.Put)(requests(), metadata=routing)
-    return ObjectRef(endpoint=response.endpoint, key=response.key, version=response.version)
+    return ObjectRef(endpoint=response.endpoint, key=response.key, version=response.version, signature=response.signature)
 
 
 def _remote_get(ref: ObjectRef, client_version: int):
     with _remote_cache_client(ref) as (client, metadata):
-        responses = list(client.Get(cache_pb2.CacheGetRequest(key=ref.key, client_version=client_version), metadata=metadata))
+        responses = list(client.Get(cache_pb2.CacheGetRequest(key=ref.key, client_version=client_version, signature=ref.signature), metadata=metadata))
     assert responses and responses[0].WhichOneof("payload") == "header"
     assert all(response.WhichOneof("payload") == "chunk" for response in responses[1:])
     return responses[0].header, [response.chunk for response in responses[1:]]
@@ -320,7 +328,7 @@ def test_version_zero_forces_full_response_with_cached_object():
     assert get_object(ref, deserializer=_raw_deserializer) == {"base": base_data, "deltas": []}
     patched_ref = _remote_patch_without_local_cache_invalidation(ref, delta_data)
 
-    forced_ref = ObjectRef(endpoint=ref.endpoint, key=ref.key, version=0)
+    forced_ref = ObjectRef(endpoint=ref.endpoint, key=ref.key, version=0, signature=ref.signature)
     header, chunks = _remote_get(forced_ref, 0)
     assert header.mode == cache_pb2.CACHE_GET_MODE_FULL
     assert header.version == patched_ref.version

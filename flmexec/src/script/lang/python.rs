@@ -37,6 +37,8 @@ const FLAME_HOME_ENV: &str = "FLAME_HOME";
 const FLAME_ENDPOINT_ENV: &str = "FLAME_ENDPOINT";
 const FLAME_CACHE_ENDPOINT_ENV: &str = "FLAME_CACHE_ENDPOINT";
 const FLAME_CA_FILE_ENV: &str = "FLAME_CA_FILE";
+const FLAME_CERT_FILE_ENV: &str = "FLAME_CERT_FILE";
+const FLAME_KEY_FILE_ENV: &str = "FLAME_KEY_FILE";
 const PROPAGATED_ENV_VARS: &[&str] = &[
     // Python/Flame
     PYTHONPATH_ENV,
@@ -45,6 +47,8 @@ const PROPAGATED_ENV_VARS: &[&str] = &[
     FLAME_ENDPOINT_ENV,
     FLAME_CACHE_ENDPOINT_ENV,
     FLAME_CA_FILE_ENV,
+    FLAME_CERT_FILE_ENV,
+    FLAME_KEY_FILE_ENV,
     // uv cache and config
     "UV_CACHE_DIR",
     "UV_PYTHON_INSTALL_DIR",
@@ -309,6 +313,8 @@ mod tests {
         assert!(PROPAGATED_ENV_VARS.contains(&FLAME_ENDPOINT_ENV));
         assert!(PROPAGATED_ENV_VARS.contains(&FLAME_CACHE_ENDPOINT_ENV));
         assert!(PROPAGATED_ENV_VARS.contains(&FLAME_CA_FILE_ENV));
+        assert!(PROPAGATED_ENV_VARS.contains(&FLAME_CERT_FILE_ENV));
+        assert!(PROPAGATED_ENV_VARS.contains(&FLAME_KEY_FILE_ENV));
     }
 
     #[test]

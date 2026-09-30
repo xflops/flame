@@ -7,12 +7,23 @@ option go_package = "github.com/flame-sh/flame/sdk/go/rpc/v1";
 // The cache stores opaque bytes. Clients serialize and deserialize values,
 // including Arrow values, before sending them over this service.
 service ObjectCacheService {
+  // Delegate the authenticated mTLS client user identity.
+  rpc Delegate(CacheDelegateRequest) returns (CacheDelegateResponse) {}
   rpc Put(stream CacheWriteRequest) returns (CacheObjectMetadata) {}
   rpc Patch(stream CacheWriteRequest) returns (CacheObjectMetadata) {}
   rpc Get(CacheGetRequest) returns (stream CacheGetResponse) {}
   rpc Delete(CacheDeleteRequest) returns (CacheDeleteResponse) {}
   rpc GetMetadata(CacheGetMetadataRequest) returns (CacheObjectMetadata) {}
   rpc List(CacheListRequest) returns (stream CacheObjectMetadata) {}
+}
+
+message CacheDelegateRequest {
+  // The globally unique application name.
+  string key = 1;
+}
+
+message CacheDelegateResponse {
+  string token = 1;
 }
 
 message CacheWriteHeader {
@@ -44,6 +55,8 @@ message CacheObjectMetadata {
   int64 creation_time = 6;
   // Client-defined type shared by the base object and all patches.
   string data_type = 7;
+  // Signature of the exact object key; carry this with ObjectRef.
+  string signature = 8;
 }
 
 message CacheGetRequest {
@@ -51,6 +64,7 @@ message CacheGetRequest {
   // Zero forces a full response. Otherwise the server may return unchanged or
   // a contiguous suffix of patches after this version.
   uint64 client_version = 2;
+  string signature = 3;
 }
 
 enum CacheGetMode {

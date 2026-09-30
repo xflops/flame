@@ -444,6 +444,30 @@ pub struct ApplicationSchema {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct Package {
+    pub url: String,
+    pub signature: String,
+}
+
+impl From<Package> for rpc::Package {
+    fn from(package: Package) -> Self {
+        Self {
+            url: package.url,
+            signature: package.signature,
+        }
+    }
+}
+
+impl From<rpc::Package> for Package {
+    fn from(package: rpc::Package) -> Self {
+        Self {
+            url: package.url,
+            signature: package.signature,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ApplicationAttributes {
     pub shim: Option<Shim>,
     pub image: Option<String>,
@@ -457,7 +481,7 @@ pub struct ApplicationAttributes {
     #[serde(with = "serde_duration")]
     pub delay_release: Option<Duration>,
     pub schema: Option<ApplicationSchema>,
-    pub url: Option<String>,
+    pub package: Option<Package>,
     pub installer: Option<String>,
 }
 
@@ -1528,7 +1552,8 @@ impl From<ApplicationAttributes> for ApplicationSpec {
             max_instances: app.max_instances,
             delay_release: app.delay_release.map(|s| s.num_seconds()),
             schema: app.schema.clone().map(rpc::ApplicationSchema::from),
-            url: app.url.clone(),
+            url: None,
+            package: app.package.clone().map(rpc::Package::from),
             installer: app.installer.clone(),
         }
     }
@@ -1555,7 +1580,12 @@ impl From<ApplicationSpec> for ApplicationAttributes {
             max_instances: app.max_instances,
             delay_release: app.delay_release.map(Duration::seconds),
             schema: app.schema.clone().map(ApplicationSchema::from),
-            url: app.url.clone(),
+            package: app.package.clone().map(Package::from).or_else(|| {
+                app.url.clone().map(|url| Package {
+                    url,
+                    signature: String::new(),
+                })
+            }),
             installer: app.installer.clone(),
         }
     }
@@ -2468,6 +2498,7 @@ mod tests {
                 delay_release: None,
                 schema: None,
                 url: None,
+                package: None,
                 installer: None,
             }),
             status: Some(rpc::ApplicationStatus {

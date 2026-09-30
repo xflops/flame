@@ -18,6 +18,7 @@ CREATE TABLE applications (
     working_directory   TEXT,
     schema              TEXT,
     url                 TEXT,
+    package_signature   TEXT,
 
     max_instances       INTEGER NOT NULL,
     delay_release       INTEGER NOT NULL,
@@ -32,12 +33,12 @@ CREATE TABLE applications (
 -- Step 3: Copy data from old table to new table (excluding shim column)
 INSERT INTO applications (
     name, description, labels, image, command, arguments, environments,
-    working_directory, schema, url, max_instances, delay_release,
+    working_directory, schema, url, package_signature, max_instances, delay_release,
     creation_time, version, state
 )
 SELECT 
     name, description, labels, image, command, arguments, environments,
-    working_directory, schema, url, max_instances, delay_release,
+    working_directory, schema, url, package_signature, max_instances, delay_release,
     creation_time, version, state
 FROM applications_old;
 

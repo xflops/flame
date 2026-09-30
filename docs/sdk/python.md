@@ -54,6 +54,23 @@ in `x-flame-object-cache` metadata while TLS verifies the public proxy host.
 After replacing certificate or CA files, close asyncio cache channels with
 `await flamepy.core.aio.cache.close()` before the next operation.
 
+With server-side `security` enabled, use a tenant certificate for both the
+session manager and cache. The cache `Delegate(app)` RPC requires tenant mTLS;
+cache data calls accept tenant mTLS or TLS plus the resulting delegated token. Configure
+`cluster.tls` and `cache.tls` in the client context with the appropriate CA,
+certificate, and key files. This is a single-user cluster policy: any verified
+tenant may sign any application name. Session-manager Roles still control
+application, session, and task RPCs; a Role object selector for one app is
+`application:<name>`.
+
+An application that creates sessions or submits tasks from inside its executor
+needs its own tenant client certificate and key. Set `FLAME_CERT_FILE` and
+`FLAME_KEY_FILE` in that application's `spec.environments`, and make those
+files available to the workload. Grant the tenant the required application
+Role. The host shim passes the endpoint and CA to workloads, but does not pass
+the executor manager's client certificate. A `flmexec` Python script also
+inherits the explicitly configured workload certificate paths.
+
 ## Create Sessions And Run Tasks
 
 The core client API uses bytes for task input, task output, and common data:
@@ -273,7 +290,8 @@ API when you need explicit byte-level protocol control.
 
 ## Use Object Cache
 
-Top-level helpers store Python objects in Flame object cache:
+Top-level helpers store Python objects in Flame object cache. This first
+example assumes security is disabled:
 
 ```python
 import flamepy
@@ -286,6 +304,30 @@ next_value = flamepy.get_object(next_ref)
 ```
 
 Object references are versioned. `version=0` forces a fresh download. Nonzero versions allow the client to reuse cached state and request newer patches when the cache server can provide them.
+
+In secure deployments, sign the globally unique application name once and
+pass its token when working with cache keys under `<app>/<session>`:
+
+```python
+from flamepy.core import sign_app_token
+from flamepy.core.cache import put_object
+
+token = sign_app_token("my-app")
+ref = put_object("my-app/shared", {"temperature": 0.8}, app_token=token)
+```
+
+The Python App flow signs its application before storing session data and
+uses the token for its own cache calls. Cache `List` uses the cache system
+identity. `ObjectRef` contains
+the endpoint, key, version, and signature for that exact key. The cache checks
+the signature when reading; keep the user delegation token separately.
+
+When deploying a Python App with cache-backed packages, `CacheStorage`
+requests `Delegate(app)` to upload or delete `<app>/pkg/...` objects. An executor
+manager downloads those packages with its system node mTLS certificate and
+the stored package key signature;
+the app token cannot read package objects. Bootstrap cache paths remain
+system-cache-only.
 
 Lower-level helpers under `flamepy.core` expose `ObjectKey`,
 `patch_object()`, `upload_object()`, `download_object()`, and

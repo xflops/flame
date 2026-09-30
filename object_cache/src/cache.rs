@@ -23,7 +23,8 @@ use regex::Regex;
 use stdng::{lock_ptr, new_ptr, MutexPtr};
 use url::Url;
 
-use common::ctx::{FlameCache, FlameCluster};
+use common::ctx::{FlameCache, FlameCluster, FlameSecurity};
+use common::security::{self, SecurityManager};
 use common::FlameError;
 
 use crate::eviction::{new_policy, EvictionConfig, EvictionPolicyPtr};
@@ -35,6 +36,7 @@ use rpc::flame::v1::object_cache_service_server::ObjectCacheServiceServer;
 
 /// Default batch size for eviction operations
 const EVICTION_BATCH_SIZE: usize = 10;
+const CACHE_DELEGATION_DOMAIN: &str = "flame.cache.delegation.ed25519.v1";
 
 /// Wildcard session identifier for matching all sessions of an application
 pub const WILDCARD_SESSION: &str = "*";
@@ -727,6 +729,7 @@ impl ObjectCache {
 /// * `cache_config` - Cache configuration (includes optional TLS and GC config)
 pub async fn run(
     cluster_config: &FlameCluster,
+    security: Option<&FlameSecurity>,
     cache_config: &FlameCache,
 ) -> Result<(), FlameError> {
     // Clients may use a Service to select a cache replica for the initial
@@ -758,11 +761,23 @@ pub async fn run(
     let collector = ApplicationGarbageCollector::new(
         Arc::clone(&cache),
         cluster_config,
+        security,
         cache_config.gc.interval,
     )?;
     let gc_handle = tokio::spawn(collector.run());
 
-    let grpc_server = GrpcCacheServer::new(Arc::clone(&cache));
+    if cache_config.requires_tls() != security.is_some() {
+        return Err(FlameError::InvalidConfig(
+            "cache endpoint TLS must match security configuration".to_string(),
+        ));
+    }
+    let grpc_server = if let Some(config) = security {
+        let security: Arc<dyn SecurityManager> =
+            Arc::from(security::new(Some(config)).with_delegation(CACHE_DELEGATION_DOMAIN)?);
+        GrpcCacheServer::secured(Arc::clone(&cache), security)
+    } else {
+        GrpcCacheServer::new(Arc::clone(&cache))
+    };
 
     tracing::info!("Starting object cache gRPC server at {}", address_str);
 
@@ -772,14 +787,8 @@ pub async fn run(
 
     let mut builder = tonic::transport::Server::builder();
 
-    if cache_config.requires_tls() {
-        let tls_config = cache_config.tls.as_ref().ok_or_else(|| {
-            FlameError::InvalidConfig(
-                "cache endpoint uses grpcs:// but cache.tls is not configured".to_string(),
-            )
-        })?;
-
-        let tls = tls_config.server_tls_config()?;
+    if let Some(config) = security {
+        let tls = config.tls.mutual_tls_config()?.client_auth_optional(true);
         builder = builder
             .tls_config(tls)
             .map_err(|e| FlameError::InvalidConfig(format!("TLS config error: {}", e)))?;

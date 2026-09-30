@@ -52,71 +52,65 @@
         "replicas": { "type": "integer", "minimum": 0 }
       }
     },
-    "tls": {
+    "security": {
       "type": "object",
       "properties": {
         "enabled": { "type": "boolean" },
+        "trustDomain": { "type": "string", "minLength": 1 }
+      },
+      "required": ["enabled", "trustDomain"]
+    },
+    "tls": {
+      "type": "object",
+      "properties": {
         "mountPath": { "type": "string", "minLength": 1 },
-        "cluster": {
+        "sessionManager": {
           "type": "object",
           "properties": {
             "secretName": { "type": "string" },
             "certKey": { "type": "string", "minLength": 1 },
             "privateKeyKey": { "type": "string", "minLength": 1 },
             "caKey": { "type": "string", "minLength": 1 }
-          }
+          },
+          "required": ["secretName", "certKey", "privateKeyKey", "caKey"]
         },
-        "cache": {
+        "objectCache": {
           "type": "object",
           "properties": {
             "secretName": { "type": "string" },
             "certKey": { "type": "string", "minLength": 1 },
             "privateKeyKey": { "type": "string", "minLength": 1 },
             "caKey": { "type": "string", "minLength": 1 }
-          }
+          },
+          "required": ["secretName", "certKey", "privateKeyKey", "caKey"]
+        },
+        "executorManager": {
+          "type": "object",
+          "properties": {
+            "secretName": { "type": "string" },
+            "certKey": { "type": "string", "minLength": 1 },
+            "privateKeyKey": { "type": "string", "minLength": 1 },
+            "caKey": { "type": "string", "minLength": 1 }
+          },
+          "required": ["secretName", "certKey", "privateKeyKey", "caKey"]
         }
-      }
+      },
+      "required": ["mountPath", "sessionManager", "objectCache", "executorManager"]
     },
     "clientConfig": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" }
+        "enabled": { "type": "boolean" },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "certFile": { "type": "string" },
+            "keyFile": { "type": "string" },
+            "caFile": { "type": "string" }
+          }
+        }
       }
     }
   },
-  "allOf": [
-    {
-      "if": {
-        "properties": {
-          "tls": {
-            "properties": {
-              "enabled": { "const": true }
-            },
-            "required": ["enabled"]
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "tls": {
-            "properties": {
-              "cluster": {
-                "properties": {
-                  "secretName": { "type": "string", "minLength": 1 }
-                },
-                "required": ["secretName"]
-              },
-              "cache": {
-                "properties": {
-                  "secretName": { "type": "string", "minLength": 1 }
-                },
-                "required": ["secretName"]
-              }
-            },
-            "required": ["cluster", "cache"]
-          }
-        }
-      }
-    }
-  ]
+  "required": ["security", "tls"]
 }

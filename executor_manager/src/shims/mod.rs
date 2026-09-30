@@ -318,7 +318,7 @@ mod tests {
             arguments: vec![],
             working_directory,
             environments: HashMap::new(),
-            url: None,
+            package: None,
             installer: None,
         }
     }

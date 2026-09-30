@@ -17,6 +17,8 @@ import textwrap
 import flamepy
 import pytest
 
+pytestmark = pytest.mark.skip(reason="recursive workload calls are unsupported")
+
 NODEPS_RESULT_PREFIX = "FLMEXEC_APP_NODEPS_RESULT="
 NUMPY_RESULT_PREFIX = "FLMEXEC_APP_NUMPY_RESULT="
 

@@ -96,20 +96,27 @@ executorManager:
   extraVolumes: []
   extraVolumeMounts: []
 
-tls:
+security:
   enabled: false
-  mountPath: /etc/flame/certs
-  cluster:
-    secretName: ""
-    certKey: tls.crt
-    privateKeyKey: tls.key
-    caKey: ca.crt
-  cache:
-    secretName: ""
-    certKey: tls.crt
-    privateKeyKey: tls.key
-    caKey: ca.crt
+  trustDomain: flame.local
 
+tls:
+  mountPath: /etc/flame/certs
+  sessionManager:
+    secretName: ""
+    certKey: tls.crt
+    privateKeyKey: tls.key
+    caKey: ca.crt
+  objectCache:
+    secretName: ""
+    certKey: tls.crt
+    privateKeyKey: tls.key
+    caKey: ca.crt
+  executorManager:
+    secretName: ""
+    certKey: tls.crt
+    privateKeyKey: tls.key
+    caKey: ca.crt
 serviceAccount:
   create: true
   name: ""
@@ -119,7 +126,11 @@ podSecurityContext: {}
 securityContext: {}
 
 clientConfig:
-  enabled: true
+  enabled: false
+  tls:
+    certFile: ""
+    keyFile: ""
+    caFile: ""
 
 tests:
   enabled: true

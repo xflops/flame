@@ -18,6 +18,7 @@ pub mod events;
 pub mod net;
 pub mod pprof;
 pub mod python;
+pub mod security;
 pub mod storage;
 
 pub const FLAME_PYTHON_VERSION_ENV: &str = "FLAME_PYTHON_VERSION";

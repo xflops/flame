@@ -20,6 +20,12 @@ def test_ref_subclasses_and_inline_sync_get():
     remote.assert_not_called()
 
 
+def test_object_ref_carries_signature_without_printing_it():
+    ref = ObjectRef(endpoint="grpc://host:9090", key="app/session/value", version=1, signature="signed-key")
+    assert ObjectRef.decode(ref.encode()) == ref
+    assert "signed-key" not in repr(ref)
+
+
 @pytest.mark.asyncio
 async def test_inline_aio_get_avoids_remote_cache():
     with patch("flamepy.core.aio.cache._get_client") as client:

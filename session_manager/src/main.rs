@@ -13,6 +13,7 @@ limitations under the License.
 
 use clap::Parser;
 use futures::future::select_all;
+use std::sync::Arc;
 
 use common::ctx::FlameClusterContext;
 use common::FlameError;
@@ -24,6 +25,7 @@ mod model;
 mod notify;
 mod provider;
 mod scheduler;
+use common::security;
 use common::storage;
 
 #[derive(Parser)]
@@ -56,9 +58,14 @@ async fn main() -> Result<(), FlameError> {
     }
 
     let storage = storage::new_ptr(&ctx).await?;
-
-    // Load data from engine, e.g. sqlite.
+    // Load data from engine, e.g. sqlite, before seeding the built-in role.
     storage.load_data().await?;
+
+    let security_manager: Arc<dyn security::SecurityManager> = Arc::from(
+        security::new(ctx.security.as_ref())
+            .with_role(storage.clone())
+            .await?,
+    );
 
     let controller = controller::new_ptr(storage.clone());
     let application_manager = applications::ApplicationManager::new(controller.clone(), storage);
@@ -119,9 +126,10 @@ async fn main() -> Result<(), FlameError> {
     // Start apiserver frontend task.
     {
         let controller = controller.clone();
+        let security_manager = security_manager.clone();
         let ctx = ctx.clone();
         let handler = tokio::spawn(async move {
-            let apiserver = apiserver::new_frontend(controller);
+            let apiserver = apiserver::new_frontend(controller, security_manager);
             apiserver.run(ctx).await
         });
         handlers.push(handler);
@@ -130,9 +138,10 @@ async fn main() -> Result<(), FlameError> {
     // Start apiserver backend task.
     {
         let controller = controller.clone();
+        let security_manager = security_manager.clone();
         let ctx = ctx.clone();
         let handler = tokio::spawn(async move {
-            let apiserver = apiserver::new_backend(controller);
+            let apiserver = apiserver::new_backend(controller, security_manager);
             apiserver.run(ctx).await
         });
         handlers.push(handler);

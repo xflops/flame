@@ -26,12 +26,14 @@ data:
       recovery:
         session:
           retry_limits: {{ .Values.cluster.recovery.session.retryLimits }}
-      {{- if .Values.tls.enabled }}
+    {{- if .Values.security.enabled }}
+    security:
+      trust_domain: {{ .Values.security.trustDomain | quote }}
       tls:
-        cert_file: {{ printf "%s/%s" (include "flame.tlsClusterPath" .) .Values.tls.cluster.certKey | quote }}
-        key_file: {{ printf "%s/%s" (include "flame.tlsClusterPath" .) .Values.tls.cluster.privateKeyKey | quote }}
-        ca_file: {{ printf "%s/%s" (include "flame.tlsClusterPath" .) .Values.tls.cluster.caKey | quote }}
-      {{- end }}
+        cert_file: {{ printf "%s/tls.crt" (include "flame.tlsPath" .) | quote }}
+        key_file: {{ printf "%s/tls.key" (include "flame.tlsPath" .) | quote }}
+        ca_file: {{ printf "%s/ca.crt" (include "flame.tlsPath" .) | quote }}
+    {{- end }}
     cache:
       endpoint: {{ include "flame.cacheEndpoint" . | quote }}
       network_interface: {{ .Values.objectCache.networkInterface | quote }}
@@ -44,12 +46,6 @@ data:
         {{- end }}
       gc:
         interval: {{ .Values.objectCache.gc.interval | quote }}
-      {{- if .Values.tls.enabled }}
-      tls:
-        cert_file: {{ printf "%s/%s" (include "flame.tlsCachePath" .) .Values.tls.cache.certKey | quote }}
-        key_file: {{ printf "%s/%s" (include "flame.tlsCachePath" .) .Values.tls.cache.privateKeyKey | quote }}
-        ca_file: {{ printf "%s/%s" (include "flame.tlsCachePath" .) .Values.tls.cache.caKey | quote }}
-      {{- end }}
   {{- if .Values.clientConfig.enabled }}
   flame.yaml: |
     ---
@@ -58,14 +54,18 @@ data:
       - name: {{ .Values.cluster.name | quote }}
         cluster:
           endpoint: {{ include "flame.clusterEndpoint" . | quote }}
-          {{- if .Values.tls.enabled }}
+          {{- if .Values.security.enabled }}
           tls:
-            ca_file: {{ printf "%s/%s" (include "flame.tlsClusterPath" .) .Values.tls.cluster.caKey | quote }}
+            cert_file: {{ .Values.clientConfig.tls.certFile | quote }}
+            key_file: {{ .Values.clientConfig.tls.keyFile | quote }}
+            ca_file: {{ .Values.clientConfig.tls.caFile | quote }}
           {{- end }}
         cache:
           endpoint: {{ include "flame.cacheEndpoint" . | quote }}
-          {{- if .Values.tls.enabled }}
+        {{- if .Values.security.enabled }}
           tls:
-            ca_file: {{ printf "%s/%s" (include "flame.tlsCachePath" .) .Values.tls.cache.caKey | quote }}
-          {{- end }}
+            cert_file: {{ .Values.clientConfig.tls.certFile | quote }}
+            key_file: {{ .Values.clientConfig.tls.keyFile | quote }}
+            ca_file: {{ .Values.clientConfig.tls.caFile | quote }}
+        {{- end }}
   {{- end }}

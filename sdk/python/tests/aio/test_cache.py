@@ -9,7 +9,7 @@ import pytest
 from flamepy.core import cache as cache_module
 from flamepy.core.aio import cache as aio_cache
 from flamepy.core.cache import FetchMode, FetchResult, Object, ObjectRef, Patch, _cache_lock, _object_cache
-from flamepy.core.types import FlameClientTls
+from flamepy.core.types import FlameClientCache, FlameClientTls
 from flamepy.proto import cache_pb2, cache_pb2_grpc
 
 
@@ -307,7 +307,7 @@ class TestAioCache:
                 items = [item async for item in requests]
                 stored["header"] = items[0].header
                 stored["payload"] = b"".join(item.data for item in items[1:])
-                return SimpleNamespace(endpoint=endpoint, key="app/session/key", version=1)
+                return SimpleNamespace(endpoint=endpoint, key="app/session/key", version=1, signature="signature")
 
             async def GetMetadata(self, request):  # noqa: N802 - gRPC method
                 return SimpleNamespace(data_type=stored["header"].data_type)
@@ -315,9 +315,10 @@ class TestAioCache:
             async def Patch(self, requests, timeout=None):  # noqa: N802 - gRPC method
                 items = [item async for item in requests]
                 stored["patch"] = b"".join(item.data for item in items[1:])
-                return SimpleNamespace(endpoint=endpoint, key="app/session/key", version=2)
+                return SimpleNamespace(endpoint=endpoint, key="app/session/key", version=2, signature="signature")
 
             def Get(self, request):  # noqa: N802 - gRPC method
+                stored["get_signature"] = request.signature
                 async def responses():
                     yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(mode=cache_pb2.CACHE_GET_MODE_FULL, version=2, data_type=stored["header"].data_type))
                     yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(kind=cache_pb2.CACHE_CHUNK_KIND_BASE, version=1, data=stored["payload"]))
@@ -339,6 +340,178 @@ class TestAioCache:
         asyncio.run(run())
         assert stored["deleted"] == "app/session"
         assert stored["header"].data_type == "cloudpickle"
+        assert stored["get_signature"] == "signature"
+
+    def test_app_token_is_sent_on_cache_writes(self, monkeypatch):
+        endpoint = "grpc://cache:9090"
+        sent = []
+        monkeypatch.setattr(cache_module, "_get_cached_context", lambda: SimpleNamespace(cache=endpoint))
+
+        class FakeClient:
+            async def Put(self, requests, timeout=None, metadata=None):  # noqa: N802 - gRPC method
+                sent.append(metadata)
+                async for _ in requests:
+                    pass
+                return SimpleNamespace(endpoint=endpoint, key="app/session/key", version=1, signature="signature")
+
+        monkeypatch.setattr(aio_cache, "_get_client", lambda endpoint, tls=None: FakeClient())
+
+        async def run():
+            await aio_cache.put_object("app/session", "value", app_token="signed-app-token")
+
+        asyncio.run(run())
+        assert sent == [((aio_cache.DELEGATION_TOKEN_HEADER, "signed-app-token"),)]
+
+    def test_signing_requirement_uses_requested_cache_endpoint(self):
+        assert cache_module.cache_requires_signing("grpcs://cache:9090")
+        assert not cache_module.cache_requires_signing("grpc://cache:9090")
+
+    def test_cached_app_token_signs_once_and_respects_session_token(self, monkeypatch):
+        endpoint = "grpcs://cache:9090"
+        tls = FlameClientTls(cert_file="client.crt", key_file="client.key")
+        signed = []
+        monkeypatch.setattr(aio_cache, "_configured_endpoint", lambda: (endpoint, tls))
+        monkeypatch.setattr(cache_module, "_resolve_cache_endpoint", lambda value: (value, None))
+
+        class FakeClient:
+            async def Delegate(self, request):  # noqa: N802 - gRPC method
+                signed.append(request.key)
+                return SimpleNamespace(token=f"signed:{request.key}")
+
+        monkeypatch.setattr(aio_cache, "_get_client", lambda endpoint, tls=None: FakeClient())
+
+        async def run():
+            key = cache_module.ObjectKey.from_prefix("app/session")
+            first, second = await asyncio.gather(
+                aio_cache._resolved_app_token(key, endpoint, tls, None),
+                aio_cache._resolved_app_token(key, endpoint, tls, None),
+            )
+            assert (first, second) == ("signed:app", "signed:app")
+            assert await aio_cache.cached_app_token("app") == "signed:app"
+            active = cache_module._active_app_token.set("from-session-context")
+            try:
+                assert await aio_cache._resolved_app_token(key, endpoint, tls, None) == "from-session-context"
+            finally:
+                cache_module._active_app_token.reset(active)
+            await aio_cache.close()
+
+        asyncio.run(run())
+        assert signed == ["app"]
+
+    def test_tls_gateway_without_backend_signing_omits_automatic_token(self, monkeypatch):
+        endpoint = "grpcs-proxy://gateway:443"
+        tls = FlameClientTls(cert_file="client.crt", key_file="client.key")
+        monkeypatch.setattr(cache_module, "_resolve_cache_endpoint", lambda value: (value, None))
+
+        async def unsigned(_application, _endpoint):
+            return ""
+
+        monkeypatch.setattr(aio_cache, "cached_app_token", unsigned)
+        key = cache_module.ObjectKey.from_prefix("app/session")
+        assert asyncio.run(aio_cache._resolved_app_token(key, endpoint, tls, None)) is None
+
+    def test_secure_direct_put_get_signs_once(self, monkeypatch):
+        endpoint = "grpcs://cache:9090"
+        tls = FlameClientTls(cert_file="client.crt", key_file="client.key")
+        monkeypatch.setattr(cache_module, "_get_cached_context", lambda: SimpleNamespace(cache=FlameClientCache(endpoint=endpoint, tls=tls)))
+        sent = []
+        stored = {}
+
+        class FakeClient:
+            async def Delegate(self, request):  # noqa: N802 - gRPC method
+                sent.append(("delegate", request.key))
+                return SimpleNamespace(token="signed:app")
+
+            async def Put(self, requests, timeout=None, metadata=None):  # noqa: N802 - gRPC method
+                sent.append(("put", metadata))
+                items = [item async for item in requests]
+                stored["type"] = items[0].header.data_type
+                stored["data"] = b"".join(item.data for item in items[1:])
+                return SimpleNamespace(endpoint=endpoint, key="app/session/object", version=1, signature="signature")
+
+            def Get(self, request, metadata=None):  # noqa: N802 - gRPC method
+                sent.append(("get", metadata))
+
+                async def responses():
+                    yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(mode=cache_pb2.CACHE_GET_MODE_FULL, version=1, data_type=stored["type"]))
+                    yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(kind=cache_pb2.CACHE_CHUNK_KIND_BASE, version=1, data=stored["data"]))
+
+                return responses()
+
+        monkeypatch.setattr(aio_cache, "_get_client", lambda endpoint, tls=None: FakeClient())
+
+        async def run():
+            ref = await aio_cache.put_object("app/session", {"value": 1})
+            assert await aio_cache.get_object(ref) == {"value": 1}
+            await aio_cache.close()
+
+        asyncio.run(run())
+        assert sent == [
+            ("delegate", "app"),
+            ("put", ((aio_cache.DELEGATION_TOKEN_HEADER, "signed:app"),)),
+            ("get", ((aio_cache.DELEGATION_TOKEN_HEADER, "signed:app"),)),
+        ]
+
+    def test_secure_mutations_and_file_transfer_reuse_token(self, monkeypatch, tmp_path):
+        endpoint = "grpcs://cache:9090"
+        tls = FlameClientTls(cert_file="client.crt", key_file="client.key")
+        monkeypatch.setattr(cache_module, "_get_cached_context", lambda: SimpleNamespace(cache=FlameClientCache(endpoint=endpoint, tls=tls)))
+        sent = []
+        stored = {}
+
+        class FakeClient:
+            async def Delegate(self, request):  # noqa: N802 - gRPC method
+                sent.append(("delegate", request.key))
+                return SimpleNamespace(token="signed:app")
+
+            async def Put(self, requests, timeout=None, metadata=None):  # noqa: N802 - gRPC method
+                sent.append(("put", metadata))
+                items = [item async for item in requests]
+                stored["type"] = items[0].header.data_type
+                stored["data"] = b"".join(item.data for item in items[1:])
+                return SimpleNamespace(endpoint=endpoint, key="app/session/object", version=1, signature="signature")
+
+            async def GetMetadata(self, request, metadata=None):  # noqa: N802 - gRPC method
+                sent.append(("metadata", metadata))
+                return SimpleNamespace(data_type="cloudpickle")
+
+            async def Patch(self, requests, timeout=None, metadata=None):  # noqa: N802 - gRPC method
+                sent.append(("patch", metadata))
+                async for _ in requests:
+                    pass
+                return SimpleNamespace(endpoint=endpoint, key="app/session/object", version=2, signature="signature")
+
+            async def Delete(self, request, metadata=None):  # noqa: N802 - gRPC method
+                sent.append(("delete", metadata))
+
+            def Get(self, request, metadata=None):  # noqa: N802 - gRPC method
+                sent.append(("get", metadata))
+
+                async def responses():
+                    yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(mode=cache_pb2.CACHE_GET_MODE_FULL, version=1, data_type="raw"))
+                    yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(kind=cache_pb2.CACHE_CHUNK_KIND_BASE, version=1, data=stored["data"]))
+
+                return responses()
+
+        monkeypatch.setattr(aio_cache, "_get_client", lambda endpoint, tls=None: FakeClient())
+        source = tmp_path / "source.bin"
+        source.write_bytes(b"file bytes")
+        destination = tmp_path / "download.bin"
+
+        async def run():
+            ref = ObjectRef(endpoint, "app/session/object")
+            await aio_cache.update_object(ref, [1])
+            await aio_cache.patch_object(ref, [2])
+            await aio_cache.delete_objects("app/session")
+            uploaded = await aio_cache.upload_object("app/session", str(source), endpoint=endpoint)
+            await aio_cache.download_object(uploaded, str(destination))
+            await aio_cache.close()
+
+        asyncio.run(run())
+        assert destination.read_bytes() == b"file bytes"
+        assert [call[0] for call in sent].count("delegate") == 1
+        assert [call[0] for call in sent if call[0] != "delegate"] == ["put", "metadata", "patch", "delete", "put", "get"]
+        assert all(metadata == ((aio_cache.DELEGATION_TOKEN_HEADER, "signed:app"),) for name, metadata in sent if name != "delegate")
 
     def test_file_upload_download_and_zstd(self, monkeypatch, tmp_path):
         payload = b"abc" * 400000
@@ -353,7 +526,7 @@ class TestAioCache:
                 items = [item async for item in requests]
                 stored["type"] = items[0].header.data_type
                 stored["payload"] = b"".join(item.data for item in items[1:])
-                return SimpleNamespace(endpoint=endpoint, key="app/session/file.tar.gz", version=1)
+                return SimpleNamespace(endpoint=endpoint, key="app/session/file.tar.gz", version=1, signature="signature")
 
             def Get(self, request):  # noqa: N802 - gRPC method
                 async def responses():

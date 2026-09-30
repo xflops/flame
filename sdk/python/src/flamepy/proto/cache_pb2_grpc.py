@@ -36,6 +36,11 @@ class ObjectCacheServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.Delegate = channel.unary_unary(
+                '/flame.v1.ObjectCacheService/Delegate',
+                request_serializer=cache__pb2.CacheDelegateRequest.SerializeToString,
+                response_deserializer=cache__pb2.CacheDelegateResponse.FromString,
+                _registered_method=True)
         self.Put = channel.stream_unary(
                 '/flame.v1.ObjectCacheService/Put',
                 request_serializer=cache__pb2.CacheWriteRequest.SerializeToString,
@@ -72,6 +77,13 @@ class ObjectCacheServiceServicer(object):
     """The cache stores opaque bytes. Clients serialize and deserialize values,
     including Arrow values, before sending them over this service.
     """
+
+    def Delegate(self, request, context):
+        """Delegate the authenticated mTLS client user identity.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def Put(self, request_iterator, context):
         """Missing associated documentation comment in .proto file."""
@@ -112,6 +124,11 @@ class ObjectCacheServiceServicer(object):
 
 def add_ObjectCacheServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'Delegate': grpc.unary_unary_rpc_method_handler(
+                    servicer.Delegate,
+                    request_deserializer=cache__pb2.CacheDelegateRequest.FromString,
+                    response_serializer=cache__pb2.CacheDelegateResponse.SerializeToString,
+            ),
             'Put': grpc.stream_unary_rpc_method_handler(
                     servicer.Put,
                     request_deserializer=cache__pb2.CacheWriteRequest.FromString,
@@ -154,6 +171,33 @@ class ObjectCacheService(object):
     """The cache stores opaque bytes. Clients serialize and deserialize values,
     including Arrow values, before sending them over this service.
     """
+
+    @staticmethod
+    def Delegate(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/flame.v1.ObjectCacheService/Delegate',
+            cache__pb2.CacheDelegateRequest.SerializeToString,
+            cache__pb2.CacheDelegateResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def Put(request_iterator,

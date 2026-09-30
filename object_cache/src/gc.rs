@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use common::ctx::FlameCluster;
+use common::ctx::{FlameCluster, FlameSecurity};
 use common::FlameError;
 use rpc::flame::v1::frontend_client::FrontendClient;
 use rpc::flame::v1::{self as flame_rpc, ListApplicationsRequest};
@@ -75,7 +75,7 @@ struct FrontendApplicationLister {
 }
 
 impl FrontendApplicationLister {
-    fn new(cluster: &FlameCluster) -> Result<Self, FlameError> {
+    fn new(cluster: &FlameCluster, security: Option<&FlameSecurity>) -> Result<Self, FlameError> {
         let mut endpoint = Endpoint::from_shared(cluster.endpoint.clone()).map_err(|error| {
             FlameError::InvalidConfig(format!(
                 "invalid FSM frontend endpoint <{}>: {}",
@@ -84,8 +84,8 @@ impl FrontendApplicationLister {
         })?;
 
         if cluster.requires_tls() {
-            let tls = match cluster.tls.as_ref() {
-                Some(tls) => tls.client_tls_config()?,
+            let tls = match security {
+                Some(security) => security.tls.client_tls_config()?,
                 None => ClientTlsConfig::new().with_native_roots(),
             };
             endpoint = endpoint.tls_config(tls).map_err(|error| {
@@ -151,11 +151,12 @@ impl ApplicationGarbageCollector {
     pub(crate) fn new(
         cache: Arc<ObjectCache>,
         cluster: &FlameCluster,
+        security: Option<&FlameSecurity>,
         interval: Duration,
     ) -> Result<Self, FlameError> {
         Ok(Self {
             cache,
-            applications: Box::new(FrontendApplicationLister::new(cluster)?),
+            applications: Box::new(FrontendApplicationLister::new(cluster, security)?),
             interval,
         })
     }

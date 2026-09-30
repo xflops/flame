@@ -1,7 +1,7 @@
 ---
 cluster:
   name: flame
-  endpoint: "http://127.0.0.1:30080"
+  endpoint: "http://127.0.0.1:8080"
   resreq: "cpu=1,mem=1g"
   policies:
     - priority
@@ -14,4 +14,4 @@ cluster:
     max_executors: 10
 cache:
   endpoint: "grpc://127.0.0.1:9090"
-  network_interface: "br0"
+  network_interface: "lo"

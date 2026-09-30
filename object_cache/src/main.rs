@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    cache::run(&ctx.cluster, cache_config).await?;
+    cache::run(&ctx.cluster, ctx.security.as_ref(), cache_config).await?;
 
     Ok(())
 }

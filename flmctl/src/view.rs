@@ -178,7 +178,11 @@ async fn view_application(
     println!(
         "{:<15}{}",
         "URL:",
-        application.attributes.url.unwrap_or_default()
+        application
+            .attributes
+            .package
+            .map(|package| package.url)
+            .unwrap_or_default()
     );
     println!(
         "{:<15}{}",

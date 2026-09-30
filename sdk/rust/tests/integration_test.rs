@@ -32,20 +32,21 @@ const FLAME_DEFAULT_ADDR: &str = "https://127.0.0.1:8080";
 
 const FLAME_DEFAULT_APP: &str = "flmping";
 
-fn get_ca_cert_path() -> String {
+fn get_cert_path(name: &str) -> String {
     let root = std::env::var("FLAME_ROOT").unwrap_or_else(|_| {
         // Fallback: use CARGO_MANIFEST_DIR and navigate up
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         format!("{}/../..", manifest_dir)
     });
-    format!("{}/ci/docker/certs/ca.crt", root)
+    format!("{}/ci/docker/certs/{name}", root)
 }
 
 /// Helper function to get a TLS-enabled connection
 async fn get_connection() -> Result<flame::client::Connection, FlameError> {
     let tls_config = FlameClientTls {
-        ca_file: Some(get_ca_cert_path()),
-        ..Default::default()
+        ca_file: Some(get_cert_path("ca.crt")),
+        cert_file: Some(get_cert_path("admin.crt")),
+        key_file: Some(get_cert_path("admin.key")),
     };
     flame::client::connect_with_tls(FLAME_DEFAULT_ADDR, Some(&tls_config)).await
 }
@@ -275,7 +276,7 @@ async fn test_application_lifecycle() -> Result<(), FlameError> {
                     output: Some(string_schema.to_string()),
                     common_data: None,
                 }),
-                url: None,
+                package: None,
                 installer: None,
             },
         ),
@@ -293,7 +294,7 @@ async fn test_application_lifecycle() -> Result<(), FlameError> {
                 max_instances: None,
                 delay_release: None,
                 schema: None,
-                url: None,
+                package: None,
                 installer: None,
             },
         ),

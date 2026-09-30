@@ -43,7 +43,10 @@ pub fn client_application_attributes(
             output: schema.output,
             common_data: schema.common_data,
         }),
-        url: attributes.url,
+        package: attributes.package.map(|package| flame_rs::client::Package {
+            url: package.url,
+            signature: package.signature,
+        }),
         installer: attributes.installer,
     }
 }

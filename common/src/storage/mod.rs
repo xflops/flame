@@ -40,6 +40,7 @@ use crate::FlameError;
 
 use crate::apis::{ApplicationFilter, Executor, ExecutorFilter, ExecutorPtr, SessionFilter};
 
+use crate::apis::Role;
 use crate::events::{EventManagerPtr, FsEventManager, MemoryEventManager};
 use crate::storage::engine::EnginePtr;
 
@@ -63,6 +64,7 @@ pub struct Storage {
     executors: MutexPtr<HashMap<ExecutorID, ExecutorPtr>>,
     nodes: MutexPtr<HashMap<String, NodePtr>>,
     applications: MutexPtr<HashMap<String, ApplicationPtr>>,
+    roles: MutexPtr<HashMap<String, Role>>,
     event_manager: EventManagerPtr,
     max_sessions: Option<usize>,
 }
@@ -75,13 +77,16 @@ pub async fn new_ptr(config: &FlameClusterContext) -> Result<StoragePtr, FlameEr
         Arc::new(FsEventManager::new(&events_path)?)
     };
 
+    let engine = engine::connect(&config.cluster.storage).await?;
+
     Ok(Arc::new(Storage {
         context: config.clone(),
-        engine: engine::connect(&config.cluster.storage).await?,
+        engine,
         sessions: stdng::new_ptr(HashMap::new()),
         executors: stdng::new_ptr(HashMap::new()),
         nodes: stdng::new_ptr(HashMap::new()),
         applications: stdng::new_ptr(HashMap::new()),
+        roles: stdng::new_ptr(HashMap::new()),
         event_manager,
         max_sessions: config.cluster.limits.max_sessions,
     }))
@@ -99,6 +104,28 @@ fn derive_events_path(_storage_url: &str) -> String {
 }
 
 impl Storage {
+    pub fn get_role(&self, name: &str) -> Result<Option<Role>, FlameError> {
+        Ok(lock_ptr!(self.roles)?.get(name).cloned())
+    }
+
+    pub fn set_role(&self, role: &Role) -> Result<(), FlameError> {
+        let mut roles = lock_ptr!(self.roles)?;
+        self.engine.set_role(role)?;
+        roles.insert(role.name.clone(), role.clone());
+        Ok(())
+    }
+
+    pub fn delete_role(&self, name: &str) -> Result<(), FlameError> {
+        let mut roles = lock_ptr!(self.roles)?;
+        self.engine.delete_role(name)?;
+        roles.remove(name);
+        Ok(())
+    }
+
+    pub fn list_roles(&self) -> Result<Vec<Role>, FlameError> {
+        Ok(lock_ptr!(self.roles)?.values().cloned().collect())
+    }
+
     pub fn session_retry_limits(&self) -> u32 {
         self.context.cluster.recovery.session.retry_limits
     }
@@ -129,6 +156,16 @@ impl Storage {
     }
 
     pub async fn load_data(&self) -> Result<(), FlameError> {
+        {
+            let mut roles = lock_ptr!(self.roles)?;
+            *roles = self
+                .engine
+                .find_roles()?
+                .into_iter()
+                .map(|role| (role.name.clone(), role))
+                .collect();
+        }
+
         let ssn_list = self.engine.find_sessions().await?;
         for ssn in ssn_list {
             let task_list = self.engine.find_tasks(ssn.id.clone()).await?;
@@ -1134,3 +1171,6 @@ mod load_data_tests;
 
 #[cfg(test)]
 mod derive_events_path_tests;
+
+#[cfg(test)]
+mod security_tests;

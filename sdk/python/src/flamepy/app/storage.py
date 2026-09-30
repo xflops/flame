@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from flamepy.core.types import FlameError, FlameErrorCode
+from flamepy.core.types import ApplicationPackage, FlameError, FlameErrorCode
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,9 @@ class StorageBackend(ABC):
             FlameError: If upload fails
         """
         pass
+
+    def upload_package(self, local_path: str, filename: str) -> ApplicationPackage:
+        return ApplicationPackage(url=self.upload(local_path, filename))
 
     @abstractmethod
     def delete(self, filename: str) -> None:
@@ -315,14 +318,19 @@ class CacheStorage(StorageBackend):
         self._endpoint = f"{self._scheme}://{self._host}:{self._port}"
 
     def upload(self, local_path: str, filename: str) -> str:
-        from flamepy.core.cache import upload_object
+        return self.upload_package(local_path, filename).url
+
+    def upload_package(self, local_path: str, filename: str) -> ApplicationPackage:
+        from flamepy.core.cache import cache_requires_signing, sign_app_token, upload_object
 
         if not self._app_name:
             raise FlameError(FlameErrorCode.INVALID_CONFIG, "app_name is required for upload")
 
         try:
             key = f"{self._app_name}/pkg/{filename}"
-            ref = upload_object(key, local_path, endpoint=self._endpoint)
+            app_token = (sign_app_token(self._app_name, endpoint=self._endpoint) or None) if cache_requires_signing(self._endpoint) else None
+            token_kwargs = {"app_token": app_token} if app_token is not None else {}
+            ref = upload_object(key, local_path, endpoint=self._endpoint, **token_kwargs)
             # Preserve the server-returned owning-cache endpoint so consumers
             # such as executor-manager do not receive this external client's
             # proxy endpoint. Arrow Flight spells secure locations as
@@ -332,11 +340,12 @@ class CacheStorage(StorageBackend):
                 package_endpoint = package_endpoint.replace("grpc+tls://", "grpcs://", 1)
             url = f"{package_endpoint.rstrip('/')}/{ref.key}"
             logger.debug(f"Uploaded package to cache: {url}")
-            return url
+            return ApplicationPackage(url=url, signature=ref.signature)
         except Exception as e:
             raise FlameError(FlameErrorCode.INTERNAL, f"Failed to upload package to cache: {str(e)}")
 
-    def download(self, filename: str, local_path: str) -> None:
+    def download(self, filename: str, local_path: str, signature: str = "") -> None:
+        """Download a package using its cache signature."""
         from flamepy.core.cache import ObjectRef, download_object
 
         if not self._app_name:
@@ -344,21 +353,23 @@ class CacheStorage(StorageBackend):
 
         try:
             key = f"{self._app_name}/pkg/{filename}"
-            ref = ObjectRef(endpoint=self._endpoint, key=key, version=0)
+            ref = ObjectRef(endpoint=self._endpoint, key=key, version=0, signature=signature)
             download_object(ref, local_path)
             logger.debug(f"Downloaded package from cache: {key} -> {local_path}")
         except Exception as e:
             raise FlameError(FlameErrorCode.INTERNAL, f"Failed to download package from cache: {str(e)}")
 
     def delete(self, filename: str) -> None:
-        from flamepy.core.cache import ObjectKey, delete_objects
+        from flamepy.core.cache import ObjectKey, cache_requires_signing, delete_objects, sign_app_token
 
         if not self._app_name:
             return
 
         try:
             key = str(ObjectKey(app_name=self._app_name, session_id="pkg", object_id=filename))
-            delete_objects(key)
+            app_token = (sign_app_token(self._app_name, endpoint=self._endpoint) or None) if cache_requires_signing(self._endpoint) else None
+            token_kwargs = {"app_token": app_token} if app_token is not None else {}
+            delete_objects(key, **token_kwargs)
             logger.debug(f"Deleted package from cache: {key}")
         except Exception as e:
             logger.warning(f"Error deleting package from cache: {e}")

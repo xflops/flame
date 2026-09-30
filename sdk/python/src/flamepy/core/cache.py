@@ -18,6 +18,7 @@ import threading
 import types
 import uuid
 from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
@@ -80,6 +81,16 @@ except ImportError:
 Deserializer = Callable[[Any, List[Any]], Any]
 
 WILDCARD_SESSION = "*"
+_active_app_token: ContextVar[Optional[str]] = ContextVar("flame_cache_app_token", default=None)
+
+
+def _current_app_token(explicit: Optional[str]) -> Optional[str]:
+    return explicit if explicit is not None else _active_app_token.get()
+
+
+def _app_token_kwargs(explicit: Optional[str]) -> dict:
+    token = _current_app_token(explicit)
+    return {"app_token": token} if token is not None else {}
 
 
 class FetchMode(str, Enum):
@@ -111,6 +122,7 @@ class ObjectRef(Ref):
     endpoint: str
     key: str  # Object key in format "<app>/<ssn>/<uuid>"
     version: int = 0
+    signature: str = field(default="", repr=False)
 
     def encode(self) -> bytes:
         data = asdict(self)
@@ -682,32 +694,48 @@ def _close_aio_bridge() -> None:
 atexit.register(_close_aio_bridge)
 
 
-def put_object(key_prefix: str, obj: Any) -> ObjectRef:
-    return _call_aio_cache("put_object", key_prefix, obj)
+def sign_app_token(application: str, endpoint: Optional[str] = None) -> str:
+    """Sign an application name with the configured cache mTLS identity."""
+    return _call_aio_cache("sign_app_token", application, endpoint)
 
 
-def get_object(ref: Ref, deserializer: Optional[Deserializer] = None) -> Any:
+def cache_requires_signing(endpoint: Optional[str] = None) -> bool:
+    """Report whether the configured cache uses TLS and an app token."""
+    from urllib.parse import urlparse
+
+    from flamepy.core.aio import cache as aio_cache
+
+    if endpoint is None:
+        endpoint, _ = aio_cache._configured_endpoint()
+    return urlparse(endpoint).scheme in ("grpcs", "grpc+tls", "grpcs-proxy")
+
+
+def put_object(key_prefix: str, obj: Any, *, app_token: Optional[str] = None) -> ObjectRef:
+    return _call_aio_cache("put_object", key_prefix, obj, **_app_token_kwargs(app_token))
+
+
+def get_object(ref: Ref, deserializer: Optional[Deserializer] = None, *, app_token: Optional[str] = None) -> Any:
     if isinstance(ref, ValueRef):
         return ref.value if deserializer is None else deserializer(ref.value, [])
     if not isinstance(ref, ObjectRef):
         raise TypeError(f"Expected ValueRef or ObjectRef, got {type(ref).__name__}")
-    return _call_aio_cache("get_object", ref, deserializer)
+    return _call_aio_cache("get_object", ref, deserializer, **_app_token_kwargs(app_token))
 
 
-def update_object(ref: ObjectRef, new_obj: Any) -> ObjectRef:
-    return _call_aio_cache("update_object", ref, new_obj)
+def update_object(ref: ObjectRef, new_obj: Any, *, app_token: Optional[str] = None) -> ObjectRef:
+    return _call_aio_cache("update_object", ref, new_obj, **_app_token_kwargs(app_token))
 
 
-def patch_object(ref: ObjectRef, delta: Any) -> ObjectRef:
-    return _call_aio_cache("patch_object", ref, delta)
+def patch_object(ref: ObjectRef, delta: Any, *, app_token: Optional[str] = None) -> ObjectRef:
+    return _call_aio_cache("patch_object", ref, delta, **_app_token_kwargs(app_token))
 
 
-def delete_objects(key_prefix: str) -> None:
-    _call_aio_cache("delete_objects", key_prefix)
+def delete_objects(key_prefix: str, *, app_token: Optional[str] = None) -> None:
+    _call_aio_cache("delete_objects", key_prefix, **_app_token_kwargs(app_token))
 
 
-def upload_object(key_or_prefix: str, file_path: str, endpoint: Optional[str] = None) -> ObjectRef:
-    return _call_aio_cache("upload_object", key_or_prefix, file_path, endpoint)
+def upload_object(key_or_prefix: str, file_path: str, endpoint: Optional[str] = None, *, app_token: Optional[str] = None) -> ObjectRef:
+    return _call_aio_cache("upload_object", key_or_prefix, file_path, endpoint, **_app_token_kwargs(app_token))
 
 
 def download_object(ref: ObjectRef, dest_path: str) -> None:

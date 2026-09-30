@@ -31,8 +31,9 @@ use url::Url;
 
 use crate::apis::flame::v1::object_cache_service_client::ObjectCacheServiceClient;
 use crate::apis::flame::v1::{
-    cache_get_response, cache_write_request, CacheChunkKind, CacheDeleteRequest, CacheGetChunk,
-    CacheGetHeader, CacheGetMode, CacheGetRequest, CacheWriteHeader, CacheWriteRequest,
+    cache_get_response, cache_write_request, CacheChunkKind, CacheDelegateRequest,
+    CacheDeleteRequest, CacheGetChunk, CacheGetHeader, CacheGetMode, CacheGetRequest,
+    CacheWriteHeader, CacheWriteRequest,
 };
 use crate::apis::{FlameClientCache, FlameClientTls, FlameContext, FlameError};
 use crate::message::FlameMessage;
@@ -42,6 +43,28 @@ const DEFAULT_CACHE_PORT: u16 = 9090;
 const CONNECT_TIMEOUT_SECS: u64 = 30;
 const UPLOAD_CHUNK_SIZE: usize = 1024 * 1024;
 const CACHE_TARGET_HEADER: &str = "x-flame-object-cache";
+const DELEGATION_TOKEN_HEADER: &str = "x-flame-delegation-token";
+
+/// Ask the cache to delegate the caller identity using its configured mTLS certificate.
+pub async fn sign_app_token(
+    context: &FlameContext,
+    application: &str,
+) -> Result<String, FlameError> {
+    validate_component("application", application, true)?;
+    let cache = cache_from_context(context)?;
+    let mut client =
+        ObjectCacheServiceClient::new(connect_cache(&cache.endpoint, cache.tls.as_ref()).await?);
+    let response = client
+        .delegate(cache_request(
+            &cache.endpoint,
+            CacheDelegateRequest {
+                key: application.to_string(),
+            },
+        )?)
+        .await
+        .map_err(|error| FlameError::Internal(format!("cache delegation failed: {error}")))?;
+    Ok(response.into_inner().token)
+}
 
 /// The cache returns bytes and their client-defined type without interpreting either.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -228,11 +251,24 @@ impl Display for ObjectKey {
     }
 }
 
-#[derive(Clone, Debug, DeriveSerialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, DeriveSerialize, Deserialize, Eq, PartialEq)]
 pub struct ObjectRef {
     pub endpoint: String,
     pub key: String,
     pub version: u64,
+    #[serde(default)]
+    pub signature: String,
+}
+
+impl std::fmt::Debug for ObjectRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectRef")
+            .field("endpoint", &self.endpoint)
+            .field("key", &self.key)
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ObjectRef {
@@ -245,6 +281,7 @@ impl ObjectRef {
             endpoint: endpoint.into(),
             key: key.into(),
             version,
+            signature: String::new(),
         };
         ObjectKey::from_key(&reference.key)?;
         Ok(reference)
@@ -259,6 +296,7 @@ impl ObjectRef {
             "endpoint": &self.endpoint,
             "key": &self.key,
             "version": version,
+            "signature": &self.signature,
         };
         doc.to_writer(&mut bytes)
             .map_err(|e| FlameError::Internal(format!("failed to encode ObjectRef: {}", e)))?;
@@ -342,8 +380,43 @@ pub async fn put_object_bytes_with_context(
         false,
         bytes.into(),
         data_type.as_ref(),
+        None,
     )
     .await
+}
+
+/// Write session data using the application token provided in SessionContext.
+pub async fn put_object_bytes_with_app_token(
+    context: &FlameContext,
+    key_prefix: impl AsRef<str>,
+    bytes: impl Into<Bytes>,
+    data_type: impl AsRef<str>,
+    app_token: &str,
+) -> Result<ObjectRef, FlameError> {
+    let key = ObjectKey::from_prefix(key_prefix.as_ref())?;
+    let cache = cache_from_context(context)?;
+    do_put_bytes(
+        &cache.endpoint,
+        cache.tls.as_ref(),
+        key.to_prefix(),
+        false,
+        bytes.into(),
+        data_type.as_ref(),
+        Some(app_token),
+    )
+    .await
+}
+
+pub async fn put_object_with_app_token<T>(
+    context: &FlameContext,
+    key_prefix: impl AsRef<str>,
+    object: &T,
+    app_token: &str,
+) -> Result<ObjectRef, FlameError>
+where
+    T: FlameMessage,
+{
+    put_object_bytes_with_app_token(context, key_prefix, object.encode()?, "raw", app_token).await
 }
 
 pub fn get_object<T>(reference: ObjectRef) -> ObjectFuture<T>
@@ -384,6 +457,28 @@ pub async fn update_object_bytes(
         false,
         bytes.into(),
         data_type.as_ref(),
+        None,
+    )
+    .await
+}
+
+pub async fn update_object_bytes_with_app_token(
+    reference: &ObjectRef,
+    bytes: impl Into<Bytes>,
+    data_type: impl AsRef<str>,
+    app_token: &str,
+) -> Result<ObjectRef, FlameError> {
+    ObjectKey::from_key(&reference.key)?;
+    let endpoint = endpoint_for_reference(&reference.endpoint)?;
+    let tls = current_cache_tls()?;
+    do_put_bytes(
+        &endpoint,
+        tls.as_ref(),
+        reference.key.clone(),
+        false,
+        bytes.into(),
+        data_type.as_ref(),
+        Some(app_token),
     )
     .await
 }
@@ -410,20 +505,57 @@ pub async fn patch_object_bytes(
         true,
         bytes.into(),
         data_type.as_ref(),
+        None,
+    )
+    .await
+}
+
+pub async fn patch_object_bytes_with_app_token(
+    reference: &ObjectRef,
+    bytes: impl Into<Bytes>,
+    data_type: impl AsRef<str>,
+    app_token: &str,
+) -> Result<ObjectRef, FlameError> {
+    ObjectKey::from_key(&reference.key)?;
+    let endpoint = endpoint_for_reference(&reference.endpoint)?;
+    let tls = current_cache_tls()?;
+    do_put_bytes(
+        &endpoint,
+        tls.as_ref(),
+        reference.key.clone(),
+        true,
+        bytes.into(),
+        data_type.as_ref(),
+        Some(app_token),
     )
     .await
 }
 
 pub async fn delete_objects(key_prefix: impl AsRef<str>) -> Result<(), FlameError> {
-    let object_key = ObjectKey::from_path(key_prefix.as_ref())?;
+    delete_objects_inner(key_prefix.as_ref(), None).await
+}
+
+pub async fn delete_objects_with_app_token(
+    key_prefix: impl AsRef<str>,
+    app_token: &str,
+) -> Result<(), FlameError> {
+    delete_objects_inner(key_prefix.as_ref(), Some(app_token)).await
+}
+
+async fn delete_objects_inner(key_prefix: &str, app_token: Option<&str>) -> Result<(), FlameError> {
+    let object_key = ObjectKey::from_path(key_prefix)?;
     let context = FlameContext::from_file_with_env(None)?;
     let cache = cache_from_context(&context)?;
     let mut client =
         ObjectCacheServiceClient::new(connect_cache(&cache.endpoint, cache.tls.as_ref()).await?);
     client
-        .delete(CacheDeleteRequest {
-            key: object_key.to_string(),
-        })
+        .delete(cache_request_with_app_token(
+            &cache.endpoint,
+            CacheDeleteRequest {
+                key: object_key.to_string(),
+            },
+            app_token,
+        )?)
         .await
         .map_err(|e| FlameError::Internal(format!("cache delete failed: {}", e)))?;
     Ok(())
@@ -474,6 +606,30 @@ pub async fn upload_object_with_context_and_data_type(
         object_key.to_string(),
         file_path.as_ref(),
         data_type.as_ref(),
+        None,
+    )
+    .await
+}
+
+pub async fn upload_object_with_app_token(
+    context: &FlameContext,
+    key_or_prefix: impl AsRef<str>,
+    file_path: impl AsRef<Path>,
+    data_type: impl AsRef<str>,
+    app_token: &str,
+) -> Result<ObjectRef, FlameError> {
+    let key = ObjectKey::from_path(key_or_prefix.as_ref())?;
+    if key.is_all_sessions() {
+        return Err(FlameError::InvalidConfig("wildcard upload key".to_string()));
+    }
+    let cache = cache_from_context(context)?;
+    do_put_file(
+        &cache.endpoint,
+        cache.tls.as_ref(),
+        key.to_string(),
+        file_path.as_ref(),
+        data_type.as_ref(),
+        Some(app_token),
     )
     .await
 }
@@ -501,6 +657,7 @@ pub async fn download_object_with_data_type(
             CacheGetRequest {
                 key: reference.key.clone(),
                 client_version: 0,
+                signature: reference.signature.clone(),
             },
         )?)
         .await
@@ -662,6 +819,28 @@ fn cache_request<T>(endpoint: &CacheEndpoint, message: T) -> Result<Request<T>, 
     Ok(request)
 }
 
+fn cache_request_with_app_token<T>(
+    endpoint: &CacheEndpoint,
+    message: T,
+    app_token: Option<&str>,
+) -> Result<Request<T>, FlameError> {
+    let mut request = cache_request(endpoint, message)?;
+    if let Some(token) = app_token {
+        if token.is_empty() {
+            return Err(FlameError::InvalidConfig(
+                "empty cache app token".to_string(),
+            ));
+        }
+        request.metadata_mut().insert(
+            DELEGATION_TOKEN_HEADER,
+            token.parse().map_err(|error| {
+                FlameError::InvalidConfig(format!("invalid cache app token: {error}"))
+            })?,
+        );
+    }
+    Ok(request)
+}
+
 fn validate_component(name: &str, value: &str, reject_wildcard: bool) -> Result<(), FlameError> {
     if value.is_empty() {
         return Err(FlameError::InvalidConfig(format!("{name} cannot be empty")));
@@ -697,7 +876,7 @@ fn cache_from_context(context: &FlameContext) -> Result<CacheConfig, FlameError>
     let endpoint = cache_endpoint(cache)?;
     Ok(CacheConfig {
         endpoint,
-        tls: cache.tls.clone(),
+        tls: cache.tls.clone().or_else(|| current.cluster.tls.clone()),
     })
 }
 
@@ -713,11 +892,12 @@ fn current_cache_tls() -> Result<Option<FlameClientTls>, FlameError> {
     let Some(context) = optional_context()? else {
         return Ok(None);
     };
-    Ok(context
-        .get_current_context()?
+    let current = context.get_current_context()?;
+    Ok(current
         .cache
         .as_ref()
-        .and_then(|cache| cache.tls.clone()))
+        .and_then(|cache| cache.tls.clone())
+        .or_else(|| current.cluster.tls.clone()))
 }
 
 fn endpoint_for_reference(reference_endpoint: &str) -> Result<CacheEndpoint, FlameError> {
@@ -829,7 +1009,9 @@ fn write_bytes_stream(
 fn object_ref_from_metadata(
     metadata: crate::apis::flame::v1::CacheObjectMetadata,
 ) -> Result<ObjectRef, FlameError> {
-    ObjectRef::new(metadata.endpoint, metadata.key, metadata.version)
+    let mut reference = ObjectRef::new(metadata.endpoint, metadata.key, metadata.version)?;
+    reference.signature = metadata.signature;
+    Ok(reference)
 }
 
 async fn do_put_bytes(
@@ -839,13 +1021,18 @@ async fn do_put_bytes(
     patch: bool,
     data: Bytes,
     data_type: &str,
+    app_token: Option<&str>,
 ) -> Result<ObjectRef, FlameError> {
     let input = write_bytes_stream(key, data, data_type);
     let mut client = ObjectCacheServiceClient::new(connect_cache(endpoint, tls).await?);
     let metadata = if patch {
-        client.patch(cache_request(endpoint, input)?).await
+        client
+            .patch(cache_request_with_app_token(endpoint, input, app_token)?)
+            .await
     } else {
-        client.put(cache_request(endpoint, input)?).await
+        client
+            .put(cache_request_with_app_token(endpoint, input, app_token)?)
+            .await
     }
     .map_err(|e| FlameError::Internal(format!("cache upload failed: {}", e)))?
     .into_inner();
@@ -858,6 +1045,7 @@ async fn do_put_file(
     key: String,
     path: &Path,
     data_type: &str,
+    app_token: Option<&str>,
 ) -> Result<ObjectRef, FlameError> {
     let file = tokio::fs::File::open(path).await.map_err(|e| {
         FlameError::InvalidConfig(format!("failed to open {}: {}", path.display(), e))
@@ -886,7 +1074,9 @@ async fn do_put_file(
         }
     });
     let mut client = ObjectCacheServiceClient::new(connect_cache(endpoint, tls).await?);
-    let response = client.put(cache_request(endpoint, input)?).await;
+    let response = client
+        .put(cache_request_with_app_token(endpoint, input, app_token)?)
+        .await;
     if let Some(error) = read_error
         .lock()
         .expect("upload error mutex poisoned")
@@ -935,17 +1125,50 @@ async fn read_full_header(
 }
 
 pub async fn get_object_bytes(reference: &ObjectRef) -> Result<ObjectBytes, FlameError> {
+    get_object_bytes_inner(reference, None).await
+}
+
+pub async fn get_object_bytes_with_app_token(
+    reference: &ObjectRef,
+    app_token: &str,
+) -> Result<ObjectBytes, FlameError> {
+    get_object_bytes_inner(reference, Some(app_token)).await
+}
+
+pub async fn get_object_with_app_token<T>(
+    reference: &ObjectRef,
+    app_token: &str,
+) -> Result<T, FlameError>
+where
+    T: FlameMessage,
+{
+    let bytes = get_object_bytes_with_app_token(reference, app_token).await?;
+    if bytes.data_type != "raw" {
+        return Err(FlameError::InvalidConfig(format!(
+            "object {} has type {}, expected raw",
+            reference.key, bytes.data_type
+        )));
+    }
+    T::decode(&bytes.base.data)
+}
+
+async fn get_object_bytes_inner(
+    reference: &ObjectRef,
+    app_token: Option<&str>,
+) -> Result<ObjectBytes, FlameError> {
     ObjectKey::from_key(&reference.key)?;
     let endpoint = endpoint_for_reference(&reference.endpoint)?;
     let tls = current_cache_tls()?;
     let mut client = ObjectCacheServiceClient::new(connect_cache(&endpoint, tls.as_ref()).await?);
     let mut stream = client
-        .get(cache_request(
+        .get(cache_request_with_app_token(
             &endpoint,
             CacheGetRequest {
                 key: reference.key.clone(),
                 client_version: 0,
+                signature: reference.signature.clone(),
             },
+            app_token,
         )?)
         .await
         .map_err(|e| FlameError::Internal(format!("cache get failed: {}", e)))?
@@ -1069,7 +1292,9 @@ fn object_ref_from_doc(doc: Document) -> Result<ObjectRef, FlameError> {
         }
         None => 0,
     };
-    ObjectRef::new(endpoint, key, version)
+    let mut reference = ObjectRef::new(endpoint, key, version)?;
+    reference.signature = doc.get_str("signature").unwrap_or_default().to_string();
+    Ok(reference)
 }
 
 #[cfg(test)]
@@ -1134,10 +1359,12 @@ mod tests {
 
     #[test]
     fn object_ref_encodes_bson() {
-        let reference = ObjectRef::new("grpc://cache:9090", "app/session/object", 7).unwrap();
+        let mut reference = ObjectRef::new("grpc://cache:9090", "app/session/object", 7).unwrap();
+        reference.signature = "signed-key".to_string();
         let encoded = reference.encode().unwrap();
         let decoded = ObjectRef::decode(encoded).unwrap();
         assert_eq!(decoded, reference);
+        assert!(!format!("{reference:?}").contains("signed-key"));
     }
 
     #[test]
@@ -1184,6 +1411,35 @@ mod tests {
         let endpoint = CacheEndpoint::parse("grpc://[2001:db8::1]:9090").unwrap();
         assert_eq!(endpoint.host, "2001:db8::1");
         assert_eq!(endpoint.uri_host(), "[2001:db8::1]");
+    }
+
+    #[test]
+    fn cache_tls_prefers_cache_identity_over_cluster_identity() {
+        let context = FlameContext {
+            current_context: "test".to_string(),
+            contexts: vec![crate::apis::FlameContextEntry {
+                name: "test".to_string(),
+                cluster: crate::apis::FlameClusterConfig {
+                    endpoint: "https://fsm:8080".to_string(),
+                    tls: Some(FlameClientTls {
+                        cert_file: Some("cluster.crt".to_string()),
+                        ..Default::default()
+                    }),
+                },
+                cache: Some(FlameClientCache {
+                    endpoint: Some("grpcs://cache:9090".to_string()),
+                    tls: Some(FlameClientTls {
+                        cert_file: Some("cache.crt".to_string()),
+                        ..Default::default()
+                    }),
+                    storage: None,
+                }),
+                package: None,
+                app: None,
+            }],
+        };
+        let cache = cache_from_context(&context).unwrap();
+        assert_eq!(cache.tls.unwrap().cert_file.as_deref(), Some("cache.crt"));
     }
 
     #[test]

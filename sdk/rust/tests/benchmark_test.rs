@@ -64,12 +64,12 @@ fn benchmark_executor_count() -> Result<usize, FlameError> {
     Ok(count)
 }
 
-fn get_ca_cert_path() -> String {
+fn get_cert_path(name: &str) -> String {
     let root = std::env::var("FLAME_ROOT").unwrap_or_else(|_| {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         format!("{}/../..", manifest_dir)
     });
-    format!("{}/ci/docker/certs/ca.crt", root)
+    format!("{}/ci/docker/certs/{name}", root)
 }
 
 struct BenchmarkCase {
@@ -452,8 +452,9 @@ async fn benchmark_task_matrix() -> Result<(), FlameError> {
     println!("============================================================\n");
 
     let tls_config = FlameClientTls {
-        ca_file: Some(get_ca_cert_path()),
-        ..Default::default()
+        ca_file: Some(get_cert_path("ca.crt")),
+        cert_file: Some(get_cert_path("admin.crt")),
+        key_file: Some(get_cert_path("admin.key")),
     };
     let conn = flame::client::connect_with_tls(&benchmark_endpoint(), Some(&tls_config)).await?;
 

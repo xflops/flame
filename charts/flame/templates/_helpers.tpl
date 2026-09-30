@@ -74,11 +74,19 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- define "flame.clusterScheme" -}}
-{{- if .Values.tls.enabled -}}https{{- else -}}http{{- end -}}
+{{- if .Values.security.enabled -}}
+https
+{{- else -}}
+http
+{{- end -}}
 {{- end -}}
 
 {{- define "flame.cacheScheme" -}}
-{{- if .Values.tls.enabled -}}grpcs{{- else -}}grpc{{- end -}}
+{{- if .Values.security.enabled -}}
+grpcs
+{{- else -}}
+grpc
+{{- end -}}
 {{- end -}}
 
 {{- define "flame.clusterEndpoint" -}}
@@ -89,21 +97,33 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s://%s:%d" (include "flame.cacheScheme" .) (include "flame.objectCache.name" .) (int .Values.objectCache.service.port) -}}
 {{- end -}}
 
-{{- define "flame.tlsClusterPath" -}}
-{{- printf "%s/cluster" .Values.tls.mountPath -}}
-{{- end -}}
-
-{{- define "flame.tlsCachePath" -}}
-{{- printf "%s/cache" .Values.tls.mountPath -}}
+{{- define "flame.tlsPath" -}}
+{{- .Values.tls.mountPath -}}
 {{- end -}}
 
 {{- define "flame.validate" -}}
-{{- if .Values.tls.enabled -}}
-{{- if not .Values.tls.cluster.secretName -}}
-{{- fail "tls.cluster.secretName is required when tls.enabled=true" -}}
+{{- if .Values.security.enabled -}}
+{{- if not .Values.security.trustDomain -}}
+{{- fail "security.trustDomain is required" -}}
 {{- end -}}
-{{- if not .Values.tls.cache.secretName -}}
-{{- fail "tls.cache.secretName is required when tls.enabled=true" -}}
+{{- if and .Values.sessionManager.enabled (not .Values.tls.sessionManager.secretName) -}}
+{{- fail "tls.sessionManager.secretName is required" -}}
+{{- end -}}
+{{- if and .Values.objectCache.enabled (not .Values.tls.objectCache.secretName) -}}
+{{- fail "tls.objectCache.secretName is required" -}}
+{{- end -}}
+{{- if and .Values.executorManager.enabled (ne (int .Values.executorManager.replicas) 1) -}}
+{{- fail "secure executorManager currently requires replicas=1 with one SystemNode certificate" -}}
+{{- end -}}
+{{- if and .Values.executorManager.enabled (not .Values.tls.executorManager.secretName) -}}
+{{- fail "tls.executorManager.secretName is required" -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.clientConfig.enabled -}}
+{{- if .Values.security.enabled -}}
+{{- if or (not .Values.clientConfig.tls.certFile) (not .Values.clientConfig.tls.keyFile) (not .Values.clientConfig.tls.caFile) -}}
+{{- fail "clientConfig.tls certFile, keyFile, and caFile are required when clientConfig.enabled=true" -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if ne (int .Values.sessionManager.replicas) 1 -}}

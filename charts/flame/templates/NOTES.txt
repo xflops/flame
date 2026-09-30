@@ -7,13 +7,15 @@ In-cluster endpoints:
 Check pods:
   kubectl -n {{ .Release.Namespace }} get pods,svc
 
+{{- if .Values.clientConfig.enabled }}
 Run Helm chart test:
   helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+{{- end }}
 
 Port-forward for local inspection:
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "flame.sessionManager.name" . }} 8080:{{ .Values.sessionManager.service.frontendPort }}
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "flame.objectCache.name" . }} 9090:{{ .Values.objectCache.service.port }}
 
 Local client environment:
-  export FLAME_ENDPOINT=http://127.0.0.1:8080
-  export FLAME_CACHE_ENDPOINT=grpc://127.0.0.1:9090
+  export FLAME_ENDPOINT={{ include "flame.clusterScheme" . }}://127.0.0.1:8080
+  export FLAME_CACHE_ENDPOINT={{ include "flame.cacheScheme" . }}://127.0.0.1:9090

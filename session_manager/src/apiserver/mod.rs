@@ -16,7 +16,8 @@ use std::time::Duration;
 use tonic::transport::Server;
 
 use common::apis::ResourceRequirement;
-use common::ctx::FlameClusterContext;
+use common::ctx::{FlameClusterContext, FlameSecurity};
+use common::security::SecurityManager;
 use rpc::flame::v1::backend_server::BackendServer;
 use rpc::flame::v1::frontend_server::FrontendServer;
 
@@ -37,18 +38,33 @@ pub struct Flame {
     /// supplies no explicit `resreq`. The backend service does not need this
     /// — it is always `None` for the backend `Flame` instance.
     cluster_default_resreq: Option<ResourceRequirement>,
+    security: Option<FlameSecurity>,
+    security_manager: Arc<dyn SecurityManager>,
 }
 
-pub fn new_frontend(controller: ControllerPtr) -> Arc<dyn FlameThread> {
-    Arc::new(FrontendRunner { controller })
+pub fn new_frontend(
+    controller: ControllerPtr,
+    security_manager: Arc<dyn SecurityManager>,
+) -> Arc<dyn FlameThread> {
+    Arc::new(FrontendRunner {
+        controller,
+        security_manager,
+    })
 }
 
-pub fn new_backend(controller: ControllerPtr) -> Arc<dyn FlameThread> {
-    Arc::new(BackendRunner { controller })
+pub fn new_backend(
+    controller: ControllerPtr,
+    security_manager: Arc<dyn SecurityManager>,
+) -> Arc<dyn FlameThread> {
+    Arc::new(BackendRunner {
+        controller,
+        security_manager,
+    })
 }
 
 struct FrontendRunner {
     controller: ControllerPtr,
+    security_manager: Arc<dyn SecurityManager>,
 }
 
 #[async_trait::async_trait]
@@ -70,13 +86,14 @@ impl FlameThread for FrontendRunner {
         let frontend_service = Flame {
             controller: self.controller.clone(),
             cluster_default_resreq: ctx.cluster.resreq.clone(),
+            security: ctx.security.clone(),
+            security_manager: self.security_manager.clone(),
         };
 
         let mut builder = Server::builder().tcp_keepalive(Some(Duration::from_secs(1)));
 
-        // Apply TLS if configured
-        if let Some(ref tls_config) = ctx.cluster.tls {
-            let tls = tls_config.server_tls_config()?;
+        if let Some(security) = &ctx.security {
+            let tls = security.tls.mutual_tls_config()?;
             builder = builder
                 .tls_config(tls)
                 .map_err(|e| FlameError::InvalidConfig(format!("TLS config error: {}", e)))?;
@@ -95,6 +112,7 @@ impl FlameThread for FrontendRunner {
 
 struct BackendRunner {
     controller: ControllerPtr,
+    security_manager: Arc<dyn SecurityManager>,
 }
 
 #[async_trait::async_trait]
@@ -117,13 +135,14 @@ impl FlameThread for BackendRunner {
             // Backend never resolves session resreq — it serves executor-side
             // RPCs only. Always `None` here.
             cluster_default_resreq: None,
+            security: ctx.security.clone(),
+            security_manager: self.security_manager.clone(),
         };
 
         let mut builder = Server::builder().tcp_keepalive(Some(Duration::from_secs(1)));
 
-        // Apply TLS if configured
-        if let Some(ref tls_config) = ctx.cluster.tls {
-            let tls = tls_config.server_tls_config()?;
+        if let Some(security) = &ctx.security {
+            let tls = security.tls.mutual_tls_config()?;
             builder = builder
                 .tls_config(tls)
                 .map_err(|e| FlameError::InvalidConfig(format!("TLS config error: {}", e)))?;

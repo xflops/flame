@@ -37,6 +37,31 @@ cache:
 Stale application-data garbage collection is always enabled. The `gc` section
 only overrides its 60-second default interval.
 
+For a secure deployment, configure top-level `security.trust_domain` and
+`security.tls` with the cache certificate, key, and trusted client CA. Use a
+`grpcs://` cache endpoint. The cache derives a separate app-token signing key
+from its TLS private key. Mount the same private key on every cache replica;
+rotating it invalidates existing app tokens, including tokens held by running
+executors. Renewing the certificate with the same private key preserves them.
+The cache verifies the client's Flame URI identity
+from its mTLS certificate before `Delegate` and accepts delegation tokens only over TLS.
+This policy assumes one tenant user for the cluster: any authenticated tenant
+may request delegation for any globally named application. App and session names are unique.
+
+`Delegate` takes the application name and returns a signed user identity token.
+Put/Get, Patch, GetMetadata, and Delete accept either a verified tenant mTLS
+certificate or that token in `x-flame-delegation-token` gRPC metadata over TLS.
+The token can be reused across applications and sessions.
+The Python client calls `sign_app_token(app_name)` with its configured mTLS
+identity and accepts `app_token=token` on cache operations. Direct mTLS clients
+can access permitted data directly. Clients without a certificate
+use a delegated token over TLS.
+A delegated user token may write and delete keys under any `<app>/pkg/` prefix;
+package reads require a system cache or system node mTLS identity. A system
+node identity cannot write or delete packages or access session objects. The
+reserved `bootstrap` prefix and the global `List` operation require a system
+cache mTLS identity.
+
 ### Client Configuration (`flame.yaml`)
 
 ```yaml
@@ -190,6 +215,7 @@ The cache server implements `ObjectCacheService` in `cache.proto`:
 
 | Operation | Description |
 |-----------|-------------|
+| `Delegate` | Delegate a verified tenant's user identity |
 | `Put` | Stream a new or replacement object; return its metadata |
 | `Patch` | Stream a delta for an existing object; return updated metadata |
 | `Get` | Stream a full object, later patches, or a not-modified header |

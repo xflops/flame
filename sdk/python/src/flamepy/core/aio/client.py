@@ -10,6 +10,7 @@ import grpc
 from flamepy.core.types import (
     Application,
     ApplicationAttributes,
+    ApplicationPackage,
     ApplicationSchema,
     ApplicationState,
     Event,
@@ -54,6 +55,9 @@ from flamepy.proto.types_pb2 import (
     TaskSpec,
 )
 from flamepy.proto.types_pb2 import (
+    Package as PackageProto,
+)
+from flamepy.proto.types_pb2 import (
     ResourceRequirement as ResourceRequirementProto,
 )
 
@@ -91,7 +95,8 @@ def _application_from_proto(app) -> Application:
         max_instances=_optional_field(spec, "max_instances"),
         delay_release=_optional_field(spec, "delay_release"),
         schema=schema,
-        url=_optional_field(spec, "url"),
+        url=spec.package.url if spec.HasField("package") else _optional_field(spec, "url"),
+        package=ApplicationPackage(url=spec.package.url, signature=spec.package.signature) if spec.HasField("package") else None,
         installer=_optional_field(spec, "installer"),
     )
 
@@ -276,6 +281,7 @@ class Connection:
             delay_release=app_attrs.delay_release,
             schema=schema,
             url=app_attrs.url,
+            package=PackageProto(url=app_attrs.package.url, signature=app_attrs.package.signature) if app_attrs.package else None,
             installer=app_attrs.installer,
         )
         response = await self._rpc("RegisterApplication", RegisterApplicationRequest(name=name, application=spec), "failed to register application")
@@ -456,7 +462,10 @@ class Session:
                     result.set_exception(FlameError(FlameErrorCode.INTERNAL, "connection closed during task watch"))
                 raise
             except Exception as error:
-                await finish(error=error if isinstance(error, FlameError) else FlameError(FlameErrorCode.INTERNAL, f"Watch failed: {error}"))
+                if self.connection._closed:
+                    await finish(error=FlameError(FlameErrorCode.INTERNAL, "connection closed during task watch"))
+                else:
+                    await finish(error=error if isinstance(error, FlameError) else FlameError(FlameErrorCode.INTERNAL, f"Watch failed: {error}"))
             finally:
                 if active_watcher is not None:
                     active_watcher.close()

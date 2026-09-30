@@ -210,7 +210,7 @@ pub(crate) fn matches_attributes(
             (None, None) => true,
             _ => false,
         }
-        && application.url == attributes.url
+        && application.package == attributes.package
         && application.installer == attributes.installer
 }
 

@@ -233,7 +233,7 @@ impl ApplicationManager {
         &self,
         app: &ApplicationContext,
     ) -> Result<ApplicationInstallation, FlameError> {
-        if app.url.is_none() {
+        if app.package.is_none() {
             tracing::debug!(
                 "No package URL configured for app <{}>, skipping installation",
                 app.name
@@ -261,7 +261,7 @@ impl ApplicationManager {
         let install_key = InstallKey::new(
             &app.name,
             &installer_type,
-            app.url.as_ref(),
+            app.package.as_ref().map(|package| &package.url),
             python_version.as_ref(),
         );
 
@@ -302,7 +302,10 @@ impl ApplicationManager {
 
         installed.state = InstallState::Installing;
 
-        let url = app.url.as_ref().expect("URL presence checked above");
+        let package = app
+            .package
+            .as_ref()
+            .expect("package presence checked above");
 
         let release_path = self
             .flame_home
@@ -310,7 +313,9 @@ impl ApplicationManager {
             .join(&app.name)
             .join("releases")
             .join(install_key.release_id());
-        let package_path = self.download_package(url, &release_path).await?;
+        let package_path = self
+            .download_package(&package.url, &package.signature, &release_path)
+            .await?;
 
         let src_path = release_path.join("src");
         self.extract_package(&package_path, &src_path)?;
@@ -364,6 +369,7 @@ impl ApplicationManager {
     async fn download_package(
         &self,
         url: &str,
+        signature: &str,
         release_path: &Path,
     ) -> Result<PathBuf, FlameError> {
         let download_dir = release_path.join("download");
@@ -386,7 +392,9 @@ impl ApplicationManager {
             return Ok(package_path);
         }
 
-        self.downloader.download(url, &package_path).await?;
+        self.downloader
+            .download(url, signature, &package_path)
+            .await?;
 
         tracing::info!("Downloaded package to: {}", package_path.display());
         Ok(package_path)
@@ -552,7 +560,7 @@ mod tests {
             arguments: vec![],
             working_directory: None,
             environments: HashMap::new(),
-            url: None,
+            package: None,
             installer: Some("not-a-real-installer".to_string()),
         };
 
@@ -572,7 +580,7 @@ mod tests {
             arguments: vec![],
             working_directory: None,
             environments: HashMap::new(),
-            url: None,
+            package: None,
             installer: Some("python".to_string()),
         };
 

@@ -11,15 +11,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time;
+#[cfg(unix)]
+use std::{
+    fs,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(test)]
 use chrono::Duration;
 use chrono::Utc;
+use rusqlite::{params, Connection, OpenFlags};
 #[cfg(test)]
 use serde_json::json;
 use sqlx::{
@@ -27,8 +35,6 @@ use sqlx::{
     types::Json,
     QueryBuilder, Sqlite, SqliteConnection, SqlitePool,
 };
-#[cfg(test)]
-use std::collections::HashMap;
 use stdng::trace_fn;
 
 use crate::{
@@ -43,6 +49,7 @@ use crate::{
 use crate::apis::{ApplicationFilter, Executor, SessionFilter, TaskFilter};
 #[cfg(test)]
 use crate::apis::{ApplicationSchema, Shim};
+use crate::apis::{Role, RoleRule};
 use crate::storage::engine::types::{
     AppSchemaDao, ApplicationDao, ExecutorDao, NodeDao, SessionDao, TaskDao,
 };
@@ -51,8 +58,32 @@ use crate::storage::engine::{Engine, EnginePtr};
 
 const SQLITE_SQL: &str = "migrations/sqlite";
 
+#[cfg(unix)]
+fn create_private_sqlite_file(path: &Path) -> Result<(), FlameError> {
+    if let Ok(info) = fs::symlink_metadata(path) {
+        if !info.file_type().is_file() {
+            return Err(FlameError::Storage(format!(
+                "SQLite path is not a regular file: {}",
+                path.display()
+            )));
+        }
+    }
+    // SQLite creates WAL and SHM files with the database file's mode.
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| FlameError::Storage(format!("failed to create private SQLite file: {e}")))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|e| FlameError::Storage(format!("failed to protect SQLite file: {e}")))?;
+    Ok(())
+}
+
 pub struct SqliteEngine {
     pool: SqlitePool,
+    roles: Mutex<Connection>,
 }
 
 impl SqliteEngine {
@@ -66,6 +97,18 @@ impl SqliteEngine {
             .busy_timeout(time::Duration::from_secs(15))
             .synchronous(SqliteSynchronous::Normal)
             .create_if_missing(true);
+
+        let database_path = options.get_filename().to_path_buf();
+        let in_memory = url.contains(":memory:")
+            || database_path == Path::new(":memory:")
+            || database_path
+                .to_string_lossy()
+                .starts_with("file:sqlx-in-memory-")
+            || url.contains("mode=memory");
+        #[cfg(unix)]
+        if !in_memory {
+            create_private_sqlite_file(&database_path)?;
+        }
 
         let db = SqlitePoolOptions::new()
             .max_connections(50)
@@ -93,7 +136,29 @@ impl SqliteEngine {
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
-        Ok(Arc::new(SqliteEngine { pool: db }))
+        let roles = if in_memory {
+            Connection::open_in_memory()
+        } else {
+            Connection::open_with_flags(
+                database_path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_CREATE
+                    | OpenFlags::SQLITE_OPEN_URI,
+            )
+        }
+        .map_err(|e| FlameError::Storage(e.to_string()))?;
+        roles
+            .busy_timeout(time::Duration::from_secs(15))
+            .map_err(|e| FlameError::Storage(e.to_string()))?;
+        if in_memory {
+            roles
+                .execute_batch("CREATE TABLE IF NOT EXISTS roles (name TEXT PRIMARY KEY, rules TEXT NOT NULL, users TEXT NOT NULL)")
+                .map_err(|e| FlameError::Storage(e.to_string()))?;
+        }
+        Ok(Arc::new(SqliteEngine {
+            pool: db,
+            roles: Mutex::new(roles),
+        }))
     }
 
     async fn _count_task(
@@ -285,6 +350,56 @@ impl SqliteEngine {
 
 #[async_trait]
 impl Engine for SqliteEngine {
+    fn set_role(&self, role: &Role) -> Result<(), FlameError> {
+        let rules =
+            serde_json::to_string(&role.rules).map_err(|e| FlameError::Storage(e.to_string()))?;
+        let users =
+            serde_json::to_string(&role.users).map_err(|e| FlameError::Storage(e.to_string()))?;
+        self.roles.lock().map_err(|e| FlameError::Storage(e.to_string()))?
+            .execute("INSERT INTO roles(name, rules, users) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET rules=excluded.rules, users=excluded.users", params![role.name, rules, users])
+            .map_err(|e| FlameError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn delete_role(&self, name: &str) -> Result<(), FlameError> {
+        self.roles
+            .lock()
+            .map_err(|e| FlameError::Storage(e.to_string()))?
+            .execute("DELETE FROM roles WHERE name=?1", params![name])
+            .map_err(|e| FlameError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn find_roles(&self) -> Result<Vec<Role>, FlameError> {
+        let conn = self
+            .roles
+            .lock()
+            .map_err(|e| FlameError::Storage(e.to_string()))?;
+        let mut query = conn
+            .prepare("SELECT name, rules, users FROM roles ORDER BY name")
+            .map_err(|e| FlameError::Storage(e.to_string()))?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| FlameError::Storage(e.to_string()))?;
+        rows.map(|row| {
+            let (name, rules, users) = row.map_err(|e| FlameError::Storage(e.to_string()))?;
+            Ok(Role {
+                name,
+                rules: serde_json::from_str::<HashMap<String, Vec<RoleRule>>>(&rules)
+                    .map_err(|e| FlameError::Storage(e.to_string()))?,
+                users: serde_json::from_str::<Vec<String>>(&users)
+                    .map_err(|e| FlameError::Storage(e.to_string()))?,
+            })
+        })
+        .collect()
+    }
+
     async fn register_application(
         &self,
         name: String,
@@ -316,10 +431,11 @@ impl Engine for SqliteEngine {
                 delay_release, 
                 schema, 
                 url,
+                package_signature,
                 installer,
                 creation_time, 
                 state)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING *"#;
         let app: ApplicationDao = sqlx::query_as(sql)
             .bind(name)
@@ -334,7 +450,12 @@ impl Engine for SqliteEngine {
             .bind(attr.max_instances)
             .bind(attr.delay_release.num_seconds())
             .bind(schema)
-            .bind(attr.url)
+            .bind(attr.package.as_ref().map(|package| package.url.clone()))
+            .bind(
+                attr.package
+                    .as_ref()
+                    .map(|package| package.signature.clone()),
+            )
             .bind(attr.installer)
             .bind(Utc::now().timestamp())
             .bind(ApplicationState::Enabled as i32)
@@ -411,6 +532,7 @@ impl Engine for SqliteEngine {
                         max_instances=?,
                         delay_release=?,
                         url=?,
+                        package_signature=?,
                         installer=?,
                         version=version+1
                     WHERE name=? AND state=?
@@ -428,7 +550,12 @@ impl Engine for SqliteEngine {
             .bind(attr.working_directory)
             .bind(attr.max_instances)
             .bind(attr.delay_release.num_seconds())
-            .bind(attr.url)
+            .bind(attr.package.as_ref().map(|package| package.url.clone()))
+            .bind(
+                attr.package
+                    .as_ref()
+                    .map(|package| package.signature.clone()),
+            )
             .bind(attr.installer)
             .bind(&name)
             .bind(ApplicationState::Enabled as i32)
@@ -1435,7 +1562,7 @@ mod tests {
                 max_instances: 10,
                 delay_release: Duration::seconds(0),
                 schema: None,
-                url: None,
+                package: None,
                 installer: None,
             },
         ))?;
@@ -1608,7 +1735,7 @@ mod tests {
                         output: Some(string_schema.to_string()),
                         common_data: None,
                     }),
-                    url: None,
+                    package: None,
                     installer: None,
                 },
             ),
@@ -1626,7 +1753,7 @@ mod tests {
                     max_instances: 10,
                     delay_release: Duration::seconds(0),
                     schema: None,
-                    url: None,
+                    package: None,
                     installer: None,
                 },
             ),
@@ -1711,14 +1838,26 @@ mod tests {
                 max_instances: 5,
                 delay_release: Duration::seconds(10),
                 schema: None,
-                url: Some(test_url.clone()),
+                package: Some(crate::apis::Package {
+                    url: test_url.clone(),
+                    signature: "test-signature".to_string(),
+                }),
                 installer: None,
             },
         ))?;
 
         // Verify application was registered with URL
         assert_eq!(app.name, "flmtestapp-url");
-        assert_eq!(app.url, Some(test_url.clone()));
+        assert_eq!(
+            app.package.as_ref().map(|package| package.url.as_str()),
+            Some(test_url.as_str())
+        );
+        assert_eq!(
+            app.package
+                .as_ref()
+                .map(|package| package.signature.as_str()),
+            Some("test-signature")
+        );
         assert_eq!(
             app.description,
             Some("Test application with URL".to_string())
@@ -1729,7 +1868,20 @@ mod tests {
         let retrieved_app =
             tokio_test::block_on(storage.get_application("flmtestapp-url".to_string()))?;
         assert_eq!(retrieved_app.name, "flmtestapp-url");
-        assert_eq!(retrieved_app.url, Some(test_url));
+        assert_eq!(
+            retrieved_app
+                .package
+                .as_ref()
+                .map(|package| package.url.as_str()),
+            Some(test_url.as_str())
+        );
+        assert_eq!(
+            retrieved_app
+                .package
+                .as_ref()
+                .map(|package| package.signature.as_str()),
+            Some("test-signature")
+        );
         assert_eq!(
             retrieved_app.description,
             Some("Test application with URL".to_string())
@@ -1759,14 +1911,14 @@ mod tests {
                 max_instances: 5,
                 delay_release: Duration::seconds(10),
                 schema: None,
-                url: None,
+                package: None,
                 installer: None,
             },
         ))?;
 
         // Verify application was registered without URL
         assert_eq!(app.name, "flmtestapp-no-url");
-        assert_eq!(app.url, None);
+        assert_eq!(app.package, None);
         assert_eq!(
             app.description,
             Some("Test application without URL".to_string())
@@ -1777,7 +1929,7 @@ mod tests {
         let retrieved_app =
             tokio_test::block_on(storage.get_application("flmtestapp-no-url".to_string()))?;
         assert_eq!(retrieved_app.name, "flmtestapp-no-url");
-        assert_eq!(retrieved_app.url, None);
+        assert_eq!(retrieved_app.package, None);
         assert_eq!(retrieved_app.state, ApplicationState::Enabled);
 
         Ok(())
@@ -1803,14 +1955,14 @@ mod tests {
                 max_instances: 5,
                 delay_release: Duration::seconds(10),
                 schema: None,
-                url: None,
+                package: None,
                 installer: None,
             },
         ))?;
 
         let app_before =
             tokio_test::block_on(storage.get_application("flmtestapp-update".to_string()))?;
-        assert_eq!(app_before.url, None);
+        assert_eq!(app_before.package, None);
 
         // Update application with URL
         let test_url = "file:///opt/updated-package.whl".to_string();
@@ -1828,14 +1980,30 @@ mod tests {
                 max_instances: 10,
                 delay_release: Duration::seconds(20),
                 schema: None,
-                url: Some(test_url.clone()),
+                package: Some(crate::apis::Package {
+                    url: test_url.clone(),
+                    signature: "test-signature".to_string(),
+                }),
                 installer: None,
             },
         ))?;
 
         // Verify update including URL
         assert_eq!(updated_app.name, "flmtestapp-update");
-        assert_eq!(updated_app.url, Some(test_url.clone()));
+        assert_eq!(
+            updated_app
+                .package
+                .as_ref()
+                .map(|package| package.url.as_str()),
+            Some(test_url.as_str())
+        );
+        assert_eq!(
+            updated_app
+                .package
+                .as_ref()
+                .map(|package| package.signature.as_str()),
+            Some("test-signature")
+        );
         assert_eq!(
             updated_app.description,
             Some("Updated description".to_string())
@@ -1847,7 +2015,20 @@ mod tests {
         // Retrieve and verify URL persisted after update
         let retrieved_app =
             tokio_test::block_on(storage.get_application("flmtestapp-update".to_string()))?;
-        assert_eq!(retrieved_app.url, Some(test_url));
+        assert_eq!(
+            retrieved_app
+                .package
+                .as_ref()
+                .map(|package| package.url.as_str()),
+            Some(test_url.as_str())
+        );
+        assert_eq!(
+            retrieved_app
+                .package
+                .as_ref()
+                .map(|package| package.signature.as_str()),
+            Some("test-signature")
+        );
         assert_eq!(
             retrieved_app.description,
             Some("Updated description".to_string())

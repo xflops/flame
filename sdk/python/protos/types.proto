@@ -9,6 +9,21 @@ message Metadata {
   string name = 2;
 }
 
+message RoleRule {
+  repeated string verbs = 1;
+  repeated string objects = 2;
+}
+
+message Role {
+  string name = 1;
+  repeated RoleRule rules = 2;
+  repeated string users = 3;
+}
+
+message RoleList {
+  repeated Role roles = 1;
+}
+
 enum SessionState {
   Open = 0;
   Closed = 1;
@@ -113,6 +128,11 @@ message ApplicationSchema {
   optional string common_data = 3;
 }
 
+message Package {
+  string url = 1;
+  string signature = 2;
+}
+
 message ApplicationSpec {
   Shim shim = 1;  // Required shim type, defaults to Host
   optional string description = 2;
@@ -127,6 +147,7 @@ message ApplicationSpec {
   optional ApplicationSchema schema = 11;
   optional string url = 12;
   optional string installer = 13;
+  optional Package package = 14;
 }
 
 message Application {

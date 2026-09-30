@@ -38,8 +38,10 @@ limitations under the License.
 //! - **CRC32 checksums**: Detects corruption on read
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -57,8 +59,26 @@ use crate::apis::{
 };
 use crate::{FlameError, FLAME_HOME};
 
+use crate::apis::Role;
 use crate::apis::{ApplicationFilter, Executor, SessionFilter, TaskFilter};
 use crate::storage::engine::{Engine, EnginePtr};
+
+fn create_private_directory(path: &std::path::Path) -> Result<(), FlameError> {
+    fs::create_dir_all(path).map_err(|e| {
+        FlameError::Storage(format!(
+            "Failed to create private directory <{}>: {e}",
+            path.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| {
+        FlameError::Storage(format!(
+            "Failed to protect directory <{}>: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
 
 /// Task metadata stored in tasks.bin with fixed-size records.
 ///
@@ -139,7 +159,7 @@ struct ApplicationMetadata {
     pub max_instances: u32,
     pub delay_release_seconds: i64,
     pub schema: Option<ApplicationSchemaMetadata>,
-    pub url: Option<String>,
+    pub package: Option<crate::apis::Package>,
     #[serde(default)]
     pub installer: Option<String>,
 }
@@ -295,14 +315,15 @@ impl FilesystemEngine {
 
         let sessions_path = path.join("sessions");
         let applications_path = path.join("applications");
+        let roles_path = path.join("roles");
         let nodes_path = path.join("nodes");
 
-        fs::create_dir_all(&sessions_path).map_err(|e| {
-            FlameError::Storage(format!("Failed to create sessions directory: {e}"))
-        })?;
+        create_private_directory(&sessions_path)?;
         fs::create_dir_all(&applications_path).map_err(|e| {
             FlameError::Storage(format!("Failed to create applications directory: {e}"))
         })?;
+        fs::create_dir_all(&roles_path)
+            .map_err(|e| FlameError::Storage(format!("Failed to create roles directory: {e}")))?;
         fs::create_dir_all(&nodes_path)
             .map_err(|e| FlameError::Storage(format!("Failed to create nodes directory: {e}")))?;
 
@@ -444,9 +465,33 @@ impl FilesystemEngine {
             FlameError::Storage(format!("Failed to serialize session metadata: {e}"))
         })?;
 
-        // Write to temp file first
-        fs::write(&tmp_path, &content)
-            .map_err(|e| FlameError::Storage(format!("Failed to write session metadata: {e}")))?;
+        // The temporary file contains session credentials and becomes the final
+        // metadata file after the atomic rename.
+        let mut options = OpenOptions::new();
+        if let Ok(info) = fs::symlink_metadata(&tmp_path) {
+            if !info.file_type().is_file() {
+                return Err(FlameError::Storage(format!(
+                    "session metadata is not a regular file: {}",
+                    tmp_path.display()
+                )));
+            }
+        }
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        {
+            let mut file = options.open(&tmp_path).map_err(|e| {
+                FlameError::Storage(format!("Failed to open session metadata: {e}"))
+            })?;
+            #[cfg(unix)]
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| {
+                    FlameError::Storage(format!("Failed to protect session metadata: {e}"))
+                })?;
+            file.write_all(content.as_bytes()).map_err(|e| {
+                FlameError::Storage(format!("Failed to write session metadata: {e}"))
+            })?;
+        }
 
         // Atomic rename
         fs::rename(&tmp_path, &path)
@@ -892,7 +937,7 @@ impl FilesystemEngine {
             max_instances: meta.max_instances,
             delay_release: Duration::seconds(meta.delay_release_seconds),
             schema,
-            url: meta.url.clone(),
+            package: meta.package.clone(),
             installer: meta.installer.clone(),
         })
     }
@@ -921,6 +966,48 @@ impl FilesystemEngine {
 
 #[async_trait]
 impl Engine for FilesystemEngine {
+    fn set_role(&self, role: &Role) -> Result<(), FlameError> {
+        let path = self
+            .base_path
+            .join("roles")
+            .join(format!("{}.json", role.name));
+        let temp = path.with_extension("json.tmp");
+        fs::write(
+            &temp,
+            serde_json::to_vec(role).map_err(|e| FlameError::Storage(e.to_string()))?,
+        )
+        .map_err(|e| FlameError::Storage(e.to_string()))?;
+        fs::rename(temp, path).map_err(|e| FlameError::Storage(e.to_string()))
+    }
+
+    fn delete_role(&self, name: &str) -> Result<(), FlameError> {
+        let path = self.base_path.join("roles").join(format!("{name}.json"));
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(FlameError::Storage(e.to_string())),
+        }
+    }
+
+    fn find_roles(&self) -> Result<Vec<Role>, FlameError> {
+        let mut bindings = Vec::new();
+        let entries = fs::read_dir(self.base_path.join("roles"))
+            .map_err(|e| FlameError::Storage(e.to_string()))?;
+        for entry in entries {
+            let path = entry
+                .map_err(|e| FlameError::Storage(e.to_string()))?
+                .path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let bytes = fs::read(path).map_err(|e| FlameError::Storage(e.to_string()))?;
+                bindings.push(
+                    serde_json::from_slice(&bytes)
+                        .map_err(|e| FlameError::Storage(e.to_string()))?,
+                );
+            }
+        }
+        Ok(bindings)
+    }
+
     async fn register_application(
         &self,
         name: String,
@@ -955,7 +1042,7 @@ impl Engine for FilesystemEngine {
             max_instances: attr.max_instances,
             delay_release_seconds: attr.delay_release.num_seconds(),
             schema,
-            url: attr.url,
+            package: attr.package,
             installer: attr.installer,
         };
 
@@ -1052,7 +1139,7 @@ impl Engine for FilesystemEngine {
         meta.max_instances = attr.max_instances;
         meta.delay_release_seconds = attr.delay_release.num_seconds();
         meta.schema = schema;
-        meta.url = attr.url;
+        meta.package = attr.package;
         meta.installer = attr.installer;
 
         self.write_application_metadata(&name, &meta)?;
@@ -1104,8 +1191,7 @@ impl Engine for FilesystemEngine {
         }
 
         let session_dir = self.session_path(&attr.id);
-        fs::create_dir_all(&session_dir)
-            .map_err(|e| FlameError::Storage(format!("Failed to create session directory: {e}")))?;
+        create_private_directory(&session_dir)?;
 
         let common_data_len = if let Some(ref data) = attr.common_data {
             self.write_common_data(&attr.id, data)?;
@@ -1850,7 +1936,7 @@ mod tests {
             max_instances: 10,
             delay_release: Duration::seconds(60),
             schema: None,
-            url: None,
+            package: None,
             installer: None,
         };
 
@@ -2029,7 +2115,7 @@ mod tests {
             max_instances: 10,
             delay_release: Duration::seconds(0),
             schema: None,
-            url: None,
+            package: None,
             installer: None,
         };
         engine
@@ -2096,7 +2182,7 @@ mod tests {
             max_instances: 10,
             delay_release: Duration::seconds(0),
             schema: None,
-            url: None,
+            package: None,
             installer: None,
         };
         engine
@@ -2200,7 +2286,7 @@ mod tests {
             max_instances: 10,
             delay_release: Duration::seconds(0),
             schema: None,
-            url: None,
+            package: None,
             installer: None,
         };
 
@@ -2234,7 +2320,7 @@ mod tests {
             max_instances: 10,
             delay_release: Duration::seconds(0),
             schema: None,
-            url: None,
+            package: None,
             installer: None,
         };
         engine
@@ -2278,7 +2364,7 @@ mod tests {
             max_instances: 10,
             delay_release: Duration::seconds(0),
             schema: None,
-            url: None,
+            package: None,
             installer: None,
         };
         engine
@@ -2344,7 +2430,7 @@ mod tests {
             max_instances: 10,
             delay_release: Duration::seconds(0),
             schema: None,
-            url: None,
+            package: None,
             installer: None,
         };
         engine

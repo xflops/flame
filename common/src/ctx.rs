@@ -35,7 +35,7 @@ const DEFAULT_MAX_EXECUTORS_PER_NODE: u32 = 128;
 pub const DEFAULT_SESSION_RETRY_LIMITS: u32 = 5;
 const DEFAULT_SCHEDULE_INTERVAL: u64 = 100;
 const DEFAULT_SHIM: &str = "host";
-const DEFAULT_FLAME_CACHE_ENDPOINT: &str = "http://127.0.0.1:9090";
+const DEFAULT_FLAME_CACHE_ENDPOINT: &str = "grpcs://127.0.0.1:9090";
 const DEFAULT_FLAME_CACHE_NETWORK_INTERFACE: &str = "eth0";
 const DEFAULT_EVICTION_POLICY: &str = "lru";
 const DEFAULT_MAX_MEMORY: &str = "1G";
@@ -48,6 +48,7 @@ const DEFAULT_MAX_MEMORY: &str = "1G";
 struct FlameClusterContextYaml {
     pub cluster: FlameClusterYaml,
     pub cache: Option<FlameCacheYaml>,
+    pub security: Option<FlameSecurityYaml>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +73,13 @@ struct FlameClusterYaml {
     pub pprof: Option<FlamePprofYaml>,
     /// Recovery configuration
     pub recovery: Option<FlameRecoveryYaml>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlameSecurityYaml {
+    pub trust_domain: Option<String>,
+    pub tls: Option<FlameTlsYaml>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +110,7 @@ struct FlameLimitsYaml {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FlameTlsYaml {
     /// Path to PEM-encoded server certificate
     pub cert_file: Option<String>,
@@ -118,7 +127,7 @@ struct FlameCacheYaml {
     pub storage: Option<String>,
     pub eviction: Option<FlameEvictionYaml>,
     pub gc: Option<FlameCacheGcYaml>,
-    /// TLS configuration for Object Cache (optional, independent from cluster.tls)
+    /// Deprecated per-service TLS field. Configure top-level security.tls.
     pub tls: Option<FlameTlsYaml>,
     /// pprof profiling configuration
     pub pprof: Option<FlamePprofYaml>,
@@ -153,6 +162,7 @@ struct FlamePprofYaml {
 pub struct FlameClusterContext {
     pub cluster: FlameCluster,
     pub cache: Option<FlameCache>,
+    pub security: Option<FlameSecurity>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,10 +176,15 @@ pub struct FlameCluster {
     pub storage: String,
     pub schedule_interval: u64,
     pub executors: FlameExecutors,
-    pub tls: Option<FlameTls>,
     pub limits: FlameLimits,
     pub recovery: FlameRecovery,
     pub pprof: Option<FlamePprof>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FlameSecurity {
+    pub trust_domain: String,
+    pub tls: FlameTls,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -205,7 +220,7 @@ const DEFAULT_PPROF_PORT: u16 = 6060;
 ///
 /// When this struct is present and valid (cert_file + key_file configured),
 /// TLS is enabled for the service.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FlameTls {
     /// Path to PEM-encoded server certificate
     pub cert_file: String,
@@ -238,10 +253,32 @@ impl FlameTls {
         Ok(config)
     }
 
+    /// Require a trusted client certificate for every incoming connection.
+    pub fn mutual_tls_config(&self) -> Result<ServerTlsConfig, FlameError> {
+        let ca_file = self.ca_file.as_ref().ok_or_else(|| {
+            FlameError::InvalidConfig("security.tls.ca_file is required".to_string())
+        })?;
+        let ca = fs::read(ca_file).map_err(|e| {
+            FlameError::InvalidConfig(format!("failed to read ca_file <{ca_file}>: {e}"))
+        })?;
+        Ok(self
+            .server_tls_config()?
+            .client_ca_root(Certificate::from_pem(ca)))
+    }
+
     /// Load client TLS config for tonic.
     /// If ca_file is specified, use it; otherwise use system CA bundle.
     pub fn client_tls_config(&self) -> Result<ClientTlsConfig, FlameError> {
-        let mut config = ClientTlsConfig::new();
+        let cert = fs::read(&self.cert_file).map_err(|e| {
+            FlameError::InvalidConfig(format!(
+                "failed to read cert_file <{}>: {e}",
+                self.cert_file
+            ))
+        })?;
+        let key = fs::read(&self.key_file).map_err(|e| {
+            FlameError::InvalidConfig(format!("failed to read key_file <{}>: {e}", self.key_file))
+        })?;
+        let mut config = ClientTlsConfig::new().identity(Identity::from_pem(cert, key));
 
         if let Some(ca_file) = &self.ca_file {
             let ca = fs::read_to_string(ca_file).map_err(|e| {
@@ -261,8 +298,6 @@ pub struct FlameCache {
     pub storage: Option<String>,
     pub eviction: FlameEviction,
     pub gc: FlameCacheGc,
-    /// TLS configuration for Object Cache (optional, independent from cluster.tls)
-    pub tls: Option<FlameTls>,
     pub pprof: Option<FlamePprof>,
 }
 
@@ -427,9 +462,35 @@ impl TryFrom<FlameClusterContextYaml> for FlameClusterContext {
     type Error = FlameError;
     fn try_from(ctx: FlameClusterContextYaml) -> Result<Self, Self::Error> {
         let cluster = FlameCluster::try_from(ctx.cluster)?;
+        let security = ctx.security.map(FlameSecurity::try_from).transpose()?;
+        let cache_endpoint_explicit = ctx
+            .cache
+            .as_ref()
+            .is_some_and(|cache| cache.endpoint.is_some());
+        let mut cache = ctx.cache.map(FlameCache::try_from).transpose()?;
+        if !cache_endpoint_explicit && security.is_none() {
+            if let Some(cache) = &mut cache {
+                cache.endpoint = "grpc://127.0.0.1:9090".to_string();
+            }
+        }
+        if cluster.requires_tls() != security.is_some() {
+            return Err(FlameError::InvalidConfig(
+                "cluster endpoint scheme must match security configuration".to_string(),
+            ));
+        }
+        if let Some(ref cache) = cache {
+            if (security.is_some() && !cache.requires_tls())
+                || (security.is_none() && !cache.endpoint.starts_with("grpc://"))
+            {
+                return Err(FlameError::InvalidConfig(
+                    "cache endpoint scheme must match security configuration".to_string(),
+                ));
+            }
+        }
         Ok(FlameClusterContext {
             cluster,
-            cache: ctx.cache.map(FlameCache::try_from).transpose()?,
+            cache,
+            security,
         })
     }
 }
@@ -443,7 +504,16 @@ impl TryFrom<FlameClusterYaml> for FlameCluster {
             .transpose()?
             .unwrap_or_default();
 
-        let tls = cluster.tls.map(FlameTls::try_from).transpose()?;
+        if cluster.tls.is_some() {
+            return Err(FlameError::InvalidConfig(
+                "configure TLS under top-level security.tls".to_string(),
+            ));
+        }
+        if !cluster.endpoint.starts_with("https://") && !cluster.endpoint.starts_with("http://") {
+            return Err(FlameError::InvalidConfig(
+                "cluster endpoint must use http:// or https://".to_string(),
+            ));
+        }
 
         let limits = cluster.limits.map(FlameLimits::from).unwrap_or_default();
 
@@ -469,7 +539,6 @@ impl TryFrom<FlameClusterYaml> for FlameCluster {
                 .schedule_interval
                 .unwrap_or(DEFAULT_SCHEDULE_INTERVAL),
             executors,
-            tls,
             limits,
             recovery,
             pprof,
@@ -549,11 +618,38 @@ impl Default for FlameCluster {
             storage: DEFAULT_STORAGE.to_string(),
             schedule_interval: DEFAULT_SCHEDULE_INTERVAL,
             executors: FlameExecutors::default(),
-            tls: None,
             limits: FlameLimits::default(),
             recovery: FlameRecovery::default(),
             pprof: None,
         }
+    }
+}
+
+impl TryFrom<FlameSecurityYaml> for FlameSecurity {
+    type Error = FlameError;
+
+    fn try_from(yaml: FlameSecurityYaml) -> Result<Self, Self::Error> {
+        let trust_domain = yaml.trust_domain.filter(|s| !s.is_empty()).ok_or_else(|| {
+            FlameError::InvalidConfig("security.trust_domain is required".to_string())
+        })?;
+        let tls =
+            FlameTls::try_from(yaml.tls.ok_or_else(|| {
+                FlameError::InvalidConfig("security.tls is required".to_string())
+            })?)?;
+        if tls.ca_file.is_none() {
+            return Err(FlameError::InvalidConfig(
+                "security.tls.ca_file is required".to_string(),
+            ));
+        }
+        if trust_domain.contains('/')
+            || trust_domain.contains(':')
+            || trust_domain.chars().any(char::is_whitespace)
+        {
+            return Err(FlameError::InvalidConfig(
+                "invalid security.trust_domain".to_string(),
+            ));
+        }
+        Ok(Self { trust_domain, tls })
     }
 }
 
@@ -581,7 +677,11 @@ impl TryFrom<FlameTlsYaml> for FlameTls {
 impl TryFrom<FlameCacheYaml> for FlameCache {
     type Error = FlameError;
     fn try_from(cache: FlameCacheYaml) -> Result<Self, Self::Error> {
-        let tls = cache.tls.map(FlameTls::try_from).transpose()?;
+        if cache.tls.is_some() {
+            return Err(FlameError::InvalidConfig(
+                "configure TLS under top-level security.tls".to_string(),
+            ));
+        }
         let pprof = cache.pprof.map(FlamePprof::from);
         let gc = cache
             .gc
@@ -603,7 +703,6 @@ impl TryFrom<FlameCacheYaml> for FlameCache {
                 .transpose()?
                 .unwrap_or_default(),
             gc,
-            tls,
             pprof,
         })
     }
@@ -658,12 +757,67 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn security_is_optional_but_must_match_endpoint_schemes() {
+        let base = r#"security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
+cluster:
+  name: flame
+  endpoint: https://localhost:8080
+"#;
+        let parsed: FlameClusterContextYaml = serde_yaml::from_str(base).unwrap();
+        assert!(FlameClusterContext::try_from(parsed).is_ok());
+        let no_security = base.replace("security:\n  trust_domain: test.local\n  tls:\n    cert_file: /tmp/test-server.crt\n    key_file: /tmp/test-server.key\n    ca_file: /tmp/test-ca.crt\n", "");
+        let plaintext = no_security.replace("https://", "http://");
+        let ctx = FlameClusterContext::try_from(
+            serde_yaml::from_str::<FlameClusterContextYaml>(&plaintext).unwrap(),
+        )
+        .unwrap();
+        assert!(ctx.security.is_none());
+        assert!(FlameClusterContext::try_from(
+            serde_yaml::from_str::<FlameClusterContextYaml>(&no_security).unwrap()
+        )
+        .is_err());
+        let secure_with_plaintext = base.replace("https://", "http://");
+        assert!(FlameClusterContext::try_from(
+            serde_yaml::from_str::<FlameClusterContextYaml>(&secure_with_plaintext).unwrap()
+        )
+        .is_err());
+        let no_ca = base.replace("    ca_file: /tmp/test-ca.crt\n", "");
+        assert!(FlameClusterContext::try_from(
+            serde_yaml::from_str::<FlameClusterContextYaml>(&no_ca).unwrap()
+        )
+        .is_err());
+        let disabled = base.replace("security:\n", "security:\n  enabled: false\n");
+        assert!(serde_yaml::from_str::<FlameClusterContextYaml>(&disabled).is_err());
+    }
+
+    #[test]
+    fn plaintext_cache_uses_plaintext_default_endpoint() {
+        let yaml: FlameClusterContextYaml = serde_yaml::from_str(
+            "cluster:\n  name: flame\n  endpoint: http://localhost:8080\ncache: {}\n",
+        )
+        .unwrap();
+        let ctx = FlameClusterContext::try_from(yaml).unwrap();
+        assert_eq!(ctx.cache.unwrap().endpoint, "grpc://127.0.0.1:9090");
+    }
+
+    #[test]
     fn test_flame_context_from_file() -> Result<(), FlameError> {
         // New config structure: max_executors is under cluster.limits
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
   resreq: "cpu=1,mem=1g"
   policies:
     - priority
@@ -683,7 +837,7 @@ cluster:
         let ctx = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()))
             .map_err(|e| FlameError::Internal(e.to_string()))?;
         assert_eq!(ctx.cluster.name, "flame");
-        assert_eq!(ctx.cluster.endpoint, "http://flame-session-manager:8080");
+        assert_eq!(ctx.cluster.endpoint, "https://flame-session-manager:8080");
         assert_eq!(
             ctx.cluster.resreq,
             Some(ResourceRequirement::from("cpu=1,mem=1g"))
@@ -699,9 +853,15 @@ cluster:
     #[test]
     fn test_flame_context_with_session_recovery_retry_limits() -> Result<(), FlameError> {
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
   recovery:
     session:
       retry_limits: 2
@@ -722,13 +882,19 @@ cluster:
     #[test]
     fn test_flame_context_with_cache_eviction() -> Result<(), FlameError> {
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
   executors:
     shim: host
 cache:
-  endpoint: "grpc://127.0.0.1:9090"
+  endpoint: "grpcs://127.0.0.1:9090"
   network_interface: "eth0"
   storage: "/var/lib/flame/cache"
   eviction:
@@ -746,7 +912,7 @@ cache:
 
         assert!(ctx.cache.is_some());
         let cache = ctx.cache.unwrap();
-        assert_eq!(cache.endpoint, "grpc://127.0.0.1:9090");
+        assert_eq!(cache.endpoint, "grpcs://127.0.0.1:9090");
         assert_eq!(cache.network_interface, "eth0");
         assert_eq!(cache.storage, Some("/var/lib/flame/cache".to_string()));
         assert_eq!(cache.eviction.policy, "lru");
@@ -759,13 +925,19 @@ cache:
     #[test]
     fn test_flame_context_with_cache_no_eviction() -> Result<(), FlameError> {
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
   executors:
     shim: host
 cache:
-  endpoint: "grpc://127.0.0.1:9090"
+  endpoint: "grpcs://127.0.0.1:9090"
   eviction:
     policy: "none"
         "#;
@@ -791,13 +963,19 @@ cache:
     #[test]
     fn test_flame_context_with_cache_default_eviction() -> Result<(), FlameError> {
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
   executors:
     shim: host
 cache:
-  endpoint: "grpc://127.0.0.1:9090"
+  endpoint: "grpcs://127.0.0.1:9090"
         "#;
 
         let tmp_dir = TempDir::new().unwrap();
@@ -825,9 +1003,15 @@ cache:
     #[test]
     fn test_flame_context_with_cache_gc() -> Result<(), FlameError> {
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
 cache:
   gc:
     interval: 30s
@@ -849,9 +1033,15 @@ cache:
     #[test]
     fn test_flame_context_defaults_cache_gc_without_interval() {
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
 cache:
   gc: {}
         "#;
@@ -873,9 +1063,15 @@ cache:
         for interval in ["0s", "invalid"] {
             let context_string = format!(
                 r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
 cache:
   gc:
     interval: {interval}
@@ -897,9 +1093,15 @@ cache:
     #[test]
     fn test_flame_context_rejects_unknown_cache_gc_fields() {
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
 cache:
   gc:
     interval: 60s
@@ -1072,13 +1274,19 @@ cache:
     #[test]
     fn test_flame_context_with_max_memory_gigabytes() -> Result<(), FlameError> {
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
   executors:
     shim: host
 cache:
-  endpoint: "grpc://127.0.0.1:9090"
+  endpoint: "grpcs://127.0.0.1:9090"
   eviction:
     policy: "lru"
     max_memory: "1G"
@@ -1100,13 +1308,19 @@ cache:
     #[test]
     fn test_flame_context_with_max_memory_megabytes() -> Result<(), FlameError> {
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
   executors:
     shim: host
 cache:
-  endpoint: "grpc://127.0.0.1:9090"
+  endpoint: "grpcs://127.0.0.1:9090"
   eviction:
     policy: "lru"
     max_memory: "512M"
@@ -1128,13 +1342,19 @@ cache:
     #[test]
     fn test_flame_context_with_max_memory_lowercase() -> Result<(), FlameError> {
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
   executors:
     shim: host
 cache:
-  endpoint: "grpc://127.0.0.1:9090"
+  endpoint: "grpcs://127.0.0.1:9090"
   eviction:
     policy: "lru"
     max_memory: "2g"
@@ -1157,13 +1377,19 @@ cache:
     fn test_flame_context_with_invalid_max_memory_unit() {
         // Test invalid unit should fail
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
   executors:
     shim: host
 cache:
-  endpoint: "grpc://127.0.0.1:9090"
+  endpoint: "grpcs://127.0.0.1:9090"
   eviction:
     policy: "lru"
     max_memory: "512X"
@@ -1186,9 +1412,15 @@ cache:
     #[test]
     fn cluster_yaml_with_resreq_parses() -> Result<(), FlameError> {
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
   resreq: "cpu=2,mem=4g,gpu=1"
   executors:
     shim: host
@@ -1211,9 +1443,15 @@ cluster:
     #[test]
     fn cluster_yaml_without_resreq_is_none() -> Result<(), FlameError> {
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
   executors:
     shim: host
         "#;
@@ -1232,9 +1470,15 @@ cluster:
     #[test]
     fn cluster_yaml_with_invalid_resreq_fails() {
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
   resreq: "cpu=two,mem=4g"
   executors:
     shim: host
@@ -1252,13 +1496,19 @@ cluster:
     fn test_flame_context_with_invalid_max_memory_number() {
         // Test invalid number should fail
         let context_string = r#"---
+security:
+  trust_domain: test.local
+  tls:
+    cert_file: /tmp/test-server.crt
+    key_file: /tmp/test-server.key
+    ca_file: /tmp/test-ca.crt
 cluster:
   name: flame
-  endpoint: "http://flame-session-manager:8080"
+  endpoint: "https://flame-session-manager:8080"
   executors:
     shim: host
 cache:
-  endpoint: "grpc://127.0.0.1:9090"
+  endpoint: "grpcs://127.0.0.1:9090"
   eviction:
     policy: "lru"
     max_memory: "abcM"

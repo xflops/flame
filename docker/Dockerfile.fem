@@ -21,12 +21,13 @@ RUN ./target/release/flmadm install \
 
 FROM ubuntu:24.04
 
-RUN apt-get update && apt-get install -y python3-pip git dumb-init && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y python3-pip git dumb-init openssl && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/local/flame/work
 
 # Copy the entire installation from builder (includes lib/ with flamepy)
 COPY --from=builder /usr/local/flame /usr/local/flame
+COPY ci/docker/executor-manager-entrypoint.sh /usr/local/flame/bin/executor-manager-entrypoint.sh
 
 ENV FLAME_HOME=/usr/local/flame
 

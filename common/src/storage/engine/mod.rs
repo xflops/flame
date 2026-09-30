@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::apis::Role;
 use crate::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationState, ExecutorID, ExecutorState,
     Node, Session, SessionAttributes, SessionID, Task, TaskGID, TaskInput, TaskOptions, TaskResult,
@@ -35,6 +36,10 @@ pub type EnginePtr = Arc<dyn Engine>;
 
 #[async_trait]
 pub trait Engine: Send + Sync + 'static {
+    fn set_role(&self, role: &Role) -> Result<(), FlameError>;
+    fn delete_role(&self, name: &str) -> Result<(), FlameError>;
+    fn find_roles(&self) -> Result<Vec<Role>, FlameError>;
+
     // Application operations
     async fn register_application(
         &self,

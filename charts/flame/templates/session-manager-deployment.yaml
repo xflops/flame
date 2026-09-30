@@ -81,9 +81,9 @@ spec:
               subPath: events
             - name: logs
               mountPath: /usr/local/flame/logs
-            {{- if .Values.tls.enabled }}
-            - name: cluster-tls
-              mountPath: {{ include "flame.tlsClusterPath" . }}
+            {{- if .Values.security.enabled }}
+            - name: role-tls
+              mountPath: {{ include "flame.tlsPath" . }}
               readOnly: true
             {{- end }}
             {{- with .Values.sessionManager.extraVolumeMounts }}
@@ -110,10 +110,17 @@ spec:
           {{- end }}
         - name: logs
           emptyDir: {}
-        {{- if .Values.tls.enabled }}
-        - name: cluster-tls
+        {{- if .Values.security.enabled }}
+        - name: role-tls
           secret:
-            secretName: {{ .Values.tls.cluster.secretName }}
+            secretName: {{ .Values.tls.sessionManager.secretName | quote }}
+            items:
+              - key: {{ .Values.tls.sessionManager.certKey | quote }}
+                path: tls.crt
+              - key: {{ .Values.tls.sessionManager.privateKeyKey | quote }}
+                path: tls.key
+              - key: {{ .Values.tls.sessionManager.caKey | quote }}
+                path: ca.crt
         {{- end }}
         {{- with .Values.sessionManager.extraVolumes }}
         {{- toYaml . | nindent 8 }}

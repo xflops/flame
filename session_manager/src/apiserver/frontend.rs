@@ -21,22 +21,24 @@ use serde_json::Value;
 use stdng::trace_fn;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 use self::rpc::frontend_server::Frontend;
 use self::rpc::{
     ApplicationList, CloseSessionRequest, CreateSessionRequest, CreateTaskRequest,
-    DeleteSessionRequest, ExecutorList, GetApplicationRequest, GetNodeRequest, GetNodeResponse,
-    GetSessionRequest, GetTaskRequest, ListApplicationsRequest, ListExecutorsRequest,
-    ListNodesRequest, ListSessionsRequest, ListTasksRequest, NodeList, OpenSessionRequest,
-    RegisterApplicationRequest, Session, SessionList, Task, UnregisterApplicationRequest,
-    UpdateApplicationRequest, WatchTaskRequest,
+    DeleteRoleRequest, DeleteSessionRequest, ExecutorList, GetApplicationRequest, GetNodeRequest,
+    GetNodeResponse, GetRoleRequest, GetSessionRequest, GetTaskRequest, ListApplicationsRequest,
+    ListExecutorsRequest, ListNodesRequest, ListRolesRequest, ListSessionsRequest,
+    ListTasksRequest, NodeList, OpenSessionRequest, RegisterApplicationRequest, Session,
+    SessionList, SetRoleRequest, Task, UnregisterApplicationRequest, UpdateApplicationRequest,
+    WatchTaskRequest,
 };
 
 use rpc::flame::v1 as rpc;
 
-use common::apis::ResourceRequirement;
+use common::apis::{operation, valid_role_name, Object, ResourceRequirement, UserIdentity, ALL};
 use common::{apis, FlameError};
+use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 
 use crate::apiserver::Flame;
 
@@ -95,7 +97,54 @@ fn validate_working_directory(working_dir: &Option<String>) -> Result<(), FlameE
     Ok(())
 }
 
+fn role_to_rpc(role: common::apis::Role) -> rpc::Role {
+    role.into()
+}
+
+fn public_application(app: &apis::Application) -> rpc::Application {
+    let mut application = rpc::Application::from(app);
+    if let Some(package) = application
+        .spec
+        .as_mut()
+        .and_then(|spec| spec.package.as_mut())
+    {
+        package.signature.clear();
+    }
+    application
+}
+
 impl Flame {
+    fn frontend_actor<T>(&self, req: &Request<T>) -> Result<Option<UserIdentity>, Status> {
+        self.security_manager.identify(
+            req.extensions().get::<TlsConnectInfo<TcpConnectInfo>>(),
+            None,
+        )
+    }
+
+    async fn application_visible(
+        &self,
+        actor: &Option<UserIdentity>,
+        operation: &str,
+        application: &str,
+    ) -> Result<bool, Status> {
+        match self
+            .security_manager
+            .authorize(actor, operation, Object::Application(application))
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(status) if status.code() == Code::NotFound => Ok(false),
+            Err(status) => Err(status),
+        }
+    }
+
+    fn session_application(&self, session_id: &str) -> Result<String, Status> {
+        self.controller
+            .get_session(session_id.to_string())
+            .map(|session| session.application)
+            .map_err(|_| Status::not_found("session not found"))
+    }
+
     async fn forward_task_update(
         &self,
         ssn_id: &apis::SessionID,
@@ -132,6 +181,7 @@ impl Frontend for Flame {
         &self,
         req: Request<tonic::Streaming<WatchTaskRequest>>,
     ) -> Result<Response<Self::WatchTasksStream>, Status> {
+        let actor = self.frontend_actor(&req)?;
         let mut watch_requests = req.into_inner();
         let first = watch_requests
             .message()
@@ -141,6 +191,13 @@ impl Frontend for Flame {
             .session_id
             .parse::<apis::SessionID>()
             .map_err(|_| Status::invalid_argument("invalid session id"))?;
+        self.security_manager
+            .authorize(
+                &actor,
+                operation::LIST,
+                Object::Application(&self.session_application(&ssn_id)?),
+            )
+            .await?;
         // Subscribe before the first snapshot so no task update is lost.
         let mut task_updates = self.controller.subscribe(&ssn_id).map_err(Status::from)?;
         let (tx, rx) = mpsc::channel(128);
@@ -213,6 +270,14 @@ impl Frontend for Flame {
         req: Request<ListTasksRequest>,
     ) -> Result<Response<Self::ListTasksStream>, Status> {
         trace_fn!("Frontend::list_tasks");
+        let actor = self.frontend_actor(&req)?;
+        self.security_manager
+            .authorize(
+                &actor,
+                operation::LIST,
+                Object::Application(&self.session_application(&req.get_ref().session_id)?),
+            )
+            .await?;
         let req = req.into_inner();
         let ssn_id = req
             .session_id
@@ -245,6 +310,14 @@ impl Frontend for Flame {
         req: Request<RegisterApplicationRequest>,
     ) -> Result<Response<rpc::Result>, Status> {
         trace_fn!("Frontend::register_application");
+        let actor = self.frontend_actor(&req)?;
+        self.security_manager
+            .authorize(
+                &actor,
+                operation::UPDATE,
+                Object::Application(&req.get_ref().name),
+            )
+            .await?;
 
         let req = req.into_inner();
         let spec = req.application.ok_or(FlameError::InvalidConfig(
@@ -299,6 +372,14 @@ impl Frontend for Flame {
         req: Request<UnregisterApplicationRequest>,
     ) -> Result<Response<rpc::Result>, Status> {
         trace_fn!("Frontend::unregister_application");
+        let actor = self.frontend_actor(&req)?;
+        self.security_manager
+            .authorize(
+                &actor,
+                operation::DELETE,
+                Object::Application(&req.get_ref().name),
+            )
+            .await?;
         let req = req.into_inner();
         let res = self.controller.unregister_application(req.name).await;
 
@@ -319,6 +400,14 @@ impl Frontend for Flame {
         req: Request<UpdateApplicationRequest>,
     ) -> Result<Response<rpc::Result>, Status> {
         trace_fn!("Frontend::update_application");
+        let actor = self.frontend_actor(&req)?;
+        self.security_manager
+            .authorize(
+                &actor,
+                operation::UPDATE,
+                Object::Application(&req.get_ref().name),
+            )
+            .await?;
         let req = req.into_inner();
         let spec = req.application.ok_or(FlameError::InvalidConfig(
             "applilcation spec is missed".to_string(),
@@ -373,13 +462,21 @@ impl Frontend for Flame {
         req: tonic::Request<GetApplicationRequest>,
     ) -> Result<Response<rpc::Application>, Status> {
         trace_fn!("Frontend::get_application");
+        let actor = self.frontend_actor(&req)?;
+        self.security_manager
+            .authorize(
+                &actor,
+                operation::VIEW,
+                Object::Application(&req.get_ref().name),
+            )
+            .await?;
 
         let app = self
             .controller
             .get_application(req.into_inner().name)
             .await
             .map_err(Status::from)?;
-        Ok(Response::new(rpc::Application::from(&app)))
+        Ok(Response::new(public_application(&app)))
     }
 
     async fn list_applications(
@@ -387,6 +484,7 @@ impl Frontend for Flame {
         request: Request<ListApplicationsRequest>,
     ) -> Result<Response<ApplicationList>, Status> {
         trace_fn!("Frontend::list_applications");
+        let actor = self.frontend_actor(&request)?;
         let filter = crate::model::ApplicationFilter::try_from(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let app_list = self
@@ -395,26 +493,47 @@ impl Frontend for Flame {
             .await
             .map_err(Status::from)?;
 
-        let applications = app_list.iter().map(rpc::Application::from).collect();
+        let mut applications = Vec::new();
+        for app in &app_list {
+            if self
+                .application_visible(&actor, operation::VIEW, &app.name)
+                .await?
+            {
+                applications.push(public_application(app));
+            }
+        }
 
         Ok(Response::new(ApplicationList { applications }))
     }
 
     async fn list_executors(
         &self,
-        _: tonic::Request<ListExecutorsRequest>,
+        req: tonic::Request<ListExecutorsRequest>,
     ) -> Result<Response<ExecutorList>, Status> {
         trace_fn!("Frontend::list_executors");
+        let actor = self.frontend_actor(&req)?;
         let executor_list = self.controller.list_executors().map_err(Status::from)?;
-        let executors = executor_list.iter().map(rpc::Executor::from).collect();
+        let mut executors = Vec::new();
+        for executor in &executor_list {
+            if self
+                .application_visible(&actor, operation::LIST, &executor.application)
+                .await?
+            {
+                executors.push(rpc::Executor::from(executor));
+            }
+        }
         Ok(Response::new(ExecutorList { executors }))
     }
 
     async fn list_nodes(
         &self,
-        _: tonic::Request<ListNodesRequest>,
+        req: tonic::Request<ListNodesRequest>,
     ) -> Result<Response<NodeList>, Status> {
         trace_fn!("Frontend::list_nodes");
+        let actor = self.frontend_actor(&req)?;
+        self.security_manager
+            .authorize(&actor, operation::LIST, Object::Node(ALL))
+            .await?;
         let node_list = self.controller.list_nodes().map_err(Status::from)?;
         let nodes = node_list.iter().map(rpc::Node::from).collect();
         Ok(Response::new(NodeList { nodes }))
@@ -425,6 +544,10 @@ impl Frontend for Flame {
         req: tonic::Request<GetNodeRequest>,
     ) -> Result<Response<GetNodeResponse>, Status> {
         trace_fn!("Frontend::get_node");
+        let actor = self.frontend_actor(&req)?;
+        self.security_manager
+            .authorize(&actor, operation::VIEW, Object::Node(&req.get_ref().name))
+            .await?;
         let name = req.into_inner().name;
         let node = self
             .controller
@@ -441,6 +564,17 @@ impl Frontend for Flame {
         req: Request<CreateSessionRequest>,
     ) -> Result<Response<Session>, Status> {
         trace_fn!("Frontend::create_session");
+        let actor = self.frontend_actor(&req)?;
+        let application = req
+            .get_ref()
+            .session
+            .as_ref()
+            .ok_or(Status::invalid_argument("session spec"))?
+            .application
+            .as_str();
+        self.security_manager
+            .authorize(&actor, operation::UPDATE, Object::Application(application))
+            .await?;
         let req = req.into_inner();
         let ssn_spec = req
             .session
@@ -489,6 +623,14 @@ impl Frontend for Flame {
         &self,
         req: Request<DeleteSessionRequest>,
     ) -> Result<Response<rpc::Session>, Status> {
+        let actor = self.frontend_actor(&req)?;
+        self.security_manager
+            .authorize(
+                &actor,
+                operation::DELETE,
+                Object::Application(&self.session_application(&req.get_ref().session_id)?),
+            )
+            .await?;
         let ssn_id = req
             .into_inner()
             .session_id
@@ -509,6 +651,14 @@ impl Frontend for Flame {
         req: Request<OpenSessionRequest>,
     ) -> Result<Response<rpc::Session>, Status> {
         trace_fn!("Frontend::open_session");
+        let actor = self.frontend_actor(&req)?;
+        let application = match req.get_ref().session.as_ref() {
+            Some(spec) => spec.application.clone(),
+            None => self.session_application(&req.get_ref().session_id)?,
+        };
+        self.security_manager
+            .authorize(&actor, operation::UPDATE, Object::Application(&application))
+            .await?;
         let req = req.into_inner();
         let ssn_id = req
             .session_id
@@ -549,6 +699,14 @@ impl Frontend for Flame {
         req: Request<CloseSessionRequest>,
     ) -> Result<Response<rpc::Session>, Status> {
         trace_fn!("Frontend::close_session");
+        let actor = self.frontend_actor(&req)?;
+        self.security_manager
+            .authorize(
+                &actor,
+                operation::UPDATE,
+                Object::Application(&self.session_application(&req.get_ref().session_id)?),
+            )
+            .await?;
         let ssn_id = req
             .into_inner()
             .session_id
@@ -570,6 +728,14 @@ impl Frontend for Flame {
         req: Request<GetSessionRequest>,
     ) -> Result<Response<Session>, Status> {
         trace_fn!("Frontend::get_session");
+        let actor = self.frontend_actor(&req)?;
+        self.security_manager
+            .authorize(
+                &actor,
+                operation::VIEW,
+                Object::Application(&self.session_application(&req.get_ref().session_id)?),
+            )
+            .await?;
         let ssn_id = req
             .into_inner()
             .session_id
@@ -589,6 +755,7 @@ impl Frontend for Flame {
         request: Request<ListSessionsRequest>,
     ) -> Result<Response<SessionList>, Status> {
         trace_fn!("Frontend::list_sessions");
+        let actor = self.frontend_actor(&request)?;
         let filter = crate::model::SessionFilter::try_from(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let ssn_list = self
@@ -596,13 +763,35 @@ impl Frontend for Flame {
             .list_sessions(Some(&filter))
             .map_err(Status::from)?;
 
-        let sessions = ssn_list.iter().map(Session::from).collect();
+        let mut sessions = Vec::new();
+        for session in &ssn_list {
+            if self
+                .application_visible(&actor, operation::LIST, &session.application)
+                .await?
+            {
+                sessions.push(Session::from(session));
+            }
+        }
 
         Ok(Response::new(SessionList { sessions }))
     }
 
     async fn create_task(&self, req: Request<CreateTaskRequest>) -> Result<Response<Task>, Status> {
         trace_fn!("Frontend::create_task");
+        let actor = self.frontend_actor(&req)?;
+        let session_id = &req
+            .get_ref()
+            .task
+            .as_ref()
+            .ok_or(Status::invalid_argument("task spec"))?
+            .session_id;
+        self.security_manager
+            .authorize(
+                &actor,
+                operation::UPDATE,
+                Object::Application(&self.session_application(session_id)?),
+            )
+            .await?;
         let task_spec = req
             .into_inner()
             .task
@@ -632,6 +821,14 @@ impl Frontend for Flame {
         Ok(Response::new(task))
     }
     async fn get_task(&self, req: Request<GetTaskRequest>) -> Result<Response<Task>, Status> {
+        let actor = self.frontend_actor(&req)?;
+        self.security_manager
+            .authorize(
+                &actor,
+                operation::VIEW,
+                Object::Application(&self.session_application(&req.get_ref().session_id)?),
+            )
+            .await?;
         let req = req.into_inner();
         let ssn_id = req
             .session_id
@@ -651,12 +848,185 @@ impl Frontend for Flame {
 
         Ok(Response::new(task))
     }
+
+    async fn set_role(&self, req: Request<SetRoleRequest>) -> Result<Response<rpc::Role>, Status> {
+        let actor = self.frontend_actor(&req)?;
+        self.security_manager
+            .authorize(&actor, ALL, Object::Application(ALL))
+            .await?;
+        let role = req
+            .into_inner()
+            .role
+            .ok_or_else(|| Status::invalid_argument("role required"))?;
+        let flame_role: common::apis::Role = role.clone().try_into()?;
+        self.security_manager.set_role(&flame_role)?;
+        tracing::info!(actor = ?actor, role = %role.name, "set role");
+        Ok(Response::new(role))
+    }
+
+    async fn get_role(&self, req: Request<GetRoleRequest>) -> Result<Response<rpc::Role>, Status> {
+        let actor = self.frontend_actor(&req)?;
+        self.security_manager
+            .authorize(&actor, ALL, Object::Application(ALL))
+            .await?;
+        let role = self
+            .security_manager
+            .get_role(&req.into_inner().name)?
+            .ok_or_else(|| Status::not_found("role not found"))?;
+        Ok(Response::new(role_to_rpc(role)))
+    }
+
+    async fn list_roles(
+        &self,
+        req: Request<ListRolesRequest>,
+    ) -> Result<Response<rpc::RoleList>, Status> {
+        let actor = self.frontend_actor(&req)?;
+        self.security_manager
+            .authorize(&actor, ALL, Object::Application(ALL))
+            .await?;
+        let roles = self
+            .security_manager
+            .list_roles()?
+            .into_iter()
+            .map(role_to_rpc)
+            .collect();
+        Ok(Response::new(rpc::RoleList { roles }))
+    }
+
+    async fn delete_role(
+        &self,
+        req: Request<DeleteRoleRequest>,
+    ) -> Result<Response<rpc::Result>, Status> {
+        let actor = self.frontend_actor(&req)?;
+        self.security_manager
+            .authorize(&actor, ALL, Object::Application(ALL))
+            .await?;
+        let name = req.into_inner().name;
+        if !valid_role_name(&name) {
+            return Err(Status::invalid_argument("invalid role name"));
+        }
+        self.security_manager.delete_role(&name)?;
+        tracing::info!(actor = ?actor, role = %name, "deleted role");
+        Ok(Response::new(rpc::Result::default()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::security::SecurityManager;
     use futures::{Stream, StreamExt};
+    use std::sync::Arc;
+
+    #[test]
+    fn public_application_omits_package_signature() {
+        let application = apis::Application {
+            package: Some(apis::Package {
+                url: "grpcs://cache/app/pkg/archive.tar.gz".to_string(),
+                signature: "signed-key".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let rpc_application = public_application(&application);
+        let package = rpc_application.spec.unwrap().package.unwrap();
+        assert_eq!(package.url, "grpcs://cache/app/pkg/archive.tar.gz");
+        assert!(package.signature.is_empty());
+        assert_eq!(application.package.unwrap().signature, "signed-key");
+    }
+
+    struct ListSecurityManager;
+
+    #[async_trait::async_trait]
+    impl SecurityManager for ListSecurityManager {
+        fn with_delegation(
+            self: Box<Self>,
+            _: &str,
+        ) -> Result<Box<dyn SecurityManager>, FlameError> {
+            Ok(self)
+        }
+
+        async fn with_role(
+            self: Box<Self>,
+            _: Arc<common::storage::Storage>,
+        ) -> Result<Box<dyn SecurityManager>, FlameError> {
+            Ok(self)
+        }
+
+        fn storage(&self) -> Option<&Arc<common::storage::Storage>> {
+            None
+        }
+
+        fn identify(
+            &self,
+            _: Option<&TlsConnectInfo<TcpConnectInfo>>,
+            _: Option<&str>,
+        ) -> Result<Option<UserIdentity>, Status> {
+            Ok(Some(UserIdentity::TenantUser("alice".to_string())))
+        }
+
+        fn delegate(&self, _: &UserIdentity) -> Result<String, Status> {
+            Ok(String::new())
+        }
+
+        async fn authorize(
+            &self,
+            _: &Option<UserIdentity>,
+            _: &str,
+            object: Object<'_>,
+        ) -> Result<(), Status> {
+            match object {
+                Object::Application("allowed") => Ok(()),
+                Object::Application("broken") => Err(Status::internal("role storage failed")),
+                _ => Err(Status::not_found("resource not found")),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_applications_uses_authorize_for_each_result() {
+        let config = common::ctx::FlameClusterContext {
+            cluster: common::ctx::FlameCluster {
+                storage: "none".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let storage = crate::storage::new_ptr(&config).await.unwrap();
+        let controller = crate::controller::new_ptr(storage);
+        for name in ["allowed", "denied"] {
+            controller
+                .register_application(name.to_string(), ApplicationAttributes::default())
+                .await
+                .unwrap();
+        }
+        let flame = Flame {
+            controller,
+            cluster_default_resreq: None,
+            security: None,
+            security_manager: Arc::new(ListSecurityManager),
+        };
+        let result = flame
+            .list_applications(Request::new(ListApplicationsRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.applications.len(), 1);
+        assert_eq!(
+            result.applications[0].metadata.as_ref().unwrap().name,
+            "allowed"
+        );
+
+        let actor = Some(UserIdentity::TenantUser("alice".to_string()));
+        assert_eq!(
+            flame
+                .application_visible(&actor, operation::VIEW, "broken")
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Internal
+        );
+    }
 
     async fn watch_task_stream<S>(
         controller: crate::controller::ControllerPtr,
@@ -669,6 +1039,8 @@ mod tests {
         let flame = Flame {
             controller,
             cluster_default_resreq: None,
+            security: None,
+            security_manager: Arc::from(common::security::new(None)),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

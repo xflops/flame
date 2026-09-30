@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0b\x63\x61\x63he.proto\x12\x08\x66lame.v1\"2\n\x10\x43\x61\x63heWriteHeader\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\x11\n\tdata_type\x18\x02 \x01(\t\"\\\n\x11\x43\x61\x63heWriteRequest\x12,\n\x06header\x18\x01 \x01(\x0b\x32\x1a.flame.v1.CacheWriteHeaderH\x00\x12\x0e\n\x04\x64\x61ta\x18\x02 \x01(\x0cH\x00\x42\t\n\x07payload\"\x92\x01\n\x13\x43\x61\x63heObjectMetadata\x12\x10\n\x08\x65ndpoint\x18\x01 \x01(\t\x12\x0b\n\x03key\x18\x02 \x01(\t\x12\x0f\n\x07version\x18\x03 \x01(\x04\x12\x0c\n\x04size\x18\x04 \x01(\x04\x12\x13\n\x0b\x64\x65lta_count\x18\x05 \x01(\x04\x12\x15\n\rcreation_time\x18\x06 \x01(\x03\x12\x11\n\tdata_type\x18\x07 \x01(\t\"6\n\x0f\x43\x61\x63heGetRequest\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\x16\n\x0e\x63lient_version\x18\x02 \x01(\x04\"Z\n\x0e\x43\x61\x63heGetHeader\x12$\n\x04mode\x18\x01 \x01(\x0e\x32\x16.flame.v1.CacheGetMode\x12\x0f\n\x07version\x18\x02 \x01(\x04\x12\x11\n\tdata_type\x18\x03 \x01(\t\"V\n\rCacheGetChunk\x12&\n\x04kind\x18\x01 \x01(\x0e\x32\x18.flame.v1.CacheChunkKind\x12\x0f\n\x07version\x18\x02 \x01(\x04\x12\x0c\n\x04\x64\x61ta\x18\x03 \x01(\x0c\"s\n\x10\x43\x61\x63heGetResponse\x12*\n\x06header\x18\x01 \x01(\x0b\x32\x18.flame.v1.CacheGetHeaderH\x00\x12(\n\x05\x63hunk\x18\x02 \x01(\x0b\x32\x17.flame.v1.CacheGetChunkH\x00\x42\t\n\x07payload\"!\n\x12\x43\x61\x63heDeleteRequest\x12\x0b\n\x03key\x18\x01 \x01(\t\"\x15\n\x13\x43\x61\x63heDeleteResponse\"&\n\x17\x43\x61\x63heGetMetadataRequest\x12\x0b\n\x03key\x18\x01 \x01(\t\"\x12\n\x10\x43\x61\x63heListRequest*\x84\x01\n\x0c\x43\x61\x63heGetMode\x12\x1e\n\x1a\x43\x41\x43HE_GET_MODE_UNSPECIFIED\x10\x00\x12\x17\n\x13\x43\x41\x43HE_GET_MODE_FULL\x10\x01\x12\x1a\n\x16\x43\x41\x43HE_GET_MODE_PATCHES\x10\x02\x12\x1f\n\x1b\x43\x41\x43HE_GET_MODE_NOT_MODIFIED\x10\x03*i\n\x0e\x43\x61\x63heChunkKind\x12 \n\x1c\x43\x41\x43HE_CHUNK_KIND_UNSPECIFIED\x10\x00\x12\x19\n\x15\x43\x41\x43HE_CHUNK_KIND_BASE\x10\x01\x12\x1a\n\x16\x43\x41\x43HE_CHUNK_KIND_PATCH\x10\x02\x32\xc9\x03\n\x12ObjectCacheService\x12\x45\n\x03Put\x12\x1b.flame.v1.CacheWriteRequest\x1a\x1d.flame.v1.CacheObjectMetadata\"\x00(\x01\x12G\n\x05Patch\x12\x1b.flame.v1.CacheWriteRequest\x1a\x1d.flame.v1.CacheObjectMetadata\"\x00(\x01\x12@\n\x03Get\x12\x19.flame.v1.CacheGetRequest\x1a\x1a.flame.v1.CacheGetResponse\"\x00\x30\x01\x12G\n\x06\x44\x65lete\x12\x1c.flame.v1.CacheDeleteRequest\x1a\x1d.flame.v1.CacheDeleteResponse\"\x00\x12Q\n\x0bGetMetadata\x12!.flame.v1.CacheGetMetadataRequest\x1a\x1d.flame.v1.CacheObjectMetadata\"\x00\x12\x45\n\x04List\x12\x1a.flame.v1.CacheListRequest\x1a\x1d.flame.v1.CacheObjectMetadata\"\x00\x30\x01\x42)Z\'github.com/flame-sh/flame/sdk/go/rpc/v1b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0b\x63\x61\x63he.proto\x12\x08\x66lame.v1\"#\n\x14\x43\x61\x63heDelegateRequest\x12\x0b\n\x03key\x18\x01 \x01(\t\"&\n\x15\x43\x61\x63heDelegateResponse\x12\r\n\x05token\x18\x01 \x01(\t\"2\n\x10\x43\x61\x63heWriteHeader\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\x11\n\tdata_type\x18\x02 \x01(\t\"\\\n\x11\x43\x61\x63heWriteRequest\x12,\n\x06header\x18\x01 \x01(\x0b\x32\x1a.flame.v1.CacheWriteHeaderH\x00\x12\x0e\n\x04\x64\x61ta\x18\x02 \x01(\x0cH\x00\x42\t\n\x07payload\"\xa5\x01\n\x13\x43\x61\x63heObjectMetadata\x12\x10\n\x08\x65ndpoint\x18\x01 \x01(\t\x12\x0b\n\x03key\x18\x02 \x01(\t\x12\x0f\n\x07version\x18\x03 \x01(\x04\x12\x0c\n\x04size\x18\x04 \x01(\x04\x12\x13\n\x0b\x64\x65lta_count\x18\x05 \x01(\x04\x12\x15\n\rcreation_time\x18\x06 \x01(\x03\x12\x11\n\tdata_type\x18\x07 \x01(\t\x12\x11\n\tsignature\x18\x08 \x01(\t\"I\n\x0f\x43\x61\x63heGetRequest\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\x16\n\x0e\x63lient_version\x18\x02 \x01(\x04\x12\x11\n\tsignature\x18\x03 \x01(\t\"Z\n\x0e\x43\x61\x63heGetHeader\x12$\n\x04mode\x18\x01 \x01(\x0e\x32\x16.flame.v1.CacheGetMode\x12\x0f\n\x07version\x18\x02 \x01(\x04\x12\x11\n\tdata_type\x18\x03 \x01(\t\"V\n\rCacheGetChunk\x12&\n\x04kind\x18\x01 \x01(\x0e\x32\x18.flame.v1.CacheChunkKind\x12\x0f\n\x07version\x18\x02 \x01(\x04\x12\x0c\n\x04\x64\x61ta\x18\x03 \x01(\x0c\"s\n\x10\x43\x61\x63heGetResponse\x12*\n\x06header\x18\x01 \x01(\x0b\x32\x18.flame.v1.CacheGetHeaderH\x00\x12(\n\x05\x63hunk\x18\x02 \x01(\x0b\x32\x17.flame.v1.CacheGetChunkH\x00\x42\t\n\x07payload\"!\n\x12\x43\x61\x63heDeleteRequest\x12\x0b\n\x03key\x18\x01 \x01(\t\"\x15\n\x13\x43\x61\x63heDeleteResponse\"&\n\x17\x43\x61\x63heGetMetadataRequest\x12\x0b\n\x03key\x18\x01 \x01(\t\"\x12\n\x10\x43\x61\x63heListRequest*\x84\x01\n\x0c\x43\x61\x63heGetMode\x12\x1e\n\x1a\x43\x41\x43HE_GET_MODE_UNSPECIFIED\x10\x00\x12\x17\n\x13\x43\x41\x43HE_GET_MODE_FULL\x10\x01\x12\x1a\n\x16\x43\x41\x43HE_GET_MODE_PATCHES\x10\x02\x12\x1f\n\x1b\x43\x41\x43HE_GET_MODE_NOT_MODIFIED\x10\x03*i\n\x0e\x43\x61\x63heChunkKind\x12 \n\x1c\x43\x41\x43HE_CHUNK_KIND_UNSPECIFIED\x10\x00\x12\x19\n\x15\x43\x41\x43HE_CHUNK_KIND_BASE\x10\x01\x12\x1a\n\x16\x43\x41\x43HE_CHUNK_KIND_PATCH\x10\x02\x32\x98\x04\n\x12ObjectCacheService\x12M\n\x08\x44\x65legate\x12\x1e.flame.v1.CacheDelegateRequest\x1a\x1f.flame.v1.CacheDelegateResponse\"\x00\x12\x45\n\x03Put\x12\x1b.flame.v1.CacheWriteRequest\x1a\x1d.flame.v1.CacheObjectMetadata\"\x00(\x01\x12G\n\x05Patch\x12\x1b.flame.v1.CacheWriteRequest\x1a\x1d.flame.v1.CacheObjectMetadata\"\x00(\x01\x12@\n\x03Get\x12\x19.flame.v1.CacheGetRequest\x1a\x1a.flame.v1.CacheGetResponse\"\x00\x30\x01\x12G\n\x06\x44\x65lete\x12\x1c.flame.v1.CacheDeleteRequest\x1a\x1d.flame.v1.CacheDeleteResponse\"\x00\x12Q\n\x0bGetMetadata\x12!.flame.v1.CacheGetMetadataRequest\x1a\x1d.flame.v1.CacheObjectMetadata\"\x00\x12\x45\n\x04List\x12\x1a.flame.v1.CacheListRequest\x1a\x1d.flame.v1.CacheObjectMetadata\"\x00\x30\x01\x42)Z\'github.com/flame-sh/flame/sdk/go/rpc/v1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -32,32 +32,36 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'cache_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
   _globals['DESCRIPTOR']._serialized_options = b'Z\'github.com/flame-sh/flame/sdk/go/rpc/v1'
-  _globals['_CACHEGETMODE']._serialized_start=792
-  _globals['_CACHEGETMODE']._serialized_end=924
-  _globals['_CACHECHUNKKIND']._serialized_start=926
-  _globals['_CACHECHUNKKIND']._serialized_end=1031
-  _globals['_CACHEWRITEHEADER']._serialized_start=25
-  _globals['_CACHEWRITEHEADER']._serialized_end=75
-  _globals['_CACHEWRITEREQUEST']._serialized_start=77
-  _globals['_CACHEWRITEREQUEST']._serialized_end=169
-  _globals['_CACHEOBJECTMETADATA']._serialized_start=172
-  _globals['_CACHEOBJECTMETADATA']._serialized_end=318
-  _globals['_CACHEGETREQUEST']._serialized_start=320
-  _globals['_CACHEGETREQUEST']._serialized_end=374
-  _globals['_CACHEGETHEADER']._serialized_start=376
-  _globals['_CACHEGETHEADER']._serialized_end=466
-  _globals['_CACHEGETCHUNK']._serialized_start=468
-  _globals['_CACHEGETCHUNK']._serialized_end=554
-  _globals['_CACHEGETRESPONSE']._serialized_start=556
-  _globals['_CACHEGETRESPONSE']._serialized_end=671
-  _globals['_CACHEDELETEREQUEST']._serialized_start=673
-  _globals['_CACHEDELETEREQUEST']._serialized_end=706
-  _globals['_CACHEDELETERESPONSE']._serialized_start=708
-  _globals['_CACHEDELETERESPONSE']._serialized_end=729
-  _globals['_CACHEGETMETADATAREQUEST']._serialized_start=731
-  _globals['_CACHEGETMETADATAREQUEST']._serialized_end=769
-  _globals['_CACHELISTREQUEST']._serialized_start=771
-  _globals['_CACHELISTREQUEST']._serialized_end=789
-  _globals['_OBJECTCACHESERVICE']._serialized_start=1034
-  _globals['_OBJECTCACHESERVICE']._serialized_end=1491
+  _globals['_CACHEGETMODE']._serialized_start=907
+  _globals['_CACHEGETMODE']._serialized_end=1039
+  _globals['_CACHECHUNKKIND']._serialized_start=1041
+  _globals['_CACHECHUNKKIND']._serialized_end=1146
+  _globals['_CACHEDELEGATEREQUEST']._serialized_start=25
+  _globals['_CACHEDELEGATEREQUEST']._serialized_end=60
+  _globals['_CACHEDELEGATERESPONSE']._serialized_start=62
+  _globals['_CACHEDELEGATERESPONSE']._serialized_end=100
+  _globals['_CACHEWRITEHEADER']._serialized_start=102
+  _globals['_CACHEWRITEHEADER']._serialized_end=152
+  _globals['_CACHEWRITEREQUEST']._serialized_start=154
+  _globals['_CACHEWRITEREQUEST']._serialized_end=246
+  _globals['_CACHEOBJECTMETADATA']._serialized_start=249
+  _globals['_CACHEOBJECTMETADATA']._serialized_end=414
+  _globals['_CACHEGETREQUEST']._serialized_start=416
+  _globals['_CACHEGETREQUEST']._serialized_end=489
+  _globals['_CACHEGETHEADER']._serialized_start=491
+  _globals['_CACHEGETHEADER']._serialized_end=581
+  _globals['_CACHEGETCHUNK']._serialized_start=583
+  _globals['_CACHEGETCHUNK']._serialized_end=669
+  _globals['_CACHEGETRESPONSE']._serialized_start=671
+  _globals['_CACHEGETRESPONSE']._serialized_end=786
+  _globals['_CACHEDELETEREQUEST']._serialized_start=788
+  _globals['_CACHEDELETEREQUEST']._serialized_end=821
+  _globals['_CACHEDELETERESPONSE']._serialized_start=823
+  _globals['_CACHEDELETERESPONSE']._serialized_end=844
+  _globals['_CACHEGETMETADATAREQUEST']._serialized_start=846
+  _globals['_CACHEGETMETADATAREQUEST']._serialized_end=884
+  _globals['_CACHELISTREQUEST']._serialized_start=886
+  _globals['_CACHELISTREQUEST']._serialized_end=904
+  _globals['_OBJECTCACHESERVICE']._serialized_start=1149
+  _globals['_OBJECTCACHESERVICE']._serialized_end=1685
 # @@protoc_insertion_point(module_scope)

@@ -213,6 +213,12 @@ class ApplicationSchema:
 
 
 @dataclass
+class ApplicationPackage:
+    url: str
+    signature: str = field(default="", repr=False)
+
+
+@dataclass
 class ApplicationAttributes:
     """Attributes for an application."""
 
@@ -228,6 +234,7 @@ class ApplicationAttributes:
     delay_release: Optional[int] = None
     schema: Optional[ApplicationSchema] = None
     url: Optional[str] = None
+    package: Optional[ApplicationPackage] = None
     installer: Optional[str] = None
 
 
@@ -278,6 +285,7 @@ class Application:
     delay_release: Optional[int] = None
     schema: Optional[ApplicationSchema] = None
     url: Optional[str] = None
+    package: Optional[ApplicationPackage] = None
     installer: Optional[str] = None
 
 

@@ -35,6 +35,7 @@ use chrono::Utc;
 
 use stdng::{lock_ptr, MutexPtr};
 
+use crate::apis::Role;
 use crate::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationState, ExecutorID, ExecutorState,
     Node, Session, SessionAttributes, SessionID, SessionState, SessionStatus, Task, TaskGID,
@@ -50,6 +51,7 @@ use super::{Engine, EnginePtr};
 /// The controller cache is the source of truth for all data.
 /// This engine also maintains the minimal application/session index needed for lifecycle guards.
 pub struct NoneEngine {
+    roles: MutexPtr<HashMap<String, Role>>,
     /// Per-session task ID counters for allocation
     task_counters: MutexPtr<HashMap<SessionID, Arc<AtomicI64>>>,
     /// In-memory application cache (required for get_application)
@@ -63,6 +65,7 @@ impl NoneEngine {
     pub async fn new_ptr(_url: &str) -> Result<EnginePtr, FlameError> {
         tracing::info!("Using none storage engine (no persistence)");
         Ok(Arc::new(Self {
+            roles: stdng::new_ptr(HashMap::new()),
             task_counters: stdng::new_ptr(HashMap::new()),
             applications: stdng::new_ptr(HashMap::new()),
             sessions: stdng::new_ptr(HashMap::new()),
@@ -96,6 +99,20 @@ impl NoneEngine {
 
 #[async_trait]
 impl Engine for NoneEngine {
+    fn set_role(&self, role: &Role) -> Result<(), FlameError> {
+        lock_ptr!(self.roles)?.insert(role.name.clone(), role.clone());
+        Ok(())
+    }
+
+    fn delete_role(&self, name: &str) -> Result<(), FlameError> {
+        lock_ptr!(self.roles)?.remove(name);
+        Ok(())
+    }
+
+    fn find_roles(&self) -> Result<Vec<Role>, FlameError> {
+        Ok(lock_ptr!(self.roles)?.values().cloned().collect())
+    }
+
     // ========== Application operations ==========
 
     async fn register_application(
@@ -119,7 +136,7 @@ impl Engine for NoneEngine {
             max_instances: attr.max_instances,
             delay_release: attr.delay_release,
             schema: attr.schema,
-            url: attr.url,
+            package: attr.package,
             installer: attr.installer,
         };
 
@@ -205,7 +222,7 @@ impl Engine for NoneEngine {
             max_instances: attr.max_instances,
             delay_release: attr.delay_release,
             schema: attr.schema,
-            url: attr.url,
+            package: attr.package,
             installer: attr.installer,
         };
 

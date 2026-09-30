@@ -18,11 +18,13 @@ from .cache import (
     ObjectRef,
     Ref,
     ValueRef,
+    cache_requires_signing,
     delete_objects,
     download_object,
     get_object,
     patch_object,
     put_object,
+    sign_app_token,
     update_object,
     upload_object,
 )
@@ -187,6 +189,8 @@ __all__ = [
     "get_object",
     "patch_object",
     "put_object",
+    "sign_app_token",
+    "cache_requires_signing",
     "update_object",
     "upload_object",
 ]

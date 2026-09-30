@@ -29,8 +29,6 @@ const FLAME_KEY_FILE: &str = "FLAME_KEY_FILE";
 
 /// Client TLS configuration for connecting to Flame services.
 ///
-/// Note: To disable TLS for development, use http:// instead of https://
-/// in the endpoint URL.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FlameClientTls {
     /// Path to CA certificate for server verification
@@ -50,7 +48,22 @@ impl FlameClientTls {
     /// If ca_file is specified, use it; otherwise use system CA bundle.
     /// The domain parameter is used for server name verification.
     pub fn client_tls_config(&self, domain: &str) -> Result<ClientTlsConfig, FlameError> {
-        if self.cert_file.is_some() != self.key_file.is_some() {
+        if self.cert_file.as_deref().unwrap_or("").is_empty()
+            || self.key_file.as_deref().unwrap_or("").is_empty()
+        {
+            return Err(FlameError::InvalidConfig(
+                "client TLS requires both cert_file and key_file".to_string(),
+            ));
+        }
+        self.cache_tls_config(domain)
+    }
+
+    /// Build cache TLS with server authentication and an optional client identity.
+    pub(crate) fn cache_tls_config(&self, domain: &str) -> Result<ClientTlsConfig, FlameError> {
+        if self.cert_file.is_some() != self.key_file.is_some()
+            || self.cert_file.as_deref() == Some("")
+            || self.key_file.as_deref() == Some("")
+        {
             return Err(FlameError::InvalidConfig(
                 "client TLS requires both cert_file and key_file".to_string(),
             ));
@@ -164,6 +177,8 @@ pub struct FlameContextEntry {
 ///       endpoint: "https://flame-session-manager:8080"
 ///       tls:
 ///         ca_file: "/etc/flame/certs/ca.crt"
+///         cert_file: "/etc/flame/certs/client.crt"
+///         key_file: "/etc/flame/certs/client.key"
 ///     cache:
 ///       endpoint: "grpcs://flame-object-cache:9090"
 ///       tls:
@@ -368,12 +383,59 @@ mod tests {
     }
 
     #[test]
+    fn cache_tls_allows_server_auth_without_client_identity() {
+        FlameClientTls::default()
+            .cache_tls_config("cache.example.com")
+            .unwrap();
+        assert!(FlameClientTls::default()
+            .client_tls_config("frontend.example.com")
+            .is_err());
+        for tls in [
+            FlameClientTls {
+                cert_file: Some("client.crt".into()),
+                ..Default::default()
+            },
+            FlameClientTls {
+                key_file: Some("client.key".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(tls.cache_tls_config("cache.example.com").is_err());
+        }
+    }
+
+    #[test]
     fn client_identity_loads_pem_files() {
-        let cert_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ci/docker/certs");
+        let cert_dir = tempfile::tempdir().unwrap();
+        for name in ["ca.crt", "server.crt", "server.key"] {
+            fs::write(
+                cert_dir.path().join(name),
+                b"-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n",
+            )
+            .unwrap();
+        }
         let tls = FlameClientTls {
-            ca_file: Some(cert_dir.join("ca.crt").to_string_lossy().into_owned()),
-            cert_file: Some(cert_dir.join("server.crt").to_string_lossy().into_owned()),
-            key_file: Some(cert_dir.join("server.key").to_string_lossy().into_owned()),
+            ca_file: Some(
+                cert_dir
+                    .path()
+                    .join("ca.crt")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            cert_file: Some(
+                cert_dir
+                    .path()
+                    .join("server.crt")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            key_file: Some(
+                cert_dir
+                    .path()
+                    .join("server.key")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
         };
         tls.client_tls_config("gateway.example.com").unwrap();
     }

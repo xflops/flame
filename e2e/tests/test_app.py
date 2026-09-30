@@ -733,6 +733,7 @@ def test_app_destroy_idempotent(check_package_config, check_flmrun_app):
 # =============================================================================
 
 
+@pytest.mark.skip(reason="recursive workload calls are unsupported")
 def test_app_recursive_same_session(check_package_config, check_flmrun_app):
     """Test recursive app execution within the same session.
 

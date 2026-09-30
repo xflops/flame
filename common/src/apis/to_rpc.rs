@@ -14,6 +14,16 @@ limitations under the License.
 use rpc::flame::v1 as rpc;
 
 use super::types::*;
+use crate::apis::{object_kind, Role, ALL, APPLICATION_PREFIX, NODE_PREFIX};
+
+impl From<Package> for rpc::Package {
+    fn from(package: Package) -> Self {
+        Self {
+            url: package.url,
+            signature: package.signature,
+        }
+    }
+}
 
 impl From<ResourceRequirement> for rpc::ResourceRequirement {
     fn from(req: ResourceRequirement) -> Self {
@@ -131,7 +141,7 @@ impl From<ApplicationContext> for rpc::ApplicationContext {
             image: ctx.image.clone(),
             command: ctx.command.clone(),
             working_directory: ctx.working_directory.clone(),
-            url: ctx.url.clone(),
+            url: ctx.package.as_ref().map(|package| package.url.clone()),
             installer: ctx.installer.clone(),
         }
     }
@@ -253,7 +263,8 @@ impl From<&Application> for rpc::Application {
             max_instances: Some(app.max_instances),
             delay_release: Some(app.delay_release.num_seconds()),
             schema: app.schema.clone().map(rpc::ApplicationSchema::from),
-            url: app.url.clone(),
+            url: app.package.as_ref().map(|package| package.url.clone()),
+            package: app.package.clone().map(rpc::Package::from),
             installer: app.installer.clone(),
         });
         let metadata = Some(rpc::Metadata {
@@ -385,5 +396,32 @@ impl From<Task> for EventOwner {
 impl From<TaskGID> for EventOwner {
     fn from(gid: TaskGID) -> Self {
         Self::from(&gid)
+    }
+}
+
+impl From<Role> for rpc::Role {
+    fn from(value: Role) -> Self {
+        let mut rules = Vec::new();
+        let mut kinds: Vec<_> = value.rules.into_iter().collect();
+        kinds.sort_by(|left, right| left.0.cmp(&right.0));
+        for (kind, grants) in kinds {
+            for grant in grants {
+                let object = match kind.as_str() {
+                    ALL => ALL.to_string(),
+                    object_kind::APPLICATION => format!("{APPLICATION_PREFIX}{}", grant.object_id),
+                    object_kind::NODE => format!("{NODE_PREFIX}{}", grant.object_id),
+                    _ => format!("{kind}:{}", grant.object_id),
+                };
+                rules.push(rpc::RoleRule {
+                    verbs: grant.operations,
+                    objects: vec![object],
+                });
+            }
+        }
+        Self {
+            name: value.name,
+            users: value.users,
+            rules,
+        }
     }
 }

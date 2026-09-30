@@ -128,6 +128,26 @@ class FrontendStub(object):
                 request_serializer=frontend__pb2.ListTasksRequest.SerializeToString,
                 response_deserializer=types__pb2.Task.FromString,
                 _registered_method=True)
+        self.SetRole = channel.unary_unary(
+                '/flame.v1.Frontend/SetRole',
+                request_serializer=frontend__pb2.SetRoleRequest.SerializeToString,
+                response_deserializer=types__pb2.Role.FromString,
+                _registered_method=True)
+        self.GetRole = channel.unary_unary(
+                '/flame.v1.Frontend/GetRole',
+                request_serializer=frontend__pb2.GetRoleRequest.SerializeToString,
+                response_deserializer=types__pb2.Role.FromString,
+                _registered_method=True)
+        self.ListRoles = channel.unary_unary(
+                '/flame.v1.Frontend/ListRoles',
+                request_serializer=frontend__pb2.ListRolesRequest.SerializeToString,
+                response_deserializer=types__pb2.RoleList.FromString,
+                _registered_method=True)
+        self.DeleteRole = channel.unary_unary(
+                '/flame.v1.Frontend/DeleteRole',
+                request_serializer=frontend__pb2.DeleteRoleRequest.SerializeToString,
+                response_deserializer=types__pb2.Result.FromString,
+                _registered_method=True)
 
 
 class FrontendServicer(object):
@@ -245,6 +265,30 @@ class FrontendServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SetRole(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetRole(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListRoles(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteRole(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_FrontendServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -337,6 +381,26 @@ def add_FrontendServicer_to_server(servicer, server):
                     servicer.ListTasks,
                     request_deserializer=frontend__pb2.ListTasksRequest.FromString,
                     response_serializer=types__pb2.Task.SerializeToString,
+            ),
+            'SetRole': grpc.unary_unary_rpc_method_handler(
+                    servicer.SetRole,
+                    request_deserializer=frontend__pb2.SetRoleRequest.FromString,
+                    response_serializer=types__pb2.Role.SerializeToString,
+            ),
+            'GetRole': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetRole,
+                    request_deserializer=frontend__pb2.GetRoleRequest.FromString,
+                    response_serializer=types__pb2.Role.SerializeToString,
+            ),
+            'ListRoles': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListRoles,
+                    request_deserializer=frontend__pb2.ListRolesRequest.FromString,
+                    response_serializer=types__pb2.RoleList.SerializeToString,
+            ),
+            'DeleteRole': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteRole,
+                    request_deserializer=frontend__pb2.DeleteRoleRequest.FromString,
+                    response_serializer=types__pb2.Result.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -828,6 +892,114 @@ class Frontend(object):
             '/flame.v1.Frontend/ListTasks',
             frontend__pb2.ListTasksRequest.SerializeToString,
             types__pb2.Task.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SetRole(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/flame.v1.Frontend/SetRole',
+            frontend__pb2.SetRoleRequest.SerializeToString,
+            types__pb2.Role.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetRole(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/flame.v1.Frontend/GetRole',
+            frontend__pb2.GetRoleRequest.SerializeToString,
+            types__pb2.Role.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListRoles(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/flame.v1.Frontend/ListRoles',
+            frontend__pb2.ListRolesRequest.SerializeToString,
+            types__pb2.RoleList.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteRole(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/flame.v1.Frontend/DeleteRole',
+            frontend__pb2.DeleteRoleRequest.SerializeToString,
+            types__pb2.Result.FromString,
             options,
             channel_credentials,
             insecure,

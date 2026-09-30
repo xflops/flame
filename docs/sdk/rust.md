@@ -46,6 +46,13 @@ relevant `cluster.tls` or `cache.tls` section. An external cache proxy uses
 in `x-flame-object-cache` metadata while TLS verifies the public proxy host.
 Rotated certificate and CA files are read when a new cache connection opens.
 
+With server-side `security` enabled, use a tenant certificate for the session
+manager and cache. `flame_rs::object::sign_app_token(&context, app).await?`
+calls cache `Delegate(app)` over mTLS. Any verified tenant may sign any app under
+the current single-user cluster policy. Session-manager Roles still control
+application, session, and task RPCs; a Role object selector is `application:<name>`.
+Cache data calls accept tenant mTLS or TLS plus a delegated user token.
+
 ## Define Typed Messages
 
 With the `macros` feature enabled, derive `FlameMessage` for request, response, and common-data types:
@@ -219,7 +226,8 @@ attached to a service publisher, so its `publish()` method returns an error.
 
 ## Use Object Cache
 
-Object keys use either a prefix, `<app>/<session>`, or a full key, `<app>/<session>/<object>`.
+Object keys use either a prefix, `<app>/<session>`, or a full key,
+`<app>/<session>/<object>`. This first example assumes security is disabled:
 
 ```rust
 use flame_rs as flame;
@@ -231,7 +239,15 @@ let updated = flame::update_object(&reference, &next_model_config).await?;
 let loaded_again: ModelConfig = flame::get_object(updated).await?;
 ```
 
-Use `patch_object()` for versioned delta updates, `upload_object()` and `download_object()` for files, and `delete_objects()` to remove an object or prefix. `ObjectRef` carries the cache endpoint, full key, and object version.
+Use `patch_object()` for versioned delta updates, `upload_object()` and `download_object()` for files, and `delete_objects()` to remove an object or prefix. `ObjectRef` carries the cache endpoint, full key, object version, and the cache signature for that exact key. Pass the returned reference when reading; the cache checks the signature against the requested key.
+
+Use `flame_rs::object` helpers with the `_with_app_token` suffix for cache
+data reads and writes, such as `put_object_with_app_token()` and
+`get_object_with_app_token()`. The signed token carries the tenant username
+and covers normal session keys across applications; it may also write or
+delete `<app>/pkg/...` objects.
+Package reads and all bootstrap operations require the system cache mTLS
+identity. The object signature and user delegation token are separate credentials.
 
 The typed helpers use the `raw` data type. For caller-defined encodings, use
 `put_object_bytes()`, `update_object_bytes()`, or `patch_object_bytes()` with

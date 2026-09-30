@@ -130,12 +130,21 @@ impl HostShim {
     /// Expand environment variables in a string
     /// Supports both ${VAR} and $VAR syntax
     fn expand_env_vars(s: &str, envs: Option<&HashMap<String, String>>) -> String {
+        fn inherited(key: &str) -> Result<Option<String>, env::VarError> {
+            if matches!(key, "FLAME_CERT_FILE" | "FLAME_KEY_FILE") {
+                return Err(env::VarError::NotPresent);
+            }
+            env::var(key).map(Some)
+        }
+
         match envs {
             Some(envs) => shellexpand::env_with_context_no_errors(s, |key| {
-                envs.get(key).cloned().or_else(|| env::var(key).ok())
+                envs.get(key)
+                    .cloned()
+                    .or_else(|| inherited(key).ok().flatten())
             })
             .into_owned(),
-            None => shellexpand::env(s)
+            None => shellexpand::env_with_context(s, inherited)
                 .unwrap_or(std::borrow::Cow::Borrowed(s))
                 .into_owned(),
         }
@@ -170,10 +179,12 @@ impl HostShim {
             // Pass session manager endpoint for recursive app calls
             envs.insert(FLAME_ENDPOINT.to_string(), context.cluster.endpoint.clone());
             // Pass CA file for TLS certificate verification
-            if let Some(ref tls) = context.cluster.tls {
-                if let Some(ref ca_file) = tls.ca_file {
-                    envs.insert(FLAME_CA_FILE.to_string(), ca_file.clone());
-                }
+            if let Some(ca_file) = context
+                .security
+                .as_ref()
+                .and_then(|security| security.tls.ca_file.as_ref())
+            {
+                envs.insert(FLAME_CA_FILE.to_string(), ca_file.clone());
             }
             if let Some(cache) = &context.cache {
                 envs.insert(FLAME_CACHE_ENDPOINT.to_string(), cache.endpoint.clone());
@@ -239,6 +250,8 @@ impl HostShim {
 
         #[cfg(unix)]
         let child = cmd
+            .env_remove("FLAME_CERT_FILE")
+            .env_remove("FLAME_KEY_FILE")
             .envs(envs)
             .args(args)
             .current_dir(process_work_dir)
@@ -254,6 +267,8 @@ impl HostShim {
 
         #[cfg(not(unix))]
         let child = cmd
+            .env_remove("FLAME_CERT_FILE")
+            .env_remove("FLAME_KEY_FILE")
             .envs(envs)
             .args(args)
             .current_dir(process_work_dir)
@@ -277,7 +292,7 @@ impl HostShim {
         app: &ApplicationContext,
         flame_home: &Path,
     ) -> HashMap<String, String> {
-        if app.url.is_some()
+        if app.package.is_some()
             || !app
                 .installer
                 .as_deref()
@@ -467,7 +482,7 @@ mod tests {
             arguments: vec![],
             working_directory: None,
             environments: HashMap::new(),
-            url: None,
+            package: None,
             installer: Some("python".to_string()),
         };
 
@@ -495,7 +510,10 @@ mod tests {
             arguments: vec![],
             working_directory: None,
             environments: HashMap::new(),
-            url: Some("file:///unused-package.tar.gz".to_string()),
+            package: Some(common::apis::Package {
+                url: "file:///unused-package.tar.gz".to_string(),
+                signature: String::new(),
+            }),
             installer: Some("unsupported".to_string()),
         };
         let mut shim = HostShim {
@@ -515,5 +533,85 @@ mod tests {
         assert!(shim.instance.is_none());
         assert!(shim.instance_client.is_none());
         assert!(shim.work_dir.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_instance_does_not_inherit_manager_certificate() {
+        const CHILD: &str = "FLAME_HOST_CREDENTIAL_TEST_CHILD";
+        if env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(env::current_exe().unwrap())
+                .arg("host_instance_does_not_inherit_manager_certificate")
+                .env(CHILD, "1")
+                .env("FLAME_CERT_FILE", "/manager/client.crt")
+                .env("FLAME_KEY_FILE", "/manager/client.key")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+
+        assert_ne!(
+            HostShim::expand_env_vars("$FLAME_CERT_FILE", None),
+            "/manager/client.crt"
+        );
+        assert_ne!(
+            HostShim::expand_env_vars("$FLAME_KEY_FILE", Some(&HashMap::new())),
+            "/manager/client.key"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let top_dir = temp.path().join("run");
+        fs::create_dir_all(&top_dir).unwrap();
+        let work_dir = ExecutorWorkDir {
+            top_dir: top_dir.clone(),
+            app_dir: top_dir.join("work/test-app"),
+            socket: temp.path().join("instance.sock"),
+            auto_dir: false,
+        };
+        for (id, environments, expected) in [
+            ("without-credentials", HashMap::new(), "unset|unset"),
+            (
+                "explicit-credentials",
+                HashMap::from([
+                    (
+                        "FLAME_CERT_FILE".to_string(),
+                        "/instance/client.crt".to_string(),
+                    ),
+                    (
+                        "FLAME_KEY_FILE".to_string(),
+                        "/instance/client.key".to_string(),
+                    ),
+                ]),
+                "/instance/client.crt|/instance/client.key",
+            ),
+        ] {
+            let app = ApplicationContext {
+                name: "test-app".to_string(),
+                shim: ShimType::Host,
+                image: None,
+                command: Some("/bin/sh".to_string()),
+                arguments: vec![
+                    "-c".to_string(),
+                    "printf '%s|%s' \"${FLAME_CERT_FILE-unset}\" \"${FLAME_KEY_FILE-unset}\""
+                        .to_string(),
+                ],
+                working_directory: None,
+                environments,
+                package: None,
+                installer: None,
+            };
+            let mut executor = test_executor();
+            executor.id = id.to_string();
+            let mut instance =
+                HostShim::launch_instance(&app, &executor, &work_dir, &HashMap::new()).unwrap();
+            assert!(instance.child.wait().await.unwrap().success());
+            let actual = fs::read_to_string(top_dir.join(format!("{id}.out"))).unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 }
