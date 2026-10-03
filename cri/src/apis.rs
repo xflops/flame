@@ -27,7 +27,7 @@ use crate::cri_v1::{
 };
 
 pub const LABEL_MANAGED_BY: &str = "io.xflops.flame.managed-by";
-pub const LABEL_EXECUTOR_ID: &str = "io.xflops.flame.executor-id";
+pub const LABEL_EXECUTOR: &str = "io.xflops.flame.executor";
 pub const LABEL_APPLICATION: &str = "io.xflops.flame.application";
 pub const LABEL_WORKLOAD_UID: &str = "io.xflops.flame.workload-uid";
 pub const MANAGED_BY_EXECUTOR_MANAGER: &str = "executor-manager";
@@ -38,17 +38,17 @@ const CPU_PERIOD_US: i64 = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadFilter {
-    pub executor_id: String,
+    pub executor: String,
 }
 
 impl WorkloadFilter {
-    pub fn new(executor_id: impl Into<String>) -> Result<Self, FlameError> {
+    pub fn new(executor: impl Into<String>) -> Result<Self, FlameError> {
         let filter = Self {
-            executor_id: executor_id.into(),
+            executor: executor.into(),
         };
-        if filter.executor_id.is_empty() {
+        if filter.executor.is_empty() {
             return Err(FlameError::InvalidConfig(
-                "CRI workload filter executor ID must not be empty".to_string(),
+                "CRI workload filter executor name must not be empty".to_string(),
             ));
         }
         Ok(filter)
@@ -60,7 +60,7 @@ impl WorkloadFilter {
                 LABEL_MANAGED_BY.to_string(),
                 MANAGED_BY_EXECUTOR_MANAGER.to_string(),
             ),
-            (LABEL_EXECUTOR_ID.to_string(), self.executor_id.clone()),
+            (LABEL_EXECUTOR.to_string(), self.executor.clone()),
         ])
     }
 
@@ -76,14 +76,14 @@ pub struct WorkloadMetadata {
     pub name: String,
     pub namespace: String,
     pub uid: String,
-    pub executor_id: String,
+    pub executor: String,
     pub application: String,
 }
 
 impl WorkloadMetadata {
     pub(crate) fn labels(&self) -> HashMap<String, String> {
         let mut labels = WorkloadFilter {
-            executor_id: self.executor_id.clone(),
+            executor: self.executor.clone(),
         }
         .labels();
         labels.insert(LABEL_APPLICATION.to_string(), self.application.clone());
@@ -93,7 +93,7 @@ impl WorkloadMetadata {
 
     pub(crate) fn filter(&self) -> WorkloadFilter {
         WorkloadFilter {
-            executor_id: self.executor_id.clone(),
+            executor: self.executor.clone(),
         }
     }
 
@@ -150,7 +150,7 @@ impl WorkloadSpec {
         if metadata.name.is_empty()
             || metadata.namespace.is_empty()
             || metadata.uid.is_empty()
-            || metadata.executor_id.is_empty()
+            || metadata.executor.is_empty()
         {
             return Err(FlameError::InvalidConfig(
                 "CRI workload metadata contains an empty required field".to_string(),
@@ -495,7 +495,7 @@ mod tests {
                 name: "flame-exec".to_string(),
                 namespace: "flame".to_string(),
                 uid: "uid".to_string(),
-                executor_id: "executor".to_string(),
+                executor: "executor".to_string(),
                 application: "application".to_string(),
             },
             containers: vec![ContainerSpec {
@@ -531,7 +531,7 @@ mod tests {
         let container = spec.container_config(&spec.containers[0]).unwrap();
 
         assert_eq!(
-            sandbox.labels.get(LABEL_EXECUTOR_ID),
+            sandbox.labels.get(LABEL_EXECUTOR),
             Some(&"executor".to_string())
         );
         assert_eq!(
@@ -548,7 +548,7 @@ mod tests {
         assert_eq!(resources.cpu_period, CPU_PERIOD_US);
         assert_eq!(resources.cpu_quota, 2 * CPU_PERIOD_US);
         assert_eq!(resources.memory_limit_in_bytes, 1024);
-        assert!(container.labels.contains_key(LABEL_EXECUTOR_ID));
+        assert!(container.labels.contains_key(LABEL_EXECUTOR));
     }
 
     #[test]
@@ -584,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn workload_filter_requires_executor_id() {
+    fn workload_filter_requires_executor() {
         assert!(WorkloadFilter::new("").is_err());
     }
 }

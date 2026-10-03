@@ -43,15 +43,15 @@ session.close()
 Public helpers:
 
 - `connect(addr, tls_config=None) -> Connection`
-- `create_session(application, common_data=None, session_id=None, min_instances=0, max_instances=None, batch_size=1, resreq=None) -> Session`
-- `open_session(session_id, spec=None) -> Session`
+- `create_session(application, common_data=None, session=None, min_instances=0, max_instances=None, batch_size=1, resreq=None) -> Session`
+- `open_session(session, spec=None) -> Session`
 - `register_application(name, app_attrs) -> None`
 - `unregister_application(name) -> None`
 - `list_applications() -> list[Application]`
 - `get_application(name) -> Application | None`
 - `list_sessions() -> list[Session]`
-- `get_session(session_id) -> Session`
-- `close_session(session_id) -> Session`
+- `get_session(session) -> Session`
+- `close_session(session) -> Session`
 
 ## Session
 
@@ -60,9 +60,9 @@ Public helpers:
 Methods:
 
 - `create_task(input_data: bytes) -> Task`
-- `get_task(task_id) -> Task`
+- `get_task(task) -> Task`
 - `list_tasks() -> Iterator[Task]`
-- `watch_task(task_id, timeout=None) -> TaskWatcher`
+- `watch_task(task, timeout=None) -> TaskWatcher`
 - `run(input_data) -> bytes`
 - `submit(input_data) -> TaskFuture`
 - `close() -> None`
@@ -138,7 +138,7 @@ import flamepy
 
 class Echo(flamepy.FlameService):
     def on_session_enter(self, context):
-        self.session_id = context.session_id
+        self.session = context.session
 
     def on_task_invoke(self, context):
         return context.input
@@ -152,11 +152,13 @@ if __name__ == "__main__":
 
 Service contexts expose bytes-oriented APIs:
 
-- `SessionContext.session_id`
+- `SessionContext.session`
+- `SessionContext.workspace`
 - `SessionContext.application`
 - `SessionContext.common_data()`
-- `TaskContext.task_id`
-- `TaskContext.session_id`
+- `TaskContext.task`
+- `TaskContext.session`
+- `TaskContext.workspace`
 - `TaskContext.input`
 
 ## App API
@@ -253,16 +255,16 @@ with open_session() as ssn:
 
 Key classes and methods:
 
-- `open_session(*, ssn_id=None, language="python", runtime=None, min_instances=0, max_instances=None, resreq=None)`
+- `open_session(*, session=None, language="python", runtime=None, min_instances=0, max_instances=None, resreq=None)`
 - `open_session()` creates a Python session using the server-default runtime
-- `open_session(ssn_id="...")` reopens a session by ID
+- `open_session(session="...")` reopens a session by name
 - `Session.run_code(code, input=None) -> SessionOutput` blocks for output
 - `Session.submit_code(code, input=None) -> Future[SessionOutput]` returns immediately
 - `Session.close()`
-- `ssn.id`, `ssn.attr`
+- `ssn.name` for references, `ssn.id` for the metadata UUID, `ssn.attr`
 - `SessionOutput.data`, `SessionOutput.text()`
 
-Creation options are ignored when `ssn_id` is provided. `ssn.attr` is a read-only view of the effective creation settings; its type is intentionally not exported. `language` and `runtime` are create-time only. `close()` destroys the session. Reopen works only while the session is still open. `ResourceRequirement` and `FlameError` are imported from `flamepy`.
+Creation options are ignored when `session` is provided. `ssn.attr` is a read-only view of the effective creation settings; its type is intentionally not exported. `language` and `runtime` are create-time only. `close()` destroys the session. Reopen works only while the session is still open. `ResourceRequirement` and `FlameError` are imported from `flamepy`.
 
 ## Enums
 

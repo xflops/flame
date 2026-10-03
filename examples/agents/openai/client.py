@@ -18,9 +18,9 @@ from apis import MyContext, Question
 OPENAI_APP_NAME = "openai-agent"
 
 
-def main(message: str, ssn_id: Optional[str] = None):
-    if ssn_id:
-        session = open_session(session_id=ssn_id)
+def main(message: str, session_name: Optional[str] = None):
+    if session_name:
+        session = open_session(session=session_name)
     else:
         sys_prompt = """You are a weather forecaster.
         If you are asked to fetch the weather, you should use the fetch_weather tool after confirming the location with the user.
@@ -28,7 +28,7 @@ def main(message: str, ssn_id: Optional[str] = None):
         session = open_session(OPENAI_APP_NAME, ctx=MyContext(prompt=sys_prompt))
 
     print(f"{'=' * 30}")
-    print(f"Conversation <{session.id()}>")
+    print(f"Conversation <{session.session()}>")
     print(f"{'=' * 30}")
 
     print(f"User: {message}")

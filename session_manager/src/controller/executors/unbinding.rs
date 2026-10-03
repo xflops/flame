@@ -71,8 +71,8 @@ impl States for UnbindingState {
 
         let mut e = lock_ptr!(self.executor)?;
         e.set_state(ExecutorState::Unbinding);
-        e.ssn_id = None;
-        e.task_id = None;
+        e.session = None;
+        e.task = None;
 
         Ok(())
     }
@@ -82,8 +82,8 @@ impl States for UnbindingState {
 
         let mut e = lock_ptr!(self.executor)?;
         e.set_state(ExecutorState::Idle);
-        e.ssn_id = None;
-        e.task_id = None;
+        e.session = None;
+        e.task = None;
 
         Ok(())
     }
@@ -112,8 +112,8 @@ impl States for UnbindingState {
 
         {
             let mut e = lock_ptr!(self.executor)?;
-            e.task_id = None;
-            e.ssn_id = None;
+            e.task = None;
+            e.session = None;
         };
 
         Ok(())

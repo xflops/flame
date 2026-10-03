@@ -171,7 +171,7 @@ impl StreamHandler {
         // Send initial heartbeat immediately to identify the node
         let initial_heartbeat = proto::WatchNodeRequest {
             heartbeat: Some(proto::NodeHeartbeat {
-                node_name: node.name.clone(),
+                node: node.name.clone(),
                 status: Some(proto::NodeStatus {
                     state: proto::NodeState::from(node.state) as i32,
                     capacity: Some(node.capacity.clone().into()),
@@ -218,7 +218,10 @@ impl StreamHandler {
                 };
 
                 let heartbeat = proto::WatchNodeRequest {
-                    heartbeat: Some(proto::NodeHeartbeat { node_name, status }),
+                    heartbeat: Some(proto::NodeHeartbeat {
+                        node: node_name,
+                        status,
+                    }),
                 };
                 if heartbeat_tx.send(heartbeat).await.is_err() {
                     break;
@@ -283,7 +286,7 @@ impl StreamHandler {
 
                 tracing::debug!(
                     "WatchNode: Received executor <{}> with state {:?}",
-                    executor.id,
+                    executor.name,
                     executor.state
                 );
 
@@ -314,6 +317,7 @@ mod tests {
 
         // Create a node with known values
         let node = Node {
+            id: uuid::Uuid::new_v4().to_string(),
             name: "test-node".to_string(),
             state: NodeState::Ready,
             capacity: ResourceRequirement {
@@ -357,6 +361,7 @@ mod tests {
         use common::apis::{NodeInfo, NodeState, ResourceRequirement};
 
         let node = Node {
+            id: uuid::Uuid::new_v4().to_string(),
             name: "test-node".to_string(),
             state: NodeState::Ready,
             capacity: ResourceRequirement {
@@ -393,13 +398,15 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_conversion_preserves_application() {
+    fn test_executor_conversion_preserves_metadata_and_application() {
         use common::apis::{ExecutorState, ResourceRequirement, Shim};
 
         // Test that Executor can be created with expected fields
         let executor = Executor {
-            id: "test-exec".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "test-exec".to_string(),
             application: "test-app".to_string(),
+            workspace: "default".to_string(),
             node: "test-node".to_string(),
             resreq: ResourceRequirement::default(),
             session: None,
@@ -410,14 +417,21 @@ mod tests {
             state: ExecutorState::Idle,
         };
 
-        assert_eq!(executor.id, "test-exec");
+        assert_eq!(executor.name, "test-exec");
         assert_eq!(executor.application, "test-app");
         assert_eq!(executor.node, "test-node");
         assert_eq!(executor.state, ExecutorState::Idle);
 
         let rpc_executor = proto::Executor::from(&executor);
         assert_eq!(rpc_executor.spec.as_ref().unwrap().application, "test-app");
+        let metadata = rpc_executor.metadata.as_ref().unwrap();
+        assert_eq!(metadata.id, executor.id);
+        assert_eq!(metadata.name, "test-exec");
+        assert_eq!(metadata.workspace.as_deref(), Some("default"));
         let restored = Executor::try_from(&rpc_executor).unwrap();
+        assert_eq!(restored.id, executor.id);
+        assert_eq!(restored.name, executor.name);
+        assert_eq!(restored.workspace, executor.workspace);
         assert_eq!(restored.application, "test-app");
     }
 }

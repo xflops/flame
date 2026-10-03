@@ -31,8 +31,8 @@ def test_session_shell_run_code():
 def test_session_open_restores_attr():
     ssn = open_session(language="python", runtime="3.12")
     try:
-        other = open_session(ssn_id=ssn.id)
-        assert other.id == ssn.id
+        other = open_session(session=ssn.name)
+        assert other.name == ssn.name
         assert other.attr.language == "python"
         assert other.attr.runtime == "3.12"
         assert other.run_code("print('ready')").text().strip() == "ready"
@@ -54,10 +54,10 @@ def test_session_submit_code():
 
 def test_session_close_prevents_reopen():
     ssn = open_session(language="python")
-    ssn_id = ssn.id
+    ssn_id = ssn.name
     ssn.close()
 
     with pytest.raises(FlameError) as exc:
-        open_session(ssn_id=ssn_id)
+        open_session(session=ssn_id)
     assert exc.value.code == FlameErrorCode.INVALID_ARGUMENT
     assert "not open" in str(exc.value).lower()

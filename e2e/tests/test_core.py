@@ -24,7 +24,7 @@ from e2e.helpers import (
     serialize_common_data,
     serialize_request,
 )
-from tests.utils import deploy_e2e_application, random_string, wait_for_application_deleted
+from tests.utils import deploy_e2e_application, random_name_suffix, random_string, wait_for_application_deleted
 
 FLM_TEST_SVC_APP = "flme2e-core-svc"
 TASK_FAILED_EVENT_CODE = int(flamepy.TaskState.FAILED)
@@ -40,7 +40,7 @@ def _wait_for_terminal_task(session, task_id):
 
 def _create_failing_basic_task(session):
     task = session.create_task(serialize_request(TestRequest(input="requested_failure", fail_on_task=True)))
-    task_update = _wait_for_terminal_task(session, task.id)
+    task_update = _wait_for_terminal_task(session, task.name)
     assert task_update.state == TaskState.FAILED
     return task_update
 
@@ -88,7 +88,7 @@ def setup_test_env():
         if sess.application != FLM_TEST_SVC_APP:
             continue
         try:
-            flamepy.close_session(sess.id)
+            flamepy.close_session(sess.name)
         except Exception:
             pass
 
@@ -131,8 +131,9 @@ def test_task_context_info():
 
     # Check task context is present
     assert response.task_context is not None
-    assert response.task_context.task_id is not None
-    assert response.task_context.session_id == session.id
+    assert response.task_context.task is not None
+    assert response.task_context.session == session.name
+    assert response.task_context.workspace == "default"
     assert response.task_context.has_input is True
     assert response.task_context.input_type == "TestRequest"
 
@@ -152,7 +153,8 @@ def test_session_context_info():
 
     # Check session context is present
     assert response.session_context is not None
-    assert response.session_context.session_id == session.id
+    assert response.session_context.session == session.name
+    assert response.session_context.workspace == "default"
     assert response.session_context.has_common_data is False
     assert response.session_context.common_data_type is None
 
@@ -202,11 +204,11 @@ def test_all_context_info():
     assert response.application_context is not None
 
     # Check task context details
-    assert response.task_context.task_id is not None
-    assert response.task_context.session_id == session.id
+    assert response.task_context.task is not None
+    assert response.task_context.session == session.name
 
     # Check session context details
-    assert response.session_context.session_id == session.id
+    assert response.session_context.session == session.name
     assert response.session_context.application is not None
     assert response.session_context.application.name == FLM_TEST_SVC_APP
 
@@ -264,8 +266,8 @@ def test_list_tasks():
 
     # Verify each task has valid properties
     for task in tasks:
-        assert task.id is not None
-        assert task.session_id == session.id
+        assert task.name is not None
+        assert task.session == session.name
         assert task.state is not None
         assert task.creation_time is not None
     session.close()
@@ -443,7 +445,7 @@ def test_task_invoke_exception_handling():
         task = session.create_task(input_data)
 
         # Watch the task to see its updates
-        watcher = session.watch_task(task.id)
+        watcher = session.watch_task(task.name)
 
         failed_task = None
         for task_update in watcher:
@@ -460,7 +462,7 @@ def test_task_invoke_exception_handling():
         assert failed_task.state == flamepy.TaskState.FAILED, f"Task state should be FAILED, got {failed_task.state}"
 
         # Get the task again to ensure we have the latest events
-        refreshed_task = session.get_task(task.id)
+        refreshed_task = session.get_task(task.name)
 
         # Verify error message is recorded in events
 
@@ -500,7 +502,7 @@ class TestTaskFailure:
             input_data = b"test input"
             task = session.create_task(input_data)
 
-            failed_task = _wait_for_terminal_task(session, task.id)
+            failed_task = _wait_for_terminal_task(session, task.name)
 
             # Verify the task failed
             assert failed_task is not None, "Task should have failed"
@@ -520,11 +522,11 @@ class TestTaskFailure:
             input_data = b"test input"
             task = session.create_task(input_data)
 
-            task_update = _wait_for_terminal_task(session, task.id)
+            task_update = _wait_for_terminal_task(session, task.name)
             assert task_update.state == TaskState.FAILED
 
             # Get the task again to ensure we have the latest events
-            refreshed_task = session.get_task(task.id)
+            refreshed_task = session.get_task(task.name)
 
             # Check events for error information
             error_events = [e for e in refreshed_task.events if e.code == TASK_FAILED_EVENT_CODE]
@@ -548,7 +550,7 @@ class TestTaskFailure:
             response = invoke_task(session, TestRequest(input="test input"))
             assert response.output == "test input"
 
-            updated_session = flamepy.get_session(session.id)
+            updated_session = flamepy.get_session(session.name)
             assert updated_session.succeed >= 1
             assert updated_session.failed == 0
 
@@ -568,7 +570,7 @@ class TestTaskFailure:
             assert response.output == "success_after_failure"
 
             # Verify session counters
-            updated_session = flamepy.get_session(session.id)
+            updated_session = flamepy.get_session(session.name)
             assert updated_session.failed >= 1
             assert updated_session.succeed >= 1
 
@@ -586,10 +588,10 @@ class TestSessionBindFailureRecovery:
 
     def test_on_session_enter_failure_records_session_event(self):
         """Test that on_session_enter failure is reported as a session event."""
-        session_id = f"test-enter-failure-{random_string(8)}"
+        session_id = f"test-enter-failure-{random_name_suffix(8)}"
         session = flamepy.create_session(
             application=FLM_TEST_SVC_APP,
-            session_id=session_id,
+            session=session_id,
             common_data=_test_common_data(FLM_TEST_SVC_APP, fail_on_session_enter=True),
             max_instances=1,
         )
@@ -651,7 +653,7 @@ class TestPartialFailures:
             assert successful_outputs == ["task_0", "task_2", "task_4"]
             assert len(failures) == 2
 
-            updated_session = flamepy.get_session(session.id)
+            updated_session = flamepy.get_session(session.name)
             assert updated_session.succeed >= 3
             assert updated_session.failed >= 2
 
@@ -669,7 +671,7 @@ class TestPartialFailures:
                 response = invoke_task(session, request)
                 assert response.output == f"before_failure_{i}"
 
-            mid_session = flamepy.get_session(session.id)
+            mid_session = flamepy.get_session(session.name)
             success_count_before = mid_session.succeed
 
             _create_failing_basic_task(session)
@@ -681,7 +683,7 @@ class TestPartialFailures:
                 assert response.output == f"after_check_{i}"
 
             # Verify success count increased
-            final_session = flamepy.get_session(session.id)
+            final_session = flamepy.get_session(session.name)
             assert final_session.succeed > success_count_before
             assert final_session.failed >= 1
 
@@ -709,11 +711,11 @@ class TestSessionStateAfterFailures:
             input_data = b"test input"
             task = session.create_task(input_data)
 
-            task_update = _wait_for_terminal_task(session, task.id)
+            task_update = _wait_for_terminal_task(session, task.name)
             assert task_update.state == TaskState.FAILED
 
             # Session should still be OPEN
-            current_session = flamepy.get_session(session.id)
+            current_session = flamepy.get_session(session.name)
             assert current_session.state == flamepy.SessionState.OPEN
 
         finally:
@@ -728,18 +730,18 @@ class TestSessionStateAfterFailures:
 
         try:
             # Get initial failed count
-            initial_session = flamepy.get_session(session.id)
+            initial_session = flamepy.get_session(session.name)
             initial_failed = initial_session.failed
 
             # Create a task that will fail
             input_data = b"test input"
             task = session.create_task(input_data)
 
-            task_update = _wait_for_terminal_task(session, task.id)
+            task_update = _wait_for_terminal_task(session, task.name)
             assert task_update.state == TaskState.FAILED
 
             # Failed count should have increased
-            updated_session = flamepy.get_session(session.id)
+            updated_session = flamepy.get_session(session.name)
             assert updated_session.failed > initial_failed
 
         finally:
@@ -756,14 +758,14 @@ class TestSessionStateAfterFailures:
         input_data = b"test input"
         task = session.create_task(input_data)
 
-        task_update = _wait_for_terminal_task(session, task.id)
+        task_update = _wait_for_terminal_task(session, task.name)
         assert task_update.state == TaskState.FAILED
 
         # Close should work
         session.close()
 
         # Verify closed
-        closed_session = flamepy.get_session(session.id)
+        closed_session = flamepy.get_session(session.name)
         assert closed_session.state == flamepy.SessionState.CLOSED
 
 
@@ -786,7 +788,7 @@ class TestRecoveryAfterFailure:
             retry_response = invoke_task(session, retry_request)
             assert retry_response.output == "retry_attempt"
 
-            updated_session = flamepy.get_session(session.id)
+            updated_session = flamepy.get_session(session.name)
             assert updated_session.failed >= 1
             assert updated_session.succeed >= 1
 
@@ -806,7 +808,7 @@ class TestRecoveryAfterFailure:
             input_data = b"test input"
             task = session1.create_task(input_data)
 
-            task_update = _wait_for_terminal_task(session1, task.id)
+            task_update = _wait_for_terminal_task(session1, task.name)
             assert task_update.state == TaskState.FAILED
 
         finally:
@@ -836,7 +838,7 @@ class TestRecoveryAfterFailure:
                 response = invoke_task(session, request)
                 assert response.output == f"recovery_test_{i}"
 
-            final_session = flamepy.get_session(session.id)
+            final_session = flamepy.get_session(session.name)
             assert final_session.succeed >= 3
             assert final_session.failed >= 2
 
@@ -863,9 +865,9 @@ class TestTaskWatchTimeout:
 
             # The first response is the current status; the task may have
             # advanced before the watch starts.
-            watcher = session.watch_task(task.id)
+            watcher = session.watch_task(task.name)
             first_update = next(watcher)
-            assert first_update.id == task.id
+            assert first_update.name == task.name
             updates = [first_update.state]
             if not first_update.is_completed():
                 for task_update in watcher:
@@ -894,9 +896,9 @@ class TestTaskWatchTimeout:
             assert len(tasks) >= 1
 
             # A completed task's current status is already terminal.
-            watcher = session.watch_task(tasks[0].id)
+            watcher = session.watch_task(tasks[0].name)
             first_update = next(watcher)
-            assert first_update.id == tasks[0].id
+            assert first_update.name == tasks[0].name
             assert first_update.state == TaskState.SUCCEED
             with pytest.raises(StopIteration):
                 next(watcher)
@@ -922,7 +924,7 @@ def setup_shim_test_app():
     sessions = flamepy.list_sessions()
     for sess in sessions:
         if sess.application == FLM_SHIM_TEST_APP:
-            flamepy.close_session(sess.id)
+            flamepy.close_session(sess.name)
 
     flamepy.unregister_application(FLM_SHIM_TEST_APP)
     wait_for_application_deleted(FLM_SHIM_TEST_APP)
@@ -971,12 +973,12 @@ class TestShimSelectionNegative:
 
             try:
                 assert session is not None
-                assert session.id is not None
+                assert session.name is not None
 
                 deadline = time.time() + 3
                 session_status = None
                 while time.time() < deadline:
-                    session_status = flamepy.get_session(session.id)
+                    session_status = flamepy.get_session(session.name)
                     if session_status.state == flamepy.SessionState.OPEN:
                         break
                     time.sleep(0.5)
@@ -1014,9 +1016,9 @@ class TestShimSelectionNegative:
                 task = session.create_task(input_data)
 
                 deadline = time.time() + 3
-                task_status = session.get_task(task.id)
+                task_status = session.get_task(task.name)
                 while time.time() < deadline:
-                    task_status = session.get_task(task.id)
+                    task_status = session.get_task(task.name)
                     assert task_status.state == flamepy.TaskState.PENDING, f"Task should remain PENDING when no compatible executor available, got {task_status.state}"
                     time.sleep(0.5)
 

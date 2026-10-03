@@ -19,15 +19,14 @@ use std::collections::{HashMap, HashSet};
 use bytes::Bytes;
 use stdng::lock_ptr;
 
-use crate::model::{ExecutorInfo, SessionInfo, SnapShot};
+use crate::model::{ExecutorInfo, ScopedName, SessionInfo, SnapShot};
 use crate::scheduler::plugins::{Plugin, PluginPtr};
-use common::apis::SessionID;
 use common::FlameError;
 
 /// Orders eligible Idle executors by coverage of a session's Pending affinity.
 #[derive(Default)]
 pub struct DasPlugin {
-    affinity: HashMap<SessionID, HashSet<Bytes>>,
+    affinity: HashMap<ScopedName, HashSet<Bytes>>,
 }
 
 impl DasPlugin {
@@ -36,7 +35,7 @@ impl DasPlugin {
     }
 
     fn score(&self, executor: &ExecutorInfo, session: &SessionInfo) -> usize {
-        self.affinity.get(&session.id).map_or(0, |affinity| {
+        self.affinity.get(&session.key()).map_or(0, |affinity| {
             executor
                 .attributes
                 .iter()
@@ -56,7 +55,7 @@ impl Plugin for DasPlugin {
 
         let sessions = lock_ptr!(ss.sessions)?;
         for session in sessions.values() {
-            let affinity = self.affinity.entry(session.id.clone()).or_default();
+            let affinity = self.affinity.entry(session.key()).or_default();
             if let Some(tasks) = session.task_index.get(&common::apis::TaskState::Pending) {
                 for task in tasks.values() {
                     affinity.extend(task.affinity.iter().cloned());
@@ -76,8 +75,8 @@ impl Plugin for DasPlugin {
         Some(
             self.score(e1, session)
                 .cmp(&self.score(e2, session))
-                // A smaller ID wins equal scores.
-                .then_with(|| e2.id.cmp(&e1.id)),
+                // A smaller name wins equal scores.
+                .then_with(|| e2.name.cmp(&e1.name)),
         )
     }
 }
@@ -85,21 +84,25 @@ impl Plugin for DasPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::apis::{Session, Task, TaskState};
+    use common::apis::{Session, Task, TaskName, TaskState};
     use std::sync::Arc;
 
     fn executor(id: &str, attributes: &[&'static [u8]]) -> ExecutorInfo {
         ExecutorInfo {
-            id: id.to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: id.to_string(),
+            workspace: "default".to_string(),
             attributes: attributes.iter().copied().map(Bytes::from_static).collect(),
             ..Default::default()
         }
     }
 
-    fn task(session_id: &str, id: i64, keys: &[&'static [u8]]) -> Task {
+    fn task(session_id: &str, id: TaskName, keys: &[&'static [u8]]) -> Task {
         Task {
-            id,
-            ssn_id: session_id.to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace: "default".to_string(),
+            name: id,
+            session: session_id.to_string(),
             version: 1,
             state: TaskState::Pending,
             affinity: keys.iter().copied().map(Bytes::from_static).collect(),
@@ -107,15 +110,22 @@ mod tests {
         }
     }
 
-    fn session(id: &str, tasks: Vec<Task>) -> SessionInfo {
+    fn session_in(workspace: &str, name: &str, tasks: Vec<Task>) -> SessionInfo {
         let mut session = Session {
-            id: id.to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace: workspace.to_string(),
+            name: name.to_string(),
             ..Default::default()
         };
-        for task in tasks {
+        for mut task in tasks {
+            task.workspace = workspace.to_string();
             session.update_task(&task).unwrap();
         }
         SessionInfo::try_from(&session).unwrap()
+    }
+
+    fn session(name: &str, tasks: Vec<Task>) -> SessionInfo {
+        session_in("default", name, tasks)
     }
 
     fn setup(session: &SessionInfo) -> DasPlugin {
@@ -124,6 +134,32 @@ mod tests {
         let mut plugin = DasPlugin::default();
         plugin.setup(&snapshot).unwrap();
         plugin
+    }
+
+    #[test]
+    fn same_session_name_in_two_workspaces_keeps_affinity_separate() {
+        let first = session_in("default", "shared", vec![task("shared", 1, &[b"alpha"])]);
+        let second = session_in("other", "shared", vec![task("shared", 1, &[b"beta"])]);
+        let snapshot = SnapShot::new();
+        snapshot.add_session(Arc::new(first.clone())).unwrap();
+        snapshot.add_session(Arc::new(second.clone())).unwrap();
+        let mut plugin = DasPlugin::default();
+        plugin.setup(&snapshot).unwrap();
+
+        let alpha = executor("alpha", &[b"alpha"]);
+        let beta = executor("beta", &[b"beta"]);
+        assert_eq!(plugin.score(&alpha, &first), 1);
+        assert_eq!(plugin.score(&beta, &first), 0);
+        assert_eq!(plugin.score(&alpha, &second), 0);
+        assert_eq!(plugin.score(&beta, &second), 1);
+        assert_eq!(
+            plugin.executor_order_fn(&first, &alpha, &beta),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            plugin.executor_order_fn(&second, &beta, &alpha),
+            Some(Ordering::Greater)
+        );
     }
 
     #[test]
@@ -171,13 +207,17 @@ mod tests {
     #[test]
     fn setup_uses_pending_index_after_fifo_pop() {
         let mut source = Session {
-            id: "session".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "session".to_string(),
+            workspace: "default".to_string(),
             ..Default::default()
         };
         source
             .update_task(&Task {
-                id: 1,
-                ssn_id: "session".to_string(),
+                id: uuid::Uuid::new_v4().to_string(),
+                workspace: "default".to_string(),
+                name: 1,
+                session: "session".to_string(),
                 version: 1,
                 affinity: HashSet::from([Bytes::from_static(b"popped")]),
                 ..Default::default()
@@ -185,8 +225,10 @@ mod tests {
             .unwrap();
         source
             .update_task(&Task {
-                id: 2,
-                ssn_id: "session".to_string(),
+                id: uuid::Uuid::new_v4().to_string(),
+                workspace: "default".to_string(),
+                name: 2,
+                session: "session".to_string(),
                 version: 1,
                 affinity: HashSet::from([Bytes::from_static(b"pending")]),
                 ..Default::default()

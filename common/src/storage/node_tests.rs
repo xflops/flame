@@ -28,6 +28,7 @@ mod tests {
     fn test_node_status_construction() {
         // Create a node with specific values
         let node = Node {
+            id: uuid::Uuid::new_v4().to_string(),
             name: "test-node".to_string(),
             state: NodeState::Ready,
             capacity: ResourceRequirement {
@@ -64,6 +65,7 @@ mod tests {
     fn test_node_status_merge_preserves_existing_info() {
         // Simulate existing node with full info (as registered initially)
         let existing_node = Node {
+            id: uuid::Uuid::new_v4().to_string(),
             name: "worker-1".to_string(),
             state: NodeState::Ready,
             capacity: ResourceRequirement {
@@ -93,6 +95,7 @@ mod tests {
         // Merge logic (as implemented in backend.rs fix)
         // capacity and info preserved from existing, allocatable updated
         let merged_node = Node {
+            id: uuid::Uuid::new_v4().to_string(),
             name: existing_node.name.clone(),
             state: NodeState::Ready,
             capacity: existing_node.capacity.clone(),
@@ -121,6 +124,7 @@ mod tests {
         // Simulate a heartbeat status update for a node that doesn't exist yet
         // When no existing node, create from status data (as in backend.rs fix)
         let new_node = Node {
+            id: uuid::Uuid::new_v4().to_string(),
             name: "new-worker".to_string(),
             state: NodeState::Ready,
             capacity: ResourceRequirement {
@@ -155,6 +159,7 @@ mod tests {
     #[test]
     fn test_node_status_partial_update() {
         let existing_node = Node {
+            id: uuid::Uuid::new_v4().to_string(),
             name: "partial-worker".to_string(),
             state: NodeState::Ready,
             capacity: ResourceRequirement {
@@ -176,6 +181,7 @@ mod tests {
         // Partial update: only state and allocatable changed
         // capacity and info preserved from existing
         let merged_node = Node {
+            id: uuid::Uuid::new_v4().to_string(),
             name: existing_node.name.clone(),
             state: NodeState::NotReady,
             capacity: existing_node.capacity.clone(),
@@ -205,6 +211,7 @@ mod tests {
     #[test]
     fn test_node_refresh() {
         let mut node = Node {
+            id: uuid::Uuid::new_v4().to_string(),
             name: "refresh-test".to_string(),
             state: NodeState::Ready,
             capacity: ResourceRequirement::default(),

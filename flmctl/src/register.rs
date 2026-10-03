@@ -32,7 +32,8 @@ pub async fn run(ctx: &FlameContext, path: &String) -> Result<(), FlameError> {
         &current_ctx.cluster.endpoint,
         current_ctx.cluster.tls.as_ref(),
     )
-    .await?;
+    .await?
+    .with_workspace(current_ctx.workspace.clone());
 
     let applications = parse_application_manifests(&contents)
         .map_err(|error| FlameError::InvalidConfig(format!("invalid <{path}>: {error}")))?;

@@ -33,7 +33,7 @@ impl State for BindingState {
 
         tracing::warn!(
             "Executor <{}> received in Binding state, resetting to Idle for re-scheduling",
-            self.executor.id
+            self.executor.name
         );
 
         self.executor.state = ExecutorState::Idle;

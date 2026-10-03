@@ -47,7 +47,7 @@ STEADY_CASES = (
 
 
 def run_session(tasks: int) -> None:
-    session = core.create_session("flmping", session_id=f"python-core-benchmark-{uuid.uuid4().hex}")
+    session = core.create_session("flmping", session=f"python-core-benchmark-{uuid.uuid4().hex}")
     try:
         futures = [session.submit(b"{}") for _ in range(tasks)]
         outputs = [json.loads(future.result()) for future in futures]

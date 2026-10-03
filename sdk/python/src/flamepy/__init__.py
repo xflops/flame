@@ -49,13 +49,11 @@ from .core import (  # Type aliases; Constants; Enums; Exception classes; Data c
     Session,
     SessionAttributes,
     SessionContext,
-    SessionID,
     SessionState,
     Shim,
     Task,
     TaskContext,
     TaskFuture,
-    TaskID,
     TaskInformer,
     TaskOption,
     TaskOptions,
@@ -85,8 +83,6 @@ __version__ = "0.6.0"
 
 __all__ = [
     # Type aliases
-    "TaskID",
-    "SessionID",
     "ApplicationID",
     "Message",
     "TaskInput",

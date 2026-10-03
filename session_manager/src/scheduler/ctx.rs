@@ -21,7 +21,7 @@ use crate::controller::ControllerPtr;
 use crate::model::{ExecutorInfo, ExecutorInfoPtr, NodeInfoPtr, SessionInfoPtr, SnapShotPtr};
 use crate::scheduler::actions::{ActionPtr, AllocateAction, DispatchAction, ShuffleAction};
 use crate::scheduler::plugins::{PluginManager, PluginManagerPtr, PluginsOptions};
-use common::apis::{ExecutorID, ExecutorState};
+use common::apis::ExecutorState;
 use common::FlameError;
 
 /// One scheduling cycle: a single `Context` (one [`PluginManager::setup`] on the current
@@ -76,7 +76,7 @@ impl Context {
         exec: &ExecutorInfoPtr,
         ssn: &SessionInfoPtr,
     ) -> Result<bool, FlameError> {
-        if exec.application != ssn.application {
+        if exec.workspace != ssn.workspace || exec.application != ssn.application {
             return Ok(false);
         }
         if ssn
@@ -92,13 +92,13 @@ impl Context {
     pub fn select_executor(
         &self,
         session: &SessionInfoPtr,
-        idle_executors: &HashMap<ExecutorID, ExecutorInfoPtr>,
+        idle_executors: &HashMap<String, ExecutorInfoPtr>,
     ) -> Result<Option<ExecutorInfoPtr>, FlameError> {
         let mut eligible = idle_executors
             .values()
             .map(|executor| {
                 Ok(
-                    (executor.ssn_id.is_none() && self.is_available(executor, session)?)
+                    (executor.session.is_none() && self.is_available(executor, session)?)
                         .then(|| executor.clone()),
                 )
             })
@@ -118,7 +118,7 @@ impl Context {
     ) -> Result<(), FlameError> {
         let executor = self
             .controller
-            .create_executor(node.name.clone(), ssn.id.clone())
+            .create_executor(node.name.clone(), &ssn.gid())
             .await?;
         let exec_info = Arc::new(ExecutorInfo::from(&executor));
         self.snapshot.add_executor(exec_info.clone())?;
@@ -140,7 +140,7 @@ impl Context {
         ssn: &SessionInfoPtr,
     ) -> Result<(), FlameError> {
         self.controller
-            .bind_session(exec.id.clone(), ssn.id.clone())
+            .bind_session(exec.name.clone(), &ssn.gid())
             .await?;
         self.plugins.on_session_bind(ssn.clone())?;
         self.snapshot
@@ -154,7 +154,7 @@ impl Context {
         exec: &ExecutorInfoPtr,
         ssn: &SessionInfoPtr,
     ) -> Result<(), FlameError> {
-        self.controller.unbind_executor(exec.id.clone()).await?;
+        self.controller.unbind_executor(exec.name.clone()).await?;
         self.plugins.on_session_unbind(ssn.clone())?;
         self.snapshot
             .update_executor_state(exec.clone(), ExecutorState::Unbinding)?;
@@ -163,7 +163,7 @@ impl Context {
     }
 
     pub async fn release_executor(&self, exec: &ExecutorInfoPtr) -> Result<(), FlameError> {
-        self.controller.release_executor(exec.id.clone()).await?;
+        self.controller.release_executor(exec.name.clone()).await?;
 
         self.snapshot
             .update_executor_state(exec.clone(), ExecutorState::Releasing)?;
@@ -205,15 +205,19 @@ mod tests {
             gpu: 0,
         };
         let mut source = Session {
-            id: "session".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "session".to_string(),
+            workspace: "default".to_string(),
             application: "test-app".to_string(),
             resreq: Some(resreq.clone()),
             ..Default::default()
         };
         source
             .update_task(&Task {
-                id: 1,
-                ssn_id: source.id.clone(),
+                id: uuid::Uuid::new_v4().to_string(),
+                workspace: "default".to_string(),
+                name: 1,
+                session: source.name.clone(),
                 affinity: HashSet::from([Bytes::from_static(b"local")]),
                 ..Default::default()
             })
@@ -245,7 +249,9 @@ mod tests {
         };
 
         let local = Arc::new(ExecutorInfo {
-            id: "z-local".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "z-local".to_string(),
+            workspace: "default".to_string(),
             state: ExecutorState::Idle,
             application: "test-app".to_string(),
             resreq: resreq.clone(),
@@ -253,23 +259,29 @@ mod tests {
             ..Default::default()
         });
         let remote = Arc::new(ExecutorInfo {
-            id: "y-remote".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "y-remote".to_string(),
+            workspace: "default".to_string(),
             state: ExecutorState::Idle,
             application: "test-app".to_string(),
             resreq: resreq.clone(),
             ..Default::default()
         });
         let owned = Arc::new(ExecutorInfo {
-            id: "a-owned".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "a-owned".to_string(),
+            workspace: "default".to_string(),
             state: ExecutorState::Idle,
             application: "test-app".to_string(),
-            ssn_id: Some("other-session".to_string()),
+            session: Some("other-session".to_string()),
             resreq: resreq.clone(),
             attributes: HashSet::from([Bytes::from_static(b"local")]),
             ..Default::default()
         });
         let wrong_resource = Arc::new(ExecutorInfo {
-            id: "b-wrong-resource".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "b-wrong-resource".to_string(),
+            workspace: "default".to_string(),
             state: ExecutorState::Idle,
             application: "test-app".to_string(),
             resreq: ResourceRequirement {
@@ -280,7 +292,9 @@ mod tests {
             ..Default::default()
         });
         let wrong_shim = Arc::new(ExecutorInfo {
-            id: "c-wrong-shim".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "c-wrong-shim".to_string(),
+            workspace: "default".to_string(),
             state: ExecutorState::Idle,
             application: "test-app".to_string(),
             resreq: resreq.clone(),
@@ -289,7 +303,9 @@ mod tests {
             ..Default::default()
         });
         let wrong_application = Arc::new(ExecutorInfo {
-            id: "d-wrong-application".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "d-wrong-application".to_string(),
+            workspace: "default".to_string(),
             state: ExecutorState::Idle,
             application: "other-app".to_string(),
             resreq,
@@ -318,7 +334,7 @@ mod tests {
         let first_eligible = idle_executors
             .values()
             .find(|executor| {
-                executor.ssn_id.is_none()
+                executor.session.is_none()
                     && context.is_available(executor, &session).unwrap_or(false)
             })
             .unwrap()

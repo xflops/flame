@@ -417,7 +417,7 @@ fn json_string<'a>(json: &'a Value, pointer: &str) -> &'a str {
 }
 
 fn assert_content_addressed_package_key(key: &str, app_name: &str) {
-    let prefix = format!("{}/pkg/{}-", app_name, app_name);
+    let prefix = format!("default/{}/pkg/{}-", app_name, app_name);
     assert!(
         key.starts_with(&prefix),
         "object key {} should start with {}",
@@ -431,8 +431,8 @@ fn assert_content_addressed_package_key(key: &str, app_name: &str) {
     );
     assert_eq!(
         key.split('/').count(),
-        3,
-        "object key {} should have <app>/<session>/<object> shape",
+        4,
+        "object key {} should have <workspace>/<app>/<session>/<object> shape",
         key
     );
 

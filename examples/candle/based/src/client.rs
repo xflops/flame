@@ -82,9 +82,9 @@ struct Cli {
     /// Flame application name.
     #[arg(long)]
     app: String,
-    /// Flame session id. Defaults to an auto-generated id.
+    /// Flame session name. Defaults to an auto-generated name.
     #[arg(long)]
-    session_id: Option<String>,
+    session: Option<String>,
     /// Minimum service instances to warm for this session.
     #[arg(long, default_value_t = 1)]
     min_instances: u32,
@@ -119,8 +119,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut options = SessionOptions::new(cli.app)
         .min_instances(cli.min_instances)
         .max_instances(cli.max_instances);
-    if let Some(session_id) = cli.session_id {
-        options = options.id(session_id);
+    if let Some(session) = cli.session {
+        options = options.name(session);
     }
     if let Some(resreq) = cli.resreq {
         options = options.resreq(resreq);

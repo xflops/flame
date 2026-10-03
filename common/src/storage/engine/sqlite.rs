@@ -11,2208 +11,631 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time;
-
 use async_trait::async_trait;
-use bytes::Bytes;
-#[cfg(test)]
-use chrono::Duration;
-use chrono::Utc;
-#[cfg(test)]
-use serde_json::json;
+use chrono::{DateTime, Utc};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
     types::Json,
-    QueryBuilder, Sqlite, SqliteConnection, SqlitePool,
+    SqlitePool,
 };
-#[cfg(test)]
-use std::collections::HashMap;
-use stdng::trace_fn;
+use std::{str::FromStr, sync::Arc, time::Duration as StdDuration};
+use uuid::Uuid;
 
+use super::{
+    types::{AppSchemaDao, ApplicationDao, ExecutorDao, NodeDao, SessionDao, TaskDao},
+    Engine, EnginePtr,
+};
 use crate::{
     apis::{
-        Application, ApplicationAttributes, ApplicationID, ApplicationState, ExecutorID,
-        ExecutorState, Node, Session, SessionAttributes, SessionID, SessionState, Task, TaskGID,
-        TaskInput, TaskOptions, TaskResult, TaskState,
+        Application, ApplicationAttributes, ApplicationFilter, ApplicationState, Executor,
+        ExecutorGID, ExecutorState, Node, Session, SessionAttributes, SessionGID, SessionState,
+        Task, TaskInput, TaskName, TaskOptions, TaskResult, TaskState, Workspace,
     },
     FlameError,
 };
-
-use crate::apis::{ApplicationFilter, Executor, SessionFilter, TaskFilter};
-#[cfg(test)]
-use crate::apis::{ApplicationSchema, Shim};
-use crate::storage::engine::types::{
-    AppSchemaDao, ApplicationDao, ExecutorDao, NodeDao, SessionDao, TaskDao,
-};
-
-use crate::storage::engine::{Engine, EnginePtr};
-
-const SQLITE_SQL: &str = "migrations/sqlite";
 
 pub struct SqliteEngine {
     pool: SqlitePool,
 }
 
+fn storage(error: impl std::fmt::Display) -> FlameError {
+    FlameError::Storage(error.to_string())
+}
+fn missing(kind: &str, name: &str) -> FlameError {
+    FlameError::NotFound(format!("{kind} {name}"))
+}
+fn unique(error: sqlx::Error, kind: &str) -> FlameError {
+    if error
+        .as_database_error()
+        .is_some_and(|e| e.is_unique_violation())
+    {
+        FlameError::AlreadyExist(kind.to_string())
+    } else {
+        storage(error)
+    }
+}
+fn timestamp(value: i64) -> Result<DateTime<Utc>, FlameError> {
+    DateTime::<Utc>::from_timestamp(value, 0).ok_or_else(|| storage("invalid timestamp"))
+}
+
 impl SqliteEngine {
     pub async fn new_ptr(url: &str) -> Result<EnginePtr, FlameError> {
-        tracing::debug!("Try to create and connect to {}", url);
-
         let options = SqliteConnectOptions::from_str(url)
-            .map_err(|e| FlameError::Storage(e.to_string()))?
+            .map_err(storage)?
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true)
-            .busy_timeout(time::Duration::from_secs(15))
+            .busy_timeout(StdDuration::from_secs(15))
             .synchronous(SqliteSynchronous::Normal)
             .create_if_missing(true);
-
-        let db = SqlitePoolOptions::new()
+        let pool = SqlitePoolOptions::new()
             .max_connections(50)
             .min_connections(3)
-            .acquire_timeout(time::Duration::from_secs(30))
-            .idle_timeout(time::Duration::from_secs(5 * 60))
-            .max_lifetime(time::Duration::from_secs(30 * 60))
-            .test_before_acquire(true)
             .connect_with(options)
             .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let installed_migrations = std::path::Path::new(SQLITE_SQL);
-        let source_migrations = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SQLITE_SQL);
-        let migrations = if installed_migrations.exists() {
-            installed_migrations
+            .map_err(storage)?;
+        let installed = std::path::Path::new("migrations/sqlite");
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/sqlite");
+        let migrations = if installed.exists() {
+            installed
         } else {
-            source_migrations.as_path()
+            source.as_path()
         };
-        let migrator = sqlx::migrate::Migrator::new(migrations)
+        sqlx::migrate::Migrator::new(migrations)
             .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-        migrator
-            .run(&db)
+            .map_err(storage)?
+            .run(&pool)
             .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        Ok(Arc::new(SqliteEngine { pool: db }))
+            .map_err(storage)?;
+        Ok(Arc::new(Self { pool }))
     }
-
-    async fn _count_task(
-        &self,
-        tx: &mut SqliteConnection,
-        filter: &TaskFilter,
-    ) -> Result<i64, FlameError> {
-        if filter.states.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(0);
-        }
-
-        let mut query = QueryBuilder::<Sqlite>::new("SELECT count(*) FROM tasks WHERE ssn_id=");
-        query.push_bind(&filter.session);
-        if let Some(states) = &filter.states {
-            query.push(" AND state IN (");
-            let mut values = query.separated(", ");
-            for state in states {
-                values.push_bind(*state as i32);
-            }
-            values.push_unseparated(")");
-        }
-
-        let count: i64 = query
-            .build_query_scalar()
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to count tasks: {e}")))?;
-        Ok(count)
-    }
-
-    async fn _delete_session(
-        &self,
-        tx: &mut SqliteConnection,
-        id: SessionID,
-    ) -> Result<Session, FlameError> {
-        let sql = "DELETE FROM tasks WHERE ssn_id=?";
-        sqlx::query(sql)
-            .bind(id.clone())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to delete session: {e}")))?;
-
-        let sql = "DELETE FROM sessions WHERE id=? AND state=? RETURNING *";
-        let ssn: SessionDao = sqlx::query_as(sql)
-            .bind(id.clone())
-            .bind(SessionState::Closed as i32)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to close session: {e}")))?;
-
-        let ssn: Session = ssn.try_into()?;
-
-        Ok(ssn)
-    }
-
-    async fn _count_sessions(
-        &self,
-        tx: &mut SqliteConnection,
-        filter: &SessionFilter,
-    ) -> Result<i64, FlameError> {
-        if filter.predicate.is_some() {
-            return Err(FlameError::Storage(
-                "session predicates cannot be evaluated by SQLite".to_string(),
-            ));
-        }
-        if filter.ids.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(0);
-        }
-
-        let mut query = QueryBuilder::<Sqlite>::new("SELECT count(*) FROM sessions");
-        let mut has_condition = false;
-        if let Some(application) = &filter.application {
-            query.push(" WHERE application=").push_bind(application);
-            has_condition = true;
-        }
-        if let Some(state) = filter.state {
-            query.push(if has_condition {
-                " AND state="
-            } else {
-                " WHERE state="
-            });
-            query.push_bind(state as i32);
-            has_condition = true;
-        }
-        if let Some(ids) = &filter.ids {
-            query.push(if has_condition {
-                " AND id IN ("
-            } else {
-                " WHERE id IN ("
-            });
-            let mut values = query.separated(", ");
-            for id in ids {
-                values.push_bind(id);
-            }
-            values.push_unseparated(")");
-        }
-
-        let count: i64 = query
-            .build_query_scalar()
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to count sessions: {e}")))?;
-        Ok(count)
-    }
-
-    async fn _delete_application(
-        &self,
-        tx: &mut SqliteConnection,
-        name: String,
-    ) -> Result<(), FlameError> {
-        let sql = "DELETE FROM applications WHERE name=?";
-        sqlx::query(sql)
+    async fn application(&self, workspace: &str, name: &str) -> Result<ApplicationDao, FlameError> {
+        sqlx::query_as("SELECT * FROM applications WHERE workspace=? AND name=?")
+            .bind(workspace)
             .bind(name)
-            .execute(&mut *tx)
+            .fetch_one(&self.pool)
             .await
-            .map_err(|e| FlameError::Storage(format!("failed to delete application: {e}")))?;
-        Ok(())
+            .map_err(|e| {
+                if matches!(e, sqlx::Error::RowNotFound) {
+                    missing("application", name)
+                } else {
+                    storage(e)
+                }
+            })
     }
-
-    /// Internal helper to get session within an existing transaction.
-    /// Returns None if session not found.
-    async fn _get_session(
-        tx: &mut SqliteConnection,
-        id: SessionID,
-    ) -> Result<Option<Session>, FlameError> {
-        let sql = "SELECT * FROM sessions WHERE id=?";
-        let ssn: Option<SessionDao> = sqlx::query_as(sql)
-            .bind(id)
-            .fetch_optional(&mut *tx)
+    async fn session(&self, gid: &SessionGID) -> Result<SessionDao, FlameError> {
+        let workspace = gid.workspace.as_str();
+        let name = gid.session.as_str();
+        sqlx::query_as("SELECT * FROM sessions WHERE workspace=? AND name=?")
+            .bind(workspace)
+            .bind(name)
+            .fetch_one(&self.pool)
             .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        match ssn {
-            Some(dao) => Ok(Some(dao.try_into()?)),
-            None => Ok(None),
-        }
+            .map_err(|e| {
+                if matches!(e, sqlx::Error::RowNotFound) {
+                    missing("session", name)
+                } else {
+                    storage(e)
+                }
+            })
     }
-
-    /// Internal helper to create session within an existing transaction.
-    async fn _create_session(
-        tx: &mut SqliteConnection,
-        attr: SessionAttributes,
-    ) -> Result<Session, FlameError> {
-        let common_data: Option<Vec<u8>> = attr.common_data.map(Bytes::into);
-        let tokens = serde_json::to_string(&attr.tokens)
-            .map_err(|e| FlameError::Storage(format!("failed to serialize session tokens: {e}")))?;
-        let (resreq_cpu, resreq_memory, resreq_gpu) = match &attr.resreq {
-            Some(r) => (
-                Some(r.cpu as i64),
-                Some(r.memory as i64),
-                Some(r.gpu as i64),
-            ),
-            None => (None, None, None),
-        };
-        let sql = r#"INSERT INTO sessions (id, application, common_data, tokens, creation_time, state, min_instances, max_instances, batch_size, priority, resreq_cpu, resreq_memory, resreq_gpu)
-            VALUES (
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?
-            )
-            RETURNING *"#;
-        let ssn: SessionDao = sqlx::query_as(sql)
-            .bind(attr.id.clone())
-            .bind(attr.application)
-            .bind(common_data)
-            .bind(tokens)
-            .bind(Utc::now().timestamp())
-            .bind(SessionState::Open as i32)
-            .bind(attr.min_instances as i64)
-            .bind(attr.max_instances.map(|v| v as i64))
-            .bind(1_i64)
-            .bind(attr.priority as i64)
-            .bind(resreq_cpu)
-            .bind(resreq_memory)
-            .bind(resreq_gpu)
-            .fetch_one(&mut *tx)
+    async fn task(&self, gid: &SessionGID, name: &str) -> Result<TaskDao, FlameError> {
+        let workspace = gid.workspace.as_str();
+        let session = gid.session.as_str();
+        sqlx::query_as("SELECT * FROM tasks WHERE workspace=? AND session=? AND name=?")
+            .bind(workspace)
+            .bind(session)
+            .bind(name)
+            .fetch_one(&self.pool)
             .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        ssn.try_into()
+            .map_err(|e| {
+                if matches!(e, sqlx::Error::RowNotFound) {
+                    missing("task", name)
+                } else {
+                    storage(e)
+                }
+            })
     }
 }
 
 #[async_trait]
 impl Engine for SqliteEngine {
+    async fn create_workspace(&self, name: String) -> Result<Workspace, FlameError> {
+        let now = Utc::now();
+        sqlx::query("INSERT INTO workspaces(name,create_at) VALUES (?,?)")
+            .bind(&name)
+            .bind(now.timestamp())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| unique(e, "workspace"))?;
+        Ok(Workspace {
+            name,
+            create_at: now,
+        })
+    }
+    async fn list_workspaces(&self) -> Result<Vec<Workspace>, FlameError> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT name,create_at FROM workspaces ORDER BY name")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(storage)?;
+        rows.into_iter()
+            .map(|(name, create_at)| {
+                Ok(Workspace {
+                    name,
+                    create_at: timestamp(create_at)?,
+                })
+            })
+            .collect()
+    }
     async fn register_application(
         &self,
+        workspace: String,
         name: String,
         attr: ApplicationAttributes,
     ) -> Result<Application, FlameError> {
-        trace_fn!("Sqlite::register_application");
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to begin TX: {e}")))?;
-
-        let schema: Option<Json<AppSchemaDao>> =
-            attr.schema.clone().map(AppSchemaDao::from).map(Json);
-
-        let sql = r#"INSERT INTO applications
-            (
-                name,
-                shim,
-                image,
-                description, 
-                labels, 
-                command, 
-                arguments, 
-                environments, 
-                working_directory, 
-                max_instances, 
-                delay_release, 
-                schema, 
-                url,
-                installer,
-                creation_time, 
-                state)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            RETURNING *"#;
-        let app: ApplicationDao = sqlx::query_as(sql)
-            .bind(name)
-            .bind(attr.shim as i32)
-            .bind(attr.image)
-            .bind(attr.description)
-            .bind(Json(attr.labels))
-            .bind(attr.command)
-            .bind(Json(attr.arguments))
-            .bind(Json(attr.environments))
-            .bind(attr.working_directory)
-            .bind(attr.max_instances)
-            .bind(attr.delay_release.num_seconds())
-            .bind(schema)
-            .bind(attr.url)
-            .bind(attr.installer)
-            .bind(Utc::now().timestamp())
-            .bind(ApplicationState::Enabled as i32)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|error| {
-                if error
-                    .as_database_error()
-                    .is_some_and(|error| error.is_unique_violation())
-                {
-                    FlameError::AlreadyExist("application already exists".to_string())
-                } else {
-                    FlameError::Storage(format!("failed to register application: {error}"))
-                }
-            })?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to commit TX: {e}")))?;
-
-        Ok(app.try_into()?)
+        crate::apis::validate_application_url(&workspace, attr.url.as_deref())?;
+        let id = Uuid::new_v4().to_string();
+        let schema = attr.schema.map(|x| Json(AppSchemaDao::from(x)));
+        let dao: ApplicationDao = sqlx::query_as("INSERT INTO applications (id,workspace,name,version,shim,image,description,labels,command,arguments,environments,working_directory,max_instances,delay_release,schema,url,installer,creation_time,state) VALUES (?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING *")
+            .bind(id).bind(workspace).bind(name).bind(attr.shim as i32).bind(attr.image).bind(attr.description)
+            .bind(Json(attr.labels)).bind(attr.command).bind(Json(attr.arguments)).bind(Json(attr.environments))
+            .bind(attr.working_directory).bind(attr.max_instances as i64).bind(attr.delay_release.num_seconds())
+            .bind(schema).bind(attr.url).bind(attr.installer).bind(Utc::now().timestamp())
+            .bind(ApplicationState::Enabled as i32).fetch_one(&self.pool).await.map_err(|e| unique(e,"application"))?;
+        dao.try_into()
     }
-
-    async fn update_application(
-        &self,
-        name: String,
-        attr: ApplicationAttributes,
-    ) -> Result<Application, FlameError> {
-        trace_fn!("Sqlite::update_application");
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to begin TX: {e}")))?;
-
-        let state: i32 = sqlx::query_scalar("SELECT state FROM applications WHERE name=?")
-            .bind(&name)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| match e {
-                sqlx::Error::RowNotFound => {
-                    FlameError::NotFound(format!("application <{name}> not found"))
-                }
-                _ => FlameError::Storage(e.to_string()),
-            })?;
-        if state != ApplicationState::Enabled as i32 {
-            return Err(FlameError::InvalidState(format!(
-                "application <{name}> is not enabled"
-            )));
-        }
-
-        let filter = SessionFilter::by_application_state(name.clone(), SessionState::Open);
-        let count = self._count_sessions(&mut tx, &filter).await?;
-        if count > 0 {
-            return Err(FlameError::Storage(format!(
-                "{count} open sessions in the application"
-            )));
-        }
-
-        let schema: Option<Json<AppSchemaDao>> =
-            attr.schema.clone().map(AppSchemaDao::from).map(Json);
-
-        let sql = r#"UPDATE applications
-                    SET shim=?,
-                        image=?,
-                        schema=?,
-                        description=?,
-                        labels=?,
-                        command=?,
-                        arguments=?,
-                        environments=?,
-                        working_directory=?,
-                        max_instances=?,
-                        delay_release=?,
-                        url=?,
-                        installer=?,
-                        version=version+1
-                    WHERE name=? AND state=?
-                    RETURNING *"#;
-
-        let app: ApplicationDao = sqlx::query_as(sql)
-            .bind(attr.shim as i32)
-            .bind(attr.image)
-            .bind(schema)
-            .bind(attr.description)
-            .bind(Json(attr.labels))
-            .bind(attr.command)
-            .bind(Json(attr.arguments))
-            .bind(Json(attr.environments))
-            .bind(attr.working_directory)
-            .bind(attr.max_instances)
-            .bind(attr.delay_release.num_seconds())
-            .bind(attr.url)
-            .bind(attr.installer)
-            .bind(&name)
-            .bind(ApplicationState::Enabled as i32)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| match e {
-                sqlx::Error::RowNotFound => {
-                    FlameError::InvalidState(format!("application <{name}> is not enabled"))
-                }
-                _ => FlameError::Storage(format!("failed to update application: {e}")),
-            })?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to commit TX: {e}")))?;
-
-        Ok(app.try_into()?)
-    }
-
     async fn update_application_state(
         &self,
-        name: ApplicationID,
+        workspace: &str,
+        name: &str,
         state: ApplicationState,
     ) -> Result<Application, FlameError> {
-        trace_fn!("Sqlite::update_application_state");
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to begin TX: {e}")))?;
-
-        let current: ApplicationDao = sqlx::query_as("SELECT * FROM applications WHERE name=?")
-            .bind(&name)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| match e {
-                sqlx::Error::RowNotFound => {
-                    FlameError::NotFound(format!("application <{name}> not found"))
-                }
-                _ => FlameError::Storage(e.to_string()),
-            })?;
-
-        if current.state == state as i32 {
-            tx.commit()
-                .await
-                .map_err(|e| FlameError::Storage(format!("failed to commit TX: {e}")))?;
-            return current.try_into();
-        }
-
-        let updated: ApplicationDao = sqlx::query_as(
-            "UPDATE applications SET state=?, version=version+1 WHERE name=? RETURNING *",
-        )
-        .bind(state as i32)
-        .bind(&name)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| FlameError::Storage(format!("failed to update application state: {e}")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to commit TX: {e}")))?;
-
-        updated.try_into()
+        let dao: ApplicationDao = sqlx::query_as("UPDATE applications SET state=?,version=version+1 WHERE workspace=? AND name=? RETURNING *")
+            .bind(state as i32).bind(workspace).bind(name).fetch_one(&self.pool).await
+            .map_err(|e| if matches!(e,sqlx::Error::RowNotFound) {missing("application",name)} else {storage(e)})?;
+        dao.try_into()
     }
-
-    async fn delete_application(&self, name: ApplicationID) -> Result<(), FlameError> {
-        trace_fn!("Sqlite::delete_application");
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to begin TX: {e}")))?;
-
-        let state: i32 = sqlx::query_scalar("SELECT state FROM applications WHERE name=?")
-            .bind(&name)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| match e {
-                sqlx::Error::RowNotFound => {
-                    FlameError::NotFound(format!("application <{name}> not found"))
-                }
-                _ => FlameError::Storage(e.to_string()),
-            })?;
-        if state != ApplicationState::Disabled as i32 {
-            return Err(FlameError::InvalidState(format!(
-                "application <{name}> is not disabled"
-            )));
+    async fn delete_application(&self, workspace: &str, name: &str) -> Result<(), FlameError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let state: Option<i32> =
+            sqlx::query_scalar("SELECT state FROM applications WHERE workspace=? AND name=?")
+                .bind(workspace)
+                .bind(name)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(storage)?;
+        match state {
+            None => return Err(missing("application", name)),
+            Some(value) if value != ApplicationState::Disabled as i32 => {
+                return Err(FlameError::InvalidState(format!(
+                    "application {name} is not disabled"
+                )))
+            }
+            _ => {}
         }
-
-        let filter = SessionFilter::by_application(name.clone());
-        let count = self._count_sessions(&mut tx, &filter).await?;
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM sessions WHERE workspace=? AND application=?")
+                .bind(workspace)
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(storage)?;
         if count > 0 {
             return Err(FlameError::InvalidState(format!(
-                "application <{name}> still has {count} sessions"
+                "application {name} still has {count} sessions"
             )));
         }
-
-        self._delete_application(&mut tx, name).await?;
-
-        tx.commit()
+        sqlx::query("DELETE FROM applications WHERE workspace=? AND name=?")
+            .bind(workspace)
+            .bind(name)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| FlameError::Storage(format!("failed to delete application: {e}")))?;
-
-        Ok(())
+            .map_err(storage)?;
+        tx.commit().await.map_err(storage)
     }
-
-    async fn get_application(&self, id: ApplicationID) -> Result<Application, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let sql = "SELECT * FROM applications WHERE name=?";
-        let app: ApplicationDao = sqlx::query_as(sql)
-            .bind(&id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| match e {
-                sqlx::Error::RowNotFound => {
-                    FlameError::NotFound(format!("application <{id}> not found"))
-                }
-                _ => FlameError::Storage(e.to_string()),
-            })?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to get application: {e}")))?;
-
-        app.try_into()
+    async fn update_application(
+        &self,
+        workspace: &str,
+        name: &str,
+        attr: ApplicationAttributes,
+    ) -> Result<Application, FlameError> {
+        crate::apis::validate_application_url(workspace, attr.url.as_deref())?;
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let current: ApplicationDao =
+            sqlx::query_as("SELECT * FROM applications WHERE workspace=? AND name=?")
+                .bind(workspace)
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| {
+                    if matches!(e, sqlx::Error::RowNotFound) {
+                        missing("application", name)
+                    } else {
+                        storage(e)
+                    }
+                })?;
+        if current.state != ApplicationState::Enabled as i32 {
+            return Err(FlameError::InvalidState(format!(
+                "application {name} is not enabled"
+            )));
+        }
+        let active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sessions WHERE workspace=? AND application=? AND state=?",
+        )
+        .bind(workspace)
+        .bind(name)
+        .bind(SessionState::Open as i32)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(storage)?;
+        if active > 0 {
+            return Err(FlameError::InvalidState(format!(
+                "{active} open sessions in application"
+            )));
+        }
+        let schema = attr.schema.map(|x| Json(AppSchemaDao::from(x)));
+        let dao: ApplicationDao = sqlx::query_as("UPDATE applications SET shim=?,image=?,description=?,labels=?,command=?,arguments=?,environments=?,working_directory=?,max_instances=?,delay_release=?,schema=?,url=?,installer=?,version=version+1 WHERE workspace=? AND name=? RETURNING *")
+            .bind(attr.shim as i32).bind(attr.image).bind(attr.description).bind(Json(attr.labels)).bind(attr.command)
+            .bind(Json(attr.arguments)).bind(Json(attr.environments)).bind(attr.working_directory)
+            .bind(attr.max_instances as i64).bind(attr.delay_release.num_seconds()).bind(schema).bind(attr.url)
+            .bind(attr.installer).bind(workspace).bind(name).fetch_one(&mut *tx).await.map_err(storage)?;
+        tx.commit().await.map_err(storage)?;
+        dao.try_into()
     }
-
+    async fn get_application(
+        &self,
+        workspace: &str,
+        name: &str,
+    ) -> Result<Application, FlameError> {
+        self.application(workspace, name).await?.try_into()
+    }
     async fn find_applications(
         &self,
         filter: Option<&ApplicationFilter>,
     ) -> Result<Vec<Application>, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let app: Vec<ApplicationDao> = match filter.and_then(|filter| filter.state) {
-            Some(state) => {
-                sqlx::query_as("SELECT * FROM applications WHERE state=?")
-                    .bind(state as i32)
-                    .fetch_all(&mut *tx)
-                    .await
-            }
-            None => {
-                sqlx::query_as("SELECT * FROM applications")
-                    .fetch_all(&mut *tx)
-                    .await
-            }
-        }
-        .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        Ok(app
-            .iter()
+        let rows: Vec<ApplicationDao> =
+            sqlx::query_as("SELECT * FROM applications ORDER BY workspace,name")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(storage)?;
+        rows.into_iter()
+            .filter(|x| {
+                filter.is_none_or(|f| {
+                    f.workspace == x.workspace && f.state.is_none_or(|s| s as i32 == x.state)
+                })
+            })
             .map(Application::try_from)
-            .filter_map(Result::ok)
-            .collect())
+            .collect()
     }
-
     async fn create_session(&self, attr: SessionAttributes) -> Result<Session, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let ssn = Self::_create_session(&mut tx, attr).await?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        Ok(ssn)
+        let SessionAttributes {
+            workspace,
+            name,
+            application,
+            common_data,
+            tokens,
+            min_instances,
+            max_instances,
+            batch_size,
+            priority,
+            resreq,
+        } = attr;
+        let resreq_cpu = resreq.as_ref().map(|x| x.cpu as i64);
+        let resreq_memory = resreq.as_ref().map(|x| x.memory as i64);
+        let resreq_gpu = resreq.as_ref().map(|x| x.gpu as i64);
+        let tokens = serde_json::to_string(&tokens).map_err(storage)?;
+        let dao: SessionDao = sqlx::query_as("INSERT INTO sessions (id,workspace,name,application,version,common_data,tokens,creation_time,state,min_instances,max_instances,batch_size,priority,resreq_cpu,resreq_memory,resreq_gpu) VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?) RETURNING *")
+            .bind(Uuid::new_v4().to_string()).bind(workspace).bind(name).bind(application)
+            .bind(common_data.map(|x| x.to_vec())).bind(tokens).bind(Utc::now().timestamp())
+            .bind(SessionState::Open as i32).bind(min_instances as i64).bind(max_instances.map(i64::from))
+            .bind(batch_size as i64).bind(priority as i64).bind(resreq_cpu).bind(resreq_memory).bind(resreq_gpu)
+            .fetch_one(&self.pool).await.map_err(|e| unique(e,"session"))?;
+        dao.try_into()
     }
-
-    async fn get_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let ssn = Self::_get_session(&mut tx, id.clone())
-            .await?
-            .ok_or_else(|| FlameError::NotFound(format!("session <{id}> not found")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        Ok(ssn)
+    async fn get_session(&self, gid: &SessionGID) -> Result<Session, FlameError> {
+        self.session(gid).await?.try_into()
     }
-
     async fn open_session(
         &self,
-        id: SessionID,
+        gid: &SessionGID,
         spec: Option<SessionAttributes>,
     ) -> Result<Session, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let ssn = match Self::_get_session(&mut tx, id.clone()).await? {
-            Some(session) => {
-                // Session exists - validate state
-                if session.status.state != SessionState::Open {
-                    return Err(FlameError::InvalidState(format!(
-                        "session <{id}> is not open"
-                    )));
+        let workspace = gid.workspace.as_str();
+        let name = gid.session.as_str();
+        match self.session(gid).await {
+            Ok(dao) => {
+                if dao.state == SessionState::Open as i32 {
+                    return dao.try_into();
                 }
-                // If spec provided, validate it matches
-                if let Some(ref attr) = spec {
-                    session.validate_spec(attr)?;
-                }
-                session
+                let dao: SessionDao = sqlx::query_as("UPDATE sessions SET state=?,completion_time=NULL,version=version+1 WHERE workspace=? AND name=? RETURNING *")
+                    .bind(SessionState::Open as i32).bind(workspace).bind(name).fetch_one(&self.pool).await.map_err(storage)?;
+                dao.try_into()
             }
-            None => {
-                // Session doesn't exist
-                match spec {
-                    Some(attr) => Self::_create_session(&mut tx, attr).await?,
-                    None => return Err(FlameError::NotFound(format!("session <{id}> not found"))),
-                }
-            }
-        };
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        Ok(ssn)
-    }
-
-    async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let filter = TaskFilter::non_terminal(&id);
-        let count = self._count_task(&mut tx, &filter).await?;
-        if count > 0 {
-            return Err(FlameError::Storage(format!(
-                "{count} open tasks in the session"
-            )));
+            Err(FlameError::NotFound(_)) => match spec {
+                Some(attr) => self.create_session(attr).await,
+                None => Err(missing("session", name)),
+            },
+            Err(e) => Err(e),
         }
-
-        let ssn = self._delete_session(&mut tx, id).await?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        Ok(ssn)
     }
-
-    async fn close_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let check_running_sql = "SELECT COUNT(*) as cnt FROM tasks WHERE ssn_id=? AND state=?";
-        let running_count: (i32,) = sqlx::query_as(check_running_sql)
-            .bind(id.clone())
-            .bind(TaskState::Running as i32)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        if running_count.0 > 0 {
-            return Err(FlameError::Storage(
-                "Cannot close session with running tasks".to_string(),
+    async fn close_session(&self, gid: &SessionGID) -> Result<Session, FlameError> {
+        let workspace = gid.workspace.as_str();
+        let name = gid.session.as_str();
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let running: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM tasks WHERE workspace=? AND session=? AND state=?",
+        )
+        .bind(workspace)
+        .bind(name)
+        .bind(TaskState::Running as i32)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(storage)?;
+        if running > 0 {
+            return Err(FlameError::InvalidState(
+                "cannot close session with running tasks".into(),
             ));
         }
-
-        let cancel_pending_sql =
-            "UPDATE tasks SET state=?, completion_time=? WHERE ssn_id=? AND state=?";
-        sqlx::query(cancel_pending_sql)
-            .bind(TaskState::Cancelled as i32)
-            .bind(Utc::now().timestamp())
-            .bind(id.clone())
-            .bind(TaskState::Pending as i32)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let close_session_sql = r#"UPDATE sessions 
-            SET state=?, completion_time=?, version=version+1
-            WHERE id=?
-            RETURNING *"#;
-        let ssn: SessionDao = sqlx::query_as(close_session_sql)
-            .bind(SessionState::Closed as i32)
-            .bind(Utc::now().timestamp())
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        ssn.try_into()
+        sqlx::query("UPDATE tasks SET state=?,completion_time=? WHERE workspace=? AND session=? AND state=?")
+            .bind(TaskState::Cancelled as i32).bind(Utc::now().timestamp()).bind(workspace).bind(name)
+            .bind(TaskState::Pending as i32).execute(&mut *tx).await.map_err(storage)?;
+        let dao:SessionDao=sqlx::query_as("UPDATE sessions SET state=?,completion_time=?,version=version+1 WHERE workspace=? AND name=? RETURNING *")
+            .bind(SessionState::Closed as i32).bind(Utc::now().timestamp()).bind(workspace).bind(name)
+            .fetch_one(&mut *tx).await.map_err(|e| if matches!(e,sqlx::Error::RowNotFound){missing("session",name)}else{storage(e)})?;
+        tx.commit().await.map_err(storage)?;
+        dao.try_into()
     }
-
+    async fn delete_session(&self, gid: &SessionGID) -> Result<Session, FlameError> {
+        let workspace = gid.workspace.as_str();
+        let name = gid.session.as_str();
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let dao: SessionDao = sqlx::query_as(
+            "DELETE FROM sessions WHERE workspace=? AND name=? AND state=? RETURNING *",
+        )
+        .bind(workspace)
+        .bind(name)
+        .bind(SessionState::Closed as i32)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| {
+            if matches!(e, sqlx::Error::RowNotFound) {
+                FlameError::InvalidState(format!("session {name} is not closed"))
+            } else {
+                storage(e)
+            }
+        })?;
+        tx.commit().await.map_err(storage)?;
+        dao.try_into()
+    }
     async fn find_sessions(&self) -> Result<Vec<Session>, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let ssn: Vec<SessionDao> = sqlx::query_as("SELECT * FROM sessions")
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        Ok(ssn
-            .iter()
-            .map(Session::try_from)
-            .filter_map(Result::ok)
-            .collect())
+        let rows: Vec<SessionDao> =
+            sqlx::query_as("SELECT * FROM sessions ORDER BY workspace,name")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(storage)?;
+        rows.into_iter().map(Session::try_from).collect()
     }
-
     async fn create_task(
         &self,
-        ssn_id: SessionID,
+        gid: &SessionGID,
         input: Option<TaskInput>,
         options: Option<TaskOptions>,
     ) -> Result<Task, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let input: Option<Vec<u8>> = input.map(Bytes::into);
+        let workspace = gid.workspace.as_str();
+        let session = gid.session.as_str();
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let state: Option<i32> =
+            sqlx::query_scalar("SELECT state FROM sessions WHERE workspace=? AND name=?")
+                .bind(workspace)
+                .bind(session)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(storage)?;
+        if state != Some(SessionState::Open as i32) {
+            return Err(FlameError::InvalidState(format!(
+                "session {session} is not open"
+            )));
+        }
+        let latest: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM tasks WHERE workspace=? AND session=? ORDER BY length(name) DESC, name DESC LIMIT 1",
+        )
+        .bind(workspace)
+        .bind(session)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(storage)?;
+        let next = latest
+            .as_deref()
+            .map(|name| name.parse::<TaskName>().map_err(storage))
+            .transpose()?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| storage("task number overflow"))?;
         let affinity = serde_json::to_string(
             &options
                 .unwrap_or_default()
                 .affinity
                 .iter()
-                .map(|key| key.to_vec())
+                .map(|x| x.to_vec())
                 .collect::<Vec<_>>(),
         )
-        .map_err(|e| FlameError::Storage(e.to_string()))?;
-        let sql = r#"INSERT INTO tasks (id, ssn_id, input, affinity, creation_time, state)
-            VALUES (
-                COALESCE((SELECT MAX(id)+1 FROM tasks WHERE ssn_id=?), 1),
-                (SELECT id FROM sessions WHERE id=? AND state=?),
-                ?,
-                ?,
-                ?,
-                ?)
-            RETURNING *"#;
-        let task: TaskDao = sqlx::query_as(sql)
-            .bind(ssn_id.clone())
-            .bind(ssn_id)
-            .bind(SessionState::Open as i32)
-            .bind(input)
-            .bind(affinity)
-            .bind(Utc::now().timestamp())
-            .bind(TaskState::Pending as i32)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        task.try_into()
+        .map_err(storage)?;
+        let dao:TaskDao=sqlx::query_as("INSERT INTO tasks (id,workspace,session,name,version,input,affinity,creation_time,state) VALUES (?,?,?,?,1,?,?,?,?) RETURNING *")
+            .bind(Uuid::new_v4().to_string()).bind(workspace).bind(session).bind(next.to_string())
+            .bind(input.map(|x| x.to_vec())).bind(affinity).bind(Utc::now().timestamp()).bind(TaskState::Pending as i32)
+            .fetch_one(&mut *tx).await.map_err(storage)?;
+        tx.commit().await.map_err(storage)?;
+        dao.try_into()
     }
-
-    async fn get_task(&self, gid: TaskGID) -> Result<Task, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let sql = r#"SELECT * FROM tasks WHERE id=? AND ssn_id=?"#;
-        let task: TaskDao = sqlx::query_as(sql)
-            .bind(gid.task_id)
-            .bind(gid.ssn_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        task.try_into()
+    async fn get_task(&self, gid: &SessionGID, task: &str) -> Result<Task, FlameError> {
+        self.task(gid, task).await?.try_into()
     }
-
-    async fn retry_task(&self, gid: TaskGID) -> Result<Task, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let sql =
-            r#"UPDATE tasks SET state=?, version=version+1 WHERE id=? AND ssn_id=? RETURNING *"#;
-        let task: TaskDao = sqlx::query_as(sql)
-            .bind(TaskState::Pending as i32)
-            .bind(gid.task_id)
-            .bind(gid.ssn_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        task.try_into()
+    async fn retry_task(&self, gid: &SessionGID, task: &str) -> Result<Task, FlameError> {
+        let workspace = gid.workspace.as_str();
+        let session = gid.session.as_str();
+        let dao:TaskDao=sqlx::query_as("UPDATE tasks SET state=?,output=NULL,completion_time=NULL,version=version+1 WHERE workspace=? AND session=? AND name=? RETURNING *")
+            .bind(TaskState::Pending as i32).bind(workspace).bind(session).bind(task).fetch_one(&self.pool).await
+            .map_err(|e|if matches!(e,sqlx::Error::RowNotFound){missing("task",task)}else{storage(e)})?;
+        dao.try_into()
     }
-
     async fn update_task_state(
         &self,
-        gid: TaskGID,
-        task_state: TaskState,
+        gid: &SessionGID,
+        task: &str,
+        state: TaskState,
         _message: Option<String>,
     ) -> Result<Task, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let completion_time = match task_state {
-            TaskState::Failed | TaskState::Succeed | TaskState::Cancelled => {
-                Some(Utc::now().timestamp())
-            }
-            _ => None,
-        };
-
-        let sql = r#"UPDATE tasks SET state=?, completion_time=?, version=version+1 WHERE id=? AND ssn_id=? RETURNING *"#;
-        let task: TaskDao = sqlx::query_as(sql)
-            .bind::<i32>(task_state.into())
-            .bind(completion_time)
-            .bind(gid.task_id)
-            .bind(gid.ssn_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        task.try_into()
+        let workspace = gid.workspace.as_str();
+        let session = gid.session.as_str();
+        let completion = state.is_terminal().then(|| Utc::now().timestamp());
+        let dao:TaskDao=sqlx::query_as("UPDATE tasks SET state=?,completion_time=?,version=version+1 WHERE workspace=? AND session=? AND name=? RETURNING *")
+            .bind(state as i32).bind(completion).bind(workspace).bind(session).bind(task).fetch_one(&self.pool).await
+            .map_err(|e|if matches!(e,sqlx::Error::RowNotFound){missing("task",task)}else{storage(e)})?;
+        dao.try_into()
     }
-
     async fn update_task_result(
         &self,
-        gid: TaskGID,
-        task_result: TaskResult,
+        gid: &SessionGID,
+        task: &str,
+        result: TaskResult,
     ) -> Result<Task, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let completion_time = match task_result.state {
-            TaskState::Failed | TaskState::Succeed => Some(Utc::now().timestamp()),
-            _ => {
-                tracing::warn!(
-                    "Invalid task state <{:?}> for task <{}> when updating task result",
-                    task_result.state,
-                    gid
-                );
-                None
-            }
-        };
-
-        let sql = r#"UPDATE tasks SET state=?, completion_time=?, output=?, version=version+1 WHERE id=? AND ssn_id=? RETURNING *"#;
-
-        let task: TaskDao = sqlx::query_as(sql)
-            .bind::<i32>(task_result.state.into())
-            .bind(completion_time)
-            .bind::<Option<Vec<u8>>>(task_result.output.map(Bytes::into))
-            .bind(gid.task_id)
-            .bind(gid.ssn_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        task.try_into()
+        let workspace = gid.workspace.as_str();
+        let session = gid.session.as_str();
+        let completion = result.state.is_terminal().then(|| Utc::now().timestamp());
+        let dao:TaskDao=sqlx::query_as("UPDATE tasks SET state=?,output=?,completion_time=?,version=version+1 WHERE workspace=? AND session=? AND name=? RETURNING *")
+            .bind(result.state as i32).bind(result.output.map(|x| x.to_vec())).bind(completion)
+            .bind(workspace).bind(session).bind(task).fetch_one(&self.pool).await
+            .map_err(|e|if matches!(e,sqlx::Error::RowNotFound){missing("task",task)}else{storage(e)})?;
+        dao.try_into()
     }
-
-    async fn find_tasks(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let sql = "SELECT * FROM tasks WHERE ssn_id=?";
-        let task_list: Vec<TaskDao> = sqlx::query_as(sql)
-            .bind(ssn_id)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let tasks: Vec<Task> = task_list
-            .iter()
-            .map(Task::try_from)
-            .filter_map(Result::ok)
-            .collect();
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        Ok(tasks)
+    async fn find_tasks(&self, gid: &SessionGID) -> Result<Vec<Task>, FlameError> {
+        let workspace = gid.workspace.as_str();
+        let session = gid.session.as_str();
+        let rows: Vec<TaskDao> = sqlx::query_as(
+            "SELECT * FROM tasks WHERE workspace=? AND session=? ORDER BY length(name), name",
+        )
+        .bind(workspace)
+        .bind(session)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        rows.into_iter().map(Task::try_from).collect()
     }
-
-    // Node operations
-
     async fn create_node(&self, node: &Node) -> Result<Node, FlameError> {
-        trace_fn!("Sqlite::create_node");
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let now = Utc::now().timestamp();
-        let sql = r#"INSERT INTO nodes 
-            (name, state, capacity_cpu, capacity_memory, capacity_gpu,
-             allocatable_cpu, allocatable_memory, allocatable_gpu,
-             info_arch, info_os, creation_time, last_heartbeat)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            RETURNING *"#;
-
-        let dao: NodeDao = sqlx::query_as(sql)
-            .bind(&node.name)
-            .bind(i32::from(node.state))
-            .bind(node.capacity.cpu as i64)
-            .bind(node.capacity.memory as i64)
-            .bind(node.capacity.gpu as i64)
-            .bind(node.allocatable.cpu as i64)
-            .bind(node.allocatable.memory as i64)
-            .bind(node.allocatable.gpu as i64)
-            .bind(&node.info.arch)
-            .bind(&node.info.os)
-            .bind(now)
-            .bind(now)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to create node: {e}")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
+        let dao:NodeDao=sqlx::query_as("INSERT INTO nodes (id,name,state,capacity_cpu,capacity_memory,capacity_gpu,allocatable_cpu,allocatable_memory,allocatable_gpu,info_arch,info_os,creation_time,last_heartbeat) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING *")
+            .bind(&node.id).bind(&node.name).bind(i32::from(node.state))
+            .bind(node.capacity.cpu as i64).bind(node.capacity.memory as i64).bind(node.capacity.gpu as i64)
+            .bind(node.allocatable.cpu as i64).bind(node.allocatable.memory as i64).bind(node.allocatable.gpu as i64)
+            .bind(&node.info.arch).bind(&node.info.os).bind(Utc::now().timestamp()).bind(Utc::now().timestamp())
+            .fetch_one(&self.pool).await.map_err(|e|unique(e,"node"))?;
         dao.try_into()
     }
-
     async fn get_node(&self, name: &str) -> Result<Option<Node>, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let sql = "SELECT * FROM nodes WHERE name=?";
-        let dao: Option<NodeDao> = sqlx::query_as(sql)
+        let dao: Option<NodeDao> = sqlx::query_as("SELECT * FROM nodes WHERE name=?")
             .bind(name)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&self.pool)
             .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        match dao {
-            Some(d) => Ok(Some(d.try_into()?)),
-            None => Ok(None),
-        }
+            .map_err(storage)?;
+        dao.map(Node::try_from).transpose()
     }
-
     async fn update_node(&self, node: &Node) -> Result<Node, FlameError> {
-        trace_fn!("Sqlite::update_node");
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let sql = r#"UPDATE nodes 
-            SET state=?, capacity_cpu=?, capacity_memory=?, capacity_gpu=?,
-                allocatable_cpu=?, allocatable_memory=?, allocatable_gpu=?,
-                info_arch=?, info_os=?, last_heartbeat=?
-            WHERE name=?
-            RETURNING *"#;
-
-        let dao: NodeDao = sqlx::query_as(sql)
-            .bind(i32::from(node.state))
-            .bind(node.capacity.cpu as i64)
-            .bind(node.capacity.memory as i64)
-            .bind(node.capacity.gpu as i64)
-            .bind(node.allocatable.cpu as i64)
-            .bind(node.allocatable.memory as i64)
-            .bind(node.allocatable.gpu as i64)
-            .bind(&node.info.arch)
-            .bind(&node.info.os)
-            .bind(Utc::now().timestamp())
-            .bind(&node.name)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to update node: {e}")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
+        let dao:NodeDao=sqlx::query_as("UPDATE nodes SET state=?,capacity_cpu=?,capacity_memory=?,capacity_gpu=?,allocatable_cpu=?,allocatable_memory=?,allocatable_gpu=?,info_arch=?,info_os=?,last_heartbeat=? WHERE name=? RETURNING *")
+            .bind(i32::from(node.state)).bind(node.capacity.cpu as i64).bind(node.capacity.memory as i64).bind(node.capacity.gpu as i64)
+            .bind(node.allocatable.cpu as i64).bind(node.allocatable.memory as i64).bind(node.allocatable.gpu as i64)
+            .bind(&node.info.arch).bind(&node.info.os).bind(Utc::now().timestamp()).bind(&node.name)
+            .fetch_one(&self.pool).await.map_err(|e|if matches!(e,sqlx::Error::RowNotFound){missing("node",&node.name)}else{storage(e)})?;
         dao.try_into()
     }
-
     async fn delete_node(&self, name: &str) -> Result<(), FlameError> {
-        trace_fn!("Sqlite::delete_node");
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        // Note: executors are automatically deleted via ON DELETE CASCADE foreign key constraint
-        let sql = "DELETE FROM nodes WHERE name=?";
-        sqlx::query(sql)
+        sqlx::query("DELETE FROM nodes WHERE name=?")
             .bind(name)
-            .execute(&mut *tx)
+            .execute(&self.pool)
             .await
-            .map_err(|e| FlameError::Storage(format!("failed to delete node: {e}")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
+            .map_err(storage)?;
         Ok(())
     }
-
     async fn find_nodes(&self) -> Result<Vec<Node>, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
+        let rows: Vec<NodeDao> = sqlx::query_as("SELECT * FROM nodes")
+            .fetch_all(&self.pool)
             .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let sql = "SELECT * FROM nodes";
-        let daos: Vec<NodeDao> = sqlx::query_as(sql)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        Ok(daos
-            .iter()
-            .map(Node::try_from)
-            .filter_map(Result::ok)
-            .collect())
+            .map_err(storage)?;
+        rows.into_iter().map(Node::try_from).collect()
     }
-
-    // Executor operations
-
     async fn create_executor(&self, executor: &Executor) -> Result<Executor, FlameError> {
-        trace_fn!("Sqlite::create_executor");
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let sql = r#"INSERT INTO executors
-            (id, node, application, resreq_cpu, resreq_memory, resreq_gpu, shim, task_id, ssn_id, creation_time, state)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            RETURNING *"#;
-
-        let dao: ExecutorDao = sqlx::query_as(sql)
-            .bind(&executor.id)
-            .bind(&executor.node)
-            .bind(&executor.application)
-            .bind(executor.resreq.cpu as i64)
-            .bind(executor.resreq.memory as i64)
-            .bind(executor.resreq.gpu as i64)
-            .bind(i32::from(executor.shim))
-            .bind(executor.task_id)
-            .bind(&executor.ssn_id)
-            .bind(executor.creation_time.timestamp())
-            .bind(i32::from(executor.state))
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to create executor: {e}")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
+        let dao:ExecutorDao=sqlx::query_as("INSERT INTO executors (id,workspace,name,node,application,resreq_cpu,resreq_memory,resreq_gpu,shim,task,session,creation_time,state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING *")
+            .bind(&executor.id).bind(&executor.workspace).bind(&executor.name).bind(&executor.node).bind(&executor.application)
+            .bind(executor.resreq.cpu as i64).bind(executor.resreq.memory as i64).bind(executor.resreq.gpu as i64)
+            .bind(i32::from(executor.shim)).bind(&executor.task).bind(&executor.session).bind(executor.creation_time.timestamp())
+            .bind(i32::from(executor.state)).fetch_one(&self.pool).await.map_err(|e|unique(e,"executor"))?;
         dao.try_into()
     }
-
-    async fn get_executor(&self, id: &ExecutorID) -> Result<Option<Executor>, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let sql = "SELECT * FROM executors WHERE id=?";
-        let dao: Option<ExecutorDao> = sqlx::query_as(sql)
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        match dao {
-            Some(d) => Ok(Some(d.try_into()?)),
-            None => Ok(None),
-        }
+    async fn get_executor(&self, gid: &ExecutorGID) -> Result<Option<Executor>, FlameError> {
+        let workspace = gid.workspace.as_str();
+        let name = gid.executor.as_str();
+        let dao: Option<ExecutorDao> =
+            sqlx::query_as("SELECT * FROM executors WHERE workspace=? AND name=?")
+                .bind(workspace)
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(storage)?;
+        dao.map(Executor::try_from).transpose()
     }
-
     async fn update_executor(&self, executor: &Executor) -> Result<Executor, FlameError> {
-        trace_fn!("Sqlite::update_executor");
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let sql = r#"UPDATE executors
-            SET node=?, application=?, resreq_cpu=?, resreq_memory=?, resreq_gpu=?, shim=?,
-                task_id=?, ssn_id=?, state=?
-            WHERE id=?
-            RETURNING *"#;
-
-        let dao: ExecutorDao = sqlx::query_as(sql)
-            .bind(&executor.node)
-            .bind(&executor.application)
-            .bind(executor.resreq.cpu as i64)
-            .bind(executor.resreq.memory as i64)
-            .bind(executor.resreq.gpu as i64)
-            .bind(i32::from(executor.shim))
-            .bind(executor.task_id)
-            .bind(&executor.ssn_id)
-            .bind(i32::from(executor.state))
-            .bind(&executor.id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to update executor: {e}")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
+        let dao:ExecutorDao=sqlx::query_as("UPDATE executors SET node=?,application=?,resreq_cpu=?,resreq_memory=?,resreq_gpu=?,shim=?,task=?,session=?,state=? WHERE workspace=? AND name=? RETURNING *")
+            .bind(&executor.node).bind(&executor.application).bind(executor.resreq.cpu as i64)
+            .bind(executor.resreq.memory as i64).bind(executor.resreq.gpu as i64).bind(i32::from(executor.shim))
+            .bind(&executor.task).bind(&executor.session).bind(i32::from(executor.state))
+            .bind(&executor.workspace).bind(&executor.name).fetch_one(&self.pool).await
+            .map_err(|e|if matches!(e,sqlx::Error::RowNotFound){missing("executor",&executor.name)}else{storage(e)})?;
         dao.try_into()
     }
-
     async fn update_executor_state(
         &self,
-        id: &ExecutorID,
+        gid: &ExecutorGID,
         state: ExecutorState,
     ) -> Result<Executor, FlameError> {
-        trace_fn!("Sqlite::update_executor_state");
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let sql = r#"UPDATE executors SET state=? WHERE id=? RETURNING *"#;
-
-        let dao: ExecutorDao = sqlx::query_as(sql)
-            .bind(i32::from(state))
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to update executor state: {e}")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
+        let workspace = gid.workspace.as_str();
+        let name = gid.executor.as_str();
+        let dao: ExecutorDao =
+            sqlx::query_as("UPDATE executors SET state=? WHERE workspace=? AND name=? RETURNING *")
+                .bind(i32::from(state))
+                .bind(workspace)
+                .bind(name)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| {
+                    if matches!(e, sqlx::Error::RowNotFound) {
+                        missing("executor", name)
+                    } else {
+                        storage(e)
+                    }
+                })?;
         dao.try_into()
     }
-
-    async fn delete_executor(&self, id: &ExecutorID) -> Result<(), FlameError> {
-        trace_fn!("Sqlite::delete_executor");
-
-        let mut tx = self
-            .pool
-            .begin()
+    async fn delete_executor(&self, gid: &ExecutorGID) -> Result<(), FlameError> {
+        let workspace = gid.workspace.as_str();
+        let name = gid.executor.as_str();
+        sqlx::query("DELETE FROM executors WHERE workspace=? AND name=?")
+            .bind(workspace)
+            .bind(name)
+            .execute(&self.pool)
             .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let sql = "DELETE FROM executors WHERE id=?";
-        sqlx::query(sql)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(format!("failed to delete executor: {e}")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
+            .map_err(storage)?;
         Ok(())
     }
-
     async fn find_executors(&self, node: Option<&str>) -> Result<Vec<Executor>, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let daos: Vec<ExecutorDao> = match node {
-            Some(node_name) => {
-                let sql = "SELECT * FROM executors WHERE node=?";
-                sqlx::query_as(sql)
-                    .bind(node_name)
-                    .fetch_all(&mut *tx)
-                    .await
-                    .map_err(|e| FlameError::Storage(e.to_string()))?
-            }
-            None => {
-                let sql = "SELECT * FROM executors";
-                sqlx::query_as(sql)
-                    .fetch_all(&mut *tx)
-                    .await
-                    .map_err(|e| FlameError::Storage(e.to_string()))?
-            }
+        let rows: Vec<ExecutorDao> = match node {
+            Some(n) => sqlx::query_as("SELECT * FROM executors WHERE node=?")
+                .bind(n)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(storage)?,
+            None => sqlx::query_as("SELECT * FROM executors")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(storage)?,
         };
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        Ok(daos
-            .iter()
-            .map(Executor::try_from)
-            .filter_map(Result::ok)
-            .collect())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::apis::ApplicationState;
-
-    use super::*;
-
-    fn test_applications() -> Vec<(String, ApplicationAttributes)> {
-        ["flmexec", "flmping", "flmrun"]
-            .into_iter()
-            .map(|name| (name.to_string(), ApplicationAttributes::default()))
-            .collect()
-    }
-
-    #[test]
-    fn test_create_session_normalizes_batch_size() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_create_session_normalizes_batch_size");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-
-        for (name, attr) in test_applications() {
-            tokio_test::block_on(storage.register_application(name.clone(), attr))?;
-        }
-
-        let ssn_id = format!("ssn-batch-{}", Utc::now().timestamp());
-        let ssn = tokio_test::block_on(storage.create_session(SessionAttributes {
-            tokens: [("service".into(), "credential".into())].into(),
-            id: ssn_id.clone(),
-            application: "flmexec".to_string(),
-            common_data: None,
-            min_instances: 2,
-            max_instances: Some(4),
-            batch_size: 2,
-            priority: 0,
-            resreq: None,
-        }))?;
-
-        assert_eq!(ssn.batch_size, 1);
-
-        let ssn = tokio_test::block_on(storage.get_session(ssn_id))?;
-        assert_eq!(ssn.batch_size, 1);
-        assert_eq!(
-            ssn.tokens.get("service").map(String::as_str),
-            Some("credential")
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_get_task_with_events() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_get_task_with_events");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-
-        for (name, attr) in test_applications() {
-            tokio_test::block_on(storage.register_application(name.clone(), attr))?;
-        }
-
-        let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
-        let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
-            tokens: Default::default(),
-            id: ssn_1_id.clone(),
-            application: "flmexec".to_string(),
-            common_data: None,
-            min_instances: 0,
-            max_instances: None,
-            batch_size: 1,
-            priority: 0,
-            resreq: None,
-        }))?;
-        assert_eq!(ssn_1.id, ssn_1_id);
-        assert_eq!(ssn_1.application, "flmexec");
-        assert_eq!(ssn_1.status.state, SessionState::Open);
-
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
-        assert_eq!(task_1_1.id, 1);
-        let tasks = tokio_test::block_on(storage.find_tasks(ssn_1.id.clone()))?;
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].id, 1);
-        assert_eq!(tasks[0].ssn_id, ssn_1.id.clone());
-        assert_eq!(tasks[0].state, TaskState::Pending);
-        assert_eq!(tasks[0].input, None);
-        assert_eq!(tasks[0].output, None);
-
-        let task_1_1 = tokio_test::block_on(storage.update_task_state(
-            task_1_1.gid(),
-            TaskState::Succeed,
-            Some("Task succeeded".to_string()),
-        ))?;
-        assert_eq!(task_1_1.state, TaskState::Succeed);
-        let tasks = tokio_test::block_on(storage.find_tasks(ssn_1.id.clone()))?;
-
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].id, 1);
-        assert_eq!(tasks[0].ssn_id, ssn_1.id.clone());
-        assert_eq!(tasks[0].state, TaskState::Succeed);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_update_application() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_update_application");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-
-        for (name, attr) in test_applications() {
-            tokio_test::block_on(storage.register_application(name.clone(), attr))?;
-        }
-
-        let app_1 = tokio_test::block_on(storage.get_application("flmexec".to_string()))?;
-        assert_eq!(app_1.name, "flmexec");
-        assert_eq!(app_1.state, ApplicationState::Enabled);
-
-        let app_2 = tokio_test::block_on(storage.update_application(
-            "flmexec".to_string(),
-            ApplicationAttributes {
-                shim: Shim::Cri,
-                description: Some("This is my agent for testing.".to_string()),
-                labels: vec!["test".to_string(), "agent".to_string()],
-                image: Some("may-agent".to_string()),
-                command: Some("run-agent".to_string()),
-                arguments: vec!["--test".to_string(), "--agent".to_string()],
-                environments: HashMap::from([("TEST".to_string(), "true".to_string())]),
-                working_directory: Some("/tmp".to_string()),
-                max_instances: 10,
-                delay_release: Duration::seconds(0),
-                schema: None,
-                url: None,
-                installer: None,
-            },
-        ))?;
-        assert_eq!(app_2.name, "flmexec");
-        assert_eq!(app_2.shim, Shim::Cri);
-        assert_eq!(app_2.image.as_deref(), Some("may-agent"));
-        assert_eq!(
-            app_2.description,
-            Some("This is my agent for testing.".to_string())
-        );
-        assert_eq!(app_2.labels, vec!["test".to_string(), "agent".to_string()]);
-        assert_eq!(app_2.command, Some("run-agent".to_string()));
-        assert_eq!(
-            app_2.arguments,
-            vec!["--test".to_string(), "--agent".to_string()]
-        );
-        assert_eq!(
-            app_2.environments,
-            HashMap::from([("TEST".to_string(), "true".to_string())])
-        );
-        assert_eq!(app_2.working_directory, Some("/tmp".to_string()));
-        assert_eq!(app_2.max_instances, 10);
-        assert_eq!(app_2.delay_release, Duration::seconds(0));
-        assert!(app_2.schema.is_none());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_application_state_update_and_filter() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_application_state_update_and_filter");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-        tokio_test::block_on(
-            storage
-                .register_application("enabled-app".to_string(), ApplicationAttributes::default()),
-        )?;
-        tokio_test::block_on(
-            storage
-                .register_application("disabled-app".to_string(), ApplicationAttributes::default()),
-        )?;
-
-        let disabled = tokio_test::block_on(
-            storage
-                .update_application_state("disabled-app".to_string(), ApplicationState::Disabled),
-        )?;
-        assert_eq!(disabled.version, 2);
-        let unchanged = tokio_test::block_on(
-            storage
-                .update_application_state("disabled-app".to_string(), ApplicationState::Disabled),
-        )?;
-        assert_eq!(unchanged.version, disabled.version);
-
-        let result = tokio_test::block_on(storage.update_application(
-            "disabled-app".to_string(),
-            ApplicationAttributes {
-                image: Some("must-not-be-written".to_string()),
-                ..Default::default()
-            },
-        ));
-        assert!(matches!(result, Err(FlameError::InvalidState(_))));
-        let unchanged = tokio_test::block_on(storage.get_application("disabled-app".to_string()))?;
-        assert_eq!(unchanged.version, disabled.version);
-        assert_eq!(unchanged.image, disabled.image);
-
-        let filter = ApplicationFilter::by_state(ApplicationState::Disabled);
-        let apps = tokio_test::block_on(storage.find_applications(Some(&filter)))?;
-        assert_eq!(apps.len(), 1);
-        assert_eq!(apps[0].name, "disabled-app");
-
-        let result = tokio_test::block_on(storage.delete_application("enabled-app".to_string()));
-        assert!(matches!(result, Err(FlameError::InvalidState(_))));
-        Ok(())
-    }
-
-    #[test]
-    fn test_unregister_application() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_unregister_application");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-
-        for (name, attr) in test_applications() {
-            tokio_test::block_on(storage.register_application(name.clone(), attr))?;
-        }
-
-        let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
-
-        let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
-            tokens: Default::default(),
-            id: ssn_1_id.clone(),
-            application: "flmexec".to_string(),
-            common_data: None,
-            min_instances: 0,
-            max_instances: None,
-            batch_size: 1,
-            priority: 0,
-            resreq: None,
-        }))?;
-        assert_eq!(ssn_1.id, ssn_1_id);
-        assert_eq!(ssn_1.application, "flmexec");
-        assert_eq!(ssn_1.status.state, SessionState::Open);
-
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id, None, None))?;
-        assert_eq!(task_1_1.id, 1);
-        let res = tokio_test::block_on(storage.delete_application("flmexec".to_string()));
-        assert!(res.is_err());
-
-        let task_1_1 = tokio_test::block_on(storage.get_task(task_1_1.gid()))?;
-        assert_eq!(task_1_1.state, TaskState::Pending);
-
-        let task_1_1 = tokio_test::block_on(storage.update_task_state(
-            task_1_1.gid(),
-            TaskState::Succeed,
-            None,
-        ))?;
-        assert_eq!(task_1_1.state, TaskState::Succeed);
-
-        let res = tokio_test::block_on(storage.delete_application("flmexec".to_string()));
-        assert!(res.is_err());
-
-        let ssn_1 = tokio_test::block_on(storage.close_session(ssn_1_id.clone()))?;
-        assert_eq!(ssn_1.status.state, SessionState::Closed);
-
-        tokio_test::block_on(
-            storage.update_application_state("flmexec".to_string(), ApplicationState::Disabled),
-        )?;
-        let res = tokio_test::block_on(storage.delete_application("flmexec".to_string()));
-        assert!(matches!(res, Err(FlameError::InvalidState(_))));
-
-        let list_ssn = tokio_test::block_on(storage.find_sessions())?;
-        assert_eq!(list_ssn.len(), 1);
-        assert_eq!(list_ssn[0].id, ssn_1_id);
-
-        tokio_test::block_on(storage.delete_session(ssn_1_id))?;
-        tokio_test::block_on(storage.delete_application("flmexec".to_string()))?;
-
-        let app_1 = tokio_test::block_on(storage.get_application("flmexec".to_string()));
-        assert!(app_1.is_err());
-
-        let list_ssn = tokio_test::block_on(storage.find_sessions())?;
-        assert_eq!(list_ssn.len(), 0);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_register_application() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_register_appl");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-
-        let string_schema = json!({
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "type": "string",
-            "description": "The string for testing."
-        });
-
-        let apps = vec![
-            (
-                "my-test-agent-1".to_string(),
-                ApplicationAttributes {
-                    shim: Shim::Host,
-                    image: Some("may-agent".to_string()),
-                    description: Some("This is my agent for testing.".to_string()),
-                    labels: vec!["test".to_string(), "agent".to_string()],
-                    command: Some("my-agent".to_string()),
-                    arguments: vec!["--test".to_string(), "--agent".to_string()],
-                    environments: HashMap::from([("TEST".to_string(), "true".to_string())]),
-                    working_directory: Some("/tmp".to_string()),
-                    max_instances: 10,
-                    delay_release: Duration::seconds(0),
-                    schema: Some(ApplicationSchema {
-                        input: Some(string_schema.to_string()),
-                        output: Some(string_schema.to_string()),
-                        common_data: None,
-                    }),
-                    url: None,
-                    installer: None,
-                },
-            ),
-            (
-                "empty-app".to_string(),
-                ApplicationAttributes {
-                    shim: Shim::Host,
-                    image: None,
-                    description: None,
-                    labels: vec![],
-                    command: None,
-                    arguments: vec![],
-                    environments: HashMap::new(),
-                    working_directory: Some("/tmp".to_string()),
-                    max_instances: 10,
-                    delay_release: Duration::seconds(0),
-                    schema: None,
-                    url: None,
-                    installer: None,
-                },
-            ),
-        ];
-        for (name, attr) in apps {
-            let expected_shim = attr.shim;
-            let expected_image = attr.image.clone();
-            tokio_test::block_on(storage.register_application(name.clone(), attr)).map_err(
-                |e| FlameError::Storage(format!("failed to register application <{name}>: {e}")),
-            )?;
-            let app_1 =
-                tokio_test::block_on(storage.get_application(name.clone())).map_err(|e| {
-                    FlameError::Storage(format!("failed to get application <{name}>: {e}"))
-                })?;
-
-            assert_eq!(app_1.name, name);
-            assert_eq!(app_1.state, ApplicationState::Enabled);
-            assert_eq!(app_1.shim, expected_shim);
-            assert_eq!(app_1.image, expected_image);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_register_duplicate_application_returns_already_exists() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_register_duplicate_app");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-
-        tokio_test::block_on(
-            storage.register_application("duplicate".to_string(), ApplicationAttributes::default()),
-        )?;
-        let error = tokio_test::block_on(
-            storage.register_application("duplicate".to_string(), ApplicationAttributes::default()),
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, FlameError::AlreadyExist(_)));
-        Ok(())
-    }
-
-    #[test]
-    fn test_get_application() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_app");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-
-        for (name, attr) in test_applications() {
-            tokio_test::block_on(storage.register_application(name.clone(), attr))?;
-        }
-
-        let app_1 = tokio_test::block_on(storage.get_application("flmexec".to_string()))?;
-
-        assert_eq!(app_1.name, "flmexec");
-        assert_eq!(app_1.state, ApplicationState::Enabled);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_register_application_with_url() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_register_app_with_url");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-
-        let test_url = "file:///opt/test-package.whl".to_string();
-
-        // Register application with URL
-        let app = tokio_test::block_on(storage.register_application(
-            "flmtestapp-url".to_string(),
-            ApplicationAttributes {
-                shim: Shim::Host,
-                image: None,
-                description: Some("Test application with URL".to_string()),
-                labels: vec!["test".to_string()],
-                command: Some("/usr/bin/uv".to_string()),
-                arguments: vec![
-                    "run".to_string(),
-                    "-n".to_string(),
-                    "flamepy.app.runpy".to_string(),
-                ],
-                environments: HashMap::new(),
-                working_directory: Some("/tmp".to_string()),
-                max_instances: 5,
-                delay_release: Duration::seconds(10),
-                schema: None,
-                url: Some(test_url.clone()),
-                installer: None,
-            },
-        ))?;
-
-        // Verify application was registered with URL
-        assert_eq!(app.name, "flmtestapp-url");
-        assert_eq!(app.url, Some(test_url.clone()));
-        assert_eq!(
-            app.description,
-            Some("Test application with URL".to_string())
-        );
-        assert_eq!(app.state, ApplicationState::Enabled);
-
-        // Retrieve and verify URL persisted
-        let retrieved_app =
-            tokio_test::block_on(storage.get_application("flmtestapp-url".to_string()))?;
-        assert_eq!(retrieved_app.name, "flmtestapp-url");
-        assert_eq!(retrieved_app.url, Some(test_url));
-        assert_eq!(
-            retrieved_app.description,
-            Some("Test application with URL".to_string())
-        );
-        assert_eq!(retrieved_app.state, ApplicationState::Enabled);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_register_application_without_url() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_register_app_without_url");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-
-        // Register application without URL (backward compatibility test)
-        let app = tokio_test::block_on(storage.register_application(
-            "flmtestapp-no-url".to_string(),
-            ApplicationAttributes {
-                shim: Shim::Host,
-                image: None,
-                description: Some("Test application without URL".to_string()),
-                labels: vec!["test".to_string()],
-                command: Some("/usr/bin/test".to_string()),
-                arguments: vec![],
-                environments: HashMap::new(),
-                working_directory: Some("/tmp".to_string()),
-                max_instances: 5,
-                delay_release: Duration::seconds(10),
-                schema: None,
-                url: None,
-                installer: None,
-            },
-        ))?;
-
-        // Verify application was registered without URL
-        assert_eq!(app.name, "flmtestapp-no-url");
-        assert_eq!(app.url, None);
-        assert_eq!(
-            app.description,
-            Some("Test application without URL".to_string())
-        );
-        assert_eq!(app.state, ApplicationState::Enabled);
-
-        // Retrieve and verify URL is None
-        let retrieved_app =
-            tokio_test::block_on(storage.get_application("flmtestapp-no-url".to_string()))?;
-        assert_eq!(retrieved_app.name, "flmtestapp-no-url");
-        assert_eq!(retrieved_app.url, None);
-        assert_eq!(retrieved_app.state, ApplicationState::Enabled);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_update_application_with_url() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_update_application_with_url");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-
-        // Register initial application without URL
-        tokio_test::block_on(storage.register_application(
-            "flmtestapp-update".to_string(),
-            ApplicationAttributes {
-                shim: Shim::Host,
-                image: None,
-                description: Some("Initial description".to_string()),
-                labels: vec![],
-                command: Some("/usr/bin/test".to_string()),
-                arguments: vec![],
-                environments: HashMap::new(),
-                working_directory: Some("/tmp".to_string()),
-                max_instances: 5,
-                delay_release: Duration::seconds(10),
-                schema: None,
-                url: None,
-                installer: None,
-            },
-        ))?;
-
-        let app_before =
-            tokio_test::block_on(storage.get_application("flmtestapp-update".to_string()))?;
-        assert_eq!(app_before.url, None);
-
-        // Update application with URL
-        let test_url = "file:///opt/updated-package.whl".to_string();
-        let updated_app = tokio_test::block_on(storage.update_application(
-            "flmtestapp-update".to_string(),
-            ApplicationAttributes {
-                shim: Shim::Host,
-                image: Some("updated-image".to_string()),
-                description: Some("Updated description".to_string()),
-                labels: vec!["updated".to_string()],
-                command: Some("/usr/bin/uv".to_string()),
-                arguments: vec!["run".to_string()],
-                environments: HashMap::from([("ENV".to_string(), "test".to_string())]),
-                working_directory: Some("/opt".to_string()),
-                max_instances: 10,
-                delay_release: Duration::seconds(20),
-                schema: None,
-                url: Some(test_url.clone()),
-                installer: None,
-            },
-        ))?;
-
-        // Verify update including URL
-        assert_eq!(updated_app.name, "flmtestapp-update");
-        assert_eq!(updated_app.url, Some(test_url.clone()));
-        assert_eq!(
-            updated_app.description,
-            Some("Updated description".to_string())
-        );
-        // Note: image field is not updated by update_application method
-        assert_eq!(updated_app.working_directory, Some("/opt".to_string()));
-        assert_eq!(updated_app.max_instances, 10);
-
-        // Retrieve and verify URL persisted after update
-        let retrieved_app =
-            tokio_test::block_on(storage.get_application("flmtestapp-update".to_string()))?;
-        assert_eq!(retrieved_app.url, Some(test_url));
-        assert_eq!(
-            retrieved_app.description,
-            Some("Updated description".to_string())
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_single_session() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_single_session");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-        for (name, attr) in test_applications() {
-            tokio_test::block_on(storage.register_application(name.clone(), attr))?;
-        }
-
-        let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
-        let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
-            tokens: Default::default(),
-            id: ssn_1_id.clone(),
-            application: "flmexec".to_string(),
-            common_data: None,
-            min_instances: 0,
-            max_instances: None,
-            batch_size: 1,
-            priority: 0,
-            resreq: None,
-        }))?;
-
-        assert_eq!(ssn_1.id, ssn_1_id);
-        assert_eq!(ssn_1.application, "flmexec");
-        assert_eq!(ssn_1.status.state, SessionState::Open);
-
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
-        assert_eq!(task_1_1.id, 1);
-
-        let task_1_2 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
-        assert_eq!(task_1_2.id, 2);
-
-        let task_list = tokio_test::block_on(storage.find_tasks(ssn_1.id))?;
-        assert_eq!(task_list.len(), 2);
-
-        let task_1_1 = tokio_test::block_on(storage.update_task_state(
-            task_1_1.gid(),
-            TaskState::Succeed,
-            None,
-        ))?;
-        assert_eq!(task_1_1.state, TaskState::Succeed);
-
-        let task_1_2 = tokio_test::block_on(storage.update_task_state(
-            task_1_2.gid(),
-            TaskState::Succeed,
-            None,
-        ))?;
-        assert_eq!(task_1_2.state, TaskState::Succeed);
-
-        let ssn_1 = tokio_test::block_on(storage.close_session(ssn_1_id.clone()))?;
-        assert_eq!(ssn_1.status.state, SessionState::Closed);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_multiple_session() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_multiple_session");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-        for (name, attr) in test_applications() {
-            tokio_test::block_on(storage.register_application(name.clone(), attr))?;
-        }
-
-        let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
-        let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
-            tokens: Default::default(),
-            id: ssn_1_id.clone(),
-            application: "flmexec".to_string(),
-            common_data: None,
-            min_instances: 0,
-            max_instances: None,
-            batch_size: 1,
-            priority: 0,
-            resreq: None,
-        }))?;
-
-        assert_eq!(ssn_1.id, ssn_1_id);
-        assert_eq!(ssn_1.application, "flmexec");
-        assert_eq!(ssn_1.status.state, SessionState::Open);
-
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
-        assert_eq!(task_1_1.id, 1);
-
-        let task_1_2 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
-        assert_eq!(task_1_2.id, 2);
-
-        let task_1_1 = tokio_test::block_on(storage.update_task_state(
-            task_1_1.gid(),
-            TaskState::Succeed,
-            None,
-        ))?;
-        assert_eq!(task_1_1.state, TaskState::Succeed);
-
-        let task_1_2 = tokio_test::block_on(storage.update_task_state(
-            task_1_2.gid(),
-            TaskState::Succeed,
-            None,
-        ))?;
-        assert_eq!(task_1_2.state, TaskState::Succeed);
-
-        let ssn_2_id = format!("ssn-2-{}", Utc::now().timestamp());
-        let ssn_2 = tokio_test::block_on(storage.create_session(SessionAttributes {
-            tokens: Default::default(),
-            id: ssn_2_id.clone(),
-            application: "flmping".to_string(),
-            common_data: None,
-            min_instances: 0,
-            max_instances: None,
-            batch_size: 1,
-            priority: 0,
-            resreq: None,
-        }))?;
-
-        assert_eq!(ssn_2.id, ssn_2_id);
-        assert_eq!(ssn_2.application, "flmping");
-        assert_eq!(ssn_2.status.state, SessionState::Open);
-
-        let task_2_1 = tokio_test::block_on(storage.create_task(ssn_2.id.clone(), None, None))?;
-        assert_eq!(task_2_1.id, 1);
-
-        let task_2_2 = tokio_test::block_on(storage.create_task(ssn_2.id.clone(), None, None))?;
-        assert_eq!(task_2_2.id, 2);
-
-        let task_2_1 = tokio_test::block_on(storage.update_task_state(
-            task_2_1.gid(),
-            TaskState::Succeed,
-            None,
-        ))?;
-        assert_eq!(task_2_1.state, TaskState::Succeed);
-
-        let task_2_2 = tokio_test::block_on(storage.update_task_state(
-            task_2_2.gid(),
-            TaskState::Succeed,
-            None,
-        ))?;
-        assert_eq!(task_2_2.state, TaskState::Succeed);
-
-        let ssn_list = tokio_test::block_on(storage.find_sessions())?;
-        assert_eq!(ssn_list.len(), 2);
-
-        let ssn_1 = tokio_test::block_on(storage.close_session(ssn_1_id.clone()))?;
-        assert_eq!(ssn_1.status.state, SessionState::Closed);
-        let ssn_2 = tokio_test::block_on(storage.close_session(ssn_2_id.clone()))?;
-        assert_eq!(ssn_2.status.state, SessionState::Closed);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_close_session_with_open_tasks() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_close_session_with_open_tasks");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-        for (name, attr) in test_applications() {
-            tokio_test::block_on(storage.register_application(name.clone(), attr))?;
-        }
-        let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
-        let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
-            tokens: Default::default(),
-            id: ssn_1_id.clone(),
-            application: "flmexec".to_string(),
-            common_data: None,
-            min_instances: 0,
-            max_instances: None,
-            batch_size: 1,
-            priority: 0,
-            resreq: None,
-        }))?;
-
-        assert_eq!(ssn_1.id, ssn_1_id);
-        assert_eq!(ssn_1.application, "flmexec");
-        assert_eq!(ssn_1.status.state, SessionState::Open);
-
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
-        assert_eq!(task_1_1.id, 1);
-
-        let task_1_2 = tokio_test::block_on(storage.create_task(ssn_1.id, None, None))?;
-        assert_eq!(task_1_2.id, 2);
-
-        let ssn_1 = tokio_test::block_on(storage.close_session(ssn_1_id.clone()))?;
-        assert_eq!(ssn_1.status.state, SessionState::Closed);
-
-        let task_1_1 = tokio_test::block_on(storage.get_task(task_1_1.gid()))?;
-        assert_eq!(task_1_1.state, TaskState::Cancelled);
-
-        let task_1_2 = tokio_test::block_on(storage.get_task(task_1_2.gid()))?;
-        assert_eq!(task_1_2.state, TaskState::Cancelled);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_close_session_with_running_tasks() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_close_session_with_running_tasks");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-        for (name, attr) in test_applications() {
-            tokio_test::block_on(storage.register_application(name.clone(), attr))?;
-        }
-        let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
-        let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
-            tokens: Default::default(),
-            id: ssn_1_id.clone(),
-            application: "flmexec".to_string(),
-            common_data: None,
-            min_instances: 0,
-            max_instances: None,
-            batch_size: 1,
-            priority: 0,
-            resreq: None,
-        }))?;
-
-        assert_eq!(ssn_1.status.state, SessionState::Open);
-
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
-        assert_eq!(task_1_1.state, TaskState::Pending);
-
-        tokio_test::block_on(storage.update_task_state(task_1_1.gid(), TaskState::Running, None))?;
-
-        let res = tokio_test::block_on(storage.close_session(ssn_1_id.clone()));
-        assert!(res.is_err());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_task_for_close_session() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_create_task_for_close_session");
-
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-        for (name, attr) in test_applications() {
-            tokio_test::block_on(storage.register_application(name.clone(), attr))?;
-        }
-        let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
-        let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
-            tokens: Default::default(),
-            id: ssn_1_id.clone(),
-            application: "flmexec".to_string(),
-            common_data: None,
-            min_instances: 0,
-            max_instances: None,
-            batch_size: 1,
-            priority: 0,
-            resreq: None,
-        }))?;
-
-        assert_eq!(ssn_1.id, ssn_1_id);
-        assert_eq!(ssn_1.application, "flmexec");
-        assert_eq!(ssn_1.status.state, SessionState::Open);
-
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id, None, None))?;
-        assert_eq!(task_1_1.id, 1);
-
-        let task_1_1 = tokio_test::block_on(storage.update_task_state(
-            task_1_1.gid(),
-            TaskState::Succeed,
-            None,
-        ))?;
-        assert_eq!(task_1_1.state, TaskState::Succeed);
-
-        let ssn_1 = tokio_test::block_on(storage.close_session(ssn_1_id.clone()))?;
-        assert_eq!(ssn_1.status.state, SessionState::Closed);
-
-        let res = tokio_test::block_on(storage.create_task(ssn_1.id, None, None));
-        assert!(res.is_err());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_delete_session_with_open_tasks() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_delete_session_with_open_tasks");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-        for (name, attr) in test_applications() {
-            tokio_test::block_on(storage.register_application(name.clone(), attr))?;
-        }
-        let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
-        let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
-            tokens: Default::default(),
-            id: ssn_1_id.clone(),
-            application: "flmexec".to_string(),
-            common_data: None,
-            min_instances: 0,
-            max_instances: None,
-            batch_size: 1,
-            priority: 0,
-            resreq: None,
-        }))?;
-
-        assert_eq!(ssn_1.id, ssn_1_id);
-        assert_eq!(ssn_1.application, "flmexec");
-        assert_eq!(ssn_1.status.state, SessionState::Open);
-
-        let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
-        assert_eq!(task_1_1.id, 1);
-
-        // It should be failed because the session is open and there are open tasks
-        let res = tokio_test::block_on(storage.delete_session(ssn_1_id.clone()));
-        assert!(res.is_err());
-
-        let task_1_1 = tokio_test::block_on(storage.get_task(task_1_1.gid()))?;
-        assert_eq!(task_1_1.state, TaskState::Pending);
-
-        let task_1_1 = tokio_test::block_on(storage.update_task_state(
-            task_1_1.gid(),
-            TaskState::Succeed,
-            None,
-        ))?;
-        assert_eq!(task_1_1.state, TaskState::Succeed);
-
-        // It should be failed because the session is open
-        let res = tokio_test::block_on(storage.delete_session(ssn_1_id.clone()));
-        assert!(res.is_err());
-
-        let ssn_1 = tokio_test::block_on(storage.close_session(ssn_1_id.clone()))?;
-        assert_eq!(ssn_1.status.state, SessionState::Closed);
-
-        let ssn_1 = tokio_test::block_on(storage.delete_session(ssn_1_id.clone()))?;
-        assert_eq!(ssn_1.status.state, SessionState::Closed);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_delete_session_with_cancelled_tasks() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_delete_session_with_cancelled_tasks");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
-        tokio_test::block_on(
-            storage.register_application("flmexec".to_string(), ApplicationAttributes::default()),
-        )?;
-        let session_id = format!(
-            "cancelled-tasks-{}",
-            Utc::now().timestamp_nanos_opt().unwrap()
-        );
-        tokio_test::block_on(storage.create_session(SessionAttributes {
-            id: session_id.clone(),
-            application: "flmexec".to_string(),
-            ..Default::default()
-        }))?;
-        let task = tokio_test::block_on(storage.create_task(session_id.clone(), None, None))?;
-
-        tokio_test::block_on(storage.close_session(session_id.clone()))?;
-        assert_eq!(
-            tokio_test::block_on(storage.get_task(task.gid()))?.state,
-            TaskState::Cancelled
-        );
-        let deleted = tokio_test::block_on(storage.delete_session(session_id))?;
-        assert_eq!(deleted.status.state, SessionState::Closed);
-
-        Ok(())
+        rows.into_iter().map(Executor::try_from).collect()
     }
 }

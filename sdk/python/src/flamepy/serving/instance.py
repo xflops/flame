@@ -173,8 +173,8 @@ async def entrypoint_local_api(s: FastAPIRequest):
 
     output = instance.on_task_invoke(
         TaskContext(
-            task_id=s.query_params.get("task_id") or "0",
-            session_id=s.query_params.get("session_id") or "0",
+            task=s.query_params.get("task") or "0",
+            session=s.query_params.get("session") or "0",
             input=body_str,
         )
     )

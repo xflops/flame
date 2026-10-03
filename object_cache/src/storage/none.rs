@@ -75,8 +75,9 @@ mod tests {
 
     fn test_key() -> ObjectKey {
         ObjectKey {
-            app_name: "app".to_string(),
-            session_id: "session".to_string(),
+            workspace: "default".to_string(),
+            application: "app".to_string(),
+            session: "session".to_string(),
             object_id: Some("obj1".to_string()),
         }
     }
@@ -107,7 +108,7 @@ mod tests {
     #[tokio::test]
     async fn test_none_storage_delete_objects() {
         let storage = NoneStorage::new();
-        let key = ObjectKey::from_path("app/session").unwrap();
+        let key = ObjectKey::from_path("default/app/session").unwrap();
         storage.delete_objects(&key).await.unwrap();
     }
 

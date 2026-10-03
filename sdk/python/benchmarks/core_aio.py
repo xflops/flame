@@ -19,6 +19,7 @@ import asyncio
 import statistics
 import threading
 import time
+import uuid
 from concurrent.futures import wait
 
 import grpc
@@ -31,28 +32,28 @@ from flamepy.proto.frontend_pb2_grpc import FrontendServicer, add_FrontendServic
 
 class EchoFrontend(FrontendServicer):
     def __init__(self):
-        self.task_id = 0
+        self.task_number = 0
 
     async def CreateSession(self, request, context):  # noqa: N802
         return pb.Session(
-            metadata=pb.Metadata(id="benchmark-session"),
-            spec=pb.SessionSpec(application=request.session.application),
+            metadata=pb.Metadata(id="00000000-0000-4000-8000-000000000001", name="benchmark-session", workspace="default"),
+            spec=pb.SessionSpec(application=request.spec.application),
             status=pb.SessionStatus(state=SessionState.OPEN, creation_time=1),
         )
 
     async def CreateTask(self, request, context):  # noqa: N802
-        self.task_id += 1
-        return self._task(str(self.task_id), request.task.input)
+        self.task_number += 1
+        return self._task(str(self.task_number), request.task.input)
 
     async def WatchTasks(self, requests, context):  # noqa: N802
         async for request in requests:
-            yield self._task(request.task_id, b"ping")
+            yield self._task(request.task, b"ping")
 
     @staticmethod
-    def _task(task_id: str, payload: bytes):
+    def _task(task: str, payload: bytes):
         return pb.Task(
-            metadata=pb.Metadata(id=task_id),
-            spec=pb.TaskSpec(session_id="benchmark-session", input=payload, output=payload),
+            metadata=pb.Metadata(id=str(uuid.uuid4()), name=task, workspace="default"),
+            spec=pb.TaskSpec(session="benchmark-session", input=payload, output=payload),
             status=pb.TaskStatus(state=TaskState.SUCCEED, creation_time=1),
         )
 

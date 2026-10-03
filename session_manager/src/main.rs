@@ -75,7 +75,15 @@ async fn main() -> Result<(), FlameError> {
             let controller = controller.clone();
             move |name, attributes| {
                 let controller = controller.clone();
-                async move { controller.register_application(name, attributes).await }
+                async move {
+                    controller
+                        .register_application(
+                            common::apis::DEFAULT_WORKSPACE.to_string(),
+                            name,
+                            attributes,
+                        )
+                        .await
+                }
             }
         },
         {
@@ -83,14 +91,18 @@ async fn main() -> Result<(), FlameError> {
             move |name, attributes| {
                 let controller = controller.clone();
                 async move {
-                    let current = controller.get_application(name.clone()).await?;
+                    let current = controller
+                        .get_application(common::apis::DEFAULT_WORKSPACE, &name)
+                        .await?;
                     if current.state == common::apis::ApplicationState::Disabled {
                         return Ok(());
                     }
                     if applications::matches_attributes(&current, &attributes) {
                         return Ok(());
                     }
-                    controller.update_application(name, attributes).await
+                    controller
+                        .update_application(common::apis::DEFAULT_WORKSPACE, &name, attributes)
+                        .await
                 }
             }
         },

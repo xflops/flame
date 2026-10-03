@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ from flamepy.core.types import (
     TaskState,
     short_name,
 )
+from flamepy.util import short_name as util_short_name
 
 
 def test_session_spec_carries_tokens():
@@ -55,22 +57,22 @@ def test_sync_frontend_api_parity(frontend_server):
         assert connection.list_executors() == []
         assert connection.list_nodes() == []
 
-        attrs = SessionAttributes(application="app", id="sess-1", common_data=b"", resreq=ResourceRequirement(cpu=2))
+        attrs = SessionAttributes(application="app", name="sess-1", common_data=b"", resreq=ResourceRequirement(cpu=2))
         session = connection.create_session(attrs)
-        assert session.id == "sess-1" and session.common_data() == b""
+        assert session.name == "sess-1" and session.common_data() == b""
         assert session.events[0].code == 1001
-        assert connection.open_session("sess-1").id == session.id
-        assert connection.get_session("sess-1").id == session.id
+        assert connection.open_session("sess-1").name == session.name
+        assert connection.get_session("sess-1").name == session.name
         assert len(connection.list_sessions()) == 1
         task = session.create_task(b"input")
-        assert task.id == "task-1"
-        assert session.get_task(task.id).input == b""
-        assert [item.id for item in session.list_tasks()] == ["task-1"]
-        assert next(session.watch_task(task.id)).output == b"done"
+        assert task.name == "task-1"
+        assert session.get_task(task.name).input == b""
+        assert [item.name for item in session.list_tasks()] == ["task-1"]
+        assert next(session.watch_task(task.name)).output == b"done"
         assert session.run(b"input") == b"done"
-        assert connection.close_session(session.id).id == session.id
+        assert connection.close_session(session.name).name == session.name
         created = [req for req in service.requests if req.DESCRIPTOR.name == "CreateSessionRequest"]
-        assert created[0].session.resreq.cpu == 2
+        assert created[0].spec.resreq.cpu == 2
     finally:
         connection.close()
 
@@ -83,7 +85,7 @@ def test_failed_close_can_be_retried(frontend_server):
         service.reject_close = True
         with pytest.raises(FlameError, match="close rejected"):
             session.close()
-        assert connection.get_session(session.id).id == session.id
+        assert connection.get_session(session.name).name == session.name
         service.reject_close = False
         session.close()
     finally:
@@ -381,7 +383,7 @@ def test_slow_callbacks_bound_completion_jobs_without_blocking_aio(frontend_serv
             future.add_done_callback(callback)
         server_loop.call(_release(service))
         assert workers_started.wait(3)
-        assert session.get_task("task-1").id == "task-1"
+        assert session.get_task("task-1").name == "task-1"
         # The four occupied callback slots keep later watch tasks from
         # resolving; they do not create another unbounded completion queue.
         assert sum(future.done() for future in futures) <= 4
@@ -587,7 +589,7 @@ def test_dataclass_defaults_and_instantiation():
     ap_schema = ApplicationSchema()
     ap_attrs = ApplicationAttributes()
     dt = datetime.now(timezone.utc)
-    task = Task(id="tid", session_id="sid", state=TaskState.PENDING, creation_time=dt)
+    task = Task(id="00000000-0000-4000-8000-000000000002", name="tid", session="sid", state=TaskState.PENDING, creation_time=dt)
     app = Application(id="aid", name="n", state=ApplicationState.ENABLED, creation_time=dt)
     assert t.code == 1
     assert sa.application == "app"
@@ -734,13 +736,14 @@ def test_application_with_installer():
     assert app.installer == "curl -sSL https://install.sh | bash"
 
 
-def test_short_name_generation():
+@pytest.mark.parametrize("short_name", [short_name, util_short_name])
+def test_short_name_generation(short_name):
     s1 = short_name("foo", length=8)
     s2 = short_name("bar", length=8)
     assert s1.startswith("foo-")
     assert s2.startswith("bar-")
-    assert len(s1) >= len("foo-") + 8
-    assert len(s2) >= len("bar-") + 8
+    assert re.fullmatch(r"foo-[a-z0-9]{8}", s1)
+    assert re.fullmatch(r"bar-[a-z0-9]{8}", s2)
 
 
 def test_flame_context_env_overrides(tmp_path, monkeypatch):

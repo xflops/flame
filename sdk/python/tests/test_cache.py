@@ -160,37 +160,38 @@ class TestMaterializedCache:
 
 class TestObjectKey:
     def test_from_prefix_valid(self):
-        key = ObjectKey.from_prefix("myapp/pkg")
-        assert key.app_name == "myapp"
-        assert key.session_id == "pkg"
+        key = ObjectKey.from_prefix("default/myapp/pkg")
+        assert key.workspace == "default"
+        assert key.application == "myapp"
+        assert key.session == "pkg"
         assert key.object_id is None
 
     def test_from_key_valid(self):
-        key = ObjectKey.from_key("myapp/pkg/file.tar.gz")
-        assert key.app_name == "myapp"
-        assert key.session_id == "pkg"
+        key = ObjectKey.from_key("default/myapp/pkg/file.tar.gz")
+        assert key.application == "myapp"
+        assert key.session == "pkg"
         assert key.object_id == "file.tar.gz"
 
     def test_from_path_accepts_prefix_and_full_key(self):
-        prefix = ObjectKey.from_path("myapp/pkg")
-        full_key = ObjectKey.from_path("myapp/pkg/file.tar.gz")
+        prefix = ObjectKey.from_path("default/myapp/pkg")
+        full_key = ObjectKey.from_path("default/myapp/pkg/file.tar.gz")
 
-        assert prefix == ObjectKey(app_name="myapp", session_id="pkg")
-        assert full_key == ObjectKey(app_name="myapp", session_id="pkg", object_id="file.tar.gz")
+        assert prefix == ObjectKey(application="myapp", session="pkg")
+        assert full_key == ObjectKey(application="myapp", session="pkg", object_id="file.tar.gz")
 
     def test_from_prefix_invalid(self):
         with pytest.raises(ValueError):
             ObjectKey.from_prefix("invalid")
 
         with pytest.raises(ValueError):
-            ObjectKey.from_prefix("a/b/c")
+            ObjectKey.from_prefix("default/a/b/c")
 
     def test_from_key_invalid(self):
         with pytest.raises(ValueError):
             ObjectKey.from_key("a/b")
 
         with pytest.raises(ValueError):
-            ObjectKey.from_key("a/b/c/d")
+            ObjectKey.from_key("default/a/b/c/d")
 
     @pytest.mark.parametrize(
         "path",
@@ -202,7 +203,7 @@ class TestObjectKey:
             "app/session/",
             "*/session",
             "app/*/obj",
-            "app/session/*",
+            "default/app/session/*",
         ],
     )
     def test_from_path_rejects_invalid_components(self, path):
@@ -211,18 +212,18 @@ class TestObjectKey:
 
     def test_matches_key(self):
         all_sessions = ObjectKey.for_all_sessions("myapp")
-        session = ObjectKey.from_prefix("myapp/session")
-        exact = ObjectKey.from_key("myapp/session/obj1")
+        session = ObjectKey.from_prefix("default/myapp/session")
+        exact = ObjectKey.from_key("default/myapp/session/obj1")
 
-        assert all_sessions.matches_key("myapp/session/obj1")
-        assert all_sessions.matches_key("myapp/other/obj2")
-        assert not all_sessions.matches_key("other/session/obj1")
-        assert session.matches_key("myapp/session/obj1")
-        assert not session.matches_key("myapp/session2/obj1")
-        assert exact.matches_key("myapp/session/obj1")
-        assert not exact.matches_key("myapp/session/obj2")
-        assert not all_sessions.matches_key("myapp")
-        assert not all_sessions.matches_key("myapp/session")
-        assert not all_sessions.matches_key("myapp/session/obj1/extra")
-        assert not session.matches_key("myapp/session")
-        assert not session.matches_key("myapp/session/obj1/extra")
+        assert all_sessions.matches_key("default/myapp/session/obj1")
+        assert all_sessions.matches_key("default/myapp/other/obj2")
+        assert not all_sessions.matches_key("default/other/session/obj1")
+        assert session.matches_key("default/myapp/session/obj1")
+        assert not session.matches_key("default/myapp/session2/obj1")
+        assert exact.matches_key("default/myapp/session/obj1")
+        assert not exact.matches_key("default/myapp/session/obj2")
+        assert not all_sessions.matches_key("default/myapp")
+        assert not all_sessions.matches_key("default/myapp/session")
+        assert not all_sessions.matches_key("default/myapp/session/obj1/extra")
+        assert not session.matches_key("default/myapp/session")
+        assert not session.matches_key("default/myapp/session/obj1/extra")

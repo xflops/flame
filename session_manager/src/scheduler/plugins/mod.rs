@@ -514,7 +514,9 @@ mod tests {
     /// Create a test executor sized by `n` units (1 unit = (cpu:1, memory:1024, gpu:0)).
     fn create_test_executor(id: &str, n: u32) -> ExecutorInfoPtr {
         Arc::new(ExecutorInfo {
-            id: id.to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: id.to_string(),
+            workspace: "default".to_string(),
             node: "test-node".to_string(),
             resreq: ResourceRequirement {
                 cpu: u64::from(n),
@@ -523,8 +525,8 @@ mod tests {
             },
             shim: Shim::Host,
             application: String::new(),
-            task_id: None,
-            ssn_id: None,
+            task: None,
+            session: None,
             creation_time: Utc::now(),
             latest_updated_timestamp: Utc::now(),
             state: ExecutorState::Idle,
@@ -536,7 +538,7 @@ mod tests {
     #[test]
     fn test_snapshot_executor_state_filtering() {
         // This test verifies that SnapShot correctly filters executors by state.
-        // The SnapShot maintains an exec_index HashMap<ExecutorState, HashMap<ExecutorID, ExecutorInfoPtr>>
+        // The snapshot indexes executors by their names within each state.
         // that allows efficient lookup of executors by state.
 
         let exec_idle = create_test_executor("exec-idle", 2);
@@ -545,7 +547,9 @@ mod tests {
             ..(*exec_idle).clone()
         });
         let exec_void = Arc::new(ExecutorInfo {
-            id: "exec-void".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "exec-void".to_string(),
+            workspace: "default".to_string(),
             state: ExecutorState::Void,
             ..(*exec_idle).clone()
         });

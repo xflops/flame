@@ -58,6 +58,7 @@ mod tests {
         let engine = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
 
         let node = Node {
+            id: uuid::Uuid::new_v4().to_string(),
             name: "recovery-node".to_string(),
             state: NodeState::Ready,
             capacity: ResourceRequirement {
@@ -76,7 +77,9 @@ mod tests {
 
         let stale_timestamp = Utc::now() - chrono::Duration::minutes(10);
         let binding_executor = Executor {
-            id: "binding-exec".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "binding-exec".to_string(),
+            workspace: "default".to_string(),
             node: "recovery-node".to_string(),
             resreq: ResourceRequirement {
                 cpu: 2,
@@ -85,8 +88,8 @@ mod tests {
             },
             shim: Shim::Host,
             application: "volatile-app".to_string(),
-            task_id: None,
-            ssn_id: Some("incomplete-session".to_string()),
+            task: None,
+            session: Some("incomplete-session".to_string()),
             attributes: HashSet::from([Bytes::from_static(b"volatile-key")]),
             creation_time: Utc::now(),
             latest_updated_timestamp: stale_timestamp,
@@ -95,7 +98,9 @@ mod tests {
         tokio_test::block_on(engine.create_executor(&binding_executor))?;
 
         let idle_executor = Executor {
-            id: "idle-exec".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "idle-exec".to_string(),
+            workspace: "default".to_string(),
             node: "recovery-node".to_string(),
             resreq: ResourceRequirement {
                 cpu: 2,
@@ -104,8 +109,8 @@ mod tests {
             },
             shim: Shim::Host,
             application: "volatile-app".to_string(),
-            task_id: None,
-            ssn_id: None,
+            task: None,
+            session: None,
             attributes: HashSet::from([Bytes::from_static(b"volatile-key")]),
             creation_time: Utc::now(),
             latest_updated_timestamp: stale_timestamp,
@@ -120,24 +125,26 @@ mod tests {
         let executors = storage.list_executors(None)?;
         assert_eq!(executors.len(), 2);
 
-        let binding_exec = executors.iter().find(|e| e.id == "binding-exec").unwrap();
+        let binding_exec = executors.iter().find(|e| e.name == "binding-exec").unwrap();
         assert_eq!(binding_exec.state, ExecutorState::Idle);
-        assert_eq!(binding_exec.ssn_id, None);
+        assert_eq!(binding_exec.session, None);
         assert_eq!(binding_exec.application, "volatile-app");
         assert!(binding_exec.attributes.is_empty());
         assert!(binding_exec.latest_updated_timestamp > stale_timestamp);
 
-        let idle_exec = executors.iter().find(|e| e.id == "idle-exec").unwrap();
+        let idle_exec = executors.iter().find(|e| e.name == "idle-exec").unwrap();
         assert_eq!(idle_exec.state, ExecutorState::Idle);
         assert_eq!(idle_exec.application, "volatile-app");
         assert!(idle_exec.attributes.is_empty());
         assert!(idle_exec.latest_updated_timestamp > stale_timestamp);
 
-        let db_executor = tokio_test::block_on(engine.get_executor(&"binding-exec".to_string()))?;
+        let db_executor = tokio_test::block_on(
+            engine.get_executor(&crate::apis::ExecutorGID::new("default", "binding-exec")),
+        )?;
         assert!(db_executor.is_some());
         let db_executor = db_executor.unwrap();
         assert_eq!(db_executor.state, ExecutorState::Idle);
-        assert_eq!(db_executor.ssn_id, None);
+        assert_eq!(db_executor.session, None);
         assert_eq!(db_executor.application, "volatile-app");
 
         Ok(())
@@ -150,6 +157,7 @@ mod tests {
         let engine = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
 
         let node = Node {
+            id: uuid::Uuid::new_v4().to_string(),
             name: "state-node".to_string(),
             state: NodeState::Ready,
             capacity: ResourceRequirement {
@@ -176,7 +184,9 @@ mod tests {
 
         for (id, state) in &states_to_test {
             let executor = Executor {
-                id: id.to_string(),
+                id: uuid::Uuid::new_v4().to_string(),
+                name: id.to_string(),
+                workspace: "default".to_string(),
                 node: "state-node".to_string(),
                 resreq: ResourceRequirement {
                     cpu: 1,
@@ -185,8 +195,8 @@ mod tests {
                 },
                 shim: Shim::Host,
                 application: "state-app".to_string(),
-                task_id: None,
-                ssn_id: None,
+                task: None,
+                session: None,
                 attributes: Default::default(),
                 creation_time: Utc::now(),
                 latest_updated_timestamp: Utc::now(),
@@ -203,7 +213,7 @@ mod tests {
         assert_eq!(executors.len(), states_to_test.len());
 
         for (id, expected_state) in &states_to_test {
-            let exec = executors.iter().find(|e| e.id == *id).unwrap();
+            let exec = executors.iter().find(|e| e.name == *id).unwrap();
             assert_eq!(
                 exec.state, *expected_state,
                 "Executor {} should remain in {:?} state",
@@ -221,11 +231,16 @@ mod tests {
         let ctx = create_test_context(&url);
         let storage = crate::storage::new_ptr(&ctx).await?;
         storage
-            .register_application("affinity-app".to_string(), ApplicationAttributes::default())
+            .register_application(
+                "default".to_string(),
+                "affinity-app".to_string(),
+                ApplicationAttributes::default(),
+            )
             .await?;
         storage
             .create_session(SessionAttributes {
-                id: "affinity-session".to_string(),
+                workspace: "default".to_string(),
+                name: "affinity-session".to_string(),
                 application: "affinity-app".to_string(),
                 ..Default::default()
             })
@@ -234,7 +249,8 @@ mod tests {
         for _ in 0..2 {
             storage
                 .create_task(
-                    "affinity-session".to_string(),
+                    "default",
+                    "affinity-session",
                     None,
                     Some(TaskOptions {
                         affinity: [shared.clone()].into_iter().collect(),
@@ -246,7 +262,7 @@ mod tests {
 
         let recovered = crate::storage::new_ptr(&ctx).await?;
         recovered.load_data().await?;
-        let session = recovered.get_session_ptr("affinity-session".to_string())?;
+        let session = recovered.get_session_ptr("default", "affinity-session")?;
         let session = lock_ptr!(session)?;
         let pending = session
             .tasks_index

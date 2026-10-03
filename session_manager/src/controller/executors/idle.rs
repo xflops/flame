@@ -36,13 +36,18 @@ impl States for IdleState {
     async fn bind_session(&self, ssn_ptr: SessionPtr) -> Result<(), FlameError> {
         trace_fn!("IdleState::bind_session");
 
-        let ssn_id = {
+        let (workspace, session) = {
             let ssn = lock_ptr!(ssn_ptr)?;
-            ssn.id.clone()
+            (ssn.workspace.clone(), ssn.name.clone())
         };
 
         let mut e = lock_ptr!(self.executor)?;
-        e.ssn_id = Some(ssn_id);
+        if e.workspace != workspace {
+            return Err(FlameError::InvalidConfig(
+                "executor and session must share a workspace".to_string(),
+            ));
+        }
+        e.session = Some(session);
         e.set_state(ExecutorState::Binding);
 
         Ok(())

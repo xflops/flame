@@ -451,7 +451,7 @@ The same rejection applies to the cluster endpoint injected as
 Every sandbox and container carries these stable labels:
 
 - `io.xflops.flame.managed-by=executor-manager`;
-- `io.xflops.flame.executor-id`;
+- `io.xflops.flame.executor`;
 - `io.xflops.flame.application`; and
 - `io.xflops.flame.workload-uid`.
 

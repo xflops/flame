@@ -11,100 +11,100 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! None Storage Engine - A minimal engine for non-recoverable workloads.
-//!
-//! This engine does NOT persist any data. The controller's in-memory cache is the
-//! source of truth. The NoneEngine retains only the application/session metadata needed for
-//! lifecycle checks plus task ID counters for allocation.
-//!
-//! Use cases:
-//! - Real-time processing where task results are consumed immediately
-//! - High-throughput scenarios where disk I/O is a bottleneck
-//! - Development and testing
-//!
-//! Limitations:
-//! - All data is lost on session-manager restart
-//! - Evicted sessions are permanently lost (no persistence to fall back to)
+//! Non-persistent engine. It retains lifecycle names and allocates task numbers.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-
 use stdng::{lock_ptr, MutexPtr};
 
+use super::{Engine, EnginePtr};
 use crate::apis::{
-    Application, ApplicationAttributes, ApplicationID, ApplicationState, ExecutorID, ExecutorState,
-    Node, Session, SessionAttributes, SessionID, SessionState, SessionStatus, Task, TaskGID,
-    TaskID, TaskInput, TaskOptions, TaskResult, TaskState,
+    new_metadata_id, Application, ApplicationAttributes, ApplicationFilter, ApplicationState,
+    Executor, ExecutorGID, ExecutorState, Node, Session, SessionAttributes, SessionGID,
+    SessionState, SessionStatus, Task, TaskInput, TaskName, TaskOptions, TaskResult, TaskState,
+    Workspace, DEFAULT_WORKSPACE,
 };
-use crate::apis::{ApplicationFilter, Executor};
 use crate::FlameError;
 
-use super::{Engine, EnginePtr};
+type ScopedName = (String, String);
 
-/// None Storage Engine - stores lifecycle metadata in memory and allocates task IDs.
-///
-/// The controller cache is the source of truth for all data.
-/// This engine also maintains the minimal application/session index needed for lifecycle guards.
 pub struct NoneEngine {
-    /// Per-session task ID counters for allocation
-    task_counters: MutexPtr<HashMap<SessionID, Arc<AtomicI64>>>,
-    /// In-memory application cache (required for get_application)
-    applications: MutexPtr<HashMap<ApplicationID, Application>>,
-    /// In-memory session metadata used by lifecycle reconciliation.
-    sessions: MutexPtr<HashMap<SessionID, Session>>,
+    workspaces: MutexPtr<HashMap<String, Workspace>>,
+    applications: MutexPtr<HashMap<ScopedName, Application>>,
+    sessions: MutexPtr<HashMap<ScopedName, Session>>,
+    task_counters: MutexPtr<HashMap<ScopedName, TaskName>>,
 }
 
 impl NoneEngine {
-    /// Create a new NoneEngine instance.
     pub async fn new_ptr(_url: &str) -> Result<EnginePtr, FlameError> {
-        tracing::info!("Using none storage engine (no persistence)");
+        let default = Workspace {
+            name: DEFAULT_WORKSPACE.into(),
+            create_at: Utc::now(),
+        };
         Ok(Arc::new(Self {
-            task_counters: stdng::new_ptr(HashMap::new()),
+            workspaces: stdng::new_ptr(HashMap::from([(default.name.clone(), default)])),
             applications: stdng::new_ptr(HashMap::new()),
             sessions: stdng::new_ptr(HashMap::new()),
+            task_counters: stdng::new_ptr(HashMap::new()),
         }))
     }
 
-    /// Allocate the next task ID for a session.
-    /// Task IDs are sequential starting from 1.
-    fn next_task_id(&self, ssn_id: &SessionID) -> Result<TaskID, FlameError> {
-        let mut counters = lock_ptr!(self.task_counters)?;
-        let counter = counters
-            .entry(ssn_id.clone())
-            .or_insert_with(|| Arc::new(AtomicI64::new(0)));
-        Ok(counter.fetch_add(1, Ordering::SeqCst) + 1)
+    fn key(workspace: &str, name: &str) -> ScopedName {
+        (workspace.to_string(), name.to_string())
     }
 
-    /// Initialize task counter for a new session.
-    fn init_task_counter(&self, ssn_id: &SessionID) -> Result<(), FlameError> {
-        let mut counters = lock_ptr!(self.task_counters)?;
-        counters.insert(ssn_id.clone(), Arc::new(AtomicI64::new(0)));
-        Ok(())
-    }
-
-    /// Clean up task counter when session is deleted.
-    fn remove_task_counter(&self, ssn_id: &SessionID) -> Result<(), FlameError> {
-        let mut counters = lock_ptr!(self.task_counters)?;
-        counters.remove(ssn_id);
-        Ok(())
+    fn require_workspace(&self, name: &str) -> Result<(), FlameError> {
+        if lock_ptr!(self.workspaces)?.contains_key(name) {
+            Ok(())
+        } else {
+            Err(FlameError::NotFound(format!("workspace {name}")))
+        }
     }
 }
 
 #[async_trait]
 impl Engine for NoneEngine {
-    // ========== Application operations ==========
+    async fn create_workspace(&self, name: String) -> Result<Workspace, FlameError> {
+        let mut workspaces = lock_ptr!(self.workspaces)?;
+        if workspaces.contains_key(&name) {
+            return Err(FlameError::AlreadyExist(format!("workspace {name}")));
+        }
+        let workspace = Workspace {
+            name: name.clone(),
+            create_at: Utc::now(),
+        };
+        workspaces.insert(name, workspace.clone());
+        Ok(workspace)
+    }
+
+    async fn list_workspaces(&self) -> Result<Vec<Workspace>, FlameError> {
+        let mut result: Vec<_> = lock_ptr!(self.workspaces)?.values().cloned().collect();
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(result)
+    }
 
     async fn register_application(
         &self,
+        workspace: String,
         name: String,
         attr: ApplicationAttributes,
     ) -> Result<Application, FlameError> {
+        crate::apis::validate_application_url(&workspace, attr.url.as_deref())?;
+        self.require_workspace(&workspace)?;
+        let mut apps = lock_ptr!(self.applications)?;
+        let key = Self::key(&workspace, &name);
+        if apps.contains_key(&key) {
+            return Err(FlameError::AlreadyExist(format!(
+                "application {workspace}/{name}"
+            )));
+        }
         let app = Application {
-            name: name.clone(),
+            id: new_metadata_id(),
+            workspace,
+            name,
             version: 1,
             state: ApplicationState::Enabled,
             creation_time: Utc::now(),
@@ -122,27 +122,20 @@ impl Engine for NoneEngine {
             url: attr.url,
             installer: attr.installer,
         };
-
-        let mut apps = lock_ptr!(self.applications)?;
-        if apps.contains_key(&name) {
-            return Err(FlameError::AlreadyExist(format!(
-                "application <{name}> already exists"
-            )));
-        }
-        apps.insert(name, app.clone());
-
+        apps.insert(key, app.clone());
         Ok(app)
     }
 
     async fn update_application_state(
         &self,
-        id: ApplicationID,
+        workspace: &str,
+        name: &str,
         state: ApplicationState,
     ) -> Result<Application, FlameError> {
         let mut apps = lock_ptr!(self.applications)?;
         let app = apps
-            .get_mut(&id)
-            .ok_or_else(|| FlameError::NotFound(format!("application <{id}>")))?;
+            .get_mut(&Self::key(workspace, name))
+            .ok_or_else(|| FlameError::NotFound(format!("application {workspace}/{name}")))?;
         if app.state != state {
             app.state = state;
             app.version += 1;
@@ -150,423 +143,293 @@ impl Engine for NoneEngine {
         Ok(app.clone())
     }
 
-    async fn delete_application(&self, id: ApplicationID) -> Result<(), FlameError> {
+    async fn delete_application(&self, workspace: &str, name: &str) -> Result<(), FlameError> {
+        let key = Self::key(workspace, name);
         let mut apps = lock_ptr!(self.applications)?;
         let app = apps
-            .get(&id)
-            .ok_or_else(|| FlameError::NotFound(format!("application <{id}>")))?;
+            .get(&key)
+            .ok_or_else(|| FlameError::NotFound(format!("application {workspace}/{name}")))?;
         if app.state != ApplicationState::Disabled {
             return Err(FlameError::InvalidState(format!(
-                "application <{id}> is not disabled"
+                "application {workspace}/{name} is enabled"
             )));
         }
-
-        let sessions = lock_ptr!(self.sessions)?;
-        if sessions.values().any(|session| session.application == id) {
+        if lock_ptr!(self.sessions)?
+            .values()
+            .any(|ssn| ssn.workspace == workspace && ssn.application == name)
+        {
             return Err(FlameError::InvalidState(format!(
-                "application <{id}> still has sessions"
+                "application {workspace}/{name} still has sessions"
             )));
         }
-
-        apps.remove(&id);
-        drop(sessions);
-        drop(apps);
+        apps.remove(&key);
         Ok(())
     }
 
     async fn update_application(
         &self,
-        id: String,
+        workspace: &str,
+        name: &str,
         attr: ApplicationAttributes,
     ) -> Result<Application, FlameError> {
+        crate::apis::validate_application_url(workspace, attr.url.as_deref())?;
         let mut apps = lock_ptr!(self.applications)?;
         let app = apps
-            .get(&id)
-            .ok_or_else(|| FlameError::NotFound(format!("application <{}>", id)))?;
+            .get_mut(&Self::key(workspace, name))
+            .ok_or_else(|| FlameError::NotFound(format!("application {workspace}/{name}")))?;
         if app.state != ApplicationState::Enabled {
             return Err(FlameError::InvalidState(format!(
-                "application <{id}> is not enabled"
+                "application {workspace}/{name} is disabled"
             )));
         }
-
-        let updated = Application {
-            name: id.clone(),
-            version: app.version + 1,
-            state: app.state,
-            creation_time: app.creation_time,
-            shim: attr.shim,
-            image: attr.image,
-            description: attr.description,
-            labels: attr.labels,
-            command: attr.command,
-            arguments: attr.arguments,
-            environments: attr.environments,
-            working_directory: attr.working_directory,
-            max_instances: attr.max_instances,
-            delay_release: attr.delay_release,
-            schema: attr.schema,
-            url: attr.url,
-            installer: attr.installer,
-        };
-
-        apps.insert(id, updated.clone());
-        Ok(updated)
+        if lock_ptr!(self.sessions)?.values().any(|ssn| {
+            ssn.workspace == workspace
+                && ssn.application == name
+                && ssn.status.state == SessionState::Open
+        }) {
+            return Err(FlameError::InvalidState(format!(
+                "application {workspace}/{name} has open sessions"
+            )));
+        }
+        app.version += 1;
+        app.shim = attr.shim;
+        app.image = attr.image;
+        app.description = attr.description;
+        app.labels = attr.labels;
+        app.command = attr.command;
+        app.arguments = attr.arguments;
+        app.environments = attr.environments;
+        app.working_directory = attr.working_directory;
+        app.max_instances = attr.max_instances;
+        app.delay_release = attr.delay_release;
+        app.schema = attr.schema;
+        app.url = attr.url;
+        app.installer = attr.installer;
+        Ok(app.clone())
     }
 
-    async fn get_application(&self, id: ApplicationID) -> Result<Application, FlameError> {
-        let apps = lock_ptr!(self.applications)?;
-        apps.get(&id)
+    async fn get_application(
+        &self,
+        workspace: &str,
+        name: &str,
+    ) -> Result<Application, FlameError> {
+        lock_ptr!(self.applications)?
+            .get(&Self::key(workspace, name))
             .cloned()
-            .ok_or_else(|| FlameError::NotFound(format!("application <{}>", id)))
+            .ok_or_else(|| FlameError::NotFound(format!("application {workspace}/{name}")))
     }
 
     async fn find_applications(
         &self,
         filter: Option<&ApplicationFilter>,
     ) -> Result<Vec<Application>, FlameError> {
-        let apps = lock_ptr!(self.applications)?;
-        Ok(apps
+        Ok(lock_ptr!(self.applications)?
             .values()
             .filter(|app| {
-                filter.is_none_or(|filter| filter.state.is_none_or(|state| app.state == state))
+                filter.is_none_or(|f| {
+                    f.workspace == app.workspace && f.state.is_none_or(|s| s == app.state)
+                })
             })
             .cloned()
             .collect())
     }
 
-    // ========== Session operations ==========
-
     async fn create_session(&self, attr: SessionAttributes) -> Result<Session, FlameError> {
-        let session = Session {
-            id: attr.id,
+        self.require_workspace(&attr.workspace)?;
+        self.get_application(&attr.workspace, &attr.application)
+            .await?;
+        let key = Self::key(&attr.workspace, &attr.name);
+        let mut sessions = lock_ptr!(self.sessions)?;
+        if sessions.contains_key(&key) {
+            return Err(FlameError::AlreadyExist(format!(
+                "session {}/{}",
+                attr.workspace, attr.name
+            )));
+        }
+        let ssn = Session {
+            id: new_metadata_id(),
+            workspace: attr.workspace,
+            name: attr.name,
             application: attr.application,
+            version: 1,
             common_data: attr.common_data,
             tokens: attr.tokens,
-            min_instances: attr.min_instances,
-            max_instances: attr.max_instances,
-            batch_size: 1,
-            priority: attr.priority,
-            resreq: attr.resreq,
+            tasks: HashMap::new(),
+            tasks_index: HashMap::new(),
+            creation_time: Utc::now(),
+            completion_time: None,
+            events: vec![],
             status: SessionStatus {
                 state: SessionState::Open,
             },
-            creation_time: Utc::now(),
-            completion_time: None,
-            version: 1,
-            tasks: HashMap::new(),
-            tasks_index: HashMap::new(),
-            events: vec![],
+            min_instances: attr.min_instances,
+            max_instances: attr.max_instances,
+            batch_size: attr.batch_size,
+            priority: attr.priority,
+            resreq: attr.resreq,
             retry_count: 0,
         };
-        lock_ptr!(self.sessions)?.insert(session.id.clone(), session.clone());
-        self.init_task_counter(&session.id)?;
-        Ok(session)
+        sessions.insert(key.clone(), ssn.clone());
+        lock_ptr!(self.task_counters)?.insert(key, 0);
+        Ok(ssn)
     }
 
-    async fn get_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        Err(FlameError::NotFound(format!("session <{id}>")))
+    async fn get_session(&self, gid: &SessionGID) -> Result<Session, FlameError> {
+        let name = gid.session.as_str();
+        Err(FlameError::NotFound(format!(
+            "session {name} not retained by none engine"
+        )))
     }
 
     async fn open_session(
         &self,
-        id: SessionID,
+        gid: &SessionGID,
         spec: Option<SessionAttributes>,
     ) -> Result<Session, FlameError> {
+        let workspace = gid.workspace.as_str();
+        let name = gid.session.as_str();
         match spec {
-            Some(attr) => self.create_session(attr).await,
-            None => Err(FlameError::NotFound(format!("session <{id}>"))),
+            Some(attr) if attr.workspace == workspace && attr.name == name => {
+                self.create_session(attr).await
+            }
+            _ => Err(FlameError::NotFound(format!("session {workspace}/{name}"))),
         }
     }
 
-    async fn close_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        if let Some(session) = lock_ptr!(self.sessions)?.get_mut(&id) {
-            if session.status.state == SessionState::Open {
-                session.status.state = SessionState::Closed;
-                session.completion_time = Some(Utc::now());
-                session.version += 1;
+    async fn close_session(&self, gid: &SessionGID) -> Result<Session, FlameError> {
+        let workspace = gid.workspace.as_str();
+        let name = gid.session.as_str();
+        if let Some(ssn) = lock_ptr!(self.sessions)?.get_mut(&Self::key(workspace, name)) {
+            if ssn.status.state == SessionState::Open {
+                ssn.status.state = SessionState::Closed;
+                ssn.completion_time = Some(Utc::now());
+                ssn.version += 1;
             }
         }
-        Err(FlameError::NotFound(format!("session <{id}>")))
+        Err(FlameError::NotFound(format!(
+            "session {workspace}/{name} not retained by none engine"
+        )))
     }
 
-    async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        let session = lock_ptr!(self.sessions)?
-            .remove(&id)
-            .ok_or_else(|| FlameError::NotFound(format!("session <{id}>")))?;
-        self.remove_task_counter(&id)?;
-        Ok(session)
+    async fn delete_session(&self, gid: &SessionGID) -> Result<Session, FlameError> {
+        let workspace = gid.workspace.as_str();
+        let name = gid.session.as_str();
+        let key = Self::key(workspace, name);
+        let ssn = lock_ptr!(self.sessions)?
+            .remove(&key)
+            .ok_or_else(|| FlameError::NotFound(format!("session {workspace}/{name}")))?;
+        lock_ptr!(self.task_counters)?.remove(&key);
+        Ok(ssn)
     }
 
     async fn find_sessions(&self) -> Result<Vec<Session>, FlameError> {
         Ok(vec![])
     }
 
-    // ========== Task operations ==========
-
     async fn create_task(
         &self,
-        ssn_id: SessionID,
-        task_input: Option<TaskInput>,
+        gid: &SessionGID,
+        input: Option<TaskInput>,
         options: Option<TaskOptions>,
     ) -> Result<Task, FlameError> {
-        let task_id = self.next_task_id(&ssn_id)?;
-
+        let workspace = gid.workspace.as_str();
+        let session = gid.session.as_str();
+        let key = Self::key(workspace, session);
+        let ssn = lock_ptr!(self.sessions)?
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| FlameError::NotFound(format!("session {workspace}/{session}")))?;
+        if ssn.status.state != SessionState::Open {
+            return Err(FlameError::InvalidState("session closed".into()));
+        }
+        let mut counters = lock_ptr!(self.task_counters)?;
+        let number = counters.entry(key).or_default();
+        *number = number
+            .checked_add(1)
+            .ok_or_else(|| FlameError::Storage("task number overflow".into()))?;
         Ok(Task {
-            ssn_id,
-            id: task_id,
+            id: new_metadata_id(),
+            workspace: workspace.into(),
+            session: session.into(),
+            name: *number,
             version: 1,
-            state: TaskState::Pending,
-            creation_time: Utc::now(),
-            completion_time: None,
-            input: task_input,
+            input,
             output: None,
             affinity: options.unwrap_or_default().affinity,
+            creation_time: Utc::now(),
+            completion_time: None,
             events: vec![],
+            state: TaskState::Pending,
         })
     }
 
-    async fn get_task(&self, gid: TaskGID) -> Result<Task, FlameError> {
-        Err(FlameError::NotFound(format!("task <{}>", gid)))
+    async fn get_task(&self, gid: &SessionGID, task: &str) -> Result<Task, FlameError> {
+        let workspace = gid.workspace.as_str();
+        let session = gid.session.as_str();
+        Err(FlameError::NotFound(format!(
+            "task {workspace}/{session}/{task} not retained by none engine"
+        )))
     }
-
-    async fn retry_task(&self, gid: TaskGID) -> Result<Task, FlameError> {
-        Err(FlameError::NotFound(format!("task <{}>", gid)))
+    async fn retry_task(&self, gid: &SessionGID, task: &str) -> Result<Task, FlameError> {
+        self.get_task(gid, task).await
     }
-
     async fn update_task_state(
         &self,
-        gid: TaskGID,
-        _task_state: TaskState,
+        gid: &SessionGID,
+        task: &str,
+        _state: TaskState,
         _message: Option<String>,
     ) -> Result<Task, FlameError> {
-        Err(FlameError::NotFound(format!("task <{}>", gid)))
+        self.get_task(gid, task).await
     }
-
     async fn update_task_result(
         &self,
-        gid: TaskGID,
-        _task_result: TaskResult,
+        gid: &SessionGID,
+        task: &str,
+        _result: TaskResult,
     ) -> Result<Task, FlameError> {
-        Err(FlameError::NotFound(format!("task <{}>", gid)))
+        self.get_task(gid, task).await
     }
-
-    async fn find_tasks(&self, _ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
+    async fn find_tasks(&self, _gid: &SessionGID) -> Result<Vec<Task>, FlameError> {
         Ok(vec![])
     }
-
-    // ========== Node operations ==========
 
     async fn create_node(&self, node: &Node) -> Result<Node, FlameError> {
         Ok(node.clone())
     }
-
     async fn get_node(&self, _name: &str) -> Result<Option<Node>, FlameError> {
         Ok(None)
     }
-
     async fn update_node(&self, node: &Node) -> Result<Node, FlameError> {
         Ok(node.clone())
     }
-
     async fn delete_node(&self, _name: &str) -> Result<(), FlameError> {
         Ok(())
     }
-
     async fn find_nodes(&self) -> Result<Vec<Node>, FlameError> {
         Ok(vec![])
     }
-
-    // ========== Executor operations ==========
-
     async fn create_executor(&self, executor: &Executor) -> Result<Executor, FlameError> {
         Ok(executor.clone())
     }
-
-    async fn get_executor(&self, _id: &ExecutorID) -> Result<Option<Executor>, FlameError> {
+    async fn get_executor(&self, _gid: &ExecutorGID) -> Result<Option<Executor>, FlameError> {
         Ok(None)
     }
-
     async fn update_executor(&self, executor: &Executor) -> Result<Executor, FlameError> {
         Ok(executor.clone())
     }
-
     async fn update_executor_state(
         &self,
-        id: &ExecutorID,
+        gid: &ExecutorGID,
         _state: ExecutorState,
     ) -> Result<Executor, FlameError> {
-        Err(FlameError::NotFound(format!("executor <{}>", id)))
+        let name = gid.executor.as_str();
+        Err(FlameError::NotFound(format!("executor {name}")))
     }
-
-    async fn delete_executor(&self, _id: &ExecutorID) -> Result<(), FlameError> {
+    async fn delete_executor(&self, _gid: &ExecutorGID) -> Result<(), FlameError> {
         Ok(())
     }
-
     async fn find_executors(&self, _node: Option<&str>) -> Result<Vec<Executor>, FlameError> {
         Ok(vec![])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_none_engine_create_session() {
-        let engine = NoneEngine::new_ptr("none").await.unwrap();
-
-        let attr = SessionAttributes {
-            tokens: Default::default(),
-            id: "test-session".to_string(),
-            application: "test-app".to_string(),
-            common_data: None,
-            min_instances: 1,
-            max_instances: None,
-            batch_size: 1,
-            priority: 0,
-            resreq: None,
-        };
-
-        let session = engine.create_session(attr).await.unwrap();
-        assert_eq!(session.id, "test-session");
-        assert_eq!(session.application, "test-app");
-        assert_eq!(session.status.state, SessionState::Open);
-    }
-
-    #[tokio::test]
-    async fn test_none_engine_get_session_returns_not_found() {
-        let engine = NoneEngine::new_ptr("none").await.unwrap();
-
-        let result = engine.get_session("test-session".to_string()).await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), FlameError::NotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn test_none_engine_find_sessions_returns_empty() {
-        let engine = NoneEngine::new_ptr("none").await.unwrap();
-
-        let sessions = engine.find_sessions().await.unwrap();
-        assert!(sessions.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_none_engine_task_id_allocation() {
-        let engine = NoneEngine::new_ptr("none").await.unwrap();
-
-        let attr = SessionAttributes {
-            tokens: Default::default(),
-            id: "test-session".to_string(),
-            application: "test-app".to_string(),
-            common_data: None,
-            min_instances: 1,
-            max_instances: None,
-            batch_size: 1,
-            priority: 0,
-            resreq: None,
-        };
-        engine.create_session(attr).await.unwrap();
-
-        let task1 = engine
-            .create_task("test-session".to_string(), None, None)
-            .await
-            .unwrap();
-        assert_eq!(task1.id, 1);
-
-        let task2 = engine
-            .create_task("test-session".to_string(), None, None)
-            .await
-            .unwrap();
-        assert_eq!(task2.id, 2);
-
-        let task3 = engine
-            .create_task("test-session".to_string(), None, None)
-            .await
-            .unwrap();
-        assert_eq!(task3.id, 3);
-    }
-
-    #[tokio::test]
-    async fn test_none_engine_task_id_per_session() {
-        let engine = NoneEngine::new_ptr("none").await.unwrap();
-
-        let attr1 = SessionAttributes {
-            tokens: Default::default(),
-            id: "session-1".to_string(),
-            application: "test-app".to_string(),
-            common_data: None,
-            min_instances: 1,
-            max_instances: None,
-            batch_size: 1,
-            priority: 0,
-            resreq: None,
-        };
-        engine.create_session(attr1).await.unwrap();
-
-        let attr2 = SessionAttributes {
-            tokens: Default::default(),
-            id: "session-2".to_string(),
-            application: "test-app".to_string(),
-            common_data: None,
-            min_instances: 1,
-            max_instances: None,
-            batch_size: 1,
-            priority: 0,
-            resreq: None,
-        };
-        engine.create_session(attr2).await.unwrap();
-
-        let task1_s1 = engine
-            .create_task("session-1".to_string(), None, None)
-            .await
-            .unwrap();
-        assert_eq!(task1_s1.id, 1);
-
-        let task1_s2 = engine
-            .create_task("session-2".to_string(), None, None)
-            .await
-            .unwrap();
-        assert_eq!(task1_s2.id, 1);
-
-        let task2_s1 = engine
-            .create_task("session-1".to_string(), None, None)
-            .await
-            .unwrap();
-        assert_eq!(task2_s1.id, 2);
-    }
-
-    #[tokio::test]
-    async fn test_none_engine_delete_session_cleans_counter() {
-        let engine = NoneEngine::new_ptr("none").await.unwrap();
-
-        let attr = SessionAttributes {
-            tokens: Default::default(),
-            id: "test-session".to_string(),
-            application: "test-app".to_string(),
-            common_data: None,
-            min_instances: 1,
-            max_instances: None,
-            batch_size: 1,
-            priority: 0,
-            resreq: None,
-        };
-        engine.create_session(attr.clone()).await.unwrap();
-
-        let task1 = engine
-            .create_task("test-session".to_string(), None, None)
-            .await
-            .unwrap();
-        assert_eq!(task1.id, 1);
-
-        let result = engine.delete_session("test-session".to_string()).await;
-        assert_eq!(result.unwrap().id, "test-session");
-
-        engine.create_session(attr).await.unwrap();
-
-        let task_new = engine
-            .create_task("test-session".to_string(), None, None)
-            .await
-            .unwrap();
-        assert_eq!(task_new.id, 1);
     }
 }

@@ -36,7 +36,7 @@ pub fn from(
     e: Executor,
     app_manager: Arc<ApplicationManager>,
 ) -> Box<dyn State> {
-    tracing::debug!("Build state <{}> for Executor <{}>.", e.state, e.id);
+    tracing::debug!("Build state <{}> for Executor <{}>.", e.state, e.name);
 
     match e.state {
         ExecutorState::Void => Box::new(void::VoidState {
@@ -82,8 +82,10 @@ mod tests {
 
     fn create_test_executor(id: &str, state: ExecutorState) -> Executor {
         Executor {
-            id: id.to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: id.to_string(),
             application: "test-app".to_string(),
+            workspace: "default".to_string(),
             node: "test-node".to_string(),
             resreq: ResourceRequirement::default(),
             shim: Shim::Host,

@@ -17,19 +17,21 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use stdng::MutexPtr;
 
-use super::{ExecutorID, ExecutorState, ResourceRequirement, SessionID, Shim, TaskID};
+use super::{ExecutorGID, ExecutorID, ExecutorState, ResourceRequirement, SessionGID, Shim};
 use rpc::flame::v1 as rpc;
 
 #[derive(Clone, Debug)]
 pub struct Executor {
     pub id: ExecutorID,
+    pub name: String,
     pub node: String,
     pub resreq: ResourceRequirement,
     pub shim: Shim,
     /// Persisted owner of the retained service instance, also carried by RPC.
     pub application: String,
-    pub task_id: Option<TaskID>,
-    pub ssn_id: Option<SessionID>,
+    pub workspace: String,
+    pub task: Option<String>,
+    pub session: Option<String>,
     /// Volatile instance attributes, intentionally omitted from storage/RPC.
     pub attributes: HashSet<Bytes>,
 
@@ -40,6 +42,16 @@ pub struct Executor {
 }
 
 impl Executor {
+    pub fn gid(&self) -> ExecutorGID {
+        ExecutorGID::new(&self.workspace, &self.name)
+    }
+
+    pub fn session(&self) -> Option<SessionGID> {
+        self.session
+            .as_ref()
+            .map(|session| SessionGID::new(&self.workspace, session))
+    }
+
     pub fn set_state(&mut self, state: ExecutorState) {
         self.state = state;
         self.latest_updated_timestamp = Utc::now();
@@ -50,12 +62,14 @@ impl Default for Executor {
     fn default() -> Self {
         Executor {
             id: String::new(),
+            name: String::new(),
             node: String::new(),
             resreq: ResourceRequirement::default(),
             shim: Shim::Host,
             application: String::new(),
-            task_id: None,
-            ssn_id: None,
+            workspace: String::new(),
+            task: None,
+            session: None,
             attributes: HashSet::new(),
             creation_time: Utc::now(),
             latest_updated_timestamp: Utc::now(),
@@ -82,12 +96,16 @@ impl From<&rpc::Executor> for Executor {
 
         Executor {
             id: metadata.id.clone(),
+            name: metadata.name.clone(),
             node: spec.node.clone(),
             resreq: spec.resreq.unwrap().into(),
             shim: Shim::from(spec.shim()),
             application: spec.application.clone(),
-            task_id: None,
-            ssn_id: None,
+            workspace: metadata
+                .workspace
+                .expect("missing workspace in executor metadata"),
+            task: None,
+            session: status.session.clone(),
             attributes: HashSet::new(),
             creation_time: Utc::now(),
             latest_updated_timestamp: Utc::now(),
@@ -106,7 +124,8 @@ impl From<&Executor> for rpc::Executor {
     fn from(e: &Executor) -> Self {
         let metadata = Some(rpc::Metadata {
             id: e.id.clone(),
-            name: e.id.clone(),
+            name: e.name.clone(),
+            workspace: Some(e.workspace.clone()),
         });
 
         let spec = Some(rpc::ExecutorSpec {
@@ -118,7 +137,7 @@ impl From<&Executor> for rpc::Executor {
 
         let status = Some(rpc::ExecutorStatus {
             state: rpc::ExecutorState::from(e.state).into(),
-            session_id: e.ssn_id.clone(),
+            session: e.session.clone(),
         });
 
         rpc::Executor {
@@ -126,5 +145,32 @@ impl From<&Executor> for rpc::Executor {
             spec,
             status,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_roundtrip_preserves_workspace_in_metadata() {
+        let executor = Executor {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "executor".into(),
+            workspace: "team".into(),
+            application: "app".into(),
+            node: "node".into(),
+            ..Default::default()
+        };
+        let message = rpc::Executor::from(&executor);
+        assert_eq!(
+            message.metadata.as_ref().unwrap().workspace.as_deref(),
+            Some("team")
+        );
+        let restored = Executor::from(message);
+        assert_eq!(restored.workspace, executor.workspace);
+        assert_eq!(restored.id, executor.id);
+        assert_eq!(restored.name, executor.name);
+        assert_eq!(restored.application, executor.application);
     }
 }

@@ -84,15 +84,15 @@ impl CriShim {
         let install_started = Instant::now();
         let installation = app_manager.install(app).await?;
         tracing::debug!(
-            executor_id = %executor.id,
+            executor = %executor.name,
             phase = "install_application",
             elapsed_ms = install_started.elapsed().as_secs_f64() * 1000.0,
             "CRI shim startup phase completed"
         );
 
-        let (work_dir, uid, gid) = prepare_executor_directory(&executor.id)?;
+        let (work_dir, uid, gid) = prepare_executor_directory(&executor.name)?;
         let mut directory_guard = DirectoryGuard::new(work_dir.clone());
-        let log_dir = Path::new(LOG_ROOT).join(&executor.id);
+        let log_dir = Path::new(LOG_ROOT).join(&executor.name);
         fs::create_dir_all(&log_dir).map_err(|error| {
             FlameError::Storage(format!(
                 "failed to create CRI log directory <{}>: {error}",
@@ -141,10 +141,10 @@ impl CriShim {
         let workload_uid = Uuid::new_v4().to_string();
         let spec = WorkloadSpec {
             metadata: WorkloadMetadata {
-                name: workload_name(&app.name, &executor.id),
+                name: workload_name(&app.name, &executor.name),
                 namespace: "flame".to_string(),
                 uid: workload_uid,
-                executor_id: executor.id.clone(),
+                executor: executor.name.clone(),
                 application: app.name.clone(),
             },
             containers: vec![ContainerSpec {
@@ -171,7 +171,7 @@ impl CriShim {
         let manager_connect_started = Instant::now();
         let mut manager = WorkloadManager::connect().await?;
         tracing::debug!(
-            executor_id = %executor.id,
+            executor = %executor.name,
             phase = "manager_connect",
             elapsed_ms = manager_connect_started.elapsed().as_secs_f64() * 1000.0,
             "CRI shim startup phase completed"
@@ -182,7 +182,7 @@ impl CriShim {
             Err(error) => return Err(error),
         };
         tracing::debug!(
-            executor_id = %executor.id,
+            executor = %executor.name,
             phase = "workload_create",
             elapsed_ms = workload_create_started.elapsed().as_secs_f64() * 1000.0,
             "CRI shim startup phase completed"
@@ -228,7 +228,7 @@ impl CriShim {
             return Err(with_cleanup(primary, cleanup));
         }
         tracing::debug!(
-            executor_id = %executor.id,
+            executor = %executor.name,
             phase = "instance_uds_readiness",
             elapsed_ms = readiness_started.elapsed().as_secs_f64() * 1000.0,
             "CRI shim startup phase completed"
@@ -240,7 +240,7 @@ impl CriShim {
         self.instance_client = Some(instance_client);
         self.work_dir = Some(work_dir);
         tracing::debug!(
-            executor_id = %executor.id,
+            executor = %executor.name,
             phase = "total",
             elapsed_ms = create_started.elapsed().as_secs_f64() * 1000.0,
             "CRI shim startup completed"
@@ -305,7 +305,7 @@ impl Shim for CriShim {
             let work_dir = self
                 .work_dir
                 .take()
-                .unwrap_or_else(|| Path::new(WORK_ROOT).join(&self.executor.id));
+                .unwrap_or_else(|| Path::new(WORK_ROOT).join(&self.executor.name));
             cleanup_directory(&work_dir);
         }
         result
@@ -314,8 +314,8 @@ impl Shim for CriShim {
 
 impl CriShim {
     async fn destroy_persisted_instance(&mut self) -> Result<(), FlameError> {
-        validate_path_component(&self.executor.id)?;
-        let filter = WorkloadFilter::new(self.executor.id.clone())?;
+        validate_path_component(&self.executor.name)?;
+        let filter = WorkloadFilter::new(self.executor.name.clone())?;
         let mut manager = WorkloadManager::connect().await?;
         let handles = manager.list_workload(&filter).await?;
         let mut errors = Vec::new();
@@ -329,7 +329,7 @@ impl CriShim {
         } else {
             Err(FlameError::Internal(format!(
                 "failed to destroy persisted CRI executor <{}>: {}",
-                self.executor.id,
+                self.executor.name,
                 errors.join("; ")
             )))
         }
@@ -385,7 +385,7 @@ fn validate_inputs(executor: &Executor, app: &ApplicationContext) -> Result<(), 
     if let Some(cache) = context.cache.as_ref() {
         reject_loopback_endpoint(&cache.endpoint, "cache")?;
     }
-    validate_path_component(&executor.id)
+    validate_path_component(&executor.name)
 }
 
 fn merge_install_environment(
@@ -585,8 +585,8 @@ fn stage_ca_bundle(sources: &[&str], target: &Path) -> Result<(), FlameError> {
     })
 }
 
-fn workload_name(application: &str, executor_id: &str) -> String {
-    format!("{application}-{executor_id}")
+fn workload_name(application: &str, executor: &str) -> String {
+    format!("{application}-{executor}")
 }
 
 fn validate_path_component(value: &str) -> Result<(), FlameError> {
@@ -598,7 +598,7 @@ fn validate_path_component(value: &str) -> Result<(), FlameError> {
         || value.contains('\0')
     {
         Err(FlameError::InvalidConfig(format!(
-            "invalid executor ID for CRI work directory: <{value}>"
+            "invalid executor name for CRI work directory: <{value}>"
         )))
     } else {
         Ok(())
@@ -606,11 +606,11 @@ fn validate_path_component(value: &str) -> Result<(), FlameError> {
 }
 
 #[cfg(unix)]
-fn prepare_executor_directory(executor_id: &str) -> Result<(PathBuf, i64, i64), FlameError> {
+fn prepare_executor_directory(executor: &str) -> Result<(PathBuf, i64, i64), FlameError> {
     let root = Path::new(WORK_ROOT);
     fs::create_dir_all(root)?;
     fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
-    let work_dir = root.join(executor_id);
+    let work_dir = root.join(executor);
     fs::create_dir(&work_dir).map_err(|error| {
         FlameError::Storage(format!(
             "failed to create private CRI work directory <{}>: {error}",
@@ -627,7 +627,7 @@ fn prepare_executor_directory(executor_id: &str) -> Result<(PathBuf, i64, i64), 
 }
 
 #[cfg(not(unix))]
-fn prepare_executor_directory(_executor_id: &str) -> Result<(PathBuf, i64, i64), FlameError> {
+fn prepare_executor_directory(_executor: &str) -> Result<(PathBuf, i64, i64), FlameError> {
     Err(FlameError::InvalidConfig(
         "CRI shim requires a Unix platform".to_string(),
     ))
@@ -665,8 +665,10 @@ mod tests {
 
     fn test_executor() -> Executor {
         Executor {
-            id: "executor-1".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "executor-1".to_string(),
             application: "test-app".to_string(),
+            workspace: "default".to_string(),
             resreq: ResourceRequirement::default(),
             node: "node-1".to_string(),
             shim: ShimType::Cri,
@@ -680,6 +682,7 @@ mod tests {
 
     fn test_app() -> ApplicationContext {
         ApplicationContext {
+            workspace: "default".to_string(),
             name: "test-app".to_string(),
             shim: ShimType::Cri,
             image: Some("example/image:latest".to_string()),
@@ -935,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn executor_id_must_be_one_path_component() {
+    fn executor_must_be_one_path_component() {
         assert!(validate_path_component("executor-1").is_ok());
         assert!(validate_path_component("../executor").is_err());
         assert!(validate_path_component("executor/child").is_err());

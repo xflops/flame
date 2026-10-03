@@ -28,7 +28,9 @@ use common::{ctx::FlameClusterContext, FlameError};
 #[derive(Clone)]
 pub struct Executor {
     pub id: String,
+    pub name: String,
     pub application: String,
+    pub workspace: String,
     pub resreq: ResourceRequirement,
     pub node: String,
     /// Supported shim type from executor-manager config.
@@ -78,7 +80,11 @@ impl TryFrom<&rpc::Executor> for Executor {
 
         Ok(Executor {
             id: metadata.id.clone(),
+            name: metadata.name.clone(),
             application: spec.application.clone(),
+            workspace: metadata.workspace.clone().ok_or_else(|| {
+                FlameError::Internal("missing workspace in executor metadata".to_string())
+            })?,
             resreq: resreq.into(),
             node: spec.node.clone(),
             shim: Shim::from(spec.shim()), // Get shim from spec
@@ -101,7 +107,8 @@ impl From<&Executor> for rpc::Executor {
     fn from(e: &Executor) -> Self {
         let metadata = Some(Metadata {
             id: e.id.clone(),
-            name: e.id.clone(),
+            name: e.name.clone(),
+            workspace: Some(e.workspace.clone()),
         });
 
         let spec = Some(ExecutorSpec {
@@ -113,7 +120,7 @@ impl From<&Executor> for rpc::Executor {
 
         let status = Some(ExecutorStatus {
             state: rpc::ExecutorState::from(e.state).into(),
-            session_id: e.session.clone().map(|s| s.session_id),
+            session: e.session.clone().map(|s| s.session),
         });
 
         rpc::Executor {
@@ -135,11 +142,12 @@ impl Executor {
     pub fn update(&mut self, next: &Executor) {
         tracing::debug!(
             "Update executor <{}> from <{}> to <{}>",
-            self.id,
+            self.name,
             self.state,
             next.state
         );
         self.application = next.application.clone();
+        self.workspace = next.workspace.clone();
         self.state = next.state;
         self.shim_instance = next.shim_instance.clone();
         self.session = next.session.clone();
@@ -162,7 +170,7 @@ pub fn start(client: BackendClient, executor: ExecutorPtr, app_manager: Arc<Appl
             };
 
             if exec.state == ExecutorState::Released {
-                tracing::info!("Executor <{}> is released, exit.", exec.id);
+                tracing::info!("Executor <{}> is released, exit.", exec.name);
                 break;
             }
 
@@ -185,24 +193,24 @@ pub fn start(client: BackendClient, executor: ExecutorPtr, app_manager: Arc<Appl
                     }
                 }
                 Err(e) => {
-                    let session_id = exec
+                    let session = exec
                         .session
                         .as_ref()
-                        .map(|session| session.session_id.as_str());
+                        .map(|session| session.session.as_str());
                     let application = exec
                         .session
                         .as_ref()
                         .map(|session| session.application.name.as_str());
-                    let task_id = exec.task.as_ref().map(|task| task.task_id.as_str());
-                    let task_session_id = exec.task.as_ref().map(|task| task.session_id.as_str());
+                    let task = exec.task.as_ref().map(|task| task.task.as_str());
+                    let task_session = exec.task.as_ref().map(|task| task.session.as_str());
                     tracing::error!(
-                        executor_id = %exec.id,
+                        executor = %exec.name,
                         node = %exec.node,
                         state = %exec.state,
-                        session_id = ?session_id,
+                        session = ?session,
                         application = ?application,
-                        task_session_id = ?task_session_id,
-                        task_id = ?task_id,
+                        task_session = ?task_session,
+                        task = ?task,
                         error = %e,
                         "Failed to execute executor state"
                     );
@@ -212,4 +220,37 @@ pub fn start(client: BackendClient, executor: ExecutorPtr, app_manager: Arc<Appl
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn executor_message() -> rpc::Executor {
+        rpc::Executor::from(common::apis::Executor {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "executor".into(),
+            workspace: "team".into(),
+            application: "app".into(),
+            node: "node".into(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn rpc_roundtrip_preserves_workspace_in_metadata() {
+        let message = executor_message();
+        let executor = Executor::try_from(&message).unwrap();
+        assert_eq!(executor.workspace, "team");
+        let restored = rpc::Executor::from(executor);
+        assert_eq!(restored.metadata, message.metadata);
+        assert_eq!(restored.spec, message.spec);
+    }
+
+    #[test]
+    fn rpc_requires_workspace_in_metadata() {
+        let mut message = executor_message();
+        message.metadata.as_mut().unwrap().workspace = None;
+        assert!(Executor::try_from(&message).is_err());
+    }
 }

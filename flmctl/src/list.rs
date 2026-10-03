@@ -36,7 +36,8 @@ pub async fn run(
         &current_ctx.cluster.endpoint,
         current_ctx.cluster.tls.as_ref(),
     )
-    .await?;
+    .await?
+    .with_workspace(current_ctx.workspace.clone());
     match (application, session, executor, node) {
         (true, _, _, _) => list_applications(conn, output_format).await,
         (_, true, _, _) => list_sessions(conn, output_format).await,
@@ -60,12 +61,19 @@ async fn list_applications(conn: Connection, output_format: &str) -> Result<(), 
     }
 
     let mut table = Table::new();
-    table
-        .load_preset(NOTHING)
-        .set_header(vec!["Name", "State", "Shim", "Tags", "Created", "Command"]);
+    table.load_preset(NOTHING).set_header(vec![
+        "Workspace",
+        "Name",
+        "State",
+        "Shim",
+        "Tags",
+        "Created",
+        "Command",
+    ]);
 
     for app in &app_list {
         table.add_row(vec![
+            app.workspace.clone(),
             app.name.to_string(),
             app.state.to_string(),
             app.attributes
@@ -91,7 +99,8 @@ async fn list_sessions(conn: Connection, output_format: &str) -> Result<(), Box<
     }
     let mut table = Table::new();
     table.load_preset(NOTHING).set_header(vec![
-        "ID",
+        "Workspace",
+        "Name",
         "State",
         "App",
         "Resources",
@@ -105,8 +114,8 @@ async fn list_sessions(conn: Connection, output_format: &str) -> Result<(), Box<
 
     ssn_list.sort_by(|l, r| {
         if l.state == r.state {
-            let lid: u32 = l.id.trim().parse().unwrap_or(0);
-            let rid: u32 = r.id.trim().parse().unwrap_or(0);
+            let lid: u32 = l.name.trim().parse().unwrap_or(0);
+            let rid: u32 = r.name.trim().parse().unwrap_or(0);
             lid.cmp(&rid)
         } else if l.state == SessionState::Open {
             Ordering::Less
@@ -117,7 +126,8 @@ async fn list_sessions(conn: Connection, output_format: &str) -> Result<(), Box<
 
     for ssn in &ssn_list {
         table.add_row(vec![
-            ssn.id.to_string(),
+            ssn.workspace.clone(),
+            ssn.name.to_string(),
             ssn.state.to_string(),
             ssn.application.to_string(),
             format_resreq(&ssn.resreq),
@@ -150,16 +160,22 @@ async fn list_executors(conn: Connection, output_format: &str) -> Result<(), Box
 
 fn executor_table(executors: &[Executor]) -> Table {
     let mut table = Table::new();
-    table
-        .load_preset(NOTHING)
-        .set_header(vec!["ID", "State", "App", "Session", "Node"]);
+    table.load_preset(NOTHING).set_header(vec![
+        "Name",
+        "Workspace",
+        "State",
+        "App",
+        "Session",
+        "Node",
+    ]);
 
     for executor in executors {
         table.add_row(vec![
-            executor.id.to_string(),
+            executor.name.to_string(),
+            executor.workspace.clone(),
             executor.state.to_string(),
             executor.application.to_string(),
-            executor.session_id.clone().unwrap_or("-".to_string()),
+            executor.session.clone().unwrap_or("-".to_string()),
             executor.node.to_string(),
         ]);
     }
@@ -209,10 +225,12 @@ mod tests {
     #[test]
     fn executor_table_shows_application() {
         let table = executor_table(&[Executor {
-            id: "executor-1".to_string(),
+            id: "00000000-0000-4000-8000-000000000001".to_string(),
+            name: "executor-1".to_string(),
+            workspace: "default".to_string(),
             application: "app-1".to_string(),
             state: ExecutorState::Idle,
-            session_id: None,
+            session: None,
             node: "node-1".to_string(),
         }])
         .to_string();
@@ -224,16 +242,18 @@ mod tests {
     #[test]
     fn executor_json_is_an_array_with_state() {
         let json = format_json(&[Executor {
-            id: "executor-1".to_string(),
+            id: "00000000-0000-4000-8000-000000000001".to_string(),
+            name: "executor-1".to_string(),
+            workspace: "default".to_string(),
             application: "app-1".to_string(),
             state: ExecutorState::Idle,
-            session_id: None,
+            session: None,
             node: "node-1".to_string(),
         }])
         .unwrap();
 
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value[0]["id"], "executor-1");
+        assert_eq!(value[0]["name"], "executor-1");
         assert_eq!(value[0]["state"], "Idle");
         assert_eq!(value[0]["application"], "app-1");
     }

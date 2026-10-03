@@ -22,7 +22,8 @@ pub async fn run(ctx: &FlameContext, application: &str) -> Result<(), Box<dyn Er
         &current_ctx.cluster.endpoint,
         current_ctx.cluster.tls.as_ref(),
     )
-    .await?;
+    .await?
+    .with_workspace(current_ctx.workspace.clone());
     conn.unregister_application(application.to_owned()).await?;
 
     Ok(())

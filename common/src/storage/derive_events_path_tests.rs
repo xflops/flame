@@ -13,25 +13,25 @@ limitations under the License.
 
 #[cfg(test)]
 mod tests {
-    use super::super::derive_events_path;
-    use tempfile::TempDir;
+    use super::super::events_path;
 
     #[test]
-    fn test_flame_test_dir_set() {
-        let temp_dir = TempDir::new().unwrap();
-        let temp_path = temp_dir.path().to_string_lossy().to_string();
-        let expected = format!("{}/events", temp_path);
-
-        std::env::set_var("FLAME_TEST_DIR", &temp_path);
-        assert_eq!(derive_events_path("any"), expected);
-        std::env::remove_var("FLAME_TEST_DIR");
+    fn test_stores_have_isolated_stable_event_directories() {
+        let root = tempfile::TempDir::new().unwrap();
+        let first = events_path("sqlite:///first.db", Some(root.path().as_os_str()));
+        assert_eq!(
+            first,
+            events_path("sqlite:///first.db", Some(root.path().as_os_str()))
+        );
+        assert_ne!(
+            first,
+            events_path("sqlite:///second.db", Some(root.path().as_os_str()))
+        );
+        assert!(std::path::Path::new(&first).starts_with(root.path().join("events")));
     }
 
     #[test]
     fn test_default_events_dir() {
-        if std::env::var("FLAME_TEST_DIR").is_ok() {
-            return;
-        }
-        assert_eq!(derive_events_path("any"), "events");
+        assert_eq!(events_path("any", None), "events");
     }
 }

@@ -29,6 +29,7 @@ class ApplicationContextInfo:
     """Information about the application context."""
 
     name: Optional[str] = None
+    workspace: Optional[str] = None
     image: Optional[str] = None
     command: Optional[str] = None
     working_directory: Optional[str] = None
@@ -39,7 +40,8 @@ class ApplicationContextInfo:
 class SessionContextInfo:
     """Information about the session context."""
 
-    session_id: Optional[str] = None
+    session: Optional[str] = None
+    workspace: Optional[str] = None
     application: Optional[ApplicationContextInfo] = None
     has_common_data: bool = False
     common_data_type: Optional[str] = None
@@ -49,8 +51,9 @@ class SessionContextInfo:
 class TaskContextInfo:
     """Information about the task context."""
 
-    task_id: Optional[str] = None
-    session_id: Optional[str] = None
+    task: Optional[str] = None
+    session: Optional[str] = None
+    workspace: Optional[str] = None
     has_input: bool = False
     input_type: Optional[str] = None
 

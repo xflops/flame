@@ -242,7 +242,7 @@ class ServiceInstance:
             _validate_service_class(execution_object)
         resource_requirement = ResourceRequirement.from_string(resreq) if resreq is not None else None
 
-        session_id = short_name(app)
+        session_name = short_name(app)
 
         # Create an app session.
         # For RL module: serialize ServiceContext with cloudpickle, put in cache to get ObjectRef,
@@ -251,7 +251,7 @@ class ServiceInstance:
             execution_object=execution_object,
             constructor_args=constructor_args,
             constructor_kwargs=constructor_kwargs or {},
-            service_id=session_id,
+            service_id=session_name,
             autoscale=autoscale,
             warmup=warmup,
         )
@@ -271,8 +271,8 @@ class ServiceInstance:
             finally:
                 if register_by_value:
                     cloudpickle.unregister_pickle_by_value(execution_module)
-        # Put in cache with <app>/<session_id> key prefix
-        key_prefix = f"{app}/{session_id}"
+        # Put in cache with <workspace>/<app>/<session> key prefix
+        key_prefix = f"{FlameContext().workspace}/{app}/{session_name}"
         logger.debug(f"[ServiceInstance] Putting ServiceContext in cache: key_prefix={key_prefix}, autoscale={app_context.autoscale}")
         object_ref = _core_put_object(key_prefix, serialized_ctx)
         logger.debug(f"[ServiceInstance] ServiceContext cached: key={object_ref.key}, version={object_ref.version}")
@@ -280,7 +280,7 @@ class ServiceInstance:
         common_data_bytes = object_ref.encode()
 
         session_spec = SessionAttributes(
-            id=session_id,
+            name=session_name,
             application=app,
             common_data=common_data_bytes,
             min_instances=app_context.min_instances,
@@ -288,9 +288,9 @@ class ServiceInstance:
             batch_size=1,
             resreq=resource_requirement,
         )
-        logger.info(f"[ServiceInstance] Opening session: session_id={session_id}, app={app}")
+        logger.info(f"[ServiceInstance] Opening session: session={session_name}, app={app}")
         try:
-            self._session = core_client.open_session(session_id=session_id, spec=session_spec)
+            self._session = core_client.open_session(session=session_name, spec=session_spec)
         except Exception as e:
             logger.error(f"[ServiceInstance] Failed to open session: {type(e).__name__}: {e}", exc_info=True)
             raise
@@ -328,7 +328,7 @@ class ServiceInstance:
             _restore_service_instance,
             (
                 self._app,
-                self._session.id,
+                self._session.name,
                 self._function_wrapper is not None,
                 tuple(self._method_names),
             ),
@@ -404,7 +404,7 @@ class ServiceInstance:
 
             # For RL module: serialize ServiceRequest with cloudpickle, then call core API
             request_bytes = cloudpickle.dumps(request, protocol=cloudpickle.DEFAULT_PROTOCOL)
-            logger.info(f"[ServiceInstance] Submitting task: method={method_name}, session={self._session.id}")
+            logger.info(f"[ServiceInstance] Submitting task: method={method_name}, session={self._session.name}")
             # Submit task and return ObjectFuture
             future = self._submit(request_bytes, option)
             return ObjectFuture(future)
@@ -515,7 +515,7 @@ class ServiceInstance:
 
 def _restore_service_instance(
     app: str,
-    session_id: str,
+    session: str,
     is_callable: bool,
     method_names: tuple[str, ...],
 ) -> ServiceInstance:
@@ -531,7 +531,7 @@ def _restore_service_instance(
     instance._submissions_in_flight = 0
     instance._state = _ServiceState.OPEN
     instance._session_context = None
-    instance._session = core_client.open_session(session_id=session_id)
+    instance._session = core_client.open_session(session=session)
     instance._session_owner = _NoopSessionOwner()
     if is_callable:
         instance._create_function_wrapper()
@@ -556,7 +556,7 @@ def _nested_service_instance(
     instance._submissions_in_flight = 0
     instance._state = _ServiceState.OPEN
     instance._session_context = session_context
-    instance._session = core_client.open_session(session_id=session_context.session_id)
+    instance._session = core_client.open_session(session=session_context.session)
     instance._session_owner = _NoopSessionOwner()
     instance._generate_wrappers()
     return instance
@@ -1117,7 +1117,7 @@ class _Runtime:
         """
         from flamepy.core.cache import ObjectKey, put_object
 
-        object_key = ObjectKey.for_shared(self._name)
+        object_key = ObjectKey.for_shared(self._name, workspace=FlameContext().workspace)
         return put_object(object_key.to_prefix(), obj)
 
     def _create_package(self) -> str:

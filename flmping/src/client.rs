@@ -166,8 +166,8 @@ fn print_outputs(tasks: Vec<TaskResult<PingResponse>>) -> Result<(), Box<dyn Err
         };
 
         table.add_row(vec![
-            task.session_id,
-            task.task_id,
+            task.session,
+            task.task,
             task.state.to_string(),
             output,
         ]);

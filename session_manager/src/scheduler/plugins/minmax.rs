@@ -47,7 +47,7 @@ impl Plugin for MinMaxPlugin {
                 self.active_executors
                     .entry(executor.node.clone())
                     .or_default()
-                    .insert(executor.id.clone());
+                    .insert(executor.name.clone());
             }
         }
         Ok(())
@@ -74,7 +74,7 @@ impl Plugin for MinMaxPlugin {
         self.active_executors
             .entry(executor.node.clone())
             .or_default()
-            .insert(executor.id.clone());
+            .insert(executor.name.clone());
     }
 }
 
@@ -87,7 +87,9 @@ mod tests {
 
     fn executor(id: &str, node: &str, state: ExecutorState) -> ExecutorInfoPtr {
         Arc::new(ExecutorInfo {
-            id: id.to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: id.to_string(),
+            workspace: "default".to_string(),
             node: node.to_string(),
             state,
             ..Default::default()

@@ -43,7 +43,7 @@ impl State for IdleState {
         let Some(ssn) = ssn else {
             tracing::debug!(
                 "Executor <{}> is idle but no session is found, start to release.",
-                &self.executor.id.clone()
+                &self.executor.name.clone()
             );
 
             self.executor.session = None;
@@ -53,7 +53,7 @@ impl State for IdleState {
 
         tracing::debug!(
             "Try to bind to session <{}> which is one of application <{:?}>.",
-            &ssn.session_id.clone(),
+            &ssn.session.clone(),
             &ssn.application.clone()
         );
 
@@ -64,7 +64,7 @@ impl State for IdleState {
             tracing::error!(
                 "Shim mismatch: executor <{}> supports {:?}, but application <{}> requires {:?}. \
                 This should not happen if the scheduler is working correctly.",
-                self.executor.id,
+                self.executor.name,
                 executor_shim,
                 ssn.application.name,
                 app_shim
@@ -77,22 +77,22 @@ impl State for IdleState {
 
         tracing::debug!(
             "Shim validation passed: executor <{}> and application <{}> both use {:?} shim.",
-            self.executor.id,
+            self.executor.name,
             ssn.application.name,
             executor_shim
         );
 
         tracing::debug!(
             "Try to bind Executor <{}> to <{}>.",
-            &self.executor.id.clone(),
-            &ssn.session_id.clone()
+            &self.executor.name.clone(),
+            &ssn.session.clone()
         );
 
         let shim_ptr = match self.executor.shim_instance.clone() {
             Some(shim_ptr) => {
                 tracing::debug!(
                     "Reuse retained instance for Executor <{}> and application <{}>.",
-                    self.executor.id,
+                    self.executor.name,
                     ssn.application.name
                 );
                 shim_ptr
@@ -171,8 +171,8 @@ impl State for IdleState {
 
         tracing::debug!(
             "Executor <{}> was bound to <{}>.",
-            &self.executor.id.clone(),
-            &ssn.session_id.clone()
+            &self.executor.name.clone(),
+            &ssn.session.clone()
         );
 
         Ok(self.executor.clone())
@@ -189,8 +189,8 @@ impl IdleState {
     ) -> Result<(), FlameError> {
         tracing::warn!(
             "Executor <{}> failed to bind session <{}>: {}",
-            self.executor.id,
-            ssn.session_id,
+            self.executor.name,
+            ssn.session,
             message
         );
         self.client

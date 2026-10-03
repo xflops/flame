@@ -18,9 +18,7 @@ from flamepy.core.types import (
     FlameErrorCode,
     ResourceRequirement,
     SessionAttributes,
-    SessionID,
     Task,
-    TaskID,
     TaskOptions,
 )
 
@@ -29,25 +27,25 @@ _MAX_CALLBACK_JOBS = 256
 _CALLBACK_WORKERS = 4
 
 
-def connect(addr: str, tls_config: Optional[FlameClientTls] = None) -> "Connection":
-    return Connection.connect(addr, tls_config)
+def connect(addr: str, tls_config: Optional[FlameClientTls] = None, workspace: str = "default") -> "Connection":
+    return Connection.connect(addr, tls_config, workspace)
 
 
 def create_session(
     application: str,
     common_data: Optional[bytes] = None,
-    session_id: Optional[str] = None,
+    session: Optional[str] = None,
     min_instances: int = 0,
     max_instances: Optional[int] = None,
     batch_size: int = 1,
     resreq: Optional[ResourceRequirement] = None,
     tokens: Optional[Dict[str, str]] = None,
 ) -> "Session":
-    return ConnectionInstance.instance().create_session(SessionAttributes(id=session_id, application=application, common_data=common_data, tokens=tokens or {}, min_instances=min_instances, max_instances=max_instances, batch_size=1, resreq=resreq))
+    return ConnectionInstance.instance().create_session(SessionAttributes(name=session, application=application, common_data=common_data, tokens=tokens or {}, min_instances=min_instances, max_instances=max_instances, batch_size=1, resreq=resreq))
 
 
-def open_session(session_id: SessionID, spec: Optional[SessionAttributes] = None) -> "Session":
-    return ConnectionInstance.instance().open_session(session_id, spec)
+def open_session(session: str, spec: Optional[SessionAttributes] = None) -> "Session":
+    return ConnectionInstance.instance().open_session(session, spec)
 
 
 def register_application(name: str, app_attrs: Union[ApplicationAttributes, Dict[str, Any]]) -> None:
@@ -78,12 +76,12 @@ def list_sessions() -> List["Session"]:
     return ConnectionInstance.instance().list_sessions()
 
 
-def get_session(session_id: SessionID) -> "Session":
-    return ConnectionInstance.instance().get_session(session_id)
+def get_session(session: str) -> "Session":
+    return ConnectionInstance.instance().get_session(session)
 
 
-def close_session(session_id: SessionID) -> "Session":
-    return ConnectionInstance.instance().close_session(session_id)
+def close_session(session: str) -> "Session":
+    return ConnectionInstance.instance().close_session(session)
 
 
 class ConnectionInstance:
@@ -98,7 +96,7 @@ class ConnectionInstance:
         with cls._lock:
             if cls._connection is None or cls._connection._closed:
                 cls._context = FlameContext()
-                cls._connection = connect(cls._context.endpoint, cls._context.tls)
+                cls._connection = connect(cls._context.endpoint, cls._context.tls, getattr(cls._context, "workspace", "default"))
             return cls._connection
 
     @classmethod
@@ -132,10 +130,10 @@ class Connection:
         self._closed = False
 
     @classmethod
-    def connect(cls, addr: str, tls_config: Optional[FlameClientTls] = None) -> "Connection":
+    def connect(cls, addr: str, tls_config: Optional[FlameClientTls] = None, workspace: str = "default") -> "Connection":
         bridge = LoopThread()
         try:
-            return cls(bridge.call(aio_client.connect(addr, tls_config)), bridge)
+            return cls(bridge.call(aio_client.connect(addr, tls_config, workspace)), bridge)
         except BaseException:
             bridge.close()
             raise
@@ -221,6 +219,12 @@ class Connection:
     def register_application(self, name: str, app_attrs: Union[ApplicationAttributes, Dict[str, Any]]) -> None:
         return self._call(self._aio.register_application(name, app_attrs))
 
+    def create_workspace(self, name: str):
+        return self._call(self._aio.create_workspace(name))
+
+    def list_workspaces(self):
+        return self._call(self._aio.list_workspaces())
+
     def unregister_application(self, name: str) -> None:
         return self._call(self._aio.unregister_application(name))
 
@@ -245,14 +249,14 @@ class Connection:
     def list_sessions(self) -> List["Session"]:
         return [self._session(session) for session in self._call(self._aio.list_sessions())]
 
-    def open_session(self, session_id: SessionID, spec: Optional[SessionAttributes] = None) -> "Session":
-        return self._session(self._call(self._aio.open_session(session_id, spec)))
+    def open_session(self, session: str, spec: Optional[SessionAttributes] = None) -> "Session":
+        return self._session(self._call(self._aio.open_session(session, spec)))
 
-    def get_session(self, session_id: SessionID) -> "Session":
-        return self._session(self._call(self._aio.get_session(session_id)))
+    def get_session(self, session: str) -> "Session":
+        return self._session(self._call(self._aio.get_session(session)))
 
-    def close_session(self, session_id: SessionID) -> "Session":
-        return self._session(self._call(self._aio.close_session(session_id)))
+    def close_session(self, session: str) -> "Session":
+        return self._session(self._call(self._aio.close_session(session)))
 
 
 class Session:
@@ -261,7 +265,7 @@ class Session:
     def __init__(self, connection: Connection, aio_session: aio_client.Session):
         self.connection = connection
         self._aio = aio_session
-        for name in ("id", "application", "state", "creation_time", "pending", "running", "succeed", "failed", "completion_time", "events"):
+        for name in ("id", "name", "workspace", "application", "state", "creation_time", "pending", "running", "succeed", "failed", "completion_time", "events"):
             setattr(self, name, getattr(aio_session, name))
         self.mutex = threading.Lock()
 
@@ -271,8 +275,8 @@ class Session:
     def create_task(self, input_data: bytes, option: Optional[TaskOptions] = None) -> Task:
         return self.connection._call(self._aio.create_task(input_data, option))
 
-    def get_task(self, task_id: TaskID) -> Task:
-        return self.connection._call(self._aio.get_task(task_id))
+    def get_task(self, task: str) -> Task:
+        return self.connection._call(self._aio.get_task(task))
 
     def list_tasks(self) -> "TaskIterator":
         async def start():
@@ -280,9 +284,9 @@ class Session:
 
         return TaskIterator(self.connection._bridge, self.connection._call(start()))
 
-    def watch_task(self, task_id: TaskID, timeout: Optional[float] = None) -> "TaskWatcher":
+    def watch_task(self, task: str, timeout: Optional[float] = None) -> "TaskWatcher":
         async def start():
-            return self._aio.watch_task(task_id, timeout)
+            return self._aio.watch_task(task, timeout)
 
         return TaskWatcher(self.connection._bridge, self.connection._call(start()))
 
@@ -376,7 +380,7 @@ class Session:
         return result
 
     def close(self) -> None:
-        self.connection.close_session(self.id)
+        self.connection.close_session(self.name)
 
 
 class _AsyncIteratorFacade:

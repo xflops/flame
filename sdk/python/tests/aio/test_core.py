@@ -24,12 +24,12 @@ def test_aio_frontend_api_parity(frontend_server):
             assert await connection.list_nodes() == []
             session = await connection.create_session(SessionAttributes(application="app"))
             assert session.common_data() == b""
-            assert (await connection.open_session(session.id)).id == session.id
-            assert (await connection.get_session(session.id)).id == session.id
+            assert (await connection.open_session(session.name)).name == session.name
+            assert (await connection.get_session(session.name)).name == session.name
             assert len(await connection.list_sessions()) == 1
-            assert (await session.create_task(b"input")).id == "task-1"
+            assert (await session.create_task(b"input")).name == "task-1"
             assert (await session.get_task("task-1")).output == b"done"
-            assert [task.id async for task in session.list_tasks()] == ["task-1"]
+            assert [task.name async for task in session.list_tasks()] == ["task-1"]
             updates = session.watch_task("task-1")
             assert (await updates.__anext__()).state == TaskState.SUCCEED
             updates.close()

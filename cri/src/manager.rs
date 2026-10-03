@@ -747,8 +747,7 @@ fn with_cleanup(primary: FlameError, cleanup: Option<FlameError>) -> FlameError 
 mod tests {
     use super::*;
     use crate::apis::{
-        ContainerSecurityContext, ContainerSpec, LABEL_EXECUTOR_ID, ResourceLimits,
-        WorkloadMetadata,
+        ContainerSecurityContext, ContainerSpec, LABEL_EXECUTOR, ResourceLimits, WorkloadMetadata,
     };
     use crate::cri_v1::{
         Container, ContainerMetadata, ContainerState, PodSandbox, PodSandboxState,
@@ -852,7 +851,7 @@ mod tests {
             self.call("list_sandboxes");
             let labels = self.state.labels.lock().unwrap().clone();
             let mut foreign_labels = labels.clone();
-            foreign_labels.insert(LABEL_EXECUTOR_ID.to_string(), "foreign".to_string());
+            foreign_labels.insert(LABEL_EXECUTOR.to_string(), "foreign".to_string());
             Ok(tonic::Response::new(ListPodSandboxResponse {
                 items: vec![
                     PodSandbox {
@@ -1016,13 +1015,13 @@ mod tests {
         }
     }
 
-    fn fake_spec(executor_id: &str) -> WorkloadSpec {
+    fn fake_spec(executor: &str) -> WorkloadSpec {
         WorkloadSpec {
             metadata: WorkloadMetadata {
                 name: "workload".to_string(),
                 namespace: "flame".to_string(),
                 uid: "uid".to_string(),
-                executor_id: executor_id.to_string(),
+                executor: executor.to_string(),
                 application: "app".to_string(),
             },
             containers: vec![ContainerSpec {
@@ -1041,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn ownership_check_requires_executor_id() {
+    fn ownership_check_requires_executor() {
         let filter = WorkloadFilter::new("executor-a").unwrap();
         let mut sandbox = PodSandboxStatus {
             id: "sandbox".to_string(),
@@ -1050,7 +1049,7 @@ mod tests {
         };
         assert!(ensure_owned(&sandbox, &filter).is_ok());
         sandbox.labels.insert(
-            "io.xflops.flame.executor-id".to_string(),
+            "io.xflops.flame.executor".to_string(),
             "executor-b".to_string(),
         );
         assert!(ensure_owned(&sandbox, &filter).is_err());

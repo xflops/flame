@@ -69,6 +69,11 @@ def random_string(size=16) -> str:
     return "".join(random.choice(string.ascii_letters + string.digits) for _ in range(size))
 
 
+def random_name_suffix(size=8) -> str:
+    """Generate a lowercase alphanumeric suffix for application and session names."""
+    return "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(size))
+
+
 def wait_for_application_deleted(name: str, timeout: float = 10.0) -> None:
     """Wait for FSM to physically remove a disabled application."""
     deadline = time.monotonic() + timeout

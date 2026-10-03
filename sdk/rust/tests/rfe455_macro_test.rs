@@ -84,6 +84,7 @@ fn session_context(common_data: Option<CommonData>) -> SessionContext {
         "ssn-1".to_string(),
         ApplicationContext {
             name: "test-app".to_string(),
+            workspace: "default".to_string(),
             image: None,
             command: None,
         },
@@ -93,8 +94,9 @@ fn session_context(common_data: Option<CommonData>) -> SessionContext {
 
 fn task_context(input: Option<flame::apis::TaskInput>) -> TaskContext {
     TaskContext {
-        task_id: "task-1".to_string(),
-        session_id: "ssn-1".to_string(),
+        task: "1".to_string(),
+        session: "ssn-1".to_string(),
+        workspace: "default".to_string(),
         input,
     }
 }

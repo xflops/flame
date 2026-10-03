@@ -7,6 +7,7 @@ option go_package = "github.com/flame-sh/flame/sdk/go/rpc/v1";
 message Metadata {
   string id = 1;
   string name = 2;
+  optional string workspace = 3;
 }
 
 enum SessionState {
@@ -66,7 +67,7 @@ message TaskStatus {
 }
 
 message TaskSpec {
-  string session_id = 2;
+  string session = 2;
 
   optional bytes input = 3;
   optional bytes output = 4;
@@ -168,7 +169,16 @@ enum ExecutorState {
 
 message ExecutorStatus {
   ExecutorState state = 1;
-  optional string session_id = 2;
+  optional string session = 2;
+}
+
+message Workspace {
+  string name = 1;
+  int64 create_at = 2;
+}
+
+message WorkspaceList {
+  repeated Workspace workspaces = 1;
 }
 
 message Executor {

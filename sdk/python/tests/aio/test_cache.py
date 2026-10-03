@@ -184,7 +184,7 @@ class TestAioCache:
             return FetchResult(FetchMode.PATCHES, 3, None, [Patch(3, [3])])
 
         monkeypatch.setattr(aio_cache, "_fetch_object_data", fetch)
-        ref = ObjectRef("grpc://cache:1", "app/session/key", 2)
+        ref = ObjectRef("grpc://cache:1", "default/app/session/key", 2)
 
         async def run():
             assert await aio_cache.get_object(ref, lambda base, patches: base + [item for patch in patches for item in patch]) == [1, 2]
@@ -196,7 +196,7 @@ class TestAioCache:
 
     def test_not_modified_and_patch_fallback(self, monkeypatch):
         versions = []
-        key = ("grpc://cache:1", "app/session/key")
+        key = ("grpc://cache:1", "default/app/session/key")
         cache_module._cache_put(key, Object(version=1, data="old"))
 
         async def fetch(ref, version):
@@ -218,7 +218,7 @@ class TestAioCache:
         assert versions == [0]
 
     def test_delayed_older_fetch_does_not_regress_cache(self, monkeypatch):
-        ref = ObjectRef("grpc://cache:1", "app/session/key", 0)
+        ref = ObjectRef("grpc://cache:1", "default/app/session/key", 0)
         first_started = asyncio.Event()
         release_first = asyncio.Event()
         calls = 0
@@ -245,7 +245,7 @@ class TestAioCache:
         assert cache_module._cache_get((ref.endpoint, ref.key)).version == 3
 
     def test_not_modified_reuses_materialized_bound_method(self, monkeypatch):
-        ref = ObjectRef("grpc://cache:1", "app/session/key", 1)
+        ref = ObjectRef("grpc://cache:1", "default/app/session/key", 1)
         cache_module._cache_put((ref.endpoint, ref.key), Object(version=1, data=[1], patches=[Patch(1, [2])]))
         calls = []
 
@@ -282,7 +282,7 @@ class TestAioCache:
 
         async def run():
             with pytest.raises(ValueError, match="does not match"):
-                await aio_cache.patch_object(ObjectRef("grpc://cache:1", "app/session/key"), [1, 2])
+                await aio_cache.patch_object(ObjectRef("grpc://cache:1", "default/app/session/key"), [1, 2])
 
         asyncio.run(run())
         assert not writes
@@ -307,7 +307,7 @@ class TestAioCache:
                 items = [item async for item in requests]
                 stored["header"] = items[0].header
                 stored["payload"] = b"".join(item.data for item in items[1:])
-                return SimpleNamespace(endpoint=endpoint, key="app/session/key", version=1)
+                return SimpleNamespace(endpoint=endpoint, key="default/app/session/key", version=1)
 
             async def GetMetadata(self, request):  # noqa: N802 - gRPC method
                 return SimpleNamespace(data_type=stored["header"].data_type)
@@ -315,7 +315,7 @@ class TestAioCache:
             async def Patch(self, requests, timeout=None):  # noqa: N802 - gRPC method
                 items = [item async for item in requests]
                 stored["patch"] = b"".join(item.data for item in items[1:])
-                return SimpleNamespace(endpoint=endpoint, key="app/session/key", version=2)
+                return SimpleNamespace(endpoint=endpoint, key="default/app/session/key", version=2)
 
             def Get(self, request):  # noqa: N802 - gRPC method
                 async def responses():
@@ -331,13 +331,13 @@ class TestAioCache:
         monkeypatch.setattr(aio_cache, "_get_client", lambda endpoint, tls=None: FakeClient())
 
         async def run():
-            ref = await aio_cache.put_object("app/session", [1])
+            ref = await aio_cache.put_object("default/app/session", [1])
             await aio_cache.patch_object(ref, [2])
             assert await aio_cache.get_object(ref, lambda base, patches: base + patches[0]) == [1, 2]
-            await aio_cache.delete_objects("app/session")
+            await aio_cache.delete_objects("default/app/session")
 
         asyncio.run(run())
-        assert stored["deleted"] == "app/session"
+        assert stored["deleted"] == "default/app/session"
         assert stored["header"].data_type == "cloudpickle"
 
     def test_file_upload_download_and_zstd(self, monkeypatch, tmp_path):
@@ -353,7 +353,7 @@ class TestAioCache:
                 items = [item async for item in requests]
                 stored["type"] = items[0].header.data_type
                 stored["payload"] = b"".join(item.data for item in items[1:])
-                return SimpleNamespace(endpoint=endpoint, key="app/session/file.tar.gz", version=1)
+                return SimpleNamespace(endpoint=endpoint, key="default/app/session/file.tar.gz", version=1)
 
             def Get(self, request):  # noqa: N802 - gRPC method
                 async def responses():
@@ -366,7 +366,7 @@ class TestAioCache:
         monkeypatch.setattr(aio_cache, "_get_client", lambda endpoint, tls=None: FileClient())
 
         async def run():
-            ref = await aio_cache.upload_object("app/session/file.tar.gz", str(source))
+            ref = await aio_cache.upload_object("default/app/session/file.tar.gz", str(source))
             assert stored["type"] == "raw"
             assert stored["payload"] == payload
             output = tmp_path / "output.tar.gz"
@@ -393,7 +393,7 @@ class TestAioCache:
 
         async def run():
             with pytest.raises(ValueError, match="raw base chunks only"):
-                await aio_cache.download_object(ObjectRef("grpc://cache:1", "app/session/key"), str(output))
+                await aio_cache.download_object(ObjectRef("grpc://cache:1", "default/app/session/key"), str(output))
 
         asyncio.run(run())
         assert not output.exists()
@@ -401,7 +401,7 @@ class TestAioCache:
     def test_upload_validates_path_before_rpc(self, tmp_path):
         async def run():
             with pytest.raises(FileNotFoundError):
-                await aio_cache.upload_object("app/session/key", str(tmp_path / "missing"))
+                await aio_cache.upload_object("default/app/session/key", str(tmp_path / "missing"))
             source = tmp_path / "source"
             source.write_bytes(b"data")
             with pytest.raises(ValueError, match="Invalid object key"):
@@ -416,7 +416,7 @@ class TestAioCache:
 
             async def Put(self, request_iterator, context):  # noqa: N802 - gRPC method
                 requests = [request async for request in request_iterator]
-                key = "app/session/key"
+                key = "default/app/session/key"
                 self.objects[key] = (requests[0].header.data_type, b"".join(request.data for request in requests[1:]), [])
                 return cache_pb2.CacheObjectMetadata(endpoint=self.endpoint, key=key, version=1)
 
@@ -451,7 +451,7 @@ class TestAioCache:
             monkeypatch.setattr(cache_module, "_get_cached_context", lambda: SimpleNamespace(cache=service.endpoint))
             await server.start()
             try:
-                ref = await aio_cache.put_object("app/session", [1])
+                ref = await aio_cache.put_object("default/app/session", [1])
                 assert await aio_cache.get_object(ref) == [1]
                 ref = await aio_cache.patch_object(ref, [2])
                 assert await aio_cache.get_object(ref, lambda base, patches: base + patches[0]) == [1, 2]

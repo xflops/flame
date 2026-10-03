@@ -182,7 +182,9 @@ struct RenderedSchema {
 
 pub async fn run(ctx: &FlameContext, options: &Options) -> Result<(), FlameError> {
     let plan = build_plan(ctx, options)?;
-    let object_key = plan.prepared.object_key(&plan.app_name);
+    let object_key = plan
+        .prepared
+        .object_key(&ctx.get_current_context()?.workspace, &plan.app_name);
     let (uploaded_key, package_endpoint) = if plan.dry_run {
         (object_key, plan.cache_endpoint.clone())
     } else {
@@ -222,7 +224,8 @@ pub async fn run(ctx: &FlameContext, options: &Options) -> Result<(), FlameError
             &current_ctx.cluster.endpoint,
             current_ctx.cluster.tls.as_ref(),
         )
-        .await?;
+        .await?
+        .with_workspace(current_ctx.workspace.clone());
         conn.register_application(plan.app_name.clone(), attributes)
             .await?;
     }
@@ -238,7 +241,6 @@ fn build_plan(ctx: &FlameContext, options: &Options) -> Result<DeployPlan, Flame
         .clone()
         .or_else(|| profile.as_ref().map(|profile| profile.metadata.name.clone()))
         .ok_or_else(|| FlameError::InvalidConfig("application name required; pass --name or add metadata.name to flame.yaml or flm.yaml".to_string()))?;
-    validate_name(&app_name)?;
     let current_ctx = ctx.get_current_context()?;
     let cache_config = current_ctx
         .cache
@@ -438,11 +440,6 @@ fn parse_envs(values: &[String]) -> Result<HashMap<String, String>, FlameError> 
     Ok(envs)
 }
 
-fn validate_name(name: &str) -> Result<(), FlameError> {
-    common::apis::validate_application_name(name)
-        .map_err(|e| FlameError::InvalidConfig(e.to_string()))
-}
-
 fn normalize_cache_endpoint(raw: &str) -> Result<String, FlameError> {
     let parsed = Url::parse(raw)
         .map_err(|e| FlameError::InvalidConfig(format!("invalid cache endpoint: {}", e)))?;
@@ -605,13 +602,6 @@ mod tests {
     }
 
     #[test]
-    fn validates_names_like_session_manager() {
-        assert!(validate_name("demo-app").is_ok());
-        assert!(validate_name("app@name").is_err());
-        assert!(validate_name("-demo").is_err());
-    }
-
-    #[test]
     fn explicit_options_override_detection() {
         let options = Options {
             name: Some("demo".to_string()),
@@ -641,22 +631,22 @@ mod tests {
     }
 
     #[test]
-    fn binary_package_url_uses_three_part_content_addressed_object_key() {
+    fn binary_package_url_uses_workspace_content_addressed_object_key() {
         let temp = tempfile::TempDir::new().unwrap();
         let bin = temp.path().join("service");
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
         make_executable(&bin);
 
         let prepared = prepare_application(&bin).unwrap();
-        let object_key = prepared.object_key("demo");
+        let object_key = prepared.object_key("default", "demo");
         assert_eq!(
             object_key,
-            format!("demo/pkg/demo-{}.tar.gz", &prepared.sha256[..16])
+            format!("default/demo/pkg/demo-{}.tar.gz", &prepared.sha256[..16])
         );
         assert_eq!(
             object_url("grpc://cache:9090", &object_key),
             format!(
-                "grpc://cache:9090/demo/pkg/demo-{}.tar.gz",
+                "grpc://cache:9090/default/demo/pkg/demo-{}.tar.gz",
                 &prepared.sha256[..16]
             )
         );

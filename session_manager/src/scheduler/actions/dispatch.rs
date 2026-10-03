@@ -16,7 +16,7 @@ use std::sync::Arc;
 use stdng::collections::{BinaryHeap, Cmp};
 use stdng::{logs::TraceFn, trace_fn};
 
-use crate::model::{IDLE_EXECUTOR, READY_SESSION};
+use crate::model::IDLE_EXECUTOR;
 use crate::scheduler::actions::{Action, ActionPtr};
 use crate::scheduler::plugins::ssn_order_fn;
 use crate::scheduler::Context;
@@ -40,7 +40,7 @@ impl Action for DispatchAction {
         ss.debug()?;
 
         let mut open_ssns = BinaryHeap::new(ssn_order_fn(ctx));
-        let ssn_list = ss.find_sessions(READY_SESSION)?;
+        let ssn_list = crate::scheduler::ready_sessions(&ss)?;
         for ssn in ssn_list.values() {
             open_ssns.push(ssn.clone());
         }
@@ -82,7 +82,7 @@ impl Action for DispatchAction {
             let available = ctx.select_executor(&ssn, &idle_executors)?;
             if let Some(exec) = available {
                 ctx.bind_session(&exec, &ssn).await?;
-                idle_executors.remove(&exec.id);
+                idle_executors.remove(&exec.name);
 
                 // A session may need more than one executor. Give Dispatch the
                 // first opportunity to satisfy that demand from retained Idle

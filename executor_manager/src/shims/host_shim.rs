@@ -226,7 +226,7 @@ impl HostShim {
             .read(true)
             .write(true)
             .truncate(true)
-            .open(process_work_dir.join(format!("{}.out", executor.id)))
+            .open(process_work_dir.join(format!("{}.out", executor.name)))
             .map_err(|e| FlameError::Internal(format!("failed to open stdout log file: {e}")))?;
 
         let log_err = OpenOptions::new()
@@ -234,7 +234,7 @@ impl HostShim {
             .read(true)
             .write(true)
             .truncate(true)
-            .open(process_work_dir.join(format!("{}.err", executor.id)))
+            .open(process_work_dir.join(format!("{}.err", executor.name)))
             .map_err(|e| FlameError::Internal(format!("failed to open stderr log file: {e}")))?;
 
         #[cfg(unix)]
@@ -362,7 +362,7 @@ impl Shim for HostShim {
         installation
             .env_vars
             .extend(Self::base_runtime_environment(&self.app, &flame_home));
-        let work_dir = ExecutorWorkDir::new(&self.app, &self.executor.id)?;
+        let work_dir = ExecutorWorkDir::new(&self.app, &self.executor.name)?;
         let mut instance_client = GrpcShim::new(&work_dir)?;
         let mut instance =
             Self::launch_instance(&self.app, &self.executor, &work_dir, &installation.env_vars)?;
@@ -431,8 +431,10 @@ mod tests {
 
     fn test_executor() -> Executor {
         Executor {
-            id: "executor-1".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "executor-1".to_string(),
             application: "test-app".to_string(),
+            workspace: "default".to_string(),
             resreq: ResourceRequirement::default(),
             node: "node-1".to_string(),
             shim: ShimType::Host,
@@ -460,6 +462,7 @@ mod tests {
         let site_packages = temp.path().join("lib/python3.12/site-packages");
         fs::create_dir_all(&site_packages).unwrap();
         let app = ApplicationContext {
+            workspace: "default".to_string(),
             name: "flmrun".to_string(),
             shim: ShimType::Host,
             image: None,
@@ -488,6 +491,7 @@ mod tests {
     #[tokio::test]
     async fn create_service_installs_before_runtime_creation() {
         let app = ApplicationContext {
+            workspace: "default".to_string(),
             name: "test-app".to_string(),
             shim: ShimType::Host,
             image: None,

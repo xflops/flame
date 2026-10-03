@@ -58,8 +58,8 @@ pub struct TaskInvokeResponse {
 /// Represents the executor's working directory with cleanup management.
 /// Directory structure:
 ///   top_dir/                     - Process working directory, stdout/stderr logs
-///   top_dir/work/<app_name>/     - App-specific directory for tmp, cache
-///   /var/flame/executors/<executor_id>.sock - Socket for gRPC communication
+///   top_dir/work/<workspace>/<application>/     - App-specific directory for tmp, cache
+///   /var/flame/executors/<executor>.sock - Socket for gRPC communication
 /// Cleanup:
 ///   - top_dir: cleaned up only if auto-generated
 ///   - app_dir: always cleaned up
@@ -67,9 +67,9 @@ pub struct TaskInvokeResponse {
 pub struct ExecutorWorkDir {
     /// Top-level working directory (process runs here).
     top_dir: PathBuf,
-    /// Application working directory: top_dir/work/<app-name> (for logs, tmp, cache).
+    /// Application working directory: top_dir/work/<workspace>/<application> (for logs, tmp, cache).
     app_dir: PathBuf,
-    /// Socket path: /var/flame/executors/<executor_id>.sock
+    /// Socket path: /var/flame/executors/<executor>.sock
     socket: PathBuf,
     /// If true, top_dir was auto-generated and should be cleaned up on release.
     auto_dir: bool,
@@ -84,22 +84,22 @@ fn get_socket_dir() -> PathBuf {
 }
 
 impl ExecutorWorkDir {
-    /// Create an ExecutorWorkDir from application context and executor ID.
-    pub fn new(app: &ApplicationContext, executor_id: &str) -> Result<Self, FlameError> {
+    /// Create an ExecutorWorkDir from application context and executor name.
+    pub fn new(app: &ApplicationContext, executor: &str) -> Result<Self, FlameError> {
         let (top_dir, auto_dir) = match &app.working_directory {
             Some(wd) if !wd.is_empty() => (Path::new(wd).to_path_buf(), false),
             _ => (
                 env::current_dir()
                     .unwrap_or(Path::new(FLAME_WORKING_DIRECTORY).to_path_buf())
-                    .join(executor_id),
+                    .join(executor),
                 true,
             ),
         };
 
         let work_dir = top_dir.join("work");
-        let app_dir = work_dir.join(&app.name);
+        let app_dir = work_dir.join(&app.workspace).join(&app.name);
         let socket_dir = get_socket_dir();
-        let socket = socket_dir.join(format!("{}.sock", executor_id));
+        let socket = socket_dir.join(format!("{}.sock", executor));
 
         // Create top_dir if auto-generated
         if auto_dir {
@@ -222,7 +222,7 @@ pub fn new_ptr(
 
     tracing::info!(
         "Creating shim for executor <{}> with type: {:?} (from executor-manager config)",
-        executor.id,
+        executor.name,
         shim_type
     );
 
@@ -278,8 +278,10 @@ mod tests {
         let mut context = FlameClusterContext::default();
         context.cluster.executors.shim = shim;
         Executor {
-            id: "executor-1".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "executor-1".to_string(),
             application: "test-app".to_string(),
+            workspace: "default".to_string(),
             resreq: ResourceRequirement::default(),
             node: "node-1".to_string(),
             shim,
@@ -311,6 +313,7 @@ mod tests {
 
     fn create_test_app(name: &str, working_directory: Option<String>) -> ApplicationContext {
         ApplicationContext {
+            workspace: "default".to_string(),
             name: name.to_string(),
             shim: common::apis::Shim::Host,
             image: None,
@@ -338,11 +341,11 @@ mod tests {
         let socket_dir = setup_test_env(&temp);
 
         let app = create_test_app("test-app", None);
-        let executor_id = "exec-123";
+        let executor = "exec-123";
 
-        let work_dir = ExecutorWorkDir::new(&app, executor_id).unwrap();
+        let work_dir = ExecutorWorkDir::new(&app, executor).unwrap();
 
-        assert!(work_dir.process_dir().ends_with(executor_id));
+        assert!(work_dir.process_dir().ends_with(executor));
         assert!(work_dir.app_dir().ends_with("test-app"));
         assert_eq!(
             work_dir.socket(),
@@ -361,12 +364,15 @@ mod tests {
         std::fs::create_dir_all(&custom_dir).unwrap();
 
         let app = create_test_app("test-app", Some(custom_dir.to_string_lossy().to_string()));
-        let executor_id = "exec-456";
+        let executor = "exec-456";
 
-        let work_dir = ExecutorWorkDir::new(&app, executor_id).unwrap();
+        let work_dir = ExecutorWorkDir::new(&app, executor).unwrap();
 
         assert_eq!(work_dir.process_dir(), custom_dir.as_path());
-        assert_eq!(work_dir.app_dir(), custom_dir.join("work").join("test-app"));
+        assert_eq!(
+            work_dir.app_dir(),
+            custom_dir.join("work").join("default").join("test-app")
+        );
         assert_eq!(
             work_dir.socket(),
             socket_dir.join("exec-456.sock").as_path()
@@ -380,12 +386,12 @@ mod tests {
         setup_test_env(&temp);
 
         let app = create_test_app("test-app", None);
-        let long_executor_id = "550e8400-e29b-41d4-a716-446655440000";
+        let long_executor = "550e8400-e29b-41d4-a716-446655440000";
 
-        let work_dir = ExecutorWorkDir::new(&app, long_executor_id).unwrap();
+        let work_dir = ExecutorWorkDir::new(&app, long_executor).unwrap();
 
         let socket_path = work_dir.socket();
-        let default_path = format!("{}/{}.sock", FLAME_SOCKET_DIR, long_executor_id);
+        let default_path = format!("{}/{}.sock", FLAME_SOCKET_DIR, long_executor);
         assert!(
             default_path.len() < 104,
             "Default socket path should be under SUN_LEN limit: {} chars",
@@ -400,14 +406,14 @@ mod tests {
         setup_test_env(&temp);
 
         let app = create_test_app("test-app", None);
-        let executor_id = "exec-drop-test";
+        let executor = "exec-drop-test";
 
         let top_dir: PathBuf;
         let app_dir: PathBuf;
         let socket_path: PathBuf;
 
         {
-            let work_dir = ExecutorWorkDir::new(&app, executor_id).unwrap();
+            let work_dir = ExecutorWorkDir::new(&app, executor).unwrap();
             top_dir = work_dir.process_dir().to_path_buf();
             app_dir = work_dir.app_dir().to_path_buf();
             socket_path = work_dir.socket().to_path_buf();
@@ -436,12 +442,12 @@ mod tests {
         std::fs::create_dir_all(&custom_dir).unwrap();
 
         let app = create_test_app("test-app", Some(custom_dir.to_string_lossy().to_string()));
-        let executor_id = "exec-persist-test";
+        let executor = "exec-persist-test";
 
         let socket_path: PathBuf;
 
         {
-            let work_dir = ExecutorWorkDir::new(&app, executor_id).unwrap();
+            let work_dir = ExecutorWorkDir::new(&app, executor).unwrap();
             socket_path = work_dir.socket().to_path_buf();
 
             File::create(&socket_path).unwrap();

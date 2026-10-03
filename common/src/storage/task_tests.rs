@@ -28,10 +28,24 @@ mod tests {
         }
     }
 
+    async fn test_storage() -> storage::StoragePtr {
+        let storage = storage::new_ptr(&test_context()).await.unwrap();
+        storage
+            .register_application(
+                "default".to_string(),
+                "test-app".to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        storage
+    }
+
     fn create_session_attr(id: &str) -> SessionAttributes {
         SessionAttributes {
             tokens: Default::default(),
-            id: id.to_string(),
+            workspace: "default".to_string(),
+            name: id.to_string(),
             application: "test-app".to_string(),
             common_data: None,
             min_instances: 1,
@@ -47,14 +61,13 @@ mod tests {
 
         #[tokio::test]
         async fn creates_task_in_session() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("task-test-ssn");
             storage.create_session(attr).await.unwrap();
 
             let task = storage
-                .create_task("task-test-ssn".to_string(), None, None)
+                .create_task("default", "task-test-ssn", None, None)
                 .await
                 .unwrap();
 
@@ -63,15 +76,14 @@ mod tests {
 
         #[tokio::test]
         async fn creates_task_with_input() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("task-input-ssn");
             storage.create_session(attr).await.unwrap();
 
             let input = bytes::Bytes::from(vec![1u8, 2, 3]);
             let task = storage
-                .create_task("task-input-ssn".to_string(), Some(input.clone()), None)
+                .create_task("default", "task-input-ssn", Some(input.clone()), None)
                 .await
                 .unwrap();
 
@@ -80,8 +92,7 @@ mod tests {
 
         #[tokio::test]
         async fn creates_task_with_affinity() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("task-affinity-ssn");
             storage.create_session(attr).await.unwrap();
@@ -92,7 +103,8 @@ mod tests {
             ]);
             let task = storage
                 .create_task(
-                    "task-affinity-ssn".to_string(),
+                    "default",
+                    "task-affinity-ssn",
                     None,
                     Some(crate::apis::TaskOptions {
                         affinity: affinity.clone(),
@@ -103,7 +115,7 @@ mod tests {
 
             assert_eq!(task.affinity, affinity);
             let session = storage
-                .get_session_ptr("task-affinity-ssn".to_string())
+                .get_session_ptr("default", "task-affinity-ssn")
                 .unwrap();
             let session = lock_ptr!(session).unwrap();
             let pending = session
@@ -121,18 +133,17 @@ mod tests {
 
         #[tokio::test]
         async fn creates_multiple_tasks_with_unique_ids() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("multi-task-ssn");
             storage.create_session(attr).await.unwrap();
 
             let task1 = storage
-                .create_task("multi-task-ssn".to_string(), None, None)
+                .create_task("default", "multi-task-ssn", None, None)
                 .await
                 .unwrap();
             let task2 = storage
-                .create_task("multi-task-ssn".to_string(), None, None)
+                .create_task("default", "multi-task-ssn", None, None)
                 .await
                 .unwrap();
 
@@ -141,11 +152,10 @@ mod tests {
 
         #[tokio::test]
         async fn returns_error_for_nonexistent_session() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let result = storage
-                .create_task("nonexistent-ssn".to_string(), None, None)
+                .create_task("default", "nonexistent-ssn", None, None)
                 .await;
             assert!(result.is_err());
         }
@@ -156,19 +166,18 @@ mod tests {
 
         #[tokio::test]
         async fn returns_task_by_id() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("get-task-ssn");
             storage.create_session(attr).await.unwrap();
 
             let created_task = storage
-                .create_task("get-task-ssn".to_string(), None, None)
+                .create_task("default", "get-task-ssn", None, None)
                 .await
                 .unwrap();
 
             let retrieved_task = storage
-                .get_task("get-task-ssn".to_string(), created_task.id)
+                .get_task("default", "get-task-ssn", &created_task.name.to_string())
                 .unwrap();
 
             assert_eq!(retrieved_task.id, created_task.id);
@@ -176,46 +185,64 @@ mod tests {
 
         #[tokio::test]
         async fn returns_error_for_nonexistent_task() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("no-task-ssn");
             storage.create_session(attr).await.unwrap();
 
-            let result = storage.get_task("no-task-ssn".to_string(), 999);
+            let result = storage.get_task("default", "no-task-ssn", "999");
             assert!(result.is_err());
         }
 
         #[tokio::test]
         async fn returns_error_for_nonexistent_session() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
-            let result = storage.get_task("nonexistent-ssn".to_string(), 1);
+            let result = storage.get_task("default", "nonexistent-ssn", "1");
             assert!(result.is_err());
         }
 
         #[tokio::test]
         async fn get_task_ptr_returns_pointer() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("ptr-task-ssn");
             storage.create_session(attr).await.unwrap();
 
             let created_task = storage
-                .create_task("ptr-task-ssn".to_string(), None, None)
+                .create_task("default", "ptr-task-ssn", None, None)
                 .await
                 .unwrap();
 
-            let gid = crate::apis::TaskGID {
-                ssn_id: "ptr-task-ssn".to_string(),
-                task_id: created_task.id,
-            };
-            let task_ptr = storage.get_task_ptr(gid).unwrap();
+            let task_ptr = storage
+                .get_task_ptr("default", "ptr-task-ssn", &created_task.name.to_string())
+                .unwrap();
             let task = lock_ptr!(task_ptr).unwrap();
 
             assert_eq!(task.id, created_task.id);
+        }
+
+        #[tokio::test]
+        async fn requires_canonical_positive_task_name() {
+            let storage = test_storage().await;
+            storage
+                .create_session(create_session_attr("canonical-task-ssn"))
+                .await
+                .unwrap();
+            storage
+                .create_task("default", "canonical-task-ssn", None, None)
+                .await
+                .unwrap();
+
+            for name in ["0", "01", "+1", "-1", "not-a-number"] {
+                assert!(matches!(
+                    storage.get_task_ptr("default", "canonical-task-ssn", name),
+                    Err(crate::FlameError::NotFound(_))
+                ));
+            }
+            assert!(storage
+                .get_task_ptr("default", "canonical-task-ssn", "1")
+                .is_ok());
         }
     }
 
@@ -224,41 +251,38 @@ mod tests {
 
         #[tokio::test]
         async fn returns_empty_list_for_session_with_no_tasks() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("empty-task-ssn");
             storage.create_session(attr).await.unwrap();
 
-            let tasks = storage.list_tasks("empty-task-ssn".to_string()).unwrap();
+            let tasks = storage.list_tasks("default", "empty-task-ssn").unwrap();
             assert!(tasks.is_empty());
         }
 
         #[tokio::test]
         async fn returns_all_tasks_in_session() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("list-task-ssn");
             storage.create_session(attr).await.unwrap();
 
             for _ in 0..5 {
                 storage
-                    .create_task("list-task-ssn".to_string(), None, None)
+                    .create_task("default", "list-task-ssn", None, None)
                     .await
                     .unwrap();
             }
 
-            let tasks = storage.list_tasks("list-task-ssn".to_string()).unwrap();
+            let tasks = storage.list_tasks("default", "list-task-ssn").unwrap();
             assert_eq!(tasks.len(), 5);
         }
 
         #[tokio::test]
         async fn returns_error_for_nonexistent_session() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
-            let result = storage.list_tasks("nonexistent-ssn".to_string());
+            let result = storage.list_tasks("default", "nonexistent-ssn");
             assert!(result.is_err());
         }
     }
@@ -268,25 +292,22 @@ mod tests {
 
         #[tokio::test]
         async fn updates_task_to_running() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("update-state-ssn");
             storage.create_session(attr).await.unwrap();
 
             let task = storage
-                .create_task("update-state-ssn".to_string(), None, None)
+                .create_task("default", "update-state-ssn", None, None)
                 .await
                 .unwrap();
 
             let ssn_ptr = storage
-                .get_session_ptr("update-state-ssn".to_string())
+                .get_session_ptr("default", "update-state-ssn")
                 .unwrap();
-            let gid = crate::apis::TaskGID {
-                ssn_id: "update-state-ssn".to_string(),
-                task_id: task.id,
-            };
-            let task_ptr = storage.get_task_ptr(gid).unwrap();
+            let task_ptr = storage
+                .get_task_ptr("default", "update-state-ssn", &task.name.to_string())
+                .unwrap();
 
             storage
                 .update_task_state(ssn_ptr, task_ptr, TaskState::Running, None)
@@ -294,32 +315,27 @@ mod tests {
                 .unwrap();
 
             let updated_task = storage
-                .get_task("update-state-ssn".to_string(), task.id)
+                .get_task("default", "update-state-ssn", &task.name.to_string())
                 .unwrap();
             assert_eq!(updated_task.state, TaskState::Running);
         }
 
         #[tokio::test]
         async fn updates_task_with_message() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("state-msg-ssn");
             storage.create_session(attr).await.unwrap();
 
             let task = storage
-                .create_task("state-msg-ssn".to_string(), None, None)
+                .create_task("default", "state-msg-ssn", None, None)
                 .await
                 .unwrap();
 
-            let ssn_ptr = storage
-                .get_session_ptr("state-msg-ssn".to_string())
+            let ssn_ptr = storage.get_session_ptr("default", "state-msg-ssn").unwrap();
+            let task_ptr = storage
+                .get_task_ptr("default", "state-msg-ssn", &task.name.to_string())
                 .unwrap();
-            let gid = crate::apis::TaskGID {
-                ssn_id: "state-msg-ssn".to_string(),
-                task_id: task.id,
-            };
-            let task_ptr = storage.get_task_ptr(gid).unwrap();
 
             storage
                 .update_task_state(
@@ -332,7 +348,7 @@ mod tests {
                 .unwrap();
 
             let updated_task = storage
-                .get_task("state-msg-ssn".to_string(), task.id)
+                .get_task("default", "state-msg-ssn", &task.name.to_string())
                 .unwrap();
             assert_eq!(updated_task.state, TaskState::Running);
         }
@@ -343,23 +359,20 @@ mod tests {
 
         #[tokio::test]
         async fn updates_task_to_succeeded() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("result-ssn");
             storage.create_session(attr).await.unwrap();
 
             let task = storage
-                .create_task("result-ssn".to_string(), None, None)
+                .create_task("default", "result-ssn", None, None)
                 .await
                 .unwrap();
 
-            let ssn_ptr = storage.get_session_ptr("result-ssn".to_string()).unwrap();
-            let gid = crate::apis::TaskGID {
-                ssn_id: "result-ssn".to_string(),
-                task_id: task.id,
-            };
-            let task_ptr = storage.get_task_ptr(gid).unwrap();
+            let ssn_ptr = storage.get_session_ptr("default", "result-ssn").unwrap();
+            let task_ptr = storage
+                .get_task_ptr("default", "result-ssn", &task.name.to_string())
+                .unwrap();
 
             let result = TaskResult {
                 state: TaskState::Succeed,
@@ -372,7 +385,9 @@ mod tests {
                 .await
                 .unwrap();
 
-            let updated_task = storage.get_task("result-ssn".to_string(), task.id).unwrap();
+            let updated_task = storage
+                .get_task("default", "result-ssn", &task.name.to_string())
+                .unwrap();
             assert_eq!(updated_task.state, TaskState::Succeed);
             assert!(updated_task.output.is_some());
             assert!(updated_task.completion_time.is_some());
@@ -380,25 +395,22 @@ mod tests {
 
         #[tokio::test]
         async fn updates_task_to_failed_with_message() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("fail-result-ssn");
             storage.create_session(attr).await.unwrap();
 
             let task = storage
-                .create_task("fail-result-ssn".to_string(), None, None)
+                .create_task("default", "fail-result-ssn", None, None)
                 .await
                 .unwrap();
 
             let ssn_ptr = storage
-                .get_session_ptr("fail-result-ssn".to_string())
+                .get_session_ptr("default", "fail-result-ssn")
                 .unwrap();
-            let gid = crate::apis::TaskGID {
-                ssn_id: "fail-result-ssn".to_string(),
-                task_id: task.id,
-            };
-            let task_ptr = storage.get_task_ptr(gid).unwrap();
+            let task_ptr = storage
+                .get_task_ptr("default", "fail-result-ssn", &task.name.to_string())
+                .unwrap();
 
             let result = TaskResult {
                 state: TaskState::Failed,
@@ -412,7 +424,7 @@ mod tests {
                 .unwrap();
 
             let updated_task = storage
-                .get_task("fail-result-ssn".to_string(), task.id)
+                .get_task("default", "fail-result-ssn", &task.name.to_string())
                 .unwrap();
             assert_eq!(updated_task.state, TaskState::Failed);
         }

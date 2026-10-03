@@ -63,6 +63,7 @@ impl From<rpc::Node> for Node {
         let status = node.status.unwrap_or_default();
         let metadata = node.metadata.unwrap_or_default();
         Self {
+            id: metadata.id,
             name: metadata.name,
             capacity: status.capacity.unwrap_or_default().into(),
             allocatable: status.allocatable.unwrap_or_default().into(),
@@ -104,8 +105,11 @@ impl TryFrom<rpc::Task> for TaskContext {
             .ok_or(FlameError::InvalidConfig("spec".to_string()))?;
 
         Ok(TaskContext {
-            task_id: metadata.id.clone(),
-            session_id: spec.session_id.to_string(),
+            task: metadata.name.clone(),
+            session: spec.session.to_string(),
+            workspace: metadata
+                .workspace
+                .unwrap_or_else(|| DEFAULT_WORKSPACE.to_string()),
             input: spec.input.map(TaskInput::from),
         })
     }
@@ -125,6 +129,9 @@ impl TryFrom<rpc::Application> for ApplicationContext {
 
         Ok(ApplicationContext {
             name: metadata.name.clone(),
+            workspace: metadata
+                .workspace
+                .unwrap_or_else(|| DEFAULT_WORKSPACE.to_string()),
             shim: Shim::from(spec.shim()),
             image: spec.image.clone(),
             command: spec.command.clone(),
@@ -156,7 +163,10 @@ impl TryFrom<(rpc::Application, rpc::Session)> for SessionContext {
         let application = ApplicationContext::try_from(app)?;
 
         Ok(SessionContext {
-            session_id: metadata.id,
+            session: metadata.name,
+            workspace: metadata
+                .workspace
+                .unwrap_or_else(|| DEFAULT_WORKSPACE.to_string()),
             application,
             common_data: spec.common_data.map(CommonData::from),
             tokens: spec.tokens,
@@ -197,6 +207,10 @@ impl TryFrom<&rpc::Application> for Application {
         ))?;
 
         Ok(Application {
+            id: metadata.id.clone(),
+            workspace: metadata
+                .workspace
+                .unwrap_or_else(|| DEFAULT_WORKSPACE.to_string()),
             name: metadata.name.clone(),
             version: 0,
             state: ApplicationState::from(status.state()),

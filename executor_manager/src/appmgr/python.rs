@@ -77,9 +77,13 @@ impl Installer for PythonInstaller {
         let deps_bin_path = deps_path.join("bin");
         let uv_cache_path = flame_home.join("data/cache/uv");
         let pip_cache_path = flame_home.join("data/cache/pip");
+        let release = app_data_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown");
         let log_path = flame_home
             .join("logs/install")
-            .join(format!("{}.log", app_name));
+            .join(format!("{}-{}.log", app_name, release));
 
         fs::create_dir_all(&deps_path)
             .map_err(|e| FlameError::Internal(format!("failed to create deps directory: {}", e)))?;

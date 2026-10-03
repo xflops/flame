@@ -62,7 +62,7 @@ async fn handle_heartbeat(
     node_name: &str,
     hb: rpc::NodeHeartbeat,
 ) -> bool {
-    tracing::debug!("Received heartbeat from node <{}>", hb.node_name);
+    tracing::debug!("Received heartbeat from node <{}>", hb.node);
 
     // Update node status if provided
     if let Some(status) = hb.status {
@@ -89,6 +89,7 @@ fn build_node_from_heartbeat(
         Ok(Some(existing)) => {
             // Preserve existing node info, update status fields
             Node {
+                id: existing.id,
                 name: node_name.to_string(),
                 state: rpc::NodeState::try_from(status.state)
                     .unwrap_or(rpc::NodeState::Unknown)
@@ -107,6 +108,7 @@ fn build_node_from_heartbeat(
         _ => {
             // Node not found or error, create with status data
             Node {
+                id: String::new(),
                 name: node_name.to_string(),
                 state: rpc::NodeState::try_from(status.state)
                     .unwrap_or(rpc::NodeState::Unknown)
@@ -233,7 +235,7 @@ impl Backend for Flame {
                     continue;
                 };
 
-                let name = hb.node_name.clone();
+                let name = hb.node.clone();
 
                 // First heartbeat: identify the node and set up receiver
                 if node_name.is_none() {
@@ -308,7 +310,7 @@ impl Backend for Flame {
     ) -> Result<Response<rpc::Result>, Status> {
         trace_fn!("Backend::release_node");
         let req = req.into_inner();
-        self.controller.release_node(&req.node_name).await?;
+        self.controller.release_node(&req.node).await?;
         Ok(Response::new(rpc::Result::default()))
     }
 
@@ -322,16 +324,28 @@ impl Backend for Flame {
             .executor_spec
             .ok_or(FlameError::InvalidConfig("no executor spec".to_string()))?;
 
+        let stored = self.controller.get_executor(&req.executor)?;
+        if stored.application != spec.application || stored.node != spec.node {
+            return Err(Status::invalid_argument(
+                "executor spec does not match stored ownership",
+            ));
+        }
+        self.controller
+            .get_application(&stored.workspace, &spec.application)
+            .await?;
+
         let shim = Shim::from(spec.shim());
         let now = Utc::now();
         let e = Executor {
-            id: req.executor_id,
+            id: stored.id.clone(),
+            name: req.executor,
             node: spec.node,
             resreq: spec.resreq.unwrap_or_default().into(),
             shim,
             application: spec.application,
-            task_id: None,
-            ssn_id: None,
+            workspace: stored.workspace,
+            session: None,
+            task: None,
             attributes: Default::default(),
             creation_time: now,
             latest_updated_timestamp: now,
@@ -353,7 +367,7 @@ impl Backend for Flame {
         trace_fn!("Backend::unregister_executor");
         let req = req.into_inner();
 
-        self.controller.unregister_executor(req.executor_id).await?;
+        self.controller.unregister_executor(req.executor).await?;
 
         Ok(Response::new(rpc::Result::default()))
     }
@@ -364,12 +378,9 @@ impl Backend for Flame {
     ) -> Result<Response<BindExecutorResponse>, Status> {
         trace_fn!("Backend::bind_executor");
         let req = req.into_inner();
-        let executor_id = req.executor_id.to_string();
+        let executor = req.executor.to_string();
 
-        let ssn = self
-            .controller
-            .wait_for_session(executor_id.clone())
-            .await?;
+        let ssn = self.controller.wait_for_session(executor.clone()).await?;
 
         // If the session is not found, return.
         let Some(ssn) = ssn else {
@@ -381,7 +392,7 @@ impl Backend for Flame {
 
         let app = self
             .controller
-            .get_application(ssn.application.clone())
+            .get_application(&ssn.workspace, &ssn.application)
             .await?;
         let application = Some(rpc::Application::from(&app));
         let mut session = rpc::Session::from(&ssn);
@@ -392,7 +403,7 @@ impl Backend for Flame {
 
         tracing::debug!(
             "Bind executor <{}> to Session <{}:{}>",
-            executor_id,
+            executor,
             app.name,
             ssn.id,
         );
@@ -412,7 +423,7 @@ impl Backend for Flame {
 
         self.controller
             .bind_executor_completed(
-                req.executor_id,
+                req.executor,
                 req.result.map(FlameResult::from),
                 req.attributes,
             )
@@ -427,7 +438,7 @@ impl Backend for Flame {
     ) -> Result<Response<rpc::Result>, Status> {
         trace_fn!("Backend::unbind_executor");
         let req = req.into_inner();
-        self.controller.unbind_executor(req.executor_id).await?;
+        self.controller.unbind_executor(req.executor).await?;
 
         Ok(Response::new(rpc::Result::default()))
     }
@@ -439,7 +450,7 @@ impl Backend for Flame {
         trace_fn!("Backend::unbind_executor_completed");
         let req = req.into_inner();
         self.controller
-            .unbind_executor_completed(req.executor_id)
+            .unbind_executor_completed(req.executor)
             .await?;
 
         Ok(Response::new(rpc::Result::default()))
@@ -451,9 +462,9 @@ impl Backend for Flame {
     ) -> Result<Response<LaunchTaskResponse>, Status> {
         trace_fn!("Backend::launch_task");
         let req = req.into_inner();
-        let executor_id = req.executor_id.clone();
+        let executor = req.executor.clone();
 
-        let task = self.controller.launch_task(executor_id).await?;
+        let task = self.controller.launch_task(executor).await?;
         if let Some(task) = task {
             return Ok(Response::new(LaunchTaskResponse {
                 task: Some(rpc::Task::from(&task)),
@@ -472,12 +483,12 @@ impl Backend for Flame {
 
         let task_result = req.task_result.ok_or(FlameError::InvalidState(format!(
             "no task result when completing task in {}",
-            req.executor_id.clone()
+            req.executor.clone()
         )))?;
 
         self.controller
             .complete_task(
-                req.executor_id.clone(),
+                req.executor.clone(),
                 TaskResult::from(task_result),
                 req.attributes,
             )

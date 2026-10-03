@@ -35,7 +35,8 @@ pub async fn run(
         &current_ctx.cluster.endpoint,
         current_ctx.cluster.tls.as_ref(),
     )
-    .await?;
+    .await?
+    .with_workspace(current_ctx.workspace.clone());
     match (application, session, task, node) {
         (Some(application), None, None, None) => {
             view_application(conn, output_format, application).await
@@ -55,7 +56,7 @@ async fn view_task(
     conn: client::Connection,
     output_format: &Option<String>,
     ssn_id: &String,
-    task_id: &String,
+    task_id: &str,
 ) -> Result<(), Box<dyn Error>> {
     let session = conn.get_session(ssn_id).await?;
     let task = session.get_task(task_id).await?;
@@ -64,8 +65,8 @@ async fn view_task(
         return Ok(());
     }
 
-    println!("{:<15}{}", "Task:", task.id);
-    println!("{:<15}{}", "Session:", session.id);
+    println!("{:<15}{}", "Task:", task.name);
+    println!("{:<15}{}", "Session:", session.name);
     println!("{:<15}{}", "Application:", session.application);
     println!("{:<15}{}", "State:", task.state);
     println!("{:<15}", "Events:");
@@ -99,7 +100,8 @@ fn view_session_table(session: &client::Session) -> Result<(), Box<dyn Error>> {
     let mut table = Table::new();
     table.load_preset(NOTHING);
 
-    table.add_row(vec!["Session:", &session.id.to_string()]);
+    table.add_row(vec!["Workspace:", &session.workspace]);
+    table.add_row(vec!["Session:", &session.name.to_string()]);
     table.add_row(vec!["Application:", &session.application.to_string()]);
     table.add_row(vec!["State:", &session.state.to_string()]);
     table.add_row(vec!["Resources:", &format_resreq(&session.resreq)]);

@@ -14,19 +14,22 @@ message ApplicationContext {
     optional string working_directory = 5;
     optional string url = 6;
     optional string installer = 7;
+    string workspace = 8;
 }
 
 message SessionContext {
-    string session_id = 1;
+    string session = 1;
     ApplicationContext application = 2;
     optional bytes common_data = 3;
     map<string, string> tokens = 4;
+    string workspace = 5;
 }
 
 message TaskContext {
-    string task_id = 1;
-    string session_id = 2;
+    string task = 1;
+    string session = 2;
     optional bytes input = 4;
+    string workspace = 5;
 }
 
 message OnSessionEnterResponse {

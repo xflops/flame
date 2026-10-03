@@ -17,10 +17,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use common::apis::{
-    Application, ApplicationAttributes, ApplicationID, ApplicationState, CommonData, Event,
-    EventOwner, ExecutorID, ExecutorState, FlameResult, Node, NodeState, Session,
-    SessionAttributes, SessionID, SessionPtr, SessionState, Task, TaskGID, TaskID, TaskInput,
-    TaskOptions, TaskPtr, TaskResult, TaskState,
+    Application, ApplicationAttributes, ApplicationState, CommonData, Event, EventOwner,
+    ExecutorState, FlameResult, Node, NodeState, Session, SessionAttributes, SessionGID,
+    SessionPtr, SessionState, Task, TaskInput, TaskOptions, TaskPtr, TaskResult, TaskState,
 };
 
 use common::FlameError;
@@ -161,17 +160,17 @@ impl Controller {
 
     fn update_executor_attributes(
         &self,
-        id: &ExecutorID,
+        id: &str,
         attributes: HashSet<bytes::Bytes>,
     ) -> Result<(), FlameError> {
-        let executor = self.storage.get_executor_ptr(id.clone())?;
+        let executor = self.storage.get_executor_ptr(id)?;
         let mut executor = lock_ptr!(executor)?;
         if executor.state != ExecutorState::Bound {
             return Err(FlameError::InvalidState(format!(
                 "executor <{id}> must be bound before publishing attributes"
             )));
         }
-        executor.ssn_id.as_ref().ok_or_else(|| {
+        executor.session.as_ref().ok_or_else(|| {
             FlameError::InvalidState(format!(
                 "executor <{id}> must have a session before publishing attributes"
             ))
@@ -242,7 +241,7 @@ impl Controller {
         // Build sets for comparison
         let reported_ids: HashSet<&str> = reported_executors
             .iter()
-            .map(|executor| executor.id.as_str())
+            .map(|executor| executor.name.as_str())
             .collect();
 
         // Get executors from DB for this node
@@ -250,7 +249,7 @@ impl Controller {
             .storage
             .list_executors(Some(&ExecutorFilter::by_node(&node.name)))?;
 
-        let db_ids: HashSet<String> = db_executors.iter().map(|e| e.id.clone()).collect();
+        let db_ids: HashSet<String> = db_executors.iter().map(|e| e.name.clone()).collect();
 
         // Compare both directions and release mismatched executors
 
@@ -259,10 +258,10 @@ impl Controller {
         // perform targeted cleanup by persisted executor ID. The interrupted
         // task is failed only after cleanup is acknowledged by unregister_executor.
         for db_exec in &db_executors {
-            if !reported_ids.contains(db_exec.id.as_str()) {
+            if !reported_ids.contains(db_exec.name.as_str()) {
                 tracing::info!(
                     "Executor <{}> in DB but not reported by node <{}>. Releasing orphaned executor.",
-                    db_exec.id,
+                    db_exec.name,
                     node.name
                 );
                 let mut cleanup_executor = db_exec.clone();
@@ -271,7 +270,7 @@ impl Controller {
                 sender.send(cleanup_executor).await.map_err(|error| {
                     FlameError::Network(format!(
                         "failed to send cleanup for stale executor <{}>: {error}",
-                        db_exec.id
+                        db_exec.name
                     ))
                 })?;
                 continue;
@@ -279,16 +278,20 @@ impl Controller {
 
             // Only replay executors whose runtime was actually reported.
             if let Err(e) = sender.send(db_exec.clone()).await {
-                tracing::warn!("Failed to send executor <{}> to node: {:?}", db_exec.id, e);
+                tracing::warn!(
+                    "Failed to send executor <{}> to node: {:?}",
+                    db_exec.name,
+                    e
+                );
             }
         }
 
         // 2. Reported executors not in DB - unknown to DB, node should release them
         for reported_exec in reported_executors {
-            if !db_ids.contains(&reported_exec.id) {
+            if !db_ids.contains(&reported_exec.name) {
                 tracing::info!(
                     "Executor <{}> reported by node <{}> but not in DB. Sending release signal.",
-                    reported_exec.id,
+                    reported_exec.name,
                     node.name
                 );
                 // Send the executor with released state so node knows to clean it up
@@ -297,7 +300,7 @@ impl Controller {
                 if let Err(e) = sender.send(exec_to_release).await {
                     tracing::warn!(
                         "Failed to send release signal for executor <{}>: {:?}",
-                        reported_exec.id,
+                        reported_exec.name,
                         e
                     );
                 }
@@ -404,69 +407,83 @@ impl Controller {
 
     pub async fn create_session(&self, attr: SessionAttributes) -> Result<Session, FlameError> {
         trace_fn!("Controller::create_session");
-        self.application_enabled(&attr.application).await?;
+        self.application_enabled(&attr.workspace, &attr.application)
+            .await?;
         self.storage.create_session(attr).await
     }
 
     pub async fn open_session(
         &self,
-        id: SessionID,
+        gid: &SessionGID,
         spec: Option<SessionAttributes>,
     ) -> Result<Session, FlameError> {
         trace_fn!("Controller::open_session");
-        let application = match spec.as_ref() {
+        let application = match &spec {
             Some(attr) => attr.application.clone(),
-            None => self.storage.session_application(id.clone()).await?,
+            None => {
+                self.storage
+                    .get_session(&gid.workspace, &gid.session)?
+                    .application
+            }
         };
-        self.application_enabled(&application).await?;
-        self.storage.open_session(id, spec).await
+        self.application_enabled(&gid.workspace, &application)
+            .await?;
+        self.storage
+            .open_session(&gid.workspace, &gid.session, spec)
+            .await
     }
 
-    async fn application_enabled(&self, name: &str) -> Result<(), FlameError> {
-        let application = self.storage.get_application(name.to_string()).await?;
+    async fn application_enabled(&self, workspace: &str, name: &str) -> Result<(), FlameError> {
+        let application = self.storage.get_application(workspace, name).await?;
         if application.state != ApplicationState::Enabled {
             return Err(FlameError::InvalidState(format!(
-                "application <{name}> is disabled"
+                "application <{workspace}/{name}> is disabled"
             )));
         }
         Ok(())
     }
 
-    pub async fn close_session(&self, id: SessionID) -> Result<Session, FlameError> {
+    pub async fn close_session(&self, gid: &SessionGID) -> Result<Session, FlameError> {
         trace_fn!("Controller::close_session");
-        let session = self.storage.close_session(id.clone()).await?;
+        let session = self
+            .storage
+            .close_session(&gid.workspace, &gid.session)
+            .await?;
         // Dropping the session's broadcast sender lets subscribers drain queued
         // task updates, then receive RecvError::Closed.
-        self.notifier.tasks.remove(&id)?;
+        self.notifier.tasks.remove(gid)?;
         Ok(session)
     }
 
-    pub fn get_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        self.storage.get_session(id)
+    pub fn get_session(&self, gid: &SessionGID) -> Result<Session, FlameError> {
+        self.storage.get_session(&gid.workspace, &gid.session)
     }
 
-    pub fn is_session_open(&self, id: &SessionID) -> Result<bool, FlameError> {
-        let session = self.storage.get_session_ptr(id.clone())?;
+    pub fn is_session_open(&self, gid: &SessionGID) -> Result<bool, FlameError> {
+        let session = self.storage.get_session_ptr(&gid.workspace, &gid.session)?;
         let is_open = lock_ptr!(session)?.status.state != SessionState::Closed;
         Ok(is_open)
     }
 
-    pub async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        let session = self.storage.delete_session(id.clone()).await?;
-        self.notifier.tasks.remove(&id)?;
+    pub async fn delete_session(&self, gid: &SessionGID) -> Result<Session, FlameError> {
+        let session = self
+            .storage
+            .delete_session(&gid.workspace, &gid.session)
+            .await?;
+        self.notifier.tasks.remove(gid)?;
         Ok(session)
     }
 
     pub fn list_sessions(
         &self,
-        filter: Option<&crate::model::SessionFilter>,
+        filter: &crate::model::SessionFilter,
     ) -> Result<Vec<Session>, FlameError> {
         self.storage.list_sessions(filter)
     }
 
     pub async fn create_task(
         &self,
-        ssn_id: SessionID,
+        gid: &SessionGID,
         task_input: Option<TaskInput>,
         options: Option<TaskOptions>,
     ) -> Result<Task, FlameError> {
@@ -475,44 +492,45 @@ impl Controller {
         }
         let task = self
             .storage
-            .create_task(ssn_id.clone(), task_input, options)
+            .create_task(&gid.workspace, &gid.session, task_input, options)
             .await?;
-        let _ = self.notifier.tasks.notify(&ssn_id, task.id);
+        let _ = self.notifier.tasks.notify(gid, &task.name.to_string());
         self.notify_scheduler();
         Ok(task)
     }
 
-    pub fn subscribe(&self, ssn_id: &SessionID) -> Result<TaskSubscription, FlameError> {
-        let subscription = self.notifier.tasks.subscribe(ssn_id)?;
+    pub fn subscribe(&self, gid: &SessionGID) -> Result<TaskSubscription, FlameError> {
+        let subscription = self.notifier.tasks.subscribe(gid)?;
         // Subscribe first: a concurrent close then either fails this check or
         // closes the channel observed by the subscriber.
-        if !self.is_session_open(ssn_id)? {
+        if !self.is_session_open(gid)? {
             return Err(FlameError::NotFound("session is closed".to_string()));
         }
         Ok(subscription)
     }
 
-    pub fn get_task(&self, ssn_id: SessionID, id: TaskID) -> Result<Task, FlameError> {
-        self.storage.get_task(ssn_id, id)
+    pub fn get_task(&self, gid: &SessionGID, task: &str) -> Result<Task, FlameError> {
+        self.storage.get_task(&gid.workspace, &gid.session, task)
     }
 
-    pub fn get_task_metadata(&self, ssn_id: SessionID, id: TaskID) -> Result<Task, FlameError> {
-        self.storage.get_task_metadata(ssn_id, id)
+    pub fn get_task_metadata(&self, gid: &SessionGID, task: &str) -> Result<Task, FlameError> {
+        self.storage
+            .get_task_metadata(&gid.workspace, &gid.session, task)
     }
 
-    pub fn list_tasks(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
-        self.storage.list_tasks(ssn_id)
+    pub fn list_tasks(&self, gid: &SessionGID) -> Result<Vec<Task>, FlameError> {
+        self.storage.list_tasks(&gid.workspace, &gid.session)
     }
 
     pub async fn create_executor(
         &self,
         node_name: String,
-        ssn_id: SessionID,
+        gid: &SessionGID,
     ) -> Result<Executor, FlameError> {
         trace_fn!("Controller::create_executor");
         let executor = self
             .storage
-            .create_executor(node_name.clone(), ssn_id)
+            .create_executor(node_name.clone(), &gid.workspace, &gid.session)
             .await?;
 
         // Notify the node about the new executor
@@ -531,9 +549,9 @@ impl Controller {
         Ok(executor)
     }
 
-    pub fn get_executor(&self, id: ExecutorID) -> Result<Executor, FlameError> {
+    pub fn get_executor(&self, name: &str) -> Result<Executor, FlameError> {
         trace_fn!("Controller::get_executor");
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
+        let exe_ptr = self.storage.get_executor_ptr(name)?;
         let exe = lock_ptr!(exe_ptr)?;
         Ok((*exe).clone())
     }
@@ -546,7 +564,7 @@ impl Controller {
     pub async fn register_executor(&self, e: &Executor) -> Result<(), FlameError> {
         trace_fn!("Controller::register_executor");
 
-        let exe_ptr = self.storage.get_executor_ptr(e.id.clone())?;
+        let exe_ptr = self.storage.get_executor_ptr(&e.name)?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         state.register_executor().await?;
 
@@ -585,59 +603,70 @@ impl Controller {
         Ok(snapshot)
     }
 
-    pub async fn get_application(&self, id: ApplicationID) -> Result<Application, FlameError> {
-        self.storage.get_application(id).await
+    pub async fn get_application(
+        &self,
+        workspace: &str,
+        name: &str,
+    ) -> Result<Application, FlameError> {
+        self.storage.get_application(workspace, name).await
     }
 
     pub async fn register_application(
         &self,
+        workspace: String,
         name: String,
         attr: ApplicationAttributes,
     ) -> Result<(), FlameError> {
         trace_fn!("Controller::register_application");
-        common::apis::validate_application_name(&name)?;
-        self.storage.register_application(name, attr).await
+        self.storage
+            .register_application(workspace, name, attr)
+            .await
+            .map(|_| ())
     }
 
-    pub async fn unregister_application(&self, name: String) -> Result<(), FlameError> {
+    pub async fn unregister_application(
+        &self,
+        workspace: &str,
+        name: &str,
+    ) -> Result<(), FlameError> {
         trace_fn!("Controller::unregister_application");
         self.storage
-            .update_application_state(name, ApplicationState::Disabled)
+            .update_application_state(workspace, name, ApplicationState::Disabled)
             .await?;
         Ok(())
     }
 
     pub async fn update_application(
         &self,
-        name: String,
+        workspace: &str,
+        name: &str,
         attr: ApplicationAttributes,
     ) -> Result<(), FlameError> {
         trace_fn!("Controller::update_application");
-        common::apis::validate_application_name(&name)?;
-        self.storage.update_application(name, attr).await
+        self.storage.update_application(workspace, name, attr).await
     }
 
     pub async fn list_applications(
         &self,
-        filter: Option<&crate::model::ApplicationFilter>,
+        filter: &crate::model::ApplicationFilter,
     ) -> Result<Vec<Application>, FlameError> {
         trace_fn!("Controller::list_applications");
         self.storage.list_applications(filter).await
     }
 
-    pub async fn wait_for_session(&self, id: ExecutorID) -> Result<Option<Session>, FlameError> {
+    pub async fn wait_for_session(&self, id: String) -> Result<Option<Session>, FlameError> {
         trace_fn!("Controller::wait_for_session");
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
+        let exe_ptr = self.storage.get_executor_ptr(&id)?;
         let mut rx = self.notifier.executors.subscribe(&id)?;
 
-        let ssn_id = loop {
+        let gid = loop {
             {
                 let exe = lock_ptr!(exe_ptr)?;
                 if exe.state == ExecutorState::Releasing || exe.state == ExecutorState::Released {
                     return Ok(None);
                 }
-                if let Some(ssn_id) = exe.ssn_id.clone() {
-                    break ssn_id;
+                if let Some(gid) = exe.session() {
+                    break gid;
                 }
             }
 
@@ -646,7 +675,7 @@ impl Controller {
             }
         };
 
-        let ssn_ptr = match self.storage.get_session_ptr(ssn_id.clone()) {
+        let ssn_ptr = match self.storage.get_session_ptr(&gid.workspace, &gid.session) {
             Ok(ssn_ptr) => ssn_ptr,
             Err(FlameError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
@@ -660,13 +689,18 @@ impl Controller {
         Ok(Some((*ssn).clone()))
     }
 
-    pub async fn bind_session(&self, id: ExecutorID, ssn_id: SessionID) -> Result<(), FlameError> {
+    pub async fn bind_session(&self, id: String, gid: &SessionGID) -> Result<(), FlameError> {
         trace_fn!("Controller::bind_session");
 
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
+        let exe_ptr = self.storage.get_executor_ptr(&id)?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
 
-        let ssn_ptr = self.storage.get_session_ptr(ssn_id)?;
+        if lock_ptr!(exe_ptr)?.workspace != gid.workspace {
+            return Err(FlameError::InvalidConfig(
+                "executor and session must share a workspace".to_string(),
+            ));
+        }
+        let ssn_ptr = self.storage.get_session_ptr(&gid.workspace, &gid.session)?;
         state.bind_session(ssn_ptr).await?;
 
         let executor = {
@@ -693,12 +727,12 @@ impl Controller {
 
     pub async fn bind_session_completed(
         &self,
-        id: ExecutorID,
+        id: String,
         result: Option<FlameResult>,
     ) -> Result<(), FlameError> {
         trace_fn!("Controller::bind_session_completed");
 
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
+        let exe_ptr = self.storage.get_executor_ptr(&id)?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
 
         state.bind_session_completed(result).await?;
@@ -726,7 +760,7 @@ impl Controller {
 
     pub async fn bind_executor_completed(
         &self,
-        id: ExecutorID,
+        id: String,
         result: Option<FlameResult>,
         attributes: Option<rpc::ExecutorAttributes>,
     ) -> Result<(), FlameError> {
@@ -741,35 +775,37 @@ impl Controller {
         Ok(())
     }
 
-    pub async fn launch_task(&self, id: ExecutorID) -> Result<Option<Task>, FlameError> {
+    pub async fn launch_task(&self, id: String) -> Result<Option<Task>, FlameError> {
         trace_fn!("Controller::launch_task");
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
+        let exe_ptr = self.storage.get_executor_ptr(&id)?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
-        let (ssn_id, task_id) = {
+        let (gid, task) = {
             let exec = lock_ptr!(exe_ptr)?;
-            (exec.ssn_id.clone(), exec.task_id)
+            (exec.session(), exec.task.clone())
         };
 
-        tracing::debug!("Try to launch task for session <{:?}>", ssn_id);
-        let Some(ssn_id) = ssn_id else {
+        tracing::debug!("Try to launch task for session <{:?}>", gid);
+        let Some(gid) = gid else {
             tracing::debug!("No session to launch task for, return.");
             return Ok(None);
         };
 
-        if let Some(task_id) = task_id {
-            tracing::warn!("Re-launch the task <{}/{}>", ssn_id, task_id);
-            let task_ptr = self.storage.get_task_ptr(TaskGID { ssn_id, task_id })?;
+        if let Some(task) = task {
+            tracing::warn!("Re-launch the task <{}/{}>", gid.session, task);
+            let task_ptr = self
+                .storage
+                .get_task_ptr(&gid.workspace, &gid.session, &task)?;
             let task = lock_ptr!(task_ptr)?;
             return Ok(Some((*task).clone()));
         }
 
-        tracing::debug!("Launching task for session <{:?}>", ssn_id);
-        let ssn_ptr = match self.storage.get_session_ptr(ssn_id.clone()) {
+        tracing::debug!("Launching task for session <{:?}>", gid.session);
+        let ssn_ptr = match self.storage.get_session_ptr(&gid.workspace, &gid.session) {
             Ok(ssn_ptr) => ssn_ptr,
             Err(FlameError::NotFound(msg)) => {
                 tracing::warn!(
                     "Session <{:?}> not found when launching task: {}",
-                    ssn_id,
+                    gid.session,
                     msg
                 );
                 return Ok(None);
@@ -777,29 +813,29 @@ impl Controller {
             Err(e) => {
                 tracing::error!(
                     "Failed to get session <{:?}> when launching task: {:?}",
-                    ssn_id,
+                    gid.session,
                     e
                 );
                 return Err(e);
             }
         };
 
-        let task_ptr = self.wait_for_task(&ssn_ptr, &ssn_id).await?;
+        let task_ptr = self.wait_for_task(&ssn_ptr, &gid).await?;
 
         let Some(task_ptr) = task_ptr else {
             return Ok(None);
         };
 
-        let task_id = {
+        let task_name = {
             let task = lock_ptr!(task_ptr)?;
-            task.id
+            task.name.to_string()
         };
 
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         let result = state.launch_task(ssn_ptr, task_ptr).await;
 
         if result.is_ok() {
-            let _ = self.notifier.tasks.notify(&ssn_id, task_id);
+            let _ = self.notifier.tasks.notify(&gid, &task_name);
 
             let executor = {
                 let exe = lock_ptr!(exe_ptr)?;
@@ -814,17 +850,20 @@ impl Controller {
     async fn wait_for_task(
         &self,
         ssn: &SessionPtr,
-        ssn_id: &SessionID,
+        gid: &SessionGID,
     ) -> Result<Option<TaskPtr>, FlameError> {
         let app_name = {
             let ssn_guard = lock_ptr!(ssn)?;
             ssn_guard.application.clone()
         };
-        let app = self.storage.get_application(app_name).await?;
+        let app = self
+            .storage
+            .get_application(&gid.workspace, &app_name)
+            .await?;
         let delay_secs = app.delay_release.num_seconds().max(0) as u64;
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(delay_secs);
 
-        let mut rx = self.notifier.tasks.subscribe(ssn_id)?;
+        let mut rx = self.notifier.tasks.subscribe(gid)?;
 
         loop {
             {
@@ -853,7 +892,7 @@ impl Controller {
 
     pub async fn complete_task(
         &self,
-        id: ExecutorID,
+        id: String,
         task_result: TaskResult,
         attributes: Option<rpc::ExecutorAttributes>,
     ) -> Result<(), FlameError> {
@@ -861,26 +900,24 @@ impl Controller {
         let attributes = attributes
             .map(Self::validate_executor_attributes)
             .transpose()?;
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
-        let (ssn_id, task_id, host) = {
+        let exe_ptr = self.storage.get_executor_ptr(&id)?;
+        let (gid, task, host) = {
             let exe = lock_ptr!(exe_ptr)?;
             (
-                exe.ssn_id.clone().ok_or(FlameError::InvalidState(
+                exe.session().ok_or(FlameError::InvalidState(
                     "no session in executor".to_string(),
                 ))?,
-                exe.task_id
+                exe.task
+                    .clone()
                     .ok_or(FlameError::InvalidState("no task in executor".to_string()))?,
                 exe.node.clone(),
             )
         };
 
-        let gid = TaskGID {
-            ssn_id: ssn_id.clone(),
-            task_id,
-        };
-
-        let task_ptr = self.storage.get_task_ptr(gid)?;
-        let ssn_ptr = self.storage.get_session_ptr(ssn_id.clone())?;
+        let task_ptr = self
+            .storage
+            .get_task_ptr(&gid.workspace, &gid.session, &task)?;
+        let ssn_ptr = self.storage.get_session_ptr(&gid.workspace, &gid.session)?;
 
         let msg = match task_result.state {
             TaskState::Failed => task_result.message,
@@ -889,8 +926,8 @@ impl Controller {
                 tracing::warn!(
                     "Invalid task state <{:?}> for task <{}/{}> on host <{}> when completing task",
                     task_result.state,
-                    ssn_id,
-                    task_id,
+                    gid.session,
+                    task,
                     host
                 );
                 None
@@ -907,7 +944,7 @@ impl Controller {
         }
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         state.complete_task(ssn_ptr, task_ptr, task_result).await?;
-        let _ = self.notifier.tasks.notify(&ssn_id, task_id);
+        let _ = self.notifier.tasks.notify(&gid, &task);
 
         let executor = {
             let exe = lock_ptr!(exe_ptr)?;
@@ -930,9 +967,9 @@ impl Controller {
         Ok(())
     }
 
-    pub async fn unbind_executor(&self, id: ExecutorID) -> Result<(), FlameError> {
+    pub async fn unbind_executor(&self, id: String) -> Result<(), FlameError> {
         trace_fn!("Controller::unbind_executor");
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
+        let exe_ptr = self.storage.get_executor_ptr(&id)?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         state.unbind_executor().await?;
 
@@ -957,9 +994,9 @@ impl Controller {
         Ok(())
     }
 
-    pub async fn unbind_executor_completed(&self, id: ExecutorID) -> Result<(), FlameError> {
+    pub async fn unbind_executor_completed(&self, id: String) -> Result<(), FlameError> {
         trace_fn!("Controller::unbind_executor_completed");
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
+        let exe_ptr = self.storage.get_executor_ptr(&id)?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
 
         state.unbind_executor_completed().await?;
@@ -986,9 +1023,9 @@ impl Controller {
         Ok(())
     }
 
-    pub async fn release_executor(&self, id: ExecutorID) -> Result<(), FlameError> {
+    pub async fn release_executor(&self, id: String) -> Result<(), FlameError> {
         trace_fn!("Controller::release_executor");
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
+        let exe_ptr = self.storage.get_executor_ptr(&id)?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         state.release_executor().await?;
 
@@ -1014,9 +1051,9 @@ impl Controller {
         Ok(())
     }
 
-    pub async fn unregister_executor(&self, id: ExecutorID) -> Result<(), FlameError> {
+    pub async fn unregister_executor(&self, id: String) -> Result<(), FlameError> {
         trace_fn!("Controller::unregister_executor");
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
+        let exe_ptr = self.storage.get_executor_ptr(&id)?;
 
         // Get executor info before unregistering for notification
         let executor = {
@@ -1026,13 +1063,11 @@ impl Controller {
 
         // Crash recovery is terminal in v1: after the node confirms targeted
         // service destruction, fail the interrupted task instead of retrying it.
-        if let (Some(task_id), Some(ssn_id)) = (executor.task_id, executor.ssn_id.as_ref()) {
-            let gid = TaskGID {
-                ssn_id: ssn_id.clone(),
-                task_id,
-            };
-            let ssn_ptr = self.storage.get_session_ptr(ssn_id.clone())?;
-            let task_ptr = self.storage.get_task_ptr(gid)?;
+        if let (Some(task), Some(gid)) = (executor.task.as_ref(), executor.session()) {
+            let ssn_ptr = self.storage.get_session_ptr(&gid.workspace, &gid.session)?;
+            let task_ptr = self
+                .storage
+                .get_task_ptr(&gid.workspace, &gid.session, task)?;
             self.storage
                 .update_task_state(
                     ssn_ptr,
@@ -1044,20 +1079,22 @@ impl Controller {
                     )),
                 )
                 .await?;
-            let _ = self.notifier.tasks.notify(ssn_id, task_id);
+            let _ = self.notifier.tasks.notify(&gid, task);
         }
 
         let state = executors::from(self.storage.clone(), exe_ptr)?;
         state.unregister_executor().await?;
 
-        self.storage.delete_executor(id.clone()).await?;
+        self.storage
+            .delete_executor(&executor.workspace, &executor.name)
+            .await?;
         self.notifier.executors.remove(&id)?;
 
         // Notify the node about the executor deletion
         let mut released_executor = executor.clone();
         released_executor.state = ExecutorState::Released;
-        released_executor.task_id = None;
-        released_executor.ssn_id = None;
+        released_executor.task = None;
+        released_executor.session = None;
         if let Err(e) = self
             .connection_manager
             .notify_executor(&released_executor.node, &released_executor)
@@ -1198,6 +1235,7 @@ mod tests {
     /// Creates a test node.
     fn create_test_node(name: &str) -> Node {
         Node {
+            id: String::new(),
             name: name.to_string(),
             state: NodeState::Unknown,
             capacity: ResourceRequirement {
@@ -1224,9 +1262,10 @@ mod tests {
         }
     }
 
-    fn create_test_session_attr(id: &str) -> SessionAttributes {
+    fn create_test_session_attr(name: &str) -> SessionAttributes {
         SessionAttributes {
-            id: id.to_string(),
+            workspace: "default".to_string(),
+            name: name.to_string(),
             application: "test-app".to_string(),
             common_data: None,
             tokens: Default::default(),
@@ -1248,7 +1287,11 @@ mod tests {
 
         let controller = new_ptr(create_test_storage().await);
         controller
-            .register_application("test-app".to_string(), create_test_application())
+            .register_application(
+                "default".to_string(),
+                "test-app".to_string(),
+                create_test_application(),
+            )
             .await
             .unwrap();
 
@@ -1267,7 +1310,7 @@ mod tests {
         );
 
         controller
-            .create_task("wake-session".to_string(), None, None)
+            .create_task(&SessionGID::new("default", "wake-session"), None, None)
             .await
             .unwrap();
         tokio::time::timeout(
@@ -1283,7 +1326,10 @@ mod tests {
             .await
             .unwrap();
         let executor = controller
-            .create_executor("wake-node".to_string(), "wake-session".to_string())
+            .create_executor(
+                "wake-node".to_string(),
+                &SessionGID::new("default", "wake-session"),
+            )
             .await
             .unwrap();
         assert!(
@@ -1305,19 +1351,22 @@ mod tests {
         .expect("newly Idle executor should wake scheduler");
 
         controller
-            .bind_session(executor.id.clone(), "wake-session".to_string())
+            .bind_session(
+                executor.name.clone(),
+                &SessionGID::new("default", "wake-session"),
+            )
             .await
             .unwrap();
         controller
-            .bind_executor_completed(executor.id.clone(), None, None)
+            .bind_executor_completed(executor.name.clone(), None, None)
             .await
             .unwrap();
         controller
-            .unbind_executor(executor.id.clone())
+            .unbind_executor(executor.name.clone())
             .await
             .unwrap();
         controller
-            .unbind_executor_completed(executor.id.clone())
+            .unbind_executor_completed(executor.name.clone())
             .await
             .unwrap();
         tokio::time::timeout(
@@ -1330,7 +1379,11 @@ mod tests {
 
     async fn create_binding_executor(controller: &ControllerPtr, ssn_id: &str) -> String {
         controller
-            .register_application("test-app".to_string(), create_test_application())
+            .register_application(
+                "default".to_string(),
+                "test-app".to_string(),
+                create_test_application(),
+            )
             .await
             .unwrap();
         controller
@@ -1343,15 +1396,15 @@ mod tests {
             .await
             .unwrap();
         let executor = controller
-            .create_executor("bind-node".to_string(), ssn_id.to_string())
+            .create_executor("bind-node".to_string(), &SessionGID::new("default", ssn_id))
             .await
             .unwrap();
         controller.register_executor(&executor).await.unwrap();
         controller
-            .bind_session(executor.id.clone(), ssn_id.to_string())
+            .bind_session(executor.name.clone(), &SessionGID::new("default", ssn_id))
             .await
             .unwrap();
-        executor.id
+        executor.name
     }
 
     #[tokio::test]
@@ -1374,7 +1427,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let executor = controller.get_executor(executor_id.clone()).unwrap();
+        let executor = controller.get_executor(&executor_id).unwrap();
         assert_eq!(executor.application, "test-app");
         assert_eq!(
             executor.attributes,
@@ -1385,14 +1438,11 @@ mod tests {
             .update_executor_attributes(&executor_id, HashSet::new())
             .unwrap();
         assert_eq!(
-            controller
-                .get_executor(executor_id.clone())
-                .unwrap()
-                .attributes,
+            controller.get_executor(&executor_id).unwrap().attributes,
             HashSet::from([bytes::Bytes::from_static(b"kv-cache-key")])
         );
         controller
-            .create_task(ssn_id.clone(), None, None)
+            .create_task(&SessionGID::new("default", &ssn_id), None, None)
             .await
             .unwrap();
         controller
@@ -1420,10 +1470,7 @@ mod tests {
             bytes::Bytes::from_static(b"second-key"),
         ]);
         assert_eq!(
-            controller
-                .get_executor(executor_id.clone())
-                .unwrap()
-                .attributes,
+            controller.get_executor(&executor_id).unwrap().attributes,
             expected_attributes
         );
 
@@ -1436,7 +1483,7 @@ mod tests {
             .await
             .unwrap();
 
-        let executor = controller.get_executor(executor_id.clone()).unwrap();
+        let executor = controller.get_executor(&executor_id).unwrap();
         assert_eq!(executor.application, "test-app");
         assert_eq!(executor.attributes, expected_attributes);
 
@@ -1457,7 +1504,7 @@ mod tests {
             .unregister_executor(executor_id.clone())
             .await
             .unwrap();
-        assert!(controller.get_executor(executor_id).is_err());
+        assert!(controller.get_executor(&executor_id).is_err());
     }
 
     #[tokio::test]
@@ -1478,7 +1525,10 @@ mod tests {
             )
             .await
             .unwrap();
-        controller.close_session(ssn_id.to_string()).await.unwrap();
+        controller
+            .close_session(&SessionGID::new("default", ssn_id))
+            .await
+            .unwrap();
         controller
             .unbind_executor(executor_id.clone())
             .await
@@ -1489,22 +1539,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            controller.get_executor(executor_id.clone()).unwrap().state,
+            controller.get_executor(&executor_id).unwrap().state,
             ExecutorState::Idle
         );
 
         controller
-            .unregister_application("test-app".to_string())
+            .unregister_application("default", "test-app")
             .await
             .unwrap();
 
         assert_eq!(
-            controller.get_executor(executor_id).unwrap().state,
+            controller.get_executor(&executor_id).unwrap().state,
             ExecutorState::Idle
         );
         assert_eq!(
             controller
-                .get_application("test-app".to_string())
+                .get_application("default", "test-app")
                 .await
                 .unwrap()
                 .state,
@@ -1517,44 +1567,50 @@ mod tests {
         let storage = create_test_storage().await;
         let controller = new_ptr(storage);
         controller
-            .register_application("disabled-app".to_string(), ApplicationAttributes::default())
+            .register_application(
+                "default".to_string(),
+                "disabled-app".to_string(),
+                ApplicationAttributes::default(),
+            )
             .await
             .unwrap();
 
         let attributes = SessionAttributes {
-            id: "disabled-session".to_string(),
+            name: "disabled-session".to_string(),
             application: "disabled-app".to_string(),
             ..SessionAttributes::default()
         };
         controller.create_session(attributes.clone()).await.unwrap();
         controller
-            .close_session(attributes.id.clone())
+            .close_session(&SessionGID::new("default", &attributes.name))
             .await
             .unwrap();
         controller
-            .unregister_application("disabled-app".to_string())
+            .unregister_application("default", "disabled-app")
             .await
             .unwrap();
 
         assert!(matches!(
             controller
                 .create_session(SessionAttributes {
-                    id: "new-disabled-session".to_string(),
+                    name: "new-disabled-session".to_string(),
                     ..attributes.clone()
                 })
                 .await,
             Err(FlameError::InvalidState(_))
         ));
         assert!(matches!(
-            controller.open_session(attributes.id.clone(), None).await,
+            controller
+                .open_session(&SessionGID::new("default", &attributes.name), None)
+                .await,
             Err(FlameError::InvalidState(_))
         ));
         assert!(matches!(
             controller
                 .open_session(
-                    "missing-disabled-session".to_string(),
+                    &SessionGID::new("default", "missing-disabled-session"),
                     Some(SessionAttributes {
-                        id: "missing-disabled-session".to_string(),
+                        name: "missing-disabled-session".to_string(),
                         ..attributes
                     })
                 )
@@ -1596,12 +1652,14 @@ mod tests {
 
             fail_binding(&controller, &executor_id).await.unwrap();
 
-            let executor = controller.get_executor(executor_id).unwrap();
+            let executor = controller.get_executor(&executor_id).unwrap();
             assert_eq!(executor.state, ExecutorState::Unbinding);
-            assert_eq!(executor.ssn_id, None);
-            assert_eq!(executor.task_id, None);
+            assert_eq!(executor.session, None);
+            assert_eq!(executor.task, None);
 
-            let session = controller.get_session(ssn_id).unwrap();
+            let session = controller
+                .get_session(&SessionGID::new("default", &ssn_id))
+                .unwrap();
             assert_eq!(session.retry_count, 1);
             assert_eq!(
                 session
@@ -1630,7 +1688,7 @@ mod tests {
                 .await
                 .unwrap();
             controller
-                .bind_session(executor_id.clone(), ssn_id.clone())
+                .bind_session(executor_id.clone(), &SessionGID::new("default", &ssn_id))
                 .await
                 .unwrap();
 
@@ -1640,13 +1698,15 @@ mod tests {
                 .await
                 .unwrap();
             controller
-                .bind_session(executor_id.clone(), ssn_id.clone())
+                .bind_session(executor_id.clone(), &SessionGID::new("default", &ssn_id))
                 .await
                 .unwrap();
 
             fail_binding(&controller, &executor_id).await.unwrap();
 
-            let session = controller.get_session(ssn_id).unwrap();
+            let session = controller
+                .get_session(&SessionGID::new("default", &ssn_id))
+                .unwrap();
             assert_eq!(session.retry_count, 3);
             assert_eq!(
                 session
@@ -1679,7 +1739,7 @@ mod tests {
                 .await
                 .unwrap();
             controller
-                .bind_session(executor_id.clone(), ssn_id.clone())
+                .bind_session(executor_id.clone(), &SessionGID::new("default", &ssn_id))
                 .await
                 .unwrap();
 
@@ -1695,10 +1755,12 @@ mod tests {
                 .await
                 .unwrap();
 
-            let session = controller.get_session(ssn_id).unwrap();
+            let session = controller
+                .get_session(&SessionGID::new("default", &ssn_id))
+                .unwrap();
             assert_eq!(session.retry_count, 1);
             assert_eq!(
-                controller.get_executor(executor_id).unwrap().state,
+                controller.get_executor(&executor_id).unwrap().state,
                 ExecutorState::Bound
             );
         }
@@ -1711,9 +1773,9 @@ mod tests {
             let executor_id = create_binding_executor(&controller, &ssn_id).await;
 
             {
-                let executor = storage.get_executor_ptr(executor_id.clone()).unwrap();
+                let executor = storage.get_executor_ptr(&executor_id).unwrap();
                 let mut executor = lock_ptr!(executor).unwrap();
-                executor.ssn_id = None;
+                executor.session = None;
             }
 
             let err = controller
@@ -1730,7 +1792,7 @@ mod tests {
 
             assert!(matches!(err, FlameError::InvalidState(_)));
             assert_eq!(
-                controller.get_executor(executor_id).unwrap().state,
+                controller.get_executor(&executor_id).unwrap().state,
                 ExecutorState::Binding
             );
         }
@@ -1747,7 +1809,10 @@ mod tests {
             let ssn_id = format!("closed-session-{}", Uuid::new_v4());
             let executor_id = create_binding_executor(&controller, &ssn_id).await;
 
-            controller.close_session(ssn_id.clone()).await.unwrap();
+            controller
+                .close_session(&SessionGID::new("default", &ssn_id))
+                .await
+                .unwrap();
 
             let session = controller
                 .wait_for_session(executor_id.clone())
@@ -1755,9 +1820,9 @@ mod tests {
                 .unwrap();
             assert!(session.is_none());
 
-            let executor = controller.get_executor(executor_id.clone()).unwrap();
+            let executor = controller.get_executor(&executor_id).unwrap();
             assert_eq!(executor.state, ExecutorState::Binding);
-            assert_eq!(executor.ssn_id, Some(ssn_id));
+            assert_eq!(executor.session, Some(ssn_id));
 
             controller
                 .unregister_executor(executor_id.clone())
@@ -1765,7 +1830,7 @@ mod tests {
                 .unwrap();
 
             assert!(matches!(
-                controller.get_executor(executor_id).unwrap_err(),
+                controller.get_executor(&executor_id).unwrap_err(),
                 FlameError::NotFound(_)
             ));
         }
@@ -1777,8 +1842,14 @@ mod tests {
             let ssn_id = format!("missing-session-{}", Uuid::new_v4());
             let executor_id = create_binding_executor(&controller, &ssn_id).await;
 
-            controller.close_session(ssn_id.clone()).await.unwrap();
-            controller.delete_session(ssn_id.clone()).await.unwrap();
+            controller
+                .close_session(&SessionGID::new("default", &ssn_id))
+                .await
+                .unwrap();
+            controller
+                .delete_session(&SessionGID::new("default", &ssn_id))
+                .await
+                .unwrap();
 
             let session = controller
                 .wait_for_session(executor_id.clone())
@@ -1786,9 +1857,9 @@ mod tests {
                 .unwrap();
             assert!(session.is_none());
 
-            let executor = controller.get_executor(executor_id.clone()).unwrap();
+            let executor = controller.get_executor(&executor_id).unwrap();
             assert_eq!(executor.state, ExecutorState::Binding);
-            assert_eq!(executor.ssn_id, Some(ssn_id));
+            assert_eq!(executor.session, Some(ssn_id));
 
             controller
                 .unregister_executor(executor_id.clone())
@@ -1796,7 +1867,7 @@ mod tests {
                 .unwrap();
 
             assert!(matches!(
-                controller.get_executor(executor_id).unwrap_err(),
+                controller.get_executor(&executor_id).unwrap_err(),
                 FlameError::NotFound(_)
             ));
         }
@@ -1869,7 +1940,11 @@ mod tests {
             let node = create_test_node("recovery-node");
             storage.register_node(&node).await.unwrap();
             controller
-                .register_application("test-app".to_string(), create_test_application())
+                .register_application(
+                    "default".to_string(),
+                    "test-app".to_string(),
+                    create_test_application(),
+                )
                 .await
                 .unwrap();
             let session = controller
@@ -1877,7 +1952,7 @@ mod tests {
                 .await
                 .unwrap();
             let executor = storage
-                .create_executor(node.name.clone(), session.id)
+                .create_executor(node.name.clone(), &session.workspace, &session.name)
                 .await
                 .unwrap();
 
@@ -1891,7 +1966,7 @@ mod tests {
             assert_eq!(cleanup.id, executor.id);
             assert_eq!(cleanup.state, ExecutorState::Releasing);
             assert_eq!(
-                controller.get_executor(executor.id).unwrap().state,
+                controller.get_executor(&executor.name).unwrap().state,
                 ExecutorState::Releasing
             );
         }
@@ -1903,7 +1978,11 @@ mod tests {
             let node = create_test_node("terminal-recovery-node");
             storage.register_node(&node).await.unwrap();
             controller
-                .register_application("test-app".to_string(), create_test_application())
+                .register_application(
+                    "default".to_string(),
+                    "test-app".to_string(),
+                    create_test_application(),
+                )
                 .await
                 .unwrap();
             let session = controller
@@ -1911,40 +1990,49 @@ mod tests {
                 .await
                 .unwrap();
             let task = controller
-                .create_task(session.id.clone(), None, None)
+                .create_task(
+                    &SessionGID::new(&session.workspace, &session.name),
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
-            let session_ptr = storage.get_session_ptr(session.id.clone()).unwrap();
+            let session_ptr = storage
+                .get_session_ptr(&session.workspace, &session.name)
+                .unwrap();
             let task_ptr = storage
-                .get_task_ptr(TaskGID {
-                    ssn_id: session.id.clone(),
-                    task_id: task.id,
-                })
+                .get_task_ptr(&session.workspace, &session.name, &task.name.to_string())
                 .unwrap();
             storage
                 .update_task_state(session_ptr, task_ptr, TaskState::Running, None)
                 .await
                 .unwrap();
             let mut executor = storage
-                .create_executor(node.name, session.id.clone())
+                .create_executor(node.name, &session.workspace, &session.name)
                 .await
                 .unwrap();
             executor.state = ExecutorState::Releasing;
-            executor.ssn_id = Some(session.id.clone());
-            executor.task_id = Some(task.id);
+            executor.session = Some(session.name.clone());
+            executor.task = Some(task.name.to_string());
             storage.update_executor(&executor).await.unwrap();
 
             controller
-                .unregister_executor(executor.id.clone())
+                .unregister_executor(executor.name.clone())
                 .await
                 .unwrap();
 
             assert_eq!(
-                controller.get_task(session.id, task.id).unwrap().state,
+                controller
+                    .get_task(
+                        &SessionGID::new(&session.workspace, &session.name),
+                        &task.name.to_string()
+                    )
+                    .unwrap()
+                    .state,
                 TaskState::Failed
             );
             assert!(matches!(
-                controller.get_executor(executor.id).unwrap_err(),
+                controller.get_executor(&executor.name).unwrap_err(),
                 FlameError::NotFound(_)
             ));
         }
@@ -1973,7 +2061,7 @@ mod tests {
             let storage = create_test_storage().await;
             let controller = new_ptr(storage);
             let executor_id = create_binding_executor(&controller, "reconnect-application").await;
-            let mut reported = controller.get_executor(executor_id.clone()).unwrap();
+            let mut reported = controller.get_executor(&executor_id).unwrap();
             assert_eq!(reported.application, "test-app");
             reported.application = "other-app".to_string();
 
@@ -1983,7 +2071,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                controller.get_executor(executor_id).unwrap().application,
+                controller.get_executor(&executor_id).unwrap().application,
                 "test-app"
             );
         }

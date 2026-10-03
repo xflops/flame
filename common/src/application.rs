@@ -19,7 +19,7 @@ use chrono::Duration;
 use serde::Deserialize as _;
 use serde_derive::{Deserialize, Serialize};
 
-use crate::apis::{validate_application_name, ApplicationAttributes, ApplicationSchema, Shim};
+use crate::apis::{ApplicationAttributes, ApplicationSchema, Shim};
 use crate::FlameError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,7 +97,6 @@ impl ApplicationManifest {
     }
 
     pub fn validate(&self) -> Result<(), FlameError> {
-        validate_application_name(&self.metadata.name)?;
         self.attributes()?;
         Ok(())
     }

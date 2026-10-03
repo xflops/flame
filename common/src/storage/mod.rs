@@ -30,10 +30,10 @@ use uuid::Uuid;
 use stdng::{lock_ptr, trace_fn, MutexPtr};
 
 use crate::apis::{
-    Application, ApplicationAttributes, ApplicationID, ApplicationPtr, ApplicationState, Event,
-    EventOwner, ExecutorID, ExecutorState, Node, NodePtr, Session, SessionAttributes, SessionID,
-    SessionPtr, SessionState, Shim, Task, TaskGID, TaskID, TaskInput, TaskOptions, TaskPtr,
-    TaskResult, TaskState,
+    Application, ApplicationAttributes, ApplicationPtr, ApplicationState, Event, EventOwner,
+    ExecutorGID, ExecutorState, Node, NodePtr, Session, SessionAttributes, SessionGID, SessionPtr,
+    SessionState, Shim, Task, TaskInput, TaskName, TaskOptions, TaskPtr, TaskResult, TaskState,
+    Workspace,
 };
 use crate::ctx::FlameClusterContext;
 use crate::FlameError;
@@ -59,10 +59,11 @@ pub struct StorageSnapshot {
 pub struct Storage {
     context: FlameClusterContext,
     engine: EnginePtr,
-    sessions: MutexPtr<HashMap<SessionID, SessionPtr>>,
-    executors: MutexPtr<HashMap<ExecutorID, ExecutorPtr>>,
+    sessions: MutexPtr<HashMap<(String, String), SessionPtr>>,
+    executors: MutexPtr<HashMap<String, ExecutorPtr>>,
     nodes: MutexPtr<HashMap<String, NodePtr>>,
-    applications: MutexPtr<HashMap<String, ApplicationPtr>>,
+    applications: MutexPtr<HashMap<(String, String), ApplicationPtr>>,
+    workspaces: MutexPtr<HashMap<String, Workspace>>,
     event_manager: EventManagerPtr,
     max_sessions: Option<usize>,
 }
@@ -75,22 +76,39 @@ pub async fn new_ptr(config: &FlameClusterContext) -> Result<StoragePtr, FlameEr
         Arc::new(FsEventManager::new(&events_path)?)
     };
 
+    let engine = engine::connect(&config.cluster.storage).await?;
+    let workspaces = engine
+        .list_workspaces()
+        .await?
+        .into_iter()
+        .map(|workspace| (workspace.name.clone(), workspace))
+        .collect();
     Ok(Arc::new(Storage {
         context: config.clone(),
-        engine: engine::connect(&config.cluster.storage).await?,
+        engine,
         sessions: stdng::new_ptr(HashMap::new()),
         executors: stdng::new_ptr(HashMap::new()),
         nodes: stdng::new_ptr(HashMap::new()),
         applications: stdng::new_ptr(HashMap::new()),
+        workspaces: stdng::new_ptr(workspaces),
         event_manager,
         max_sessions: config.cluster.limits.max_sessions,
     }))
 }
 
-fn derive_events_path(_storage_url: &str) -> String {
-    if let Ok(test_dir) = std::env::var("FLAME_TEST_DIR") {
-        return std::path::Path::new(&test_dir)
+fn derive_events_path(storage_url: &str) -> String {
+    events_path(storage_url, std::env::var_os("FLAME_TEST_DIR").as_deref())
+}
+
+fn events_path(storage_url: &str, test_dir: Option<&std::ffi::OsStr>) -> String {
+    if let Some(test_dir) = test_dir {
+        use std::hash::{Hash, Hasher};
+        // Concurrent test stores must not read or append each other's event logs.
+        let mut key = std::collections::hash_map::DefaultHasher::new();
+        storage_url.hash(&mut key);
+        return std::path::Path::new(test_dir)
             .join("events")
+            .join(format!("{:016x}", key.finish()))
             .to_string_lossy()
             .to_string();
     }
@@ -99,6 +117,22 @@ fn derive_events_path(_storage_url: &str) -> String {
 }
 
 impl Storage {
+    pub async fn create_workspace(&self, name: String) -> Result<Workspace, FlameError> {
+        let workspace = self.engine.create_workspace(name).await?;
+        lock_ptr!(self.workspaces)?.insert(workspace.name.clone(), workspace.clone());
+        Ok(workspace)
+    }
+
+    pub fn list_workspaces(&self) -> Result<Vec<Workspace>, FlameError> {
+        let mut workspaces: Vec<_> = lock_ptr!(self.workspaces)?.values().cloned().collect();
+        workspaces.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(workspaces)
+    }
+
+    pub fn workspace_exists(&self, workspace: &str) -> Result<bool, FlameError> {
+        Ok(lock_ptr!(self.workspaces)?.contains_key(workspace))
+    }
+
     pub fn session_retry_limits(&self) -> u32 {
         self.context.cluster.recovery.session.retry_limits
     }
@@ -131,11 +165,15 @@ impl Storage {
     pub async fn load_data(&self) -> Result<(), FlameError> {
         let ssn_list = self.engine.find_sessions().await?;
         for ssn in ssn_list {
-            let task_list = self.engine.find_tasks(ssn.id.clone()).await?;
+            let task_list = self.engine.find_tasks(&ssn.gid()).await?;
             let mut ssn = ssn.clone();
             for task in task_list {
                 let task = match task.state {
-                    TaskState::Running => self.engine.retry_task(task.gid()).await?,
+                    TaskState::Running => {
+                        self.engine
+                            .retry_task(&task.session(), &task.name.to_string())
+                            .await?
+                    }
                     _ => task,
                 };
 
@@ -143,13 +181,19 @@ impl Storage {
             }
 
             let mut ssn_map = lock_ptr!(self.sessions)?;
-            ssn_map.insert(ssn.id.clone(), SessionPtr::new(ssn.into()));
+            ssn_map.insert(
+                (ssn.workspace.clone(), ssn.name.clone()),
+                SessionPtr::new(ssn.into()),
+            );
         }
 
         let app_list = self.engine.find_applications(None).await?;
         for app in app_list {
             let mut app_map = lock_ptr!(self.applications)?;
-            app_map.insert(app.name.clone(), ApplicationPtr::new(app.into()));
+            app_map.insert(
+                (app.workspace.clone(), app.name.clone()),
+                ApplicationPtr::new(app.into()),
+            );
         }
 
         let node_list = self.engine.find_nodes().await?;
@@ -171,7 +215,8 @@ impl Storage {
                 );
                 let mut recovered = executor.clone();
                 recovered.set_state(ExecutorState::Idle);
-                recovered.ssn_id = None;
+                recovered.session = None;
+                recovered.task = None;
                 self.engine.update_executor(&recovered).await?;
                 recovered
             } else {
@@ -179,7 +224,7 @@ impl Storage {
             };
 
             let mut exe_map = lock_ptr!(self.executors)?;
-            exe_map.insert(executor.id.clone(), ExecutorPtr::new(executor.into()));
+            exe_map.insert(executor.name.clone(), ExecutorPtr::new(executor.into()));
         }
 
         Ok(())
@@ -195,7 +240,7 @@ impl Storage {
         // Loop until we're within the limit
         while ssn_map.len() >= max {
             // Collect all closed sessions with their completion times
-            let mut closed_sessions: Vec<(SessionID, chrono::DateTime<Utc>)> = ssn_map
+            let mut closed_sessions: Vec<((String, String), chrono::DateTime<Utc>)> = ssn_map
                 .iter()
                 .filter_map(|(id, ssn_ptr)| {
                     let ssn = lock_ptr!(ssn_ptr).ok()?;
@@ -223,11 +268,11 @@ impl Storage {
             closed_sessions.sort_by_key(|a| a.1);
 
             // Evict the oldest closed session
-            if let Some((ssn_id, _)) = closed_sessions.first() {
-                ssn_map.remove(ssn_id);
+            if let Some((session_key, _)) = closed_sessions.first() {
+                ssn_map.remove(session_key);
                 tracing::debug!(
-                    "Evicted closed session <{}> from cache (limit: {}, current: {})",
-                    ssn_id,
+                    "Evicted closed session <{:?}> from cache (limit: {}, current: {})",
+                    session_key,
                     max,
                     ssn_map.len()
                 );
@@ -240,19 +285,21 @@ impl Storage {
     pub async fn register_node(&self, node: &Node) -> Result<(), FlameError> {
         trace_fn!("Storage::register_node");
 
-        let exists = {
+        let existing = {
             let node_map = lock_ptr!(self.nodes)?;
-            node_map.contains_key(&node.name)
+            node_map.get(&node.name).cloned()
         };
-
-        if exists {
-            self.engine.update_node(node).await?;
+        let mut node = node.clone();
+        if let Some(existing) = existing {
+            node.id = lock_ptr!(existing)?.id.clone();
+            node = self.engine.update_node(&node).await?;
         } else {
-            self.engine.create_node(node).await?;
+            node.id = crate::apis::new_metadata_id();
+            node = self.engine.create_node(&node).await?;
         }
 
         let mut node_map = lock_ptr!(self.nodes)?;
-        node_map.insert(node.name.clone(), stdng::new_ptr(node.clone()));
+        node_map.insert(node.name.clone(), stdng::new_ptr(node));
         Ok(())
     }
 
@@ -334,15 +381,17 @@ impl Storage {
         node: &Node,
         _: &Vec<Executor>,
     ) -> Result<Vec<Executor>, FlameError> {
-        let exists = {
+        let existing = {
             let node_map = lock_ptr!(self.nodes)?;
-            node_map.contains_key(&node.name)
+            node_map.get(&node.name).cloned()
         };
-
-        if exists {
-            self.engine.update_node(node).await?;
+        let mut node = node.clone();
+        if let Some(existing) = existing {
+            node.id = lock_ptr!(existing)?.id.clone();
+            node = self.engine.update_node(&node).await?;
         } else {
-            self.engine.create_node(node).await?;
+            node.id = crate::apis::new_metadata_id();
+            node = self.engine.create_node(&node).await?;
         }
 
         let mut node_map = lock_ptr!(self.nodes)?;
@@ -355,19 +404,7 @@ impl Storage {
         for exec in execs {
             let exec = lock_ptr!(exec)?;
             if exec.node == node.name {
-                res.push(Executor {
-                    id: exec.id.clone(),
-                    node: exec.node.clone(),
-                    resreq: exec.resreq.clone(),
-                    shim: exec.shim,
-                    application: exec.application.clone(),
-                    task_id: exec.task_id,
-                    ssn_id: exec.ssn_id.clone(),
-                    attributes: exec.attributes.clone(),
-                    creation_time: exec.creation_time,
-                    latest_updated_timestamp: exec.latest_updated_timestamp,
-                    state: exec.state,
-                });
+                res.push(exec.clone());
             }
         }
 
@@ -385,42 +422,39 @@ impl Storage {
     }
 
     /// Deletes multiple executors and retries their running tasks.
-    /// Returns the list of executor IDs that were successfully deleted.
+    /// Returns the names of executors that were successfully deleted.
     pub async fn delete_executors(
         &self,
         executors: &[Executor],
-    ) -> Result<Vec<ExecutorID>, FlameError> {
+    ) -> Result<Vec<String>, FlameError> {
         trace_fn!("Storage::delete_executors");
 
-        let mut deleted_executor_ids = Vec::new();
+        let mut deleted_executor_names = Vec::new();
 
         for executor in executors {
             // If executor has a running task, retry it
-            if let (Some(task_id), Some(ref ssn_id)) = (executor.task_id, &executor.ssn_id) {
-                let gid = TaskGID {
-                    ssn_id: ssn_id.clone(),
-                    task_id,
-                };
-                match self.engine.retry_task(gid.clone()).await {
+            if let (Some(task), Some(gid)) = (&executor.task, executor.session()) {
+                let session = &gid.session;
+                match self.engine.retry_task(&gid, task).await {
                     Ok(task) => {
                         // Update the in-memory session with the retried task
-                        if let Ok(ssn_ptr) = self.get_session_ptr(ssn_id.clone()) {
+                        if let Ok(ssn_ptr) = self.get_session_ptr(&executor.workspace, session) {
                             if let Ok(mut ssn) = lock_ptr!(ssn_ptr) {
                                 let _ = ssn.update_task(&task);
                             }
                         }
                         tracing::info!(
                             "Retried task {} for session {} due to executor {} cleanup",
-                            task_id,
-                            ssn_id,
+                            task.name,
+                            session,
                             executor.id
                         );
                     }
                     Err(e) => {
                         tracing::warn!(
                             "Failed to retry task {} for session {}: {}",
-                            task_id,
-                            ssn_id,
+                            task,
+                            session,
                             e
                         );
                     }
@@ -428,16 +462,19 @@ impl Storage {
             }
 
             // Delete the executor
-            if let Err(e) = self.delete_executor(executor.id.clone()).await {
+            if let Err(e) = self
+                .delete_executor(&executor.workspace, &executor.name)
+                .await
+            {
                 tracing::warn!("Failed to delete executor {}: {}", executor.id, e);
             } else {
-                deleted_executor_ids.push(executor.id.clone());
+                deleted_executor_names.push(executor.name.clone());
             }
         }
 
-        tracing::info!("Deleted {} executors", deleted_executor_ids.len());
+        tracing::info!("Deleted {} executors", deleted_executor_names.len());
 
-        Ok(deleted_executor_ids)
+        Ok(deleted_executor_names)
     }
 
     pub async fn create_session(&self, attr: SessionAttributes) -> Result<Session, FlameError> {
@@ -446,7 +483,10 @@ impl Storage {
 
         {
             let mut ssn_map = lock_ptr!(self.sessions)?;
-            ssn_map.insert(ssn.id.clone(), SessionPtr::new(ssn.clone().into()));
+            ssn_map.insert(
+                (ssn.workspace.clone(), ssn.name.clone()),
+                SessionPtr::new(ssn.clone().into()),
+            );
         }
 
         self.evict_sessions()?;
@@ -454,15 +494,17 @@ impl Storage {
         Ok(ssn)
     }
 
-    pub async fn close_session(&self, id: SessionID) -> Result<Session, FlameError> {
+    pub async fn close_session(&self, workspace: &str, name: &str) -> Result<Session, FlameError> {
         trace_fn!("Storage::close_session");
 
         let ssn_ptr = {
             let ssn_map = lock_ptr!(self.sessions)?;
             ssn_map
-                .get(&id)
+                .get(&(workspace.to_string(), name.to_string()))
                 .cloned()
-                .ok_or(FlameError::NotFound(format!("session <{}>", id)))?
+                .ok_or(FlameError::NotFound(format!(
+                    "session <{workspace}/{name}>"
+                )))?
         };
 
         {
@@ -478,7 +520,11 @@ impl Storage {
             }
         }
 
-        let persisted_ssn = match self.engine.close_session(id.clone()).await {
+        let persisted_ssn = match self
+            .engine
+            .close_session(&SessionGID::new(workspace, name))
+            .await
+        {
             Ok(ssn) => Some(ssn),
             Err(FlameError::NotFound(_)) => None,
             Err(e) => return Err(e),
@@ -528,28 +574,29 @@ impl Storage {
         Ok(result_ssn)
     }
 
-    pub fn get_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        let ssn_ptr = self.get_session_ptr(id)?;
+    pub fn get_session(&self, workspace: &str, name: &str) -> Result<Session, FlameError> {
+        let ssn_ptr = self.get_session_ptr(workspace, name)?;
         let ssn = lock_ptr!(ssn_ptr)?;
         let mut ssn = ssn.clone();
         ssn.events = self
             .event_manager
-            .find_events(EventOwner::session(ssn.id.clone()))?;
+            .find_events(EventOwner::session(ssn.workspace.clone(), ssn.name.clone()))?;
         Ok(ssn)
     }
 
-    pub fn get_session_ptr(&self, id: SessionID) -> Result<SessionPtr, FlameError> {
+    pub fn get_session_ptr(&self, workspace: &str, name: &str) -> Result<SessionPtr, FlameError> {
         let ssn_map = lock_ptr!(self.sessions)?;
 
         ssn_map
-            .get(&id)
-            .ok_or(FlameError::NotFound(id.to_string()))
+            .get(&(workspace.to_string(), name.to_string()))
+            .ok_or(FlameError::NotFound(format!("session {workspace}/{name}")))
             .cloned()
     }
 
     pub async fn open_session(
         &self,
-        id: SessionID,
+        workspace: &str,
+        name: &str,
         spec: Option<SessionAttributes>,
     ) -> Result<Session, FlameError> {
         trace_fn!("Storage::open_session");
@@ -558,7 +605,7 @@ impl Storage {
         // to preserve in-memory task state
         {
             let ssn_map = lock_ptr!(self.sessions)?;
-            if let Some(ssn_ptr) = ssn_map.get(&id) {
+            if let Some(ssn_ptr) = ssn_map.get(&(workspace.to_string(), name.to_string())) {
                 let ssn = lock_ptr!(ssn_ptr)?;
                 // Verify the session is still open before returning cached version
                 if ssn.status.state == SessionState::Open {
@@ -568,7 +615,7 @@ impl Storage {
                     }
                     tracing::debug!(
                         "Session <{}> already exists in cache with {} tasks, returning cached version",
-                        id,
+                        name,
                         ssn.tasks.len()
                     );
                     return Ok(ssn.clone());
@@ -577,11 +624,17 @@ impl Storage {
         }
 
         // Session not in cache or not open, delegate to engine for atomic get-or-create operation
-        let ssn = self.engine.open_session(id.clone(), spec).await?;
+        let ssn = self
+            .engine
+            .open_session(&SessionGID::new(workspace, name), spec)
+            .await?;
 
         {
             let mut ssn_map = lock_ptr!(self.sessions)?;
-            ssn_map.insert(ssn.id.clone(), SessionPtr::new(ssn.clone().into()));
+            ssn_map.insert(
+                (ssn.workspace.clone(), ssn.name.clone()),
+                SessionPtr::new(ssn.clone().into()),
+            );
         }
 
         self.evict_sessions()?;
@@ -589,87 +642,103 @@ impl Storage {
         Ok(ssn)
     }
 
-    pub fn get_task_ptr(&self, gid: TaskGID) -> Result<TaskPtr, FlameError> {
-        let ssn_map = lock_ptr!(self.sessions)?;
-        let ssn_ptr = ssn_map
-            .get(&gid.ssn_id)
-            .ok_or(FlameError::NotFound(gid.ssn_id.to_string()))?;
-
+    pub fn get_task_ptr(
+        &self,
+        workspace: &str,
+        session: &str,
+        task: &str,
+    ) -> Result<TaskPtr, FlameError> {
+        let ssn_ptr = self.get_session_ptr(workspace, session)?;
         let ssn = lock_ptr!(ssn_ptr)?;
-        let task_ptr = ssn
-            .tasks
-            .get(&gid.task_id)
-            .ok_or(FlameError::NotFound(gid.to_string()))?;
-
-        Ok(task_ptr.clone())
+        let task_number = task
+            .parse::<TaskName>()
+            .ok()
+            .filter(|number| *number != 0 && number.to_string() == task)
+            .ok_or_else(|| FlameError::NotFound(format!("task {workspace}/{session}/{task}")))?;
+        ssn.tasks
+            .get(&task_number)
+            .cloned()
+            .ok_or_else(|| FlameError::NotFound(format!("task {workspace}/{session}/{task}")))
     }
 
-    pub async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError> {
+    pub async fn delete_session(&self, workspace: &str, name: &str) -> Result<Session, FlameError> {
         let cached = {
             let ssn_map = lock_ptr!(self.sessions)?;
-            ssn_map.get(&id).cloned()
+            ssn_map
+                .get(&(workspace.to_string(), name.to_string()))
+                .cloned()
         };
 
         let ssn = match cached {
             Some(ssn_ptr) => {
                 let ssn = lock_ptr!(ssn_ptr)?.clone();
-                if let Err(error) = self.engine.delete_session(id.clone()).await {
+                if let Err(error) = self
+                    .engine
+                    .delete_session(&SessionGID::new(workspace, name))
+                    .await
+                {
                     if !matches!(error, FlameError::NotFound(_)) {
                         return Err(error);
                     }
                 }
                 ssn
             }
-            None => self.engine.delete_session(id.clone()).await?,
+            None => {
+                self.engine
+                    .delete_session(&SessionGID::new(workspace, name))
+                    .await?
+            }
         };
 
         {
             let mut ssn_map = lock_ptr!(self.sessions)?;
-            ssn_map.remove(&id);
+            ssn_map.remove(&(workspace.to_string(), name.to_string()));
         }
 
-        self.event_manager.remove_events(id)?;
+        self.event_manager
+            .remove_events(&SessionGID::new(workspace, name))?;
 
         Ok(ssn)
     }
 
-    pub fn list_sessions(
-        &self,
-        filter: Option<&SessionFilter>,
-    ) -> Result<Vec<Session>, FlameError> {
-        if filter.and_then(|filter| filter.limit) == Some(0) {
+    pub fn list_sessions(&self, filter: &SessionFilter) -> Result<Vec<Session>, FlameError> {
+        if filter.limit == Some(0) {
             return Ok(Vec::new());
         }
         let mut ssn_list = vec![];
         let ssn_map = lock_ptr!(self.sessions)?;
 
-        for ssn in ssn_map.deref().values() {
+        for ((workspace, _), ssn) in ssn_map.iter() {
+            if workspace != &filter.workspace {
+                continue;
+            }
             let ssn = lock_ptr!(ssn)?;
             let mut ssn = ssn.clone();
             ssn.events = self
                 .event_manager
-                .find_events(EventOwner::session(ssn.id.clone()))?;
-            let matches = filter.is_none_or(|filter| {
-                filter
-                    .application
-                    .as_ref()
-                    .is_none_or(|application| ssn.application == *application)
+                .find_events(EventOwner::session(ssn.workspace.clone(), ssn.name.clone()))?;
+            let matches = {
+                ssn.workspace == filter.workspace
+                    && filter
+                        .application
+                        .as_ref()
+                        .is_none_or(|application| ssn.application == *application)
                     && filter.state.is_none_or(|state| ssn.status.state == state)
-                    && filter.ids.as_ref().is_none_or(|ids| ids.contains(&ssn.id))
-            });
+                    && filter
+                        .names
+                        .as_ref()
+                        .is_none_or(|names| names.contains(&ssn.name))
+            };
             if !matches {
                 continue;
             }
-            if let Some(predicate) = filter.and_then(|filter| filter.predicate) {
+            if let Some(predicate) = filter.predicate {
                 if !predicate.matches(ssn.retry_count, self.session_retry_limits()) {
                     continue;
                 }
             }
             ssn_list.push(ssn);
-            if filter
-                .and_then(|filter| filter.limit)
-                .is_some_and(|limit| ssn_list.len() >= limit)
-            {
+            if filter.limit.is_some_and(|limit| ssn_list.len() >= limit) {
                 break;
             }
         }
@@ -680,7 +749,7 @@ impl Storage {
     /// Lists executors with optional filtering.
     ///
     /// # Arguments
-    /// * `filter` - Filter criteria (state, node, and/or executor IDs).
+    /// * `filter` - Filter criteria (state, node, and/or executor names).
     ///   - `None` filter means return all executors
     ///   - For each field in filter:
     ///     - `None` = ignore this field (match all)
@@ -720,10 +789,10 @@ impl Storage {
                     }
                 }
 
-                // Filter by ids if specified
+                // Filter by names if specified
                 // Some([]) matches nothing, Some([a,b]) matches a or b, None matches all
-                if let Some(ref ids) = filter.ids {
-                    if !ids.contains(&exe.id) {
+                if let Some(ref names) = filter.names {
+                    if !names.contains(&exe.name) {
                         return None;
                     }
                 }
@@ -737,17 +806,18 @@ impl Storage {
 
     pub async fn create_task(
         &self,
-        ssn_id: SessionID,
+        workspace: &str,
+        session: &str,
         task_input: Option<TaskInput>,
         options: Option<TaskOptions>,
     ) -> Result<Task, FlameError> {
         trace_fn!("Storage::create_task");
         let task = self
             .engine
-            .create_task(ssn_id.clone(), task_input, options)
+            .create_task(&SessionGID::new(workspace, session), task_input, options)
             .await?;
 
-        let ssn = self.get_session_ptr(ssn_id.clone())?;
+        let ssn = self.get_session_ptr(workspace, session)?;
         let mut ssn = lock_ptr!(ssn)?;
         ssn.update_task(&task)?;
 
@@ -763,11 +833,9 @@ impl Storage {
         Ok(task)
     }
 
-    pub fn get_task(&self, ssn_id: SessionID, id: TaskID) -> Result<Task, FlameError> {
-        let mut task = self.get_task_metadata(ssn_id, id)?;
-        let events = self
-            .event_manager
-            .find_events(EventOwner::from(task.gid()))?;
+    pub fn get_task(&self, workspace: &str, session: &str, task: &str) -> Result<Task, FlameError> {
+        let mut task = self.get_task_metadata(workspace, session, task)?;
+        let events = self.event_manager.find_events(EventOwner::from(&task))?;
         task.events = events;
 
         Ok(task)
@@ -776,21 +844,23 @@ impl Storage {
     /// Clone the current task state without loading historical events from disk.
     /// Nonterminal watch updates need current state without serializing
     /// unrelated sessions behind event storage I/O.
-    pub fn get_task_metadata(&self, ssn_id: SessionID, id: TaskID) -> Result<Task, FlameError> {
-        let task_ptr = self.get_task_ptr(TaskGID {
-            ssn_id,
-            task_id: id,
-        })?;
+    pub fn get_task_metadata(
+        &self,
+        workspace: &str,
+        session: &str,
+        task: &str,
+    ) -> Result<Task, FlameError> {
+        let task_ptr = self.get_task_ptr(workspace, session, task)?;
         let mut task = lock_ptr!(task_ptr)?.clone();
         task.events.clear();
         Ok(task)
     }
 
-    pub fn list_tasks(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
+    pub fn list_tasks(&self, workspace: &str, session: &str) -> Result<Vec<Task>, FlameError> {
         let ssn_map = lock_ptr!(self.sessions)?;
         let ssn = ssn_map
-            .get(&ssn_id)
-            .ok_or(FlameError::NotFound(ssn_id.to_string()))?;
+            .get(&(workspace.to_string(), session.to_string()))
+            .ok_or_else(|| FlameError::NotFound(format!("session {workspace}/{session}")))?;
 
         let ssn = lock_ptr!(ssn)?;
         let task_list = ssn
@@ -805,84 +875,127 @@ impl Storage {
         Ok(task_list)
     }
 
-    pub async fn get_application(&self, id: ApplicationID) -> Result<Application, FlameError> {
-        self.engine.get_application(id).await
+    pub async fn get_application(
+        &self,
+        workspace: &str,
+        name: &str,
+    ) -> Result<Application, FlameError> {
+        self.engine.get_application(workspace, name).await
+    }
+
+    pub fn get_application_ptr(
+        &self,
+        workspace: &str,
+        name: &str,
+    ) -> Result<ApplicationPtr, FlameError> {
+        lock_ptr!(self.applications)?
+            .get(&(workspace.to_string(), name.to_string()))
+            .cloned()
+            .ok_or_else(|| FlameError::NotFound(format!("application {workspace}/{name}")))
     }
 
     pub async fn register_application(
         &self,
+        workspace: String,
         name: String,
         attr: ApplicationAttributes,
-    ) -> Result<(), FlameError> {
-        let app = self.engine.register_application(name, attr).await?;
+    ) -> Result<Application, FlameError> {
+        let app = self
+            .engine
+            .register_application(workspace, name, attr)
+            .await?;
 
         let mut app_map = lock_ptr!(self.applications)?;
         // just lock the sessions to avoid cache mismatch.
         let _unused = lock_ptr!(self.sessions)?;
 
-        app_map.insert(app.name.clone(), stdng::new_ptr(app.clone()));
+        app_map.insert(
+            (app.workspace.clone(), app.name.clone()),
+            stdng::new_ptr(app.clone()),
+        );
 
-        Ok(())
+        Ok(app)
     }
 
     pub async fn update_application_state(
         &self,
-        name: ApplicationID,
+        workspace: &str,
+        name: &str,
         state: ApplicationState,
     ) -> Result<Application, FlameError> {
         let app = self
             .engine
-            .update_application_state(name.clone(), state)
+            .update_application_state(workspace, name, state)
             .await?;
 
         let mut app_map = lock_ptr!(self.applications)?;
-        app_map.insert(name, stdng::new_ptr(app.clone()));
+        app_map.insert(
+            (workspace.to_string(), name.to_string()),
+            stdng::new_ptr(app.clone()),
+        );
         Ok(app)
     }
 
-    pub async fn delete_application(&self, name: ApplicationID) -> Result<(), FlameError> {
-        self.engine.delete_application(name.clone()).await?;
+    pub async fn delete_application(&self, workspace: &str, name: &str) -> Result<(), FlameError> {
+        self.engine.delete_application(workspace, name).await?;
 
         let mut app_map = lock_ptr!(self.applications)?;
-        app_map.remove(&name);
+        app_map.remove(&(workspace.to_string(), name.to_string()));
 
         Ok(())
     }
 
     pub async fn update_application(
         &self,
-        name: String,
+        workspace: &str,
+        name: &str,
         attr: ApplicationAttributes,
     ) -> Result<(), FlameError> {
-        let app = self.engine.update_application(name.clone(), attr).await?;
+        let app = self
+            .engine
+            .update_application(workspace, name, attr)
+            .await?;
 
         let mut app_map = lock_ptr!(self.applications)?;
-        app_map.insert(name.clone(), stdng::new_ptr(app.clone()));
+        app_map.insert(
+            (workspace.to_string(), name.to_string()),
+            stdng::new_ptr(app.clone()),
+        );
 
         Ok(())
     }
 
     pub async fn list_applications(
         &self,
-        filter: Option<&ApplicationFilter>,
+        filter: &ApplicationFilter,
     ) -> Result<Vec<Application>, FlameError> {
-        self.engine.find_applications(filter).await
+        self.engine.find_applications(Some(filter)).await
     }
 
-    pub async fn session_application(&self, id: SessionID) -> Result<ApplicationID, FlameError> {
+    pub async fn session_application(
+        &self,
+        workspace: &str,
+        session: &str,
+    ) -> Result<String, FlameError> {
         let cached = {
             let ssn_map = lock_ptr!(self.sessions)?;
-            ssn_map.get(&id).cloned()
+            ssn_map
+                .get(&(workspace.to_string(), session.to_string()))
+                .cloned()
         };
         if let Some(ssn) = cached {
             return Ok(lock_ptr!(ssn)?.application.clone());
         }
 
-        Ok(self.engine.get_session(id).await?.application)
+        Ok(self
+            .engine
+            .get_session(&SessionGID::new(workspace, session))
+            .await?
+            .application)
     }
 
     pub fn count_session(&self, filter: &SessionFilter) -> Result<usize, FlameError> {
-        Ok(self.list_sessions(Some(filter))?.len())
+        Ok(self.list_sessions(filter)?.len())
     }
 
     pub async fn update_task_state(
@@ -893,20 +1006,25 @@ impl Storage {
         message: Option<String>,
     ) -> Result<(), FlameError> {
         trace_fn!("Storage::update_task_state");
-        let gid = TaskGID {
-            ssn_id: {
-                let ssn_ptr = lock_ptr!(ssn)?;
-                ssn_ptr.id.clone()
-            },
-            task_id: {
-                let task_ptr = lock_ptr!(task)?;
-                task_ptr.id
-            },
-        };
+        let current = lock_ptr!(task)?.clone();
+        {
+            let owner = lock_ptr!(ssn)?;
+            if owner.workspace != current.workspace || owner.name != current.session {
+                return Err(FlameError::InvalidConfig(format!(
+                    "task {}/{}/{} does not belong to session {}/{}",
+                    current.workspace, current.session, current.name, owner.workspace, owner.name
+                )));
+            }
+        }
 
         let updated_task = match self
             .engine
-            .update_task_state(gid.clone(), task_state, message)
+            .update_task_state(
+                &current.session(),
+                &current.name.to_string(),
+                task_state,
+                message,
+            )
             .await
         {
             Ok(task) => task,
@@ -931,7 +1049,7 @@ impl Storage {
         ssn_ptr.update_task(&updated_task)?;
 
         self.event_manager.record_event(
-            EventOwner::from(updated_task.gid()),
+            EventOwner::from(&updated_task),
             Event {
                 code: task_state.into(),
                 message: Some(format!("Task state was updated to <{:?}>", task_state)),
@@ -949,16 +1067,16 @@ impl Storage {
         task_result: TaskResult,
     ) -> Result<(), FlameError> {
         trace_fn!("Storage::update_task_result");
-        let gid = TaskGID {
-            ssn_id: {
-                let ssn_ptr = lock_ptr!(ssn)?;
-                ssn_ptr.id.clone()
-            },
-            task_id: {
-                let task_ptr = lock_ptr!(task)?;
-                task_ptr.id
-            },
-        };
+        let current = lock_ptr!(task)?.clone();
+        {
+            let owner = lock_ptr!(ssn)?;
+            if owner.workspace != current.workspace || owner.name != current.session {
+                return Err(FlameError::InvalidConfig(format!(
+                    "task {}/{}/{} does not belong to session {}/{}",
+                    current.workspace, current.session, current.name, owner.workspace, owner.name
+                )));
+            }
+        }
 
         let task_state = task_result.state;
         let task_message = task_result.message.clone();
@@ -966,7 +1084,7 @@ impl Storage {
 
         let updated_task = match self
             .engine
-            .update_task_result(gid.clone(), task_result)
+            .update_task_result(&current.session(), &current.name.to_string(), task_result)
             .await
         {
             Ok(task) => task,
@@ -1000,7 +1118,7 @@ impl Storage {
         };
 
         self.event_manager.record_event(
-            EventOwner::from(updated_task.gid()),
+            EventOwner::from(&updated_task),
             Event {
                 code: updated_task.state.into(),
                 message: Some(event_message),
@@ -1014,24 +1132,25 @@ impl Storage {
     pub async fn create_executor(
         &self,
         node_name: String,
-        ssn_id: SessionID,
+        workspace: &str,
+        session: &str,
     ) -> Result<Executor, FlameError> {
         trace_fn!("Storage::create_executor");
-        let ssn = self.get_session_ptr(ssn_id.clone())?;
+        let ssn = self.get_session_ptr(workspace, session)?;
 
         let (application, resreq) = {
             let ssn = lock_ptr!(ssn)?;
             let resreq = ssn.resreq.clone().ok_or_else(|| {
                 FlameError::InvalidState(format!(
                     "session <{}> has no resreq; resolve_session_resreq must populate it",
-                    ssn_id
+                    session
                 ))
             })?;
             (ssn.application.clone(), resreq)
         };
         let shim = {
             let applications = lock_ptr!(self.applications)?;
-            match applications.get(&application) {
+            match applications.get(&(workspace.to_string(), application.clone())) {
                 Some(application) => lock_ptr!(application)?.shim,
                 None => {
                     tracing::warn!(
@@ -1044,14 +1163,17 @@ impl Storage {
         };
 
         let now = Utc::now();
+        let name = Uuid::new_v4().to_string();
         let e = Executor {
             id: Uuid::new_v4().to_string(),
+            name: name.clone(),
             node: node_name.clone(),
             resreq,
             shim,
             application,
-            task_id: None,
-            ssn_id: None,
+            workspace: workspace.to_string(),
+            task: None,
+            session: None,
             attributes: Default::default(),
             creation_time: now,
             latest_updated_timestamp: now,
@@ -1062,16 +1184,16 @@ impl Storage {
 
         let mut exe_map = lock_ptr!(self.executors)?;
         let exe = ExecutorPtr::new(e.clone().into());
-        exe_map.insert(e.id.clone(), exe.clone());
+        exe_map.insert(e.name.clone(), exe.clone());
 
         Ok(e.clone())
     }
 
-    pub fn get_executor_ptr(&self, id: ExecutorID) -> Result<ExecutorPtr, FlameError> {
+    pub fn get_executor_ptr(&self, name: &str) -> Result<ExecutorPtr, FlameError> {
         let exe_map = lock_ptr!(self.executors)?;
         let exe = exe_map
-            .get(&id)
-            .ok_or(FlameError::NotFound(id.to_string()))?;
+            .get(name)
+            .ok_or(FlameError::NotFound(name.to_string()))?;
 
         Ok(exe.clone())
     }
@@ -1081,23 +1203,25 @@ impl Storage {
         self.engine.update_executor(executor).await?;
 
         let exe_map = lock_ptr!(self.executors)?;
-        if let Some(exe_ptr) = exe_map.get(&executor.id) {
+        if let Some(exe_ptr) = exe_map.get(&executor.name) {
             let mut exe = lock_ptr!(exe_ptr)?;
             exe.state = executor.state;
-            exe.task_id = executor.task_id;
-            exe.ssn_id = executor.ssn_id.clone();
+            exe.task = executor.task.clone();
+            exe.session = executor.session.clone();
             exe.latest_updated_timestamp = executor.latest_updated_timestamp;
         }
 
         Ok(())
     }
 
-    pub async fn delete_executor(&self, id: ExecutorID) -> Result<(), FlameError> {
+    pub async fn delete_executor(&self, workspace: &str, name: &str) -> Result<(), FlameError> {
         trace_fn!("Storage::delete_executor");
-        self.engine.delete_executor(&id).await?;
+        self.engine
+            .delete_executor(&ExecutorGID::new(workspace, name))
+            .await?;
 
         let mut exe_map = lock_ptr!(self.executors)?;
-        exe_map.remove(&id);
+        exe_map.remove(name);
 
         Ok(())
     }

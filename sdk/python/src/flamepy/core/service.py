@@ -103,6 +103,7 @@ class ApplicationContext:
     """Context for an application."""
 
     name: str
+    workspace: str = "default"
     image: Optional[str] = None
     command: Optional[str] = None
     working_directory: Optional[str] = None
@@ -115,8 +116,9 @@ class SessionContext:
 
     _common_data: Optional[bytes]
 
-    session_id: str
+    session: str
     application: ApplicationContext
+    workspace: str = "default"
     tokens: Dict[str, str] = field(default_factory=dict, repr=False)
 
     def common_data(self) -> Optional[bytes]:
@@ -128,9 +130,10 @@ class SessionContext:
 class TaskContext:
     """Context for a task."""
 
-    task_id: str
-    session_id: str
+    task: str
+    session: str
     input: Optional[bytes]  # Task input as bytes in core API
+    workspace: str = "default"
 
 
 class FlameService:

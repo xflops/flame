@@ -41,11 +41,14 @@ mod tests {
 
             let attr = create_app_attr();
             storage
-                .register_application("test-app".to_string(), attr)
+                .register_application("default".to_string(), "test-app".to_string(), attr)
                 .await
                 .unwrap();
 
-            let apps = storage.list_applications(None).await.unwrap();
+            let apps = storage
+                .list_applications(&crate::apis::ApplicationFilter::new("default"))
+                .await
+                .unwrap();
             assert_eq!(apps.len(), 1);
             assert_eq!(apps[0].name, "test-app");
         }
@@ -57,15 +60,18 @@ mod tests {
 
             let attr = create_app_attr();
             storage
-                .register_application("app-1".to_string(), attr.clone())
+                .register_application("default".to_string(), "app-1".to_string(), attr.clone())
                 .await
                 .unwrap();
             storage
-                .register_application("app-2".to_string(), attr)
+                .register_application("default".to_string(), "app-2".to_string(), attr)
                 .await
                 .unwrap();
 
-            let apps = storage.list_applications(None).await.unwrap();
+            let apps = storage
+                .list_applications(&crate::apis::ApplicationFilter::new("default"))
+                .await
+                .unwrap();
             assert_eq!(apps.len(), 2);
         }
 
@@ -80,12 +86,12 @@ mod tests {
                 ..Default::default()
             };
             storage
-                .register_application("attr-app".to_string(), attr)
+                .register_application("default".to_string(), "attr-app".to_string(), attr)
                 .await
                 .unwrap();
 
             let app = storage
-                .get_application("attr-app".to_string())
+                .get_application("default", "attr-app")
                 .await
                 .unwrap();
             assert_eq!(app.image, Some("custom-image:v1".to_string()));
@@ -103,14 +109,11 @@ mod tests {
 
             let attr = create_app_attr();
             storage
-                .register_application("get-app".to_string(), attr)
+                .register_application("default".to_string(), "get-app".to_string(), attr)
                 .await
                 .unwrap();
 
-            let app = storage
-                .get_application("get-app".to_string())
-                .await
-                .unwrap();
+            let app = storage.get_application("default", "get-app").await.unwrap();
             assert_eq!(app.name, "get-app");
         }
 
@@ -119,7 +122,7 @@ mod tests {
             let ctx = test_context();
             let storage = storage::new_ptr(&ctx).await.unwrap();
 
-            let result = storage.get_application("nonexistent".to_string()).await;
+            let result = storage.get_application("default", "nonexistent").await;
             assert!(result.is_err());
         }
     }
@@ -135,7 +138,7 @@ mod tests {
 
             let attr = create_app_attr();
             storage
-                .register_application("update-app".to_string(), attr)
+                .register_application("default".to_string(), "update-app".to_string(), attr)
                 .await
                 .unwrap();
 
@@ -144,12 +147,12 @@ mod tests {
                 ..Default::default()
             };
             storage
-                .update_application("update-app".to_string(), new_attr)
+                .update_application("default", "update-app", new_attr)
                 .await
                 .unwrap();
 
             let app = storage
-                .get_application("update-app".to_string())
+                .get_application("default", "update-app")
                 .await
                 .unwrap();
             assert_eq!(app.image, Some("new-image:v2".to_string()));
@@ -159,17 +162,22 @@ mod tests {
         async fn rejects_updates_to_disabled_application() {
             let storage = storage::new_ptr(&test_context()).await.unwrap();
             storage
-                .register_application("disabled-app".to_string(), create_app_attr())
+                .register_application(
+                    "default".to_string(),
+                    "disabled-app".to_string(),
+                    create_app_attr(),
+                )
                 .await
                 .unwrap();
             let disabled = storage
-                .update_application_state("disabled-app".to_string(), ApplicationState::Disabled)
+                .update_application_state("default", "disabled-app", ApplicationState::Disabled)
                 .await
                 .unwrap();
 
             let result = storage
                 .update_application(
-                    "disabled-app".to_string(),
+                    "default",
+                    "disabled-app",
                     ApplicationAttributes {
                         image: Some("must-not-be-written".to_string()),
                         ..Default::default()
@@ -179,7 +187,7 @@ mod tests {
             assert!(matches!(result, Err(crate::FlameError::InvalidState(_))));
 
             let unchanged = storage
-                .get_application("disabled-app".to_string())
+                .get_application("default", "disabled-app")
                 .await
                 .unwrap();
             assert_eq!(unchanged.version, disabled.version);
@@ -194,7 +202,8 @@ mod tests {
         fn create_session_attr(id: &str, app: &str) -> SessionAttributes {
             SessionAttributes {
                 tokens: Default::default(),
-                id: id.to_string(),
+                workspace: "default".to_string(),
+                name: id.to_string(),
                 application: app.to_string(),
                 common_data: None,
                 min_instances: 1,
@@ -212,29 +221,32 @@ mod tests {
 
             let attr = create_app_attr();
             storage
-                .register_application("unregister-app".to_string(), attr)
+                .register_application("default".to_string(), "unregister-app".to_string(), attr)
                 .await
                 .unwrap();
 
             let disabled = storage
-                .update_application_state("unregister-app".to_string(), ApplicationState::Disabled)
+                .update_application_state("default", "unregister-app", ApplicationState::Disabled)
                 .await
                 .unwrap();
             assert_eq!(disabled.state, ApplicationState::Disabled);
             assert_eq!(disabled.version, 2);
 
             let unchanged = storage
-                .update_application_state("unregister-app".to_string(), ApplicationState::Disabled)
+                .update_application_state("default", "unregister-app", ApplicationState::Disabled)
                 .await
                 .unwrap();
             assert_eq!(unchanged.version, disabled.version);
 
             storage
-                .delete_application("unregister-app".to_string())
+                .delete_application("default", "unregister-app")
                 .await
                 .unwrap();
 
-            let apps = storage.list_applications(None).await.unwrap();
+            let apps = storage
+                .list_applications(&crate::apis::ApplicationFilter::new("default"))
+                .await
+                .unwrap();
             assert!(apps.is_empty());
         }
 
@@ -245,55 +257,78 @@ mod tests {
 
             let app_attr = create_app_attr();
             storage
-                .register_application("cleanup-app".to_string(), app_attr)
+                .register_application("default".to_string(), "cleanup-app".to_string(), app_attr)
                 .await
                 .unwrap();
 
             let ssn_attr = create_session_attr("cleanup-ssn", "cleanup-app");
             storage.create_session(ssn_attr).await.unwrap();
 
-            assert_eq!(storage.list_sessions(None).unwrap().len(), 1);
+            assert_eq!(
+                storage
+                    .list_sessions(&crate::apis::SessionFilter::new("default"))
+                    .unwrap()
+                    .len(),
+                1
+            );
 
             storage
-                .update_application_state("cleanup-app".to_string(), ApplicationState::Disabled)
+                .update_application_state("default", "cleanup-app", ApplicationState::Disabled)
                 .await
                 .unwrap();
 
-            let open_sessions =
-                crate::apis::SessionFilter::by_application_state("cleanup-app", SessionState::Open);
+            let open_sessions = crate::apis::SessionFilter::new("default")
+                .by_application("cleanup-app")
+                .by_state(SessionState::Open);
             assert_eq!(storage.count_session(&open_sessions).unwrap(), 1);
-            let result = storage.delete_application("cleanup-app".to_string()).await;
+            let result = storage.delete_application("default", "cleanup-app").await;
             assert!(matches!(result, Err(crate::FlameError::InvalidState(_))));
 
             storage
-                .close_session("cleanup-ssn".to_string())
+                .close_session("default", "cleanup-ssn")
                 .await
                 .unwrap();
-            let result = storage.delete_application("cleanup-app".to_string()).await;
+            let result = storage.delete_application("default", "cleanup-app").await;
             assert!(matches!(result, Err(crate::FlameError::InvalidState(_))));
-            assert_eq!(storage.list_sessions(None).unwrap().len(), 1);
+            assert_eq!(
+                storage
+                    .list_sessions(&crate::apis::SessionFilter::new("default"))
+                    .unwrap()
+                    .len(),
+                1
+            );
 
             storage
-                .delete_session("cleanup-ssn".to_string())
+                .delete_session("default", "cleanup-ssn")
                 .await
                 .unwrap();
             storage
-                .delete_application("cleanup-app".to_string())
+                .delete_application("default", "cleanup-app")
                 .await
                 .unwrap();
 
-            assert_eq!(storage.list_sessions(None).unwrap().len(), 0);
+            assert_eq!(
+                storage
+                    .list_sessions(&crate::apis::SessionFilter::new("default"))
+                    .unwrap()
+                    .len(),
+                0
+            );
         }
 
         #[tokio::test]
         async fn rejects_deleting_an_enabled_application() {
             let storage = storage::new_ptr(&test_context()).await.unwrap();
             storage
-                .register_application("enabled-app".to_string(), create_app_attr())
+                .register_application(
+                    "default".to_string(),
+                    "enabled-app".to_string(),
+                    create_app_attr(),
+                )
                 .await
                 .unwrap();
 
-            let result = storage.delete_application("enabled-app".to_string()).await;
+            let result = storage.delete_application("default", "enabled-app").await;
             assert!(matches!(result, Err(crate::FlameError::InvalidState(_))));
         }
     }
@@ -306,7 +341,10 @@ mod tests {
             let ctx = test_context();
             let storage = storage::new_ptr(&ctx).await.unwrap();
 
-            let apps = storage.list_applications(None).await.unwrap();
+            let apps = storage
+                .list_applications(&crate::apis::ApplicationFilter::new("default"))
+                .await
+                .unwrap();
             assert!(apps.is_empty());
         }
 
@@ -318,12 +356,19 @@ mod tests {
             let attr = create_app_attr();
             for i in 0..3 {
                 storage
-                    .register_application(format!("list-app-{}", i), attr.clone())
+                    .register_application(
+                        "default".to_string(),
+                        format!("list-app-{}", i),
+                        attr.clone(),
+                    )
                     .await
                     .unwrap();
             }
 
-            let apps = storage.list_applications(None).await.unwrap();
+            let apps = storage
+                .list_applications(&crate::apis::ApplicationFilter::new("default"))
+                .await
+                .unwrap();
             assert_eq!(apps.len(), 3);
 
             let names: Vec<_> = apps.iter().map(|a| a.name.as_str()).collect();
@@ -336,24 +381,33 @@ mod tests {
         async fn filters_by_application_state() {
             let storage = storage::new_ptr(&test_context()).await.unwrap();
             storage
-                .register_application("enabled-app".to_string(), create_app_attr())
+                .register_application(
+                    "default".to_string(),
+                    "enabled-app".to_string(),
+                    create_app_attr(),
+                )
                 .await
                 .unwrap();
             storage
-                .register_application("disabled-app".to_string(), create_app_attr())
+                .register_application(
+                    "default".to_string(),
+                    "disabled-app".to_string(),
+                    create_app_attr(),
+                )
                 .await
                 .unwrap();
             storage
                 .update_application_state(
-                    "disabled-app".to_string(),
+                    "default",
+                    "disabled-app",
                     crate::apis::ApplicationState::Disabled,
                 )
                 .await
                 .unwrap();
 
-            let filter =
-                crate::apis::ApplicationFilter::by_state(crate::apis::ApplicationState::Disabled);
-            let apps = storage.list_applications(Some(&filter)).await.unwrap();
+            let filter = crate::apis::ApplicationFilter::new("default")
+                .by_state(crate::apis::ApplicationState::Disabled);
+            let apps = storage.list_applications(&filter).await.unwrap();
             assert_eq!(apps.len(), 1);
             assert_eq!(apps[0].name, "disabled-app");
         }

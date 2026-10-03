@@ -25,6 +25,7 @@ pub use types::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rpc::flame::v1 as rpc;
 
     #[test]
     fn test_resreq_from_string() {
@@ -77,52 +78,13 @@ mod tests {
         assert_eq!(attrs.shim, Shim::Host);
     }
 
-    mod validate_application_name {
-        use super::*;
-
-        #[test]
-        fn valid_names() {
-            assert!(validate_application_name("my-app").is_ok());
-            assert!(validate_application_name("my_app").is_ok());
-            assert!(validate_application_name("my.app").is_ok());
-            assert!(validate_application_name("myapp123").is_ok());
-            assert!(validate_application_name("MyApp").is_ok());
-            assert!(validate_application_name("a").is_ok());
-        }
-
-        #[test]
-        fn empty_name() {
-            assert!(validate_application_name("").is_err());
-        }
-
-        #[test]
-        fn path_traversal() {
-            assert!(validate_application_name("..").is_err());
-            assert!(validate_application_name("../etc").is_err());
-            assert!(validate_application_name("app/../../etc").is_err());
-            assert!(validate_application_name("app\\..\\etc").is_err());
-        }
-
-        #[test]
-        fn starts_with_dot_or_dash() {
-            assert!(validate_application_name(".hidden").is_err());
-            assert!(validate_application_name("-invalid").is_err());
-        }
-
-        #[test]
-        fn invalid_characters() {
-            assert!(validate_application_name("app name").is_err());
-            assert!(validate_application_name("app@name").is_err());
-            assert!(validate_application_name("app#name").is_err());
-            assert!(validate_application_name("app$name").is_err());
-        }
-
-        #[test]
-        fn too_long() {
-            let long_name = "a".repeat(254);
-            assert!(validate_application_name(&long_name).is_err());
-            let ok_name = "a".repeat(253);
-            assert!(validate_application_name(&ok_name).is_ok());
-        }
+    #[test]
+    fn numeric_task_name_is_decimal_text_in_rpc_metadata() {
+        let task = Task {
+            name: 10,
+            ..Default::default()
+        };
+        let rpc_task = rpc::Task::from(&task);
+        assert_eq!(rpc_task.metadata.unwrap().name, "10");
     }
 }

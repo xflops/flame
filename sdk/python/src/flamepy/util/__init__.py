@@ -17,7 +17,7 @@ import string
 
 def short_name(prefix: str, length: int = 6) -> str:
     """Generate a short name with a prefix."""
-    alphabet = string.ascii_letters + string.digits
+    alphabet = string.ascii_lowercase + string.digits
     sn = "".join(random.SystemRandom().choice(alphabet) for _ in range(length))
     return f"{prefix}-{sn}"
 

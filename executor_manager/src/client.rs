@@ -170,7 +170,7 @@ impl BackendClient {
 
     pub async fn release_node(&mut self, node: &Node) -> Result<(), FlameError> {
         let req = ReleaseNodeRequest {
-            node_name: node.name.clone(),
+            node: node.name.clone(),
         };
 
         self.client
@@ -183,7 +183,7 @@ impl BackendClient {
 
     pub async fn register_executor(&mut self, exe: &Executor) -> Result<(), FlameError> {
         let req = RegisterExecutorRequest {
-            executor_id: exe.id.clone(),
+            executor: exe.name.clone(),
             executor_spec: Some(rpc::ExecutorSpec {
                 resreq: Some(exe.resreq.clone().into()),
                 node: exe.node.clone(),
@@ -205,7 +205,7 @@ impl BackendClient {
         exe: &Executor,
     ) -> Result<Option<SessionContext>, FlameError> {
         let req = BindExecutorRequest {
-            executor_id: exe.id.clone(),
+            executor: exe.name.clone(),
         };
 
         let resp = self
@@ -231,7 +231,7 @@ impl BackendClient {
         attributes: Option<rpc::ExecutorAttributes>,
     ) -> Result<(), FlameError> {
         let req = BindExecutorCompletedRequest {
-            executor_id: exe.id.clone(),
+            executor: exe.name.clone(),
             result: result.map(rpc::Result::from),
             attributes,
         };
@@ -246,7 +246,7 @@ impl BackendClient {
 
     pub async fn unbind_executor(&mut self, exe: &Executor) -> Result<(), FlameError> {
         let req = UnbindExecutorRequest {
-            executor_id: exe.id.clone(),
+            executor: exe.name.clone(),
         };
 
         self.client
@@ -258,7 +258,7 @@ impl BackendClient {
 
     pub async fn unbind_executor_completed(&mut self, exe: &Executor) -> Result<(), FlameError> {
         let req = UnbindExecutorCompletedRequest {
-            executor_id: exe.id.clone(),
+            executor: exe.name.clone(),
         };
 
         self.client
@@ -271,7 +271,7 @@ impl BackendClient {
 
     pub async fn launch_task(&mut self, exe: &Executor) -> Result<Option<TaskContext>, FlameError> {
         let req = LaunchTaskRequest {
-            executor_id: exe.id.clone(),
+            executor: exe.name.clone(),
         };
 
         let resp = self
@@ -294,7 +294,7 @@ impl BackendClient {
         attributes: Option<rpc::ExecutorAttributes>,
     ) -> Result<(), FlameError> {
         let req = CompleteTaskRequest {
-            executor_id: exe.id.clone(),
+            executor: exe.name.clone(),
             task_result: Some(task_result.clone().try_into()?),
             attributes,
         };
@@ -309,7 +309,7 @@ impl BackendClient {
 
     pub async fn unregister_executor(&mut self, exe: &Executor) -> Result<(), FlameError> {
         let req = UnregisterExecutorRequest {
-            executor_id: exe.id.clone(),
+            executor: exe.name.clone(),
         };
 
         self.client

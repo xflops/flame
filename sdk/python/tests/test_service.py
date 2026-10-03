@@ -57,20 +57,20 @@ def test_dataclasses_fields_and_methods():
     assert app.working_directory == "/work"
     assert app.url == "http://example/"
 
-    sess = service.SessionContext(_common_data=b"ABC", session_id="sess-1", application=app)
-    assert sess.session_id == "sess-1"
+    sess = service.SessionContext(_common_data=b"ABC", session="sess-1", application=app)
+    assert sess.session == "sess-1"
     assert sess.application is app
     assert sess.common_data() == b"ABC"
 
-    task = service.TaskContext(task_id="task-1", session_id="sess-1", input=b"in")
-    assert task.task_id == "task-1"
-    assert task.session_id == "sess-1"
+    task = service.TaskContext(task="task-1", session="sess-1", input=b"in")
+    assert task.task == "task-1"
+    assert task.session == "sess-1"
     assert task.input == b"in"
 
 
 def test_session_context_round_trips_through_cloudpickle():
     app = service.ApplicationContext("my-app")
-    context = service.SessionContext(_common_data=b"ABC", session_id="sess-1", application=app)
+    context = service.SessionContext(_common_data=b"ABC", session="sess-1", application=app)
 
     restored = cloudpickle.loads(cloudpickle.dumps(context))
 
@@ -141,7 +141,7 @@ def test_concurrent_servicers_publish_to_their_own_instance():
 
     def invoke(index):
         responses[index] = servicers[index].OnTaskInvoke(
-            shim_pb2.TaskContext(task_id=f"task-{index}", session_id="session"),
+            shim_pb2.TaskContext(task=f"task-{index}", session="session"),
             DummyContext(),
         )
 
@@ -164,7 +164,7 @@ def test_direct_servicer_uses_one_loop_for_concurrent_calls():
 
         def on_task_invoke(self, context):
             barrier.wait(timeout=2)
-            return context.task_id.encode()
+            return context.task.encode()
 
         def on_session_leave(self):
             pass
@@ -174,7 +174,7 @@ def test_direct_servicer_uses_one_loop_for_concurrent_calls():
     responses = [None, None]
 
     def invoke(index):
-        responses[index] = servicer.OnTaskInvoke(shim_pb2.TaskContext(task_id=str(index), session_id="session"), DummyContext())
+        responses[index] = servicer.OnTaskInvoke(shim_pb2.TaskContext(task=str(index), session="session"), DummyContext())
 
     threads = [threading.Thread(target=invoke, args=(index,)) for index in range(2)]
     try:
@@ -196,7 +196,7 @@ def test_servicer_wraps_enter_and_task_publication():
             self.publish({b"prefix", b"block"})
 
         def on_task_invoke(self, context):
-            if context.task_id == "task-error":
+            if context.task == "task-error":
                 self.publish({b"error-key"})
                 raise RuntimeError("task failed")
             return None
@@ -206,10 +206,10 @@ def test_servicer_wraps_enter_and_task_publication():
 
     servicer = service.FlameInstanceServicer(PublishingService())
     enter_request = shim_pb2.SessionContext(
-        session_id="session-1",
+        session="session-1",
         application=shim_pb2.ApplicationContext(name="application-1"),
     )
-    task_request = shim_pb2.TaskContext(task_id="task-1", session_id="session-2")
+    task_request = shim_pb2.TaskContext(task="task-1", session="session-2")
 
     enter_response = servicer.OnSessionEnter(enter_request, DummyContext())
     assert set(enter_response.attributes.attr) == {b"entered", b"prefix", b"block"}
@@ -223,7 +223,7 @@ def test_servicer_wraps_enter_and_task_publication():
     assert list(next_response.attributes.attr) == []
 
     failed_response = servicer.OnTaskInvoke(
-        shim_pb2.TaskContext(task_id="task-error", session_id="session-2"),
+        shim_pb2.TaskContext(task="task-error", session="session-2"),
         DummyContext(),
     )
     assert failed_response.task_result.return_code == -1
@@ -233,7 +233,7 @@ def test_servicer_wraps_enter_and_task_publication():
 def test_failed_session_enter_does_not_leak_publication():
     class FailFirstEnterService(service.FlameService):
         def on_session_enter(self, context):
-            if context.session_id == "failed-session":
+            if context.session == "failed-session":
                 self.publish({b"failed-enter-key"})
                 raise RuntimeError("session enter failed")
 
@@ -245,9 +245,9 @@ def test_failed_session_enter_does_not_leak_publication():
 
     servicer = service.FlameInstanceServicer(FailFirstEnterService())
 
-    def request(session_id):
+    def request(session):
         return shim_pb2.SessionContext(
-            session_id=session_id,
+            session=session,
             application=shim_pb2.ApplicationContext(name="application-1"),
         )
 
@@ -328,6 +328,7 @@ def test_flame_service_abstract_minimal_implementation():
     class MockAppCtx:
         def __init__(self):
             self.name = "app"
+            self.workspace = "default"
             self.image = "img"
             self.command = "cmd"
             self.working_directory = "/work"
@@ -338,7 +339,8 @@ def test_flame_service_abstract_minimal_implementation():
 
     class MockSessionEnterRequest:
         def __init__(self):
-            self.session_id = "sess-123"
+            self.session = "sess-123"
+            self.workspace = "default"
             self.application = MockAppCtx()
             self.common_data = b"C"
             self.tokens = {"service": "credential"}
@@ -352,14 +354,15 @@ def test_flame_service_abstract_minimal_implementation():
     resp = servicer.OnSessionEnter(req, DummyContext())
     assert resp.result.return_code == 0
     # Verify service received a SessionContext with the right fields
-    assert svc.called["enter"].session_id == "sess-123"
+    assert svc.called["enter"].session == "sess-123"
     assert svc.called["enter"].tokens == {"service": "credential"}
 
     # OnTaskInvoke path
     class MockTaskRequest:
         def __init__(self):
-            self.task_id = "t1"
-            self.session_id = "sess-123"
+            self.task = "t1"
+            self.session = "sess-123"
+            self.workspace = "default"
             self.input = b"in"
 
         def HasField(self, field):  # noqa: N802
@@ -369,7 +372,7 @@ def test_flame_service_abstract_minimal_implementation():
     resp2 = servicer.OnTaskInvoke(req2, DummyContext())
     assert resp2.task_result.return_code == 0
     assert resp2.task_result.output == b"OUT"
-    assert svc.called["invoke"].task_id == "t1"
+    assert svc.called["invoke"].task == "t1"
 
     # OnSessionLeave path
     resp3 = servicer.OnSessionLeave(None, DummyContext())
@@ -394,6 +397,7 @@ def test_on_session_enter_exception_path_returns_error():  # noqa: N802
     class MockAppCtx:
         def __init__(self):
             self.name = "app"
+            self.workspace = "default"
             self.image = "img"
 
         def HasField(self, field):  # noqa: N802
@@ -401,7 +405,8 @@ def test_on_session_enter_exception_path_returns_error():  # noqa: N802
 
     class MockSessionEnterRequest:
         def __init__(self):
-            self.session_id = "sess-1"
+            self.session = "sess-1"
+            self.workspace = "default"
             self.application = MockAppCtx()
             self.common_data = None
             self.tokens = {}
@@ -430,8 +435,9 @@ def test_on_task_invoke_exception_path():  # noqa: N802
 
     class MockTaskRequest:
         def __init__(self):
-            self.task_id = "tid"
-            self.session_id = "sess"
+            self.task = "tid"
+            self.session = "sess"
+            self.workspace = "default"
             self.input = b"in"
 
         def HasField(self, field):  # noqa: N802
@@ -465,6 +471,7 @@ def test_service_preserves_empty_optional_bytes():  # noqa: N802
 
     class MockAppCtx:
         name = "app"
+        workspace = "default"
         image = None
         command = None
         working_directory = None
@@ -474,7 +481,8 @@ def test_service_preserves_empty_optional_bytes():  # noqa: N802
             return False
 
     class MockSessionEnterRequest:
-        session_id = "sess"
+        session = "sess"
+        workspace = "default"
         application = MockAppCtx()
         common_data = b""
         tokens = {}
@@ -483,8 +491,9 @@ def test_service_preserves_empty_optional_bytes():  # noqa: N802
             return field == "common_data"
 
     class MockTaskRequest:
-        task_id = "task"
-        session_id = "sess"
+        task = "task"
+        session = "sess"
+        workspace = "default"
         input = b""
 
         def HasField(self, field):  # noqa: N802
@@ -597,17 +606,17 @@ def test_cloudpickle_serialization_of_callable():
 
 class TestSessionInitialization:
     def test_session_requires_name_or_session_id(self):
-        with pytest.raises(ValueError, match="Either 'name' or 'session_id' must be provided"):
+        with pytest.raises(ValueError, match="Either 'name' or 'session' must be provided"):
             open_session()
 
     def test_session_rejects_both_name_and_session_id(self):
         with pytest.raises(ValueError, match="Cannot provide both"):
-            open_session(name="myapp", session_id="sess-1")
+            open_session(name="myapp", session="sess-1")
 
     def test_session_with_session_id_opens_existing(self, monkeypatch):
         fake_session = FakeSession()
-        monkeypatch.setattr(serving_client, "open_core_session", lambda session_id: fake_session)
-        session = open_session(session_id="sess-1")
+        monkeypatch.setattr(serving_client, "open_core_session", lambda session: fake_session)
+        session = open_session(session="sess-1")
         assert session._name == "myapp"
         assert session._session is fake_session
 
@@ -838,7 +847,7 @@ def test_on_session_enter_decodes_object_ref(instance, monkeypatch):
     app_ctx = ApplicationContext(name="test-app")
     session_ctx = SessionContext(
         _common_data=b"encoded-ref",
-        session_id="sess-1",
+        session="sess-1",
         application=app_ctx,
     )
 
@@ -851,7 +860,7 @@ def test_on_session_enter_handles_none_common_data(instance):
     app_ctx = ApplicationContext(name="test-app")
     session_ctx = SessionContext(
         _common_data=None,
-        session_id="sess-1",
+        session="sess-1",
         application=app_ctx,
     )
 
@@ -878,8 +887,8 @@ def test_on_task_invoke_calls_entrypoint(instance, monkeypatch):
     )
 
     task_ctx = TaskContext(
-        task_id="task-1",
-        session_id="sess-1",
+        task="task-1",
+        session="sess-1",
         input=b"serialized-input",
     )
 
@@ -900,8 +909,8 @@ def test_on_task_invoke_with_none_input(instance, monkeypatch):
         return None
 
     task_ctx = TaskContext(
-        task_id="task-1",
-        session_id="sess-1",
+        task="task-1",
+        session="sess-1",
         input=None,
     )
 
@@ -914,8 +923,8 @@ def test_on_task_invoke_with_none_input(instance, monkeypatch):
 def test_on_task_invoke_without_entrypoint(instance):
     """Test on_task_invoke returns None when no entrypoint is registered."""
     task_ctx = TaskContext(
-        task_id="task-1",
-        session_id="sess-1",
+        task="task-1",
+        session="sess-1",
         input=b"data",
     )
 
@@ -940,8 +949,8 @@ def test_on_task_invoke_with_zero_param_entrypoint(instance, monkeypatch):
     )
 
     task_ctx = TaskContext(
-        task_id="task-1",
-        session_id="sess-1",
+        task="task-1",
+        session="sess-1",
         input=b"ignored",
     )
 

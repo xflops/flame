@@ -232,7 +232,7 @@ class TestCacheStorage:
         test_file.write_bytes(b"package content")
 
         def mock_upload_object(key, file_path, endpoint=None):
-            assert key == "myapp/pkg/myapp-1.0.0.tar.gz"
+            assert key == "default/myapp/pkg/myapp-1.0.0.tar.gz"
             assert endpoint == "grpc://host:9090"
             return ObjectRef(endpoint="grpc://host:9090", key=key, version=1)
 
@@ -241,7 +241,7 @@ class TestCacheStorage:
         storage = CacheStorage("grpc://host:9090", app_name="myapp")
         url = storage.upload(str(test_file), "myapp-1.0.0.tar.gz")
 
-        assert url == "grpc://host:9090/myapp/pkg/myapp-1.0.0.tar.gz"
+        assert url == "grpc://host:9090/default/myapp/pkg/myapp-1.0.0.tar.gz"
 
     def test_upload_preserves_returned_cache_endpoint(self, monkeypatch, tmp_path):
         from flamepy.core.cache import ObjectRef
@@ -258,7 +258,7 @@ class TestCacheStorage:
         storage = CacheStorage("grpcs-proxy://gateway.example:443", app_name="myapp")
         url = storage.upload(str(test_file), "myapp-1.0.0.tar.gz")
 
-        assert url == "grpc://10.0.0.42:9090/myapp/pkg/myapp-1.0.0.tar.gz"
+        assert url == "grpc://10.0.0.42:9090/default/myapp/pkg/myapp-1.0.0.tar.gz"
 
     def test_upload_converts_flight_tls_scheme_for_package_url(self, monkeypatch, tmp_path):
         from flamepy.core.cache import ObjectRef
@@ -275,13 +275,13 @@ class TestCacheStorage:
         storage = CacheStorage("grpcs://cache-service:9090", app_name="myapp")
         url = storage.upload(str(test_file), "myapp-1.0.0.tar.gz")
 
-        assert url == "grpcs://10.0.0.42:9090/myapp/pkg/myapp-1.0.0.tar.gz"
+        assert url == "grpcs://10.0.0.42:9090/default/myapp/pkg/myapp-1.0.0.tar.gz"
 
     def test_download(self, monkeypatch, tmp_path):
         dest_file = tmp_path / "downloaded.tar.gz"
 
         def mock_download_object(ref, dest_path):
-            assert ref.key == "myapp/pkg/myapp-1.0.0.tar.gz"
+            assert ref.key == "default/myapp/pkg/myapp-1.0.0.tar.gz"
             with open(dest_path, "wb") as f:
                 f.write(b"downloaded content")
 
@@ -305,7 +305,7 @@ class TestCacheStorage:
         storage = CacheStorage("grpc://host:9090", app_name="myapp")
         storage.delete("myapp-1.0.0.tar.gz")
 
-        assert deleted_key == "myapp/pkg/myapp-1.0.0.tar.gz"
+        assert deleted_key == "default/myapp/pkg/myapp-1.0.0.tar.gz"
 
     def test_upload_requires_app_name(self, tmp_path):
         import pytest
@@ -672,9 +672,12 @@ def test_service_proxy_captured_by_service_reopens_existing_session(monkeypatch)
         serialized_contexts.append(serialized)
         return MagicMock(key="context", version=1, encode=MagicMock(return_value=b"context"))
 
-    fn_a_session = MagicMock(id="fn-a-session")
-    fn_b_session = MagicMock(id="fn-b-session")
-    reopened_fn_a_session = MagicMock(id="fn-a-session")
+    fn_a_session = MagicMock(id="00000000-0000-4000-8000-000000000001")
+    fn_a_session.name = "fn-a-session"
+    fn_b_session = MagicMock(id="00000000-0000-4000-8000-000000000002")
+    fn_b_session.name = "fn-b-session"
+    reopened_fn_a_session = MagicMock(id="00000000-0000-4000-8000-000000000001")
+    fn_a_session.name = "fn-a-session"
     nested_future = Future()
     nested_future.set_result(b"result")
     reopened_fn_a_session.submit.return_value = nested_future
@@ -695,7 +698,7 @@ def test_service_proxy_captured_by_service_reopens_existing_session(monkeypatch)
     result = restored_context.execution_object(3)
 
     assert isinstance(result, ObjectFuture)
-    open_session.assert_called_with(session_id="fn-a-session")
+    open_session.assert_called_with(session="fn-a-session")
     reopened_fn_a_session.submit.assert_called_once()
     captured_proxy = restored_context.execution_object.__closure__[0].cell_contents
     assert isinstance(captured_proxy._session_owner, _NoopSessionOwner)
@@ -778,7 +781,7 @@ def test_recursive_service_declaration_reuses_context_without_init(monkeypatch):
     assert recursive_service._session_context is session_context
     assert "_session_context" not in recursive_service._execution_object.__dict__
     put_context.assert_not_called()
-    open_session.assert_called_once_with(session_id="recursive-session")
+    open_session.assert_called_once_with(session="recursive-session")
     recursive_service.invoke()
     session.submit.assert_called_once()
     recursive_service.close()
@@ -810,7 +813,7 @@ def test_recursive_service_declaration_prefers_invocation_context(monkeypatch):
         recursive_service = RecursiveService.remote()
 
     runtime.service.assert_not_called()
-    open_session.assert_called_once_with(session_id="recursive-session")
+    open_session.assert_called_once_with(session="recursive-session")
     assert recursive_service._session_context is session_context
     recursive_service.close()
     session.close.assert_not_called()
@@ -867,7 +870,7 @@ def test_recursive_service_declaration_requires_existing_session(monkeypatch):
             recursive_service.remote()
 
     put_context.assert_not_called()
-    open_session.assert_called_once_with(session_id="missing-session")
+    open_session.assert_called_once_with(session="missing-session")
 
 
 def test_objectfuture_ref_returns_inline_valueref():
@@ -884,7 +887,7 @@ def test_service_response_requires_a_supported_ref():
     from flamepy.core import ObjectRef
 
     assert ServiceResponse(ValueRef(None)).result == ValueRef(None)
-    cached = ObjectRef(endpoint="grpc://host:9090", key="app/session/value", version=1)
+    cached = ObjectRef(endpoint="grpc://host:9090", key="default/app/session/value", version=1)
     assert ServiceResponse(cached).result == cached
     with pytest.raises(TypeError, match="ValueRef or ObjectRef"):
         ServiceResponse("raw value")
@@ -901,7 +904,7 @@ def test_objectfuture_ref_returns_explicit_objectref():
     from flamepy.app import ObjectFuture
     from flamepy.core import ObjectRef
 
-    reference = ObjectRef(endpoint="grpc://host:9090", key="app/session/value", version=1)
+    reference = ObjectRef(endpoint="grpc://host:9090", key="default/app/session/value", version=1)
     future = Future()
     future.set_result(cloudpickle.dumps(ServiceResponse(reference)))
 
@@ -916,7 +919,7 @@ def test_objectfuture_get_cached_none_and_chains_reference_without_client_fetch(
     from flamepy.app import ObjectFuture, ServiceInstance
     from flamepy.core import ObjectRef
 
-    reference = ObjectRef(endpoint="grpc://host:9090", key="app/session/value", version=1)
+    reference = ObjectRef(endpoint="grpc://host:9090", key="default/app/session/value", version=1)
     future = Future()
     future.set_result(cloudpickle.dumps(ServiceResponse(reference)))
     result = ObjectFuture(future)
@@ -986,7 +989,7 @@ def test_app_get_mixed_value_and_object_references():
 
     inline = Future()
     inline.set_result(cloudpickle.dumps(ServiceResponse(ValueRef("inline"))))
-    reference = ObjectRef(endpoint="grpc://host:9090", key="app/session/value", version=1)
+    reference = ObjectRef(endpoint="grpc://host:9090", key="default/app/session/value", version=1)
     cached = Future()
     cached.set_result(cloudpickle.dumps(ServiceResponse(reference)))
 
@@ -1010,7 +1013,7 @@ def test_get_data_reads_inline_none_and_cached_request():
         "result": None,
         "metadata": {},
     }
-    ref = ObjectRef(endpoint="grpc://host:9090", key="app/session/request", version=1)
+    ref = ObjectRef(endpoint="grpc://host:9090", key="default/app/session/request", version=1)
     request = ServiceRequest(args=(b"payload",))
     with patch("flamepy.app.helper.get_object", return_value=cloudpickle.dumps(request)) as get:
         value = get_data(ref.encode())
@@ -1506,7 +1509,7 @@ def test_app_service_instance_generates_session_id(monkeypatch):
     instance = ServiceInstance("pi-example", lambda: None)
 
     spec = open_session_mock.call_args.kwargs["spec"]
-    assert spec.id.startswith("pi-example-")
+    assert spec.name.startswith("pi-example-")
     assert isinstance(instance._session_owner, _ServiceSessionOwner)
 
 
@@ -1527,7 +1530,7 @@ def test_app_service_instance_ignores_execution_object_session_context(monkeypat
 
     instance = ServiceInstance("pi-example", service)
 
-    assert open_session_mock.call_args.kwargs["session_id"].startswith("pi-example-")
+    assert open_session_mock.call_args.kwargs["session"].startswith("pi-example-")
     assert isinstance(instance._session_owner, _ServiceSessionOwner)
     instance.close()
     instance._session.close.assert_called_once_with()
@@ -2087,7 +2090,7 @@ def test_app_service_serializes_by_value_under_process_wide_lock(monkeypatch):
     )
     monkeypatch.setattr(
         "flamepy.app.client.core_client.open_session",
-        lambda **kwargs: MagicMock(id=kwargs["session_id"]),
+        lambda **kwargs: MagicMock(id=kwargs["session"]),
     )
 
     def declare_service():
@@ -2120,7 +2123,7 @@ async def test_runpy_resolves_object_ref_to_cached_none():
     from flamepy.core.cache import ObjectRef
 
     svc = FlameRunpyService()
-    ref = ObjectRef(endpoint="grpc://host:9090", key="app/session/object", version=1)
+    ref = ObjectRef(endpoint="grpc://host:9090", key="default/app/session/object", version=1)
 
     with patch("flamepy.app.runpy.aio_core.get_object", return_value=None):
         args, kwargs = await svc._resolve_object_refs((ref,), {"value": ref})
@@ -2138,7 +2141,7 @@ async def test_runpy_binds_session_context_and_publishes_invocation_attributes()
         def run(self):
             app.publish_attributes({b"b"})
             app.publish_attributes({b"c"})
-            return app.session_context().session_id
+            return app.session_context().session
 
     svc = FlameRunpyService()
 
@@ -2191,8 +2194,8 @@ async def test_runpy_keeps_concurrent_invocation_attributes_with_their_response(
     async def invoke(index):
         attribute = f"invocation-{index}".encode()
         request = shim_pb2.TaskContext(
-            task_id=f"task-{index}",
-            session_id="session",
+            task=f"task-{index}",
+            session="session",
             input=cloudpickle.dumps(ServiceRequest(method="run", args=(attribute,))),
         )
         return await servicer.OnTaskInvoke(request, MagicMock())
@@ -2253,7 +2256,7 @@ async def test_runpy_binds_recursive_service_to_current_session(monkeypatch):
     assert captured["proxy"]._session_context is session_context
     assert "_session_context" not in captured["execution_object"].__dict__
     put_context.assert_not_called()
-    open_session.assert_called_once_with(session_id="recursive-session")
+    open_session.assert_called_once_with(session="recursive-session")
     with pytest.raises(RuntimeError, match="not running in a Flame invocation"):
         app.session_context()
 
@@ -2319,7 +2322,7 @@ async def test_app_runtime_helpers_are_invocation_scoped():
         def run(self):
             app.publish_attributes({b"initial"})
             app.publish_attributes({b"initial", b"next"})
-            return app.session_context().session_id
+            return app.session_context().session
 
         def invalid(self):
             app.publish_attributes({"invalid"})
@@ -2464,7 +2467,7 @@ def test_app_ref_returns_objectrefs():
     f2 = Future()
     from flamepy.core import ObjectRef
 
-    refs = [ObjectRef(endpoint="grpc://host:9090", key=f"app/session/{index}", version=1) for index in range(2)]
+    refs = [ObjectRef(endpoint="grpc://host:9090", key=f"default/app/session/{index}", version=1) for index in range(2)]
     f1.set_result(cloudpickle.dumps(ServiceResponse(refs[0])))
     f2.set_result(cloudpickle.dumps(ServiceResponse(refs[1])))
     assert app.ref([ObjectFuture(f1), ObjectFuture(f2)]) == refs

@@ -136,6 +136,7 @@ class FlameInstanceServicer(InstanceServicer):
             app = request.application
             app_context = ApplicationContext(
                 name=app.name,
+                workspace=app.workspace,
                 image=app.image if app.HasField("image") else None,
                 command=app.command if app.HasField("command") else None,
                 working_directory=app.working_directory if app.HasField("working_directory") else None,
@@ -143,8 +144,9 @@ class FlameInstanceServicer(InstanceServicer):
             )
             session_context = SessionContext(
                 _common_data=request.common_data if request.HasField("common_data") else None,
-                session_id=request.session_id,
+                session=request.session,
                 application=app_context,
+                workspace=request.workspace,
                 tokens=dict(request.tokens),
             )
             async with self._binding_lock:
@@ -156,9 +158,10 @@ class FlameInstanceServicer(InstanceServicer):
 
     async def OnTaskInvoke(self, request, context):  # noqa: N802
         task_context = TaskContext(
-            task_id=request.task_id,
-            session_id=request.session_id,
+            task=request.task,
+            session=request.session,
             input=request.input if request.HasField("input") else None,
+            workspace=request.workspace,
         )
         if self._active_tasks >= self._max_inflight:
             return OnTaskInvokeResponse(task_result=TaskResultProto(return_code=-1, message="too many concurrent task invocations"))

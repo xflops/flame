@@ -22,7 +22,8 @@ pub async fn run(ctx: &FlameContext, session_id: &str) -> Result<(), Box<dyn Err
         &current_ctx.cluster.endpoint,
         current_ctx.cluster.tls.as_ref(),
     )
-    .await?;
+    .await?
+    .with_workspace(current_ctx.workspace.clone());
 
     conn.close_session(session_id).await?;
 

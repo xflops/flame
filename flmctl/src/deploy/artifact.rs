@@ -54,9 +54,10 @@ pub struct PreparedApplication {
 }
 
 impl PreparedApplication {
-    pub fn object_key(&self, app_name: &str) -> String {
+    pub fn object_key(&self, workspace: &str, app_name: &str) -> String {
         format!(
-            "{}/pkg/{}-{}.tar.gz",
+            "{}/{}/pkg/{}-{}.tar.gz",
+            workspace,
             app_name,
             app_name,
             &self.sha256[..16]
@@ -544,8 +545,8 @@ mod tests {
         assert!(prepared.detection_root.join("bin/service").exists());
         assert_eq!(prepared.package_path.file_name().unwrap(), "service.tar.gz");
         assert_eq!(
-            prepared.object_key("demo"),
-            format!("demo/pkg/demo-{}.tar.gz", &prepared.sha256[..16])
+            prepared.object_key("default", "demo"),
+            format!("default/demo/pkg/demo-{}.tar.gz", &prepared.sha256[..16])
         );
         assert_eq!(prepared.sha256.len(), 64);
     }
@@ -639,8 +640,8 @@ mod tests {
         assert_eq!(contents, "print('hello')\n");
         assert!(entries.next().is_none());
         assert_eq!(
-            prepared.object_key("demo"),
-            format!("demo/pkg/demo-{}.tar.gz", &prepared.sha256[..16])
+            prepared.object_key("default", "demo"),
+            format!("default/demo/pkg/demo-{}.tar.gz", &prepared.sha256[..16])
         );
     }
 

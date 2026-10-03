@@ -11,7 +11,7 @@ def main():
         result = ssn.run_code("print(1 + 2)")
         print(result.text())
 
-        other = open_session(ssn_id=ssn.id)
+        other = open_session(session=ssn.name)
         print(other.run_code("print('ready')").text())
 
     with open_session(language="shell", runtime="bash") as ssn:

@@ -76,7 +76,7 @@ def _remote_get(ref: ObjectRef, client_version: int):
 
 def test_cache_put_and_get():
     """Test basic put and get operations."""
-    key_prefix = "test-app/test-session-001"
+    key_prefix = "default/test-app/test-session-001"
     test_data = {"message": "Hello, Flame!", "value": 42}
 
     ref = put_object(key_prefix, test_data)
@@ -93,7 +93,7 @@ def test_cache_put_and_get():
 
 def test_cache_cloudpickle_object_and_patch_remain_raw():
     """Arbitrary Python objects remain uncompressed, including their patches."""
-    key_prefix = f"test-app/test-cloudpickle-{uuid.uuid4().hex[:8]}"
+    key_prefix = f"default/test-app/test-cloudpickle-{uuid.uuid4().hex[:8]}"
     base = {"text": "repeat-me" * 2000}
     delta = {"text": "another-repeat" * 2000}
 
@@ -108,7 +108,7 @@ def test_cache_cloudpickle_object_and_patch_remain_raw():
 
 def test_cache_zstd_arrow_table():
     """The Python SDK compresses Arrow data and tags the stored type."""
-    key_prefix = f"test-app/test-zstd-arrow-{uuid.uuid4().hex[:8]}"
+    key_prefix = f"default/test-app/test-zstd-arrow-{uuid.uuid4().hex[:8]}"
     table = pa.table({"item": ["repeat-me"] * 1000})
 
     ref = put_object(key_prefix, table)
@@ -120,7 +120,7 @@ def test_cache_zstd_arrow_table():
 
 def test_cache_put_and_get_native_arrow_table():
     """Test that Arrow tables round-trip through the object cache."""
-    key_prefix = f"test-app/test-native-arrow-{uuid.uuid4().hex[:8]}"
+    key_prefix = f"default/test-app/test-native-arrow-{uuid.uuid4().hex[:8]}"
     table = pa.table({"col1": [1, 2, 3], "col2": ["a", "b", "c"]})
 
     ref = put_object(key_prefix, table)
@@ -135,7 +135,7 @@ def test_cache_put_and_get_native_arrow_table():
 
 def test_cache_native_arrow_table_update():
     """Test that Arrow table updates rewrite the base object."""
-    key_prefix = f"test-app/test-native-arrow-update-{uuid.uuid4().hex[:8]}"
+    key_prefix = f"default/test-app/test-native-arrow-update-{uuid.uuid4().hex[:8]}"
     table = pa.table({"value": [1, 2, 3]})
     updated = pa.table({"value": [4, 5], "label": ["x", "y"]})
 
@@ -152,7 +152,7 @@ def test_cache_native_arrow_table_update():
 
 def test_cache_update():
     """Test update operation."""
-    key_prefix = "test-app/test-session-002"
+    key_prefix = "default/test-app/test-session-002"
     original_data = {"count": 0}
     updated_data = {"count": 1}
 
@@ -168,7 +168,7 @@ def test_cache_update():
 
 def test_cache_with_complex_objects():
     """Test caching complex Python objects."""
-    key_prefix = "test-app/test-session-003"
+    key_prefix = "default/test-app/test-session-003"
 
     class ComplexObject:
         def __init__(self, name, data):
@@ -232,7 +232,7 @@ def _cached_object(ref: ObjectRef):
 
 def test_patch_single_delta():
     """Test patching an object with a single delta."""
-    key_prefix = "test-app/test-patch-001"
+    key_prefix = "default/test-app/test-patch-001"
     base_data = {"logs": []}
     delta_data = {"worker": 1, "log": "started"}
 
@@ -251,7 +251,7 @@ def test_patch_single_delta():
 
 def test_patch_multiple_deltas():
     """Test patching an object with multiple deltas."""
-    key_prefix = "test-app/test-patch-002"
+    key_prefix = "default/test-app/test-patch-002"
     base_data = {"results": []}
 
     ref = put_object(key_prefix, base_data)
@@ -275,7 +275,7 @@ def test_patch_multiple_deltas():
 
 def test_incremental_get_applies_remote_patch_only_response():
     """Test a cached client applies only patches appended by another client."""
-    key_prefix = f"test-app/test-incremental-patch-{uuid.uuid4().hex[:8]}"
+    key_prefix = f"default/test-app/test-incremental-patch-{uuid.uuid4().hex[:8]}"
     base_data = {"items": ["base"]}
     delta_data_1 = {"items": ["patch-1"]}
     delta_data_2 = {"items": ["patch-2"]}
@@ -312,7 +312,7 @@ def test_incremental_get_applies_remote_patch_only_response():
 
 def test_version_zero_forces_full_response_with_cached_object():
     """Test version=0 gets the full base plus patches even with a local cache."""
-    key_prefix = f"test-app/test-incremental-full-{uuid.uuid4().hex[:8]}"
+    key_prefix = f"default/test-app/test-incremental-full-{uuid.uuid4().hex[:8]}"
     base_data = {"items": ["base"]}
     delta_data = {"items": ["patch-1"]}
 
@@ -332,7 +332,7 @@ def test_version_zero_forces_full_response_with_cached_object():
 
 def test_incremental_get_falls_back_to_full_after_remote_update():
     """Test stale cached base is replaced by a full response after update."""
-    key_prefix = f"test-app/test-incremental-update-{uuid.uuid4().hex[:8]}"
+    key_prefix = f"default/test-app/test-incremental-update-{uuid.uuid4().hex[:8]}"
     base_data = {"version": 1}
     updated_data = {"version": 2}
 
@@ -356,7 +356,7 @@ def test_incremental_get_falls_back_to_full_after_remote_update():
 
 def test_patch_preserves_delta_order():
     """Test that deltas are returned in the order they were appended."""
-    key_prefix = "test-app/test-patch-003"
+    key_prefix = "default/test-app/test-patch-003"
     base_data = {"sequence": "start"}
 
     ref = put_object(key_prefix, base_data)
@@ -375,7 +375,7 @@ def test_patch_preserves_delta_order():
 
 def test_patch_with_complex_delta():
     """Test patching with complex Python objects as deltas."""
-    key_prefix = "test-app/test-patch-004"
+    key_prefix = "default/test-app/test-patch-004"
 
     class LogEntry:
         def __init__(self, level, message):
@@ -407,7 +407,7 @@ def test_patch_with_complex_delta():
 
 def test_update_clears_deltas():
     """Test that update operation clears all existing deltas."""
-    key_prefix = "test-app/test-patch-005"
+    key_prefix = "default/test-app/test-patch-005"
     base_data = {"version": 1}
 
     ref = put_object(key_prefix, base_data)
@@ -429,7 +429,7 @@ def test_update_clears_deltas():
 
 def test_put_clears_deltas():
     """Test that put operation on same key clears existing deltas."""
-    key_prefix = "test-app/test-patch-006"
+    key_prefix = "default/test-app/test-patch-006"
     base_data = {"initial": True}
 
     ref = put_object(key_prefix, base_data)
@@ -452,7 +452,7 @@ def test_patch_nonexistent_object():
     cache_config = ctx.cache
     cache_endpoint = cache_config.get("endpoint") if isinstance(cache_config, dict) else cache_config
 
-    fake_ref = ObjectRef(endpoint=cache_endpoint, key="test-app/nonexistent-session/nonexistent-object", version=0)
+    fake_ref = ObjectRef(endpoint=cache_endpoint, key="default/test-app/nonexistent-session/nonexistent-object", version=0)
 
     with pytest.raises(Exception):
         patch_object(fake_ref, {"delta": "data"})
@@ -460,7 +460,7 @@ def test_patch_nonexistent_object():
 
 def test_patch_with_nested_data():
     """Test patching with deeply nested data structures."""
-    key_prefix = "test-app/test-patch-007"
+    key_prefix = "default/test-app/test-patch-007"
     base_data = {"root": {"level1": {"level2": []}}}
 
     ref = put_object(key_prefix, base_data)
@@ -476,7 +476,7 @@ def test_patch_with_nested_data():
 
 def test_patch_with_binary_data():
     """Test patching with binary data."""
-    key_prefix = "test-app/test-patch-008"
+    key_prefix = "default/test-app/test-patch-008"
     base_data = {"type": "binary_container"}
 
     ref = put_object(key_prefix, base_data)
@@ -492,7 +492,7 @@ def test_patch_with_binary_data():
 
 def test_patch_with_none_values():
     """Test patching with None values in data."""
-    key_prefix = "test-app/test-patch-009"
+    key_prefix = "default/test-app/test-patch-009"
     base_data = {"value": None}
 
     ref = put_object(key_prefix, base_data)
@@ -508,7 +508,7 @@ def test_patch_with_none_values():
 
 def test_patch_large_number_of_deltas():
     """Test patching with a large number of deltas."""
-    key_prefix = "test-app/test-patch-010"
+    key_prefix = "default/test-app/test-patch-010"
     base_data = {"counter": 0}
 
     ref = put_object(key_prefix, base_data)
@@ -549,8 +549,8 @@ TEST_SESSION_PREFIX = "cache-pressure-test-ssn"
 
 
 def generate_session_id() -> str:
-    """Generate a unique key prefix in <app>/<ssn> format for testing."""
-    return f"{TEST_APP}/{TEST_SESSION_PREFIX}-{uuid.uuid4().hex[:8]}"
+    """Generate a unique key prefix in <workspace>/<app>/<ssn> format for testing."""
+    return f"default/{TEST_APP}/{TEST_SESSION_PREFIX}-{uuid.uuid4().hex[:8]}"
 
 
 def create_large_object(size_kb: int) -> dict:

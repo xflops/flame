@@ -16,11 +16,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::{types::Json, FromRow};
 use std::collections::{HashMap, HashSet};
 
+use crate::apis::Event;
 use crate::apis::{
     Application, ApplicationSchema, ApplicationState, ExecutorState, Node, NodeInfo, NodeState,
-    ResourceRequirement, Session, SessionStatus, Shim, Task,
+    ResourceRequirement, Session, SessionStatus, Shim, Task, TaskName,
 };
-use crate::apis::{ApplicationID, Event, ExecutorID, SessionID, TaskID};
 use crate::FlameError;
 use bytes::Bytes;
 
@@ -44,7 +44,9 @@ pub struct AppSchemaDao {
 
 #[derive(Clone, FromRow, Debug)]
 pub struct ApplicationDao {
-    pub name: ApplicationID,
+    pub id: String,
+    pub workspace: String,
+    pub name: String,
     pub version: u32,
     pub shim: i32,
     pub image: Option<String>,
@@ -65,7 +67,9 @@ pub struct ApplicationDao {
 
 #[derive(Clone, FromRow, Debug)]
 pub struct SessionDao {
-    pub id: SessionID,
+    pub id: String,
+    pub workspace: String,
+    pub name: String,
     pub application: String,
     pub version: u32,
 
@@ -87,8 +91,10 @@ pub struct SessionDao {
 
 #[derive(Clone, FromRow, Debug)]
 pub struct TaskDao {
-    pub id: TaskID,
-    pub ssn_id: SessionID,
+    pub id: String,
+    pub workspace: String,
+    pub session: String,
+    pub name: String,
     pub version: u32,
     pub input: Option<Vec<u8>>,
     pub output: Option<Vec<u8>>,
@@ -102,6 +108,7 @@ pub struct TaskDao {
 
 #[derive(Clone, FromRow, Debug)]
 pub struct NodeDao {
+    pub id: String,
     pub name: String,
     pub state: i32,
 
@@ -122,7 +129,9 @@ pub struct NodeDao {
 
 #[derive(Clone, FromRow, Debug)]
 pub struct ExecutorDao {
-    pub id: ExecutorID,
+    pub id: String,
+    pub workspace: String,
+    pub name: String,
     pub node: String,
     pub application: String,
 
@@ -132,8 +141,8 @@ pub struct ExecutorDao {
 
     pub shim: i32,
 
-    pub task_id: Option<TaskID>,
-    pub ssn_id: Option<SessionID>,
+    pub task: Option<String>,
+    pub session: Option<String>,
 
     pub creation_time: i64,
     pub state: i32,
@@ -154,6 +163,8 @@ impl TryFrom<&SessionDao> for Session {
 
         Ok(Self {
             id: ssn.id.clone(),
+            workspace: ssn.workspace.clone(),
+            name: ssn.name.clone(),
             application: ssn.application.clone(),
             version: ssn.version,
             common_data: ssn.common_data.clone().map(Bytes::from),
@@ -196,9 +207,21 @@ impl TryFrom<&TaskDao> for Task {
     type Error = FlameError;
 
     fn try_from(task: &TaskDao) -> Result<Self, Self::Error> {
+        let name = task
+            .name
+            .parse::<TaskName>()
+            .map_err(|e| FlameError::Storage(format!("invalid task name {}: {e}", task.name)))?;
+        if name == 0 || name.to_string() != task.name {
+            return Err(FlameError::Storage(format!(
+                "invalid task name {}",
+                task.name
+            )));
+        }
         Ok(Self {
-            id: task.id,
-            ssn_id: task.ssn_id.clone(),
+            id: task.id.clone(),
+            workspace: task.workspace.clone(),
+            session: task.session.clone(),
+            name,
             version: task.version,
             input: task.input.clone().map(Bytes::from),
             output: task.output.clone().map(Bytes::from),
@@ -242,6 +265,8 @@ impl TryFrom<&ApplicationDao> for Application {
 
     fn try_from(app: &ApplicationDao) -> Result<Self, Self::Error> {
         Ok(Self {
+            id: app.id.clone(),
+            workspace: app.workspace.clone(),
             name: app.name.clone(),
             version: app.version,
             state: ApplicationState::try_from(app.state)?,
@@ -320,6 +345,7 @@ impl TryFrom<&NodeDao> for Node {
 
     fn try_from(dao: &NodeDao) -> Result<Self, Self::Error> {
         Ok(Self {
+            id: dao.id.clone(),
             name: dao.name.clone(),
             state: NodeState::from(dao.state),
             capacity: ResourceRequirement {
@@ -351,6 +377,7 @@ impl TryFrom<NodeDao> for Node {
 impl From<&Node> for NodeDao {
     fn from(node: &Node) -> Self {
         Self {
+            id: node.id.clone(),
             name: node.name.clone(),
             state: i32::from(node.state),
             capacity_cpu: node.capacity.cpu as i64,
@@ -375,6 +402,8 @@ impl TryFrom<&ExecutorDao> for Executor {
     fn try_from(dao: &ExecutorDao) -> Result<Self, Self::Error> {
         Ok(Self {
             id: dao.id.clone(),
+            workspace: dao.workspace.clone(),
+            name: dao.name.clone(),
             node: dao.node.clone(),
             resreq: ResourceRequirement {
                 cpu: dao.resreq_cpu as u64,
@@ -383,8 +412,8 @@ impl TryFrom<&ExecutorDao> for Executor {
             },
             shim: Shim::try_from(dao.shim).unwrap_or_default(),
             application: dao.application.clone(),
-            task_id: dao.task_id,
-            ssn_id: dao.ssn_id.clone(),
+            task: dao.task.clone(),
+            session: dao.session.clone(),
             attributes: HashSet::new(),
             creation_time: DateTime::<Utc>::from_timestamp(dao.creation_time, 0)
                 .ok_or(FlameError::Storage("invalid creation time".to_string()))?,
@@ -406,14 +435,16 @@ impl From<&Executor> for ExecutorDao {
     fn from(exec: &Executor) -> Self {
         Self {
             id: exec.id.clone(),
+            workspace: exec.workspace.clone(),
+            name: exec.name.clone(),
             node: exec.node.clone(),
             application: exec.application.clone(),
             resreq_cpu: exec.resreq.cpu as i64,
             resreq_memory: exec.resreq.memory as i64,
             resreq_gpu: exec.resreq.gpu as i64,
             shim: i32::from(exec.shim),
-            task_id: exec.task_id,
-            ssn_id: exec.ssn_id.clone(),
+            task: exec.task.clone(),
+            session: exec.session.clone(),
             creation_time: exec.creation_time.timestamp(),
             state: i32::from(exec.state),
         }

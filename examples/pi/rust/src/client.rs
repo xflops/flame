@@ -101,5 +101,5 @@ fn count_inside(tasks: &[TaskResult<PiResponse>]) -> Result<u64, FlameError> {
 fn format_task_error(task: &TaskResult<PiResponse>) -> String {
     task.error_message
         .clone()
-        .unwrap_or_else(|| format!("task {} ended in state {}", task.task_id, task.state))
+        .unwrap_or_else(|| format!("task {} ended in state {}", task.task, task.state))
 }

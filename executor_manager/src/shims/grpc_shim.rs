@@ -265,8 +265,9 @@ mod tests {
         socket_dir
     }
 
-    fn create_test_work_dir(executor_id: &str, temp: &tempfile::TempDir) -> ExecutorWorkDir {
+    fn create_test_work_dir(executor: &str, temp: &tempfile::TempDir) -> ExecutorWorkDir {
         let app = ApplicationContext {
+            workspace: "default".to_string(),
             name: "test-app".to_string(),
             shim: ShimType::Host,
             image: None,
@@ -278,7 +279,7 @@ mod tests {
             installer: None,
         };
 
-        ExecutorWorkDir::new(&app, executor_id).unwrap()
+        ExecutorWorkDir::new(&app, executor).unwrap()
     }
 
     #[test]
@@ -332,8 +333,10 @@ mod tests {
         let mut shim = GrpcShim::new(&work_dir).unwrap();
 
         let ctx = SessionContext {
-            session_id: "test-session".to_string(),
+            workspace: "default".to_string(),
+            session: "test-session".to_string(),
             application: ApplicationContext {
+                workspace: "default".to_string(),
                 name: "test-app".to_string(),
                 shim: ShimType::Host,
                 image: None,
@@ -366,8 +369,9 @@ mod tests {
         let mut shim = GrpcShim::new(&work_dir).unwrap();
 
         let ctx = TaskContext {
-            task_id: "test-task".to_string(),
-            session_id: "test-session".to_string(),
+            workspace: "default".to_string(),
+            task: "test-task".to_string(),
+            session: "test-session".to_string(),
             input: None,
         };
 

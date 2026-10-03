@@ -43,7 +43,7 @@ struct ApplicationSnapshot {
     creation_time: i64,
 }
 
-type ApplicationMap = HashMap<String, ApplicationSnapshot>;
+type ApplicationMap = HashMap<(String, String), ApplicationSnapshot>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StaleReason {
@@ -53,7 +53,7 @@ enum StaleReason {
 
 #[derive(Clone, Debug)]
 struct Candidate {
-    application: String,
+    application: (String, String),
     metadata: ObjectMetadata,
     reason: StaleReason,
 }
@@ -108,16 +108,31 @@ impl FrontendApplicationLister {
 #[async_trait]
 impl ApplicationLister for FrontendApplicationLister {
     async fn list_applications(&mut self) -> Result<ApplicationMap, FlameError> {
-        let mut request = Request::new(ListApplicationsRequest { state: None });
+        let mut request = Request::new(flame_rpc::ListWorkspacesRequest {});
         request.set_timeout(LIST_APPLICATIONS_TIMEOUT);
-
-        let applications = self
+        let workspaces = self
             .client
-            .list_applications(request)
+            .list_workspaces(request)
             .await
             .map_err(|error| FlameError::Network(error.to_string()))?
             .into_inner()
-            .applications;
+            .workspaces;
+        let mut applications = Vec::new();
+        for workspace in workspaces {
+            let mut request = Request::new(ListApplicationsRequest {
+                state: None,
+                workspace: Some(workspace.name),
+            });
+            request.set_timeout(LIST_APPLICATIONS_TIMEOUT);
+            applications.extend(
+                self.client
+                    .list_applications(request)
+                    .await
+                    .map_err(|error| FlameError::Network(error.to_string()))?
+                    .into_inner()
+                    .applications,
+            );
+        }
 
         validate_applications(applications)
     }
@@ -204,11 +219,13 @@ impl ApplicationGarbageCollector {
                 }
             };
 
-            if let Some(reason) =
-                classify_stale(applications.get(&key.app_name), metadata.creation_time, now)
-            {
+            if let Some(reason) = classify_stale(
+                applications.get(&(key.workspace.clone(), key.application.clone())),
+                metadata.creation_time,
+                now,
+            ) {
                 candidates.push(Candidate {
-                    application: key.app_name,
+                    application: (key.workspace, key.application),
                     metadata,
                     reason,
                 });
@@ -246,21 +263,24 @@ impl ApplicationGarbageCollector {
                 Ok(true) => {
                     stats.deleted += 1;
                     tracing::debug!(
-                        application = %candidate.application,
+                        workspace = %candidate.application.0,
+                        application = %candidate.application.1,
                         key = %candidate.metadata.key,
                         reason = ?candidate.reason,
                         "deleted stale cache object"
                     );
                 }
                 Ok(false) => tracing::debug!(
-                    application = %candidate.application,
+                    workspace = %candidate.application.0,
+                    application = %candidate.application.1,
                     key = %candidate.metadata.key,
                     "stale cache candidate changed before deletion"
                 ),
                 Err(error) => {
                     stats.failures += 1;
                     tracing::warn!(
-                        application = %candidate.application,
+                        workspace = %candidate.application.0,
+                        application = %candidate.application.1,
                         key = %candidate.metadata.key,
                         error = %error,
                         "failed to delete stale cache object"
@@ -301,6 +321,18 @@ fn validate_applications(
                 "ListApplications returned an application with an empty name".to_string(),
             ));
         }
+        let workspace = metadata.workspace.ok_or_else(|| {
+            FlameError::InvalidState(format!(
+                "ListApplications returned application <{}> without workspace",
+                metadata.name
+            ))
+        })?;
+        if workspace.is_empty() {
+            return Err(FlameError::InvalidState(format!(
+                "ListApplications returned application <{}> with empty workspace",
+                metadata.name
+            )));
+        }
 
         let status = application.status.ok_or_else(|| {
             FlameError::InvalidState(format!(
@@ -327,7 +359,7 @@ fn validate_applications(
 
         if result
             .insert(
-                metadata.name.clone(),
+                (workspace.clone(), metadata.name.clone()),
                 ApplicationSnapshot {
                     state,
                     creation_time: status.creation_time,
@@ -336,8 +368,8 @@ fn validate_applications(
             .is_some()
         {
             return Err(FlameError::InvalidState(format!(
-                "ListApplications returned duplicate application <{}>",
-                metadata.name
+                "ListApplications returned duplicate application <{}/{}>",
+                workspace, metadata.name
             )));
         }
     }
@@ -385,6 +417,7 @@ mod tests {
             metadata: Some(flame_rpc::Metadata {
                 id: name.to_string(),
                 name: name.to_string(),
+                workspace: Some("default".to_string()),
             }),
             spec: None,
             status: Some(flame_rpc::ApplicationStatus {
@@ -475,10 +508,39 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(applications["enabled"].state, ApplicationState::Enabled);
-        assert_eq!(applications["enabled"].creation_time, 11);
-        assert_eq!(applications["disabled"].state, ApplicationState::Disabled);
-        assert_eq!(applications["disabled"].creation_time, 22);
+        assert_eq!(
+            applications[&("default".to_string(), "enabled".to_string())].state,
+            ApplicationState::Enabled
+        );
+        assert_eq!(
+            applications[&("default".to_string(), "enabled".to_string())].creation_time,
+            11
+        );
+        assert_eq!(
+            applications[&("default".to_string(), "disabled".to_string())].state,
+            ApplicationState::Disabled
+        );
+        assert_eq!(
+            applications[&("default".to_string(), "disabled".to_string())].creation_time,
+            22
+        );
+    }
+
+    #[test]
+    fn application_validation_allows_same_name_in_different_workspaces() {
+        let first = application("same", flame_rpc::ApplicationState::Enabled as i32, 11);
+        let mut second = application("same", flame_rpc::ApplicationState::Disabled as i32, 22);
+        second.metadata.as_mut().unwrap().workspace = Some("other".to_string());
+        let applications = validate_applications(vec![first, second]).unwrap();
+        assert_eq!(applications.len(), 2);
+        assert_eq!(
+            applications[&("default".to_string(), "same".to_string())].state,
+            ApplicationState::Enabled
+        );
+        assert_eq!(
+            applications[&("other".to_string(), "same".to_string())].state,
+            ApplicationState::Disabled
+        );
     }
 
     struct MockLister {
@@ -532,13 +594,13 @@ mod tests {
     #[tokio::test]
     async fn missing_candidates_are_rechecked_before_deletion() {
         let cache = Arc::new(MockCache {
-            objects: vec![object("app/session/object", 1)],
+            objects: vec![object("default/app/session/object", 1)],
             deleted: Mutex::new(Vec::new()),
             fail_keys: HashSet::new(),
         });
         let calls = Arc::new(Mutex::new(0));
         let appeared = HashMap::from([(
-            "app".to_string(),
+            ("default".to_string(), "app".to_string()),
             ApplicationSnapshot {
                 state: ApplicationState::Enabled,
                 creation_time: 5_000,
@@ -559,18 +621,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_application_name_is_matched_with_workspace() {
+        let cache = Arc::new(MockCache {
+            objects: vec![
+                object("default/app/session/object", 1),
+                object("other/app/session/object", 1),
+            ],
+            deleted: Mutex::new(Vec::new()),
+            fail_keys: HashSet::new(),
+        });
+        let applications = HashMap::from([(
+            ("default".to_string(), "app".to_string()),
+            ApplicationSnapshot {
+                state: ApplicationState::Enabled,
+                creation_time: 1,
+            },
+        )]);
+        let mut collector = collector(
+            cache.clone(),
+            vec![Ok(applications.clone()), Ok(applications)],
+            Arc::new(Mutex::new(0)),
+        );
+        let stats = collector.reconcile(20_000).await.unwrap();
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(
+            &*cache.deleted.lock().unwrap(),
+            &["other/app/session/object"]
+        );
+    }
+
+    #[tokio::test]
     async fn enabled_candidates_are_rechecked_and_delete_exact_objects() {
         let cache = Arc::new(MockCache {
             objects: vec![
-                object("app/session/old", 1),
-                object("app/session/current", 15_000),
+                object("default/app/session/old", 1),
+                object("default/app/session/current", 15_000),
             ],
             deleted: Mutex::new(Vec::new()),
             fail_keys: HashSet::new(),
         });
         let calls = Arc::new(Mutex::new(0));
         let applications = HashMap::from([(
-            "app".to_string(),
+            ("default".to_string(), "app".to_string()),
             ApplicationSnapshot {
                 state: ApplicationState::Enabled,
                 creation_time: 15_000,
@@ -586,21 +678,24 @@ mod tests {
 
         assert_eq!(*calls.lock().unwrap(), 2);
         assert_eq!(stats.deleted, 1);
-        assert_eq!(&*cache.deleted.lock().unwrap(), &["app/session/old"]);
+        assert_eq!(
+            &*cache.deleted.lock().unwrap(),
+            &["default/app/session/old"]
+        );
     }
 
     #[tokio::test]
     async fn failed_second_list_deletes_nothing() {
         let cache = Arc::new(MockCache {
             objects: vec![
-                object("missing/session/object", 1),
-                object("enabled/session/object", 1),
+                object("default/missing/session/object", 1),
+                object("default/enabled/session/object", 1),
             ],
             deleted: Mutex::new(Vec::new()),
             fail_keys: HashSet::new(),
         });
         let applications = HashMap::from([(
-            "enabled".to_string(),
+            ("default".to_string(), "enabled".to_string()),
             ApplicationSnapshot {
                 state: ApplicationState::Enabled,
                 creation_time: 15_000,
@@ -624,14 +719,14 @@ mod tests {
     async fn one_delete_failure_does_not_stop_other_candidates() {
         let cache = Arc::new(MockCache {
             objects: vec![
-                object("app/session/fail", 1),
-                object("app/session/delete", 2),
+                object("default/app/session/fail", 1),
+                object("default/app/session/delete", 2),
             ],
             deleted: Mutex::new(Vec::new()),
-            fail_keys: HashSet::from(["app/session/fail".to_string()]),
+            fail_keys: HashSet::from(["default/app/session/fail".to_string()]),
         });
         let applications = HashMap::from([(
-            "app".to_string(),
+            ("default".to_string(), "app".to_string()),
             ApplicationSnapshot {
                 state: ApplicationState::Enabled,
                 creation_time: 20_000,
@@ -648,6 +743,9 @@ mod tests {
 
         assert_eq!(stats.failures, 1);
         assert_eq!(stats.deleted, 1);
-        assert_eq!(&*cache.deleted.lock().unwrap(), &["app/session/delete"]);
+        assert_eq!(
+            &*cache.deleted.lock().unwrap(),
+            &["default/app/session/delete"]
+        );
     }
 }

@@ -91,18 +91,18 @@ impl ExecutorManager {
     }
 
     async fn handle_executor_update(&mut self, mut executor: Executor) -> Result<(), FlameError> {
-        let executor_id = executor.id.clone();
+        let executor_name = executor.name.clone();
         let state = executor.state;
 
         if state == ExecutorState::Released {
             tracing::info!(
                 "Removing executor <{}> from map (state={:?})",
-                executor_id,
+                executor_name,
                 state
             );
             let removed = {
                 let mut executors = lock_ptr!(self.executors)?;
-                executors.remove(&executor_id)
+                executors.remove(&executor_name)
             };
             if let Some(executor) = removed {
                 let shim = {
@@ -119,10 +119,10 @@ impl ExecutorManager {
 
         let mut executors = lock_ptr!(self.executors)?;
 
-        if !executors.contains_key(&executor_id) {
+        if !executors.contains_key(&executor_name) {
             tracing::info!(
                 "Creating executor <{}> (state={:?}, shim={:?})",
-                executor_id,
+                executor_name,
                 state,
                 self.ctx.cluster.executors.shim
             );
@@ -130,16 +130,16 @@ impl ExecutorManager {
             executor.shim = self.ctx.cluster.executors.shim;
 
             let executor_ptr = Arc::new(Mutex::new(executor));
-            executors.insert(executor_id.clone(), executor_ptr.clone());
+            executors.insert(executor_name.clone(), executor_ptr.clone());
             executor::start(self.client.clone(), executor_ptr, self.app_manager.clone());
             return Ok(());
         }
 
-        if let Some(existing) = executors.get(&executor_id) {
+        if let Some(existing) = executors.get(&executor_name) {
             let existing = lock_ptr!(existing)?;
             tracing::debug!(
                 "Executor <{}> already exists (current_state={:?}, received_state={:?})",
-                executor_id,
+                executor_name,
                 existing.state,
                 state
             );

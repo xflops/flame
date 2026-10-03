@@ -45,25 +45,32 @@ impl DiskStorage {
     fn object_path(&self, key: &ObjectKey) -> PathBuf {
         let object_id = key.object_id.as_ref().expect("object_id required");
         self.storage_path
-            .join(&key.app_name)
-            .join(&key.session_id)
+            .join(&key.workspace)
+            .join(&key.application)
+            .join(&key.session)
             .join(format!("{}.bin", object_id))
     }
 
     fn delta_dir(&self, key: &ObjectKey) -> PathBuf {
         let object_id = key.object_id.as_ref().expect("object_id required");
         self.storage_path
-            .join(&key.app_name)
-            .join(&key.session_id)
+            .join(&key.workspace)
+            .join(&key.application)
+            .join(&key.session)
             .join(format!("{}.deltas", object_id))
     }
 
     fn session_dir(&self, key: &ObjectKey) -> PathBuf {
-        self.storage_path.join(&key.app_name).join(&key.session_id)
+        self.storage_path
+            .join(&key.workspace)
+            .join(&key.application)
+            .join(&key.session)
     }
 
     fn app_dir(&self, key: &ObjectKey) -> PathBuf {
-        self.storage_path.join(&key.app_name)
+        self.storage_path
+            .join(&key.workspace)
+            .join(&key.application)
     }
 }
 
@@ -236,75 +243,91 @@ impl StorageEngine for DiskStorage {
                 return Ok(results);
             }
 
-            for app_entry in fs::read_dir(&storage_path)? {
-                let app_entry = app_entry?;
-                let app_path = app_entry.path();
-
-                if !app_path.is_dir() {
+            for workspace_entry in fs::read_dir(&storage_path)? {
+                let workspace_entry = workspace_entry?;
+                let workspace_path = workspace_entry.path();
+                if !workspace_path.is_dir() {
                     continue;
                 }
-
-                let app_name = app_path
+                let workspace = workspace_path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .ok_or_else(|| FlameError::Internal("Invalid app directory name".to_string()))?
+                    .ok_or_else(|| {
+                        FlameError::Internal("Invalid workspace directory name".to_string())
+                    })?
                     .to_string();
 
-                for session_entry in fs::read_dir(&app_path)? {
-                    let session_entry = session_entry?;
-                    let session_path = session_entry.path();
+                for app_entry in fs::read_dir(&workspace_path)? {
+                    let app_entry = app_entry?;
+                    let app_path = app_entry.path();
 
-                    if !session_path.is_dir() {
+                    if !app_path.is_dir() {
                         continue;
                     }
 
-                    let session_id = session_path
+                    let application = app_path
                         .file_name()
                         .and_then(|n| n.to_str())
                         .ok_or_else(|| {
-                            FlameError::Internal("Invalid session directory name".to_string())
+                            FlameError::Internal("Invalid app directory name".to_string())
                         })?
                         .to_string();
 
-                    for object_entry in fs::read_dir(&session_path)? {
-                        let object_entry = object_entry?;
-                        let object_path = object_entry.path();
+                    for session_entry in fs::read_dir(&app_path)? {
+                        let session_entry = session_entry?;
+                        let session_path = session_entry.path();
 
-                        if object_path.is_dir() {
+                        if !session_path.is_dir() {
                             continue;
                         }
 
-                        let extension = object_path.extension().and_then(|e| e.to_str());
-                        if extension != Some("bin") {
-                            continue;
-                        }
-
-                        let object_id = object_path
-                            .file_stem()
+                        let session = session_path
+                            .file_name()
                             .and_then(|n| n.to_str())
                             .ok_or_else(|| {
-                                FlameError::Internal("Invalid object file name".to_string())
+                                FlameError::Internal("Invalid session directory name".to_string())
                             })?
                             .to_string();
 
-                        let key = ObjectKey {
-                            app_name: app_name.clone(),
-                            session_id: session_id.clone(),
-                            object_id: Some(object_id.clone()),
-                        };
+                        for object_entry in fs::read_dir(&session_path)? {
+                            let object_entry = object_entry?;
+                            let object_path = object_entry.path();
 
-                        let delta_dir = session_path.join(format!("{}.deltas", object_id));
-                        let base = load_object_from_file(&object_path)?;
-                        let deltas = read_deltas_sync(&delta_dir, base.version, &base.data_type)?;
-                        let object = Object::with_data_at(
-                            base.version,
-                            base.data,
-                            base.data_type,
-                            deltas,
-                            base.creation_time,
-                        );
+                            if object_path.is_dir() {
+                                continue;
+                            }
 
-                        results.push((key, object));
+                            let extension = object_path.extension().and_then(|e| e.to_str());
+                            if extension != Some("bin") {
+                                continue;
+                            }
+
+                            let object_id = object_path
+                                .file_stem()
+                                .and_then(|n| n.to_str())
+                                .ok_or_else(|| {
+                                    FlameError::Internal("Invalid object file name".to_string())
+                                })?
+                                .to_string();
+
+                            let key_path =
+                                format!("{workspace}/{application}/{session}/{object_id}");
+                            let key = ObjectKey::try_from(key_path.as_str())?;
+
+                            let delta_dir = session_path.join(format!("{}.deltas", object_id));
+                            let base = load_object_from_file(&object_path)?;
+                            let deltas =
+                                read_deltas_sync(&delta_dir, base.version, &base.data_type)?;
+                            let object = Object::with_data_at(
+                                base.version,
+                                base.data,
+                                base.data_type,
+                                deltas,
+                                base.creation_time,
+                            );
+
+                            results.push((key, object));
+                        }
                     }
                 }
             }
@@ -502,8 +525,9 @@ mod tests {
 
     fn test_key(app: &str, session: &str, object: &str) -> ObjectKey {
         ObjectKey {
-            app_name: app.to_string(),
-            session_id: session.to_string(),
+            workspace: "default".to_string(),
+            application: app.to_string(),
+            session: session.to_string(),
             object_id: Some(object.to_string()),
         }
     }
@@ -529,6 +553,45 @@ mod tests {
         assert_eq!(loaded.data_type, "raw");
         assert_eq!(loaded.opaque_data().unwrap(), &[1, 2, 3, 4, 5]);
         assert!(loaded.deltas.is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_names_in_different_workspaces_use_distinct_paths() {
+        let temp_dir = tempdir().unwrap();
+        let storage = DiskStorage::new(temp_dir.path().to_path_buf()).unwrap();
+        let first = test_key("app", "session", "object");
+        let mut second = first.clone();
+        second.workspace = "other".to_string();
+        storage
+            .write_object(&first, &Object::new(0, b"first".to_vec()))
+            .await
+            .unwrap();
+        storage
+            .write_object(&second, &Object::new(0, b"second".to_vec()))
+            .await
+            .unwrap();
+        assert_ne!(storage.object_path(&first), storage.object_path(&second));
+        assert_eq!(
+            storage
+                .read_object(&first)
+                .await
+                .unwrap()
+                .unwrap()
+                .opaque_data()
+                .unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            storage
+                .read_object(&second)
+                .await
+                .unwrap()
+                .unwrap()
+                .opaque_data()
+                .unwrap(),
+            b"second"
+        );
+        assert_eq!(storage.load_objects().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -647,7 +710,7 @@ mod tests {
             .await
             .unwrap();
 
-        let delete_key = ObjectKey::from_path("test-app/test-session").unwrap();
+        let delete_key = ObjectKey::from_path("default/test-app/test-session").unwrap();
         storage.delete_objects(&delete_key).await.unwrap();
 
         assert!(storage.read_object(&key1).await.unwrap().is_none());
@@ -713,8 +776,9 @@ mod cache_benchmarks {
 
     fn key(name: &str) -> ObjectKey {
         ObjectKey {
-            app_name: "bench".to_string(),
-            session_id: "session".to_string(),
+            workspace: "default".to_string(),
+            application: "bench".to_string(),
+            session: "session".to_string(),
             object_id: Some(name.to_string()),
         }
     }

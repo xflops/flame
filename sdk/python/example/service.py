@@ -24,7 +24,7 @@ class ExampleService(flamepy.FlameService):
 
     def on_session_enter(self, context: flamepy.SessionContext) -> bool:
         """Handle session enter."""
-        print(f"🟢 Entering session: {context.session_id}")
+        print(f"🟢 Entering session: {context.session}")
         print(f"   Application: {context.application.name}")
         print(f"   Common data: {context.common_data}")
 
@@ -36,8 +36,8 @@ class ExampleService(flamepy.FlameService):
     def on_task_invoke(self, context: flamepy.TaskContext) -> Optional[TaskOutput]:
         """Handle task invoke."""
         self._task_count += 1
-        print(f"🟡 Invoking task {self._task_count}: {context.task_id}")
-        print(f"   Session: {context.session_id}")
+        print(f"🟡 Invoking task {self._task_count}: {context.task}")
+        print(f"   Session: {context.session}")
 
         if context.input:
             print(f"   Input: {context.input}")

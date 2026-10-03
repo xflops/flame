@@ -128,7 +128,7 @@ async def test_runpy_binds_session_context_and_publishes_invocation_attributes()
         def run(self):
             app.publish_attributes({b"b"})
             app.publish_attributes({b"c"})
-            return app.session_context().session_id
+            return app.session_context().session
 
     svc = FlameRunpyService()
     svc._load_app_context = lambda context: _context(ServiceContext(Worker, constructor_args=()))
@@ -155,12 +155,12 @@ async def test_runpy_handles_async_method_and_sync_method_returning_awaitable():
     class Worker:
         async def async_method(self):
             app.publish_attributes({b"async"})
-            return app.session_context().session_id
+            return app.session_context().session
 
         def returns_awaitable(self):
             async def resolve():
                 app.publish_attributes({b"awaitable"})
-                return app.session_context().session_id
+                return app.session_context().session
 
             return resolve()
 
@@ -247,7 +247,7 @@ async def test_runpy_binds_recursive_service_to_current_session(monkeypatch):
     assert captured["proxy"]._session_context is session_context
     assert "_session_context" not in captured["execution_object"].__dict__
     put_context.assert_not_called()
-    open_session.assert_called_once_with(session_id="recursive-session")
+    open_session.assert_called_once_with(session="recursive-session")
     with pytest.raises(RuntimeError, match="not running in a Flame invocation"):
         app.session_context()
 
@@ -307,7 +307,7 @@ async def test_app_runtime_helpers_are_invocation_scoped():
         def run(self):
             app.publish_attributes({b"initial"})
             app.publish_attributes({b"initial", b"next"})
-            return app.session_context().session_id
+            return app.session_context().session
 
         def invalid(self):
             app.publish_attributes({"invalid"})
@@ -372,7 +372,7 @@ async def test_runpy_reuses_class_execution_object_between_sessions():
         def session_id(self):
             import flamepy.app as app
 
-            return app.session_context().session_id
+            return app.session_context().session
 
         def fail(self):
             import flamepy.app as app

@@ -267,31 +267,34 @@ def _cache_apply_patches(
 
 @dataclass(frozen=True)
 class ObjectKey:
-    """Parsed object key: <app_name>/<session_id>/<object_id>
+    """Parsed object key: <workspace>/<application>/<session>/<object_id>
 
-    session_id can be WILDCARD_SESSION ('*') for all sessions, requires object_id to be None.
+    session can be WILDCARD_SESSION ('*') for all sessions, requires object_id to be None.
     """
 
-    app_name: str
-    session_id: str
+    application: str
+    session: str
     object_id: Optional[str] = None
+    workspace: str = "default"
 
     def __post_init__(self):
-        if not self.app_name:
-            raise ValueError("app_name cannot be empty")
-        if self.app_name == WILDCARD_SESSION:
-            raise ValueError("Wildcard '*' not allowed for app_name")
-        if ".." in self.app_name or "\\" in self.app_name or "/" in self.app_name:
-            raise ValueError(f"app_name contains invalid characters: '{self.app_name}'")
+        if not (1 <= len(self.workspace) <= 63) or not self.workspace[0].isalnum() or not self.workspace[-1].isalnum() or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in self.workspace):
+            raise ValueError(f"invalid workspace name: {self.workspace!r}")
+        if not self.application:
+            raise ValueError("application cannot be empty")
+        if self.application == WILDCARD_SESSION:
+            raise ValueError("Wildcard '*' not allowed for application")
+        if ".." in self.application or "\\" in self.application or "/" in self.application:
+            raise ValueError(f"application contains invalid characters: '{self.application}'")
 
-        if not self.session_id:
-            raise ValueError("session_id cannot be empty")
+        if not self.session:
+            raise ValueError("session cannot be empty")
 
-        is_wildcard = self.session_id == WILDCARD_SESSION
+        is_wildcard = self.session == WILDCARD_SESSION
 
         if not is_wildcard:
-            if ".." in self.session_id or "\\" in self.session_id or "/" in self.session_id:
-                raise ValueError(f"session_id contains invalid characters: '{self.session_id}'")
+            if ".." in self.session or "\\" in self.session or "/" in self.session:
+                raise ValueError(f"session contains invalid characters: '{self.session}'")
 
         if self.object_id is not None:
             if is_wildcard:
@@ -307,14 +310,14 @@ class ObjectKey:
     def from_path(cls, path: str) -> "ObjectKey":
         """Parse from key prefix or full key.
 
-        Accepts '<app>/<ssn>' prefixes and '<app>/<ssn>/<uuid>' full keys.
+        Accepts '<workspace>/<app>/<ssn>' prefixes and '<workspace>/<app>/<ssn>/<uuid>' full keys.
         """
         parts = path.split("/")
-        if len(parts) == 2:
-            return cls(app_name=parts[0], session_id=parts[1], object_id=None)
         if len(parts) == 3:
-            return cls(app_name=parts[0], session_id=parts[1], object_id=parts[2])
-        raise ValueError(f"Invalid object key path '{path}': expected '<app>/<ssn>' or '<app>/<ssn>/<uuid>' format")
+            return cls(workspace=parts[0], application=parts[1], session=parts[2], object_id=None)
+        if len(parts) == 4:
+            return cls(workspace=parts[0], application=parts[1], session=parts[2], object_id=parts[3])
+        raise ValueError(f"Invalid object key path '{path}': expected '<workspace>/<app>/<ssn>' or '<workspace>/<app>/<ssn>/<uuid>' format")
 
     @classmethod
     def from_prefix(cls, prefix: str) -> "ObjectKey":
@@ -333,48 +336,49 @@ class ObjectKey:
         return object_key
 
     @classmethod
-    def for_shared(cls, app_name: str) -> "ObjectKey":
+    def for_shared(cls, application: str, workspace: str = "default") -> "ObjectKey":
         """Create key for shared storage: '<app>/shared'."""
-        return cls(app_name=app_name, session_id="shared", object_id=None)
+        return cls(application=application, session="shared", object_id=None, workspace=workspace)
 
     @classmethod
-    def for_all_sessions(cls, app_name: str) -> "ObjectKey":
+    def for_all_sessions(cls, application: str, workspace: str = "default") -> "ObjectKey":
         """Create wildcard key for all sessions: '<app>/*'."""
-        return cls(app_name=app_name, session_id=WILDCARD_SESSION, object_id=None)
+        return cls(application=application, session=WILDCARD_SESSION, object_id=None, workspace=workspace)
 
     def is_all_sessions(self) -> bool:
-        """Return True if this key represents all sessions (session_id == '*')."""
-        return self.session_id == WILDCARD_SESSION
+        """Return True if this key represents all sessions (session == '*')."""
+        return self.session == WILDCARD_SESSION
 
     def with_generated_id(self) -> "ObjectKey":
         """Return new ObjectKey with a generated UUID."""
         return ObjectKey(
-            app_name=self.app_name,
-            session_id=self.session_id,
+            workspace=self.workspace,
+            application=self.application,
+            session=self.session,
             object_id=str(uuid.uuid4()),
         )
 
     def to_prefix(self) -> str:
         """Return key prefix '<app>/<ssn>'."""
-        return f"{self.app_name}/{self.session_id}"
+        return f"{self.workspace}/{self.application}/{self.session}"
 
     def to_key(self) -> Optional[str]:
         """Return full key '<app>/<ssn>/<uuid>' or None if object_id not set."""
         if self.object_id is None:
             return None
-        return f"{self.app_name}/{self.session_id}/{self.object_id}"
+        return f"{self.workspace}/{self.application}/{self.session}/{self.object_id}"
 
     def matches_key(self, key: str) -> bool:
         """Return True if this prefix/full ObjectKey matches a full object key."""
         if self.is_all_sessions():
-            prefix = f"{self.app_name}/"
+            prefix = f"{self.workspace}/{self.application}/"
             if not key.startswith(prefix):
                 return False
             suffix = key[len(prefix) :]
-            session_id, separator, object_id = suffix.partition("/")
-            return bool(session_id and separator and object_id) and "/" not in object_id
+            session, separator, object_id = suffix.partition("/")
+            return bool(session and separator and object_id) and "/" not in object_id
         if self.object_id is None:
-            prefix = f"{self.app_name}/{self.session_id}/"
+            prefix = f"{self.workspace}/{self.application}/{self.session}/"
             if not key.startswith(prefix):
                 return False
             object_id = key[len(prefix) :]

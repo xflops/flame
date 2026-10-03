@@ -91,6 +91,7 @@ mod tests {
     /// Helper to create a test node with specified state
     fn create_test_node(name: &str, state: NodeState) -> NodePtr {
         stdng::new_ptr(Node {
+            id: String::new(),
             name: name.to_string(),
             state,
             capacity: ResourceRequirement::default(),
@@ -212,6 +213,7 @@ mod tests {
             };
 
             let updated_node = Node {
+                id: String::new(),
                 name: "test-node".to_string(),
                 state: NodeState::Ready,
                 capacity: ResourceRequirement {
@@ -310,6 +312,7 @@ mod tests {
             };
 
             let updated_node = Node {
+                id: String::new(),
                 name: "test-node".to_string(),
                 state: NodeState::Ready,
                 capacity: ResourceRequirement {
@@ -413,6 +416,7 @@ mod tests {
             };
 
             let updated_node = Node {
+                id: String::new(),
                 name: "test-node".to_string(),
                 state: NodeState::Ready,
                 capacity: ResourceRequirement::default(),

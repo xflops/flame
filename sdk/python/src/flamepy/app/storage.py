@@ -282,10 +282,11 @@ class HttpStorage(StorageBackend):
 class CacheStorage(StorageBackend):
     """Storage backend using flame-object-cache directly or through a gRPC proxy."""
 
-    def __init__(self, storage_base: str | None = None, app_name: str | None = None):
+    def __init__(self, storage_base: str | None = None, app_name: str | None = None, workspace: str | None = None):
         from flamepy.core.types import FlameClientCache, FlameContext
 
         self._app_name = app_name
+        self._workspace = workspace or getattr(FlameContext(), "workspace", "default")
 
         if storage_base is not None:
             parsed_url = urlparse(storage_base)
@@ -321,7 +322,7 @@ class CacheStorage(StorageBackend):
             raise FlameError(FlameErrorCode.INVALID_CONFIG, "app_name is required for upload")
 
         try:
-            key = f"{self._app_name}/pkg/{filename}"
+            key = f"{self._workspace}/{self._app_name}/pkg/{filename}"
             ref = upload_object(key, local_path, endpoint=self._endpoint)
             # Preserve the server-returned owning-cache endpoint so consumers
             # such as executor-manager do not receive this external client's
@@ -343,7 +344,7 @@ class CacheStorage(StorageBackend):
             raise FlameError(FlameErrorCode.INVALID_CONFIG, "app_name is required for download")
 
         try:
-            key = f"{self._app_name}/pkg/{filename}"
+            key = f"{self._workspace}/{self._app_name}/pkg/{filename}"
             ref = ObjectRef(endpoint=self._endpoint, key=key, version=0)
             download_object(ref, local_path)
             logger.debug(f"Downloaded package from cache: {key} -> {local_path}")
@@ -357,7 +358,7 @@ class CacheStorage(StorageBackend):
             return
 
         try:
-            key = str(ObjectKey(app_name=self._app_name, session_id="pkg", object_id=filename))
+            key = str(ObjectKey(application=self._app_name, session="pkg", object_id=filename, workspace=self._workspace))
             delete_objects(key)
             logger.debug(f"Deleted package from cache: {key}")
         except Exception as e:

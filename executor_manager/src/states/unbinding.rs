@@ -51,14 +51,14 @@ impl UnbindingState {
             if let Err(error) = shim.on_session_leave().await {
                 tracing::warn!(
                     "Executor <{}> session leave failed; completing unbind and retaining the application service: {}",
-                    self.executor.id,
+                    self.executor.name,
                     error
                 );
             }
         } else {
             tracing::debug!(
                 "Executor <{}> has no shim instance during unbinding; skip on_session_leave",
-                self.executor.id
+                self.executor.name
             );
         }
     }
@@ -127,8 +127,10 @@ mod tests {
     async fn successful_unbind_retains_application_instance() {
         let shim: ShimPtr = Arc::new(Mutex::new(TestShim { fail_leave: false }));
         let executor = Executor {
-            id: "executor-1".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "executor-1".to_string(),
             application: "test-app".to_string(),
+            workspace: "default".to_string(),
             resreq: ResourceRequirement::default(),
             node: "node-1".to_string(),
             shim: ShimType::Host,
@@ -156,8 +158,10 @@ mod tests {
     async fn failed_session_leave_does_not_destroy_application_instance() {
         let shim: ShimPtr = Arc::new(Mutex::new(TestShim { fail_leave: true }));
         let executor = Executor {
-            id: "executor-1".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "executor-1".to_string(),
             application: "test-app".to_string(),
+            workspace: "default".to_string(),
             resreq: ResourceRequirement::default(),
             node: "node-1".to_string(),
             shim: ShimType::Host,

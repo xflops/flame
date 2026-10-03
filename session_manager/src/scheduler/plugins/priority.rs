@@ -14,11 +14,12 @@ limitations under the License.
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use common::apis::{ResourceRequirement, SessionID, TaskState};
+use crate::model::ScopedName;
+use common::apis::{ResourceRequirement, TaskState};
 use common::FlameError;
 
 use crate::model::{
-    ExecutorInfoPtr, SessionInfo, SessionInfoPtr, SnapShot, ALL_EXECUTOR, ALL_NODE, OPEN_SESSION,
+    ExecutorInfoPtr, SessionInfo, SessionInfoPtr, SnapShot, ALL_EXECUTOR, ALL_NODE,
 };
 use crate::scheduler::plugins::{Plugin, PluginPtr};
 
@@ -56,25 +57,25 @@ pub struct PriorityPlugin {
     max_needy_priority: u32,
     /// Priority for each open session, keyed by session ID.
     /// Populated in `setup()`.
-    ssn_priority: HashMap<SessionID, u32>,
+    ssn_priority: HashMap<ScopedName, u32>,
     /// Per-session priority-distributed share, expressed as a `ResourceRequirement`
     /// (cpu/memory/gpu). Populated in `setup()` step 2 from the cluster-capacity
     /// distribution loop. Read-only thereafter for the cycle.
-    ssn_desired: HashMap<SessionID, ResourceRequirement>,
+    ssn_desired: HashMap<ScopedName, ResourceRequirement>,
     /// Executor resources currently allocated per session, expressed as a
     /// `ResourceRequirement`. Initialised from the snapshot in `setup()`; updated
     /// via callbacks.
-    ssn_allocated: HashMap<SessionID, ResourceRequirement>,
+    ssn_allocated: HashMap<ScopedName, ResourceRequirement>,
     /// Resources selected during this scheduling cycle but not yet bound to a
     /// session. Pipeline accounting prevents Allocate from creating more
     /// executors for demand that is already in flight.
-    ssn_pipelined: HashMap<SessionID, ResourceRequirement>,
+    ssn_pipelined: HashMap<ScopedName, ResourceRequirement>,
     /// Per-executor effective resource requirement for each session, cached in
     /// `setup()` so lifecycle callbacks can adjust resource accounting without
     /// re-deriving from the snapshot. After the slots-cleanup refactor, every open session's
     /// `resreq` is guaranteed to be populated by `resolve_session_resreq` in
     /// `apiserver::frontend`, so this is simply a clone of `ssn.resreq`.
-    ssn_unit: HashMap<SessionID, ResourceRequirement>,
+    ssn_unit: HashMap<ScopedName, ResourceRequirement>,
 }
 
 impl PriorityPlugin {
@@ -168,7 +169,7 @@ impl Plugin for PriorityPlugin {
         // ── Step 2: distribute `total` by (priority desc, creation_time asc) ─
         // Hash iteration is non-deterministic; collect and sort explicitly so that
         // earlier-created sessions within a priority tier are filled first.
-        let open_ssns = ss.find_sessions(OPEN_SESSION)?;
+        let open_ssns = crate::scheduler::open_sessions(ss)?;
         let mut sessions: Vec<SessionInfoPtr> = open_ssns.values().cloned().collect();
         sessions.sort_by(|a, b| {
             b.priority
@@ -178,7 +179,7 @@ impl Plugin for PriorityPlugin {
 
         let mut remaining = total.clone();
         for ssn in &sessions {
-            self.ssn_priority.insert(ssn.id.clone(), ssn.priority);
+            self.ssn_priority.insert(ssn.key(), ssn.priority);
 
             // Per-task / per-executor effective resreq. After the slots-cleanup
             // refactor, `resolve_session_resreq` in `apiserver::frontend` always
@@ -193,12 +194,12 @@ impl Plugin for PriorityPlugin {
             // Per-field min — guaranteed `granted ≤ remaining` per resource.
             let granted = demand.min(&remaining);
 
-            self.ssn_desired.insert(ssn.id.clone(), granted.clone());
+            self.ssn_desired.insert(ssn.key(), granted.clone());
             self.ssn_allocated
-                .insert(ssn.id.clone(), ResourceRequirement::default());
+                .insert(ssn.key(), ResourceRequirement::default());
             self.ssn_pipelined
-                .insert(ssn.id.clone(), ResourceRequirement::default());
-            self.ssn_unit.insert(ssn.id.clone(), per_task);
+                .insert(ssn.key(), ResourceRequirement::default());
+            self.ssn_unit.insert(ssn.key(), per_task);
 
             // `granted = remaining.min(demand)` per-field, so `granted ≤ remaining`
             // always holds in every dimension; sub() cannot underflow here.
@@ -224,8 +225,11 @@ impl Plugin for PriorityPlugin {
         // the source of truth for what resources are actually consumed.
         let executors = ss.find_executors(ALL_EXECUTOR)?;
         for exe in executors.values() {
-            if let Some(ref ssn_id) = exe.ssn_id {
-                if let Some(alloc) = self.ssn_allocated.get_mut(ssn_id) {
+            if let Some(ref session) = exe.session {
+                if let Some(alloc) = self
+                    .ssn_allocated
+                    .get_mut(&(exe.workspace.clone(), session.clone()))
+                {
                     alloc.add(&exe.resreq);
                 }
             }
@@ -246,8 +250,8 @@ impl Plugin for PriorityPlugin {
     /// Returns ordering based on priority (descending). Returns `None` when
     /// priorities are equal, deferring tiebreaking to the next plugin in the chain.
     fn ssn_order_fn(&self, s1: &SessionInfo, s2: &SessionInfo) -> Option<Ordering> {
-        let p1 = self.ssn_priority.get(&s1.id).copied().unwrap_or(0);
-        let p2 = self.ssn_priority.get(&s2.id).copied().unwrap_or(0);
+        let p1 = self.ssn_priority.get(&s1.key()).copied().unwrap_or(0);
+        let p2 = self.ssn_priority.get(&s2.key()).copied().unwrap_or(0);
 
         if p1 != p2 {
             // Higher priority comes first → descending order.
@@ -272,7 +276,7 @@ impl Plugin for PriorityPlugin {
     /// Because `PluginManager::is_underused` uses "first non-`None` wins", the `Some(true)`
     /// path overrides any downstream-plugin veto for high-priority sessions.
     fn is_underused(&self, ssn: &SessionInfoPtr) -> Option<bool> {
-        let priority = self.ssn_priority.get(&ssn.id).copied()?;
+        let priority = self.ssn_priority.get(&ssn.key()).copied()?;
 
         if priority < self.max_needy_priority {
             tracing::debug!(
@@ -286,8 +290,8 @@ impl Plugin for PriorityPlugin {
         // has unmet demand. With ResourceRequirement semantics, "unmet" means
         // `allocated < desired` in *any* dimension (i.e. `!allocated.great_equal(desired)`).
         // Demand of zero (default) is treated as "no demand → defer to the next plugin".
-        let desired = self.ssn_desired.get(&ssn.id)?;
-        let allocated = self.ssn_allocated.get(&ssn.id)?;
+        let desired = self.ssn_desired.get(&ssn.key())?;
+        let allocated = self.ssn_allocated.get(&ssn.key())?;
         let zero = ResourceRequirement::default();
 
         if !desired.equal(&zero) && !allocated.great_equal(desired) {
@@ -311,40 +315,40 @@ impl Plugin for PriorityPlugin {
     }
 
     fn is_ready(&self, ssn: &SessionInfoPtr) -> Option<bool> {
-        let desired = self.ssn_desired.get(&ssn.id)?;
-        let allocated = self.ssn_allocated.get(&ssn.id)?;
-        let pipelined = self.ssn_pipelined.get(&ssn.id)?;
+        let desired = self.ssn_desired.get(&ssn.key())?;
+        let allocated = self.ssn_allocated.get(&ssn.key())?;
+        let pipelined = self.ssn_pipelined.get(&ssn.key())?;
         let mut available = allocated.clone();
         available.add(pipelined);
         Some(available.great_equal(desired))
     }
 
     fn on_executor_pipeline(&mut self, _exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
-        let unit = match self.ssn_unit.get(&ssn.id) {
+        let unit = match self.ssn_unit.get(&ssn.key()) {
             Some(u) => u.clone(),
             None => return,
         };
-        if let Some(pipelined) = self.ssn_pipelined.get_mut(&ssn.id) {
+        if let Some(pipelined) = self.ssn_pipelined.get_mut(&ssn.key()) {
             pipelined.add(&unit);
         }
     }
 
     fn on_session_bind(&mut self, ssn: SessionInfoPtr) {
-        let unit = match self.ssn_unit.get(&ssn.id) {
+        let unit = match self.ssn_unit.get(&ssn.key()) {
             Some(u) => u.clone(),
             None => return,
         };
-        if let Some(alloc) = self.ssn_allocated.get_mut(&ssn.id) {
+        if let Some(alloc) = self.ssn_allocated.get_mut(&ssn.key()) {
             alloc.add(&unit);
         }
     }
 
     fn on_session_unbind(&mut self, ssn: SessionInfoPtr) {
-        let unit = match self.ssn_unit.get(&ssn.id) {
+        let unit = match self.ssn_unit.get(&ssn.key()) {
             Some(u) => u.clone(),
             None => return,
         };
-        if let Some(alloc) = self.ssn_allocated.get_mut(&ssn.id) {
+        if let Some(alloc) = self.ssn_allocated.get_mut(&ssn.key()) {
             if let Err(e) = alloc.sub(&unit) {
                 tracing::warn!(
                     "[PriorityPlugin] sub underflow on unbind for ssn <{}>: {e}",
@@ -420,7 +424,9 @@ mod tests {
             tasks_status.insert(TaskState::Running, running);
         }
         Arc::new(SessionInfo {
-            id: id.to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: id.to_string(),
+            workspace: "default".to_string(),
             application: "test-app".to_string(),
             tasks_status,
             creation_time,
@@ -438,6 +444,8 @@ mod tests {
 
     fn create_test_app(name: &str) -> Arc<AppInfo> {
         Arc::new(AppInfo {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace: "default".to_string(),
             name: name.to_string(),
             state: ApplicationState::Enabled,
             shim: Shim::Host,
@@ -489,7 +497,7 @@ mod tests {
 
     fn create_snapshot_with_executor(
         sessions: Vec<Arc<SessionInfo>>,
-        exec_ssn_id: &str,
+        exec_session: &str,
         slots: u32,
         total_slots: u32,
     ) -> SnapShot {
@@ -498,7 +506,9 @@ mod tests {
         // "an executor consuming `slots`-worth of resources is initialised for the
         // session" → set `resreq = slots × unit = (cpu:slots, memory:slots*1024, gpu:0)`.
         let exec = Arc::new(ExecutorInfo {
-            id: "exec-1".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "exec-1".to_string(),
+            workspace: "default".to_string(),
             node: "node-1".to_string(),
             resreq: ResourceRequirement {
                 cpu: u64::from(slots),
@@ -507,8 +517,8 @@ mod tests {
             },
             shim: Shim::Host,
             application: String::new(),
-            task_id: None,
-            ssn_id: Some(exec_ssn_id.to_string()),
+            task: None,
+            session: Some(exec_session.to_string()),
             creation_time: Utc::now(),
             latest_updated_timestamp: Utc::now(),
             state: ExecutorState::Bound,
@@ -521,6 +531,20 @@ mod tests {
     // ── setup() tests ────────────────────────────────────────────────────────
 
     #[test]
+    fn same_session_name_in_two_workspaces_keeps_priority_separate() {
+        let first = create_test_session("shared", 100, 1);
+        let mut second = (*create_test_session("shared", 10, 1)).clone();
+        second.workspace = "other".to_string();
+        let second = Arc::new(second);
+        let snapshot = create_snapshot_with_capacity(vec![first.clone(), second.clone()], 2);
+        let mut plugin = make_plugin();
+        plugin.setup(&snapshot).unwrap();
+        assert_eq!(plugin.ssn_priority.get(&first.key()), Some(&100));
+        assert_eq!(plugin.ssn_priority.get(&second.key()), Some(&10));
+        assert_eq!(plugin.ssn_priority.len(), 2);
+    }
+
+    #[test]
     fn test_setup_max_needy_priority() {
         let ssn_high = create_test_session("ssn-high", 100, 4);
         let ssn_low = create_test_session("ssn-low", 10, 2);
@@ -530,8 +554,18 @@ mod tests {
         plugin.setup(&ss).unwrap();
 
         assert_eq!(plugin.max_needy_priority, 100);
-        assert_eq!(plugin.ssn_priority.get("ssn-high"), Some(&100));
-        assert_eq!(plugin.ssn_priority.get("ssn-low"), Some(&10));
+        assert_eq!(
+            plugin
+                .ssn_priority
+                .get(&("default".to_string(), "ssn-high".to_string())),
+            Some(&100)
+        );
+        assert_eq!(
+            plugin
+                .ssn_priority
+                .get(&("default".to_string(), "ssn-low".to_string())),
+            Some(&10)
+        );
     }
 
     #[test]
@@ -555,9 +589,24 @@ mod tests {
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        assert_eq!(plugin.ssn_desired.get("A"), Some(&slots_to_rr(8)));
-        assert_eq!(plugin.ssn_desired.get("B"), Some(&slots_to_rr(6)));
-        assert_eq!(plugin.ssn_desired.get("C"), Some(&slots_to_rr(8)));
+        assert_eq!(
+            plugin
+                .ssn_desired
+                .get(&("default".to_string(), "A".to_string())),
+            Some(&slots_to_rr(8))
+        );
+        assert_eq!(
+            plugin
+                .ssn_desired
+                .get(&("default".to_string(), "B".to_string())),
+            Some(&slots_to_rr(6))
+        );
+        assert_eq!(
+            plugin
+                .ssn_desired
+                .get(&("default".to_string(), "C".to_string())),
+            Some(&slots_to_rr(8))
+        );
         let cpu_sum: u64 = plugin.ssn_desired.values().map(|r| r.cpu).sum();
         let mem_sum: u64 = plugin.ssn_desired.values().map(|r| r.memory).sum();
         assert_eq!(cpu_sum, 22);
@@ -585,9 +634,24 @@ mod tests {
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        assert_eq!(plugin.ssn_desired.get("A"), Some(&slots_to_rr(4)));
-        assert_eq!(plugin.ssn_desired.get("B"), Some(&slots_to_rr(0)));
-        assert_eq!(plugin.ssn_desired.get("C"), Some(&slots_to_rr(0)));
+        assert_eq!(
+            plugin
+                .ssn_desired
+                .get(&("default".to_string(), "A".to_string())),
+            Some(&slots_to_rr(4))
+        );
+        assert_eq!(
+            plugin
+                .ssn_desired
+                .get(&("default".to_string(), "B".to_string())),
+            Some(&slots_to_rr(0))
+        );
+        assert_eq!(
+            plugin
+                .ssn_desired
+                .get(&("default".to_string(), "C".to_string())),
+            Some(&slots_to_rr(0))
+        );
         let cpu_sum: u64 = plugin.ssn_desired.values().map(|r| r.cpu).sum();
         assert_eq!(cpu_sum, 4);
         assert_eq!(plugin.max_needy_priority, 100);
@@ -619,8 +683,18 @@ mod tests {
 
         // Earlier session (a-late-id, t_early) is filled first → gets full demand=4.
         // Later session (z-early-id, t_late) absorbs the residual → gets 1.
-        assert_eq!(plugin.ssn_desired.get("a-late-id"), Some(&slots_to_rr(4)));
-        assert_eq!(plugin.ssn_desired.get("z-early-id"), Some(&slots_to_rr(1)));
+        assert_eq!(
+            plugin
+                .ssn_desired
+                .get(&("default".to_string(), "a-late-id".to_string())),
+            Some(&slots_to_rr(4))
+        );
+        assert_eq!(
+            plugin
+                .ssn_desired
+                .get(&("default".to_string(), "z-early-id".to_string())),
+            Some(&slots_to_rr(1))
+        );
     }
 
     #[test]
@@ -637,8 +711,18 @@ mod tests {
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        assert_eq!(plugin.ssn_desired.get("z-id"), Some(&slots_to_rr(4)));
-        assert_eq!(plugin.ssn_desired.get("a-id"), Some(&slots_to_rr(1)));
+        assert_eq!(
+            plugin
+                .ssn_desired
+                .get(&("default".to_string(), "z-id".to_string())),
+            Some(&slots_to_rr(4))
+        );
+        assert_eq!(
+            plugin
+                .ssn_desired
+                .get(&("default".to_string(), "a-id".to_string())),
+            Some(&slots_to_rr(1))
+        );
     }
 
     #[test]
@@ -702,9 +786,16 @@ mod tests {
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        assert_eq!(plugin.ssn_desired.get("s"), Some(&slots_to_rr(18)));
         assert_eq!(
-            plugin.ssn_allocated.get("s"),
+            plugin
+                .ssn_desired
+                .get(&("default".to_string(), "s".to_string())),
+            Some(&slots_to_rr(18))
+        );
+        assert_eq!(
+            plugin
+                .ssn_allocated
+                .get(&("default".to_string(), "s".to_string())),
             Some(&ResourceRequirement::default())
         );
     }
@@ -720,7 +811,12 @@ mod tests {
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        assert_eq!(plugin.ssn_desired.get("s"), Some(&slots_to_rr(4)));
+        assert_eq!(
+            plugin
+                .ssn_desired
+                .get(&("default".to_string(), "s".to_string())),
+            Some(&slots_to_rr(4))
+        );
     }
 
     #[test]
@@ -733,7 +829,12 @@ mod tests {
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        assert_eq!(plugin.ssn_desired.get("s"), Some(&slots_to_rr(6)));
+        assert_eq!(
+            plugin
+                .ssn_desired
+                .get(&("default".to_string(), "s".to_string())),
+            Some(&slots_to_rr(6))
+        );
     }
 
     #[test]
@@ -748,7 +849,12 @@ mod tests {
         let mut plugin = make_plugin();
         plugin.setup(&ss).unwrap();
 
-        assert_eq!(plugin.ssn_allocated.get("s"), Some(&slots_to_rr(2)));
+        assert_eq!(
+            plugin
+                .ssn_allocated
+                .get(&("default".to_string(), "s".to_string())),
+            Some(&slots_to_rr(2))
+        );
     }
 
     #[test]
@@ -786,7 +892,9 @@ mod tests {
         plugin.setup(&ss).unwrap();
 
         assert_eq!(
-            plugin.ssn_desired.get("s"),
+            plugin
+                .ssn_desired
+                .get(&("default".to_string(), "s".to_string())),
             Some(&ResourceRequirement::default())
         );
     }
@@ -918,9 +1026,16 @@ mod tests {
         let exec = Arc::new(ExecutorInfo::default());
         plugin.on_executor_pipeline(exec, ssn.clone());
         assert_eq!(
-            plugin.ssn_allocated.get("s"),
+            plugin
+                .ssn_allocated
+                .get(&("default".to_string(), "s".to_string())),
             Some(&ResourceRequirement::default())
         );
-        assert_eq!(plugin.ssn_pipelined.get("s"), Some(&slots_to_rr(2)));
+        assert_eq!(
+            plugin
+                .ssn_pipelined
+                .get(&("default".to_string(), "s".to_string())),
+            Some(&slots_to_rr(2))
+        );
     }
 }

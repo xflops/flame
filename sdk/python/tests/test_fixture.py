@@ -28,15 +28,15 @@ class FrontendFixture(FrontendServicer):
 
     def _session(self, session_id="sess-1"):
         return pb.Session(
-            metadata=pb.Metadata(id=session_id),
+            metadata=pb.Metadata(id="00000000-0000-4000-8000-000000000001", name=session_id, workspace="default"),
             spec=pb.SessionSpec(application="app", common_data=b""),
             status=pb.SessionStatus(state=SessionState.OPEN, creation_time=1, events=[pb.Event(code=1001, message="test", creation_time=1)]),
         )
 
     def _task(self, task_id="task-1", state=TaskState.SUCCEED):
         return pb.Task(
-            metadata=pb.Metadata(id=task_id),
-            spec=pb.TaskSpec(session_id="sess-1", input=b"", output=b"done"),
+            metadata=pb.Metadata(id="00000000-0000-4000-8000-000000000002", name=task_id, workspace="default"),
+            spec=pb.TaskSpec(session="sess-1", input=b"", output=b"done"),
             status=pb.TaskStatus(state=state, creation_time=1),
         )
 
@@ -54,7 +54,7 @@ class FrontendFixture(FrontendServicer):
         if request.name == "missing":
             await context.abort(grpc.StatusCode.NOT_FOUND, "missing")
         app = pb.Application(
-            metadata=pb.Metadata(id="app-1", name=request.name),
+            metadata=pb.Metadata(id="00000000-0000-4000-8000-000000000003", name=request.name, workspace="default"),
             status=pb.ApplicationStatus(state=0, creation_time=1),
         )
         app.spec.image = ""
@@ -69,13 +69,13 @@ class FrontendFixture(FrontendServicer):
 
     async def CreateSession(self, request, context):
         self.requests.append(request)
-        return self._session(request.session_id)
+        return self._session(request.name)
 
     async def OpenSession(self, request, context):
-        return self._session(request.session_id)
+        return self._session(request.session)
 
     async def GetSession(self, request, context):
-        return self._session(request.session_id)
+        return self._session(request.session)
 
     async def ListSessions(self, request, context):
         return pb.SessionList(sessions=[self._session()])
@@ -83,7 +83,7 @@ class FrontendFixture(FrontendServicer):
     async def CloseSession(self, request, context):
         if self.reject_close:
             await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "close rejected")
-        return self._session(request.session_id)
+        return self._session(request.session)
 
     async def CreateTask(self, request, context):
         if self.create_task_gate is not None:
@@ -96,7 +96,7 @@ class FrontendFixture(FrontendServicer):
         return self._task(task_id, TaskState.PENDING)
 
     async def GetTask(self, request, context):
-        return self._task(request.task_id)
+        return self._task(request.task)
 
     async def ListTasks(self, request, context):
         yield self._task()
@@ -112,15 +112,15 @@ class FrontendFixture(FrontendServicer):
 
         async def receive():
             async for request in requests:
-                self.watch_requests.append(request.task_id)
-                if request.task_id == "hold":
+                self.watch_requests.append(request.task)
+                if request.task == "hold":
                     await updates.put(self._task("hold", TaskState.PENDING))
                     release_tasks.append(asyncio.create_task(after_release("hold")))
-                elif request.task_id == "error":
+                elif request.task == "error":
                     await updates.put(self._task("error", TaskState.PENDING))
                     await updates.put(None)
                 else:
-                    await updates.put(self._task(request.task_id))
+                    await updates.put(self._task(request.task))
 
         reader = asyncio.create_task(receive())
         try:

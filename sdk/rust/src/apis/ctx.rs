@@ -26,6 +26,11 @@ const FLAME_CACHE_ENDPOINT: &str = "FLAME_CACHE_ENDPOINT";
 const FLAME_CA_FILE: &str = "FLAME_CA_FILE";
 const FLAME_CERT_FILE: &str = "FLAME_CERT_FILE";
 const FLAME_KEY_FILE: &str = "FLAME_KEY_FILE";
+const FLAME_WORKSPACE: &str = "FLAME_WORKSPACE";
+
+fn default_workspace() -> String {
+    "default".to_string()
+}
 
 /// Client TLS configuration for connecting to Flame services.
 ///
@@ -140,6 +145,8 @@ pub struct FlamePackage {
 pub struct FlameContextEntry {
     /// Name of this context
     pub name: String,
+    #[serde(default = "default_workspace")]
+    pub workspace: String,
     /// Cluster configuration
     pub cluster: FlameClusterConfig,
     /// Cache configuration (optional)
@@ -228,6 +235,7 @@ impl FlameContext {
 
         let ctx = FlameContextEntry {
             name: "env".to_string(),
+            workspace: env::var(FLAME_WORKSPACE).unwrap_or_else(|_| default_workspace()),
             cluster: FlameClusterConfig { endpoint, tls },
             cache,
             package: None,
@@ -257,6 +265,9 @@ impl FlameContext {
     /// Apply environment variable overrides to the current context.
     fn apply_env_overrides(&mut self) {
         if let Ok(current) = self.get_current_context_mut() {
+            if let Ok(workspace) = env::var(FLAME_WORKSPACE) {
+                current.workspace = workspace;
+            }
             // Override endpoint if FLAME_ENDPOINT is set
             if let Ok(endpoint) = env::var(FLAME_ENDPOINT) {
                 current.cluster.endpoint = endpoint;
@@ -305,6 +316,11 @@ impl FlameContext {
                 "Context <{}> not found",
                 current
             )))
+    }
+
+    pub fn set_workspace(&mut self, workspace: impl Into<String>) -> Result<(), FlameError> {
+        self.get_current_context_mut()?.workspace = workspace.into();
+        Ok(())
     }
 
     pub fn from_file(fp: Option<String>) -> Result<Self, FlameError> {

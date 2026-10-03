@@ -62,39 +62,48 @@ type ObjectFutureInner<T> = Pin<Box<dyn Future<Output = Result<T, FlameError>> +
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ObjectKey {
-    pub app_name: String,
-    pub session_id: String,
+    pub workspace: String,
+    pub application: String,
+    pub session: String,
     pub object_id: Option<String>,
 }
 
 impl ObjectKey {
     pub fn prefix(
-        app_name: impl Into<String>,
-        session_id: impl Into<String>,
+        workspace: impl Into<String>,
+        application: impl Into<String>,
+        session: impl Into<String>,
     ) -> Result<Self, FlameError> {
-        Self::new(app_name.into(), session_id.into(), None)
+        Self::new(workspace.into(), application.into(), session.into(), None)
     }
 
     pub fn key(
-        app_name: impl Into<String>,
-        session_id: impl Into<String>,
+        workspace: impl Into<String>,
+        application: impl Into<String>,
+        session: impl Into<String>,
         object_id: impl Into<String>,
     ) -> Result<Self, FlameError> {
-        Self::new(app_name.into(), session_id.into(), Some(object_id.into()))
+        Self::new(
+            workspace.into(),
+            application.into(),
+            session.into(),
+            Some(object_id.into()),
+        )
     }
 
     pub fn from_path(path: impl AsRef<str>) -> Result<Self, FlameError> {
         let path = path.as_ref();
         let parts: Vec<&str> = path.split('/').collect();
         match parts.as_slice() {
-            [app_name, session_id] => Self::new((*app_name).to_string(), (*session_id).to_string(), None),
-            [app_name, session_id, object_id] => Self::new(
-                (*app_name).to_string(),
-                (*session_id).to_string(),
+            [workspace, application, session] => Self::new((*workspace).to_string(), (*application).to_string(), (*session).to_string(), None),
+            [workspace, application, session, object_id] => Self::new(
+                (*workspace).to_string(),
+                (*application).to_string(),
+                (*session).to_string(),
                 Some((*object_id).to_string()),
             ),
             _ => Err(FlameError::InvalidConfig(format!(
-                "invalid object key path '{}': expected '<app>/<session>' or '<app>/<session>/<object>'",
+                "invalid object key path '{}': expected '<workspace>/<app>/<session>' or '<workspace>/<app>/<session>/<object>'",
                 path
             ))),
         }
@@ -105,7 +114,7 @@ impl ObjectKey {
         let key = Self::from_path(prefix)?;
         if key.object_id.is_some() {
             return Err(FlameError::InvalidConfig(format!(
-                "invalid object key prefix '{}': expected '<app>/<session>'",
+                "invalid object key prefix '{}': expected '<workspace>/<app>/<session>'",
                 prefix
             )));
         }
@@ -117,23 +126,29 @@ impl ObjectKey {
         let object_key = Self::from_path(key)?;
         if object_key.object_id.is_none() {
             return Err(FlameError::InvalidConfig(format!(
-                "invalid object key '{}': expected '<app>/<session>/<object>'",
+                "invalid object key '{}': expected '<workspace>/<app>/<session>/<object>'",
                 key
             )));
         }
         Ok(object_key)
     }
 
-    pub fn for_shared(app_name: impl Into<String>) -> Result<Self, FlameError> {
-        Self::prefix(app_name, "shared")
+    pub fn for_shared(
+        workspace: impl Into<String>,
+        application: impl Into<String>,
+    ) -> Result<Self, FlameError> {
+        Self::prefix(workspace, application, "shared")
     }
 
-    pub fn for_all_sessions(app_name: impl Into<String>) -> Result<Self, FlameError> {
-        Self::prefix(app_name, WILDCARD_SESSION)
+    pub fn for_all_sessions(
+        workspace: impl Into<String>,
+        application: impl Into<String>,
+    ) -> Result<Self, FlameError> {
+        Self::prefix(workspace, application, WILDCARD_SESSION)
     }
 
     pub fn is_all_sessions(&self) -> bool {
-        self.session_id == WILDCARD_SESSION
+        self.session == WILDCARD_SESSION
     }
 
     pub fn with_generated_id(&self) -> Result<Self, FlameError> {
@@ -143,41 +158,45 @@ impl ObjectKey {
             ));
         }
         Self::new(
-            self.app_name.clone(),
-            self.session_id.clone(),
+            self.workspace.clone(),
+            self.application.clone(),
+            self.session.clone(),
             Some(uuid::Uuid::new_v4().to_string()),
         )
     }
 
     pub fn to_prefix(&self) -> String {
-        format!("{}/{}", self.app_name, self.session_id)
+        format!("{}/{}/{}", self.workspace, self.application, self.session)
     }
 
     pub fn to_key(&self) -> Option<String> {
-        self.object_id
-            .as_ref()
-            .map(|object_id| format!("{}/{}/{}", self.app_name, self.session_id, object_id))
+        self.object_id.as_ref().map(|object_id| {
+            format!(
+                "{}/{}/{}/{}",
+                self.workspace, self.application, self.session, object_id
+            )
+        })
     }
 
     pub fn matches_key(&self, key: impl AsRef<str>) -> bool {
         let key = key.as_ref();
         if self.is_all_sessions() {
-            let prefix = format!("{}/", self.app_name);
+            let prefix = format!("{}/{}/", self.workspace, self.application);
             if !key.starts_with(&prefix) {
                 return false;
             }
             let suffix = &key[prefix.len()..];
-            let Some((session_id, object_id)) = suffix.split_once('/') else {
+            let Some((session, object_id)) = suffix.split_once('/') else {
                 return false;
             };
-            return !session_id.is_empty() && !object_id.is_empty() && !object_id.contains('/');
+            return !session.is_empty() && !object_id.is_empty() && !object_id.contains('/');
         }
 
         if let Some(full_key) = self.to_key() {
             return key == full_key;
         }
 
-        let prefix = format!("{}/{}/", self.app_name, self.session_id);
+        let prefix = format!("{}/{}/{}/", self.workspace, self.application, self.session);
         if !key.starts_with(&prefix) {
             return false;
         }
@@ -186,25 +205,40 @@ impl ObjectKey {
     }
 
     fn new(
-        app_name: String,
-        session_id: String,
+        workspace: String,
+        application: String,
+        session: String,
         object_id: Option<String>,
     ) -> Result<Self, FlameError> {
-        validate_component("app_name", &app_name, false)?;
-        if app_name == WILDCARD_SESSION {
+        if workspace.is_empty()
+            || workspace.len() > 63
+            || !workspace.as_bytes()[0].is_ascii_lowercase()
+                && !workspace.as_bytes()[0].is_ascii_digit()
+            || !workspace.as_bytes()[workspace.len() - 1].is_ascii_lowercase()
+                && !workspace.as_bytes()[workspace.len() - 1].is_ascii_digit()
+            || !workspace
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        {
+            return Err(FlameError::InvalidConfig(format!(
+                "invalid workspace name: {workspace}"
+            )));
+        }
+        validate_component("application", &application, false)?;
+        if application == WILDCARD_SESSION {
             return Err(FlameError::InvalidConfig(
-                "wildcard '*' not allowed for app_name".to_string(),
+                "wildcard '*' not allowed for application".to_string(),
             ));
         }
 
-        if session_id == WILDCARD_SESSION {
+        if session == WILDCARD_SESSION {
             if object_id.is_some() {
                 return Err(FlameError::InvalidConfig(
                     "wildcard session '*' cannot have object_id".to_string(),
                 ));
             }
         } else {
-            validate_component("session_id", &session_id, false)?;
+            validate_component("session", &session, false)?;
         }
 
         if let Some(object_id) = object_id.as_deref() {
@@ -212,8 +246,9 @@ impl ObjectKey {
         }
 
         Ok(Self {
-            app_name,
-            session_id,
+            workspace,
+            application,
+            session,
             object_id,
         })
     }
@@ -1097,44 +1132,46 @@ mod tests {
 
     #[test]
     fn object_key_parses_prefix_and_full_key() {
-        let prefix = ObjectKey::from_prefix("app/session").unwrap();
-        assert_eq!(prefix.app_name, "app");
-        assert_eq!(prefix.session_id, "session");
+        let prefix = ObjectKey::from_prefix("default/app/session").unwrap();
+        assert_eq!(prefix.workspace, "default");
+        assert_eq!(prefix.application, "app");
+        assert_eq!(prefix.session, "session");
         assert_eq!(prefix.object_id, None);
-        assert_eq!(prefix.to_string(), "app/session");
-        assert!(prefix.matches_key("app/session/object"));
-        assert!(!prefix.matches_key("app/other/object"));
+        assert_eq!(prefix.to_string(), "default/app/session");
+        assert!(prefix.matches_key("default/app/session/object"));
+        assert!(!prefix.matches_key("default/app/other/object"));
 
-        let full = ObjectKey::from_key("app/session/object").unwrap();
+        let full = ObjectKey::from_key("default/app/session/object").unwrap();
         assert_eq!(full.object_id.as_deref(), Some("object"));
-        assert_eq!(full.to_string(), "app/session/object");
-        assert!(full.matches_key("app/session/object"));
-        assert!(!full.matches_key("app/session/other"));
+        assert_eq!(full.to_string(), "default/app/session/object");
+        assert!(full.matches_key("default/app/session/object"));
+        assert!(!full.matches_key("default/app/session/other"));
     }
 
     #[test]
     fn object_key_rejects_unsafe_components() {
         assert!(ObjectKey::from_path("../session").is_err());
-        assert!(ObjectKey::from_path("app/session/").is_err());
-        assert!(ObjectKey::from_path("app/*/object").is_err());
-        assert!(ObjectKey::from_path("*/session").is_err());
+        assert!(ObjectKey::from_path("default/app/session/").is_err());
+        assert!(ObjectKey::from_path("default/app/*/object").is_err());
+        assert!(ObjectKey::from_path("*/app/session").is_err());
     }
 
     #[test]
     fn object_key_supports_shared_and_wildcard_helpers() {
-        let shared = ObjectKey::for_shared("app").unwrap();
-        assert_eq!(shared.to_string(), "app/shared");
+        let shared = ObjectKey::for_shared("default", "app").unwrap();
+        assert_eq!(shared.to_string(), "default/app/shared");
 
-        let wildcard = ObjectKey::for_all_sessions("app").unwrap();
+        let wildcard = ObjectKey::for_all_sessions("default", "app").unwrap();
         assert!(wildcard.is_all_sessions());
-        assert!(wildcard.matches_key("app/session/object"));
-        assert!(!wildcard.matches_key("other/session/object"));
+        assert!(wildcard.matches_key("default/app/session/object"));
+        assert!(!wildcard.matches_key("default/other/session/object"));
         assert!(wildcard.with_generated_id().is_err());
     }
 
     #[test]
     fn object_ref_encodes_bson() {
-        let reference = ObjectRef::new("grpc://cache:9090", "app/session/object", 7).unwrap();
+        let reference =
+            ObjectRef::new("grpc://cache:9090", "default/app/session/object", 7).unwrap();
         let encoded = reference.encode().unwrap();
         let decoded = ObjectRef::decode(encoded).unwrap();
         assert_eq!(decoded, reference);

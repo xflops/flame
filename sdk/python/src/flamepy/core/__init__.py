@@ -91,11 +91,9 @@ from .types import (
     Message,
     ResourceRequirement,
     SessionAttributes,
-    SessionID,
     SessionState,
     Shim,
     Task,
-    TaskID,
     TaskInformer,
     TaskInput,
     TaskOption,
@@ -107,8 +105,6 @@ from .types import (
 
 __all__ = [
     # Type aliases
-    "TaskID",
-    "SessionID",
     "ApplicationID",
     "Message",
     "TaskInput",

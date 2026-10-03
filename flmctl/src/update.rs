@@ -59,7 +59,8 @@ async fn update_application(ctx: &FlameContext, application: &str) -> Result<(),
         &current_ctx.cluster.endpoint,
         current_ctx.cluster.tls.as_ref(),
     )
-    .await?;
+    .await?
+    .with_workspace(current_ctx.workspace.clone());
 
     conn.update_application(app.metadata.name, app_attr).await?;
 

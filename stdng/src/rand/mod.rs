@@ -18,5 +18,21 @@ pub fn short_name() -> String {
         .sample_iter(Alphanumeric)
         .take(6)
         .map(char::from)
+        .map(|character| character.to_ascii_lowercase())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn short_name_uses_lowercase_alphanumeric_characters() {
+        for _ in 0..100 {
+            let name = super::short_name();
+            assert_eq!(name.len(), 6);
+            assert!(
+                name.chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+            );
+        }
+    }
 }

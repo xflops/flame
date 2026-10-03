@@ -35,6 +35,7 @@ mod tests {
 
         // Create a node
         let node = Node {
+            id: uuid::Uuid::new_v4().to_string(),
             name: "test-node-1".to_string(),
             state: NodeState::Ready,
             capacity: ResourceRequirement {
@@ -67,6 +68,7 @@ mod tests {
 
         // Update the node
         let updated_node = Node {
+            id: node.id.clone(),
             name: "test-node-1".to_string(),
             state: NodeState::NotReady,
             capacity: ResourceRequirement {
@@ -111,6 +113,7 @@ mod tests {
 
         // First create a node (required for foreign key)
         let node = Node {
+            id: uuid::Uuid::new_v4().to_string(),
             name: "test-node-exec".to_string(),
             state: NodeState::Ready,
             capacity: ResourceRequirement {
@@ -132,7 +135,9 @@ mod tests {
 
         // Create an executor
         let executor = Executor {
-            id: "exec-1".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "exec-1".to_string(),
+            workspace: "default".to_string(),
             node: "test-node-exec".to_string(),
             resreq: ResourceRequirement {
                 cpu: 2,
@@ -141,8 +146,8 @@ mod tests {
             },
             shim: Shim::Host,
             application: "test-app".to_string(),
-            task_id: None,
-            ssn_id: None,
+            task: None,
+            session: None,
             attributes: Default::default(),
             creation_time: Utc::now(),
             latest_updated_timestamp: Utc::now(),
@@ -150,21 +155,24 @@ mod tests {
         };
 
         let created = tokio_test::block_on(storage.create_executor(&executor))?;
-        assert_eq!(created.id, "exec-1");
+        assert_eq!(created.name, "exec-1");
         assert_eq!(created.state, ExecutorState::Void);
         assert_eq!(created.application, "test-app");
 
         // Get the executor
-        let retrieved = tokio_test::block_on(storage.get_executor(&"exec-1".to_string()))?;
+        let retrieved = tokio_test::block_on(
+            storage.get_executor(&crate::apis::ExecutorGID::new("default", "exec-1")),
+        )?;
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.node, "test-node-exec");
         assert_eq!(retrieved.application, "test-app");
 
         // Update executor state
-        let updated = tokio_test::block_on(
-            storage.update_executor_state(&"exec-1".to_string(), ExecutorState::Idle),
-        )?;
+        let updated = tokio_test::block_on(storage.update_executor_state(
+            &crate::apis::ExecutorGID::new("default", "exec-1"),
+            ExecutorState::Idle,
+        ))?;
         assert_eq!(updated.state, ExecutorState::Idle);
         assert_eq!(updated.application, "test-app");
 
@@ -178,10 +186,14 @@ mod tests {
         assert_eq!(all_executors.len(), 1);
 
         // Delete the executor
-        tokio_test::block_on(storage.delete_executor(&"exec-1".to_string()))?;
+        tokio_test::block_on(
+            storage.delete_executor(&crate::apis::ExecutorGID::new("default", "exec-1")),
+        )?;
 
         // Verify deletion
-        let deleted = tokio_test::block_on(storage.get_executor(&"exec-1".to_string()))?;
+        let deleted = tokio_test::block_on(
+            storage.get_executor(&crate::apis::ExecutorGID::new("default", "exec-1")),
+        )?;
         assert!(deleted.is_none());
 
         Ok(())
@@ -195,6 +207,7 @@ mod tests {
 
         // Create a node
         let node = Node {
+            id: uuid::Uuid::new_v4().to_string(),
             name: "cascade-node".to_string(),
             state: NodeState::Ready,
             capacity: ResourceRequirement {
@@ -217,7 +230,9 @@ mod tests {
         // Create executors on the node
         for i in 1..=3 {
             let executor = Executor {
-                id: format!("cascade-exec-{}", i),
+                id: uuid::Uuid::new_v4().to_string(),
+                name: format!("cascade-exec-{}", i),
+                workspace: "default".to_string(),
                 node: "cascade-node".to_string(),
                 resreq: ResourceRequirement {
                     cpu: 2,
@@ -226,8 +241,8 @@ mod tests {
                 },
                 shim: Shim::Host,
                 application: "test-app".to_string(),
-                task_id: None,
-                ssn_id: None,
+                task: None,
+                session: None,
                 attributes: Default::default(),
                 creation_time: Utc::now(),
                 latest_updated_timestamp: Utc::now(),
@@ -258,6 +273,7 @@ mod tests {
 
         // Create a node
         let node = Node {
+            id: uuid::Uuid::new_v4().to_string(),
             name: "state-node".to_string(),
             state: NodeState::Ready,
             capacity: ResourceRequirement {
@@ -276,7 +292,9 @@ mod tests {
 
         // Create an executor
         let executor = Executor {
-            id: "state-exec".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "state-exec".to_string(),
+            workspace: "default".to_string(),
             node: "state-node".to_string(),
             resreq: ResourceRequirement {
                 cpu: 2,
@@ -285,8 +303,8 @@ mod tests {
             },
             shim: Shim::Host,
             application: "test-app".to_string(),
-            task_id: None,
-            ssn_id: None,
+            task: None,
+            session: None,
             attributes: Default::default(),
             creation_time: Utc::now(),
             latest_updated_timestamp: Utc::now(),
@@ -305,9 +323,10 @@ mod tests {
         ];
 
         for state in states {
-            let updated = tokio_test::block_on(
-                storage.update_executor_state(&"state-exec".to_string(), state),
-            )?;
+            let updated = tokio_test::block_on(storage.update_executor_state(
+                &crate::apis::ExecutorGID::new("default", "state-exec"),
+                state,
+            ))?;
             assert_eq!(updated.state, state);
         }
 

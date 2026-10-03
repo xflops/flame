@@ -182,10 +182,10 @@ def test_app_data_aware_scheduling(check_package_config, check_flmrun_app):
                 return value, self.instance_key, self.executor_id
 
         warm_service = WarmDataService.remote()
-        warm_session_id = warm_service._session.id
-        bound = wait_for_executors(lambda executor: executor.status.state == ExecutorBound and executor.status.session_id == warm_session_id)
+        warm_session_id = warm_service._session.name
+        bound = wait_for_executors(lambda executor: executor.status.state == ExecutorBound and executor.status.session == warm_session_id)
 
-        executor_ids = {executor.metadata.id for executor in bound}
+        executor_ids = {executor.metadata.name for executor in bound}
         key_by_executor = {}
         probe_deadline = time.monotonic() + 60
         attempt = 0
@@ -220,13 +220,13 @@ def test_app_data_aware_scheduling(check_package_config, check_flmrun_app):
 
         services = [declare_data_service() for _ in targets]
         warm_service.close()
-        wait_for_executors(lambda executor: executor.metadata.id in executor_ids and executor.status.state == ExecutorIdle)
+        wait_for_executors(lambda executor: executor.metadata.name in executor_ids and executor.status.state == ExecutorIdle)
 
         # Let several scheduler cycles pass. Without the Idle grace, Shuffle
         # would release these retained App processes before DAS can reuse them.
         time.sleep(2)
-        retained = [executor for executor in flamepy.list_executors() if executor.metadata.id in executor_ids]
-        assert {executor.metadata.id for executor in retained} == executor_ids
+        retained = [executor for executor in flamepy.list_executors() if executor.metadata.name in executor_ids]
+        assert {executor.metadata.name for executor in retained} == executor_ids
         assert all(executor.status.state == ExecutorIdle for executor in retained)
 
         futures = [
@@ -417,7 +417,7 @@ def test_objectfuture_explicit_objectref_result(check_package_config, check_flmr
             from flamepy.core import put_object
 
             context = session_context()
-            return put_object(f"{context.application.name}/{context.session_id}", value)
+            return put_object(f"{context.workspace}/{context.application.name}/{context.session}", value)
 
         result = cached_result.remote("cached value")
         assert isinstance(result.ref(), flamepy.core.ObjectRef)
@@ -767,7 +767,7 @@ def test_app_recursive_same_session(check_package_config, check_flmrun_app):
         # This test waits synchronously for nested results, so autoscaling
         # provides executor capacity for the child tasks.
         service = RecursiveTestService.remote()
-        logger.info(f"[TEST] Service created, session_id={service._session.id}")
+        logger.info(f"[TEST] Service created, session={service._session.name}")
 
         # Test with depth=0 (base case)
         logger.info("[TEST] Testing depth=0")
@@ -795,7 +795,7 @@ def test_app_recursive_same_session(check_package_config, check_flmrun_app):
 
         traced_value, session_ids = service.compute_recursive(2, True).get()
         assert traced_value == 4
-        assert session_ids == [service._session.id] * 3
+        assert session_ids == [service._session.name] * 3
 
     wait_for_application_deleted(shared_app_name)
     app_names = [registered.name for registered in flamepy.list_applications()]
@@ -984,7 +984,7 @@ class TestGetData:
             value = result.get()
             assert value == 8, f"Expected 8, got {value}"
 
-            session = get_session(sum_service._session.id)
+            session = get_session(sum_service._session.name)
             tasks = list(session.list_tasks())
             assert len(tasks) >= 1, "Expected at least one task"
 
@@ -1013,7 +1013,7 @@ class TestGetData:
             value = result.get()
             assert value == 28, f"Expected 28, got {value}"
 
-            session = get_session(multiply_service._session.id)
+            session = get_session(multiply_service._session.name)
             tasks = list(session.list_tasks())
             assert len(tasks) >= 1, "Expected at least one task"
 
@@ -1067,7 +1067,7 @@ class TestGetData:
             value = result.get()
             assert value == 40, f"Expected 40, got {value}"
 
-            session = get_session(calc_service._session.id)
+            session = get_session(calc_service._session.name)
             tasks = list(session.list_tasks())
             assert len(tasks) >= 1, "Expected at least one task"
 
@@ -1483,10 +1483,10 @@ class TestDRFSessionManagement:
             result = sum_service(1, 2)
             assert result.get() == 3
 
-            session_id = sum_service._session.id
+            session_id = sum_service._session.name
 
         sessions = flamepy.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = next((s for s in sessions if s.name == session_id), None)
         if session:
             assert session.state == flamepy.SessionState.CLOSED
 

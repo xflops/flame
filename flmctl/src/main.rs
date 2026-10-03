@@ -40,12 +40,21 @@ pub struct Cli {
     #[arg(long)]
     config: Option<String>,
 
+    /// Workspace for resource commands; defaults to the current context's workspace.
+    #[arg(long, global = true)]
+    workspace: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Create or list workspaces.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommands,
+    },
     /// View the object of Flame
     View {
         /// The name of application
@@ -143,14 +152,42 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum WorkspaceCommands {
+    Create { name: String },
+    List,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     flame_rs::apis::init_logger()?;
 
     let cli = Cli::parse();
-    let ctx = FlameContext::from_file(cli.config)?;
+    let mut ctx = FlameContext::from_file(cli.config)?;
+    if let Some(workspace) = cli.workspace {
+        ctx.set_workspace(workspace)?;
+    }
 
     match &cli.command {
+        Some(Commands::Workspace { command }) => {
+            let current = ctx.get_current_context()?;
+            let conn = flame_rs::client::connect_with_tls(
+                &current.cluster.endpoint,
+                current.cluster.tls.as_ref(),
+            )
+            .await?;
+            match command {
+                WorkspaceCommands::Create { name } => {
+                    let workspace = conn.create_workspace(name.clone()).await?;
+                    println!("{}", workspace.name);
+                }
+                WorkspaceCommands::List => {
+                    for workspace in conn.list_workspaces().await? {
+                        println!("{}", workspace.name);
+                    }
+                }
+            }
+        }
         Some(Commands::List {
             application,
             session,

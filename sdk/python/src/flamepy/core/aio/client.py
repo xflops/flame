@@ -17,11 +17,9 @@ from flamepy.core.types import (
     FlameError,
     FlameErrorCode,
     SessionAttributes,
-    SessionID,
     SessionState,
     Shim,
     Task,
-    TaskID,
     TaskOptions,
     TaskState,
     short_name,
@@ -30,6 +28,7 @@ from flamepy.proto.frontend_pb2 import (
     CloseSessionRequest,
     CreateSessionRequest,
     CreateTaskRequest,
+    CreateWorkspaceRequest,
     GetApplicationRequest,
     GetSessionRequest,
     GetTaskRequest,
@@ -38,6 +37,7 @@ from flamepy.proto.frontend_pb2 import (
     ListNodesRequest,
     ListSessionsRequest,
     ListTasksRequest,
+    ListWorkspacesRequest,
     OpenSessionRequest,
     RegisterApplicationRequest,
     UnregisterApplicationRequest,
@@ -78,6 +78,7 @@ def _application_from_proto(app) -> Application:
     return Application(
         id=app.metadata.id,
         name=app.metadata.name,
+        workspace=app.metadata.workspace,
         state=ApplicationState(app.status.state),
         creation_time=datetime.fromtimestamp(app.status.creation_time / 1000, tz=timezone.utc),
         shim=Shim(spec.shim),
@@ -100,6 +101,8 @@ def _session_from_proto(connection: "Connection", response) -> "Session":
     return Session(
         connection=connection,
         id=response.metadata.id,
+        name=response.metadata.name,
+        workspace=response.metadata.workspace,
         application=response.spec.application,
         state=SessionState(response.status.state),
         creation_time=datetime.fromtimestamp(response.status.creation_time / 1000, tz=timezone.utc),
@@ -113,10 +116,12 @@ def _session_from_proto(connection: "Connection", response) -> "Session":
     )
 
 
-def _task_from_proto(response, session_id: str) -> Task:
+def _task_from_proto(response, session: str) -> Task:
     return Task(
         id=response.metadata.id,
-        session_id=session_id,
+        name=response.metadata.name,
+        workspace=response.metadata.workspace,
+        session=session,
         state=TaskState(response.status.state),
         creation_time=datetime.fromtimestamp(response.status.creation_time / 1000, tz=timezone.utc),
         input=_optional_field(response.spec, "input"),
@@ -159,15 +164,16 @@ def _session_spec(attrs: SessionAttributes) -> SessionSpec:
     return spec
 
 
-async def connect(addr: str, tls_config: Optional[FlameClientTls] = None) -> "Connection":
-    return await Connection.connect(addr, tls_config)
+async def connect(addr: str, tls_config: Optional[FlameClientTls] = None, workspace: str = "default") -> "Connection":
+    return await Connection.connect(addr, tls_config, workspace)
 
 
 class Connection:
     """One frontend gRPC channel owned by the event loop that created it."""
 
-    def __init__(self, addr: str, channel: grpc.aio.Channel, frontend: FrontendStub):
+    def __init__(self, addr: str, channel: grpc.aio.Channel, frontend: FrontendStub, workspace: str = "default"):
         self.addr = addr
+        self.workspace = workspace
         self._channel = channel
         self._frontend = frontend
         self._loop = asyncio.get_running_loop()
@@ -175,10 +181,10 @@ class Connection:
         self._submissions: set[asyncio.Task] = set()
         self._watches: set[asyncio.Task] = set()
         self._results: set[asyncio.Future] = set()
-        self._session_watches: Dict[SessionID, _SessionWatch] = {}
+        self._session_watches: Dict[tuple[str, str], _SessionWatch] = {}
 
     @classmethod
-    async def connect(cls, addr: str, tls_config: Optional[FlameClientTls] = None) -> "Connection":
+    async def connect(cls, addr: str, tls_config: Optional[FlameClientTls] = None, workspace: str = "default") -> "Connection":
         if not addr:
             raise FlameError(FlameErrorCode.INVALID_CONFIG, "address cannot be empty")
         channel = None
@@ -204,7 +210,7 @@ class Connection:
             else:
                 channel = grpc.aio.insecure_channel(target)
             await asyncio.wait_for(channel.channel_ready(), timeout=10)
-            return cls(addr, channel, FrontendStub(channel))
+            return cls(addr, channel, FrontendStub(channel), workspace)
         except BaseException as error:
             if channel is not None:
                 await channel.close()
@@ -256,6 +262,13 @@ class Connection:
         except grpc.RpcError as error:
             raise _grpc_error(error, operation) from error
 
+    async def create_workspace(self, name: str):
+        return await self._rpc("CreateWorkspace", CreateWorkspaceRequest(name=name), "failed to create workspace")
+
+    async def list_workspaces(self):
+        response = await self._rpc("ListWorkspaces", ListWorkspacesRequest(), "failed to list workspaces")
+        return list(response.workspaces)
+
     async def register_application(self, name: str, app_attrs: Union[ApplicationAttributes, Dict[str, Any]]) -> None:
         if isinstance(app_attrs, dict):
             app_attrs = ApplicationAttributes(**app_attrs)
@@ -279,20 +292,20 @@ class Connection:
             url=app_attrs.url,
             installer=app_attrs.installer,
         )
-        response = await self._rpc("RegisterApplication", RegisterApplicationRequest(name=name, application=spec), "failed to register application")
+        response = await self._rpc("RegisterApplication", RegisterApplicationRequest(name=name, application=spec, workspace=self.workspace), "failed to register application")
         _raise_for_result(response, "register application")
 
     async def unregister_application(self, name: str) -> None:
-        response = await self._rpc("UnregisterApplication", UnregisterApplicationRequest(name=name), "failed to unregister application")
+        response = await self._rpc("UnregisterApplication", UnregisterApplicationRequest(name=name, workspace=self.workspace), "failed to unregister application")
         _raise_for_result(response, "unregister application")
 
     async def list_applications(self) -> List[Application]:
-        response = await self._rpc("ListApplications", ListApplicationsRequest(), "failed to list applications")
+        response = await self._rpc("ListApplications", ListApplicationsRequest(workspace=self.workspace), "failed to list applications")
         return [_application_from_proto(app) for app in response.applications]
 
     async def get_application(self, name: str) -> Optional[Application]:
         try:
-            response = await self._rpc("GetApplication", GetApplicationRequest(name=name), "failed to get application")
+            response = await self._rpc("GetApplication", GetApplicationRequest(name=name, workspace=self.workspace), "failed to get application")
         except FlameError as error:
             if error.code == FlameErrorCode.NOT_FOUND:
                 return None
@@ -300,7 +313,7 @@ class Connection:
         return _application_from_proto(response)
 
     async def list_executors(self) -> List[Any]:
-        response = await self._rpc("ListExecutors", ListExecutorsRequest(), "failed to list executors")
+        response = await self._rpc("ListExecutors", ListExecutorsRequest(workspace=self.workspace), "failed to list executors")
         return list(response.executors)
 
     async def list_nodes(self) -> List[Any]:
@@ -308,43 +321,48 @@ class Connection:
         return list(response.nodes)
 
     async def create_session(self, attrs: SessionAttributes) -> "Session":
-        response = await self._rpc("CreateSession", CreateSessionRequest(session_id=attrs.id or short_name(attrs.application), session=_session_spec(attrs)), "failed to create session")
+        response = await self._rpc("CreateSession", CreateSessionRequest(name=attrs.name or short_name(attrs.application), spec=_session_spec(attrs), workspace=self.workspace), "failed to create session")
         return _session_from_proto(self, response)
 
     async def list_sessions(self) -> List["Session"]:
-        response = await self._rpc("ListSessions", ListSessionsRequest(), "failed to list sessions")
+        response = await self._rpc("ListSessions", ListSessionsRequest(workspace=self.workspace), "failed to list sessions")
         return [_session_from_proto(self, item) for item in response.sessions]
 
-    async def open_session(self, session_id: SessionID, spec: Optional[SessionAttributes] = None) -> "Session":
-        response = await self._rpc("OpenSession", OpenSessionRequest(session_id=session_id, session=_session_spec(spec) if spec is not None else None), "failed to open session")
+    async def open_session(self, session: str, spec: Optional[SessionAttributes] = None) -> "Session":
+        response = await self._rpc("OpenSession", OpenSessionRequest(session=session, spec=_session_spec(spec) if spec is not None else None, workspace=self.workspace), "failed to open session")
         return _session_from_proto(self, response)
 
-    async def get_session(self, session_id: SessionID) -> "Session":
-        response = await self._rpc("GetSession", GetSessionRequest(session_id=session_id), "failed to get session")
+    async def get_session(self, session: str) -> "Session":
+        response = await self._rpc("GetSession", GetSessionRequest(session=session, workspace=self.workspace), "failed to get session")
         return _session_from_proto(self, response)
 
-    async def close_session(self, session_id: SessionID) -> "Session":
-        response = await self._rpc("CloseSession", CloseSessionRequest(session_id=session_id), "failed to close session")
-        session_watch = self._session_watches.get(session_id)
+    async def close_session(self, session: str) -> "Session":
+        response = await self._rpc("CloseSession", CloseSessionRequest(session=session, workspace=self.workspace), "failed to close session")
+        session_watch = self._session_watches.get((self.workspace, session))
         if session_watch is not None:
             session_watch.close(FlameError(FlameErrorCode.INTERNAL, "session closed during task watch"))
         return _session_from_proto(self, response)
 
-    def _watch_task(self, session_id: SessionID, task_id: TaskID, timeout: Optional[float]) -> "TaskWatcher":
+    def _watch_task(self, session: str, task: str, timeout: Optional[float], workspace: Optional[str] = None) -> "TaskWatcher":
         self._check_loop()
-        session_watch = self._session_watches.get(session_id)
+        workspace = workspace or self.workspace
+        session_watch = self._session_watches.get((workspace, session))
         if session_watch is None:
-            session_watch = _SessionWatch(self, session_id)
-            self._session_watches[session_id] = session_watch
-        return session_watch.register(task_id, timeout)
+            session_watch = _SessionWatch(self, session, workspace)
+            self._session_watches[(workspace, session)] = session_watch
+        return session_watch.register(task, timeout)
 
 
 class Session:
     """A session handle using its connection's aio frontend channel."""
 
-    def __init__(self, connection: Connection, id: SessionID, application: str, state: SessionState, creation_time: datetime, pending: int, running: int, succeed: int, failed: int, completion_time: Optional[datetime], common_data: Optional[bytes] = None, events: Optional[List[Event]] = None):
+    def __init__(
+        self, connection: Connection, id: str, name: str, application: str, state: SessionState, creation_time: datetime, pending: int, running: int, succeed: int, failed: int, completion_time: Optional[datetime], common_data: Optional[bytes] = None, events: Optional[List[Event]] = None, workspace: str = "default"
+    ):
         self.connection = connection
         self.id = id
+        self.name = name
+        self.workspace = workspace
         self.application = application
         self.state = state
         self.creation_time = creation_time
@@ -363,28 +381,28 @@ class Session:
         if not isinstance(input_data, bytes):
             raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "input_data must be bytes in core API")
         option = option or TaskOptions()
-        response = await self.connection._rpc("CreateTask", CreateTaskRequest(task=TaskSpec(session_id=self.id, input=input_data, affinity=list(option.affinity))), "failed to create task")
+        response = await self.connection._rpc("CreateTask", CreateTaskRequest(task=TaskSpec(session=self.name, input=input_data, affinity=list(option.affinity)), workspace=self.workspace), "failed to create task")
         return response, option
 
     async def create_task(self, input_data: bytes, option: Optional[TaskOptions] = None) -> Task:
         response, option = await self._create_task_response(input_data, option)
-        task = _task_from_proto(response, self.id)
+        task = _task_from_proto(response, self.name)
         task.input = input_data
         if not task.affinity:
             task.affinity = set(option.affinity)
         return task
 
-    async def get_task(self, task_id: TaskID) -> Task:
-        response = await self.connection._rpc("GetTask", GetTaskRequest(task_id=task_id, session_id=self.id), "failed to get task")
-        return _task_from_proto(response, self.id)
+    async def get_task(self, task: str) -> Task:
+        response = await self.connection._rpc("GetTask", GetTaskRequest(task=task, session=self.name, workspace=self.workspace), "failed to get task")
+        return _task_from_proto(response, self.name)
 
     def list_tasks(self) -> "TaskIterator":
         self.connection._check_loop()
-        stream = self.connection._frontend.ListTasks(ListTasksRequest(session_id=self.id))
-        return TaskIterator(stream, self.id)
+        stream = self.connection._frontend.ListTasks(ListTasksRequest(session=self.name, workspace=self.workspace))
+        return TaskIterator(stream, self.name)
 
-    def watch_task(self, task_id: TaskID, timeout: Optional[float] = None) -> "TaskWatcher":
-        return self.connection._watch_task(self.id, task_id, timeout)
+    def watch_task(self, task: str, timeout: Optional[float] = None) -> "TaskWatcher":
+        return self.connection._watch_task(self.name, task, timeout, self.workspace)
 
     def submit(self, input_data: bytes, option: Optional[TaskOptions] = None) -> asyncio.Task[bytes]:
         """Schedule a task and return an awaitable before CreateTask replies."""
@@ -413,8 +431,8 @@ class Session:
 
     async def _start_task(self, input_data: bytes, option: Optional[TaskOptions] = None, *, _defer_watch: bool = False, _before_result=None, _discard_result_slot=None) -> asyncio.Future:
         response, _ = await self._create_task_response(input_data, option)
-        task_id = response.metadata.id
-        watcher = None if _defer_watch else self.watch_task(task_id)
+        task = response.metadata.name
+        watcher = None if _defer_watch else self.watch_task(task)
         result = asyncio.get_running_loop().create_future()
         self.connection._results.add(result)
         result.add_done_callback(self.connection._results.discard)
@@ -442,7 +460,7 @@ class Session:
                     # succeeds. WatchTask sends a current-status snapshot, so
                     # this one-turn delay cannot miss task completion.
                     await asyncio.sleep(0)
-                    active_watcher = self.watch_task(task_id)
+                    active_watcher = self.watch_task(task)
                 async for update in active_watcher:
                     if update.is_failed():
                         message = next((event.message for event in update.events or [] if event.code == TaskState.FAILED), "Task failed without error message")
@@ -474,56 +492,57 @@ class Session:
         return result
 
     async def close(self) -> None:
-        await self.connection.close_session(self.id)
+        await self.connection.close_session(self.name)
 
 
 class _SessionWatch:
     """One bidirectional WatchTasks stream shared by a session's subscribers."""
 
-    def __init__(self, connection: Connection, session_id: SessionID):
+    def __init__(self, connection: Connection, session: str, workspace: str):
         self._connection = connection
-        self._session_id = session_id
-        self._requests: asyncio.Queue[Optional[TaskID]] = asyncio.Queue()
-        self._subscribers: Dict[TaskID, set[TaskWatcher]] = {}
+        self._session = session
+        self._workspace = workspace
+        self._requests: asyncio.Queue[Optional[str]] = asyncio.Queue()
+        self._subscribers: Dict[str, set[TaskWatcher]] = {}
         self._stream = None
         self._closed = False
         self._reader = asyncio.create_task(self._read())
 
-    def register(self, task_id: TaskID, timeout: Optional[float]) -> "TaskWatcher":
-        watcher = TaskWatcher(self, task_id, timeout)
-        subscribers = self._subscribers.get(task_id)
+    def register(self, task: str, timeout: Optional[float]) -> "TaskWatcher":
+        watcher = TaskWatcher(self, task, timeout)
+        subscribers = self._subscribers.get(task)
         if subscribers is None:
             subscribers = set()
-            self._subscribers[task_id] = subscribers
+            self._subscribers[task] = subscribers
         subscribers.add(watcher)
         # Each registration asks the frontend for a current snapshot. Reusing
         # a locally cached status could return stale task metadata.
-        self._requests.put_nowait(task_id)
+        self._requests.put_nowait(task)
         return watcher
 
     def unregister(self, watcher: "TaskWatcher") -> None:
-        subscribers = self._subscribers.get(watcher._task_id)
+        subscribers = self._subscribers.get(watcher._task)
         if subscribers is not None:
             subscribers.discard(watcher)
 
     async def _request_stream(self):
         while True:
-            task_id = await self._requests.get()
-            if task_id is None:
+            task = await self._requests.get()
+            if task is None:
                 return
-            yield WatchTaskRequest(task_id=task_id, session_id=self._session_id)
+            yield WatchTaskRequest(task=task, session=self._session, workspace=self._workspace)
 
     async def _read(self) -> None:
         error = FlameError(FlameErrorCode.INTERNAL, "task watch stream closed before completion")
         try:
             self._stream = self._connection._frontend.WatchTasks(self._request_stream())
             async for response in self._stream:
-                task = _task_from_proto(response, self._session_id)
-                subscribers = self._subscribers.get(task.id)
+                task = _task_from_proto(response, self._session)
+                subscribers = self._subscribers.get(task.name)
                 if subscribers is None:
                     continue
                 if task.is_completed() or task.is_failed():
-                    self._subscribers.pop(task.id, None)
+                    self._subscribers.pop(task.name, None)
                 for watcher in tuple(subscribers):
                     watcher._deliver(task)
         except asyncio.CancelledError:
@@ -539,8 +558,9 @@ class _SessionWatch:
         if self._closed:
             return
         self._closed = True
-        if self._connection._session_watches.get(self._session_id) is self:
-            self._connection._session_watches.pop(self._session_id)
+        key = (self._workspace, self._session)
+        if self._connection._session_watches.get(key) is self:
+            self._connection._session_watches.pop(key)
         for subscribers in self._subscribers.values():
             for watcher in tuple(subscribers):
                 watcher._fail(error)
@@ -555,9 +575,9 @@ class _SessionWatch:
 class TaskWatcher(AsyncIterator[Task]):
     """A task's latest status followed by updates from its session stream."""
 
-    def __init__(self, session_watch: _SessionWatch, task_id: TaskID, timeout: Optional[float] = None):
+    def __init__(self, session_watch: _SessionWatch, task: str, timeout: Optional[float] = None):
         self._session_watch = session_watch
-        self._task_id = task_id
+        self._task = task
         self._updates: asyncio.Queue[Union[Task, FlameError]] = asyncio.Queue(maxsize=1)
         self._loop = asyncio.get_running_loop()
         self._timeout = timeout
@@ -614,10 +634,10 @@ class TaskWatcher(AsyncIterator[Task]):
 class TaskIterator(AsyncIterator[Task]):
     """Lazy async iterator for a session's tasks."""
 
-    def __init__(self, stream, session_id: str):
+    def __init__(self, stream, session: str):
         self._stream = stream
         self._responses = stream.__aiter__()
-        self._session_id = session_id
+        self._session = session
         self._loop = asyncio.get_running_loop()
 
     def __aiter__(self) -> "TaskIterator":
@@ -627,7 +647,7 @@ class TaskIterator(AsyncIterator[Task]):
         if asyncio.get_running_loop() is not self._loop:
             raise RuntimeError("aio task iterator used from another event loop")
         try:
-            return _task_from_proto(await self._responses.__anext__(), self._session_id)
+            return _task_from_proto(await self._responses.__anext__(), self._session)
         except grpc.RpcError as error:
             raise _grpc_error(error, "failed to list tasks") from error
 

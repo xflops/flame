@@ -141,8 +141,8 @@ class FlameRunpyService(AioFlameService):
         session_context = self._ssn_ctx
         if session_context is None:
             raise ValueError("Session context is not available")
-        if context.session_id != session_context.session_id:
-            raise ValueError(f"Task session '{context.session_id}' does not match bound session '{session_context.session_id}'")
+        if context.session != session_context.session:
+            raise ValueError(f"Task session '{context.session}' does not match bound session '{session_context.session}'")
         if request.method is None:
             if not callable(execution_object):
                 raise ValueError(f"Function service is not callable: {type(execution_object)}")

@@ -39,96 +39,126 @@ const EVICTION_BATCH_SIZE: usize = 10;
 /// Wildcard session identifier for matching all sessions of an application
 pub const WILDCARD_SESSION: &str = "*";
 
-/// Parsed object key: `<app_name>/<session_id>/<object_id>`
-/// session_id can be "*" for wildcard (all sessions), requires object_id to be None
+/// Parsed object key: `<workspace>/<application>/<session>/<object_id>`
+/// session can be "*" for wildcard (all sessions), requires object_id to be None
 #[derive(Debug, Clone)]
 pub struct ObjectKey {
-    pub app_name: String,
-    pub session_id: String,
+    pub workspace: String,
+    pub application: String,
+    pub session: String,
     pub object_id: Option<String>,
 }
 
 impl ObjectKey {
+    fn validate_workspace(value: &str) -> Result<(), FlameError> {
+        let bytes = value.as_bytes();
+        let valid = !bytes.is_empty()
+            && bytes.len() <= 63
+            && bytes
+                .first()
+                .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            && bytes
+                .last()
+                .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
+        if valid {
+            Ok(())
+        } else {
+            Err(FlameError::InvalidConfig(format!(
+                "Invalid workspace: '{}'",
+                value
+            )))
+        }
+    }
+
     /// Parse from path string.
     ///
     /// Wildcard '*' handling:
-    /// - Only allowed for session_id (e.g., "app/*" for delete all sessions)
-    /// - Not allowed for app_name or object_id
-    /// - Wildcard session cannot have object_id (e.g., "app/*/obj" is invalid)
+    /// - Only allowed for session (e.g., "workspace/app/*" for delete all sessions)
+    /// - Not allowed for application or object_id
+    /// - Wildcard session cannot have object_id (e.g., "default/app/*/obj" is invalid)
     pub fn from_path(path_str: &str) -> Result<Self, FlameError> {
         let parts: Vec<&str> = path_str.split('/').collect();
+        Self::validate_workspace(parts[0])?;
 
         for (i, part) in parts.iter().enumerate() {
-            if part.is_empty() || part.contains("..") || part.contains('\\') {
+            if part.is_empty() || *part == "." || part.contains("..") || part.contains('\\') {
                 return Err(FlameError::InvalidConfig(format!(
                     "Invalid key component: '{}'",
                     part
                 )));
             }
-            // Wildcard only allowed at index 1 (session_id position)
-            if *part == WILDCARD_SESSION && i != 1 {
+            // Wildcard only allowed at index 2 (session position)
+            if part.contains(WILDCARD_SESSION) && !(i == 2 && *part == WILDCARD_SESSION) {
                 return Err(FlameError::InvalidConfig(
-                    "Wildcard '*' only allowed for session_id".to_string(),
+                    "Wildcard '*' only allowed for session".to_string(),
                 ));
             }
         }
 
         match parts.len() {
-            2 => Ok(ObjectKey {
-                app_name: parts[0].to_string(),
-                session_id: parts[1].to_string(),
+            3 => Ok(ObjectKey {
+                workspace: parts[0].to_string(),
+                application: parts[1].to_string(),
+                session: parts[2].to_string(),
                 object_id: None,
             }),
-            3 => {
+            4 => {
                 // Wildcard session cannot reference specific objects
-                if parts[1] == WILDCARD_SESSION {
+                if parts[2] == WILDCARD_SESSION {
                     return Err(FlameError::InvalidConfig(
                         "Wildcard session '*' cannot have object_id".to_string(),
                     ));
                 }
                 // Object ID cannot be wildcard
-                if parts[2] == WILDCARD_SESSION {
+                if parts[3] == WILDCARD_SESSION {
                     return Err(FlameError::InvalidConfig(
                         "Wildcard '*' not allowed for object_id".to_string(),
                     ));
                 }
                 Ok(ObjectKey {
-                    app_name: parts[0].to_string(),
-                    session_id: parts[1].to_string(),
-                    object_id: Some(parts[2].to_string()),
+                    workspace: parts[0].to_string(),
+                    application: parts[1].to_string(),
+                    session: parts[2].to_string(),
+                    object_id: Some(parts[3].to_string()),
                 })
             }
             _ => Err(FlameError::InvalidConfig(format!(
-                "Invalid path '{}': expected '<app>/<ssn>' or '<app>/<ssn>/<uuid>'",
+                "Invalid path '{}': expected '<workspace>/<app>/<ssn>' or '<workspace>/<app>/<ssn>/<uuid>'",
                 path_str
             ))),
         }
     }
 
     pub fn is_all_sessions(&self) -> bool {
-        self.session_id == WILDCARD_SESSION
+        self.session == WILDCARD_SESSION
     }
 
     pub fn to_key(&self) -> Option<String> {
         if self.is_all_sessions() {
             return None;
         }
-        self.object_id
-            .as_ref()
-            .map(|oid| format!("{}/{}/{}", self.app_name, self.session_id, oid))
+        self.object_id.as_ref().map(|oid| {
+            format!(
+                "{}/{}/{}/{}",
+                self.workspace, self.application, self.session, oid
+            )
+        })
     }
 
     pub fn to_prefix(&self) -> String {
         if self.is_all_sessions() {
-            self.app_name.clone()
+            format!("{}/{}", self.workspace, self.application)
         } else {
-            format!("{}/{}", self.app_name, self.session_id)
+            format!("{}/{}/{}", self.workspace, self.application, self.session)
         }
     }
 
     pub fn matches(&self, key_str: &str) -> bool {
         if self.is_all_sessions() {
-            key_str.starts_with(&format!("{}/", self.app_name))
+            key_str.starts_with(&format!("{}/{}/", self.workspace, self.application))
         } else if let Some(full_key) = self.to_key() {
             key_str == full_key
         } else {
@@ -149,7 +179,13 @@ impl ObjectKey {
                 "Wildcard session '*' cannot have object_id".to_string(),
             ));
         }
-        if id.is_empty() || id.contains("..") || id.contains('\\') || id.contains('/') {
+        if id.is_empty()
+            || id == "."
+            || id.contains("..")
+            || id.contains('\\')
+            || id.contains('/')
+            || id.contains('*')
+        {
             return Err(FlameError::InvalidConfig(format!(
                 "Invalid object_id: '{}'",
                 id
@@ -167,16 +203,22 @@ impl TryFrom<&str> for ObjectKey {
 
     fn try_from(key: &str) -> Result<Self, Self::Error> {
         let parts: Vec<&str> = key.split('/').collect();
+        Self::validate_workspace(parts[0])?;
 
-        if parts.len() != 3 {
+        if parts.len() != 4 {
             return Err(FlameError::InvalidConfig(format!(
-                "Invalid key '{}': expected '<app>/<ssn>/<uuid>'",
+                "Invalid key '{}': expected '<workspace>/<app>/<ssn>/<uuid>'",
                 key
             )));
         }
 
         for part in &parts {
-            if part.is_empty() || part.contains("..") || part.contains('\\') {
+            if part.is_empty()
+                || *part == "."
+                || part.contains("..")
+                || part.contains('\\')
+                || part.contains('*')
+            {
                 return Err(FlameError::InvalidConfig(format!(
                     "Invalid key component: '{}'",
                     part
@@ -185,9 +227,10 @@ impl TryFrom<&str> for ObjectKey {
         }
 
         Ok(ObjectKey {
-            app_name: parts[0].to_string(),
-            session_id: parts[1].to_string(),
-            object_id: Some(parts[2].to_string()),
+            workspace: parts[0].to_string(),
+            application: parts[1].to_string(),
+            session: parts[2].to_string(),
+            object_id: Some(parts[3].to_string()),
         })
     }
 }
@@ -808,19 +851,20 @@ mod tests {
 
         #[test]
         fn object_key_accepts_valid_keys() {
-            assert!(ObjectKey::try_from("app/session/object").is_ok());
-            assert!(ObjectKey::try_from("my-app/my-session/my-object").is_ok());
-            assert!(ObjectKey::try_from("test-app/test-session/test-object").is_ok());
-            assert!(
-                ObjectKey::try_from("app1/session1/550e8400-e29b-41d4-a716-446655440000").is_ok()
-            );
+            assert!(ObjectKey::try_from("default/app/session/object").is_ok());
+            assert!(ObjectKey::try_from("default/my-app/my-session/my-object").is_ok());
+            assert!(ObjectKey::try_from("default/test-app/test-session/test-object").is_ok());
+            assert!(ObjectKey::try_from(
+                "default/app1/session1/550e8400-e29b-41d4-a716-446655440000"
+            )
+            .is_ok());
         }
 
         #[test]
         fn object_key_rejects_path_traversal() {
             assert!(ObjectKey::try_from("../etc/passwd").is_err());
             assert!(ObjectKey::try_from("app/../other/object").is_err());
-            assert!(ObjectKey::try_from("app/session/..").is_err());
+            assert!(ObjectKey::try_from("default/app/session/..").is_err());
         }
 
         #[test]
@@ -831,48 +875,61 @@ mod tests {
         #[test]
         fn object_key_rejects_empty_components() {
             assert!(ObjectKey::try_from("app//object").is_err());
-            assert!(ObjectKey::try_from("/session/object").is_err());
+            assert!(ObjectKey::try_from("/default/session/object").is_err());
         }
 
         #[test]
         fn object_key_from_path_two_parts() {
-            let key = ObjectKey::from_path("my-app/my-session").unwrap();
-            assert_eq!(key.app_name, "my-app");
-            assert_eq!(key.session_id, "my-session");
+            let key = ObjectKey::from_path("default/my-app/my-session").unwrap();
+            assert_eq!(key.application, "my-app");
+            assert_eq!(key.session, "my-session");
             assert!(key.object_id.is_none());
         }
 
         #[test]
         fn object_key_from_path_three_parts() {
-            let key = ObjectKey::from_path("my-app/my-session/my-uuid").unwrap();
-            assert_eq!(key.app_name, "my-app");
-            assert_eq!(key.session_id, "my-session");
+            let key = ObjectKey::from_path("default/my-app/my-session/my-uuid").unwrap();
+            assert_eq!(key.application, "my-app");
+            assert_eq!(key.session, "my-session");
             assert_eq!(key.object_id, Some("my-uuid".to_string()));
         }
 
         #[test]
         fn object_key_to_key_and_prefix() {
-            let key = ObjectKey::from_path("app/session/uuid").unwrap();
-            assert_eq!(key.to_key(), Some("app/session/uuid".to_string()));
-            assert_eq!(key.to_prefix(), "app/session");
+            let key = ObjectKey::from_path("default/app/session/uuid").unwrap();
+            assert_eq!(key.to_key(), Some("default/app/session/uuid".to_string()));
+            assert_eq!(key.to_prefix(), "default/app/session");
         }
 
         #[test]
         fn object_key_matches_exact_full_key() {
-            let full_key = ObjectKey::from_path("app/session/uuid").unwrap();
-            let session_key = ObjectKey::from_path("app/session").unwrap();
-            let app_key = ObjectKey::from_path("app/*").unwrap();
+            let full_key = ObjectKey::from_path("default/app/session/uuid").unwrap();
+            let session_key = ObjectKey::from_path("default/app/session").unwrap();
+            let app_key = ObjectKey::from_path("default/app/*").unwrap();
 
-            assert!(full_key.matches("app/session/uuid"));
-            assert!(!full_key.matches("app/session/other"));
-            assert!(session_key.matches("app/session/uuid"));
-            assert!(session_key.matches("app/session/other"));
-            assert!(app_key.matches("app/other/uuid"));
+            assert!(full_key.matches("default/app/session/uuid"));
+            assert!(!full_key.matches("default/app/session/other"));
+            assert!(session_key.matches("default/app/session/uuid"));
+            assert!(session_key.matches("default/app/session/other"));
+            assert!(app_key.matches("default/app/other/uuid"));
+            assert!(!app_key.matches("other/app/session/uuid"));
+        }
+
+        #[test]
+        fn object_key_rejects_invalid_workspace() {
+            for key in [
+                "Upper/app/session/object",
+                "a.b/app/session/object",
+                "-a/app/session/object",
+                "a-/app/session/object",
+            ] {
+                assert!(ObjectKey::try_from(key).is_err(), "{key}");
+            }
         }
 
         #[test]
         fn object_key_with_generated_id() {
-            let key = ObjectKey::from_path("app/session").unwrap();
+            let key = ObjectKey::from_path("default/app/session").unwrap();
             assert!(key.object_id.is_none());
             let key_with_id = key.with_generated_id();
             assert!(key_with_id.object_id.is_some());
@@ -991,7 +1048,7 @@ mod tests {
             let cache = create_test_cache().await;
             let meta = cache
                 .put(
-                    ObjectKey::from_path("app/session").unwrap(),
+                    ObjectKey::from_path("default/app/session").unwrap(),
                     Object::new(0, vec![7; 1024]),
                 )
                 .await
@@ -1045,9 +1102,9 @@ mod tests {
             let cache = create_test_cache().await;
             let obj = Object::new(1, vec![1, 2, 3]);
 
-            let key = ObjectKey::from_path("test-app/test-session").unwrap();
+            let key = ObjectKey::from_path("default/test-app/test-session").unwrap();
             let meta = cache.put(key, obj.clone()).await.unwrap();
-            assert!(meta.key.starts_with("test-app/test-session/"));
+            assert!(meta.key.starts_with("default/test-app/test-session/"));
             assert_eq!(meta.size, 3);
 
             let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
@@ -1060,7 +1117,7 @@ mod tests {
         async fn patch_keeps_object_readable_with_none_storage() {
             let cache = create_test_cache().await;
 
-            let key = ObjectKey::from_path("app/session").unwrap();
+            let key = ObjectKey::from_path("default/app/session").unwrap();
             let meta = cache
                 .put(key, Object::new_typed(0, b"base".to_vec(), "arrow_table"))
                 .await
@@ -1093,7 +1150,7 @@ mod tests {
             let cache = create_test_cache().await;
             let meta = cache
                 .put(
-                    ObjectKey::from_path("app/session/object").unwrap(),
+                    ObjectKey::from_path("default/app/session/object").unwrap(),
                     Object::new_typed(0, b"base".to_vec(), "arrow_table"),
                 )
                 .await
@@ -1112,7 +1169,7 @@ mod tests {
             let cache = create_test_cache().await;
             let meta = cache
                 .put(
-                    ObjectKey::from_path("app/session/object").unwrap(),
+                    ObjectKey::from_path("default/app/session/object").unwrap(),
                     Object::new_typed(0, b"base".to_vec(), "raw.zstd"),
                 )
                 .await
@@ -1140,7 +1197,7 @@ mod tests {
         async fn patch_replaces_eviction_accounting_for_resident_object() {
             let cache = create_test_cache_with_max_memory("10").await;
 
-            let key = ObjectKey::from_path("app/session").unwrap();
+            let key = ObjectKey::from_path("default/app/session").unwrap();
             let meta = cache
                 .put(key, Object::new(0, b"base".to_vec()))
                 .await
@@ -1164,19 +1221,19 @@ mod tests {
             let cache = create_test_cache().await;
             let obj = Object::new(0, vec![42]);
 
-            let key = ObjectKey::from_path("app/session")
+            let key = ObjectKey::from_path("default/app/session")
                 .unwrap()
                 .with_object_id("custom-id".to_string())
                 .unwrap();
             let meta = cache.put(key, obj).await.unwrap();
 
-            assert_eq!(meta.key, "app/session/custom-id");
+            assert_eq!(meta.key, "default/app/session/custom-id");
         }
 
         #[tokio::test]
         async fn get_returns_not_found_for_missing_key() {
             let cache = create_test_cache().await;
-            let key = ObjectKey::try_from("app/session/nonexistent").unwrap();
+            let key = ObjectKey::try_from("default/app/session/nonexistent").unwrap();
             let result = cache.get(&key).await;
             assert!(result.is_err());
         }
@@ -1192,7 +1249,7 @@ mod tests {
         async fn delete_removes_session_objects() {
             let cache = create_test_cache().await;
 
-            let key = ObjectKey::from_path("app/session-to-delete").unwrap();
+            let key = ObjectKey::from_path("default/app/session-to-delete").unwrap();
             cache
                 .put(key.clone(), Object::new(0, vec![1]))
                 .await
@@ -1202,22 +1259,22 @@ mod tests {
                 .await
                 .unwrap();
 
-            let other_key = ObjectKey::from_path("app/other-session").unwrap();
+            let other_key = ObjectKey::from_path("default/app/other-session").unwrap();
             cache.put(other_key, Object::new(0, vec![3])).await.unwrap();
 
-            let delete_key = ObjectKey::from_path("app/session-to-delete").unwrap();
+            let delete_key = ObjectKey::from_path("default/app/session-to-delete").unwrap();
             cache.delete(&delete_key).await.unwrap();
 
             let all = cache.list_all().await.unwrap();
             assert_eq!(all.len(), 1);
-            assert!(all[0].key.starts_with("app/other-session/"));
+            assert!(all[0].key.starts_with("default/app/other-session/"));
         }
 
         #[tokio::test]
         async fn delete_removes_exact_object() {
             let cache = create_test_cache().await;
 
-            let key = ObjectKey::from_path("app/session").unwrap();
+            let key = ObjectKey::from_path("default/app/session").unwrap();
             let meta1 = cache
                 .put(key.clone(), Object::new(0, vec![1]))
                 .await
@@ -1239,7 +1296,7 @@ mod tests {
         async fn delete_if_unchanged_removes_only_the_expected_object() {
             let cache = create_test_cache().await;
 
-            let key = ObjectKey::from_path("app/session").unwrap();
+            let key = ObjectKey::from_path("default/app/session").unwrap();
             let expected = cache
                 .put(key.clone(), Object::new(0, vec![1]))
                 .await
@@ -1257,7 +1314,7 @@ mod tests {
         async fn delete_if_unchanged_preserves_a_replaced_object() {
             let cache = create_test_cache().await;
 
-            let key = ObjectKey::from_path("app/session")
+            let key = ObjectKey::from_path("default/app/session")
                 .unwrap()
                 .with_object_id("object".to_string())
                 .unwrap();
@@ -1281,10 +1338,10 @@ mod tests {
         async fn list_all_returns_all_metadata() {
             let cache = create_test_cache().await;
 
-            let key1 = ObjectKey::from_path("app/s1").unwrap();
+            let key1 = ObjectKey::from_path("default/app/s1").unwrap();
             cache.put(key1, Object::new(0, vec![1])).await.unwrap();
 
-            let key2 = ObjectKey::from_path("app/s2").unwrap();
+            let key2 = ObjectKey::from_path("default/app/s2").unwrap();
             cache.put(key2, Object::new(0, vec![2])).await.unwrap();
 
             let all = cache.list_all().await.unwrap();
@@ -1299,7 +1356,7 @@ mod tests {
 
         #[tokio::test]
         async fn put_rejects_invalid_object_id() {
-            let key = ObjectKey::from_path("app/session").unwrap();
+            let key = ObjectKey::from_path("default/app/session").unwrap();
             let result = key.with_object_id("../bad".to_string());
             assert!(result.is_err());
         }
@@ -1315,9 +1372,9 @@ mod tests {
             let cache = ObjectCache::new(endpoint, storage, None).unwrap();
             let mut object = Object::new_typed_at(1, vec![0; 100], "raw", 1234);
             object.deltas = vec![Object::new(1, Vec::<u8>::new()); 5];
-            let meta = cache.create_metadata("app/session/key".to_string(), &object);
+            let meta = cache.create_metadata("default/app/session/key".to_string(), &object);
 
-            assert_eq!(meta.key, "app/session/key");
+            assert_eq!(meta.key, "default/app/session/key");
             assert_eq!(meta.version, 1);
             assert_eq!(meta.size, 100);
             assert_eq!(meta.delta_count, 5);
@@ -1344,7 +1401,7 @@ mod tests {
             let cache = create_test_cache().await;
             let obj = Object::new(0, vec![1, 2, 3]);
 
-            let key = ObjectKey::from_path("test-app/test-session").unwrap();
+            let key = ObjectKey::from_path("default/test-app/test-session").unwrap();
             let meta = cache.put(key, obj).await.unwrap();
 
             assert_eq!(meta.version, 1);
@@ -1359,7 +1416,7 @@ mod tests {
             let cache = create_test_cache().await;
             let obj = Object::new(0, vec![1, 2, 3]);
 
-            let key = ObjectKey::from_path("app/session").unwrap();
+            let key = ObjectKey::from_path("default/app/session").unwrap();
             let meta = cache.put(key, obj).await.unwrap();
 
             let key = ObjectKey::try_from(meta.key.as_str()).unwrap();

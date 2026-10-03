@@ -23,8 +23,6 @@ from typing import Any, Dict, List, Optional, Set
 import yaml
 
 # Type aliases
-TaskID = str
-SessionID = str
 ApplicationID = str
 Message = bytes
 TaskInput = Message
@@ -195,7 +193,7 @@ class SessionAttributes:
     """Attributes for creating a session."""
 
     application: str
-    id: Optional[str] = None
+    name: Optional[str] = None
     common_data: Any = None
     tokens: Dict[str, str] = field(default_factory=dict, repr=False)
     min_instances: int = 0
@@ -236,8 +234,9 @@ class ApplicationAttributes:
 class Task:
     """Represents a computing task."""
 
-    id: TaskID
-    session_id: SessionID
+    id: str
+    name: str
+    session: str
     state: TaskState
     creation_time: datetime
     input: Any = None
@@ -245,6 +244,7 @@ class Task:
     affinity: Set[bytes] = field(default_factory=set)
     completion_time: Optional[datetime] = None
     events: Optional[List[Event]] = None
+    workspace: str = "default"
 
     def is_completed(self) -> bool:
         """Check if the task is completed."""
@@ -280,6 +280,7 @@ class Application:
     schema: Optional[ApplicationSchema] = None
     url: Optional[str] = None
     installer: Optional[str] = None
+    workspace: str = "default"
 
 
 class TaskInformer:
@@ -296,7 +297,7 @@ class TaskInformer:
 
 def short_name(prefix: str, length: int = 6) -> str:
     """Generate a short name with a prefix."""
-    alphabet = string.ascii_letters + string.digits
+    alphabet = string.ascii_lowercase + string.digits
     sn = "".join(random.SystemRandom().choice(alphabet) for _ in range(length))
     return f"{prefix}-{sn}"
 
@@ -403,9 +404,11 @@ class FlameContext:
     _cache_tls = None
     _package = None
     _app = None
+    _workspace = "default"
 
     def __init__(self):
         self._app = DEFAULT_FLAME_APP_TEMPLATE
+        self._workspace = "default"
 
         home = Path.home()
         config_file = home / ".flame" / DEFAULT_FLAME_CONF
@@ -456,6 +459,7 @@ class FlameContext:
 
                         # Parse the application template if present.
                         self._app = ctx.get("app", DEFAULT_FLAME_APP_TEMPLATE)
+                        self._workspace = ctx.get("workspace", "default")
                         break
                 else:
                     raise FlameError(FlameErrorCode.INVALID_CONFIG, f"context <{current_context}> not found")
@@ -516,6 +520,8 @@ class FlameContext:
         if endpoint is not None:
             self._endpoint = endpoint
 
+        self._workspace = os.getenv("FLAME_WORKSPACE", self._workspace)
+
         # Override/set cache endpoint
         cache_endpoint = os.getenv("FLAME_CACHE_ENDPOINT")
         if cache_endpoint is not None:
@@ -543,6 +549,10 @@ class FlameContext:
     def endpoint(self) -> str:
         """Get the Flame cluster endpoint."""
         return self._endpoint if self._endpoint is not None else DEFAULT_FLAME_ENDPOINT
+
+    @property
+    def workspace(self) -> str:
+        return self._workspace
 
     @property
     def tls(self) -> Optional[FlameClientTls]:

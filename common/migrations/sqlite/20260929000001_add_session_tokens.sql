@@ -1,1 +1,0 @@
-ALTER TABLE sessions ADD COLUMN tokens TEXT NOT NULL DEFAULT '{}';

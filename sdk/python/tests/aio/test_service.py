@@ -32,10 +32,10 @@ def test_aio_shim_handles_concurrent_hooks_and_isolates_attributes(monkeypatch):
 
     class Service(aio_service.FlameService):
         async def on_session_enter(self, context):
-            assert context.session_id == "session"
+            assert context.session == "session"
 
         async def on_task_invoke(self, context):
-            self.publish({context.task_id.encode()})
+            self.publish({context.task.encode()})
             await asyncio.sleep(0.01)
             return context.input
 
@@ -50,12 +50,12 @@ def test_aio_shim_handles_concurrent_hooks_and_isolates_attributes(monkeypatch):
                 stub = InstanceStub(channel)
                 enter = await stub.OnSessionEnter(
                     shim_pb2.SessionContext(
-                        session_id="session",
+                        session="session",
                         application=shim_pb2.ApplicationContext(name="app"),
                     )
                 )
                 assert enter.result.return_code == 0
-                responses = await asyncio.gather(*(stub.OnTaskInvoke(shim_pb2.TaskContext(task_id=str(i), session_id="session", input=b"payload")) for i in range(12)))
+                responses = await asyncio.gather(*(stub.OnTaskInvoke(shim_pb2.TaskContext(task=str(i), session="session", input=b"payload")) for i in range(12)))
                 for i, response in enumerate(responses):
                     assert response.task_result.return_code == 0
                     assert response.task_result.output == b"payload"
@@ -86,7 +86,7 @@ def test_aio_shim_moves_synchronous_hooks_off_event_loop():
     async def exercise():
         servicer = aio_service.FlameInstanceServicer(Service())
         try:
-            response = await servicer.OnTaskInvoke(shim_pb2.TaskContext(task_id="task", session_id="session", input=b""), None)
+            response = await servicer.OnTaskInvoke(shim_pb2.TaskContext(task="task", session="session", input=b""), None)
             assert response.task_result.output.startswith(b"flame-shim")
             assert set(response.attributes.attr) == {b"sync"}
         finally:
@@ -114,9 +114,9 @@ def test_task_limit_keeps_session_control_available():
     async def exercise():
         servicer = aio_service.FlameInstanceServicer(Service(), max_inflight=1)
         try:
-            first = asyncio.create_task(servicer.OnTaskInvoke(shim_pb2.TaskContext(task_id="first", session_id="session"), None))
+            first = asyncio.create_task(servicer.OnTaskInvoke(shim_pb2.TaskContext(task="first", session="session"), None))
             await started.wait()
-            excess = await servicer.OnTaskInvoke(shim_pb2.TaskContext(task_id="excess", session_id="session"), None)
+            excess = await servicer.OnTaskInvoke(shim_pb2.TaskContext(task="excess", session="session"), None)
             assert excess.task_result.return_code == -1
             assert "too many concurrent" in excess.task_result.message
             leave = asyncio.create_task(servicer.OnSessionLeave(types_pb2.EmptyRequest(), None))
@@ -154,7 +154,7 @@ def test_cancelled_enter_keeps_binding_blocked_until_worker_finishes():
             enter = asyncio.create_task(
                 servicer.OnSessionEnter(
                     shim_pb2.SessionContext(
-                        session_id="session",
+                        session="session",
                         application=shim_pb2.ApplicationContext(name="app"),
                     ),
                     None,
@@ -197,7 +197,7 @@ def test_close_cancels_stalled_async_hook_after_timeout(monkeypatch):
         servicer = aio_service.FlameInstanceServicer(Service())
         enter = asyncio.create_task(
             servicer.OnSessionEnter(
-                shim_pb2.SessionContext(session_id="session", application=shim_pb2.ApplicationContext(name="app")),
+                shim_pb2.SessionContext(session="session", application=shim_pb2.ApplicationContext(name="app")),
                 None,
             )
         )
@@ -232,7 +232,7 @@ def test_close_does_not_wait_indefinitely_for_sync_hook(monkeypatch):
 
     async def exercise():
         servicer = aio_service.FlameInstanceServicer(Service())
-        task = asyncio.create_task(servicer.OnTaskInvoke(shim_pb2.TaskContext(task_id="task", session_id="session"), None))
+        task = asyncio.create_task(servicer.OnTaskInvoke(shim_pb2.TaskContext(task="task", session="session"), None))
         try:
             assert await asyncio.to_thread(started.wait, 2)
             await asyncio.wait_for(servicer.close(), timeout=0.5)
@@ -315,19 +315,19 @@ def test_aio_app_worker_retains_class_across_session_bindings(monkeypatch):
     service._load_app_context = load_context
 
     async def exercise():
-        for session_id in ("first", "second"):
-            await service.on_session_enter(SessionContext(None, session_id, ApplicationContext("app")))
+        for session in ("first", "second"):
+            await service.on_session_enter(SessionContext(None, session, ApplicationContext("app")))
             result = await service.on_task_invoke(
                 TaskContext(
                     "task",
-                    session_id,
+                    session,
                     cloudpickle.dumps(ServiceRequest(method="call")),
                 )
             )
             from flamepy.app import ServiceResponse
             from flamepy.core import ValueRef
 
-            assert cloudpickle.loads(result) == ServiceResponse(ValueRef(1 if session_id == "first" else 2))
+            assert cloudpickle.loads(result) == ServiceResponse(ValueRef(1 if session == "first" else 2))
             await service.on_session_leave()
 
     asyncio.run(exercise())
@@ -341,7 +341,7 @@ def test_aio_app_worker_isolates_invocation_attributes(monkeypatch):
     async def function(value):
         app.publish_attributes({str(value).encode()})
         await asyncio.sleep(0.01)
-        assert app.session_context().session_id == "session"
+        assert app.session_context().session == "session"
         return value
 
     async def fake_put_object(key_prefix, value):

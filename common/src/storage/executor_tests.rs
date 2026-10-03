@@ -32,10 +32,24 @@ mod tests {
         }
     }
 
+    async fn test_storage() -> storage::StoragePtr {
+        let storage = storage::new_ptr(&test_context()).await.unwrap();
+        storage
+            .register_application(
+                "default".to_string(),
+                "test-app".to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        storage
+    }
+
     fn create_session_attr(id: &str) -> SessionAttributes {
         SessionAttributes {
             tokens: Default::default(),
-            id: id.to_string(),
+            workspace: "default".to_string(),
+            name: id.to_string(),
             application: "test-app".to_string(),
             common_data: None,
             min_instances: 1,
@@ -59,8 +73,7 @@ mod tests {
 
         #[tokio::test]
         async fn creates_executor_for_session() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("exec-create-ssn");
             storage.create_session(attr).await.unwrap();
@@ -69,7 +82,7 @@ mod tests {
             storage.register_node(&node).await.unwrap();
 
             let executor = storage
-                .create_executor("exec-node".to_string(), "exec-create-ssn".to_string())
+                .create_executor("exec-node".to_string(), "default", "exec-create-ssn")
                 .await
                 .unwrap();
 
@@ -80,8 +93,7 @@ mod tests {
 
         #[tokio::test]
         async fn creates_executor_with_unique_id() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("multi-exec-ssn");
             storage.create_session(attr).await.unwrap();
@@ -90,11 +102,11 @@ mod tests {
             storage.register_node(&node).await.unwrap();
 
             let exec1 = storage
-                .create_executor("multi-exec-node".to_string(), "multi-exec-ssn".to_string())
+                .create_executor("multi-exec-node".to_string(), "default", "multi-exec-ssn")
                 .await
                 .unwrap();
             let exec2 = storage
-                .create_executor("multi-exec-node".to_string(), "multi-exec-ssn".to_string())
+                .create_executor("multi-exec-node".to_string(), "default", "multi-exec-ssn")
                 .await
                 .unwrap();
 
@@ -107,6 +119,7 @@ mod tests {
             let storage = storage::new_ptr(&ctx).await.unwrap();
             storage
                 .register_application(
+                    "default".to_string(),
                     "test-app".to_string(),
                     ApplicationAttributes {
                         shim: Shim::Cri,
@@ -121,7 +134,7 @@ mod tests {
                 .unwrap();
 
             let executor = storage
-                .create_executor("cri-node".to_string(), "cri-exec-ssn".to_string())
+                .create_executor("cri-node".to_string(), "default", "cri-exec-ssn")
                 .await
                 .unwrap();
 
@@ -130,11 +143,10 @@ mod tests {
 
         #[tokio::test]
         async fn returns_error_for_nonexistent_session() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let result = storage
-                .create_executor("some-node".to_string(), "nonexistent-ssn".to_string())
+                .create_executor("some-node".to_string(), "default", "nonexistent-ssn")
                 .await;
             assert!(result.is_err());
         }
@@ -145,8 +157,7 @@ mod tests {
 
         #[tokio::test]
         async fn returns_executor_by_id() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("get-exec-ssn");
             storage.create_session(attr).await.unwrap();
@@ -155,11 +166,11 @@ mod tests {
             storage.register_node(&node).await.unwrap();
 
             let created_exec = storage
-                .create_executor("get-exec-node".to_string(), "get-exec-ssn".to_string())
+                .create_executor("get-exec-node".to_string(), "default", "get-exec-ssn")
                 .await
                 .unwrap();
 
-            let exec_ptr = storage.get_executor_ptr(created_exec.id.clone()).unwrap();
+            let exec_ptr = storage.get_executor_ptr(&created_exec.name).unwrap();
             let exec = lock_ptr!(exec_ptr).unwrap();
 
             assert_eq!(exec.id, created_exec.id);
@@ -167,10 +178,9 @@ mod tests {
 
         #[tokio::test]
         async fn returns_error_for_nonexistent_executor() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
-            let result = storage.get_executor_ptr("nonexistent-exec".to_string());
+            let result = storage.get_executor_ptr("nonexistent-exec");
             assert!(result.is_err());
         }
     }
@@ -180,8 +190,7 @@ mod tests {
 
         #[tokio::test]
         async fn updates_executor_state() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("update-exec-ssn");
             storage.create_session(attr).await.unwrap();
@@ -190,25 +199,21 @@ mod tests {
             storage.register_node(&node).await.unwrap();
 
             let mut executor = storage
-                .create_executor(
-                    "update-exec-node".to_string(),
-                    "update-exec-ssn".to_string(),
-                )
+                .create_executor("update-exec-node".to_string(), "default", "update-exec-ssn")
                 .await
                 .unwrap();
 
             executor.state = ExecutorState::Idle;
             storage.update_executor(&executor).await.unwrap();
 
-            let exec_ptr = storage.get_executor_ptr(executor.id.clone()).unwrap();
+            let exec_ptr = storage.get_executor_ptr(&executor.name).unwrap();
             let exec = lock_ptr!(exec_ptr).unwrap();
             assert_eq!(exec.state, ExecutorState::Idle);
         }
 
         #[tokio::test]
         async fn updates_executor_with_session_binding() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("bind-exec-ssn");
             storage.create_session(attr).await.unwrap();
@@ -217,18 +222,18 @@ mod tests {
             storage.register_node(&node).await.unwrap();
 
             let mut executor = storage
-                .create_executor("bind-exec-node".to_string(), "bind-exec-ssn".to_string())
+                .create_executor("bind-exec-node".to_string(), "default", "bind-exec-ssn")
                 .await
                 .unwrap();
 
             executor.state = ExecutorState::Binding;
-            executor.ssn_id = Some("bind-exec-ssn".to_string());
+            executor.session = Some("bind-exec-ssn".to_string());
             storage.update_executor(&executor).await.unwrap();
 
-            let exec_ptr = storage.get_executor_ptr(executor.id.clone()).unwrap();
+            let exec_ptr = storage.get_executor_ptr(&executor.name).unwrap();
             let exec = lock_ptr!(exec_ptr).unwrap();
             assert_eq!(exec.state, ExecutorState::Binding);
-            assert_eq!(exec.ssn_id, Some("bind-exec-ssn".to_string()));
+            assert_eq!(exec.session, Some("bind-exec-ssn".to_string()));
         }
     }
 
@@ -237,8 +242,7 @@ mod tests {
 
         #[tokio::test]
         async fn deletes_executor_from_storage() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("del-exec-ssn");
             storage.create_session(attr).await.unwrap();
@@ -247,20 +251,22 @@ mod tests {
             storage.register_node(&node).await.unwrap();
 
             let executor = storage
-                .create_executor("del-exec-node".to_string(), "del-exec-ssn".to_string())
+                .create_executor("del-exec-node".to_string(), "default", "del-exec-ssn")
                 .await
                 .unwrap();
 
-            storage.delete_executor(executor.id.clone()).await.unwrap();
+            storage
+                .delete_executor("default", &executor.name)
+                .await
+                .unwrap();
 
-            let result = storage.get_executor_ptr(executor.id);
+            let result = storage.get_executor_ptr(&executor.name);
             assert!(result.is_err());
         }
 
         #[tokio::test]
         async fn delete_removes_from_list() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("del-list-ssn");
             storage.create_session(attr).await.unwrap();
@@ -269,13 +275,16 @@ mod tests {
             storage.register_node(&node).await.unwrap();
 
             let executor = storage
-                .create_executor("del-list-node".to_string(), "del-list-ssn".to_string())
+                .create_executor("del-list-node".to_string(), "default", "del-list-ssn")
                 .await
                 .unwrap();
 
             assert_eq!(storage.list_executors(None).unwrap().len(), 1);
 
-            storage.delete_executor(executor.id).await.unwrap();
+            storage
+                .delete_executor("default", &executor.name)
+                .await
+                .unwrap();
 
             assert_eq!(storage.list_executors(None).unwrap().len(), 0);
         }
@@ -286,8 +295,7 @@ mod tests {
 
         #[tokio::test]
         async fn deletes_multiple_executors() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("bulk-del-ssn");
             storage.create_session(attr).await.unwrap();
@@ -296,11 +304,11 @@ mod tests {
             storage.register_node(&node).await.unwrap();
 
             let exec1 = storage
-                .create_executor("bulk-del-node".to_string(), "bulk-del-ssn".to_string())
+                .create_executor("bulk-del-node".to_string(), "default", "bulk-del-ssn")
                 .await
                 .unwrap();
             let exec2 = storage
-                .create_executor("bulk-del-node".to_string(), "bulk-del-ssn".to_string())
+                .create_executor("bulk-del-node".to_string(), "default", "bulk-del-ssn")
                 .await
                 .unwrap();
 
@@ -317,8 +325,7 @@ mod tests {
 
         #[tokio::test]
         async fn returns_empty_list_when_no_executors() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let executors = storage.list_executors(None).unwrap();
             assert!(executors.is_empty());
@@ -326,8 +333,7 @@ mod tests {
 
         #[tokio::test]
         async fn returns_all_executors_with_no_filter() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("list-exec-ssn");
             storage.create_session(attr).await.unwrap();
@@ -337,7 +343,7 @@ mod tests {
 
             for _ in 0..3 {
                 storage
-                    .create_executor("list-exec-node".to_string(), "list-exec-ssn".to_string())
+                    .create_executor("list-exec-node".to_string(), "default", "list-exec-ssn")
                     .await
                     .unwrap();
             }
@@ -348,8 +354,7 @@ mod tests {
 
         #[tokio::test]
         async fn filters_by_state() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("filter-state-ssn");
             storage.create_session(attr).await.unwrap();
@@ -360,7 +365,8 @@ mod tests {
             let mut exec1 = storage
                 .create_executor(
                     "filter-state-node".to_string(),
-                    "filter-state-ssn".to_string(),
+                    "default",
+                    "filter-state-ssn",
                 )
                 .await
                 .unwrap();
@@ -370,7 +376,8 @@ mod tests {
             storage
                 .create_executor(
                     "filter-state-node".to_string(),
-                    "filter-state-ssn".to_string(),
+                    "default",
+                    "filter-state-ssn",
                 )
                 .await
                 .unwrap();
@@ -378,7 +385,7 @@ mod tests {
             let filter = ExecutorFilter {
                 state: Some(ExecutorState::Idle),
                 node: None,
-                ids: None,
+                names: None,
             };
             let filtered = storage.list_executors(Some(&filter)).unwrap();
             assert_eq!(filtered.len(), 1);
@@ -387,8 +394,7 @@ mod tests {
 
         #[tokio::test]
         async fn filters_by_node() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("filter-node-ssn");
             storage.create_session(attr).await.unwrap();
@@ -399,22 +405,22 @@ mod tests {
             storage.register_node(&node2).await.unwrap();
 
             storage
-                .create_executor("node-1".to_string(), "filter-node-ssn".to_string())
+                .create_executor("node-1".to_string(), "default", "filter-node-ssn")
                 .await
                 .unwrap();
             storage
-                .create_executor("node-1".to_string(), "filter-node-ssn".to_string())
+                .create_executor("node-1".to_string(), "default", "filter-node-ssn")
                 .await
                 .unwrap();
             storage
-                .create_executor("node-2".to_string(), "filter-node-ssn".to_string())
+                .create_executor("node-2".to_string(), "default", "filter-node-ssn")
                 .await
                 .unwrap();
 
             let filter = ExecutorFilter {
                 state: None,
                 node: Some("node-1".to_string()),
-                ids: None,
+                names: None,
             };
             let filtered = storage.list_executors(Some(&filter)).unwrap();
             assert_eq!(filtered.len(), 2);
@@ -423,8 +429,7 @@ mod tests {
 
         #[tokio::test]
         async fn filters_by_ids() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("filter-ids-ssn");
             storage.create_session(attr).await.unwrap();
@@ -433,35 +438,34 @@ mod tests {
             storage.register_node(&node).await.unwrap();
 
             let exec1 = storage
-                .create_executor("filter-ids-node".to_string(), "filter-ids-ssn".to_string())
+                .create_executor("filter-ids-node".to_string(), "default", "filter-ids-ssn")
                 .await
                 .unwrap();
             let exec2 = storage
-                .create_executor("filter-ids-node".to_string(), "filter-ids-ssn".to_string())
+                .create_executor("filter-ids-node".to_string(), "default", "filter-ids-ssn")
                 .await
                 .unwrap();
             storage
-                .create_executor("filter-ids-node".to_string(), "filter-ids-ssn".to_string())
+                .create_executor("filter-ids-node".to_string(), "default", "filter-ids-ssn")
                 .await
                 .unwrap();
 
             let filter = ExecutorFilter {
                 state: None,
                 node: None,
-                ids: Some(vec![exec1.id.clone(), exec2.id.clone()]),
+                names: Some(vec![exec1.name.clone(), exec2.name.clone()]),
             };
             let filtered = storage.list_executors(Some(&filter)).unwrap();
             assert_eq!(filtered.len(), 2);
 
-            let ids: Vec<_> = filtered.iter().map(|e| e.id.as_str()).collect();
-            assert!(ids.contains(&exec1.id.as_str()));
-            assert!(ids.contains(&exec2.id.as_str()));
+            let names: Vec<_> = filtered.iter().map(|e| e.name.as_str()).collect();
+            assert!(names.contains(&exec1.name.as_str()));
+            assert!(names.contains(&exec2.name.as_str()));
         }
 
         #[tokio::test]
         async fn combines_multiple_filters() {
-            let ctx = test_context();
-            let storage = storage::new_ptr(&ctx).await.unwrap();
+            let storage = test_storage().await;
 
             let attr = create_session_attr("multi-filter-ssn");
             storage.create_session(attr).await.unwrap();
@@ -472,21 +476,21 @@ mod tests {
             storage.register_node(&node2).await.unwrap();
 
             let mut exec1 = storage
-                .create_executor("mf-node-1".to_string(), "multi-filter-ssn".to_string())
+                .create_executor("mf-node-1".to_string(), "default", "multi-filter-ssn")
                 .await
                 .unwrap();
             exec1.state = ExecutorState::Idle;
             storage.update_executor(&exec1).await.unwrap();
 
             let mut exec2 = storage
-                .create_executor("mf-node-1".to_string(), "multi-filter-ssn".to_string())
+                .create_executor("mf-node-1".to_string(), "default", "multi-filter-ssn")
                 .await
                 .unwrap();
             exec2.state = ExecutorState::Binding;
             storage.update_executor(&exec2).await.unwrap();
 
             let mut exec3 = storage
-                .create_executor("mf-node-2".to_string(), "multi-filter-ssn".to_string())
+                .create_executor("mf-node-2".to_string(), "default", "multi-filter-ssn")
                 .await
                 .unwrap();
             exec3.state = ExecutorState::Idle;
@@ -495,7 +499,7 @@ mod tests {
             let filter = ExecutorFilter {
                 state: Some(ExecutorState::Idle),
                 node: Some("mf-node-1".to_string()),
-                ids: None,
+                names: None,
             };
             let filtered = storage.list_executors(Some(&filter)).unwrap();
             assert_eq!(filtered.len(), 1);

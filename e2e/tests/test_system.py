@@ -41,7 +41,7 @@ from flamepy.proto import types_pb2
 from e2e.api import TestContext
 from e2e.api import TestRequest as E2ETestRequest
 from e2e.helpers import invoke_task, serialize_common_data
-from tests.utils import deploy_e2e_application, random_string
+from tests.utils import deploy_e2e_application, random_name_suffix, random_string
 
 FLM_SYSTEM_TEST_APP = "flme2e-system-svc"
 SYSTEM_TESTS_ENV = "FLAME_E2E_SYSTEM_TESTS"
@@ -441,7 +441,7 @@ def _close_system_sessions():
             if session.application != FLM_SYSTEM_TEST_APP:
                 continue
             with suppress(Exception):
-                flamepy.close_session(session.id)
+                flamepy.close_session(session.name)
 
 
 def _unregister_system_application():
@@ -506,7 +506,7 @@ def test_parallel_sessions_task_stress():
         for session_spec in session_specs:
             session = flamepy.create_session(
                 application=FLM_SYSTEM_TEST_APP,
-                session_id=session_spec.session_id,
+                session=session_spec.session_id,
                 common_data=serialize_common_data(
                     TestContext(common_data=session_spec.common_data),
                     FLM_SYSTEM_TEST_APP,
@@ -555,7 +555,7 @@ def test_parallel_sessions_task_stress():
             elapsed_ms = (time.perf_counter() - task_started_at) * 1000
             assert response.output == task_spec.output_value
             assert response.common_data == task_spec.common_data
-            return task_spec.session_index, session.id, response.output, elapsed_ms
+            return task_spec.session_index, session.name, response.output, elapsed_ms
 
         outputs_by_session = Counter()
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -569,7 +569,7 @@ def test_parallel_sessions_task_stress():
         assert outputs_by_session == expected_counts
         session_results = []
         for index, session in enumerate(sessions):
-            refreshed = flamepy.get_session(session.id)
+            refreshed = flamepy.get_session(session.name)
             assert refreshed.state == flamepy.SessionState.OPEN
             assert refreshed.succeed >= expected_counts[index]
             assert refreshed.failed == 0
@@ -580,7 +580,7 @@ def test_parallel_sessions_task_stress():
                     "failed": refreshed.failed,
                     "common_data_bytes": len(session_specs[index].common_data),
                     "max_instances": session_specs[index].max_instances,
-                    "session_id": session.id,
+                    "session_id": session.name,
                     "state": refreshed.state.name,
                 }
             )
@@ -638,7 +638,7 @@ def test_single_session_longevity():
 
     session = flamepy.create_session(
         application=FLM_SYSTEM_TEST_APP,
-        session_id=f"system-longevity-{random_string(8)}",
+        session=f"system-longevity-{random_name_suffix(8)}",
         common_data=serialize_common_data(
             TestContext(common_data=common_data),
             FLM_SYSTEM_TEST_APP,
@@ -658,11 +658,11 @@ def test_single_session_longevity():
         while time.monotonic() < deadline or completed_tasks == 0:
             task_started_at = time.perf_counter()
             input_value = _payload(
-                f"{session.id}:input-tick-{completed_tasks}",
+                f"{session.name}:input-tick-{completed_tasks}",
                 payload_bytes,
             )
             output_value = _payload(
-                f"{session.id}:output-tick-{completed_tasks}",
+                f"{session.name}:output-tick-{completed_tasks}",
                 payload_bytes,
             )
             response = invoke_task(
@@ -677,7 +677,7 @@ def test_single_session_longevity():
             completed_tasks += 1
             task_latency_ms.append(round((time.perf_counter() - task_started_at) * 1000, 3))
 
-            refreshed = flamepy.get_session(session.id)
+            refreshed = flamepy.get_session(session.name)
             assert refreshed.state == flamepy.SessionState.OPEN
             assert refreshed.failed == 0
 
@@ -690,7 +690,7 @@ def test_single_session_longevity():
 
         elapsed_seconds = time.monotonic() - started_at
         perf_elapsed_seconds = time.perf_counter() - perf_started_at
-        final_session = flamepy.get_session(session.id)
+        final_session = flamepy.get_session(session.name)
         assert final_session.succeed >= completed_tasks
         assert final_session.failed == 0
         _write_system_report(
@@ -714,7 +714,7 @@ def test_single_session_longevity():
                 "session": {
                     "actual_succeed": final_session.succeed,
                     "failed": final_session.failed,
-                    "session_id": session.id,
+                    "session_id": session.name,
                     "state": final_session.state.name,
                 },
                 "task_latency_ms": _numeric_summary(task_latency_ms),
@@ -745,7 +745,7 @@ def test_app_fuzzed_task_workload():
     )
 
     cluster_before = _cluster_snapshot()
-    app_name = f"system-app-{random_string(8)}"
+    app_name = f"system-app-{random_name_suffix(8)}"
     started_at = time.perf_counter()
 
     app.init(app_name)

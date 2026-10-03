@@ -20,6 +20,7 @@ bincode = { workspace = true }
 async-trait = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
+url = { workspace = true }
 crc32fast = "1.3"
 
 time = { workspace = true }

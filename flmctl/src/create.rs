@@ -28,7 +28,8 @@ pub async fn run(
         &current_ctx.cluster.endpoint,
         current_ctx.cluster.tls.as_ref(),
     )
-    .await?;
+    .await?
+    .with_workspace(current_ctx.workspace.clone());
 
     // `resreq` is optional now — when omitted, the server applies
     // `cluster.resreq` or a hardcoded fallback.
@@ -38,7 +39,7 @@ pub async fn run(
         .transpose()?;
 
     let attr = SessionAttributes {
-        id: format!("{app}-{}", stdng::rand::short_name()),
+        name: format!("{app}-{}", stdng::rand::short_name()),
         application: app.to_owned(),
         common_data: None,
         tokens: Default::default(),
@@ -51,7 +52,7 @@ pub async fn run(
 
     let ssn = conn.create_session(&attr).await?;
 
-    println!("Session <{}> was created.", ssn.id);
+    println!("Session <{}> was created.", ssn.name);
 
     Ok(())
 }

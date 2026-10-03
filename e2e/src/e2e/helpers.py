@@ -140,8 +140,8 @@ def serialize_service_context(service_context: app.ServiceContext, app_name: str
     """
     # Serialize the context using cloudpickle
     serialized_ctx = cloudpickle.dumps(service_context, protocol=cloudpickle.DEFAULT_PROTOCOL)
-    # Generate key prefix in <app>/<session> format for caching
-    key_prefix = f"{app_name}/{short_name(app_name)}"
+    # Generate key prefix in <workspace>/<app>/<session> format for caching
+    key_prefix = f"default/{app_name}/{short_name(app_name)}"
     # Put in cache to get ObjectRef
     object_ref = put_object(key_prefix, serialized_ctx)
     # Encode ObjectRef to bytes for core API
@@ -197,7 +197,7 @@ def serialize_common_data(common_data: Optional[TestContext], app_name: str) -> 
     # Serialize with JSON
     serialized_ctx = json.dumps(asdict(common_data)).encode("utf-8")
     # Put in cache to get ObjectRef
-    key_prefix = f"{app_name}/{short_name(app_name)}"
+    key_prefix = f"default/{app_name}/{short_name(app_name)}"
     object_ref = put_object(key_prefix, serialized_ctx)
     # Encode ObjectRef to bytes for core API
     return object_ref.encode()
@@ -338,12 +338,12 @@ class RecursiveService:
 
         logger.info(f"[RecursiveService] compute_recursive called with depth={depth}")
         session_context = app.session_context()
-        logger.info(f"[RecursiveService] session_context: session_id={session_context.session_id}, app_name={session_context.application.name}")
+        logger.info(f"[RecursiveService] session_context: session={session_context.session}, app_name={session_context.application.name}")
 
         if depth <= 0:
             logger.info("[RecursiveService] Base case reached, returning 1")
             if include_session_ids:
-                return 1, [session_context.session_id]
+                return 1, [session_context.session]
             return 1
 
         try:
@@ -357,7 +357,7 @@ class RecursiveService:
                 pass
 
             inner_service = InnerRecursiveService.remote()
-            logger.info(f"[RecursiveService] Inner service created, session_id={inner_service._session.id}")
+            logger.info(f"[RecursiveService] Inner service created, session={inner_service._session.name}")
 
             logger.info(f"[RecursiveService] Calling compute_recursive({depth - 1}) on inner service")
             result = inner_service.compute_recursive(depth - 1, include_session_ids)
@@ -368,7 +368,7 @@ class RecursiveService:
             if include_session_ids:
                 value, session_ids = inner_value
                 final_result = value * 2
-                return final_result, [session_context.session_id, *session_ids]
+                return final_result, [session_context.session, *session_ids]
 
             final_result = inner_value * 2
             logger.info(f"[RecursiveService] Returning {final_result}")

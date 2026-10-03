@@ -205,7 +205,7 @@ verify_workloads() {
     done
     grep -Eq '"io.xflops.flame.managed-by"[[:space:]]*:[[:space:]]*"executor-manager"' \
         /tmp/flame-cri-containers
-    grep -q '"io.xflops.flame.executor-id"' /tmp/flame-cri-containers
+    grep -q '"io.xflops.flame.executor"' /tmp/flame-cri-containers
 }
 
 diagnostics() {

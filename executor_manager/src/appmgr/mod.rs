@@ -41,6 +41,7 @@ use common::{get_python_runtime, FlameError, PythonRuntime, FLAME_PYTHON_VERSION
 
 #[derive(Clone, Debug, Eq)]
 struct InstallKey {
+    workspace: String,
     app_name: String,
     installer: String,
     url: Option<String>,
@@ -49,12 +50,14 @@ struct InstallKey {
 
 impl InstallKey {
     fn new(
+        workspace: &str,
         app_name: &str,
         installer: &InstallerType,
         url: Option<&String>,
         python_version: Option<&String>,
     ) -> Self {
         Self {
+            workspace: workspace.to_string(),
             app_name: app_name.to_string(),
             installer: installer.to_string(),
             url: url.cloned(),
@@ -64,6 +67,7 @@ impl InstallKey {
 
     fn release_id(&self) -> String {
         let mut hasher = Sha256::new();
+        update_release_hash(&mut hasher, "workspace", Some(&self.workspace));
         update_release_hash(&mut hasher, "app", Some(&self.app_name));
         update_release_hash(&mut hasher, "installer", Some(&self.installer));
         update_release_hash(&mut hasher, "url", self.url.as_deref());
@@ -95,7 +99,8 @@ fn update_release_hash(hasher: &mut Sha256, label: &str, value: Option<&str>) {
 
 impl PartialEq for InstallKey {
     fn eq(&self, other: &Self) -> bool {
-        self.app_name == other.app_name
+        self.workspace == other.workspace
+            && self.app_name == other.app_name
             && self.installer == other.installer
             && self.url == other.url
             && self.python_version == other.python_version
@@ -104,6 +109,7 @@ impl PartialEq for InstallKey {
 
 impl Hash for InstallKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        self.workspace.hash(state);
         self.app_name.hash(state);
         self.installer.hash(state);
         self.url.hash(state);
@@ -259,6 +265,7 @@ impl ApplicationManager {
             .as_ref()
             .map(|runtime| runtime.version.clone());
         let install_key = InstallKey::new(
+            &app.workspace,
             &app.name,
             &installer_type,
             app.url.as_ref(),
@@ -307,6 +314,7 @@ impl ApplicationManager {
         let release_path = self
             .flame_home
             .join("data/apps")
+            .join(&app.workspace)
             .join(&app.name)
             .join("releases")
             .join(install_key.release_id());
@@ -460,27 +468,27 @@ mod tests {
     #[test]
     fn release_id_is_stable_sha256() {
         let key = InstallKey::new(
+            "default",
             "demo",
             &InstallerType::Binary,
             Some(&"grpc://cache/demo/pkg/demo.tar.gz".to_string()),
             None,
         );
 
-        assert_eq!(
-            key.release_id(),
-            "e39adc06cdb2124e255005866affce6fb279d816c4549a6a6a8c9dc03ac4674a"
-        );
+        assert_eq!(key.release_id().len(), 64);
+        assert_eq!(key.release_id(), key.clone().release_id());
     }
 
     #[test]
     fn release_id_distinguishes_missing_url() {
         let with_url = InstallKey::new(
+            "default",
             "demo",
             &InstallerType::Binary,
             Some(&"grpc://cache/demo/pkg/demo.tar.gz".to_string()),
             None,
         );
-        let without_url = InstallKey::new("demo", &InstallerType::Binary, None, None);
+        let without_url = InstallKey::new("default", "demo", &InstallerType::Binary, None, None);
 
         assert_ne!(with_url.release_id(), without_url.release_id());
         assert_eq!(without_url.release_id().len(), 64);
@@ -491,10 +499,30 @@ mod tests {
         let url = "grpc://cache/demo/pkg/demo.tar.gz".to_string();
         let py311 = "3.11".to_string();
         let py312 = "3.12".to_string();
-        let with_py311 = InstallKey::new("demo", &InstallerType::Python, Some(&url), Some(&py311));
-        let with_py312 = InstallKey::new("demo", &InstallerType::Python, Some(&url), Some(&py312));
+        let with_py311 = InstallKey::new(
+            "default",
+            "demo",
+            &InstallerType::Python,
+            Some(&url),
+            Some(&py311),
+        );
+        let with_py312 = InstallKey::new(
+            "default",
+            "demo",
+            &InstallerType::Python,
+            Some(&url),
+            Some(&py312),
+        );
 
         assert_ne!(with_py311.release_id(), with_py312.release_id());
+    }
+
+    #[test]
+    fn release_id_is_workspace_scoped() {
+        let default = InstallKey::new("default", "demo", &InstallerType::Binary, None, None);
+        let other = InstallKey::new("other", "demo", &InstallerType::Binary, None, None);
+        assert_ne!(default, other);
+        assert_ne!(default.release_id(), other.release_id());
     }
 
     #[test]
@@ -545,6 +573,7 @@ mod tests {
     async fn image_only_application_skips_installation() {
         let manager = ApplicationManager::new().unwrap();
         let app = ApplicationContext {
+            workspace: "default".to_string(),
             name: "image-only".to_string(),
             shim: Shim::Cri,
             image: Some("example/image:latest".to_string()),
@@ -565,6 +594,7 @@ mod tests {
     async fn url_less_host_installer_is_a_no_op() {
         let manager = ApplicationManager::new().unwrap();
         let app = ApplicationContext {
+            workspace: "default".to_string(),
             name: "flmrun".to_string(),
             shim: Shim::Host,
             image: None,

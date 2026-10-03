@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use stdng::{lock_ptr, new_ptr, MutexPtr};
 
-use crate::apis::{Event, EventOwner, SessionID, TaskID};
+use crate::apis::{Event, EventOwner, SessionGID};
 use crate::FlameError;
 
 use super::EventManager;
@@ -24,12 +24,15 @@ use super::EventManager;
 #[derive(Clone, Debug)]
 struct InMemoryEvent {
     code: i32,
-    message: String,
+    message: Option<String>,
     creation_time: i64,
 }
 
+type OwnerEvents = HashMap<Option<String>, Vec<InMemoryEvent>>;
+type Events = HashMap<SessionGID, OwnerEvents>;
+
 pub struct MemoryEventManager {
-    events: MutexPtr<HashMap<SessionID, HashMap<TaskID, Vec<InMemoryEvent>>>>,
+    events: MutexPtr<Events>,
 }
 
 impl MemoryEventManager {
@@ -50,13 +53,13 @@ impl EventManager for MemoryEventManager {
     fn record_event(&self, owner: EventOwner, event: Event) -> Result<(), FlameError> {
         let mut events = lock_ptr!(self.events)?;
         events
-            .entry(owner.session_id)
+            .entry(SessionGID::new(owner.workspace, owner.session))
             .or_default()
-            .entry(owner.task_id)
+            .entry(owner.task)
             .or_default()
             .push(InMemoryEvent {
                 code: event.code,
-                message: event.message.unwrap_or_default(),
+                message: event.message,
                 creation_time: event.creation_time.timestamp_millis(),
             });
         Ok(())
@@ -64,10 +67,11 @@ impl EventManager for MemoryEventManager {
 
     fn find_events(&self, owner: EventOwner) -> Result<Vec<Event>, FlameError> {
         let events = lock_ptr!(self.events)?;
-        let Some(session_events) = events.get(&owner.session_id) else {
+        let Some(session_events) = events.get(&SessionGID::new(owner.workspace, owner.session))
+        else {
             return Ok(vec![]);
         };
-        let Some(task_events) = session_events.get(&owner.task_id) else {
+        let Some(task_events) = session_events.get(&owner.task) else {
             return Ok(vec![]);
         };
 
@@ -77,16 +81,16 @@ impl EventManager for MemoryEventManager {
                 .ok_or(FlameError::Internal("Invalid creation time".to_string()))?;
             event_list.push(Event {
                 code: e.code,
-                message: Some(e.message.clone()),
+                message: e.message.clone(),
                 creation_time,
             });
         }
         Ok(event_list)
     }
 
-    fn remove_events(&self, session_id: SessionID) -> Result<(), FlameError> {
+    fn remove_events(&self, session: &SessionGID) -> Result<(), FlameError> {
         let mut events = lock_ptr!(self.events)?;
-        events.remove(&session_id);
+        events.remove(session);
         Ok(())
     }
 

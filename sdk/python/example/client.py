@@ -11,7 +11,7 @@ import flamepy
 def main():
     print("Creating session...")
     session = flamepy.create_session(application="flmtest", common_data=b"shared data")
-    print(f"Created session: {session.id}")
+    print(f"Created session: {session.name}")
 
     # Run a task synchronously and get its output
     print("\n1. Running task synchronously...")

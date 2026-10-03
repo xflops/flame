@@ -372,7 +372,7 @@ mod tests {
         let mut client = client().await;
         let put = client
             .put(stream::iter(write_messages(
-                "app/session",
+                "default/app/session",
                 "arrow.table",
                 b"base",
             )))
@@ -486,7 +486,11 @@ mod tests {
     async fn grpc_empty_payload_round_trip() {
         let mut client = client().await;
         let put = client
-            .put(stream::iter(write_messages("app/session", "raw", b"")))
+            .put(stream::iter(write_messages(
+                "default/app/session",
+                "raw",
+                b"",
+            )))
             .await
             .unwrap()
             .into_inner();
@@ -508,7 +512,7 @@ mod tests {
         let stored = b"client-zstd-frame";
         let put = client
             .put(stream::iter(write_messages(
-                "app/session",
+                "default/app/session",
                 "cloudpickle.zstd",
                 stored,
             )))

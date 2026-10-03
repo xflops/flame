@@ -42,7 +42,7 @@ pub trait StorageEngine: Send + Sync + 'static {
         delta: &Object,
     ) -> Result<ObjectMetadata, FlameError>;
 
-    /// Delete all objects matching the key prefix (app/session).
+    /// Delete all objects matching the key prefix (workspace/application/session).
     async fn delete_objects(&self, key: &ObjectKey) -> Result<(), FlameError>;
 
     /// Load all objects from storage (for startup recovery).

@@ -81,16 +81,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let handles =
         try_join_all((0..task_num).map(|_| ssn.invoke::<_, ScriptOutput>(&script))).await?;
-    let task_ids = handles
+    let task_names = handles
         .iter()
-        .map(|handle| handle.id().clone())
+        .map(|handle| handle.name().to_string())
         .collect::<Vec<_>>();
     let outputs = try_join_all(handles).await?;
 
-    for (task_id, output) in task_ids.into_iter().zip(outputs) {
+    for (task_name, output) in task_names.into_iter().zip(outputs) {
         println!(
             "Task {:<10}: {:?}",
-            task_id,
+            task_name,
             output.map(|output| output.data).unwrap_or_default()
         );
     }

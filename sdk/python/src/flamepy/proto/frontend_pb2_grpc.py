@@ -38,6 +38,16 @@ class FrontendStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.CreateWorkspace = channel.unary_unary(
+                '/flame.v1.Frontend/CreateWorkspace',
+                request_serializer=frontend__pb2.CreateWorkspaceRequest.SerializeToString,
+                response_deserializer=types__pb2.Workspace.FromString,
+                _registered_method=True)
+        self.ListWorkspaces = channel.unary_unary(
+                '/flame.v1.Frontend/ListWorkspaces',
+                request_serializer=frontend__pb2.ListWorkspacesRequest.SerializeToString,
+                response_deserializer=types__pb2.WorkspaceList.FromString,
+                _registered_method=True)
         self.RegisterApplication = channel.unary_unary(
                 '/flame.v1.Frontend/RegisterApplication',
                 request_serializer=frontend__pb2.RegisterApplicationRequest.SerializeToString,
@@ -135,6 +145,18 @@ class FrontendServicer(object):
     The frontend service of Flame, which is used to communicate with client sdk,
     e.g. create connection/session/task and so on.
     """
+
+    def CreateWorkspace(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListWorkspaces(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def RegisterApplication(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -248,6 +270,16 @@ class FrontendServicer(object):
 
 def add_FrontendServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'CreateWorkspace': grpc.unary_unary_rpc_method_handler(
+                    servicer.CreateWorkspace,
+                    request_deserializer=frontend__pb2.CreateWorkspaceRequest.FromString,
+                    response_serializer=types__pb2.Workspace.SerializeToString,
+            ),
+            'ListWorkspaces': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListWorkspaces,
+                    request_deserializer=frontend__pb2.ListWorkspacesRequest.FromString,
+                    response_serializer=types__pb2.WorkspaceList.SerializeToString,
+            ),
             'RegisterApplication': grpc.unary_unary_rpc_method_handler(
                     servicer.RegisterApplication,
                     request_deserializer=frontend__pb2.RegisterApplicationRequest.FromString,
@@ -351,6 +383,60 @@ class Frontend(object):
     The frontend service of Flame, which is used to communicate with client sdk,
     e.g. create connection/session/task and so on.
     """
+
+    @staticmethod
+    def CreateWorkspace(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/flame.v1.Frontend/CreateWorkspace',
+            frontend__pb2.CreateWorkspaceRequest.SerializeToString,
+            types__pb2.Workspace.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListWorkspaces(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/flame.v1.Frontend/ListWorkspaces',
+            frontend__pb2.ListWorkspacesRequest.SerializeToString,
+            types__pb2.WorkspaceList.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def RegisterApplication(request,

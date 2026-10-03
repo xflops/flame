@@ -114,7 +114,7 @@ from flamepy.core.cache import (
 )
 
 # Put an object (returns ObjectRef with version=1)
-ref = put_object("app/session", my_data)
+ref = put_object("default/app/session", my_data)
 print(f"Stored at: {ref.key}, version: {ref.version}")
 
 # The SDK uses ZSTD for arrays, tables, data frames, and tensors regardless
