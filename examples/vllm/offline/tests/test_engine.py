@@ -15,7 +15,7 @@ from flamepy.core.service import ApplicationContext, SessionContext
 class FakeLLM:
     creations = 0
 
-    def __init__(self, *, model: str, enable_prefix_caching: bool) -> None:
+    def __init__(self, *, model: str, enable_prefix_caching: bool, **kwargs) -> None:
         self.model = model
         self.enable_prefix_caching = enable_prefix_caching
         self.cached_prompts = set()
@@ -50,6 +50,9 @@ with (
 class VllmEngineTest(unittest.TestCase):
     def setUp(self) -> None:
         FakeLLM.creations = 0
+        vllm_patch = patch.dict(sys.modules, {"vllm": fake_vllm})
+        vllm_patch.start()
+        self.addCleanup(vllm_patch.stop)
 
     def test_service_publishes_prompt_keys(self) -> None:
         service = FlameRunpyService()

@@ -44,6 +44,37 @@ and leave FEM CPU and memory limits unset. Host discovery does not subtract
 resources used by Kubernetes or other services. GPU workers require a compatible
 image and host driver libraries.
 
+For GPU workers, expose the host NVIDIA devices and driver libraries to FEM.
+With GPU Operator drivers installed under `/run/nvidia`, add:
+
+```yaml
+executorManager:
+  extraVolumes:
+    - name: host-devices
+      hostPath:
+        path: /dev
+        type: Directory
+    - name: nvidia-driver
+      hostPath:
+        path: /run/nvidia
+        type: DirectoryOrCreate
+  extraVolumeMounts:
+    - name: host-devices
+      mountPath: /dev
+    - name: nvidia-driver
+      mountPath: /run/nvidia
+      readOnly: true
+  extraEnv:
+    - name: LD_LIBRARY_PATH
+      value: /run/nvidia/driver/usr/lib/x86_64-linux-gnu
+    - name: PATH
+      value: /run/nvidia/driver/usr/bin:/usr/local/flame/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+```
+
+These paths match x86_64 GPU Operator hosts; adapt them to the host driver
+installation. NVML provides GPU discovery, and Host services inherit the devices
+and library paths. CPU workers in the same DaemonSet report zero GPUs.
+
 SRE must arrange a maintenance window and ensure workers have no tasks before
 updating or deleting FEM Pods. Kubernetes enforces `terminationGracePeriodSeconds`;
 FEM does not automatically drain tasks on termination. DaemonSet updates use
@@ -53,17 +84,27 @@ the maintenance window.
 Session-manager and object-cache Pods retain their own security and networking
 settings. The chart does not create application Pods or use a Kubernetes provider.
 
+Image versions are configurable through `global.imageTag`; each component can
+also set its own `image.tag`. For testing with `latest`, use
+`global.imagePullPolicy=Always` to pull the current image on each Pod start.
+
 ## Install
 
+Use `flame-system` as the default namespace. For each test iteration, uninstall
+the existing release, update the Helm values, and install again:
+
 ```bash
-helm install flame ./charts/flame --namespace flame --create-namespace
+helm uninstall flame --namespace flame-system --ignore-not-found --wait
+# Update your Helm values for the next test.
+helm install flame ./charts/flame --namespace flame-system --create-namespace \
+  --set global.imageTag=latest --set global.imagePullPolicy=Always
 ```
 
 For local Kind testing without persistent volumes:
 
 ```bash
 helm install flame ./charts/flame \
-  --namespace flame \
+  --namespace flame-system \
   --create-namespace \
   --set sessionManager.persistence.enabled=false \
   --set objectCache.persistence.enabled=false
@@ -73,7 +114,7 @@ To install multiple object-cache replicas:
 
 ```bash
 helm install flame ./charts/flame \
-  --namespace flame \
+  --namespace flame-system \
   --create-namespace \
   --set objectCache.replicas=3
 ```
@@ -81,15 +122,15 @@ helm install flame ./charts/flame \
 ## Verify
 
 ```bash
-helm test flame --namespace flame
-kubectl -n flame get pods,svc
+helm test flame --namespace flame-system
+kubectl -n flame-system get pods,svc
 ```
 
 Port-forward for local inspection:
 
 ```bash
-kubectl -n flame port-forward svc/flame-session-manager 8080:8080
-kubectl -n flame port-forward svc/flame-object-cache 9090:9090
+kubectl -n flame-system port-forward svc/flame-session-manager 8080:8080
+kubectl -n flame-system port-forward svc/flame-object-cache 9090:9090
 ```
 
 Then configure local clients:

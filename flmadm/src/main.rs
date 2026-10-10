@@ -64,7 +64,7 @@ enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Install all example binaries under FLAME_HOME/examples.
+        /// Install all supported examples under FLAME_HOME/examples.
         #[arg(long)]
         with_examples: bool,
 

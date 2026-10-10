@@ -75,7 +75,7 @@ impl Default for InstallConfig {
     }
 }
 
-/// A buildable example whose release binaries can be installed by flmadm.
+/// An example whose binaries and source assets can be installed by flmadm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExampleSpec {
     pub name: &'static str,
@@ -101,11 +101,44 @@ const EXAMPLES: &[ExampleSpec] = &[
         assets: &[".python-version", "README.md", "main.py", "pyproject.toml"],
     },
     ExampleSpec {
+        name: "agents/scripts",
+        package: "agent-scripts",
+        relative_dir: "agents/scripts",
+        binaries: &[],
+        assets: &["README.md", "main.py"],
+    },
+    ExampleSpec {
+        name: "vllm/offline",
+        package: "flame-vllm",
+        relative_dir: "vllm/offline",
+        binaries: &[],
+        assets: &[
+            ".python-version",
+            "README.md",
+            "main.py",
+            "engine.py",
+            "pyproject.toml",
+        ],
+    },
+    ExampleSpec {
+        name: "vllm/serving",
+        package: "flame-vllm-serving",
+        relative_dir: "vllm/serving",
+        binaries: &[],
+        assets: &[
+            ".python-version",
+            "README.md",
+            "client.py",
+            "service.py",
+            "pyproject.toml",
+        ],
+    },
+    ExampleSpec {
         name: "candle/based",
         package: "candle-based-example",
         relative_dir: "candle/based",
         binaries: &["candle-based-example", "candle-based-example-service"],
-        assets: &["candle-based-example.yaml", "README.md"],
+        assets: &["README.md"],
     },
 ];
 

@@ -1,0 +1,16 @@
+[project]
+name = "flame-vllm"
+version = "0.2.0"
+description = "Retained vLLM engine and prefix-cache reuse with flamepy.app"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+	"vllm==0.12.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main", "engine"]

@@ -37,6 +37,11 @@ cache:
 Stale application-data garbage collection is always enabled. The `gc` section
 only overrides its 60-second default interval.
 
+Disk storage removes empty session and application directories after deletion.
+Startup recovery also removes empty directories left by earlier versions.
+Nonempty directories, the cache root, and the filesystem's `lost+found`
+directory are preserved.
+
 ### Client Configuration (`flame.yaml`)
 
 ```yaml

@@ -65,8 +65,19 @@ WARN[0000] No services to build
 
 Step 2: log in to flame-console and run the pi example
 
+Load the installed Flame SDK before starting `uv`. The example's project
+dependencies provide NumPy; `flamepy` comes from the Flame installation through
+`PYTHONPATH`, which `flmenv.sh` sets. A fresh console shell needs this step:
+
+```shell
+source /usr/local/flame/sbin/flmenv.sh --python-version 3.12
+cd /usr/local/flame/examples/pi/python
+uv run main.py
+```
+
 ```shell
 [klausm@flm-worker flame]$ docker compose exec -it flame-console /bin/bash
+root@0e24c41da5f5:/# source /usr/local/flame/sbin/flmenv.sh --python-version 3.12
 root@0e24c41da5f5:/# cd /opt/examples/pi/python/
 root@0e24c41da5f5:/opt/examples/pi/python# ls
 README.md  main.py  pyproject.toml

@@ -28,8 +28,6 @@ repeated text. Use `--temperature 0` only when deterministic output is required.
   model options as common data, invokes one generation task, prints the text, and
   closes the session.
 - `src/api.rs`: Shared typed request, response, and model option messages.
-- `candle-based-example.yaml`: Registration manifest for installed examples
-  that use `/usr/local/flame/examples/candle/based/candle-based-example-service`.
 
 ## Flame Integration Surface
 
@@ -90,9 +88,6 @@ flmctl deploy \
   --name candle-based-example \
   --application /usr/local/flame/examples/candle/based/candle-based-example-service
 ```
-
-If you register `candle-based-example.yaml` directly instead, its command path
-expects the installed example layout under `/usr/local/flame/examples`.
 
 ## Run The Client
 
@@ -215,7 +210,7 @@ Flame session options:
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--app` | required | Flame application name used during deploy or register. |
+| `--app` | required | Flame application name used during deploy. |
 | `--session-id` | generated | Explicit Flame session id. |
 | `--min-instances` | `1` | Minimum service instances for the session. |
 | `--max-instances` | `1` | Maximum service instances for the session. |
@@ -230,5 +225,5 @@ Flame session options:
   deterministic argmax and can make repetition worse for this model.
 - If local model files are not found, confirm the paths exist on the service
   worker, not only on the machine running the client.
-- If the client cannot find the application, deploy or register the service and
+- If the client cannot find the application, deploy the service and
   pass that exact name with `--app`.

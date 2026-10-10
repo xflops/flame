@@ -28,6 +28,7 @@ const MAX_DELTAS_PER_OBJECT: u64 = 1000;
 const OPAQUE_MAGIC: &[u8; 8] = b"FLCACHE\0";
 const OPAQUE_FORMAT_VERSION: u8 = 3;
 const OPAQUE_HEADER_LEN: usize = 8 + 1 + 8 + 8 + 8 + 4;
+const LOST_FOUND_DIR: &str = "lost+found";
 
 pub struct DiskStorage {
     storage_path: PathBuf,
@@ -191,6 +192,8 @@ impl StorageEngine for DiskStorage {
     }
 
     async fn delete_objects(&self, key: &ObjectKey) -> Result<(), FlameError> {
+        let session_dir = self.session_dir(key);
+        let app_dir = self.app_dir(key);
         let object_path = key.object_id.as_ref().map(|_| self.object_path(key));
         let delta_dir = key.object_id.as_ref().map(|_| self.delta_dir(key));
         let dir_to_delete = if object_path.is_none() && key.is_all_sessions() {
@@ -220,6 +223,8 @@ impl StorageEngine for DiskStorage {
                     tracing::debug!("Deleted directory: {:?}", path);
                 }
             }
+            remove_empty_dir(&session_dir);
+            remove_empty_dir(&app_dir);
             Ok(())
         })
         .await
@@ -240,7 +245,7 @@ impl StorageEngine for DiskStorage {
                 let app_entry = app_entry?;
                 let app_path = app_entry.path();
 
-                if !app_path.is_dir() {
+                if !app_path.is_dir() || app_entry.file_name() == LOST_FOUND_DIR {
                     continue;
                 }
 
@@ -306,7 +311,9 @@ impl StorageEngine for DiskStorage {
 
                         results.push((key, object));
                     }
+                    remove_empty_dir(&session_path);
                 }
+                remove_empty_dir(&app_path);
             }
 
             tracing::info!("Loaded {} objects from disk", results.len());
@@ -314,6 +321,24 @@ impl StorageEngine for DiskStorage {
         })
         .await
         .map_err(|e| FlameError::Internal(format!("Task join error: {}", e)))?
+    }
+}
+
+fn remove_empty_dir(path: &Path) {
+    match fs::remove_dir(path) {
+        Ok(()) => {
+            tracing::debug!("Removed empty cache directory: {:?}", path);
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "failed to remove empty cache directory"
+        ),
     }
 }
 
@@ -652,6 +677,8 @@ mod tests {
 
         assert!(storage.read_object(&key1).await.unwrap().is_none());
         assert!(storage.read_object(&key2).await.unwrap().is_none());
+        assert!(!storage.app_dir(&key1).exists());
+        assert!(temp_dir.path().exists());
     }
 
     #[tokio::test]
@@ -681,6 +708,98 @@ mod tests {
         assert!(storage.read_object(&key1).await.unwrap().is_none());
         assert!(!key1_delta_dir.exists());
         assert!(storage.read_object(&key2).await.unwrap().is_some());
+        assert!(storage.session_dir(&key2).exists());
+
+        storage.delete_objects(&key2).await.unwrap();
+        assert!(!storage.session_dir(&key2).exists());
+        assert!(!storage.app_dir(&key2).exists());
+        assert!(temp_dir.path().exists());
+        storage.delete_objects(&key2).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_disk_storage_pruning_preserves_other_sessions() {
+        let temp_dir = tempdir().unwrap();
+        let storage = DiskStorage::new(temp_dir.path().to_path_buf()).unwrap();
+        let key1 = test_key("app", "session1", "obj");
+        let key2 = test_key("app", "session2", "obj");
+        for key in [&key1, &key2] {
+            storage
+                .write_object(key, &Object::new(1, vec![1]))
+                .await
+                .unwrap();
+        }
+
+        storage.delete_objects(&key1).await.unwrap();
+        assert!(!storage.session_dir(&key1).exists());
+        assert!(storage.app_dir(&key1).exists());
+        assert!(storage.read_object(&key2).await.unwrap().is_some());
+
+        storage
+            .delete_objects(&ObjectKey::from_path("app/*").unwrap())
+            .await
+            .unwrap();
+        assert!(!storage.app_dir(&key1).exists());
+        assert!(temp_dir.path().exists());
+    }
+
+    #[tokio::test]
+    async fn test_disk_storage_recovery_prunes_legacy_empty_directories() {
+        let temp_dir = tempdir().unwrap();
+        let storage = DiskStorage::new(temp_dir.path().to_path_buf()).unwrap();
+        let key = test_key("live-app", "live-session", "obj");
+        storage
+            .write_object(&key, &Object::new(1, vec![1]))
+            .await
+            .unwrap();
+        for directory in [
+            "old-app/pkg",
+            "old-app/session",
+            "live-app/old-session",
+            LOST_FOUND_DIR,
+        ] {
+            fs::create_dir_all(temp_dir.path().join(directory)).unwrap();
+        }
+
+        assert_eq!(storage.load_objects().await.unwrap().len(), 1);
+        assert!(!temp_dir.path().join("old-app").exists());
+        assert!(!temp_dir.path().join("live-app/old-session").exists());
+        assert!(temp_dir.path().join(LOST_FOUND_DIR).exists());
+        assert!(storage.read_object(&key).await.unwrap().is_some());
+        assert!(temp_dir.path().exists());
+    }
+
+    #[tokio::test]
+    async fn test_disk_storage_pruning_with_independent_application_writes() {
+        use std::sync::Arc;
+
+        let temp_dir = tempdir().unwrap();
+        let storage = Arc::new(DiskStorage::new(temp_dir.path().to_path_buf()).unwrap());
+        let mut tasks = Vec::new();
+        for i in 0..32 {
+            let storage = Arc::clone(&storage);
+            tasks.push(tokio::spawn(async move {
+                let stale = test_key(&format!("stale-app-{i}"), "session", "object");
+                let retained = test_key(&format!("active-app-{i}"), "session", "object");
+                storage
+                    .write_object(&stale, &Object::new(1, vec![1]))
+                    .await
+                    .unwrap();
+                let object = Object::new(1, vec![2]);
+                let (deleted, written) = tokio::join!(
+                    storage.delete_objects(&stale),
+                    storage.write_object(&retained, &object),
+                );
+                deleted.unwrap();
+                written.unwrap();
+                retained
+            }));
+        }
+        for task in tasks {
+            let key = task.await.unwrap();
+            assert!(storage.read_object(&key).await.unwrap().is_some());
+        }
+        assert_eq!(storage.load_objects().await.unwrap().len(), 32);
     }
 
     #[tokio::test]

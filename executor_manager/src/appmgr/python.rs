@@ -168,8 +168,19 @@ impl Installer for PythonInstaller {
         env_vars.insert("PYTHONPATH".to_string(), python_paths.join(":"));
 
         let mut ld_paths = Self::find_native_lib_paths(&deps_path);
-        if let Some(app_ld_path) = app_environments.get("LD_LIBRARY_PATH") {
-            ld_paths.push(app_ld_path.clone());
+        let inherited_ld_path = std::env::var("LD_LIBRARY_PATH").ok();
+        // Keep dependency/application precedence while retaining host libraries,
+        // such as NVIDIA drivers mounted into the executor manager.
+        for path in [
+            app_environments.get("LD_LIBRARY_PATH").map(String::as_str),
+            inherited_ld_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !path.is_empty() {
+                ld_paths.push(path.to_string());
+            }
         }
         if !ld_paths.is_empty() {
             env_vars.insert("LD_LIBRARY_PATH".to_string(), ld_paths.join(":"));
@@ -212,5 +223,60 @@ impl Installer for PythonInstaller {
 
     fn name(&self) -> &'static str {
         "python"
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::{Installer, PythonInstaller};
+
+    #[tokio::test]
+    async fn install_preserves_inherited_library_path_after_dependency_and_application_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let src = home.path().join("release/src");
+        let native_dir = home.path().join("release/deps/torch/lib");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&native_dir).unwrap();
+        fs::write(
+            src.join("pyproject.toml"),
+            "[project]\nname = 'test-app'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(native_dir.join("libtorch.so"), b"").unwrap();
+
+        // Avoid package downloads; the fixture already provides installed libraries.
+        let bin = home.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let uv = bin.join("uv");
+        fs::write(&uv, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&uv, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let inherited_path = std::env::var("LD_LIBRARY_PATH").ok();
+        let installer = PythonInstaller::new();
+        for application_path in [Some("/app/lib:/app/vendor/lib"), None, Some("")] {
+            let mut app_environment = HashMap::new();
+            let mut expected_paths = vec![native_dir.to_string_lossy().into_owned()];
+            if let Some(path) = application_path {
+                app_environment.insert("LD_LIBRARY_PATH".into(), path.into());
+                if !path.is_empty() {
+                    expected_paths.push(path.into());
+                }
+            }
+            if let Some(path) = inherited_path.as_ref().filter(|path| !path.is_empty()) {
+                expected_paths.push(path.clone());
+            }
+            let environment = installer
+                .install("test-app", &src, home.path(), &app_environment)
+                .await
+                .unwrap();
+            assert_eq!(
+                environment.get("LD_LIBRARY_PATH"),
+                Some(&expected_paths.join(":"))
+            );
+        }
     }
 }

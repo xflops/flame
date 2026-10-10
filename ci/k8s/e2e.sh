@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 RELEASE="${RELEASE:-flame}"
-NAMESPACE="${NAMESPACE:-flame-k8s-e2e}"
+NAMESPACE="${NAMESPACE:-flame-system}"
 CHART_DIR="${CHART_DIR:-${ROOT_DIR}/charts/flame}"
 IMAGE_REGISTRY="${IMAGE_REGISTRY:-xflops}"
 IMAGE_TAG="${IMAGE_TAG:-ci}"
@@ -239,6 +239,10 @@ install_external_infrastructure() {
 }
 
 install_flame() {
+    log "Uninstalling existing Flame release"
+    helm uninstall "$RELEASE" --namespace "$NAMESPACE" --ignore-not-found \
+        --wait --timeout "$TIMEOUT"
+
     log "Linting chart"
     helm lint "$CHART_DIR" "${HELM_E2E_ARGS[@]}" "$@"
 
@@ -249,7 +253,7 @@ install_flame() {
         "$@" >"${TMPDIR:-/tmp}/flame-k8s-e2e-rendered.yaml"
 
     log "Installing chart into namespace ${NAMESPACE}"
-    helm upgrade --install "$RELEASE" "$CHART_DIR" \
+    helm install "$RELEASE" "$CHART_DIR" \
         --namespace "$NAMESPACE" \
         --create-namespace \
         --wait \

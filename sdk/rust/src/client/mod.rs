@@ -518,6 +518,8 @@ pub struct Node {
     pub state: NodeState,
     pub cpu: u64,
     pub memory: u64,
+    #[serde(default)]
+    pub gpu: i32,
     pub arch: String,
     pub os: String,
 }
@@ -1664,6 +1666,7 @@ impl From<&rpc::Node> for Node {
             state,
             cpu: capacity.cpu,
             memory: capacity.memory,
+            gpu: capacity.gpu,
             arch: info.arch,
             os: info.os,
         }
@@ -1751,6 +1754,51 @@ mod tests {
     use bytes::Bytes;
     use chrono::TimeZone;
     use serde_derive::{Deserialize, Serialize};
+
+    #[test]
+    fn node_conversion_preserves_gpu_capacity() {
+        let response = rpc::Node {
+            status: Some(rpc::NodeStatus {
+                capacity: Some(rpc::ResourceRequirement {
+                    cpu: 192,
+                    memory: 2 * 1024_u64.pow(4),
+                    gpu: 8,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let node = Node::from(&response);
+        assert_eq!(node.cpu, 192);
+        assert_eq!(node.memory, 2 * 1024_u64.pow(4));
+        assert_eq!(node.gpu, 8);
+        assert_eq!(Node::from(response).gpu, 8);
+        assert_eq!(serde_json::to_value(node).unwrap()["gpu"], 8);
+    }
+
+    #[test]
+    fn node_conversion_defaults_missing_capacity_to_zero() {
+        let node = Node::from(rpc::Node::default());
+        assert_eq!(node.cpu, 0);
+        assert_eq!(node.memory, 0);
+        assert_eq!(node.gpu, 0);
+    }
+
+    #[test]
+    fn node_json_without_gpu_remains_compatible() {
+        let node: Node = serde_json::from_value(serde_json::json!({
+            "name": "node-1",
+            "hostname": "node-1",
+            "state": "Ready",
+            "cpu": 16,
+            "memory": 32 * 1024_u64.pow(3),
+            "arch": "x86_64",
+            "os": "linux"
+        }))
+        .unwrap();
+        assert_eq!(node.gpu, 0);
+    }
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct TestCommonData {

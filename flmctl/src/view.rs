@@ -255,6 +255,7 @@ async fn view_node(
     println!("{:<15}", "Capacity:");
     println!("  {:<13}{}", "CPU:", node.cpu);
     println!("  {:<13}{}", "Memory:", format_memory(node.memory));
+    println!("  {:<13}{}", "GPU:", node.gpu);
     println!("{:<15}", "Info:");
     println!("  {:<13}{}", "Arch:", node.arch);
     println!("  {:<13}{}", "OS:", node.os);

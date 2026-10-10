@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from hashlib import sha256
 
 import flamepy.app as app  # noqa: PLR0402
-from vllm import LLM, SamplingParams
 
 MODEL = "facebook/opt-125m"
 
@@ -27,10 +26,21 @@ class VllmEngine:
     """A vLLM class service retained across App session changes."""
 
     def __init__(self, model: str = MODEL) -> None:
+        from vllm import LLM
+
         self.model = model
-        self.llm = LLM(model=model, enable_prefix_caching=True)
+        self.llm = LLM(
+            model=model,
+            enable_prefix_caching=True,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=0.1,
+            max_model_len=1024,
+            enforce_eager=True,
+        )
 
     def generate(self, prompt: str) -> GenerationResult:
+        from vllm import SamplingParams
+
         key = kv_key(self.model, prompt)
         output = self.llm.generate(prompt, SamplingParams(max_tokens=32))[0]
         app.publish_attributes({key})

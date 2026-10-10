@@ -143,7 +143,7 @@ sudo flmadm uninstall --backup-dir /backups/flame-backup-2026-01-28
 - `--worker`: Install worker components only (flame-executor-manager, flmping-service, flmexec-service, flamepy)
 - `--cache`: Install cache component only (flame-object-cache)
 - `--client`: Install client components only (flmping, flmexec, flamepy)
-- `--with-examples`: Install all supported example binaries under `${PREFIX}/examples`
+- `--with-examples`: Install all supported example binaries and Python sources under `${PREFIX}/examples`, including vLLM
 - `--no-systemd`: Skip systemd service generation (for user-local installs)
 - `--enable`: Enable and start systemd services after installation
 - `--skip-build`: Skip building from source (use pre-built binaries)
@@ -248,7 +248,11 @@ ${PREFIX}/
 │   └── flmadm
 ├── sdk/python/             # Python SDK
 ├── examples/               # Optional example binaries, docs, and manifests from --with-examples
+│   ├── agents/scripts/
 │   ├── pi/rust/
+│   ├── pi/python/
+│   ├── vllm/offline/
+│   ├── vllm/serving/
 │   └── candle/based/
 ├── work/                   # Working directory
 │   ├── sessions/

@@ -48,7 +48,7 @@ impl InstallationManager {
         Ok(())
     }
 
-    /// Install example binaries under FLAME_HOME/examples when requested.
+    /// Install example binaries and source assets under FLAME_HOME/examples when requested.
     pub fn install_examples(
         &self,
         src_dir: &Path,
@@ -844,6 +844,10 @@ mod tests {
             fs::write(pi_dir.join("README.md"), "readme").unwrap();
 
             let python_pi_dir = src_dir.join("examples/pi/python");
+            let agent_scripts_dir = src_dir.join("examples/agents/scripts");
+            fs::create_dir_all(&agent_scripts_dir).unwrap();
+            fs::write(agent_scripts_dir.join("README.md"), "agent scripts").unwrap();
+            fs::write(agent_scripts_dir.join("main.py"), "# agent.open_session").unwrap();
             fs::create_dir_all(&python_pi_dir).unwrap();
             fs::write(python_pi_dir.join(".python-version"), "3.12").unwrap();
             fs::write(python_pi_dir.join("README.md"), "readme").unwrap();
@@ -854,13 +858,27 @@ mod tests {
             )
             .unwrap();
 
+            for (name, modules) in [
+                ("offline", ["main.py", "engine.py"]),
+                ("serving", ["client.py", "service.py"]),
+            ] {
+                let vllm_dir = src_dir.join("examples/vllm").join(name);
+                fs::create_dir_all(&vllm_dir).unwrap();
+                fs::write(vllm_dir.join(".python-version"), "3.12").unwrap();
+                fs::write(vllm_dir.join("README.md"), format!("vllm {name}")).unwrap();
+                for module in modules {
+                    fs::write(vllm_dir.join(module), format!("# {module}")).unwrap();
+                }
+                fs::write(
+                    vllm_dir.join("pyproject.toml"),
+                    "[project]\nname = 'flame-vllm'\n",
+                )
+                .unwrap();
+                fs::write(vllm_dir.join("uv.lock"), "uninstalled lock file").unwrap();
+            }
+
             let example_dir = src_dir.join("examples/candle/based");
             fs::create_dir_all(&example_dir).unwrap();
-            fs::write(
-                example_dir.join("candle-based-example.yaml"),
-                "metadata: {}\n",
-            )
-            .unwrap();
             fs::write(example_dir.join("README.md"), "readme").unwrap();
         }
 
@@ -886,6 +904,32 @@ mod tests {
             assert!(paths.examples.join("pi/python/main.py").exists());
             assert!(paths.examples.join("pi/python/pyproject.toml").exists());
             assert!(!paths.examples.join("pi/python/pi").exists());
+            for asset in ["README.md", "main.py"] {
+                assert_eq!(
+                    fs::read(paths.examples.join("agents/scripts").join(asset)).unwrap(),
+                    fs::read(src_dir.join("examples/agents/scripts").join(asset)).unwrap(),
+                );
+            }
+            for (name, modules) in [
+                ("offline", ["main.py", "engine.py"]),
+                ("serving", ["client.py", "service.py"]),
+            ] {
+                for asset in [".python-version", "README.md", "pyproject.toml"]
+                    .into_iter()
+                    .chain(modules)
+                {
+                    assert_eq!(
+                        fs::read(paths.examples.join("vllm").join(name).join(asset)).unwrap(),
+                        fs::read(src_dir.join("examples/vllm").join(name).join(asset)).unwrap(),
+                    );
+                }
+                assert!(!paths
+                    .examples
+                    .join("vllm")
+                    .join(name)
+                    .join("uv.lock")
+                    .exists());
+            }
 
             assert!(paths
                 .examples
@@ -894,10 +938,6 @@ mod tests {
             assert!(paths
                 .examples
                 .join("candle/based/candle-based-example-service")
-                .exists());
-            assert!(paths
-                .examples
-                .join("candle/based/candle-based-example.yaml")
                 .exists());
             assert!(paths.examples.join("candle/based/README.md").exists());
             assert!(!paths.bin.join("candle-based-example").exists());
@@ -934,6 +974,7 @@ mod tests {
                 .unwrap();
 
             assert!(!paths.examples.join("pi/rust/pi").exists());
+            assert!(!paths.examples.join("vllm").exists());
             assert!(!paths
                 .examples
                 .join("candle/based/candle-based-example")

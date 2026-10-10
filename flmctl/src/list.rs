@@ -175,7 +175,7 @@ async fn list_nodes(conn: Connection, output_format: &str) -> Result<(), Box<dyn
     }
     let mut table = Table::new();
     table.load_preset(NOTHING).set_header(vec![
-        "NAME", "HOSTNAME", "STATUS", "CPU", "MEMORY", "ARCH", "OS",
+        "NAME", "HOSTNAME", "STATUS", "CPU", "MEMORY", "GPU", "ARCH", "OS",
     ]);
 
     for node in &node_list {
@@ -190,6 +190,7 @@ async fn list_nodes(conn: Connection, output_format: &str) -> Result<(), Box<dyn
             status.to_string(),
             node.cpu.to_string(),
             format_memory(node.memory),
+            node.gpu.to_string(),
             node.arch.to_string(),
             node.os.to_string(),
         ]);
