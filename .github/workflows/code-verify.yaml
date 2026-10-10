@@ -3,6 +3,25 @@ on: [push, pull_request]
 env:
   CLICOLOR_FORCE: 1
 jobs:
+  image-publishing:
+    name: Image Publishing Verify
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Validate publishing scripts
+        run: |
+          bash -n ci/release/image-manifests.sh
+          python3 -m unittest discover -s ci/release -p test_image_manifests.py -v
+      - name: Validate Bake targets
+        run: |
+          for arch in amd64 arm64; do
+            ARCH="$arch" docker buildx bake --file ci/release/image-bake.hcl --print > "bake-${arch}.json"
+            jq -e --arg platform "linux/${arch}" '.target | length == 5 and all(.[]; .platforms == [$platform])' "bake-${arch}.json"
+          done
+
   rust:
     name: Rust Code Verify
     runs-on: ubuntu-latest

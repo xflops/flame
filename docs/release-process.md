@@ -87,6 +87,16 @@ gh workflow run release-publish.yaml --ref main \
   -f release_tag="${RELEASE_TAG}"
 ```
 
+Main and release image publishing use the shared `build-images.yaml` workflow.
+It builds amd64 on `ubuntu-24.04` and arm64 on `ubuntu-24.04-arm`, without QEMU.
+Each runner builds all five images with `ci/release/image-bake.hcl`, sharing the
+common Rust compilation stage. Build caches are scoped by image and architecture.
+Native binary and Python SDK smoke checks must pass before the image digests are
+uploaded. A separate job merges the verified digests into multiarchitecture tags
+and checks both platforms. Main promotes its `sha-<commit>` tags to `latest` only
+after the whole image set succeeds; releases publish the requested version tag.
+Architecture tags such as `sha-<commit>-arm64` are intermediate build references.
+
 ## Source Readiness
 
 1. Start from the release branch or create it from the intended base:
