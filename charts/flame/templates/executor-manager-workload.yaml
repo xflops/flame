@@ -1,13 +1,13 @@
-{{- if .Values.executorManager.enabled }}
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: {{ include "flame.executorManager.name" . }}
   labels:
     {{- include "flame.labels" . | nindent 4 }}
     app.kubernetes.io/component: executor-manager
 spec:
-  replicas: {{ .Values.executorManager.replicas }}
+  updateStrategy:
+    type: OnDelete
   selector:
     matchLabels:
       {{- include "flame.selectorLabels" . | nindent 6 }}
@@ -20,6 +20,10 @@ spec:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      hostNetwork: {{ .Values.executorManager.hostNetwork }}
+      hostPID: {{ .Values.executorManager.hostPID }}
+      dnsPolicy: {{ ternary "ClusterFirstWithHostNet" "ClusterFirst" .Values.executorManager.hostNetwork }}
+      terminationGracePeriodSeconds: {{ .Values.executorManager.terminationGracePeriodSeconds }}
       serviceAccountName: {{ include "flame.serviceAccountName" . }}
       automountServiceAccountToken: {{ .Values.serviceAccount.automountToken }}
       {{- with .Values.global.imagePullSecrets }}
@@ -76,7 +80,7 @@ spec:
             {{- with .Values.executorManager.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- with .Values.securityContext }}
+          {{- with mergeOverwrite (deepCopy .Values.securityContext) .Values.executorManager.securityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -128,4 +132,3 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-{{- end }}

@@ -4,13 +4,54 @@ This chart installs a static Flame cluster on Kubernetes:
 
 - one `flame-session-manager`
 - a configurable number of `flame-object-cache` replicas
-- a configurable number of `flame-executor-manager` replicas
+- one privileged Host-shim `flame-executor-manager` per selected worker node
 
-It does not implement the future Kubernetes provider or application pod
-autoscaling. Executor capacity is static and follows
-`executorManager.replicas`. Object-cache capacity follows
+Kubernetes manages persistent FEM workers; Flame schedules application services
+and tasks within those workers. The chart always installs executor managers as a DaemonSet,
+with host networking, host PID access, and root privileges. Object-cache capacity follows
 `objectCache.replicas`; each StatefulSet replica owns its own cache volume when
 persistence is enabled.
+
+## Host workers
+
+Select a dedicated worker pool using node labels and, when needed, taints and
+tolerations. FEM discovers the whole host's CPU, memory, and GPU resources.
+The Host shim launches services inside the FEM container.
+For example:
+
+```yaml
+cluster:
+  executors:
+    shim: host
+executorManager:
+  hostNetwork: true
+  hostPID: true
+  securityContext:
+    privileged: true
+    runAsNonRoot: false
+    runAsUser: 0
+    runAsGroup: 0
+  nodeSelector:
+    kubernetes.io/os: linux
+    flame.xflops.io/worker: "true"
+  terminationGracePeriodSeconds: 300
+```
+
+FEM registers using its Pod hostname. Host-networked workers use
+`ClusterFirstWithHostNet` DNS so the session-manager and cache Services resolve.
+Workers assume the whole host is available to Flame. Use dedicated worker nodes
+and leave FEM CPU and memory limits unset. Host discovery does not subtract
+resources used by Kubernetes or other services. GPU workers require a compatible
+image and host driver libraries.
+
+SRE must arrange a maintenance window and ensure workers have no tasks before
+updating or deleting FEM Pods. Kubernetes enforces `terminationGracePeriodSeconds`;
+FEM does not automatically drain tasks on termination. DaemonSet updates use
+`OnDelete`, so config or image changes are applied by deleting worker Pods during
+the maintenance window.
+
+Session-manager and object-cache Pods retain their own security and networking
+settings. The chart does not create application Pods or use a Kubernetes provider.
 
 ## Install
 

@@ -8,6 +8,13 @@ Date: 2026-05-29
 
 GitHub issue: https://github.com/xflops/flame/issues/478
 
+Worker deployment revision (2026-10-10): the chart uses a privileged,
+host-networked Host-shim FEM DaemonSet, with one worker per selected node,
+existing whole-host resource discovery and SRE-managed maintenance. The Deployment
+descriptions below document the original chart design.
+See the [current chart documentation](../../../charts/flame/README.md#host-workers)
+for worker configuration and update procedures.
+
 ## Summary
 
 Add a first-party Helm chart for installing a static Flame cluster on

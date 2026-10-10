@@ -61,7 +61,6 @@ HELM_E2E_ARGS=(
     --set sessionManager.persistence.enabled=false
     --set objectCache.persistence.enabled=false
     --set "objectCache.replicas=${OBJECT_CACHE_REPLICAS}"
-    --set executorManager.replicas=1
 )
 
 log() {
@@ -120,6 +119,24 @@ wait_rollout() {
     local component="$2"
 
     log "Waiting for ${kind}/${component}"
+    if [[ "$kind" == "daemonset" ]]; then
+        local name generation desired
+        name="$(kubectl -n "$NAMESPACE" get daemonset \
+            -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=${component}" \
+            -o 'jsonpath={.items[0].metadata.name}')"
+        generation="$(kubectl -n "$NAMESPACE" get "daemonset/$name" -o 'jsonpath={.metadata.generation}')"
+        # rollout status supports only RollingUpdate; FEM uses OnDelete.
+        kubectl -n "$NAMESPACE" wait "daemonset/$name" \
+            --for="jsonpath={.status.observedGeneration}=${generation}" --timeout="$TIMEOUT"
+        desired="$(kubectl -n "$NAMESPACE" get "daemonset/$name" -o 'jsonpath={.status.desiredNumberScheduled}')"
+        if [[ ! "$desired" =~ ^[1-9][0-9]*$ ]]; then
+            log "DaemonSet/$name has no scheduled workers"
+            return 1
+        fi
+        kubectl -n "$NAMESPACE" wait "daemonset/$name" \
+            --for="jsonpath={.status.numberReady}=${desired}" --timeout="$TIMEOUT"
+        return
+    fi
     kubectl -n "$NAMESPACE" rollout status "$kind" \
         -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=${component}" \
         --timeout="$TIMEOUT"
@@ -242,7 +259,7 @@ install_flame() {
 
     wait_rollout deployment session-manager
     wait_rollout statefulset object-cache
-    wait_rollout deployment executor-manager
+    wait_rollout daemonset executor-manager
 }
 
 create_external_access() {

@@ -80,16 +80,23 @@ objectCache:
   extraVolumeMounts: []
 
 executorManager:
-  enabled: true
   image:
     repository: flame-executor-manager
     tag: ""
-  replicas: 3
+  hostNetwork: true
+  hostPID: true
+  terminationGracePeriodSeconds: 300
+  securityContext:
+    privileged: true
+    runAsNonRoot: false
+    runAsUser: 0
+    runAsGroup: 0
   runtimeStorage:
     medium: ""
     sizeLimit: ""
   resources: {}
-  nodeSelector: {}
+  nodeSelector:
+    kubernetes.io/os: linux
   tolerations: []
   affinity: {}
   extraEnv: []

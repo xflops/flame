@@ -49,7 +49,11 @@
     "executorManager": {
       "type": "object",
       "properties": {
-        "replicas": { "type": "integer", "minimum": 0 }
+        "hostNetwork": { "type": "boolean" },
+        "hostPID": { "type": "boolean" },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+        "securityContext": { "type": "object" },
+        "resources": { "type": "object" }
       }
     },
     "tls": {

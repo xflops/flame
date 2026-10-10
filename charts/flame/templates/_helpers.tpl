@@ -98,6 +98,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- define "flame.validate" -}}
+{{- if ne .Values.cluster.executors.shim "host" -}}
+{{- fail "Kubernetes executor managers require cluster.executors.shim=host" -}}
+{{- end -}}
 {{- if .Values.tls.enabled -}}
 {{- if not .Values.tls.cluster.secretName -}}
 {{- fail "tls.cluster.secretName is required when tls.enabled=true" -}}
