@@ -19,6 +19,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 #[cfg(unix)]
@@ -41,30 +42,96 @@ use common::{
 
 struct HostInstance {
     child: tokio::process::Child,
+    #[cfg(unix)]
+    process_group: Option<Pid>,
 }
 
 impl HostInstance {
     fn new(child: tokio::process::Child) -> Self {
-        Self { child }
-    }
-
-    /// Kill the child process
-    #[cfg(unix)]
-    fn kill_process(&mut self) {
-        if let Some(id) = self.child.id() {
-            let ig = Pid::from_raw(id as i32);
-            let _ = killpg(ig, Signal::SIGTERM);
-            tracing::debug!("Killed process group <{}>", id);
-        } else {
-            drop(self.child.kill());
-            tracing::debug!("Killed child process");
+        Self {
+            #[cfg(unix)]
+            process_group: child.id().map(|id| Pid::from_raw(id as i32)),
+            child,
         }
     }
 
-    #[cfg(not(unix))]
+    /// Await termination before the executor's device assignment can be returned.
+    async fn stop(&mut self) -> Result<(), FlameError> {
+        #[cfg(unix)]
+        let process_group = self.process_group;
+        #[cfg(unix)]
+        if let Some(group) = process_group {
+            signal_group(group, Signal::SIGTERM)?;
+        }
+        #[cfg(not(unix))]
+        self.child.start_kill()?;
+
+        match tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await {
+            Ok(result) => {
+                result?;
+                // The leader may exit while worker processes still hold GPU memory.
+                #[cfg(unix)]
+                if let Some(group) = process_group {
+                    signal_group(group, Signal::SIGKILL)?;
+                }
+            }
+            Err(_) => {
+                #[cfg(unix)]
+                if let Some(group) = process_group {
+                    signal_group(group, Signal::SIGKILL)?;
+                }
+                #[cfg(not(unix))]
+                self.child.start_kill()?;
+                tokio::time::timeout(Duration::from_secs(5), self.child.wait())
+                    .await
+                    .map_err(|_| {
+                        FlameError::Internal("Host instance did not exit after SIGKILL".to_string())
+                    })??;
+            }
+        }
+        #[cfg(unix)]
+        if let Some(group) = process_group {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match killpg(group, None) {
+                        Err(nix::errno::Errno::ESRCH) => return Ok(()),
+                        Ok(()) => tokio::time::sleep(Duration::from_millis(20)).await,
+                        Err(error) => {
+                            return Err(FlameError::Internal(format!(
+                                "failed to check Host process group <{group}>: {error}"
+                            )))
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(|_| {
+                FlameError::Internal(format!(
+                "Host process group <{group}> still exists after SIGKILL; keeping GPU assignment"
+            ))
+            })??;
+            self.process_group = None;
+        }
+        Ok(())
+    }
+
+    /// Synchronous drop fallback; ordinary teardown calls `stop` and reaps the child.
     fn kill_process(&mut self) {
-        drop(self.child.kill());
-        tracing::debug!("Killed child process");
+        #[cfg(unix)]
+        if let Some(group) = self.process_group {
+            let _ = signal_group(group, Signal::SIGKILL);
+        }
+        let _ = self.child.start_kill();
+    }
+}
+
+#[cfg(unix)]
+fn signal_group(group: Pid, signal: Signal) -> Result<(), FlameError> {
+    match killpg(group, signal) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(error) => Err(FlameError::Internal(format!(
+            "failed to signal Host process group <{group}>: {error}"
+        ))),
     }
 }
 
@@ -197,6 +264,10 @@ impl HostShim {
             }
         }
 
+        // Assignments belong to the executor and override application,
+        // installer, and inherited settings for the lifetime of its service.
+        Self::apply_assignments(&mut envs, &executor.assignments)?;
+
         let command = Self::expand_env_vars(&command, Some(&envs));
         let args: Vec<String> = args
             .iter()
@@ -267,6 +338,26 @@ impl HostShim {
             })?;
 
         Ok(HostInstance::new(child))
+    }
+
+    fn apply_assignments(
+        environment: &mut HashMap<String, String>,
+        assignments: &crate::devices::DeviceAssignments,
+    ) -> Result<(), FlameError> {
+        let mut assigned_envs = HashMap::new();
+        for assignment in assignments.values() {
+            for (key, value) in &assignment.envs {
+                if let Some(previous) = assigned_envs.insert(key.clone(), value.clone()) {
+                    if previous != *value {
+                        return Err(FlameError::InvalidConfig(format!(
+                            "device assignments conflict on environment variable '{key}'"
+                        )));
+                    }
+                }
+            }
+        }
+        environment.extend(assigned_envs);
+        Ok(())
     }
 
     fn is_path_env(key: &str) -> bool {
@@ -348,7 +439,7 @@ impl Drop for HostShim {
 
 #[async_trait]
 impl Shim for HostShim {
-    async fn create_service(
+    async fn create_instance(
         &mut self,
         app_manager: Arc<ApplicationManager>,
     ) -> Result<(), FlameError> {
@@ -367,7 +458,12 @@ impl Shim for HostShim {
         let mut instance =
             Self::launch_instance(&self.app, &self.executor, &work_dir, &installation.env_vars)?;
         if let Err(error) = instance_client.connect().await {
-            instance.kill_process();
+            // Retain ownership if cleanup fails so the GPU assignment stays leased.
+            self.work_dir = Some(work_dir);
+            self.instance = Some(instance);
+            self.destroy_instance().await.map_err(|cleanup| {
+                FlameError::Internal(format!("{error}; Host instance cleanup failed: {cleanup}"))
+            })?;
             return Err(error);
         }
         self.work_dir = Some(work_dir);
@@ -416,9 +512,10 @@ impl Shim for HostShim {
         if let Some(mut client) = self.instance_client.take() {
             client.close();
         }
-        if let Some(mut instance) = self.instance.take() {
-            instance.kill_process();
+        if let Some(instance) = self.instance.as_mut() {
+            instance.stop().await?;
         }
+        self.instance = None;
         self.work_dir = None;
         Ok(())
     }
@@ -427,6 +524,7 @@ impl Shim for HostShim {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices::DeviceManager;
     use common::apis::{ExecutorState, ResourceRequirement, Shim as ShimType};
 
     fn test_executor() -> Executor {
@@ -439,9 +537,285 @@ mod tests {
             session: None,
             task: None,
             context: None,
+            app_mgr: None,
             shim_instance: None,
+            assignments: Default::default(),
             state: ExecutorState::Idle,
         }
+    }
+
+    #[test]
+    fn gpu_assignment_overrides_application_and_installer_visibility() {
+        let gpu_workdir = tempfile::tempdir().unwrap();
+        let allocator = crate::devices::gpu::GpuManager::new()
+            .with_workdir(gpu_workdir.path())
+            .with_inventory(vec!["GPU-first".to_string(), "GPU-second".to_string()])
+            .unwrap();
+        let assignment = allocator
+            .allocate(&crate::devices::test_executor(
+                (common::apis::ResourceRequirement {
+                    gpu: 2,
+                    ..Default::default()
+                })
+                .clone(),
+            ))
+            .unwrap();
+        // The launcher applies this after merging both application and installer envs.
+        let mut environment = HashMap::from([
+            ("CUDA_VISIBLE_DEVICES".to_string(), "0,1,2,3".to_string()),
+            ("OTHER_VARIABLE".to_string(), "preserved".to_string()),
+        ]);
+        let assignments =
+            crate::devices::DeviceAssignments::from([("gpu".to_string(), assignment)]);
+        HostShim::apply_assignments(&mut environment, &assignments).unwrap();
+        assert_eq!(environment["CUDA_VISIBLE_DEVICES"], "GPU-first,GPU-second");
+        assert_eq!(environment["OTHER_VARIABLE"], "preserved");
+        assert_eq!(
+            HostShim::expand_env_vars("$CUDA_VISIBLE_DEVICES", Some(&environment)),
+            "GPU-first,GPU-second"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launched_process_receives_assignment_instead_of_app_or_install_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let gpu_workdir = tempfile::tempdir().unwrap();
+        let allocator = crate::devices::gpu::GpuManager::new()
+            .with_workdir(gpu_workdir.path())
+            .with_inventory(vec!["GPU-assigned".to_string()])
+            .unwrap();
+        let mut executor = test_executor();
+        executor.resreq.gpu = 1;
+        executor.assignments.insert(
+            "gpu".to_string(),
+            allocator
+                .allocate(&crate::devices::test_executor(
+                    (common::apis::ResourceRequirement {
+                        gpu: 1,
+                        ..Default::default()
+                    })
+                    .clone(),
+                ))
+                .unwrap(),
+        );
+        let app = ApplicationContext {
+            name: "test-app".to_string(),
+            shim: ShimType::Host,
+            image: None,
+            command: Some("sh".to_string()),
+            arguments: vec![
+                "-c".to_string(),
+                "printf '%s' \"$CUDA_VISIBLE_DEVICES\"".to_string(),
+            ],
+            working_directory: None,
+            environments: HashMap::from([(
+                "CUDA_VISIBLE_DEVICES".to_string(),
+                "app-override".to_string(),
+            )]),
+            url: None,
+            installer: None,
+        };
+        let work_dir = ExecutorWorkDir {
+            top_dir: temp.path().to_path_buf(),
+            app_dir: temp.path().join("app"),
+            socket: temp.path().join("instance.sock"),
+            auto_dir: false,
+        };
+        let install_environment = HashMap::from([(
+            "CUDA_VISIBLE_DEVICES".to_string(),
+            "install-override".to_string(),
+        )]);
+        let mut instance =
+            HostShim::launch_instance(&app, &executor, &work_dir, &install_environment).unwrap();
+        instance.child.wait().await.unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join("executor-1.out")).unwrap(),
+            "GPU-assigned"
+        );
+        instance.stop().await.unwrap();
+    }
+
+    #[test]
+    fn cpu_executor_hides_gpus_even_when_application_sets_visibility() {
+        let mut environment =
+            HashMap::from([("CUDA_VISIBLE_DEVICES".to_string(), "0".to_string())]);
+        let gpu_workdir = tempfile::tempdir().unwrap();
+        let gpu = crate::devices::gpu::GpuManager::new()
+            .with_workdir(gpu_workdir.path())
+            .with_inventory(Vec::new())
+            .unwrap();
+        let assignments = crate::devices::DeviceAssignments::from([(
+            "gpu".to_string(),
+            gpu.allocate(&crate::devices::test_executor(
+                (common::apis::ResourceRequirement {
+                    gpu: 0,
+                    ..Default::default()
+                })
+                .clone(),
+            ))
+            .unwrap(),
+        )]);
+        HostShim::apply_assignments(&mut environment, &assignments).unwrap();
+        assert_eq!(environment["CUDA_VISIBLE_DEVICES"], "");
+    }
+
+    #[test]
+    fn applies_environment_from_all_device_assignments() {
+        let gpu_workdir = tempfile::tempdir().unwrap();
+        let gpu = crate::devices::gpu::GpuManager::new()
+            .with_workdir(gpu_workdir.path())
+            .with_inventory(Vec::new())
+            .unwrap();
+        let mut first = gpu
+            .allocate(&crate::devices::test_executor(
+                (common::apis::ResourceRequirement {
+                    gpu: 0,
+                    ..Default::default()
+                })
+                .clone(),
+            ))
+            .unwrap();
+        first.envs = HashMap::from([("FIRST_DEVICE".to_string(), "a".to_string())]);
+        let mut second = gpu
+            .allocate(&crate::devices::test_executor(
+                (common::apis::ResourceRequirement {
+                    gpu: 0,
+                    ..Default::default()
+                })
+                .clone(),
+            ))
+            .unwrap();
+        second.envs = HashMap::from([("SECOND_DEVICE".to_string(), "b".to_string())]);
+        let assignments = crate::devices::DeviceAssignments::from([
+            ("first".to_string(), first),
+            ("second".to_string(), second),
+        ]);
+        let mut environment =
+            HashMap::from([("FIRST_DEVICE".to_string(), "app-override".to_string())]);
+        HostShim::apply_assignments(&mut environment, &assignments).unwrap();
+        assert_eq!(environment["FIRST_DEVICE"], "a");
+        assert_eq!(environment["SECOND_DEVICE"], "b");
+    }
+
+    #[test]
+    fn conflicting_assignment_environments_fail_without_partial_updates() {
+        let gpu_workdir = tempfile::tempdir().unwrap();
+        let gpu = crate::devices::gpu::GpuManager::new()
+            .with_workdir(gpu_workdir.path())
+            .with_inventory(Vec::new())
+            .unwrap();
+        let mut first = gpu
+            .allocate(&crate::devices::test_executor(
+                (common::apis::ResourceRequirement {
+                    gpu: 0,
+                    ..Default::default()
+                })
+                .clone(),
+            ))
+            .unwrap();
+        first.envs = HashMap::from([("DEVICE".to_string(), "a".to_string())]);
+        let mut second = gpu
+            .allocate(&crate::devices::test_executor(
+                (common::apis::ResourceRequirement {
+                    gpu: 0,
+                    ..Default::default()
+                })
+                .clone(),
+            ))
+            .unwrap();
+        second.envs = HashMap::from([("DEVICE".to_string(), "b".to_string())]);
+        let assignments = crate::devices::DeviceAssignments::from([
+            ("first".to_string(), first),
+            ("second".to_string(), second),
+        ]);
+        let mut environment = HashMap::from([("DEVICE".to_string(), "original".to_string())]);
+        assert!(HostShim::apply_assignments(&mut environment, &assignments).is_err());
+        assert_eq!(environment["DEVICE"], "original");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_reaps_running_host_process_before_returning() {
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .current_dir(std::env::temp_dir())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut instance = HostInstance::new(child);
+        instance.stop().await.unwrap();
+        assert!(instance.child.try_wait().unwrap().is_some());
+        assert!(instance.child.id().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_kills_and_reaps_process_that_ignores_sigterm() {
+        use tokio::io::AsyncReadExt;
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; printf ready; exec sleep 60"])
+            .stdout(Stdio::piped())
+            .current_dir(std::env::temp_dir())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut ready = [0_u8; 5];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            child.stdout.as_mut().unwrap().read_exact(&mut ready),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&ready, b"ready");
+        let mut instance = HostInstance::new(child);
+        tokio::time::timeout(Duration::from_secs(12), instance.stop())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(instance.child.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_waits_for_worker_group_after_leader_exits() {
+        use tokio::io::AsyncReadExt;
+        let leader = tokio::process::Command::new("sleep")
+            .arg("60")
+            .current_dir(std::env::temp_dir())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = Pid::from_raw(leader.id().unwrap() as i32);
+        let mut worker = tokio::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; printf ready; exec sleep 60"])
+            .stdout(Stdio::piped())
+            .current_dir(std::env::temp_dir())
+            .process_group(group.as_raw())
+            .spawn()
+            .unwrap();
+        let mut ready = [0_u8; 5];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            worker.stdout.as_mut().unwrap().read_exact(&mut ready),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // Reap the worker as a real init/subreaper would. A zombie still belongs
+        // to the group, so teardown conservatively retains capacity until reaped.
+        let worker_wait = tokio::spawn(async move { worker.wait().await.unwrap() });
+        let mut instance = HostInstance::new(leader);
+        instance.child.start_kill().unwrap();
+        instance.child.wait().await.unwrap();
+        assert!(instance.child.id().is_none());
+        assert!(killpg(group, None).is_ok());
+        instance.stop().await.unwrap();
+        worker_wait.await.unwrap();
+        assert_eq!(killpg(group, None), Err(nix::errno::Errno::ESRCH));
+        assert!(instance.process_group.is_none());
+        instance.stop().await.unwrap();
     }
 
     #[test]
@@ -486,7 +860,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_service_installs_before_runtime_creation() {
+    async fn create_instance_installs_before_runtime_creation() {
         let app = ApplicationContext {
             name: "test-app".to_string(),
             shim: ShimType::Host,
@@ -507,7 +881,7 @@ mod tests {
         };
 
         let error = shim
-            .create_service(Arc::new(ApplicationManager::new().unwrap()))
+            .create_instance(Arc::new(ApplicationManager::new().unwrap()))
             .await
             .unwrap_err();
 

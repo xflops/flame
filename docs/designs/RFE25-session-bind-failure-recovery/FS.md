@@ -277,7 +277,7 @@ function bind_idle_executor(executor):
         return
 
     shim = create shim
-    if shim creation or shim.create_service(app_manager) fails:
+    if shim creation or shim.create_instance(app_manager) fails:
         backend.BindExecutorCompleted(
             executor.id,
             result = {
@@ -467,7 +467,7 @@ Expected outcome: users see the bind failure event, and the session can be sched
 
 1. Session `s2` is scheduled to executor `e-b`.
 2. Executor-manager cannot install the application package.
-3. HostShim returns the installation error from `create_service`, and executor-manager calls `BindExecutorCompleted(e-b, result={ return_code: BIND_RESULT_SHIM_CREATE_FAILED, message: "shim service creation failed: installer exited with status 127" })`.
+3. HostShim returns the installation error from `create_instance`, and executor-manager calls `BindExecutorCompleted(e-b, result={ return_code: BIND_RESULT_SHIM_CREATE_FAILED, message: "shim service creation failed: installer exited with status 127" })`.
 4. Session-manager records `SESSION_BIND_FAILED` with the service-creation failure code and increments `s2.retry_count`.
 5. Executor `e-b` moves from `Binding` to `Unbinding` for cleanup.
 

@@ -18,6 +18,7 @@ use common::FlameError;
 
 mod appmgr;
 mod client;
+mod devices;
 mod executor;
 mod manager;
 mod shims;

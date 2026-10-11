@@ -46,18 +46,18 @@ impl State for ReleasingState {
             .unregister_executor(&self.executor.clone())
             .await?;
 
-        self.release_completed();
+        self.release_completed()?;
 
         Ok(self.executor.clone())
     }
 }
 
 impl ReleasingState {
-    fn release_completed(&mut self) {
+    fn release_completed(&mut self) -> Result<(), FlameError> {
         // The executor and its retained service instance share one lifetime.
         // Drop the last executor-owned shim reference only after Session
         // Manager has accepted the unregister operation.
-        self.executor.release();
+        self.executor.release()
     }
 }
 
@@ -65,6 +65,7 @@ impl ReleasingState {
 mod tests {
     use super::*;
     use crate::appmgr::ApplicationManager;
+    use crate::devices::DeviceManager;
     use crate::shims::{SessionEnterResponse, Shim as ShimService, ShimPtr, TaskInvokeResponse};
     use common::apis::{ResourceRequirement, SessionContext, Shim, TaskContext};
     use std::sync::Arc;
@@ -74,7 +75,7 @@ mod tests {
 
     #[async_trait]
     impl ShimService for TestShim {
-        async fn create_service(
+        async fn create_instance(
             &mut self,
             _app_manager: Arc<ApplicationManager>,
         ) -> Result<(), FlameError> {
@@ -105,17 +106,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stopped_service_retains_saved_claim_until_fem_removal() {
+        let gpu_workdir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(crate::devices::DeviceManagers::with_gpu(
+            crate::devices::gpu::GpuManager::new()
+                .with_workdir(gpu_workdir.path())
+                .with_inventory(vec!["GPU-a".into()])
+                .unwrap(),
+        ));
+        let mut executor = crate::devices::test_executor(ResourceRequirement {
+            gpu: 1,
+            ..Default::default()
+        });
+        executor.assignments = manager.allocate(&executor).unwrap();
+
+        executor.shim_instance = Some(Arc::new(Mutex::new(TestShim)));
+        executor.state = ExecutorState::Releasing;
+        let mut state = ReleasingState {
+            client: BackendClient::default(),
+            executor,
+        };
+        // There is no backend connection. Service cleanup does not free physical
+        // ownership; FEM retains the claim until it removes the executor.
+        assert!(state.execute().await.is_err());
+        assert!(!state.executor.assignments.is_empty());
+        assert!(state.executor.shim_instance.is_none());
+        assert_eq!(state.executor.state, ExecutorState::Releasing);
+        let saved = gpu_workdir
+            .path()
+            .join("gpu")
+            .join(format!("{}.json", state.executor.id));
+        assert!(saved.exists());
+        let competitor = crate::devices::test_executor(ResourceRequirement {
+            gpu: 1,
+            ..Default::default()
+        });
+        assert!(manager.allocate(&competitor).is_err());
+        manager.release(&state.executor).unwrap();
+        assert!(!saved.exists());
+        assert!(manager.allocate(&competitor).is_ok());
+    }
+
+    #[tokio::test]
     async fn release_clears_retained_instance() {
+        let gpu_workdir = tempfile::tempdir().unwrap();
+        let allocator = Arc::new(crate::devices::DeviceManagers::with_gpu(
+            crate::devices::gpu::GpuManager::new()
+                .with_workdir(gpu_workdir.path())
+                .with_inventory(vec!["GPU-a".to_string()])
+                .unwrap(),
+        ));
+        let request = ResourceRequirement {
+            gpu: 1,
+            ..Default::default()
+        };
         let shim: ShimPtr = Arc::new(Mutex::new(TestShim));
         let executor = Executor {
             id: "executor-1".to_string(),
             application: "test-app".to_string(),
-            resreq: ResourceRequirement::default(),
+            resreq: ResourceRequirement {
+                gpu: 1,
+                ..Default::default()
+            },
+            assignments: allocator
+                .allocate(&{
+                    let mut metadata = crate::devices::test_executor(request.clone());
+                    metadata.id = "executor-1".into();
+                    metadata
+                })
+                .unwrap(),
             node: "node-1".to_string(),
             shim: Shim::Host,
             session: None,
             task: None,
             context: None,
+            app_mgr: None,
             shim_instance: Some(shim),
             state: ExecutorState::Releasing,
         };
@@ -124,9 +189,30 @@ mod tests {
             executor,
         };
 
-        state.release_completed();
+        assert!(allocator
+            .allocate(&crate::devices::test_executor((request).clone()))
+            .is_err());
+        state
+            .executor
+            .shim_instance
+            .as_ref()
+            .unwrap()
+            .lock()
+            .await
+            .destroy_instance()
+            .await
+            .unwrap();
+        state.release_completed().unwrap();
 
         assert_eq!(state.executor.state, ExecutorState::Released);
         assert!(state.executor.shim_instance.is_none());
+        assert!(state.executor.assignments.is_empty());
+        assert!(allocator
+            .allocate(&crate::devices::test_executor(request.clone()))
+            .is_err());
+        allocator.release(&state.executor).unwrap();
+        assert!(allocator
+            .allocate(&crate::devices::test_executor((request).clone()))
+            .is_ok());
     }
 }

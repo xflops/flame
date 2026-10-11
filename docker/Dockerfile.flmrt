@@ -30,5 +30,7 @@ COPY --from=builder /usr/local/flame /usr/local/flame
 ENV FLAME_HOME=/usr/local/flame
 ENV PATH=/usr/local/flame/bin:${PATH}
 ENV PYTHONPATH=/usr/local/flame/lib/python3.12/site-packages
+# Device and driver injection is selected explicitly through CRI CDI requests.
+ENV NVIDIA_VISIBLE_DEVICES=void
 
 WORKDIR /var/lib/flame

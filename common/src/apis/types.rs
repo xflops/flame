@@ -451,32 +451,6 @@ fn totalram() -> u64 {
     system::sysinfo().totalram
 }
 
-fn detect_gpus() -> i32 {
-    if let Ok(devices) = std::env::var("CUDA_VISIBLE_DEVICES") {
-        if devices.is_empty() || devices == "-1" {
-            return 0;
-        }
-        return devices.split(',').count() as i32;
-    }
-
-    match nvml_wrapper::Nvml::init() {
-        Ok(nvml) => match nvml.device_count() {
-            Ok(count) => {
-                tracing::info!("Detected {} GPU(s) via NVML", count);
-                count as i32
-            }
-            Err(e) => {
-                tracing::warn!("NVML initialized but failed to get device count: {}", e);
-                0
-            }
-        },
-        Err(e) => {
-            tracing::debug!("NVML not available, GPU detection skipped: {}", e);
-            0
-        }
-    }
-}
-
 impl Node {
     pub fn new() -> Self {
         let name = uname();
@@ -492,7 +466,8 @@ impl Node {
     pub fn refresh(&mut self) {
         let memory = totalram();
         let cpu = num_cpus::get() as u64;
-        let gpu = detect_gpus();
+        // FEM supplies GPU capacity from its device-manager inventory.
+        let gpu = self.capacity.gpu;
         let capacity = ResourceRequirement { cpu, memory, gpu };
         let allocatable = capacity.clone();
         let info = NodeInfo {

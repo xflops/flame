@@ -20,6 +20,7 @@ data:
       schedule_interval: {{ .Values.cluster.scheduleInterval }}
       executors:
         shim: {{ .Values.cluster.executors.shim | quote }}
+        devices: {{ .Values.cluster.executors.devices | toJson }}
       limits:
         max_sessions: {{ .Values.cluster.limits.maxSessions }}
         {{- if ne .Values.cluster.limits.application.maxExecutors nil }}

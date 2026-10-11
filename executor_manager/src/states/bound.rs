@@ -32,6 +32,12 @@ impl State for BoundState {
     async fn execute(&mut self) -> Result<Executor, FlameError> {
         trace_fn!("BoundState::execute");
 
+        if self.executor.shim_instance.is_none() {
+            return Err(FlameError::InvalidState(
+                "no shim instance in bound state".to_string(),
+            ));
+        }
+
         let task = self.client.launch_task(&self.executor.clone()).await?;
         self.executor.task = task.clone();
 

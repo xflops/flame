@@ -17,6 +17,7 @@ limitations under the License.
 //! streaming protocol, including reconnection logic and heartbeat management.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -30,6 +31,7 @@ use rpc::flame::v1 as proto;
 use stdng::{lock_ptr, MutexPtr};
 
 use crate::client::BackendClient;
+use crate::devices::DeviceManagers;
 use crate::executor::{Executor, ExecutorPtr};
 use crate::manager::ExecutorMessage;
 
@@ -57,6 +59,7 @@ const RESPONSE_TIMEOUT_SECS: u64 = 10;
 pub struct StreamHandler {
     client: BackendClient,
     node: MutexPtr<Node>,
+    dev_mgr: Arc<DeviceManagers>,
     /// Reference to current executors (shared with manager) for re-registration
     executors: MutexPtr<HashMap<String, ExecutorPtr>>,
     reconnect_interval: Duration,
@@ -70,14 +73,34 @@ impl StreamHandler {
     ///
     /// * `client` - The backend client for gRPC communication
     /// * `executors` - Shared reference to current executors for re-registration on reconnect
-    pub fn new(client: BackendClient, executors: MutexPtr<HashMap<String, ExecutorPtr>>) -> Self {
-        StreamHandler {
+    /// * `dev_mgr` - Shared device inventory for registration and heartbeat capacity
+    pub fn new(
+        client: BackendClient,
+        executors: MutexPtr<HashMap<String, ExecutorPtr>>,
+        dev_mgr: Arc<DeviceManagers>,
+    ) -> Result<Self, FlameError> {
+        let mut node = Node::new();
+        Self::refresh_node(&mut node, &dev_mgr)?;
+        Ok(StreamHandler {
             client,
-            node: stdng::new_ptr(Node::new()),
+            node: stdng::new_ptr(node),
+            dev_mgr,
             executors,
             reconnect_interval: Duration::from_secs(DEFAULT_RECONNECT_INTERVAL_SECS),
             heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS),
-        }
+        })
+    }
+
+    fn refresh_node(node: &mut Node, dev_mgr: &DeviceManagers) -> Result<(), FlameError> {
+        dev_mgr.discover()?;
+        // Rebuild host capacity so a previous device report cannot survive a refresh.
+        node.capacity = Default::default();
+        node.refresh();
+        // Device managers may describe resources also discovered on the host.
+        // Merge per resource instead of counting the same CPU/memory twice.
+        node.capacity = node.capacity.clone().max(&dev_mgr.capacity());
+        node.allocatable = node.capacity.clone();
+        Ok(())
     }
 
     /// Runs the stream handler, forwarding executor updates to the manager.
@@ -140,7 +163,11 @@ impl StreamHandler {
         executor_tx: &mpsc::Sender<ExecutorMessage>,
     ) -> Result<(), FlameError> {
         // Get current node state
-        let node = lock_ptr!(self.node)?.clone();
+        let node = {
+            let mut node = lock_ptr!(self.node)?;
+            Self::refresh_node(&mut node, &self.dev_mgr)?;
+            node.clone()
+        };
 
         // Get current executors for state alignment during registration
         let current_executors: Vec<Executor> = lock_ptr!(self.executors)?
@@ -190,6 +217,7 @@ impl StreamHandler {
         // Spawn heartbeat task for periodic heartbeats
         let heartbeat_tx = request_tx.clone();
         let node_ptr = self.node.clone();
+        let dev_mgr = self.dev_mgr.clone();
         let heartbeat_interval = self.heartbeat_interval;
         let heartbeat_handle = tokio::spawn(async move {
             let mut ticker = interval(heartbeat_interval);
@@ -200,7 +228,10 @@ impl StreamHandler {
                 let (node_name, status) = match node_ptr.lock() {
                     Ok(mut node) => {
                         // Refresh node to get current resource status
-                        node.refresh();
+                        if let Err(error) = Self::refresh_node(&mut node, &dev_mgr) {
+                            tracing::warn!(%error, "Failed to discover devices for heartbeat");
+                            continue;
+                        }
                         let status = proto::NodeStatus {
                             state: proto::NodeState::from(node.state) as i32,
                             capacity: Some(node.capacity.clone().into()),
@@ -308,6 +339,85 @@ impl StreamHandler {
 mod tests {
     use super::*;
 
+    struct RefreshDevices {
+        visible: std::sync::atomic::AtomicI32,
+        discovered: std::sync::atomic::AtomicI32,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::devices::DeviceManager for RefreshDevices {
+        fn discover(&self) -> Result<(), FlameError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.fail.load(SeqCst) {
+                return Err(FlameError::Internal("discovery failed".into()));
+            }
+            self.discovered.store(self.visible.load(SeqCst), SeqCst);
+            Ok(())
+        }
+        fn capacity(&self) -> common::apis::ResourceRequirement {
+            common::apis::ResourceRequirement {
+                gpu: self.discovered.load(std::sync::atomic::Ordering::SeqCst),
+                ..Default::default()
+            }
+        }
+        fn allocate(&self, _: &Executor) -> Result<crate::devices::DeviceAssignment, FlameError> {
+            unreachable!()
+        }
+        fn release(&self, _: &Executor) -> Result<(), FlameError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn every_node_refresh_discovers_before_reading_capacity() {
+        use std::sync::atomic::{AtomicBool, AtomicI32, Ordering::SeqCst};
+        let devices = Arc::new(RefreshDevices {
+            visible: AtomicI32::new(2),
+            discovered: AtomicI32::new(0),
+            fail: AtomicBool::new(false),
+        });
+        let dev_mgr = Arc::new(DeviceManagers::with_manager("gpu", devices.clone()));
+        let handler = StreamHandler::new(
+            BackendClient::default(),
+            stdng::new_ptr(HashMap::new()),
+            dev_mgr.clone(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&handler.dev_mgr, &dev_mgr));
+        let host = Node::new();
+        let mut node = lock_ptr!(handler.node).unwrap();
+        assert_eq!(node.capacity.gpu, 2);
+        for visible in [3, 0, 1] {
+            devices.visible.store(visible, SeqCst);
+            StreamHandler::refresh_node(&mut node, &handler.dev_mgr).unwrap();
+            assert_eq!(node.capacity.gpu, visible);
+            assert_eq!(node.capacity.cpu, host.capacity.cpu);
+            assert_eq!(node.capacity.memory, host.capacity.memory);
+            assert_eq!(node.allocatable, node.capacity);
+        }
+        let previous = node.clone();
+        devices.visible.store(99, SeqCst);
+        devices.fail.store(true, SeqCst);
+        assert!(StreamHandler::refresh_node(&mut node, &handler.dev_mgr).is_err());
+        assert_eq!(node.capacity, previous.capacity);
+        assert_eq!(node.allocatable, previous.allocatable);
+        assert!(StreamHandler::new(
+            BackendClient::default(),
+            stdng::new_ptr(HashMap::new()),
+            dev_mgr,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn disabled_device_managers_clear_previous_device_capacity() {
+        let mut node = Node::new();
+        node.capacity.gpu = 99;
+        StreamHandler::refresh_node(&mut node, &DeviceManagers::default()).unwrap();
+        assert_eq!(node.capacity.gpu, 0);
+        assert_eq!(node.allocatable, node.capacity);
+    }
+
     #[test]
     fn test_node_status_collection() {
         use common::apis::{NodeInfo, NodeState, ResourceRequirement};
@@ -402,10 +512,12 @@ mod tests {
             application: "test-app".to_string(),
             node: "test-node".to_string(),
             resreq: ResourceRequirement::default(),
+            assignments: Default::default(),
             session: None,
             task: None,
             context: None,
             shim: Shim::Host,
+            app_mgr: None,
             shim_instance: None,
             state: ExecutorState::Idle,
         };

@@ -16,7 +16,7 @@ Load the installed Flame SDK environment, then deploy the worker package:
 source /usr/local/flame/sbin/flmenv.sh --python-version 3.12
 cd "$FLAME_HOME/examples/vllm/serving"
 flmctl deploy --name vllm-serving --application . --max-instances 1 \
-  --env CUDA_VISIBLE_DEVICES=0 --env VLLM_MODEL=facebook/opt-125m
+  --env VLLM_MODEL=facebook/opt-125m
 ```
 
 `flmctl deploy` detects the `vllm-serving` script in `pyproject.toml`, uploads
@@ -24,11 +24,11 @@ the package, and registers the worker. FEM installs its pinned vLLM dependencies
 The console client needs only the Flame SDK; run it with `python3` to avoid
 installing CUDA dependencies on the console.
 
-The deployment above is a single-executor smoke example on otherwise idle GPU
-workers. Host shim reserves GPU counts without assigning physical devices, so
-the explicit visibility selects GPU 0. For other workloads, arrange device
-assignment separately. GPU FEMs must expose NVIDIA devices and preserve their
-driver `LD_LIBRARY_PATH` in Python executors; see the Helm GPU worker guidance.
+FEM assigns the executor's GPU and sets `CUDA_VISIBLE_DEVICES`; no visibility
+override is needed on the application. GPU FEMs must expose NVIDIA devices and
+preserve their driver `LD_LIBRARY_PATH` in Python executors; see the Helm GPU
+worker guidance. To use a container image instead, see
+[GPU runtime images](../../../docs/tutorials/gpu-runtime.md).
 
 Set `VLLM_MODEL` during deployment to select the application model; it defaults
 to `facebook/opt-125m`. Sessions cannot change the model. Deploy a separate

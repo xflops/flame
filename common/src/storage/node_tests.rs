@@ -207,13 +207,19 @@ mod tests {
         let mut node = Node {
             name: "refresh-test".to_string(),
             state: NodeState::Ready,
-            capacity: ResourceRequirement::default(),
+            capacity: ResourceRequirement {
+                gpu: 3,
+                ..Default::default()
+            },
             allocatable: ResourceRequirement::default(),
             info: NodeInfo::default(),
         };
 
         // Refresh should update capacity, allocatable, and info
         node.refresh();
+        // Refreshing host CPU/memory must preserve FEM's GPU inventory.
+        assert_eq!(node.capacity.gpu, 3);
+        assert_eq!(node.allocatable.gpu, 3);
 
         // After refresh, capacity should have non-zero values (from system)
         // Note: In test environment, these might be actual system values

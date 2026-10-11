@@ -29,11 +29,12 @@ library paths, application-configured paths, and the FEM's inherited library
 paths in that order. Older FEM images that do not preserve inherited paths
 require the driver path to be configured explicitly on the App template.
 
-The Host shim currently reserves GPU counts without assigning physical devices.
-For this single-executor test on otherwise idle GPU workers, configure
-`CUDA_VISIBLE_DEVICES=0` and `max_instances=1` on the template selected by the
-client configuration's `app` field. Other GPU applications need their own device
-assignment; the resource request alone does not provide GPU isolation.
+FEM assigns one available physical GPU to each `gpu=1` executor and sets
+`CUDA_VISIBLE_DEVICES` when starting the service. Do not set GPU visibility on
+the application template. The assignment remains reserved while the executor
+is retained between sessions, and is released after its service stops.
+Host visibility controls CUDA selection; it does not restrict access to device
+files. For container device isolation, see [GPU runtime images](../../../docs/tutorials/gpu-runtime.md).
 
 From a source checkout of `examples/vllm/offline`, check the example without loading a model:
 

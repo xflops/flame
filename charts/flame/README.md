@@ -23,6 +23,7 @@ For example:
 cluster:
   executors:
     shim: host
+    devices: [gpu]
 executorManager:
   hostNetwork: true
   hostPID: true
@@ -36,6 +37,11 @@ executorManager:
     flame.xflops.io/worker: "true"
   terminationGracePeriodSeconds: 300
 ```
+
+`cluster.executors.devices` selects FEM device managers and defaults to `[gpu]`.
+Set it to `[]` to disable device discovery and advertise CPU and memory only.
+GPU is currently the implemented manager; configuring an unsupported device
+name (such as `tpu`) fails FEM startup rather than silently skipping it.
 
 FEM registers using its Pod hostname. Host-networked workers use
 `ClusterFirstWithHostNet` DNS so the session-manager and cache Services resolve.

@@ -413,7 +413,7 @@ allows binding a socket below a mount exposed to the sandbox; Flame must not
 require or enable the broader `host-uds=open` or `host-uds=all` modes.
 
 Flame does not mutate containerd or runsc configuration. Each
-`create_service` performs a real bind/connect readiness check through the
+`create_instance` performs a real bind/connect readiness check through the
 configured default runtime. If shared UDS creation is unavailable, that bind
 fails with an actionable prerequisite error and does not fall back to Host.
 
@@ -515,7 +515,7 @@ operation is attempted once; the shim does not run a local retry loop.
 ### Executor lifecycle
 
 On bind, executor manager constructs the selected shim and immediately calls
-`create_service`, passing the shared ApplicationManager. CRI invokes the same
+`create_instance`, passing the shared ApplicationManager. CRI invokes the same
 installation path as Host when the application has a package URL. It mounts
 the returned release and Python runtime read-only, mounts the managed UV/pip
 caches read/write, and rewrites the installer's environment to executor-local
@@ -530,7 +530,7 @@ bundle as `FLAME_CA_FILE`. This avoids incorrectly using one service's CA as
 the other service's sole trust root while retaining a single SDK trust-file
 contract.
 
-`create_service` owns rollback because a failed instance is never stored in
+`create_instance` owns rollback because a failed instance is never stored in
 the executor state. The runtime instance is application-scoped and shares the
 executor lifetime: session unbind calls only `on_session_leave`, while executor
 release deletes the workload. A session-leave error is reported but does not

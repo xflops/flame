@@ -59,7 +59,7 @@ pub struct TaskInvokeResponse {
 /// Directory structure:
 ///   top_dir/                     - Process working directory, stdout/stderr logs
 ///   top_dir/work/<app_name>/     - App-specific directory for tmp, cache
-///   /var/flame/executors/<executor_id>.sock - Socket for gRPC communication
+///   /var/flame/shim/<executor_id>.sock - Socket for gRPC communication
 /// Cleanup:
 ///   - top_dir: cleaned up only if auto-generated
 ///   - app_dir: always cleaned up
@@ -69,15 +69,15 @@ pub struct ExecutorWorkDir {
     top_dir: PathBuf,
     /// Application working directory: top_dir/work/<app-name> (for logs, tmp, cache).
     app_dir: PathBuf,
-    /// Socket path: /var/flame/executors/<executor_id>.sock
+    /// Socket path: /var/flame/shim/<executor_id>.sock
     socket: PathBuf,
     /// If true, top_dir was auto-generated and should be cleaned up on release.
     auto_dir: bool,
 }
 
-const FLAME_SOCKET_DIR: &str = "/var/flame/executors";
+const FLAME_SOCKET_DIR: &str = "/var/flame/shim";
 
-fn get_socket_dir() -> PathBuf {
+pub(super) fn get_socket_dir() -> PathBuf {
     std::env::var("FLAME_SOCKET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(FLAME_SOCKET_DIR))
@@ -246,7 +246,7 @@ pub fn new_ptr(
 pub trait Shim: Send + 'static {
     /// Creates the application-scoped runtime service. Called once when the
     /// executor first receives an application session.
-    async fn create_service(
+    async fn create_instance(
         &mut self,
         app_manager: Arc<ApplicationManager>,
     ) -> Result<(), FlameError>;
@@ -281,11 +281,13 @@ mod tests {
             id: "executor-1".to_string(),
             application: "test-app".to_string(),
             resreq: ResourceRequirement::default(),
+            assignments: Default::default(),
             node: "node-1".to_string(),
             shim,
             session: None,
             task: None,
             context: Some(context),
+            app_mgr: None,
             shim_instance: None,
             state: ExecutorState::Idle,
         }

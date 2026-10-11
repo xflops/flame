@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use common::FlameError;
 
 use crate::cri_v1::{
-    ContainerConfig as CriContainerConfig, ContainerMetadata, ContainerState,
+    CdiDevice, ContainerConfig as CriContainerConfig, ContainerMetadata, ContainerState,
     ContainerStatus as CriContainerStatus, ImageSpec, Int64Value, KeyValue, LinuxContainerConfig,
     LinuxContainerResources, LinuxContainerSecurityContext, LinuxPodSandboxConfig,
     LinuxSandboxSecurityContext, Mount as CriMount, MountPropagation, PodSandboxConfig,
@@ -135,6 +135,8 @@ pub struct ContainerSpec {
     pub mounts: Vec<Mount>,
     pub resources: ResourceLimits,
     pub security_context: ContainerSecurityContext,
+    /// Fully qualified CDI names resolved by the container runtime.
+    pub cdi: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +264,11 @@ impl WorkloadSpec {
             annotations: self.metadata.annotations(),
             log_path: format!("{}.log", container.name),
             mounts,
+            cdi_devices: container
+                .cdi
+                .iter()
+                .map(|name| CdiDevice { name: name.clone() })
+                .collect(),
             stop_signal: Signal::Sigterm.into(),
             ..Default::default()
         })
@@ -418,6 +425,8 @@ impl ContainerStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadStatus {
     pub sandbox_id: String,
+    /// Ownership and application identity recorded when the workload was created.
+    pub labels: HashMap<String, String>,
     pub state: SandboxState,
     pub created_at: DateTime<Utc>,
     pub containers: Vec<ContainerStatus>,
@@ -430,6 +439,7 @@ impl WorkloadStatus {
     ) -> Result<Self, FlameError> {
         Ok(Self {
             sandbox_id: required_string(sandbox.id.clone(), "sandbox ID")?,
+            labels: sandbox.labels.clone(),
             state: SandboxState::try_from(sandbox.state)?,
             created_at: required_timestamp(sandbox.created_at, "sandbox created_at")?,
             containers,
@@ -518,6 +528,7 @@ mod tests {
                     memory: 1024,
                 },
                 security_context: ContainerSecurityContext::default(),
+                cdi: vec![],
             }],
             log_directory: "/var/log/flame/executors/executor".to_string(),
         }
@@ -559,6 +570,26 @@ mod tests {
         spec.containers[0].resources.cpu = 1;
         spec.containers[0].resources.memory = u64::MAX;
         assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn assigned_cdi_devices_are_forwarded_to_runtime() {
+        let mut spec = test_spec();
+        let names = vec![
+            "nvidia.com/gpu=GPU-first".to_string(),
+            "nvidia.com/gpu=GPU-second".to_string(),
+        ];
+        spec.containers[0].cdi = names.clone();
+        let config = spec.container_config(&spec.containers[0]).unwrap();
+        assert_eq!(
+            config
+                .cdi_devices
+                .into_iter()
+                .map(|device| device.name)
+                .collect::<Vec<_>>(),
+            names
+        );
+        assert!(!config.linux.unwrap().security_context.unwrap().privileged);
     }
 
     #[test]

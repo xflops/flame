@@ -11,6 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::PathBuf;
@@ -87,6 +88,7 @@ struct FlameSessionRecoveryYaml {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FlameExecutorsYaml {
     pub shim: Option<String>,
+    pub devices: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,9 +185,11 @@ pub struct FlameCluster {
     pub pprof: Option<FlamePprof>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FlameExecutors {
     pub shim: Shim,
+    /// Device managers loaded by FEM. An empty list disables device discovery.
+    pub devices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -540,9 +544,31 @@ impl Default for FlameSessionRecovery {
 impl TryFrom<FlameExecutorsYaml> for FlameExecutors {
     type Error = FlameError;
     fn try_from(executors: FlameExecutorsYaml) -> Result<Self, Self::Error> {
+        let devices = executors
+            .devices
+            .unwrap_or_else(|| FlameExecutors::default().devices);
+        let mut names = HashSet::new();
+        for name in &devices {
+            if !names.insert(name) {
+                return Err(FlameError::InvalidConfig(format!(
+                    "duplicate device manager <{}> in cluster.executors.devices",
+                    name
+                )));
+            }
+        }
         Ok(FlameExecutors {
             shim: Shim::try_from(executors.shim.unwrap_or(DEFAULT_SHIM.to_string()))?,
+            devices,
         })
+    }
+}
+
+impl Default for FlameExecutors {
+    fn default() -> Self {
+        Self {
+            shim: Shim::default(),
+            devices: vec!["gpu".to_string()],
+        }
     }
 }
 
@@ -717,6 +743,38 @@ impl TryFrom<FlameEvictionYaml> for FlameEviction {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn executor_devices_default_to_gpu() {
+        let yaml: FlameExecutorsYaml = serde_yaml::from_str("shim: host").unwrap();
+        let executors = FlameExecutors::try_from(yaml).unwrap();
+        assert_eq!(executors.devices, ["gpu"]);
+        assert_eq!(FlameExecutors::default().devices, ["gpu"]);
+        assert_eq!(FlameCluster::default().executors.devices, ["gpu"]);
+    }
+
+    #[test]
+    fn executor_devices_explicit_empty_disables_managers() {
+        let yaml: FlameExecutorsYaml = serde_yaml::from_str("devices: []").unwrap();
+        assert!(FlameExecutors::try_from(yaml).unwrap().devices.is_empty());
+    }
+
+    #[test]
+    fn executor_devices_preserve_configured_names() {
+        let yaml: FlameExecutorsYaml = serde_yaml::from_str("devices: [gpu, tpu]").unwrap();
+        assert_eq!(
+            FlameExecutors::try_from(yaml).unwrap().devices,
+            ["gpu", "tpu"]
+        );
+    }
+
+    #[test]
+    fn executor_devices_reject_duplicates() {
+        let yaml: FlameExecutorsYaml = serde_yaml::from_str("devices: [gpu, gpu]").unwrap();
+        let error = FlameExecutors::try_from(yaml).unwrap_err();
+        assert!(matches!(error, FlameError::InvalidConfig(_)));
+        assert!(error.to_string().contains("duplicate device manager <gpu>"));
+    }
 
     #[test]
     fn test_executor_limit_defaults() {

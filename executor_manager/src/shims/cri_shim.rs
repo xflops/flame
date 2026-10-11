@@ -31,6 +31,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::appmgr::{ApplicationInstallation, ApplicationManager, InstallationMountKind};
+use crate::devices::DeviceAssignments;
 use crate::executor::Executor;
 use crate::shims::grpc_shim::GrpcShim;
 use crate::shims::{Shim, ShimPtr};
@@ -68,8 +69,54 @@ impl CriShim {
         }))
     }
 
+    /// Reconnect a surviving executor service after device assignments have
+    /// been restored. Recovery never deletes a workload or replaces its socket.
+    async fn recover(&mut self) -> Result<bool, FlameError> {
+        let executor = &self.executor;
+        validate_path_component(&executor.id)?;
+        let filter = WorkloadFilter::new(executor.id.clone())?;
+        let mut manager = WorkloadManager::connect().await?;
+        let mut handles = manager.list_workload(&filter).await?;
+        if handles.is_empty() {
+            return Ok(false);
+        }
+        if handles.len() != 1 {
+            return Err(FlameError::InvalidState(format!(
+                "executor <{}> has {} surviving CRI workloads; refusing ambiguous recovery",
+                executor.id,
+                handles.len()
+            )));
+        }
+        let handle = handles.pop().expect("validated single workload");
+        let status = manager.status(&handle).await?;
+        validate_recovery_status(executor, &status)?;
+
+        let work_dir = Path::new(WORK_ROOT).join(&executor.id);
+        let mut instance_client = GrpcShim::new_at(&work_dir.join(INSTANCE_SOCKET))?;
+        tokio::time::timeout(Duration::from_secs(30), instance_client.connect())
+            .await
+            .map_err(|_| {
+                FlameError::Network(format!(
+                    "timed out reconnecting to CRI executor <{}>",
+                    executor.id
+                ))
+            })??;
+        tracing::info!(executor_id = %executor.id, sandbox_id = %handle.sandbox_id(),
+            "Recovered retained CRI executor service");
+        self.manager = Some(manager);
+        self.handle = Some(handle);
+        self.instance_client = Some(instance_client);
+        self.work_dir = Some(work_dir);
+        Ok(true)
+    }
+
     async fn create(&mut self, app_manager: &ApplicationManager) -> Result<(), FlameError> {
         if self.handle.is_some() {
+            return Ok(());
+        }
+        // A retained container is the executor's existing service. Reconnect
+        // before installation or any work-directory/socket mutation.
+        if self.recover().await? {
             return Ok(());
         }
         let create_started = Instant::now();
@@ -113,6 +160,7 @@ impl CriShim {
         let installation_mounts = container_mounts(&work_dir, &installation)?;
         let installed_environment = rebase_install_environment(&installation, &installation_mounts);
         merge_install_environment(&mut env, &installed_environment);
+        let cdi = apply_assignments(&executor.assignments, &mut env)?;
         let ca_sources = endpoint_ca_files(context);
         if !ca_sources.is_empty() {
             let ca_target = work_dir.join("ca.crt");
@@ -164,6 +212,7 @@ impl CriShim {
                     run_as_group: Some(gid),
                     supplemental_groups: vec![gid],
                 },
+                cdi,
             }],
             log_directory: log_dir.to_string_lossy().to_string(),
         };
@@ -249,9 +298,52 @@ impl CriShim {
     }
 }
 
+fn validate_recovery_status(
+    executor: &Executor,
+    status: &cri_rs::WorkloadStatus,
+) -> Result<(), FlameError> {
+    if status.labels.get(cri_rs::LABEL_APPLICATION) != Some(&executor.application)
+        || status.labels.get(cri_rs::LABEL_EXECUTOR_ID) != Some(&executor.id)
+        || status
+            .labels
+            .get(cri_rs::LABEL_MANAGED_BY)
+            .map(String::as_str)
+            != Some(cri_rs::MANAGED_BY_EXECUTOR_MANAGER)
+    {
+        return Err(FlameError::InvalidState(format!(
+            "surviving CRI workload does not belong to executor <{}> and application <{}>",
+            executor.id, executor.application
+        )));
+    }
+    if !status.healthy()
+        || status.containers.len() != 1
+        || status.containers[0].name != "application"
+    {
+        return Err(FlameError::InvalidState(format!(
+            "surviving CRI executor <{}> is not a healthy application service",
+            executor.id
+        )));
+    }
+    // CRI status does not expose the original CUDA environment or CDI request.
+    // Physical ownership comes from the manager's restored assignment map.
+    if executor.resreq.gpu < 0
+        || executor
+            .assignments
+            .get("gpu")
+            .map_or(0, |assignment| assignment.devices().len())
+            != executor.resreq.gpu as usize
+    {
+        return Err(FlameError::InvalidState(format!(
+            "restored device assignment does not match executor <{}> GPU request",
+            executor.id
+        )));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Shim for CriShim {
-    async fn create_service(
+    async fn create_instance(
         &mut self,
         app_manager: Arc<ApplicationManager>,
     ) -> Result<(), FlameError> {
@@ -373,11 +465,6 @@ fn validate_inputs(executor: &Executor, app: &ApplicationContext) -> Result<(), 
             app.name
         )));
     }
-    if executor.resreq.gpu != 0 {
-        return Err(FlameError::InvalidConfig(
-            "CRI applications do not support GPU resources in v1".to_string(),
-        ));
-    }
     let context = executor.context.as_ref().ok_or_else(|| {
         FlameError::InvalidState("CRI executor is missing cluster context".to_string())
     })?;
@@ -386,6 +473,36 @@ fn validate_inputs(executor: &Executor, app: &ApplicationContext) -> Result<(), 
         reject_loopback_endpoint(&cache.endpoint, "cache")?;
     }
     validate_path_component(&executor.id)
+}
+
+/// Apply manager-produced launch settings after application/installation defaults.
+fn apply_assignments(
+    assignments: &DeviceAssignments,
+    env: &mut BTreeMap<String, String>,
+) -> Result<Vec<String>, FlameError> {
+    let mut assigned_envs = BTreeMap::new();
+    let mut cdi = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let ordered: BTreeMap<_, _> = assignments.iter().collect();
+    for assignment in ordered.values() {
+        for (key, value) in &assignment.envs {
+            if let Some(previous) = assigned_envs.insert(key.clone(), value.clone()) {
+                if previous != *value {
+                    return Err(FlameError::InvalidConfig(format!(
+                        "device assignments conflict on environment variable '{key}'"
+                    )));
+                }
+            }
+        }
+        // Preserve each manager's device order (and therefore local ordinal mapping).
+        for device in &assignment.cdi {
+            if seen.insert(device.clone()) {
+                cdi.push(device.clone());
+            }
+        }
+    }
+    env.extend(assigned_envs);
+    Ok(cdi)
 }
 
 fn merge_install_environment(
@@ -660,6 +777,7 @@ fn cleanup_directory(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices::DeviceManager;
     use common::apis::{ExecutorState, ResourceRequirement, Shim as ShimType};
     use tempfile::tempdir;
 
@@ -673,7 +791,9 @@ mod tests {
             session: None,
             task: None,
             context: None,
+            app_mgr: None,
             shim_instance: None,
+            assignments: Default::default(),
             state: ExecutorState::Idle,
         }
     }
@@ -692,17 +812,215 @@ mod tests {
         }
     }
 
+    fn recovery_status(executor: &Executor) -> cri_rs::WorkloadStatus {
+        cri_rs::WorkloadStatus {
+            sandbox_id: "sandbox-1".into(),
+            labels: HashMap::from([
+                (cri_rs::LABEL_EXECUTOR_ID.into(), executor.id.clone()),
+                (
+                    cri_rs::LABEL_APPLICATION.into(),
+                    executor.application.clone(),
+                ),
+                (
+                    cri_rs::LABEL_MANAGED_BY.into(),
+                    cri_rs::MANAGED_BY_EXECUTOR_MANAGER.into(),
+                ),
+            ]),
+            state: cri_rs::SandboxState::Ready,
+            created_at: chrono::Utc::now(),
+            containers: vec![cri_rs::ContainerStatus {
+                id: "container-1".into(),
+                sandbox_id: "sandbox-1".into(),
+                name: "application".into(),
+                image: "example/image:latest".into(),
+                image_ref: "sha256:example".into(),
+                state: ContainerRuntimeState::Running,
+                created_at: chrono::Utc::now(),
+                started_at: Some(chrono::Utc::now()),
+                finished_at: None,
+                exit_code: 0,
+                reason: String::new(),
+                message: String::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn recovery_requires_a_healthy_application_with_matching_ownership() {
+        let executor = test_executor();
+        let status = recovery_status(&executor);
+        validate_recovery_status(&executor, &status).unwrap();
+        for label in [
+            cri_rs::LABEL_APPLICATION,
+            cri_rs::LABEL_EXECUTOR_ID,
+            cri_rs::LABEL_MANAGED_BY,
+        ] {
+            let mut foreign = status.clone();
+            foreign.labels.insert(label.into(), "foreign".into());
+            assert!(validate_recovery_status(&executor, &foreign).is_err());
+        }
+        let mut exited = status.clone();
+        exited.containers[0].state = ContainerRuntimeState::Exited;
+        assert!(validate_recovery_status(&executor, &exited).is_err());
+        let mut unexpected = status.clone();
+        unexpected.containers[0].name = "another-service".into();
+        assert!(validate_recovery_status(&executor, &unexpected).is_err());
+        let mut duplicate = status.clone();
+        duplicate.containers.push(status.containers[0].clone());
+        assert!(validate_recovery_status(&executor, &duplicate).is_err());
+        let mut unready = status;
+        unready.state = cri_rs::SandboxState::NotReady;
+        assert!(validate_recovery_status(&executor, &unready).is_err());
+    }
+
+    #[test]
+    fn recovery_does_not_adopt_gpu_workloads_without_restored_assignments() {
+        let mut executor = test_executor();
+        executor.resreq.gpu = 1;
+        assert!(validate_recovery_status(&executor, &recovery_status(&executor)).is_err());
+        let assignment = crate::devices::DeviceAssignment::new(vec!["GPU-restored".into()]);
+        executor
+            .assignments
+            .insert("gpu".into(), assignment.clone());
+        validate_recovery_status(&executor, &recovery_status(&executor)).unwrap();
+        executor.resreq.gpu = 2;
+        assert!(validate_recovery_status(&executor, &recovery_status(&executor)).is_err());
+    }
+
+    #[test]
+    fn assigned_gpus_are_injected_into_the_application_image() {
+        let gpu_workdir = tempfile::tempdir().unwrap();
+        let allocator = crate::devices::gpu::GpuManager::new()
+            .with_workdir(gpu_workdir.path())
+            .with_inventory(vec!["GPU-b".into(), "GPU-a".into()])
+            .unwrap();
+        let mut executor = test_executor();
+        executor.resreq.gpu = 2;
+        executor.assignments.insert(
+            "gpu".to_string(),
+            allocator
+                .allocate(&crate::devices::test_executor(
+                    (common::apis::ResourceRequirement {
+                        gpu: 2,
+                        ..Default::default()
+                    })
+                    .clone(),
+                ))
+                .unwrap(),
+        );
+        let mut env = BTreeMap::from([
+            ("CUDA_VISIBLE_DEVICES".into(), "7".into()),
+            ("NVIDIA_VISIBLE_DEVICES".into(), "all".into()),
+        ]);
+        let devices = apply_assignments(&executor.assignments, &mut env).unwrap();
+        assert_eq!(devices, ["nvidia.com/gpu=GPU-b", "nvidia.com/gpu=GPU-a"]);
+        assert_eq!(env["CUDA_VISIBLE_DEVICES"], "GPU-b,GPU-a");
+        assert_eq!(env["NVIDIA_VISIBLE_DEVICES"], "void");
+    }
+
+    #[test]
+    fn cpu_image_does_not_inject_gpus_or_inherit_visibility() {
+        let mut env = BTreeMap::from([
+            ("CUDA_VISIBLE_DEVICES".into(), "0".into()),
+            ("NVIDIA_VISIBLE_DEVICES".into(), "all".into()),
+        ]);
+        let gpu_workdir = tempfile::tempdir().unwrap();
+        let allocator = crate::devices::gpu::GpuManager::new()
+            .with_workdir(gpu_workdir.path())
+            .with_inventory(vec![])
+            .unwrap();
+        let assignments = HashMap::from([(
+            "gpu".into(),
+            allocator
+                .allocate(&crate::devices::test_executor(
+                    (common::apis::ResourceRequirement {
+                        gpu: 0,
+                        ..Default::default()
+                    })
+                    .clone(),
+                ))
+                .unwrap(),
+        )]);
+        assert!(apply_assignments(&assignments, &mut env)
+            .unwrap()
+            .is_empty());
+        assert_eq!(env["CUDA_VISIBLE_DEVICES"], "");
+        assert_eq!(env["NVIDIA_VISIBLE_DEVICES"], "void");
+    }
+
+    #[test]
+    fn generic_assignments_merge_envs_and_cdi_and_reject_conflicts_atomically() {
+        let gpu_workdir = tempfile::tempdir().unwrap();
+        let allocator = crate::devices::gpu::GpuManager::new()
+            .with_workdir(gpu_workdir.path())
+            .with_inventory(vec![])
+            .unwrap();
+        let mut first = allocator
+            .allocate(&crate::devices::test_executor(
+                (common::apis::ResourceRequirement {
+                    gpu: 0,
+                    ..Default::default()
+                })
+                .clone(),
+            ))
+            .unwrap();
+        first.envs = HashMap::from([("DEVICE_MODE".into(), "first".into())]);
+        first.cdi = vec!["vendor.example/device=a".into()];
+        let mut second = allocator
+            .allocate(&crate::devices::test_executor(
+                (common::apis::ResourceRequirement {
+                    gpu: 0,
+                    ..Default::default()
+                })
+                .clone(),
+            ))
+            .unwrap();
+        second.envs = HashMap::from([("OTHER_DEVICE".into(), "second".into())]);
+        second.cdi = vec![
+            "vendor.example/device=b".into(),
+            "vendor.example/device=a".into(),
+        ];
+        let mut assignments = HashMap::from([("first".into(), first), ("second".into(), second)]);
+        let mut env = BTreeMap::from([("DEVICE_MODE".into(), "app-default".into())]);
+        assert_eq!(
+            apply_assignments(&assignments, &mut env).unwrap(),
+            ["vendor.example/device=a", "vendor.example/device=b"]
+        );
+        assert_eq!(env["DEVICE_MODE"], "first");
+        assert_eq!(env["OTHER_DEVICE"], "second");
+        assignments
+            .get_mut("second")
+            .unwrap()
+            .envs
+            .insert("DEVICE_MODE".into(), "conflict".into());
+        let before = env.clone();
+        assert!(apply_assignments(&assignments, &mut env).is_err());
+        assert_eq!(env, before);
+    }
+
+    #[test]
+    fn disabled_device_managers_preserve_environment_and_request_no_cdi() {
+        let mut env = BTreeMap::from([("DEVICE_MODE".into(), "app-default".into())]);
+        let before = env.clone();
+        assert!(apply_assignments(&DeviceAssignments::default(), &mut env)
+            .unwrap()
+            .is_empty());
+        assert_eq!(env, before);
+    }
+
     #[tokio::test]
-    async fn cleanup_only_shim_cannot_create_service() {
-        let shim = CriShim::new_ptr(&test_executor(), None);
+    async fn service_creation_validates_recovery_identity_without_application_context() {
+        let mut executor = test_executor();
+        executor.id = "../executor".into();
+        let shim = CriShim::new_ptr(&executor, None);
         let error = shim
             .lock()
             .await
-            .create_service(Arc::new(ApplicationManager::new().unwrap()))
+            .create_instance(Arc::new(ApplicationManager::new().unwrap()))
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("cleanup-only CRI shim"));
+        assert!(error.to_string().contains("invalid executor ID"));
     }
 
     #[test]

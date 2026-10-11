@@ -38,6 +38,7 @@ mod tests {
                 schedule_interval: 1000,
                 executors: FlameExecutors {
                     shim: Shim::default(),
+                    ..Default::default()
                 },
                 tls: None,
                 limits: FlameLimits {

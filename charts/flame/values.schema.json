@@ -11,6 +11,21 @@
         "imagePullSecrets": { "type": "array" }
       }
     },
+    "cluster": {
+      "type": "object",
+      "properties": {
+        "executors": {
+          "type": "object",
+          "properties": {
+            "devices": {
+              "type": "array",
+              "items": { "type": "string" },
+              "uniqueItems": true
+            }
+          }
+        }
+      }
+    },
     "sessionManager": {
       "type": "object",
       "properties": {

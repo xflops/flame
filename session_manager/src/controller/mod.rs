@@ -1016,7 +1016,13 @@ impl Controller {
 
     pub async fn unregister_executor(&self, id: ExecutorID) -> Result<(), FlameError> {
         trace_fn!("Controller::unregister_executor");
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
+        let exe_ptr = match self.storage.get_executor_ptr(id.clone()) {
+            Ok(executor) => executor,
+            // Removal is idempotent: FEM can acknowledge an executor that SM
+            // already deleted without changing its normal cleanup workflow.
+            Err(FlameError::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
 
         // Get executor info before unregistering for notification
         let executor = {
@@ -1053,7 +1059,7 @@ impl Controller {
         self.storage.delete_executor(id.clone()).await?;
         self.notifier.executors.remove(&id)?;
 
-        // Notify the node about the executor deletion
+        // Notify the node about the executor deletion.
         let mut released_executor = executor.clone();
         released_executor.state = ExecutorState::Released;
         released_executor.task_id = None;
@@ -1069,7 +1075,6 @@ impl Controller {
                 e
             );
         }
-
         Ok(())
     }
 
@@ -1178,6 +1183,7 @@ mod tests {
                 schedule_interval: 1000,
                 executors: FlameExecutors {
                     shim: Shim::default(),
+                    ..Default::default()
                 },
                 tls: None,
                 limits: FlameLimits {
@@ -1353,6 +1359,31 @@ mod tests {
             .await
             .unwrap();
         executor.id
+    }
+
+    #[tokio::test]
+    async fn unregister_missing_executor_succeeds() {
+        let controller = new_ptr(create_test_storage().await);
+        controller
+            .unregister_executor("missing-executor".into())
+            .await
+            .unwrap();
+        assert!(matches!(
+            controller.get_executor("missing-executor".into()),
+            Err(FlameError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn unregister_executor_is_idempotent() {
+        let controller = new_ptr(create_test_storage().await);
+        let id = create_binding_executor(&controller, "unregister-idempotent").await;
+        controller.unregister_executor(id.clone()).await.unwrap();
+        controller.unregister_executor(id.clone()).await.unwrap();
+        assert!(matches!(
+            controller.get_executor(id),
+            Err(FlameError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

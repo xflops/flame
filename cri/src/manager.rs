@@ -769,6 +769,7 @@ mod tests {
         cleanup_not_found: Mutex<bool>,
         container_status_requests: Mutex<Vec<String>>,
         container_status_response_id: Mutex<Option<String>>,
+        listed_sandboxes: Mutex<Option<Vec<PodSandbox>>>,
     }
 
     struct FakeRuntime {
@@ -850,6 +851,9 @@ mod tests {
             _: Request<ListPodSandboxRequest>,
         ) -> Result<tonic::Response<ListPodSandboxResponse>, Status> {
             self.call("list_sandboxes");
+            if let Some(items) = self.state.listed_sandboxes.lock().unwrap().clone() {
+                return Ok(tonic::Response::new(ListPodSandboxResponse { items }));
+            }
             let labels = self.state.labels.lock().unwrap().clone();
             let mut foreign_labels = labels.clone();
             foreign_labels.insert(LABEL_EXECUTOR_ID.to_string(), "foreign".to_string());
@@ -1035,6 +1039,7 @@ mod tests {
                 mounts: Vec::new(),
                 resources: ResourceLimits::default(),
                 security_context: ContainerSecurityContext::default(),
+                cdi: Vec::new(),
             }],
             log_directory: "/tmp/logs".to_string(),
         }

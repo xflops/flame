@@ -13,11 +13,11 @@ limitations under the License.
 
 use std::convert::TryFrom;
 use std::sync::{Arc, Mutex};
-use stdng::{lock_ptr, logs::TraceFn, trace_fn, MutexPtr};
-use tokio::task::JoinHandle;
+use stdng::{lock_ptr, logs::TraceFn, trace_fn};
 
 use crate::appmgr::ApplicationManager;
 use crate::client::BackendClient;
+use crate::devices::DeviceAssignments;
 use crate::shims::ShimPtr;
 use ::rpc::flame::v1::{self as rpc, ExecutorSpec, ExecutorStatus, Metadata};
 
@@ -30,6 +30,11 @@ pub struct Executor {
     pub id: String,
     pub application: String,
     pub resreq: ResourceRequirement,
+    /// FEM-local device assignment metadata; never serialized to Session Manager.
+    pub assignments: DeviceAssignments,
+    /// Shared FEM-local application manager, attached before worker startup.
+    /// RPC-decoded executor metadata has no application manager pointer.
+    pub app_mgr: Option<Arc<ApplicationManager>>,
     pub node: String,
     /// Supported shim type from executor-manager config.
     /// This indicates what type of shim this executor supports (Host or Wasm).
@@ -80,11 +85,13 @@ impl TryFrom<&rpc::Executor> for Executor {
             id: metadata.id.clone(),
             application: spec.application.clone(),
             resreq: resreq.into(),
+            assignments: Default::default(),
             node: spec.node.clone(),
             shim: Shim::from(spec.shim()), // Get shim from spec
             session: None,
             task: None,
             context: None,
+            app_mgr: None,
             shim_instance: None,
             state,
         })
@@ -125,11 +132,13 @@ impl From<&Executor> for rpc::Executor {
 }
 
 impl Executor {
-    pub(crate) fn release(&mut self) {
+    pub(crate) fn release(&mut self) -> Result<(), FlameError> {
+        self.assignments.clear();
         self.shim_instance = None;
         self.session = None;
         self.task = None;
         self.state = ExecutorState::Released;
+        Ok(())
     }
 
     pub fn update(&mut self, next: &Executor) {
@@ -142,74 +151,237 @@ impl Executor {
         self.application = next.application.clone();
         self.state = next.state;
         self.shim_instance = next.shim_instance.clone();
+        self.assignments = next.assignments.clone();
         self.session = next.session.clone();
         self.task = next.task.clone();
     }
 }
 
-pub fn start(client: BackendClient, executor: ExecutorPtr, app_manager: Arc<ApplicationManager>) {
+pub fn start(client: BackendClient, executor: ExecutorPtr) -> Result<(), FlameError> {
     tokio::task::spawn(async move {
         loop {
-            let exec = {
-                let exec = lock_ptr!(executor);
-                match exec {
-                    Ok(exec) => exec.clone(),
-                    Err(e) => {
-                        tracing::error!("Failed to lock executor: {e}");
-                        return;
-                    }
+            let exec = match executor.lock() {
+                Ok(exec) => exec.clone(),
+                Err(error) => {
+                    tracing::error!("Failed to lock executor: {error}");
+                    return;
                 }
             };
-
             if exec.state == ExecutorState::Released {
-                tracing::info!("Executor <{}> is released, exit.", exec.id);
-                break;
+                tracing::info!(executor_id = %exec.id, "Executor is released, exit");
+                return;
             }
-
-            let mut state = states::from(client.clone(), exec.clone(), app_manager.clone());
+            let mut state = match states::from(client.clone(), executor.clone()) {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::error!(executor_id = %exec.id, %error, "Failed to build executor state");
+                    return;
+                }
+            };
             match state.execute().await {
-                Ok(next_state) => {
-                    let mut exec = lock_ptr!(executor);
-                    match exec {
-                        Ok(mut exec) => {
-                            // A server-pushed removal wins over a state
-                            // transition that was already in flight.
-                            if exec.state == ExecutorState::Released {
-                                break;
-                            }
-                            exec.update(&next_state);
+                Ok(next) => {
+                    let mut shared = match executor.lock() {
+                        Ok(shared) => shared,
+                        Err(error) => {
+                            tracing::error!(executor_id = %exec.id, %error, "Failed to update executor state");
+                            return;
                         }
-                        Err(e) => {
-                            tracing::error!("Failed to lock executor: {e}");
-                        }
+                    };
+                    if shared.state != ExecutorState::Released {
+                        shared.update(&next);
                     }
                 }
-                Err(e) => {
-                    let session_id = exec
-                        .session
-                        .as_ref()
-                        .map(|session| session.session_id.as_str());
-                    let application = exec
-                        .session
-                        .as_ref()
-                        .map(|session| session.application.name.as_str());
-                    let task_id = exec.task.as_ref().map(|task| task.task_id.as_str());
-                    let task_session_id = exec.task.as_ref().map(|task| task.session_id.as_str());
-                    tracing::error!(
-                        executor_id = %exec.id,
-                        node = %exec.node,
-                        state = %exec.state,
-                        session_id = ?session_id,
-                        application = ?application,
-                        task_session_id = ?task_session_id,
-                        task_id = ?task_id,
-                        error = %e,
-                        "Failed to execute executor state"
-                    );
-                    // State/RPC errors are not necessarily shim crashes. Keep the worker alive so
-                    // session-manager can drive the executor through unbinding and release.
+                Err(error) => {
+                    tracing::error!(executor_id = %exec.id, node = %exec.node, state = %exec.state,
+                        %error, "Failed to execute executor state");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
         }
     });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::gpu::GpuManager;
+    use crate::devices::DeviceManager;
+    use crate::shims::{SessionEnterResponse, Shim as ShimService, TaskInvokeResponse};
+    use async_trait::async_trait;
+    use tokio::sync::Notify;
+
+    struct DelayedDestroy {
+        fail_first: bool,
+        entered: Arc<Notify>,
+        finish: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl ShimService for DelayedDestroy {
+        async fn create_instance(&mut self, _: Arc<ApplicationManager>) -> Result<(), FlameError> {
+            unreachable!()
+        }
+        async fn on_session_enter(
+            &mut self,
+            _: &SessionContext,
+        ) -> Result<SessionEnterResponse, FlameError> {
+            unreachable!()
+        }
+        async fn on_task_invoke(
+            &mut self,
+            _: &TaskContext,
+        ) -> Result<TaskInvokeResponse, FlameError> {
+            unreachable!()
+        }
+        async fn on_session_leave(&mut self) -> Result<(), FlameError> {
+            unreachable!()
+        }
+        async fn destroy_instance(&mut self) -> Result<(), FlameError> {
+            self.entered.notify_one();
+            self.finish.notified().await;
+            if self.fail_first {
+                self.fail_first = false;
+                Err(FlameError::Internal("cleanup failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_service_cleanup_keeps_allocation_until_explicit_release() {
+        let gpu_workdir = tempfile::tempdir().unwrap();
+        let allocator = Arc::new(crate::devices::DeviceManagers::with_gpu(
+            GpuManager::new()
+                .with_workdir(gpu_workdir.path())
+                .with_inventory(vec!["GPU-a".to_string()])
+                .unwrap(),
+        ));
+        let request = ResourceRequirement {
+            gpu: 1,
+            ..Default::default()
+        };
+        let entered = Arc::new(Notify::new());
+        let finish = Arc::new(Notify::new());
+        let mut executor = Executor {
+            id: "executor-1".to_string(),
+            application: "test-app".to_string(),
+            resreq: ResourceRequirement {
+                gpu: 1,
+                ..Default::default()
+            },
+            assignments: allocator
+                .allocate(&{
+                    let mut metadata = crate::devices::test_executor(request.clone());
+                    metadata.id = "executor-1".into();
+                    metadata
+                })
+                .unwrap(),
+            node: "test-node".to_string(),
+            shim: Shim::Host,
+            session: None,
+            task: None,
+            context: None,
+            app_mgr: None,
+            shim_instance: Some(Arc::new(tokio::sync::Mutex::new(DelayedDestroy {
+                fail_first: false,
+                entered: entered.clone(),
+                finish: finish.clone(),
+            }))),
+            state: ExecutorState::Bound,
+        };
+        let shim = executor.shim_instance.clone().unwrap();
+        let cleanup = tokio::spawn(async move { shim.lock().await.destroy_instance().await });
+        entered.notified().await;
+        assert!(allocator
+            .allocate(&crate::devices::test_executor((request).clone()))
+            .is_err());
+        finish.notify_one();
+        cleanup.await.unwrap().unwrap();
+        assert!(allocator
+            .allocate(&crate::devices::test_executor((request).clone()))
+            .is_err());
+        executor.release().unwrap();
+        assert!(allocator
+            .allocate(&crate::devices::test_executor(request.clone()))
+            .is_err());
+        allocator.release(&executor).unwrap();
+        assert!(allocator
+            .allocate(&crate::devices::test_executor((request).clone()))
+            .is_ok());
+    }
+    #[tokio::test]
+    async fn released_executor_exits_without_running_a_state() {
+        let mut metadata = crate::devices::test_executor(ResourceRequirement::default());
+        metadata.state = ExecutorState::Released;
+        let executor = stdng::new_ptr(metadata);
+        start(BackendClient::default(), executor.clone()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while Arc::strong_count(&executor) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(executor.lock().unwrap().state, ExecutorState::Released);
+    }
+
+    #[tokio::test]
+    async fn releasing_executor_requires_backend_acknowledgement() {
+        let workdir = tempfile::tempdir().unwrap();
+        let devices = Arc::new(crate::devices::DeviceManagers::with_gpu(
+            GpuManager::new()
+                .with_workdir(workdir.path())
+                .with_inventory(vec!["GPU-a".into()])
+                .unwrap(),
+        ));
+        let mut metadata = crate::devices::test_executor(ResourceRequirement {
+            gpu: 1,
+            ..Default::default()
+        });
+        metadata.assignments = devices.allocate(&metadata).unwrap();
+
+        metadata.state = ExecutorState::Releasing;
+        let entered = Arc::new(Notify::new());
+        let finish = Arc::new(Notify::new());
+        metadata.shim_instance = Some(Arc::new(tokio::sync::Mutex::new(DelayedDestroy {
+            fail_first: false,
+            entered: entered.clone(),
+            finish: finish.clone(),
+        })));
+        let executor = stdng::new_ptr(metadata);
+        start(BackendClient::default(), executor.clone()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(executor.lock().unwrap().state, ExecutorState::Releasing);
+        let mut competing = crate::devices::test_executor(ResourceRequirement {
+            gpu: 1,
+            ..Default::default()
+        });
+        competing.id = "competing".into();
+        assert!(devices.allocate(&competing).is_err());
+        finish.notify_one();
+        // The failed backend unregister leaves both the persisted ownership and
+        // local Releasing state intact; only FEM later frees the physical claim.
+        assert!(workdir
+            .path()
+            .join("gpu")
+            .join(format!("{}.json", executor.lock().unwrap().id))
+            .exists());
+        assert!(devices.allocate(&competing).is_err());
+        assert_eq!(executor.lock().unwrap().state, ExecutorState::Releasing);
+        executor.lock().unwrap().state = ExecutorState::Released;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while Arc::strong_count(&executor) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(devices.allocate(&competing).is_err());
+        devices.release(&executor.lock().unwrap()).unwrap();
+        assert!(devices.allocate(&competing).is_ok());
+    }
 }

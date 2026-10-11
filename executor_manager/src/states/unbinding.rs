@@ -31,6 +31,14 @@ impl State for UnbindingState {
     async fn execute(&mut self) -> Result<Executor, FlameError> {
         trace_fn!("UnbindingState::execute");
 
+        // A failed normal bind can legitimately have no service after cleanup.
+        // Without local session context, report the missing service for restart.
+        if self.executor.session.is_none() && self.executor.shim_instance.is_none() {
+            return Err(FlameError::InvalidState(
+                "no shim instance in unbinding state".to_string(),
+            ));
+        }
+
         self.client.unbind_executor(&self.executor.clone()).await?;
         self.leave_session().await;
 
@@ -76,6 +84,7 @@ impl UnbindingState {
 mod tests {
     use super::*;
     use crate::appmgr::ApplicationManager;
+    use crate::devices::DeviceManager;
     use crate::shims::{SessionEnterResponse, Shim, ShimPtr, TaskInvokeResponse};
     use common::apis::{ResourceRequirement, SessionContext, Shim as ShimType, TaskContext};
     use std::sync::Arc;
@@ -87,7 +96,7 @@ mod tests {
 
     #[async_trait]
     impl Shim for TestShim {
-        async fn create_service(
+        async fn create_instance(
             &mut self,
             _app_manager: Arc<ApplicationManager>,
         ) -> Result<(), FlameError> {
@@ -125,16 +134,37 @@ mod tests {
 
     #[tokio::test]
     async fn successful_unbind_retains_application_instance() {
+        let gpu_workdir = tempfile::tempdir().unwrap();
+        let allocator = crate::devices::gpu::GpuManager::new()
+            .with_workdir(gpu_workdir.path())
+            .with_inventory(vec!["GPU-a".to_string()])
+            .unwrap();
         let shim: ShimPtr = Arc::new(Mutex::new(TestShim { fail_leave: false }));
         let executor = Executor {
             id: "executor-1".to_string(),
             application: "test-app".to_string(),
-            resreq: ResourceRequirement::default(),
+            resreq: ResourceRequirement {
+                gpu: 1,
+                ..Default::default()
+            },
+            assignments: std::collections::HashMap::from([(
+                "gpu".to_string(),
+                allocator
+                    .allocate(&crate::devices::test_executor(
+                        (common::apis::ResourceRequirement {
+                            gpu: 1,
+                            ..Default::default()
+                        })
+                        .clone(),
+                    ))
+                    .unwrap(),
+            )]),
             node: "node-1".to_string(),
             shim: ShimType::Host,
             session: None,
             task: None,
             context: None,
+            app_mgr: None,
             shim_instance: Some(shim.clone()),
             state: ExecutorState::Unbinding,
         };
@@ -146,6 +176,19 @@ mod tests {
         state.unbind_completed();
 
         assert_eq!(state.executor.state, ExecutorState::Idle);
+        assert!(allocator
+            .allocate(&crate::devices::test_executor(
+                (common::apis::ResourceRequirement {
+                    gpu: 1,
+                    ..Default::default()
+                })
+                .clone()
+            ))
+            .is_err());
+        assert_eq!(
+            state.executor.assignments.get("gpu").unwrap().devices(),
+            ["GPU-a"]
+        );
         assert!(Arc::ptr_eq(
             state.executor.shim_instance.as_ref().unwrap(),
             &shim
@@ -159,11 +202,13 @@ mod tests {
             id: "executor-1".to_string(),
             application: "test-app".to_string(),
             resreq: ResourceRequirement::default(),
+            assignments: Default::default(),
             node: "node-1".to_string(),
             shim: ShimType::Host,
             session: None,
             task: None,
             context: None,
+            app_mgr: None,
             shim_instance: Some(shim.clone()),
             state: ExecutorState::Unbinding,
         };

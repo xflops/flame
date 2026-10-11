@@ -45,6 +45,7 @@ wasmtime-wasi = { version = "43", optional = true }
 anyhow = "1"
 tokio-stream = { workspace = true }
 shellexpand = "3.1"
+nvml-wrapper = "0.10"
 
 [lints.rust]
 unused = "allow"

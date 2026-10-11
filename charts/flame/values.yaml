@@ -17,6 +17,8 @@ cluster:
   storage: "fs:///var/lib/flame/session"
   executors:
     shim: host
+    # Device managers loaded by FEM; [] disables device discovery.
+    devices: [gpu]
   limits:
     # Maximum number of sessions in the cluster.
     maxSessions: 1000

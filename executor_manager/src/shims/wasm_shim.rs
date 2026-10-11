@@ -63,7 +63,7 @@ impl WasmShim {
 
 #[async_trait]
 impl Shim for WasmShim {
-    async fn create_service(
+    async fn create_instance(
         &mut self,
         _app_manager: Arc<ApplicationManager>,
     ) -> Result<(), common::FlameError> {
