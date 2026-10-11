@@ -22,7 +22,20 @@ data:
         shim: {{ .Values.cluster.executors.shim | quote }}
       limits:
         max_sessions: {{ .Values.cluster.limits.maxSessions }}
-        max_executors: {{ .Values.cluster.limits.maxExecutors }}
+        {{- if ne .Values.cluster.limits.application.maxExecutors nil }}
+        application:
+          max_executors: {{ .Values.cluster.limits.application.maxExecutors }}
+        {{- else }}
+        application: {}
+        {{- end }}
+        {{- if ne .Values.cluster.limits.session.maxExecutors nil }}
+        session:
+          max_executors: {{ .Values.cluster.limits.session.maxExecutors }}
+        {{- else }}
+        session: {}
+        {{- end }}
+        node:
+          max_executors: {{ .Values.cluster.limits.node.maxExecutors }}
       recovery:
         session:
           retry_limits: {{ .Values.cluster.recovery.session.retryLimits }}

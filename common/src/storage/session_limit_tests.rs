@@ -23,7 +23,7 @@ mod tests {
                 storage: "none".to_string(),
                 limits: FlameLimits {
                     max_sessions,
-                    max_executors: 128,
+                    ..Default::default()
                 },
                 ..Default::default()
             },

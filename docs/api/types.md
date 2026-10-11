@@ -105,7 +105,7 @@ message SessionSpec {
 | `application` | string | Name of the application to run |
 | `common_data` | bytes | Data shared across all tasks (optional) |
 | `min_instances` | uint32 | Minimum executor instances (default: 0) |
-| `max_instances` | uint32 | Maximum executor instances (optional, unlimited if not set) |
+| `max_instances` | uint32 | Maximum executor instances, including in-flight bindings and reservations (optional, unlimited if not set; `0` prevents allocation and binding) |
 | `batch_size` | uint32 | Reserved for future implementation; currently `1` |
 | `priority` | uint32 | Session priority; higher = more important (default: 0) |
 | `resreq` | ResourceRequirement | Per-task resource request (optional); when absent, the server applies `cluster.resreq`, with a hardcoded `cpu=1,mem=1g,gpu=0` fallback. |
@@ -295,7 +295,7 @@ message ApplicationSpec {
 | `arguments` | string[] | Command arguments |
 | `environments` | Environment[] | Environment variables |
 | `working_directory` | string | Working directory |
-| `max_instances` | uint32 | Maximum concurrent instances |
+| `max_instances` | uint32 | Maximum application executor instances across sessions, including startup, retained Idle and releasing instances; `0` prevents creation |
 | `delay_release` | int64 | Base executor release delay in seconds (default: 60); retained Idle executors use twice this delay |
 | `schema` | ApplicationSchema | Input/output schema definitions |
 | `url` | string | Service URL for remote services |

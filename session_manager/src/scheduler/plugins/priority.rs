@@ -329,7 +329,7 @@ impl Plugin for PriorityPlugin {
         }
     }
 
-    fn on_session_bind(&mut self, ssn: SessionInfoPtr) {
+    fn on_session_bind(&mut self, _exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
         let unit = match self.ssn_unit.get(&ssn.id) {
             Some(u) => u.clone(),
             None => return,
@@ -339,7 +339,7 @@ impl Plugin for PriorityPlugin {
         }
     }
 
-    fn on_session_unbind(&mut self, ssn: SessionInfoPtr) {
+    fn on_session_unbind(&mut self, _exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
         let unit = match self.ssn_unit.get(&ssn.id) {
             Some(u) => u.clone(),
             None => return,

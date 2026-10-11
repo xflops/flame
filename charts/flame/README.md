@@ -90,6 +90,35 @@ also set its own `image.tag`. For testing with `latest`, use
 
 ## Install
 
+Executor limits have explicit application, session, and node scopes:
+
+```yaml
+cluster:
+  limits:
+    maxSessions: 1000
+    application:
+      maxExecutors: null
+    session:
+      maxExecutors: null
+    node:
+      maxExecutors: 128
+```
+
+`maxSessions` limits the total session count. Optional application and session
+`maxExecutors` values are hard ceilings: the scheduler applies the lower of the
+cluster ceiling and the application's or session's requested `max_instances`.
+A `null` ceiling leaves the requested limit in effect. Node `maxExecutors`
+limits active executors on each node. Idle executors continue to count toward
+application and node limits; binding executors count toward session limits.
+An application or node ceiling of `0` prevents creating new executors; retained
+executors can still bind within the session limit. A session ceiling of `0`
+prevents binding or reserving executors for that session.
+
+The previous `cluster.limits.maxExecutors` value has moved to
+`cluster.limits.node.maxExecutors`. Update existing values files and `--set`
+arguments before installing; the chart rejects the old key to avoid silently
+discarding an existing limit.
+
 Use `flame-system` as the default namespace. For each test iteration, uninstall
 the existing release, update the Helm values, and install again:
 

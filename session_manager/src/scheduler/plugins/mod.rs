@@ -26,7 +26,7 @@ use crate::scheduler::plugins::priority::PriorityPlugin;
 use crate::scheduler::plugins::shim::ShimPlugin;
 use crate::scheduler::Context;
 
-use common::ctx::FlameClusterContext;
+use common::ctx::{FlameClusterContext, FlameLimits};
 use common::FlameError;
 
 mod das;
@@ -38,14 +38,14 @@ mod shim;
 #[derive(Clone, Debug)]
 pub struct PluginsOptions {
     pub policies: Vec<String>,
-    pub max_executors: u32,
+    pub limits: FlameLimits,
 }
 
 impl From<&FlameClusterContext> for PluginsOptions {
     fn from(context: &FlameClusterContext) -> Self {
         Self {
             policies: context.cluster.policies.clone(),
-            max_executors: context.cluster.limits.max_executors,
+            limits: context.cluster.limits.clone(),
         }
     }
 }
@@ -139,9 +139,9 @@ pub trait Plugin: Send + Sync + 'static {
     }
 
     // Events callbacks
-    fn on_session_bind(&mut self, ssn: SessionInfoPtr) {}
+    fn on_session_bind(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {}
 
-    fn on_session_unbind(&mut self, ssn: SessionInfoPtr) {}
+    fn on_session_unbind(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {}
 
     fn on_executor_pipeline(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {}
 }
@@ -256,8 +256,9 @@ impl PluginManager {
     /// Returns whether the active demand policy has reserved enough capacity.
     ///
     /// Like `is_underused`, the first plugin with an opinion is authoritative.
-    /// In the default chain Priority's task-derived demand is the allocation
-    /// ceiling; DRF supplies readiness when Priority is disabled.
+    /// MinMax checks the session's hard ceiling first. Below that ceiling,
+    /// Priority's task-derived demand determines readiness; DRF supplies
+    /// readiness when Priority is disabled.
     /// This check includes pipelined capacity, unlike `is_underused`, and thus
     /// prevents duplicate allocation while an executor is being provisioned.
     pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
@@ -343,21 +344,29 @@ impl PluginManager {
             .all(|(_, plugin)| plugin.is_reclaimable(exec).unwrap_or(true)))
     }
 
-    pub fn on_session_bind(&self, ssn: SessionInfoPtr) -> Result<(), FlameError> {
+    pub fn on_session_bind(
+        &self,
+        exec: ExecutorInfoPtr,
+        ssn: SessionInfoPtr,
+    ) -> Result<(), FlameError> {
         let mut plugins = lock_ptr!(self.plugins)?;
 
         for (_, plugin) in plugins.iter_mut() {
-            plugin.on_session_bind(ssn.clone());
+            plugin.on_session_bind(exec.clone(), ssn.clone());
         }
 
         Ok(())
     }
 
-    pub fn on_session_unbind(&self, ssn: SessionInfoPtr) -> Result<(), FlameError> {
+    pub fn on_session_unbind(
+        &self,
+        exec: ExecutorInfoPtr,
+        ssn: SessionInfoPtr,
+    ) -> Result<(), FlameError> {
         let mut plugins = lock_ptr!(self.plugins)?;
 
         for (_, plugin) in plugins.iter_mut() {
-            plugin.on_session_unbind(ssn.clone());
+            plugin.on_session_unbind(exec.clone(), ssn.clone());
         }
         Ok(())
     }

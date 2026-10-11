@@ -11,7 +11,8 @@ cluster:
   executors:
     shim: host
   limits:
-    max_executors: 10
+    node:
+      max_executors: 10
 cache:
   endpoint: "grpc://127.0.0.1:9090"
   network_interface: "br0"

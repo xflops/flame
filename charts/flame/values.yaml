@@ -18,8 +18,17 @@ cluster:
   executors:
     shim: host
   limits:
+    # Maximum number of sessions in the cluster.
     maxSessions: 1000
-    maxExecutors: 128
+    application:
+      # Optional hard ceiling per application, including idle executors.
+      maxExecutors: null
+    session:
+      # Optional hard ceiling per session, including binding executors.
+      maxExecutors: null
+    node:
+      # Maximum active executors per node, including idle executors.
+      maxExecutors: 128
   recovery:
     session:
       retryLimits: 5

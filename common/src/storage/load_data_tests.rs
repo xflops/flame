@@ -42,7 +42,8 @@ mod tests {
                 tls: None,
                 limits: FlameLimits {
                     max_sessions: None,
-                    max_executors: 10,
+                    node: crate::ctx::FlameNodeLimits { max_executors: 10 },
+                    ..Default::default()
                 },
                 recovery: Default::default(),
                 pprof: None,

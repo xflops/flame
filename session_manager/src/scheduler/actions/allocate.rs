@@ -97,23 +97,6 @@ impl Action for AllocateAction {
                 ssn.tasks_status.get(&common::apis::TaskState::Running)
             );
 
-            if let Some(max_instances) = ssn.max_instances {
-                let all_executors = ss.find_executors(None)?;
-                let current_count = all_executors
-                    .values()
-                    .filter(|e| e.ssn_id.as_ref() == Some(&ssn.id))
-                    .count();
-                if current_count >= max_instances as usize {
-                    tracing::debug!(
-                        "Session <{}> has reached max_instances limit: {} >= {}",
-                        ssn.id,
-                        current_count,
-                        max_instances
-                    );
-                    continue;
-                }
-            }
-
             if let Some(exec) = void_executors
                 .values()
                 .find(|e| ctx.is_available(e, &ssn).unwrap_or(false))

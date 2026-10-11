@@ -98,6 +98,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- define "flame.validate" -}}
+{{- if hasKey .Values.cluster.limits "maxExecutors" -}}
+{{- fail "cluster.limits.maxExecutors has moved to cluster.limits.node.maxExecutors; update your Helm values" -}}
+{{- end -}}
 {{- if ne .Values.cluster.executors.shim "host" -}}
 {{- fail "Kubernetes executor managers require cluster.executors.shim=host" -}}
 {{- end -}}

@@ -238,7 +238,7 @@ impl Plugin for DRFPlugin {
         }
     }
 
-    fn on_session_bind(&mut self, ssn: SessionInfoPtr) {
+    fn on_session_bind(&mut self, _exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
         let ssn_resreq = self.get_session_resreq(&ssn);
 
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
@@ -254,7 +254,7 @@ impl Plugin for DRFPlugin {
         }
     }
 
-    fn on_session_unbind(&mut self, ssn: SessionInfoPtr) {
+    fn on_session_unbind(&mut self, _exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
         let ssn_resreq = self.get_session_resreq(&ssn);
 
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {

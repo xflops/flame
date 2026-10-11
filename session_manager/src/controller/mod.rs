@@ -1182,7 +1182,8 @@ mod tests {
                 tls: None,
                 limits: FlameLimits {
                     max_sessions: None,
-                    max_executors: 10,
+                    node: common::ctx::FlameNodeLimits { max_executors: 10 },
+                    ..Default::default()
                 },
                 recovery: FlameRecovery {
                     session: FlameSessionRecovery { retry_limits },

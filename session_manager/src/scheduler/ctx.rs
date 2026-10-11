@@ -142,9 +142,13 @@ impl Context {
         self.controller
             .bind_session(exec.id.clone(), ssn.id.clone())
             .await?;
-        self.plugins.on_session_bind(ssn.clone())?;
+        self.plugins.on_session_bind(exec.clone(), ssn.clone())?;
+        let bound = Arc::new(ExecutorInfo {
+            ssn_id: Some(ssn.id.clone()),
+            ..exec.as_ref().clone()
+        });
         self.snapshot
-            .update_executor_state(exec.clone(), ExecutorState::Binding)?;
+            .update_executor_state(bound, ExecutorState::Binding)?;
 
         Ok(())
     }
@@ -155,7 +159,7 @@ impl Context {
         ssn: &SessionInfoPtr,
     ) -> Result<(), FlameError> {
         self.controller.unbind_executor(exec.id.clone()).await?;
-        self.plugins.on_session_unbind(ssn.clone())?;
+        self.plugins.on_session_unbind(exec.clone(), ssn.clone())?;
         self.snapshot
             .update_executor_state(exec.clone(), ExecutorState::Unbinding)?;
 

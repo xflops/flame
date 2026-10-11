@@ -87,18 +87,29 @@ struct FlameSessionRecoveryYaml {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FlameExecutorsYaml {
     pub shim: Option<String>,
-    pub limits: Option<FlameExecutorLimitsYaml>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FlameExecutorLimitsYaml {
+struct FlameApplicationLimitsYaml {
+    pub max_executors: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FlameSessionLimitsYaml {
+    pub max_executors: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FlameNodeLimitsYaml {
     pub max_executors: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FlameLimitsYaml {
     pub max_sessions: Option<usize>,
-    pub max_executors: Option<u32>,
+    pub application: Option<FlameApplicationLimitsYaml>,
+    pub session: Option<FlameSessionLimitsYaml>,
+    pub node: Option<FlameNodeLimitsYaml>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,9 +188,31 @@ pub struct FlameExecutors {
     pub shim: Shim,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FlameLimits {
+    /// Maximum number of sessions across the entire cluster.
     pub max_sessions: Option<usize>,
+    pub application: FlameApplicationLimits,
+    pub session: FlameSessionLimits,
+    pub node: FlameNodeLimits,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FlameApplicationLimits {
+    /// Hard ceiling on executors belonging to each application.
+    /// None leaves application-specific limits in effect.
+    pub max_executors: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FlameSessionLimits {
+    /// Hard ceiling on executor count, including explicitly requested limits.
+    /// None leaves this scope without an additional cluster ceiling.
+    pub max_executors: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlameNodeLimits {
     /// Maximum number of non-Released executors allowed on each node.
     pub max_executors: u32,
 }
@@ -517,15 +550,43 @@ impl From<FlameLimitsYaml> for FlameLimits {
     fn from(yaml: FlameLimitsYaml) -> Self {
         FlameLimits {
             max_sessions: yaml.max_sessions,
-            max_executors: yaml.max_executors.unwrap_or(DEFAULT_MAX_EXECUTORS_PER_NODE),
+            application: yaml
+                .application
+                .map(FlameApplicationLimits::from)
+                .unwrap_or_default(),
+            session: yaml
+                .session
+                .map(FlameSessionLimits::from)
+                .unwrap_or_default(),
+            node: FlameNodeLimits {
+                max_executors: yaml
+                    .node
+                    .and_then(|node| node.max_executors)
+                    .unwrap_or(DEFAULT_MAX_EXECUTORS_PER_NODE),
+            },
         }
     }
 }
 
-impl Default for FlameLimits {
+impl From<FlameApplicationLimitsYaml> for FlameApplicationLimits {
+    fn from(yaml: FlameApplicationLimitsYaml) -> Self {
+        Self {
+            max_executors: yaml.max_executors,
+        }
+    }
+}
+
+impl From<FlameSessionLimitsYaml> for FlameSessionLimits {
+    fn from(yaml: FlameSessionLimitsYaml) -> Self {
+        Self {
+            max_executors: yaml.max_executors,
+        }
+    }
+}
+
+impl Default for FlameNodeLimits {
     fn default() -> Self {
-        FlameLimits {
-            max_sessions: None,
+        Self {
             max_executors: DEFAULT_MAX_EXECUTORS_PER_NODE,
         }
     }
@@ -658,8 +719,54 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn test_executor_limit_defaults() {
+        let limits = FlameLimits::default();
+        assert_eq!(limits.max_sessions, None);
+        assert_eq!(limits.application.max_executors, None);
+        assert_eq!(limits.session.max_executors, None);
+        assert_eq!(limits.node.max_executors, DEFAULT_MAX_EXECUTORS_PER_NODE);
+    }
+
+    #[test]
+    fn test_executor_limits_partial_scopes() {
+        let yaml: FlameLimitsYaml =
+            serde_yaml::from_str("max_sessions: 50\napplication:\n  max_executors: 12\n").unwrap();
+        let limits = FlameLimits::from(yaml);
+        assert_eq!(limits.max_sessions, Some(50));
+        assert_eq!(limits.application.max_executors, Some(12));
+        assert_eq!(limits.session.max_executors, None);
+        assert_eq!(limits.node.max_executors, DEFAULT_MAX_EXECUTORS_PER_NODE);
+
+        let yaml: FlameLimitsYaml =
+            serde_yaml::from_str("session:\n  max_executors: 3\nnode:\n  max_executors: 8\n")
+                .unwrap();
+        let limits = FlameLimits::from(yaml);
+        assert_eq!(limits.application.max_executors, None);
+        assert_eq!(limits.session.max_executors, Some(3));
+        assert_eq!(limits.node.max_executors, 8);
+    }
+
+    #[test]
+    fn test_executor_limits_preserve_zero() {
+        let yaml: FlameLimitsYaml = serde_yaml::from_str(
+            "application:\n  max_executors: 0\nsession:\n  max_executors: 0\nnode:\n  max_executors: 0\n",
+        )
+        .unwrap();
+        let limits = FlameLimits::from(yaml);
+        assert_eq!(limits.application.max_executors, Some(0));
+        assert_eq!(limits.session.max_executors, Some(0));
+        assert_eq!(limits.node.max_executors, 0);
+
+        let yaml: FlameLimitsYaml = serde_yaml::from_str("node: {}\n").unwrap();
+        assert_eq!(
+            FlameLimits::from(yaml).node.max_executors,
+            DEFAULT_MAX_EXECUTORS_PER_NODE
+        );
+    }
+
+    #[test]
     fn test_flame_context_from_file() -> Result<(), FlameError> {
-        // New config structure: max_executors is under cluster.limits
+        // Executor limits explicitly identify their scope.
         let context_string = r#"---
 cluster:
   name: flame
@@ -672,7 +779,8 @@ cluster:
   executors:
     shim: host
   limits:
-    max_executors: 10
+    node:
+      max_executors: 10
         "#;
 
         let tmp_dir = TempDir::new().unwrap();
@@ -691,7 +799,7 @@ cluster:
         assert_eq!(ctx.cluster.policies, vec!["priority", "drf"]);
         assert_eq!(ctx.cluster.storage, "sqlite://flame.db");
         assert_eq!(ctx.cluster.executors.shim, Shim::Host);
-        assert_eq!(ctx.cluster.limits.max_executors, 10);
+        assert_eq!(ctx.cluster.limits.node.max_executors, 10);
 
         Ok(())
     }

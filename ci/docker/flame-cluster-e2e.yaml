@@ -11,7 +11,8 @@ cluster:
   executors:
     shim: host
   limits:
-    max_executors: 10
+    node:
+      max_executors: 10
   # TLS Configuration for Session Manager
   tls:
     cert_file: "/etc/flame/certs/server.crt"

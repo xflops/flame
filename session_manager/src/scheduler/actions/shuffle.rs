@@ -68,7 +68,7 @@ impl Action for ShuffleAction {
             let ssn = underused
                 .pop()
                 .expect("failed to pop underused session: loop guard ensures non-empty");
-            if !ctx.is_underused(&ssn)? {
+            if !ctx.is_underused(&ssn)? || ctx.is_ready(&ssn)? {
                 continue;
             }
 

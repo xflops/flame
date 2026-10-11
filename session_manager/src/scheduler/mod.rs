@@ -45,7 +45,7 @@ impl FlameThread for ScheduleRunner {
             "Scheduler started with interval: {}ms, enabled policies: {:?}, max executors per node: {}",
             schedule_interval,
             options.policies,
-            options.max_executors,
+            options.limits.node.max_executors,
         );
         let schedule_interval = Duration::from_millis(schedule_interval);
 
@@ -289,7 +289,10 @@ mod tests {
         }
 
         let options = PluginsOptions {
-            max_executors: 1,
+            limits: common::ctx::FlameLimits {
+                node: common::ctx::FlameNodeLimits { max_executors: 1 },
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut ctx = Context::new(controller.clone(), &options)?;
@@ -478,6 +481,255 @@ mod tests {
             assert_eq!(executor.ssn_id.as_ref(), Some(&session_ids[index]));
         }
 
+        Ok(())
+    }
+
+    fn instance_limit_env(
+        application_max: u32,
+        session_max: Option<u32>,
+    ) -> Result<(TestEnv, String, PluginsOptions), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = &env.controller;
+        let mut application = new_test_application();
+        application.max_instances = application_max;
+        tokio_test::block_on(controller.register_application("flmtest".to_string(), application))?;
+        tokio_test::block_on(
+            controller
+                .storage()
+                .register_node(&new_test_node("node_1".to_string())),
+        )?;
+        let session_id = format!("instance-limit-{}", Uuid::new_v4());
+        tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+            id: session_id.clone(),
+            application: "flmtest".to_string(),
+            max_instances: session_max,
+            resreq: Some(ResourceRequirement {
+                cpu: 1,
+                memory: 1024,
+                gpu: 0,
+            }),
+            ..Default::default()
+        }))?;
+        // Match the deployed configuration: DRF supplies capacity while DAS
+        // selects retained executors. Priority must not mask limit violations.
+        let options = PluginsOptions {
+            policies: vec!["drf".to_string(), "das".to_string()],
+            ..Default::default()
+        };
+        Ok((env, session_id, options))
+    }
+
+    #[test]
+    fn test_dispatch_session_limit_preserves_das_selected_executor() -> Result<(), FlameError> {
+        assert_dispatch_limit_preserves_das(Some(1), None)
+    }
+
+    #[test]
+    fn test_dispatch_cluster_session_ceiling_preserves_das() -> Result<(), FlameError> {
+        assert_dispatch_limit_preserves_das(None, Some(1))?;
+        assert_dispatch_limit_preserves_das(Some(10), Some(1))
+    }
+
+    fn assert_dispatch_limit_preserves_das(
+        session_limit: Option<u32>,
+        cluster_limit: Option<u32>,
+    ) -> Result<(), FlameError> {
+        let (env, session_id, mut options) = instance_limit_env(10, session_limit)?;
+        options.limits.session.max_executors = cluster_limit;
+        let controller = &env.controller;
+        let affinity = Bytes::from_static(b"retained-prefix");
+        let mut executor_ids = Vec::new();
+        for _ in 0..2 {
+            let executor = tokio_test::block_on(
+                controller.create_executor("node_1".to_string(), session_id.clone()),
+            )?;
+            tokio_test::block_on(controller.register_executor(&executor))?;
+            executor_ids.push(executor.id);
+        }
+        {
+            let executor = controller
+                .storage()
+                .get_executor_ptr(executor_ids[1].clone())?;
+            stdng::lock_ptr!(executor)?
+                .attributes
+                .insert(affinity.clone());
+        }
+        tokio_test::block_on(controller.create_task(
+            session_id.clone(),
+            None,
+            Some(TaskOptions {
+                affinity: [affinity].into_iter().collect(),
+            }),
+        ))?;
+
+        for _ in 0..3 {
+            let mut ctx = Context::new(controller.clone(), &options)?;
+            tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
+            assert_eq!(
+                controller
+                    .list_executors()?
+                    .iter()
+                    .filter(|exec| exec.ssn_id.as_ref() == Some(&session_id))
+                    .count(),
+                1,
+                "dispatch must bind only the DAS-selected executor"
+            );
+            tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
+
+            let executors = controller.list_executors()?;
+            assert_eq!(
+                executors.len(),
+                2,
+                "allocation must reuse the retained executor"
+            );
+            let selected = controller.get_executor(executor_ids[1].clone())?;
+            assert_eq!(selected.ssn_id.as_ref(), Some(&session_id));
+            assert_eq!(selected.state, common::apis::ExecutorState::Binding);
+            let cold = controller.get_executor(executor_ids[0].clone())?;
+            assert_eq!(
+                cold.ssn_id, None,
+                "the cold executor must not steal the task"
+            );
+            assert_eq!(cold.state, common::apis::ExecutorState::Idle);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_dispatch_session_limit_allows_multiple_instances() -> Result<(), FlameError> {
+        let (env, session_id, options) = instance_limit_env(10, Some(2))?;
+        let controller = &env.controller;
+        for _ in 0..3 {
+            let executor = tokio_test::block_on(
+                controller.create_executor("node_1".to_string(), session_id.clone()),
+            )?;
+            tokio_test::block_on(controller.register_executor(&executor))?;
+            tokio_test::block_on(controller.create_task(session_id.clone(), None, None))?;
+        }
+        for _ in 0..2 {
+            let mut ctx = Context::new(controller.clone(), &options)?;
+            tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
+            tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
+            let executors = controller.list_executors()?;
+            assert_eq!(executors.len(), 3);
+            assert_eq!(
+                executors
+                    .iter()
+                    .filter(|exec| exec.ssn_id.as_ref() == Some(&session_id))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                executors
+                    .iter()
+                    .filter(|exec| exec.state == common::apis::ExecutorState::Idle)
+                    .count(),
+                1
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_allocate_session_limit_counts_inflight_executor() -> Result<(), FlameError> {
+        let (env, session_id, options) = instance_limit_env(10, Some(1))?;
+        let controller = &env.controller;
+        tokio_test::block_on(controller.create_task(session_id.clone(), None, None))?;
+        for cycle in 0..3 {
+            let mut ctx = Context::new(controller.clone(), &options)?;
+            tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
+            tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
+            let executors = controller.list_executors()?;
+            assert_eq!(
+                executors.len(),
+                1,
+                "an unregistered executor already reserves an instance"
+            );
+            if cycle == 0 {
+                assert_eq!(executors[0].state, common::apis::ExecutorState::Void);
+                tokio_test::block_on(controller.register_executor(&executors[0]))?;
+            } else {
+                assert_eq!(executors[0].state, common::apis::ExecutorState::Binding);
+                assert_eq!(executors[0].ssn_id.as_ref(), Some(&session_id));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_allocate_application_limit_without_session_limit() -> Result<(), FlameError> {
+        assert_application_limit_spans_sessions(1, None)
+    }
+
+    #[test]
+    fn test_allocate_cluster_application_ceiling_spans_sessions() -> Result<(), FlameError> {
+        assert_application_limit_spans_sessions(10, Some(1))
+    }
+
+    fn assert_application_limit_spans_sessions(
+        application_limit: u32,
+        cluster_limit: Option<u32>,
+    ) -> Result<(), FlameError> {
+        let (env, session_id, mut options) = instance_limit_env(application_limit, None)?;
+        options.limits.application.max_executors = cluster_limit;
+        let controller = &env.controller;
+        tokio_test::block_on(controller.create_task(session_id.clone(), None, None))?;
+        let second_session =
+            tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+                id: format!("instance-limit-second-{}", Uuid::new_v4()),
+                application: "flmtest".to_string(),
+                max_instances: None,
+                resreq: Some(ResourceRequirement {
+                    cpu: 1,
+                    memory: 1024,
+                    gpu: 0,
+                }),
+                ..Default::default()
+            }))?;
+        tokio_test::block_on(controller.create_task(second_session.id, None, None))?;
+        for cycle in 0..3 {
+            let mut ctx = Context::new(controller.clone(), &options)?;
+            tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
+            tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
+            let executors = controller.list_executors()?;
+            assert_eq!(
+                executors.len(),
+                1,
+                "the application limit spans all sessions"
+            );
+            if cycle == 0 {
+                tokio_test::block_on(controller.register_executor(&executors[0]))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_dispatch_zero_session_limit_keeps_retained_executor_idle() -> Result<(), FlameError> {
+        let (env, session_id, options) = instance_limit_env(10, Some(0))?;
+        let controller = &env.controller;
+        let executor = tokio_test::block_on(
+            controller.create_executor("node_1".to_string(), session_id.clone()),
+        )?;
+        tokio_test::block_on(controller.register_executor(&executor))?;
+        tokio_test::block_on(controller.create_task(session_id, None, None))?;
+        let mut ctx = Context::new(controller.clone(), &options)?;
+        tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
+        tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
+        let executors = controller.list_executors()?;
+        assert_eq!(executors.len(), 1);
+        assert_eq!(executors[0].state, common::apis::ExecutorState::Idle);
+        assert_eq!(executors[0].ssn_id, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_allocate_zero_application_limit_creates_no_executor() -> Result<(), FlameError> {
+        let (env, session_id, options) = instance_limit_env(0, None)?;
+        tokio_test::block_on(env.controller.create_task(session_id, None, None))?;
+        let mut ctx = Context::new(env.controller.clone(), &options)?;
+        tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
+        assert!(env.controller.list_executors()?.is_empty());
         Ok(())
     }
 

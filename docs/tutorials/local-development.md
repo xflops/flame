@@ -166,7 +166,10 @@ cluster:
   executors:
     shim: host
   limits:
-    max_executors: 128
+    application: {}
+    session: {}
+    node:
+      max_executors: 128
 cache:
   endpoint: "grpc://127.0.0.1:9090"
   network_interface: "lo"
@@ -174,6 +177,14 @@ cache:
 ```
 
 Restart the services after changing this file.
+
+`limits.node.max_executors` caps active executors on each node. Set
+`limits.application.max_executors` or `limits.session.max_executors` to add hard
+ceilings per application or session. Each ceiling also applies when the
+application or session requests a higher `max_instances`; lower requested limits
+still apply. An omitted application or session ceiling leaves its requested
+limit in effect. Idle executors continue to count toward application and node
+limits; unbinding removes an executor only from its session count.
 
 ## Troubleshooting
 
