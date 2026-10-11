@@ -1,5 +1,6 @@
 """Process-local vLLM engine used by the App DAS reuse example."""
 
+import os
 from dataclasses import dataclass
 from hashlib import sha256
 
@@ -26,6 +27,10 @@ class VllmEngine:
     """A vLLM class service retained across App session changes."""
 
     def __init__(self, model: str = MODEL) -> None:
+        # Keep spawned engine sockets short and avoid CUDA compiler dependencies
+        # in the dedicated-host smoke example. Preserve explicit runtime settings.
+        os.environ.setdefault("VLLM_RPC_BASE_PATH", "/tmp")
+        os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
         from vllm import LLM
 
         self.model = model
@@ -36,6 +41,7 @@ class VllmEngine:
             gpu_memory_utilization=0.1,
             max_model_len=1024,
             enforce_eager=True,
+            attention_config={"backend": "TRITON_ATTN"},
         )
 
     def generate(self, prompt: str) -> GenerationResult:

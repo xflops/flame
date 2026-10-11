@@ -22,6 +22,13 @@ The service requests `gpu=1`. It runs a single-GPU engine in eager
 mode, with a 1024-token context and 10% GPU memory utilization for this small
 model smoke example.
 
+The example pins vLLM 0.31.0, which accepts FEM-assigned GPU UUIDs. It uses
+Triton attention and disables FlashInfer sampling by default so the worker does
+not need `nvcc`. Engine sockets default to `/tmp` to avoid Unix socket path limits
+under executor work directories. Explicit `VLLM_RPC_BASE_PATH` and
+`VLLM_USE_FLASHINFER_SAMPLER` settings are preserved. GPU visibility remains owned
+by FEM; the example does not rewrite it.
+
 GPU FEMs must expose the NVIDIA devices and driver libraries and set
 `LD_LIBRARY_PATH`, such as `/run/nvidia/driver/usr/lib/x86_64-linux-gnu` for
 GPU Operator installations. Flame's Python installer combines dependency

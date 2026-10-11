@@ -20,7 +20,7 @@ use common::FlameError;
 use crate::model::{
     ExecutorInfoPtr, SessionInfo, SessionInfoPtr, SnapShot, ALL_EXECUTOR, ALL_NODE, OPEN_SESSION,
 };
-use crate::scheduler::plugins::{Plugin, PluginPtr};
+use crate::scheduler::plugins::{compute_demand, Plugin, PluginPtr};
 
 /// PriorityPlugin implements priority-based session ordering and allocation blocking.
 ///
@@ -90,36 +90,6 @@ impl PriorityPlugin {
     }
 }
 
-/// Per-session task-driven demand ceiling, expressed as a `ResourceRequirement`.
-///
-/// Sums pending + running task counts, rounds the total down to whole batches,
-/// multiplies by the per-executor resreq (`per_task`), then clamps to
-/// `[min_instances * per_task, max_instances * per_task]` per-field. Algorithm
-/// preserved verbatim from the slot-based version; the only change is that
-/// scaling is now per-resource (`per_task.mul(N)`) and clamping is per-field
-/// (`min` / `max` helpers on `ResourceRequirement`).
-///
-/// `per_task` is the session's effective per-executor resreq, which after the
-/// slots-cleanup refactor is always `ssn.resreq` (server-populated).
-fn compute_demand(ssn: &SessionInfo, per_task: &ResourceRequirement) -> ResourceRequirement {
-    let mut task_count: u32 = 0;
-    for state in [TaskState::Pending, TaskState::Running] {
-        if let Some(c) = ssn.tasks_status.get(&state) {
-            // tasks_status counts are non-negative; clamp to 0 if anything weird.
-            task_count = task_count.saturating_add((*c).max(0) as u32);
-        }
-    }
-    let mut demand = per_task.mul(task_count);
-
-    if let Some(max_i) = ssn.max_instances {
-        // Per-field clamp from above.
-        demand = demand.min(&per_task.mul(max_i));
-    }
-    let floor = per_task.mul(ssn.min_instances);
-    // Per-field clamp from below.
-    demand.max(&floor)
-}
-
 impl Plugin for PriorityPlugin {
     fn name(&self) -> &'static str {
         "priority"
@@ -131,7 +101,7 @@ impl Plugin for PriorityPlugin {
     ///
     /// 1. Sum cluster capacity (`ResourceRequirement`) from the snapshot's nodes.
     /// 2. Sort open sessions by `(priority desc, creation_time asc)` and walk them in
-    ///    order, granting each session `min(compute_demand(ssn, per_task), remaining)`
+    ///    order, granting each session `min(per_task.mul(compute_demand(ssn)), remaining)`
     ///    per-field and decrementing `remaining`. The result is `ssn_desired[id]`,
     ///    a `ResourceRequirement`. `max_needy_priority` is updated in the same pass
     ///    for any session with pending tasks. The session's per-executor effective
@@ -189,7 +159,7 @@ impl Plugin for PriorityPlugin {
                 .clone()
                 .expect("SessionInfo.resreq must be populated by resolve_session_resreq");
 
-            let demand = compute_demand(ssn, &per_task);
+            let demand = per_task.mul(compute_demand(ssn));
             // Per-field min — guaranteed `granted ≤ remaining` per resource.
             let granted = demand.min(&remaining);
 
@@ -710,10 +680,8 @@ mod tests {
     }
 
     #[test]
-    fn test_setup_compute_demand_respects_max_instances() {
-        // pending=10, slots=1, max_instances=4 → per-session demand capped at
-        // max_instances × per_task = 4 × (1,1024,0) = (4,4096,0).
-        // Cluster has plenty of slack so the per-session cap binds, not capacity.
+    fn test_setup_demand_uses_minmax_ceiling() {
+        // MinMax calculates the bounded demand used for capacity distribution.
         let ssn = create_test_session_full("s", 0, 10, 0, 1, 1, 0, Some(4), Utc::now());
         let ss = create_snapshot_with_capacity(vec![ssn], 100);
 
@@ -724,9 +692,8 @@ mod tests {
     }
 
     #[test]
-    fn test_setup_compute_demand_respects_min_instances() {
-        // pending=0, min_instances=2, slots=3 → per-session demand floored at
-        // min_instances × per_task = 2 × (3,3*1024,0) = (6,6*1024,0).
+    fn test_setup_demand_uses_minmax_floor() {
+        // MinMax includes minimum warmup in the capacity distribution.
         let ssn = create_test_session_full("s", 0, 0, 0, 3, 1, 2, None, Utc::now());
         let ss = create_snapshot_with_capacity(vec![ssn], 100);
 

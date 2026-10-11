@@ -322,6 +322,29 @@ mod tests {
     }
 
     #[test]
+    fn readiness_preserves_fair_share_ceiling_when_demand_is_larger() {
+        let session = Arc::new(SessionInfo {
+            tasks_status: [(TaskState::Pending, 10)].into_iter().collect(),
+            ..session().as_ref().clone()
+        });
+        let plugin = DRFPlugin {
+            total: rr(4),
+            ssn_map: HashMap::from([
+                (
+                    session.id.clone(),
+                    DRFSessionInfo {
+                        allocated: rr(2),
+                        ..Default::default()
+                    },
+                ),
+                ("other-session".into(), DRFSessionInfo::default()),
+            ]),
+            node_allocations: HashMap::new(),
+        };
+        assert_eq!(plugin.is_ready(&session), Some(true));
+    }
+
+    #[test]
     fn pipeline_accounts_void_capacity_without_changing_allocated_ownership() {
         let ssn = session();
         let mut plugin = DRFPlugin {

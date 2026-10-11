@@ -3,8 +3,8 @@
 This example serves batched text generation through `flamepy.serving`.
 The client opens a Flame session, submits prompts, and receives generated text.
 The worker declares its handler with `@ins.entrypoint`.
-The worker creates its global vLLM engine at startup. The entrypoint reads
-session settings with `ins.context()` and passes them to the engine with each request.
+The worker creates one global `LLM` at startup. The entrypoint reads
+session settings with `ins.context()` and calls the model directly for each request.
 The worker retains the model and prefix cache
 across session bindings until the executor is released.
 
@@ -23,6 +23,13 @@ flmctl deploy --name vllm-serving --application . --max-instances 1 \
 the package, and registers the worker. FEM installs its pinned vLLM dependencies.
 The console client needs only the Flame SDK; run it with `python3` to avoid
 installing CUDA dependencies on the console.
+
+The example pins vLLM 0.31.0, which accepts FEM-assigned GPU UUIDs. It uses
+Triton attention and disables FlashInfer sampling by default so the worker does
+not need `nvcc`. Engine sockets default to `/tmp` to avoid Unix socket path limits
+under executor work directories. Explicit `VLLM_RPC_BASE_PATH` and
+`VLLM_USE_FLASHINFER_SAMPLER` settings are preserved. GPU visibility remains owned
+by FEM; the example does not rewrite it.
 
 FEM assigns the executor's GPU and sets `CUDA_VISIBLE_DEVICES`; no visibility
 override is needed on the application. GPU FEMs must expose NVIDIA devices and

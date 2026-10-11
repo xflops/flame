@@ -520,6 +520,60 @@ mod tests {
     }
 
     #[test]
+    fn test_drf_gpu_allocation_stops_at_task_demand_while_binding() -> Result<(), FlameError> {
+        let (env, session_id, options) = instance_limit_env(1000, None)?;
+        let controller = &env.controller;
+        let request = ResourceRequirement {
+            gpu: 1,
+            ..Default::default()
+        };
+        {
+            let session = controller.storage().get_session_ptr(session_id.clone())?;
+            stdng::lock_ptr!(session)?.resreq = Some(request.clone());
+        }
+        for name in ["node_1", "node_2"] {
+            let mut node = new_test_node(name.to_string());
+            node.capacity.gpu = 8;
+            node.allocatable.gpu = 8;
+            tokio_test::block_on(controller.storage().register_node(&node))?;
+        }
+
+        // First reproduce one pending task with no configured instance cap,
+        // then ensure additional task demand still grows the executor pool.
+        for demand in [1, 3] {
+            let existing_tasks = controller.list_tasks(session_id.clone())?.len();
+            for _ in existing_tasks..demand {
+                tokio_test::block_on(controller.create_task(session_id.clone(), None, None))?;
+            }
+            for cycle in 0..20 {
+                let mut ctx = Context::new(controller.clone(), &options)?;
+                tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
+                tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
+                let executors = controller.list_executors()?;
+                assert!(
+                    executors.len() <= demand,
+                    "cycle {cycle}: {demand} pending tasks must not consume every GPU while binding"
+                );
+                // FEM registration makes provisioned executors available for
+                // binding; leave them Binding so no task has started yet.
+                for executor in executors {
+                    if executor.state == common::apis::ExecutorState::Void {
+                        tokio_test::block_on(controller.register_executor(&executor))?;
+                    }
+                }
+            }
+            let executors = controller.list_executors()?;
+            assert_eq!(executors.len(), demand);
+            assert!(executors.iter().all(|executor| {
+                executor.state == common::apis::ExecutorState::Binding
+                    && executor.ssn_id.as_ref() == Some(&session_id)
+                    && executor.resreq == request
+            }));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_dispatch_session_limit_preserves_das_selected_executor() -> Result<(), FlameError> {
         assert_dispatch_limit_preserves_das(Some(1), None)
     }

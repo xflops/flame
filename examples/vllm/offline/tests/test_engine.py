@@ -1,6 +1,7 @@
 """Unit tests for the vLLM DAS example without loading a real model."""
 
 import asyncio
+import os
 import sys
 import types
 import unittest
@@ -17,6 +18,8 @@ class FakeLLM:
 
     def __init__(self, *, model: str, enable_prefix_caching: bool, **kwargs) -> None:
         self.model = model
+        self.options = kwargs
+        self.environment = dict(os.environ)
         self.enable_prefix_caching = enable_prefix_caching
         self.cached_prompts = set()
         type(self).creations += 1
@@ -53,6 +56,21 @@ class VllmEngineTest(unittest.TestCase):
         vllm_patch = patch.dict(sys.modules, {"vllm": fake_vllm})
         vllm_patch.start()
         self.addCleanup(vllm_patch.stop)
+
+    def test_compiler_free_defaults_preserve_gpu_assignment(self) -> None:
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "GPU-assigned"}, clear=True):
+            engine = VllmEngine(MODEL)
+        self.assertEqual(engine.llm.options["attention_config"], {"backend": "TRITON_ATTN"})
+        self.assertEqual(engine.llm.environment["VLLM_RPC_BASE_PATH"], "/tmp")
+        self.assertEqual(engine.llm.environment["VLLM_USE_FLASHINFER_SAMPLER"], "0")
+        self.assertEqual(engine.llm.environment["CUDA_VISIBLE_DEVICES"], "GPU-assigned")
+
+    def test_explicit_runtime_settings_are_preserved(self) -> None:
+        environment = {"VLLM_RPC_BASE_PATH": "/tmp/custom", "VLLM_USE_FLASHINFER_SAMPLER": "1"}
+        with patch.dict(os.environ, environment):
+            engine = VllmEngine(MODEL)
+        for key, value in environment.items():
+            self.assertEqual(engine.llm.environment[key], value)
 
     def test_service_publishes_prompt_keys(self) -> None:
         service = FlameRunpyService()

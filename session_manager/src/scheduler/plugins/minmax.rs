@@ -22,7 +22,7 @@ use common::FlameError;
 use crate::model::{
     ExecutorInfoPtr, NodeInfoPtr, SessionInfoPtr, SnapShot, ALL_APPLICATION, ALL_EXECUTOR,
 };
-use crate::scheduler::plugins::{Plugin, PluginPtr, PluginsOptions};
+use crate::scheduler::plugins::{compute_demand, Plugin, PluginPtr, PluginsOptions};
 
 #[derive(Default)]
 pub struct MinMaxPlugin {
@@ -79,11 +79,30 @@ impl Plugin for MinMaxPlugin {
         Ok(())
     }
 
-    fn is_ready(&self, ssn: &SessionInfoPtr) -> Option<bool> {
-        let max_instances = executor_limit(ssn.max_instances, self.limits.session.max_executors)?;
+    fn is_underused(&self, ssn: &SessionInfoPtr) -> Option<bool> {
         let instances = self.session_executors.get(&ssn.id).map_or(0, HashSet::len);
-        // Below the hard ceiling, the demand policy still decides readiness.
-        (instances >= max_instances as usize).then_some(true)
+        if executor_limit(ssn.max_instances, self.limits.session.max_executors)
+            .is_some_and(|maximum| instances >= maximum as usize)
+        {
+            return Some(false);
+        }
+        // Warmup is demand even when the session has no pending tasks.
+        (instances < ssn.min_instances as usize).then_some(true)
+    }
+
+    fn is_ready(&self, ssn: &SessionInfoPtr) -> Option<bool> {
+        let instances = self.session_executors.get(&ssn.id).map_or(0, HashSet::len);
+        if executor_limit(ssn.max_instances, self.limits.session.max_executors)
+            .is_some_and(|maximum| instances >= maximum as usize)
+        {
+            return Some(true);
+        }
+        if instances < ssn.min_instances as usize {
+            return Some(false);
+        }
+        // Count existing and pipelined reservations before another allocation.
+        // Below demand, let the configured policy apply fairness constraints.
+        (instances >= compute_demand(ssn) as usize).then_some(true)
     }
 
     fn is_allocatable(&self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Option<bool> {
@@ -158,6 +177,7 @@ mod tests {
 
     use super::*;
     use crate::model::{AppInfo, ExecutorInfo, NodeInfo, SessionInfo};
+    use common::apis::TaskState;
 
     fn plugin(snapshot: &SnapShot) -> MinMaxPlugin {
         let mut plugin = MinMaxPlugin::default();
@@ -170,6 +190,7 @@ mod tests {
             id: "session".to_string(),
             application: "app".to_string(),
             max_instances,
+            tasks_status: [(TaskState::Pending, 10)].into_iter().collect(),
             ..Default::default()
         })
     }
@@ -181,6 +202,165 @@ mod tests {
         assert_eq!(plugin.is_ready(&limited_session(None)), None);
         assert_eq!(plugin.is_ready(&limited_session(Some(1))), None);
         assert_eq!(plugin.is_ready(&limited_session(Some(0))), Some(true));
+    }
+
+    #[test]
+    fn task_demand_counts_running_binding_and_pipeline_reservations() {
+        let mut plugin = plugin(&SnapShot::new());
+        let session = Arc::new(SessionInfo {
+            tasks_status: [(TaskState::Pending, 1), (TaskState::Running, 2)]
+                .into_iter()
+                .collect(),
+            ..limited_session(None).as_ref().clone()
+        });
+        for index in 0..3 {
+            assert_eq!(plugin.is_ready(&session), None);
+            let reserved = executor(&format!("executor-{index}"), "node", ExecutorState::Binding);
+            plugin.on_executor_pipeline(reserved.clone(), session.clone());
+            plugin.on_session_bind(reserved, session.clone());
+        }
+        assert_eq!(plugin.is_ready(&session), Some(true));
+    }
+
+    #[test]
+    fn minimum_counts_pipeline_bindings_and_defers_when_satisfied() {
+        let mut plugin = plugin(&SnapShot::new());
+        let session = Arc::new(SessionInfo {
+            min_instances: 2,
+            tasks_status: Default::default(),
+            ..limited_session(None).as_ref().clone()
+        });
+        assert_eq!(plugin.is_underused(&session), Some(true));
+        assert_eq!(plugin.is_ready(&session), Some(false));
+        let first = executor("first", "node", ExecutorState::Void);
+        plugin.on_executor_pipeline(first.clone(), session.clone());
+        plugin.on_session_bind(first, session.clone());
+        assert_eq!(plugin.is_ready(&session), Some(false));
+        plugin.on_session_bind(
+            executor("second", "node", ExecutorState::Binding),
+            session.clone(),
+        );
+        assert_eq!(plugin.is_underused(&session), None);
+        assert_eq!(plugin.is_ready(&session), Some(true));
+        plugin.on_session_unbind(
+            executor("second", "node", ExecutorState::Bound),
+            session.clone(),
+        );
+        assert_eq!(plugin.is_underused(&session), Some(true));
+        assert_eq!(plugin.is_ready(&session), Some(false));
+    }
+
+    #[test]
+    fn session_ceiling_takes_precedence_over_minimum() {
+        let session = Arc::new(SessionInfo {
+            min_instances: 3,
+            ..limited_session(Some(1)).as_ref().clone()
+        });
+        let mut plugin = plugin(&SnapShot::new());
+        plugin.on_executor_pipeline(
+            executor("first", "node", ExecutorState::Void),
+            session.clone(),
+        );
+        assert_eq!(plugin.is_ready(&session), Some(true));
+        assert_eq!(plugin.is_underused(&session), Some(false));
+        plugin.limits.session.max_executors = Some(0);
+        assert_eq!(plugin.is_ready(&session), Some(true));
+        assert_eq!(plugin.is_underused(&session), Some(false));
+    }
+
+    #[tokio::test]
+    async fn warmup_without_pending_tasks_works_with_each_demand_policy() {
+        use crate::scheduler::actions::{AllocateAction, DispatchAction};
+        use crate::scheduler::Context;
+        use common::apis::{
+            ApplicationAttributes, Node, NodeState, ResourceRequirement, SessionAttributes,
+        };
+        use common::ctx::{FlameCluster, FlameClusterContext};
+
+        for policies in [vec!["drf", "das"], vec!["priority", "drf", "das"]] {
+            for cluster_ceiling in [None, Some(2)] {
+                let database = common::temp_db_path("minmax_warmup");
+                let config = FlameClusterContext {
+                    cluster: FlameCluster {
+                        storage: format!("sqlite:///{database}"),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let storage = crate::storage::new_ptr(&config).await.unwrap();
+                let controller = crate::controller::new_ptr(storage);
+                controller
+                    .register_application("app".into(), ApplicationAttributes::default())
+                    .await
+                    .unwrap();
+                let capacity = ResourceRequirement {
+                    cpu: 16,
+                    memory: 16384,
+                    gpu: 0,
+                };
+                controller
+                    .storage()
+                    .register_node(&Node {
+                        name: "node".into(),
+                        capacity: capacity.clone(),
+                        allocatable: capacity,
+                        state: NodeState::Ready,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let session = controller
+                    .create_session(SessionAttributes {
+                        id: "warmup".into(),
+                        application: "app".into(),
+                        min_instances: 3,
+                        resreq: Some(ResourceRequirement {
+                            cpu: 1,
+                            memory: 1024,
+                            gpu: 0,
+                        }),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let mut options = PluginsOptions {
+                    policies: policies.iter().map(|policy| policy.to_string()).collect(),
+                    ..Default::default()
+                };
+                options.limits.session.max_executors = cluster_ceiling;
+                let expected = cluster_ceiling.unwrap_or(3) as usize;
+                for cycle in 0..8 {
+                    let mut context = Context::new(controller.clone(), &options).unwrap();
+                    DispatchAction::new_ptr()
+                        .execute(&mut context)
+                        .await
+                        .unwrap();
+                    AllocateAction::new_ptr()
+                        .execute(&mut context)
+                        .await
+                        .unwrap();
+                    let executors = controller.list_executors().unwrap();
+                    assert!(
+                        executors.len() <= expected,
+                        "cycle {cycle}, policies {policies:?}"
+                    );
+                    for executor in executors {
+                        if executor.state == ExecutorState::Void {
+                            controller.register_executor(&executor).await.unwrap();
+                        }
+                    }
+                }
+                let executors = controller.list_executors().unwrap();
+                assert_eq!(executors.len(), expected, "policies {policies:?}");
+                assert!(executors
+                    .iter()
+                    .all(|executor| executor.state == ExecutorState::Binding
+                        && executor.ssn_id.as_ref() == Some(&session.id)));
+                assert!(controller.list_tasks(session.id).unwrap().is_empty());
+                drop(controller);
+                let _ = std::fs::remove_file(database);
+            }
+        }
     }
 
     #[test]

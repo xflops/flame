@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Batched vLLM inference through flamepy.serving"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["vllm==0.12.0"]
+dependencies = ["vllm==0.31.0"]
 
 [project.scripts]
 vllm-serving = "service:ins.run"

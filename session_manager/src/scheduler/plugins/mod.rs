@@ -26,6 +26,7 @@ use crate::scheduler::plugins::priority::PriorityPlugin;
 use crate::scheduler::plugins::shim::ShimPlugin;
 use crate::scheduler::Context;
 
+use common::apis::TaskState;
 use common::ctx::{FlameClusterContext, FlameLimits};
 use common::FlameError;
 
@@ -34,6 +35,20 @@ mod drf;
 mod minmax;
 mod priority;
 mod shim;
+
+/// Bounded executor demand shared by scheduling plugins.
+/// MinMax enforces task demand, minimum warmup and maximum instance constraints.
+pub(super) fn compute_demand(ssn: &SessionInfo) -> u32 {
+    let task_count = [TaskState::Pending, TaskState::Running]
+        .iter()
+        .filter_map(|state| ssn.tasks_status.get(state))
+        .fold(0u32, |count, tasks| {
+            count.saturating_add((*tasks).max(0) as u32)
+        });
+    let demand = task_count.max(ssn.min_instances);
+    ssn.max_instances
+        .map_or(demand, |maximum| demand.min(maximum))
+}
 
 #[derive(Clone, Debug)]
 pub struct PluginsOptions {
@@ -231,11 +246,11 @@ impl PluginManager {
     /// Returns whether the session is underused (needs more executors).
     ///
     /// Uses "first non-`None` wins" ordering, identical to `ssn_order_fn`.
-    /// Plugins are consulted in registration order (Priority → DRF → DAS → Shim).
+    /// MinMax applies instance bounds first, then configured policies decide demand.
     /// The first plugin that returns `Some(result)` wins; `None` means "no opinion, ask the
     /// next plugin".  If no plugin has an opinion, the session is considered NOT underused.
     ///
-    /// This gives `PriorityPlugin` (registered first) full authority:
+    /// Once MinMax defers, `PriorityPlugin` has authority over task demand:
     /// - `Some(false)` → blocked; no further plugins consulted.
     /// - `Some(true)` → underused; overrides any downstream-plugin veto.
     /// - `None` → defer to the next plugin in the chain for additional underuse checks.
@@ -256,9 +271,9 @@ impl PluginManager {
     /// Returns whether the active demand policy has reserved enough capacity.
     ///
     /// Like `is_underused`, the first plugin with an opinion is authoritative.
-    /// MinMax checks the session's hard ceiling first. Below that ceiling,
-    /// Priority's task-derived demand determines readiness; DRF supplies
-    /// readiness when Priority is disabled.
+    /// MinMax checks the session's instance bounds first. Within those bounds,
+    /// MinMax stops at task demand; Priority and DRF may stop earlier according
+    /// to their capacity distribution or fairness policies.
     /// This check includes pipelined capacity, unlike `is_underused`, and thus
     /// prevents duplicate allocation while an executor is being provisioned.
     pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
