@@ -101,6 +101,11 @@ Choose its tag with `--image`; the image and host driver must support the
 application's CUDA requirements. Driver injection belongs to the host runtime,
 so the image does not bundle a host NVIDIA driver.
 
+Keep each FEM's GPU assignment directory private to that worker. Workers may
+share installed application packages, but must not share `workdir/gpu`: discovery
+validates the saved ledger against that FEM's active assignments. The Compose
+deployment mounts a separate anonymous volume at `workdir/gpu` for each replica.
+
 FEM saves each assignment as `<workdir>/gpu/<executor-id>.json`. Allocation
 writes that executor's file. Releasing stops the service and unregisters the
 executor. Session manager sends Released through the ordinary executor-update

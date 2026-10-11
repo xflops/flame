@@ -65,6 +65,8 @@ services:
         target: /usr/local/flame/work
         volume:
           nocopy: true
+      # Each FEM owns its device ledger; replicas may share installed packages.
+      - /usr/local/flame/work/gpu
       - ./logs:/usr/local/flame/logs
       - ./work/cache:/usr/local/flame/data/cache
     networks:
