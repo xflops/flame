@@ -15,14 +15,15 @@ limitations under the License.
 
 use std::collections::{HashMap, HashSet};
 
-use common::apis::ExecutorState;
+use common::apis::{ExecutorState, TaskState};
 use common::ctx::FlameLimits;
 use common::FlameError;
 
 use crate::model::{
-    ExecutorInfoPtr, NodeInfoPtr, SessionInfoPtr, SnapShot, ALL_APPLICATION, ALL_EXECUTOR,
+    ExecutorInfoPtr, NodeInfoPtr, SessionInfo, SessionInfoPtr, SnapShot, ALL_APPLICATION,
+    ALL_EXECUTOR,
 };
-use crate::scheduler::plugins::{compute_demand, Plugin, PluginPtr, PluginsOptions};
+use crate::scheduler::plugins::{Plugin, PluginPtr, PluginsOptions};
 
 #[derive(Default)]
 pub struct MinMaxPlugin {
@@ -86,8 +87,9 @@ impl Plugin for MinMaxPlugin {
         {
             return Some(false);
         }
-        // Warmup is demand even when the session has no pending tasks.
-        (instances < ssn.min_instances as usize).then_some(true)
+        // Below demand, including warmup without pending tasks, the session needs
+        // more executors; `is_ready` and the configured policies bound how fast.
+        (instances < compute_demand(ssn) as usize).then_some(true)
     }
 
     fn is_ready(&self, ssn: &SessionInfoPtr) -> Option<bool> {
@@ -162,6 +164,19 @@ impl Plugin for MinMaxPlugin {
             executors.remove(&executor.id);
         }
     }
+}
+
+/// Bounded executor demand: task demand, minimum warmup and maximum instances.
+fn compute_demand(ssn: &SessionInfo) -> u32 {
+    let task_count = [TaskState::Pending, TaskState::Running]
+        .iter()
+        .filter_map(|state| ssn.tasks_status.get(state))
+        .fold(0u32, |count, tasks| {
+            count.saturating_add((*tasks).max(0) as u32)
+        });
+    let demand = task_count.max(ssn.min_instances);
+    ssn.max_instances
+        .map_or(demand, |maximum| demand.min(maximum))
 }
 
 fn executor_limit(entity: Option<u32>, cluster: Option<u32>) -> Option<u32> {
@@ -248,6 +263,23 @@ mod tests {
         );
         assert_eq!(plugin.is_underused(&session), Some(true));
         assert_eq!(plugin.is_ready(&session), Some(false));
+    }
+
+    #[test]
+    fn underused_while_below_task_demand() {
+        let mut plugin = plugin(&SnapShot::new());
+        let session = Arc::new(SessionInfo {
+            tasks_status: [(TaskState::Pending, 2)].into_iter().collect(),
+            ..limited_session(None).as_ref().clone()
+        });
+        assert_eq!(plugin.is_underused(&session), Some(true));
+        for index in 0..2 {
+            plugin.on_session_bind(
+                executor(&format!("executor-{index}"), "node", ExecutorState::Binding),
+                session.clone(),
+            );
+        }
+        assert_eq!(plugin.is_underused(&session), None);
     }
 
     #[test]

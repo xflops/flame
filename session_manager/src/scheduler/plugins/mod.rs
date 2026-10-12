@@ -36,20 +36,6 @@ mod minmax;
 mod priority;
 mod shim;
 
-/// Bounded executor demand shared by scheduling plugins.
-/// MinMax enforces task demand, minimum warmup and maximum instance constraints.
-pub(super) fn compute_demand(ssn: &SessionInfo) -> u32 {
-    let task_count = [TaskState::Pending, TaskState::Running]
-        .iter()
-        .filter_map(|state| ssn.tasks_status.get(state))
-        .fold(0u32, |count, tasks| {
-            count.saturating_add((*tasks).max(0) as u32)
-        });
-    let demand = task_count.max(ssn.min_instances);
-    ssn.max_instances
-        .map_or(demand, |maximum| demand.min(maximum))
-}
-
 #[derive(Clone, Debug)]
 pub struct PluginsOptions {
     pub policies: Vec<String>,
@@ -272,8 +258,8 @@ impl PluginManager {
     ///
     /// Like `is_underused`, the first plugin with an opinion is authoritative.
     /// MinMax checks the session's instance bounds first. Within those bounds,
-    /// MinMax stops at task demand; Priority and DRF may stop earlier according
-    /// to their capacity distribution or fairness policies.
+    /// MinMax stops at task demand; DRF may stop earlier according to its
+    /// fairness policy.
     /// This check includes pipelined capacity, unlike `is_underused`, and thus
     /// prevents duplicate allocation while an executor is being provisioned.
     pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
