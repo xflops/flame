@@ -385,6 +385,7 @@ impl TryFrom<&ExecutorDao> for Executor {
             application: dao.application.clone(),
             task_id: dao.task_id,
             ssn_id: dao.ssn_id.clone(),
+            signal: None,
             attributes: HashSet::new(),
             creation_time: DateTime::<Utc>::from_timestamp(dao.creation_time, 0)
                 .ok_or(FlameError::Storage("invalid creation time".to_string()))?,

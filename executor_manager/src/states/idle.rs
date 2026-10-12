@@ -330,6 +330,7 @@ mod tests {
             task: None,
             context: None,
             app_mgr: Some(Arc::new(ApplicationManager::new().unwrap())),
+            dev_mgr: None,
 
             shim_instance: None,
             state: ExecutorState::Idle,

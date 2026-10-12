@@ -215,18 +215,10 @@ mod tests {
             info: NodeInfo::default(),
         };
 
-        // Refresh should update capacity, allocatable, and info
+        // Refresh updates identity info only; capacity belongs to FEM device managers.
         node.refresh();
-        // Refreshing host CPU/memory must preserve FEM's GPU inventory.
         assert_eq!(node.capacity.gpu, 3);
-        assert_eq!(node.allocatable.gpu, 3);
-
-        // After refresh, capacity should have non-zero values (from system)
-        // Note: In test environment, these might be actual system values
-        // We just verify the refresh doesn't panic and sets some values
-        assert!(
-            node.capacity.cpu > 0 || node.capacity.memory > 0 || cfg!(not(target_os = "linux"))
-        );
+        assert_eq!(node.capacity.cpu, 0);
 
         // Info should be populated
         assert!(!node.info.arch.is_empty() || cfg!(not(target_os = "linux")));

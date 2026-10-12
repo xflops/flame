@@ -288,6 +288,7 @@ mod tests {
             task: None,
             context: Some(context),
             app_mgr: None,
+            dev_mgr: None,
             shim_instance: None,
             state: ExecutorState::Idle,
         }

@@ -42,6 +42,12 @@ impl State for ReleasingState {
             self.executor.shim_instance = None;
         }
 
+        // Free device claims before Session Manager frees node capacity, so a
+        // replacement executor never sees them still held.
+        if let Some(dev_mgr) = &self.executor.dev_mgr {
+            dev_mgr.release(&self.executor)?;
+        }
+
         self.client
             .unregister_executor(&self.executor.clone())
             .await?;
@@ -106,7 +112,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stopped_service_retains_saved_claim_until_fem_removal() {
+    async fn releasing_frees_device_claim_before_unregistering() {
         let gpu_workdir = tempfile::tempdir().unwrap();
         let manager = Arc::new(crate::devices::DeviceManagers::with_gpu(
             crate::devices::gpu::GpuManager::new()
@@ -119,31 +125,32 @@ mod tests {
             ..Default::default()
         });
         executor.assignments = manager.allocate(&executor).unwrap();
-
+        executor.dev_mgr = Some(manager.clone());
         executor.shim_instance = Some(Arc::new(Mutex::new(TestShim)));
         executor.state = ExecutorState::Releasing;
+        let saved = gpu_workdir
+            .path()
+            .join(crate::devices::GPU)
+            .join(format!("{}.json", executor.id));
+        assert!(saved.exists());
         let mut state = ReleasingState {
             client: BackendClient::default(),
             executor,
         };
-        // There is no backend connection. Service cleanup does not free physical
-        // ownership; FEM retains the claim until it removes the executor.
+        // There is no backend connection, so unregister fails. The claim is
+        // already free, so a replacement can be allocated once Session Manager
+        // frees the node capacity.
         assert!(state.execute().await.is_err());
-        assert!(!state.executor.assignments.is_empty());
         assert!(state.executor.shim_instance.is_none());
         assert_eq!(state.executor.state, ExecutorState::Releasing);
-        let saved = gpu_workdir
-            .path()
-            .join("gpu")
-            .join(format!("{}.json", state.executor.id));
-        assert!(saved.exists());
+        assert!(!saved.exists());
         let competitor = crate::devices::test_executor(ResourceRequirement {
             gpu: 1,
             ..Default::default()
         });
-        assert!(manager.allocate(&competitor).is_err());
-        manager.release(&state.executor).unwrap();
-        assert!(!saved.exists());
+        assert!(manager.allocate(&competitor).is_ok());
+        // Retried releasing stays idempotent.
+        assert!(state.execute().await.is_err());
         assert!(manager.allocate(&competitor).is_ok());
     }
 
@@ -181,6 +188,7 @@ mod tests {
             task: None,
             context: None,
             app_mgr: None,
+            dev_mgr: None,
             shim_instance: Some(shim),
             state: ExecutorState::Releasing,
         };

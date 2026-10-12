@@ -329,7 +329,7 @@ fn validate_recovery_status(
     if executor.resreq.gpu < 0
         || executor
             .assignments
-            .get("gpu")
+            .get(crate::devices::GPU)
             .map_or(0, |assignment| assignment.devices().len())
             != executor.resreq.gpu as usize
     {
@@ -792,6 +792,7 @@ mod tests {
             task: None,
             context: None,
             app_mgr: None,
+            dev_mgr: None,
             shim_instance: None,
             assignments: Default::default(),
             state: ExecutorState::Idle,
@@ -881,7 +882,7 @@ mod tests {
         let assignment = crate::devices::DeviceAssignment::new(vec!["GPU-restored".into()]);
         executor
             .assignments
-            .insert("gpu".into(), assignment.clone());
+            .insert(crate::devices::GPU.into(), assignment.clone());
         validate_recovery_status(&executor, &recovery_status(&executor)).unwrap();
         executor.resreq.gpu = 2;
         assert!(validate_recovery_status(&executor, &recovery_status(&executor)).is_err());
@@ -897,7 +898,7 @@ mod tests {
         let mut executor = test_executor();
         executor.resreq.gpu = 2;
         executor.assignments.insert(
-            "gpu".to_string(),
+            crate::devices::GPU.to_string(),
             allocator
                 .allocate(&crate::devices::test_executor(
                     (common::apis::ResourceRequirement {
@@ -930,7 +931,7 @@ mod tests {
             .with_inventory(vec![])
             .unwrap();
         let assignments = HashMap::from([(
-            "gpu".into(),
+            crate::devices::GPU.into(),
             allocator
                 .allocate(&crate::devices::test_executor(
                     (common::apis::ResourceRequirement {

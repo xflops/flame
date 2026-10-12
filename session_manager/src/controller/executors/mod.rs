@@ -102,6 +102,7 @@ mod tests {
             shim: Shim::Host,
             application: String::new(),
             task_id: None,
+            signal: None,
             ssn_id: None,
             attributes: Default::default(),
             creation_time: Utc::now(),

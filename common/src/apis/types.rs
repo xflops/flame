@@ -350,6 +350,11 @@ impl Task {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signal {
+    Interrupt,
+}
+
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq, Hash, strum_macros::Display)]
 pub enum ExecutorState {
     #[default]
@@ -441,16 +446,6 @@ fn uname() -> String {
     system::uname().nodename().to_string_lossy().to_string()
 }
 
-#[cfg(not(target_os = "linux"))]
-fn totalram() -> u64 {
-    0
-}
-
-#[cfg(target_os = "linux")]
-fn totalram() -> u64 {
-    system::sysinfo().totalram
-}
-
 impl Node {
     pub fn new() -> Self {
         let name = uname();
@@ -463,19 +458,12 @@ impl Node {
         node
     }
 
+    /// Refreshes node identity info. Capacity comes from FEM device managers.
     pub fn refresh(&mut self) {
-        let memory = totalram();
-        let cpu = num_cpus::get() as u64;
-        // FEM supplies GPU capacity from its device-manager inventory.
-        let gpu = self.capacity.gpu;
-        let capacity = ResourceRequirement { cpu, memory, gpu };
-        let allocatable = capacity.clone();
         let info = NodeInfo {
             arch: env::consts::ARCH.to_string(),
             os: env::consts::OS.to_string(),
         };
-        self.capacity = capacity;
-        self.allocatable = allocatable;
         self.info = info;
     }
 }

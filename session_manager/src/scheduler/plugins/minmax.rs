@@ -13,9 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use common::apis::{ExecutorState, TaskState};
+use common::apis::{ExecutorState, ResourceRequirement, SessionState, TaskState};
 use common::ctx::FlameLimits;
 use common::FlameError;
 
@@ -27,11 +27,23 @@ use crate::scheduler::plugins::{Plugin, PluginPtr, PluginsOptions};
 
 #[derive(Default)]
 pub struct MinMaxPlugin {
+    // Configured executor limits for nodes, applications and sessions.
     limits: FlameLimits,
-    active_executors: HashMap<String, HashSet<String>>,
+    // Node name -> reserved executor count, including Idle/departing executors.
+    // Enforces the node executor limit.
+    node_executors: HashMap<String, usize>,
+    // Node name -> reserved CPU/memory/GPU totals. Prevents resource overcommit.
+    node_resources: HashMap<String, ResourceRequirement>,
+    // Application name -> max_instances, combined with the cluster application limit.
     application_limits: HashMap<String, u32>,
-    application_executors: HashMap<String, HashSet<String>>,
-    session_executors: HashMap<String, HashSet<String>>,
+    // Application name -> reserved executor count. Enforces application limits.
+    application_executors: HashMap<String, usize>,
+    // Session ID -> allocated/pipelined executor count, including interrupted ones.
+    // Used for readiness and hard session limits.
+    session_executors: HashMap<String, usize>,
+    // Session ID -> interrupted executor count. Subtracted from session_executors
+    // to determine effective usage when checking whether a session is overused.
+    session_interrupted: HashMap<String, usize>,
 }
 
 impl MinMaxPlugin {
@@ -49,31 +61,26 @@ impl Plugin for MinMaxPlugin {
     }
 
     fn setup(&mut self, snapshot: &SnapShot) -> Result<(), FlameError> {
-        self.active_executors.clear();
+        self.node_executors.clear();
+        self.node_resources.clear();
         self.application_executors.clear();
         self.session_executors.clear();
+        self.session_interrupted.clear();
         self.application_limits = snapshot
             .find_applications(ALL_APPLICATION)?
             .values()
             .map(|application| (application.name.clone(), application.max_instances))
             .collect();
         for executor in snapshot.find_executors(ALL_EXECUTOR)?.values() {
-            // Retained Idle and Releasing executors still occupy application
-            // and node capacity. The next setup removes them once Released.
-            if executor.state != ExecutorState::Released {
-                self.active_executors
-                    .entry(executor.node.clone())
-                    .or_default()
-                    .insert(executor.id.clone());
-                self.application_executors
-                    .entry(executor.application.clone())
-                    .or_default()
-                    .insert(executor.id.clone());
-                if let Some(session) = &executor.ssn_id {
-                    self.session_executors
-                        .entry(session.clone())
-                        .or_default()
-                        .insert(executor.id.clone());
+            // Retained and departing executors occupy capacity until Released.
+            if executor.state == ExecutorState::Released {
+                continue;
+            }
+            self.account_capacity(executor);
+            if let Some(session) = &executor.ssn_id {
+                *self.session_executors.entry(session.clone()).or_default() += 1;
+                if executor.is_interrupted() {
+                    *self.session_interrupted.entry(session.clone()).or_default() += 1;
                 }
             }
         }
@@ -81,7 +88,7 @@ impl Plugin for MinMaxPlugin {
     }
 
     fn is_underused(&self, ssn: &SessionInfoPtr) -> Option<bool> {
-        let instances = self.session_executors.get(&ssn.id).map_or(0, HashSet::len);
+        let instances = self.session_executors.get(&ssn.id).copied().unwrap_or(0);
         if executor_limit(ssn.max_instances, self.limits.session.max_executors)
             .is_some_and(|maximum| instances >= maximum as usize)
         {
@@ -93,7 +100,7 @@ impl Plugin for MinMaxPlugin {
     }
 
     fn is_ready(&self, ssn: &SessionInfoPtr) -> Option<bool> {
-        let instances = self.session_executors.get(&ssn.id).map_or(0, HashSet::len);
+        let instances = self.session_executors.get(&ssn.id).copied().unwrap_or(0);
         if executor_limit(ssn.max_instances, self.limits.session.max_executors)
             .is_some_and(|maximum| instances >= maximum as usize)
         {
@@ -107,11 +114,37 @@ impl Plugin for MinMaxPlugin {
         (instances >= compute_demand(ssn) as usize).then_some(true)
     }
 
+    fn is_overused(&self, ssn: &SessionInfoPtr) -> Option<bool> {
+        let executors = self.session_executors.get(&ssn.id).copied().unwrap_or(0);
+        let interrupted = self.session_interrupted.get(&ssn.id).copied().unwrap_or(0);
+        let effective = executors.saturating_sub(interrupted);
+        let demand = if ssn.state == SessionState::Closed {
+            0
+        } else {
+            executor_limit(ssn.max_instances, self.limits.session.max_executors)
+                .map_or(compute_demand(ssn), |maximum| {
+                    compute_demand(ssn).min(maximum)
+                })
+        };
+        (effective > demand as usize).then_some(true)
+    }
+
     fn is_allocatable(&self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Option<bool> {
-        let active = self
-            .active_executors
+        // Resource limits are admission constraints under every policy. DRF
+        // controls fairness, but enabling it must not be required for safety.
+        let used = self
+            .node_resources
             .get(&node.name)
-            .map_or(0, HashSet::len);
+            .cloned()
+            .unwrap_or_default();
+        let request = ssn.resreq.clone().unwrap_or_default();
+        if request.cpu > node.allocatable.cpu.saturating_sub(used.cpu)
+            || request.memory > node.allocatable.memory.saturating_sub(used.memory)
+            || request.gpu > node.allocatable.gpu.saturating_sub(used.gpu)
+        {
+            return Some(false);
+        }
+        let active = self.node_executors.get(&node.name).copied().unwrap_or(0);
         let allocatable = active < self.limits.node.max_executors as usize;
         if !allocatable {
             tracing::debug!(
@@ -133,36 +166,68 @@ impl Plugin for MinMaxPlugin {
         let instances = self
             .application_executors
             .get(&ssn.application)
-            .map_or(0, HashSet::len);
+            .copied()
+            .unwrap_or(0);
         Some(instances < max_instances as usize)
     }
 
+    fn is_available(&self, executor: &ExecutorInfoPtr, _ssn: &SessionInfoPtr) -> Option<bool> {
+        executor.is_interrupted().then_some(false)
+    }
+
+    fn is_reclaimable(&self, executor: &ExecutorInfoPtr) -> Option<bool> {
+        executor.is_interrupted().then_some(false)
+    }
+
+    fn on_executor_create(&mut self, executor: ExecutorInfoPtr, ssn: SessionInfoPtr) {
+        self.account_capacity(&executor);
+        *self.session_executors.entry(ssn.id.clone()).or_default() += 1;
+    }
+
     fn on_executor_pipeline(&mut self, executor: ExecutorInfoPtr, ssn: SessionInfoPtr) {
-        self.on_session_bind(executor, ssn);
+        // Physical capacity and any existing session owner were counted by setup.
+        if executor.ssn_id.as_ref() != Some(&ssn.id) {
+            *self.session_executors.entry(ssn.id.clone()).or_default() += 1;
+        }
     }
 
     fn on_session_bind(&mut self, executor: ExecutorInfoPtr, ssn: SessionInfoPtr) {
-        self.active_executors
-            .entry(executor.node.clone())
-            .or_default()
-            .insert(executor.id.clone());
-        self.application_executors
-            .entry(executor.application.clone())
-            .or_default()
-            .insert(executor.id.clone());
-        self.session_executors
-            .entry(ssn.id.clone())
-            .or_default()
-            .insert(executor.id.clone());
+        // Dispatch binds retained Idle capacity; its node/application usage
+        // is already counted. A reservation owned by this session is not new.
+        if executor.ssn_id.as_ref() != Some(&ssn.id) {
+            *self.session_executors.entry(ssn.id.clone()).or_default() += 1;
+        }
+    }
+
+    fn on_executor_interrupt(&mut self, _executor: ExecutorInfoPtr, ssn: SessionInfoPtr) {
+        // Keep the reservation, but exclude the interrupted executor from overuse.
+        *self.session_interrupted.entry(ssn.id.clone()).or_default() += 1;
     }
 
     fn on_session_unbind(&mut self, executor: ExecutorInfoPtr, ssn: SessionInfoPtr) {
-        // Unbinding ends session ownership but keeps the executor and its
-        // application service alive. Keep application and node counts until
-        // the executor is Released and excluded by the next setup.
-        if let Some(executors) = self.session_executors.get_mut(&ssn.id) {
-            executors.remove(&executor.id);
+        let instances = self.session_executors.entry(ssn.id.clone()).or_default();
+        *instances = instances.saturating_sub(1);
+        if executor.is_interrupted() {
+            let interrupted = self.session_interrupted.entry(ssn.id.clone()).or_default();
+            *interrupted = interrupted.saturating_sub(1);
         }
+    }
+}
+
+impl MinMaxPlugin {
+    fn account_capacity(&mut self, executor: &ExecutorInfoPtr) {
+        *self
+            .node_executors
+            .entry(executor.node.clone())
+            .or_default() += 1;
+        self.node_resources
+            .entry(executor.node.clone())
+            .or_default()
+            .add(&executor.resreq);
+        *self
+            .application_executors
+            .entry(executor.application.clone())
+            .or_default() += 1;
     }
 }
 
@@ -211,6 +276,230 @@ mod tests {
     }
 
     #[test]
+    fn overused_preserves_demand_and_applies_effective_maximum() {
+        let snapshot = SnapShot::new();
+        let mut plugin = plugin(&snapshot);
+        let session = Arc::new(SessionInfo {
+            min_instances: 1,
+            tasks_status: Default::default(),
+            ..limited_session(None).as_ref().clone()
+        });
+        for id in ["one", "two", "three"] {
+            plugin.on_session_bind(executor(id, "node", ExecutorState::Bound), session.clone());
+        }
+        assert_eq!(plugin.is_overused(&session), Some(true));
+        for task_state in [TaskState::Pending, TaskState::Running] {
+            let busy = Arc::new(SessionInfo {
+                tasks_status: [(task_state, 3)].into_iter().collect(),
+                ..session.as_ref().clone()
+            });
+            assert_eq!(plugin.is_overused(&busy), None);
+            let bounded = Arc::new(SessionInfo {
+                max_instances: Some(2),
+                ..busy.as_ref().clone()
+            });
+            assert_eq!(plugin.is_overused(&bounded), Some(true));
+        }
+        plugin.on_session_unbind(
+            executor("one", "node", ExecutorState::Bound),
+            session.clone(),
+        );
+        plugin.on_session_unbind(
+            executor("two", "node", ExecutorState::Bound),
+            session.clone(),
+        );
+        assert_eq!(plugin.is_overused(&session), None);
+        plugin.limits.session.max_executors = Some(0);
+        assert_eq!(plugin.is_overused(&session), Some(true));
+    }
+
+    #[test]
+    fn overused_excludes_departures_across_scheduling_cycles() {
+        let snapshot = SnapShot::new();
+        let session = Arc::new(SessionInfo {
+            min_instances: 1,
+            tasks_status: Default::default(),
+            ..limited_session(None).as_ref().clone()
+        });
+        for (id, state) in [
+            ("binding", ExecutorState::Binding),
+            ("bound", ExecutorState::Bound),
+            ("departing", ExecutorState::Unbinding),
+        ] {
+            snapshot
+                .add_executor(Arc::new(ExecutorInfo {
+                    signal: (id == "departing").then_some(common::apis::Signal::Interrupt),
+                    ssn_id: Some(session.id.clone()),
+                    application: session.application.clone(),
+                    ..executor(id, "node", state).as_ref().clone()
+                }))
+                .unwrap();
+        }
+        let mut plugin = plugin(&snapshot);
+        assert_eq!(plugin.is_overused(&session), Some(true));
+        let bound = snapshot.find_executors(ALL_EXECUTOR).unwrap()["bound"].clone();
+        plugin.on_executor_interrupt(bound.clone(), session.clone());
+        assert_eq!(plugin.is_overused(&session), None);
+        snapshot
+            .update_executor(Arc::new(ExecutorInfo {
+                signal: Some(common::apis::Signal::Interrupt),
+                ..bound.as_ref().clone()
+            }))
+            .unwrap();
+        plugin.setup(&snapshot).unwrap();
+        assert_eq!(plugin.is_overused(&session), None);
+        assert_eq!(plugin.node_executors["node"], 3);
+        assert_eq!(plugin.application_executors["app"], 3);
+        assert_eq!(plugin.session_executors[&session.id], 3);
+        assert_eq!(plugin.session_interrupted[&session.id], 2);
+    }
+
+    #[test]
+    fn interrupted_reservations_preserve_capacity_and_session_ceiling() {
+        use crate::scheduler::plugins::{PluginManager, PluginsOptions};
+        for request in [
+            ResourceRequirement {
+                cpu: 1,
+                ..Default::default()
+            },
+            ResourceRequirement {
+                memory: 1024,
+                ..Default::default()
+            },
+            ResourceRequirement {
+                gpu: 1,
+                ..Default::default()
+            },
+        ] {
+            let snapshot = SnapShot::new();
+            let session = Arc::new(SessionInfo {
+                resreq: Some(request.clone()),
+                ..limited_session(Some(1)).as_ref().clone()
+            });
+            snapshot.add_session(session.clone()).unwrap();
+            let node = Arc::new(NodeInfo {
+                name: "node".into(),
+                allocatable: request.clone(),
+                state: common::apis::NodeState::Ready,
+            });
+            snapshot.add_node(node.clone()).unwrap();
+            let retained = Arc::new(ExecutorInfo {
+                ssn_id: Some(session.id.clone()),
+                application: session.application.clone(),
+                resreq: request,
+                ..executor("retained", "node", ExecutorState::Bound)
+                    .as_ref()
+                    .clone()
+            });
+            snapshot.add_executor(retained.clone()).unwrap();
+            let mut policy = plugin(&snapshot);
+            policy.on_executor_interrupt(retained.clone(), session.clone());
+            assert_eq!(policy.session_executors[&session.id], 1);
+            assert_eq!(policy.is_overused(&session), None);
+            assert_eq!(policy.is_ready(&session), Some(true));
+            assert_eq!(policy.is_underused(&session), Some(false));
+            assert_eq!(policy.is_allocatable(&node, &session), Some(false));
+            snapshot
+                .update_executor(Arc::new(ExecutorInfo {
+                    signal: Some(common::apis::Signal::Interrupt),
+                    ..retained.as_ref().clone()
+                }))
+                .unwrap();
+            policy.setup(&snapshot).unwrap();
+            assert_eq!(policy.session_executors[&session.id], 1);
+            assert_eq!(policy.is_allocatable(&node, &session), Some(false));
+            assert_eq!(policy.is_ready(&session), Some(true));
+            let manager = PluginManager::setup(
+                &snapshot,
+                &PluginsOptions {
+                    policies: vec!["drf".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let interrupted = snapshot.find_executors(ALL_EXECUTOR).unwrap()[&retained.id].clone();
+            assert!(!manager.is_available(&interrupted, &session).unwrap());
+            assert!(!manager.is_reclaimable(&interrupted).unwrap());
+            assert!(!manager.is_allocatable(&node, &session).unwrap());
+            assert!(!manager.is_overused(&session).unwrap());
+            assert_eq!(policy.node_executors["node"], 1);
+            assert_eq!(policy.application_executors["app"], 1);
+        }
+    }
+
+    #[test]
+    fn resource_capacity_counts_retained_and_inflight_executors() {
+        for request in [
+            ResourceRequirement {
+                cpu: 1,
+                ..Default::default()
+            },
+            ResourceRequirement {
+                memory: 1024,
+                ..Default::default()
+            },
+            ResourceRequirement {
+                gpu: 1,
+                ..Default::default()
+            },
+        ] {
+            for state in [
+                ExecutorState::Void,
+                ExecutorState::Binding,
+                ExecutorState::Idle,
+                ExecutorState::Bound,
+                ExecutorState::Unbinding,
+                ExecutorState::Releasing,
+            ] {
+                let snapshot = SnapShot::new();
+                let retained = Arc::new(ExecutorInfo {
+                    resreq: request.clone(),
+                    ..executor("retained", "node", state).as_ref().clone()
+                });
+                snapshot.add_executor(retained.clone()).unwrap();
+                let node = Arc::new(NodeInfo {
+                    name: "node".into(),
+                    allocatable: ResourceRequirement {
+                        cpu: request.cpu * 2,
+                        memory: request.memory * 2,
+                        gpu: request.gpu * 2,
+                    },
+                    ..Default::default()
+                });
+                let session = Arc::new(SessionInfo {
+                    resreq: Some(request.clone()),
+                    ..limited_session(None).as_ref().clone()
+                });
+                let mut plugin = plugin(&snapshot);
+                plugin.limits.node.max_executors = 10;
+                assert_eq!(plugin.is_allocatable(&node, &session), Some(true));
+                // Reserving retained capacity does not charge resources twice.
+                plugin.on_executor_pipeline(retained, session.clone());
+                assert_eq!(plugin.is_allocatable(&node, &session), Some(true));
+                let new = Arc::new(ExecutorInfo {
+                    resreq: request.clone(),
+                    ..executor("new", "node", ExecutorState::Void)
+                        .as_ref()
+                        .clone()
+                });
+                plugin.on_executor_create(new, session.clone());
+                assert_eq!(plugin.is_allocatable(&node, &session), Some(false));
+                // Only Released executors stop consuming capacity at next setup.
+                let released = Arc::new(ExecutorInfo {
+                    state: ExecutorState::Released,
+                    resreq: request.clone(),
+                    ..executor("retained", "node", state).as_ref().clone()
+                });
+                snapshot
+                    .update_executor_state(released, ExecutorState::Released)
+                    .unwrap();
+                plugin.setup(&snapshot).unwrap();
+                assert_eq!(plugin.is_allocatable(&node, &session), Some(true));
+            }
+        }
+    }
+
+    #[test]
     fn session_limit_defers_below_cap_and_blocks_zero() {
         let snapshot = SnapShot::new();
         let plugin = plugin(&snapshot);
@@ -231,8 +520,13 @@ mod tests {
         for index in 0..3 {
             assert_eq!(plugin.is_ready(&session), None);
             let reserved = executor(&format!("executor-{index}"), "node", ExecutorState::Binding);
-            plugin.on_executor_pipeline(reserved.clone(), session.clone());
-            plugin.on_session_bind(reserved, session.clone());
+            plugin.on_executor_create(reserved.clone(), session.clone());
+            let binding = Arc::new(ExecutorInfo {
+                ssn_id: Some(session.id.clone()),
+                ..reserved.as_ref().clone()
+            });
+            plugin.on_session_bind(binding, session.clone());
+            assert_eq!(plugin.session_executors[&session.id], index + 1);
         }
         assert_eq!(plugin.is_ready(&session), Some(true));
     }
@@ -248,8 +542,7 @@ mod tests {
         assert_eq!(plugin.is_underused(&session), Some(true));
         assert_eq!(plugin.is_ready(&session), Some(false));
         let first = executor("first", "node", ExecutorState::Void);
-        plugin.on_executor_pipeline(first.clone(), session.clone());
-        plugin.on_session_bind(first, session.clone());
+        plugin.on_executor_create(first, session.clone());
         assert_eq!(plugin.is_ready(&session), Some(false));
         plugin.on_session_bind(
             executor("second", "node", ExecutorState::Binding),
@@ -309,7 +602,11 @@ mod tests {
         };
         use common::ctx::{FlameCluster, FlameClusterContext};
 
-        for policies in [vec!["drf", "das"], vec!["priority", "drf", "das"]] {
+        for policies in [
+            vec!["drf", "das"],
+            vec!["priority", "drf", "das"],
+            vec!["priority", "das"],
+        ] {
             for cluster_ceiling in [None, Some(2)] {
                 let database = common::temp_db_path("minmax_warmup");
                 let config = FlameClusterContext {
@@ -434,7 +731,7 @@ mod tests {
             let node = Arc::new(NodeInfo::default());
             for index in 0..effective_limit {
                 assert_eq!(plugin.is_allocatable(&node, &session), Some(true));
-                plugin.on_executor_pipeline(
+                plugin.on_executor_create(
                     Arc::new(ExecutorInfo {
                         id: format!("executor-{index}"),
                         application: "app".to_string(),
@@ -489,23 +786,39 @@ mod tests {
 
     #[test]
     fn binding_callbacks_update_session_limit() {
-        let mut plugin = plugin(&SnapShot::new());
+        let snapshot = SnapShot::new();
+        let idle = executor("bound", "node", ExecutorState::Idle);
+        snapshot.add_executor(idle.clone()).unwrap();
+        let mut plugin = plugin(&snapshot);
         let session = limited_session(Some(1));
-        let bound = executor("bound", "node", ExecutorState::Idle);
         assert_eq!(plugin.is_ready(&session), None);
-        plugin.on_session_bind(bound.clone(), session.clone());
-        plugin.on_session_bind(bound.clone(), session.clone());
+        plugin.on_session_bind(idle.clone(), session.clone());
         assert_eq!(plugin.is_ready(&session), Some(true));
-        assert_eq!(plugin.session_executors[&session.id].len(), 1);
-        plugin.on_session_unbind(
-            executor("other", "node", ExecutorState::Idle),
-            session.clone(),
+        assert_eq!(plugin.session_executors[&session.id], 1);
+        assert_eq!(
+            plugin
+                .session_interrupted
+                .get(&session.id)
+                .copied()
+                .unwrap_or(0),
+            0
         );
-        assert_eq!(plugin.is_ready(&session), Some(true));
-        plugin.on_session_unbind(bound.clone(), session.clone());
-        assert_eq!(plugin.is_ready(&session), None);
+        let bound = Arc::new(ExecutorInfo {
+            state: ExecutorState::Bound,
+            ssn_id: Some(session.id.clone()),
+            ..idle.as_ref().clone()
+        });
         plugin.on_session_unbind(bound, session.clone());
         assert_eq!(plugin.is_ready(&session), None);
+        assert_eq!(plugin.session_executors[&session.id], 0);
+        assert_eq!(
+            plugin
+                .session_interrupted
+                .get(&session.id)
+                .copied()
+                .unwrap_or(0),
+            0
+        );
     }
 
     #[test]
@@ -513,8 +826,7 @@ mod tests {
         let mut plugin = plugin(&SnapShot::new());
         let session = limited_session(Some(2));
         let first = executor("first", "node", ExecutorState::Void);
-        plugin.on_executor_pipeline(first.clone(), session.clone());
-        plugin.on_session_bind(first, session.clone());
+        plugin.on_executor_create(first, session.clone());
         assert_eq!(plugin.is_ready(&session), None);
         plugin.on_executor_pipeline(
             executor("second", "node", ExecutorState::Unbinding),
@@ -610,20 +922,27 @@ mod tests {
         assert_eq!(plugin.is_allocatable(&node, &session), Some(true));
         plugin.on_session_bind(retained.clone(), session.clone());
         assert_eq!(plugin.is_allocatable(&node, &session), Some(true));
-        plugin.on_session_unbind(retained.clone(), session.clone());
+        plugin.on_session_unbind(
+            Arc::new(ExecutorInfo {
+                state: ExecutorState::Bound,
+                ssn_id: Some(session.id.clone()),
+                ..retained.as_ref().clone()
+            }),
+            session.clone(),
+        );
         let new = Arc::new(ExecutorInfo {
             id: "new".to_string(),
             application: "app".to_string(),
             state: ExecutorState::Void,
             ..Default::default()
         });
-        plugin.on_executor_pipeline(new, session.clone());
+        plugin.on_executor_create(new, session.clone());
         assert_eq!(plugin.is_allocatable(&node, &session), Some(false));
         assert_eq!(plugin.is_ready(&session), None);
         // Pipelining an existing instance changes its reservation, not the
         // number of application processes occupying capacity.
         plugin.on_executor_pipeline(retained, session.clone());
-        assert_eq!(plugin.application_executors["app"].len(), 2);
+        assert_eq!(plugin.application_executors["app"], 2);
         assert_eq!(plugin.is_ready(&session), Some(true));
     }
 
@@ -670,8 +989,10 @@ mod tests {
     }
 
     #[test]
-    fn pipelined_executors_are_counted_once_within_the_cycle() {
+    fn creation_and_pipeline_charge_distinct_capacity_and_session_reservations() {
         let snapshot = SnapShot::new();
+        let retained = executor("retained", "other-node", ExecutorState::Void);
+        snapshot.add_executor(retained.clone()).unwrap();
         let mut plugin = MinMaxPlugin {
             limits: FlameLimits {
                 node: common::ctx::FlameNodeLimits { max_executors: 1 },
@@ -686,11 +1007,16 @@ mod tests {
             name: "node".to_string(),
             ..Default::default()
         });
-        let executor = executor("new", "node", ExecutorState::Void);
+        let created = executor("new", "node", ExecutorState::Void);
 
         assert_eq!(plugin.is_allocatable(&node, &session), Some(true));
-        plugin.on_executor_pipeline(executor.clone(), session.clone());
-        plugin.on_executor_pipeline(executor, session.clone());
+        plugin.on_executor_create(created, session.clone());
+        assert_eq!(plugin.node_executors["node"], 1);
+        assert_eq!(plugin.session_executors[&session.id], 1);
+        plugin.on_executor_pipeline(retained, session.clone());
+        assert_eq!(plugin.node_executors["other-node"], 1);
+        assert_eq!(plugin.node_executors["node"], 1);
+        assert_eq!(plugin.session_executors[&session.id], 2);
         assert_eq!(plugin.is_allocatable(&node, &session), Some(false));
     }
 }

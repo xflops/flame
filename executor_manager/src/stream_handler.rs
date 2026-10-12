@@ -93,12 +93,9 @@ impl StreamHandler {
 
     fn refresh_node(node: &mut Node, dev_mgr: &DeviceManagers) -> Result<(), FlameError> {
         dev_mgr.discover()?;
-        // Rebuild host capacity so a previous device report cannot survive a refresh.
-        node.capacity = Default::default();
         node.refresh();
-        // Device managers may describe resources also discovered on the host.
-        // Merge per resource instead of counting the same CPU/memory twice.
-        node.capacity = node.capacity.clone().max(&dev_mgr.capacity());
+        // Capacity is owned by the device managers, so rebuild it on each refresh.
+        node.capacity = dev_mgr.capacity();
         node.allocatable = node.capacity.clone();
         Ok(())
     }
@@ -376,7 +373,10 @@ mod tests {
             discovered: AtomicI32::new(0),
             fail: AtomicBool::new(false),
         });
-        let dev_mgr = Arc::new(DeviceManagers::with_manager("gpu", devices.clone()));
+        let dev_mgr = Arc::new(DeviceManagers::with_manager(
+            crate::devices::GPU,
+            devices.clone(),
+        ));
         let handler = StreamHandler::new(
             BackendClient::default(),
             stdng::new_ptr(HashMap::new()),
@@ -384,15 +384,14 @@ mod tests {
         )
         .unwrap();
         assert!(Arc::ptr_eq(&handler.dev_mgr, &dev_mgr));
-        let host = Node::new();
         let mut node = lock_ptr!(handler.node).unwrap();
         assert_eq!(node.capacity.gpu, 2);
         for visible in [3, 0, 1] {
             devices.visible.store(visible, SeqCst);
             StreamHandler::refresh_node(&mut node, &handler.dev_mgr).unwrap();
             assert_eq!(node.capacity.gpu, visible);
-            assert_eq!(node.capacity.cpu, host.capacity.cpu);
-            assert_eq!(node.capacity.memory, host.capacity.memory);
+            assert_eq!(node.capacity.cpu, 0);
+            assert_eq!(node.capacity.memory, 0);
             assert_eq!(node.allocatable, node.capacity);
         }
         let previous = node.clone();
@@ -414,7 +413,7 @@ mod tests {
         let mut node = Node::new();
         node.capacity.gpu = 99;
         StreamHandler::refresh_node(&mut node, &DeviceManagers::default()).unwrap();
-        assert_eq!(node.capacity.gpu, 0);
+        assert_eq!(node.capacity, Default::default());
         assert_eq!(node.allocatable, node.capacity);
     }
 
@@ -518,6 +517,7 @@ mod tests {
             context: None,
             shim: Shim::Host,
             app_mgr: None,
+            dev_mgr: None,
             shim_instance: None,
             state: ExecutorState::Idle,
         };

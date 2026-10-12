@@ -17,7 +17,7 @@ use stdng::{lock_ptr, logs::TraceFn, trace_fn};
 
 use crate::appmgr::ApplicationManager;
 use crate::client::BackendClient;
-use crate::devices::DeviceAssignments;
+use crate::devices::{DeviceAssignments, DeviceManagers};
 use crate::shims::ShimPtr;
 use ::rpc::flame::v1::{self as rpc, ExecutorSpec, ExecutorStatus, Metadata};
 
@@ -35,6 +35,9 @@ pub struct Executor {
     /// Shared FEM-local application manager, attached before worker startup.
     /// RPC-decoded executor metadata has no application manager pointer.
     pub app_mgr: Option<Arc<ApplicationManager>>,
+    /// Shared FEM device managers, attached with `app_mgr`. Releasing frees the
+    /// executor's claims through it before telling Session Manager it is gone.
+    pub dev_mgr: Option<Arc<DeviceManagers>>,
     pub node: String,
     /// Supported shim type from executor-manager config.
     /// This indicates what type of shim this executor supports (Host or Wasm).
@@ -92,6 +95,7 @@ impl TryFrom<&rpc::Executor> for Executor {
             task: None,
             context: None,
             app_mgr: None,
+            dev_mgr: None,
             shim_instance: None,
             state,
         })
@@ -284,6 +288,7 @@ mod tests {
             task: None,
             context: None,
             app_mgr: None,
+            dev_mgr: None,
             shim_instance: Some(Arc::new(tokio::sync::Mutex::new(DelayedDestroy {
                 fail_first: false,
                 entered: entered.clone(),
@@ -367,7 +372,7 @@ mod tests {
         // local Releasing state intact; only FEM later frees the physical claim.
         assert!(workdir
             .path()
-            .join("gpu")
+            .join(crate::devices::GPU)
             .join(format!("{}.json", executor.lock().unwrap().id))
             .exists());
         assert!(devices.allocate(&competing).is_err());

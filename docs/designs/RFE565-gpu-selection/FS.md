@@ -143,7 +143,8 @@ manager-pointer ownership cycles. This is local device selection, not an additio
 scheduler policy.
 
 `Executor.assignments` stores cloneable `DeviceAssignment` descriptions keyed
-by device type (currently `"gpu"`). Each contains only device IDs, environment
+by device type (`"cpu"`, `"memory"` and `"gpu"`). Each contains the reserved
+value (CPU cores, memory bytes or GPU count), device IDs, environment
 variables, and CDI settings. The GPU manager owns the executor-ID-to-assignment
 map; the assignment duplicates no identity or rollback metadata. Cloning or
 dropping an assignment does not change ownership. Release receives executor

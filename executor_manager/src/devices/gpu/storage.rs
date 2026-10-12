@@ -36,11 +36,13 @@ pub(super) fn validate_executor_id(executor_id: &str) -> Result<(), FlameError> 
 
 pub(super) fn assignment_path(workdir: &Path, executor_id: &str) -> Result<PathBuf, FlameError> {
     validate_executor_id(executor_id)?;
-    Ok(workdir.join("gpu").join(format!("{executor_id}.json")))
+    Ok(workdir
+        .join(crate::devices::GPU)
+        .join(format!("{executor_id}.json")))
 }
 
 pub(super) fn load(workdir: &Path) -> Result<HashMap<String, DeviceAssignment>, FlameError> {
-    let directory = workdir.join("gpu");
+    let directory = workdir.join(crate::devices::GPU);
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
@@ -101,7 +103,7 @@ pub(super) fn save(
     assignment: &DeviceAssignment,
 ) -> Result<(), FlameError> {
     let path = assignment_path(workdir, executor_id)?;
-    let directory = workdir.join("gpu");
+    let directory = workdir.join(crate::devices::GPU);
     let temporary = directory.join(format!(".gpu-assignment-{}.tmp", Uuid::new_v4()));
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         fs::create_dir_all(&directory)?;
@@ -138,7 +140,7 @@ pub(super) fn remove(workdir: &Path, executor_id: &str) -> Result<(), FlameError
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(io_error("remove", &path, error)),
     }
-    let directory = workdir.join("gpu");
+    let directory = workdir.join(crate::devices::GPU);
     match File::open(&directory) {
         Ok(directory_file) => directory_file
             .sync_all()

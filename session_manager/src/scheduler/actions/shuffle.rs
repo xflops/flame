@@ -13,15 +13,13 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use stdng::collections::{BinaryHeap, Cmp};
 use stdng::{logs::TraceFn, trace_fn};
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::model::{ExecutorInfo, SnapShot, BOUND_EXECUTOR, IDLE_EXECUTOR, READY_SESSION};
+use crate::model::{ExecutorInfo, SnapShot, BOUND_EXECUTOR, IDLE_EXECUTOR};
 use crate::scheduler::actions::{Action, ActionPtr};
 use crate::scheduler::ctx::Context;
-use crate::scheduler::plugins::ssn_order_fn;
 
 use common::FlameError;
 
@@ -49,68 +47,18 @@ impl Action for ShuffleAction {
         trace_fn!("ShuffleAction::execute");
         let ss = ctx.snapshot.clone();
 
-        let mut underused = BinaryHeap::new(ssn_order_fn(ctx));
-        let open_ssns = ss.find_sessions(READY_SESSION)?;
-        for ssn in open_ssns.values() {
-            if ctx.is_underused(ssn)? {
-                underused.push(ssn.clone());
-            }
-        }
-
-        let mut bound_execs = ss.find_executors(BOUND_EXECUTOR)?;
-
-        // Unbind overused sessions for underused sessions.
-        loop {
-            if underused.is_empty() {
-                break;
-            }
-
-            let ssn = underused
-                .pop()
-                .expect("failed to pop underused session: loop guard ensures non-empty");
-            if !ctx.is_underused(&ssn)? || ctx.is_ready(&ssn)? {
+        // Reclaim surplus bindings even when no recipient currently needs them.
+        // Interrupt requests take effect after any in-flight task completes.
+        for executor in ss.find_executors(BOUND_EXECUTOR)?.values() {
+            if !ctx.is_reclaimable(executor)? {
                 continue;
             }
-
-            let mut exec = None;
-            for e in bound_execs.values_mut() {
-                tracing::debug!(
-                    "Try to unbound Executor <{}> for session <{}>",
-                    e.id,
-                    ssn.id.clone()
-                );
-
-                let target_ssn = match e.ssn_id.clone() {
-                    Some(ssn_id) => Some(ss.get_session(&ssn_id)?),
-                    None => None,
-                };
-
-                if let Some(target_ssn) = target_ssn {
-                    if !ctx.is_preemptible(&target_ssn)? {
-                        continue;
-                    }
-
-                    // Unbind the overused session, so the executor will
-                    // become idle and be allocated to the underused session.
-                    ctx.unbind_session(e, &target_ssn).await?;
-                    exec = Some(e.clone());
-
-                    break;
-                }
-            }
-
-            if let Some(exec) = exec {
-                tracing::debug!(
-                    "Executor <{}> was pipelined to session <{}>, remove it from bound list.",
-                    exec.id,
-                    ssn.id.clone()
-                );
-
-                bound_execs.remove(&exec.id);
-
-                // Pipeline the executor to the underused session to avoid over allocation.
-                ctx.pipeline_executor(&exec, &ssn)?;
-                underused.push(ssn.clone());
+            let Some(session_id) = &executor.ssn_id else {
+                continue;
+            };
+            let session = ss.get_session(session_id)?;
+            if ctx.is_overused(&session)? {
+                ctx.interrupt_executor(executor, &session).await?;
             }
         }
 
@@ -133,7 +81,7 @@ mod tests {
     use crate::model::AppInfo;
     use common::apis::{
         ApplicationAttributes, ExecutorState, FlameResult, Node, NodeState, ResourceRequirement,
-        SessionAttributes, BIND_RESULT_OK,
+        SessionAttributes, Signal, BIND_RESULT_OK,
     };
     use common::ctx::{FlameCluster, FlameClusterContext};
 
@@ -197,6 +145,142 @@ mod tests {
         let executor = idle_executor(now + Duration::seconds(1));
 
         assert!(idle_executor_expired(&snapshot(Some(Duration::minutes(1))), &executor,).unwrap());
+    }
+
+    #[tokio::test]
+    async fn shuffle_trims_surplus_without_recipient_and_preserves_minimum() {
+        let (controller, ids) = bound_executors(3, 1).await;
+        for _ in 0..3 {
+            let mut context = shuffle_context(controller.clone());
+            ShuffleAction {}.execute(&mut context).await.unwrap();
+            let executors = controller.list_executors().unwrap();
+            assert_eq!(executors.len(), ids.len());
+            assert_eq!(
+                executors
+                    .iter()
+                    .filter(|e| e.state == ExecutorState::Bound && !e.is_interrupted())
+                    .count(),
+                1
+            );
+            assert_eq!(
+                executors
+                    .iter()
+                    .filter(|e| e.state == ExecutorState::Bound && e.is_interrupted())
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shuffle_signals_inflight_tasks_without_blocking_completion() {
+        let (controller, ids) = bound_executors(3, 0).await;
+        // Snapshot the idle bindings before the worker receives a new task.
+        let mut context = shuffle_context(controller.clone());
+        controller
+            .create_task("session".into(), None, None)
+            .await
+            .unwrap();
+        let task = controller
+            .launch_task(ids[0].clone())
+            .await
+            .unwrap()
+            .unwrap();
+        ShuffleAction {}.execute(&mut context).await.unwrap();
+        let busy = controller.get_executor(ids[0].clone()).unwrap();
+        assert_eq!(busy.state, ExecutorState::Bound);
+        assert_eq!(busy.task_id, Some(task.id));
+        assert_eq!(busy.signal, Some(Signal::Interrupt));
+        for id in &ids[1..] {
+            let interrupted = controller.get_executor(id.clone()).unwrap();
+            assert_eq!(interrupted.state, ExecutorState::Bound);
+            assert_eq!(interrupted.signal, Some(Signal::Interrupt));
+        }
+        controller
+            .complete_task(
+                ids[0].clone(),
+                common::apis::TaskResult {
+                    state: common::apis::TaskState::Succeed,
+                    output: None,
+                    message: None,
+                },
+                Some(rpc::flame::v1::ExecutorAttributes {
+                    attr: vec![b"task-completed".to_vec()],
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(controller
+            .launch_task(ids[0].clone())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    fn shuffle_context(controller: crate::controller::ControllerPtr) -> Context {
+        Context::new(
+            controller,
+            &crate::scheduler::plugins::PluginsOptions {
+                policies: vec!["priority".into(), "das".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    async fn bound_executors(
+        count: usize,
+        minimum: u32,
+    ) -> (crate::controller::ControllerPtr, Vec<String>) {
+        let config = FlameClusterContext {
+            cluster: FlameCluster {
+                storage: "none".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let storage = crate::storage::new_ptr(&config).await.unwrap();
+        let controller = crate::controller::new_ptr(storage.clone());
+        controller
+            .register_application("app".into(), ApplicationAttributes::default())
+            .await
+            .unwrap();
+        storage
+            .register_node(&Node {
+                name: "node".into(),
+                state: NodeState::Ready,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        controller
+            .create_session(SessionAttributes {
+                id: "session".into(),
+                application: "app".into(),
+                min_instances: minimum,
+                resreq: Some(ResourceRequirement::default()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..count {
+            let executor = controller
+                .create_executor("node".into(), "session".into())
+                .await
+                .unwrap();
+            controller.register_executor(&executor).await.unwrap();
+            controller
+                .bind_session(executor.id.clone(), "session".into())
+                .await
+                .unwrap();
+            controller
+                .bind_executor_completed(executor.id.clone(), None, None)
+                .await
+                .unwrap();
+            ids.push(executor.id);
+        }
+        (controller, ids)
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use stdng::MutexPtr;
 
-use super::{ExecutorID, ExecutorState, ResourceRequirement, SessionID, Shim, TaskID};
+use super::{ExecutorID, ExecutorState, ResourceRequirement, SessionID, Shim, Signal, TaskID};
 use rpc::flame::v1 as rpc;
 
 #[derive(Clone, Debug)]
@@ -37,11 +37,30 @@ pub struct Executor {
     /// Volatile lifecycle timestamp; intentionally omitted from storage and RPC.
     pub latest_updated_timestamp: DateTime<Utc>,
     pub state: ExecutorState,
+    /// Volatile control signal, intentionally omitted from storage and RPC.
+    pub signal: Option<Signal>,
 }
 
 impl Executor {
+    pub fn is_interrupted(&self) -> bool {
+        self.signal == Some(Signal::Interrupt)
+    }
+
+    /// Whether this executor is leaving or no longer owns the session binding.
+    pub fn is_unbinding(&self, ssn_id: &SessionID) -> bool {
+        matches!(
+            self.state,
+            ExecutorState::Unbinding | ExecutorState::Releasing | ExecutorState::Released
+        ) || self.ssn_id.as_ref() != Some(ssn_id)
+    }
+
     pub fn set_state(&mut self, state: ExecutorState) {
         self.state = state;
+        if state == ExecutorState::Idle {
+            // Keep the signal through unbinding, then clear it so the executor
+            // can be reused without interrupting its next session binding.
+            self.signal = None;
+        }
         self.latest_updated_timestamp = Utc::now();
     }
 }
@@ -54,6 +73,7 @@ impl Default for Executor {
             resreq: ResourceRequirement::default(),
             shim: Shim::Host,
             application: String::new(),
+            signal: None,
             task_id: None,
             ssn_id: None,
             attributes: HashSet::new(),
@@ -86,6 +106,7 @@ impl From<&rpc::Executor> for Executor {
             resreq: spec.resreq.unwrap().into(),
             shim: Shim::from(spec.shim()),
             application: spec.application.clone(),
+            signal: None,
             task_id: None,
             ssn_id: None,
             attributes: HashSet::new(),
@@ -126,5 +147,67 @@ impl From<&Executor> for rpc::Executor {
             spec,
             status,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unbinding_detects_departure_and_session_ownership_change() {
+        let session_id = "session".to_string();
+        for (state, departing) in [
+            (ExecutorState::Binding, false),
+            (ExecutorState::Bound, false),
+            (ExecutorState::Unbinding, true),
+            (ExecutorState::Releasing, true),
+            (ExecutorState::Released, true),
+        ] {
+            let mut executor = Executor {
+                state,
+                ssn_id: Some(session_id.clone()),
+                ..Default::default()
+            };
+            assert_eq!(executor.is_unbinding(&session_id), departing);
+            executor.ssn_id = Some("other-session".into());
+            assert!(executor.is_unbinding(&session_id));
+            executor.ssn_id = None;
+            assert!(executor.is_unbinding(&session_id));
+        }
+    }
+
+    #[test]
+    fn interrupt_keeps_executor_bound_until_normal_lifecycle_transition() {
+        let session_id = "session".to_string();
+        let mut executor = Executor {
+            state: ExecutorState::Bound,
+            ssn_id: Some(session_id.clone()),
+            signal: Some(Signal::Interrupt),
+            ..Default::default()
+        };
+
+        assert!(executor.is_interrupted());
+        assert!(!executor.is_unbinding(&session_id));
+        assert_eq!(executor.state, ExecutorState::Bound);
+        executor.set_state(ExecutorState::Bound);
+        assert!(executor.is_interrupted());
+        executor.set_state(ExecutorState::Unbinding);
+        assert!(executor.is_interrupted());
+        assert!(executor.is_unbinding(&session_id));
+        executor.set_state(ExecutorState::Idle);
+        assert!(!executor.is_interrupted());
+        executor.set_state(ExecutorState::Bound);
+        assert!(!executor.is_unbinding(&session_id));
+    }
+
+    #[test]
+    fn rpc_does_not_restore_volatile_signal() {
+        let executor = Executor {
+            signal: Some(Signal::Interrupt),
+            ..Default::default()
+        };
+        let restored = Executor::from(rpc::Executor::from(executor));
+        assert_eq!(restored.signal, None);
     }
 }

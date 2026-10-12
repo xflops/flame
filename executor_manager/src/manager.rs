@@ -106,14 +106,9 @@ impl ExecutorManager {
 
         let existing = lock_ptr!(self.executors)?.get(&executor_id).cloned();
         if state == ExecutorState::Released {
-            if let Some(existing) = existing {
-                {
-                    let mut executor = lock_ptr!(existing)?;
-                    executor.state = ExecutorState::Released;
-                    self.dev_mgr.release(&executor)?;
-                }
-                lock_ptr!(self.executors)?.remove(&executor_id);
-            }
+            // Session Manager only releases an executor after its own Releasing
+            // unregistered it, and Releasing already freed the devices.
+            lock_ptr!(self.executors)?.remove(&executor_id);
             return Ok(());
         }
         if existing.is_some() {
@@ -121,6 +116,7 @@ impl ExecutorManager {
             return Ok(());
         }
         executor.app_mgr = Some(self.app_mgr.clone());
+        executor.dev_mgr = Some(self.dev_mgr.clone());
         executor.context = Some(self.ctx.clone());
         executor.shim = self.ctx.cluster.executors.shim;
         executor.assignments = self.dev_mgr.allocate(&executor)?;
@@ -175,6 +171,7 @@ mod tests {
             task: None,
             context: None,
             app_mgr: None,
+            dev_mgr: None,
             shim_instance: None,
             state,
         }
@@ -203,41 +200,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_assignment_release_retains_entry_for_retry() {
-        let workdir = tempfile::tempdir().unwrap();
-        let mut manager = manager(workdir.path());
-        let mut exec = executor("executor-1", ExecutorState::Released);
-        exec.assignments = manager.dev_mgr.allocate(&exec).unwrap();
-        lock_ptr!(manager.executors)
-            .unwrap()
-            .insert(exec.id.clone(), Arc::new(Mutex::new(exec)));
-        let path = workdir.path().join("gpu/executor-1.json");
-        std::fs::remove_file(&path).unwrap();
-        std::fs::create_dir(&path).unwrap();
-        assert!(manager
-            .handle_executor_update(executor("executor-1", ExecutorState::Released))
-            .await
-            .is_err());
-        assert!(lock_ptr!(manager.executors)
-            .unwrap()
-            .contains_key("executor-1"));
-        assert!(manager
-            .dev_mgr
-            .allocate(&executor("executor-2", ExecutorState::Idle))
-            .is_err());
-        std::fs::remove_dir(&path).unwrap();
-        manager
-            .handle_executor_update(executor("executor-1", ExecutorState::Released))
-            .await
-            .unwrap();
-        assert!(lock_ptr!(manager.executors).unwrap().is_empty());
-        manager
-            .dev_mgr
-            .allocate(&executor("executor-2", ExecutorState::Idle))
-            .unwrap();
-    }
-
-    #[tokio::test]
     async fn repeated_stream_update_preserves_assignment() {
         let workdir = tempfile::tempdir().unwrap();
         let mut manager = manager(workdir.path());
@@ -256,7 +218,7 @@ mod tests {
             lock_ptr!(pointer)
                 .unwrap()
                 .assignments
-                .get("gpu")
+                .get(crate::devices::GPU)
                 .unwrap()
                 .devices(),
             ["GPU-a"]
@@ -316,7 +278,7 @@ mod tests {
             .unwrap();
         let pointer = lock_ptr!(manager.executors).unwrap()["executor-1"].clone();
         let exec = lock_ptr!(pointer).unwrap();
-        assert_eq!(exec.assignments["gpu"].devices(), ["GPU-a"]);
+        assert_eq!(exec.assignments[crate::devices::GPU].devices(), ["GPU-a"]);
         assert!(Arc::ptr_eq(
             exec.app_mgr.as_ref().unwrap(),
             &manager.app_mgr
@@ -328,22 +290,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn released_notification_finishes_local_releasing_and_frees_devices() {
+    async fn released_notification_removes_a_releasing_executor() {
         let workdir = tempfile::tempdir().unwrap();
         let mut manager = manager(workdir.path());
         let mut existing = executor("executor-1", ExecutorState::Releasing);
         existing.assignments = manager.dev_mgr.allocate(&existing).unwrap();
-        let pointer = Arc::new(Mutex::new(existing));
+        // Releasing frees the devices before it unregisters the executor.
+        manager.dev_mgr.release(&existing).unwrap();
         lock_ptr!(manager.executors)
             .unwrap()
-            .insert("executor-1".into(), pointer.clone());
+            .insert("executor-1".into(), Arc::new(Mutex::new(existing)));
         manager
             .handle_executor_update(executor("executor-1", ExecutorState::Released))
             .await
             .unwrap();
-        assert_eq!(lock_ptr!(pointer).unwrap().state, ExecutorState::Released);
         assert!(lock_ptr!(manager.executors).unwrap().is_empty());
-        assert!(!workdir.path().join("gpu/executor-1.json").exists());
         manager
             .dev_mgr
             .allocate(&executor("executor-2", ExecutorState::Idle))
@@ -356,6 +317,8 @@ mod tests {
         let mut manager = manager(workdir.path());
         let mut completed = executor("executor-1", ExecutorState::Released);
         completed.assignments = manager.dev_mgr.allocate(&completed).unwrap();
+        // Releasing frees the devices before the executor is Released.
+        manager.dev_mgr.release(&completed).unwrap();
         completed.release().unwrap();
         let pointer = Arc::new(Mutex::new(completed));
         lock_ptr!(manager.executors)

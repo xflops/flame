@@ -38,6 +38,15 @@ def _wait_for_terminal_task(session, task_id):
     pytest.fail(f"Task {task_id} watcher ended before terminal state")
 
 
+def _wait_for_session_unbound(session_id, timeout_seconds=10):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if all(executor.status.session_id != session_id for executor in flamepy.list_executors()):
+            return
+        time.sleep(0.05)
+    pytest.fail(f"Session {session_id} remained bound after its task queue emptied")
+
+
 def _create_failing_basic_task(session):
     task = session.create_task(serialize_request(TestRequest(input="requested_failure", fail_on_task=True)))
     task_update = _wait_for_terminal_task(session, task.id)
@@ -219,27 +228,22 @@ def test_all_context_info():
 
 
 def test_service_state_tracking():
-    """Test that service state is maintained across multiple tasks."""
+    """Test per-binding state when an empty session unbinds between tasks."""
     session = flamepy.create_session(application=FLM_TEST_SVC_APP, common_data=None)
 
     num_tasks = 5
-    session_enter_count = None
-    session_leave_count = None
     for i in range(1, num_tasks + 1):
         request = TestRequest(input=f"task_{i}")
         response = invoke_task(session, request)
 
-        # Check service state increments
+        # Each request starts a new binding after the previous one unbound.
         assert response.service_state is not None
-        assert response.service_state["task_count"] == i
-        if session_enter_count is None:
-            session_enter_count = response.service_state["session_enter_count"]
-            assert session_enter_count >= 1
-            session_leave_count = response.service_state["session_leave_count"]
-            assert session_leave_count >= 0
-            assert session_enter_count == session_leave_count + 1
-        assert response.service_state["session_enter_count"] == session_enter_count
-        assert response.service_state["session_leave_count"] == session_leave_count
+        assert response.output == f"task_{i}"
+        assert response.service_state["task_count"] == 1
+        assert response.service_state["session_enter_count"] >= 1
+        assert response.service_state["session_leave_count"] >= 0
+        assert response.service_state["session_enter_count"] == response.service_state["session_leave_count"] + 1
+        _wait_for_session_unbound(session.id)
 
     session.close()
 
@@ -358,23 +362,39 @@ def test_update_common_data():
 def test_multiple_sessions_isolation():
     """Test that service state is isolated across different sessions."""
     # First session
-    session1 = flamepy.create_session(application=FLM_TEST_SVC_APP, common_data=None)
+    common_data1 = f"session1-{random_string()}"
+    session1 = flamepy.create_session(
+        application=FLM_TEST_SVC_APP,
+        common_data=serialize_common_data(TestContext(common_data=common_data1), FLM_TEST_SVC_APP),
+    )
 
     for i in range(3):
-        request = TestRequest(input=f"session1_task_{i}")
+        request = TestRequest(input=f"session1_task_{i}", request_session_context=True)
         response = invoke_task(session1, request)
-        assert response.service_state["task_count"] == i + 1
+        assert response.output == f"session1_task_{i}"
+        assert response.common_data == common_data1
+        assert response.session_context.session_id == session1.id
+        assert response.service_state["task_count"] == 1
+        assert response.service_state["session_enter_count"] == response.service_state["session_leave_count"] + 1
+        _wait_for_session_unbound(session1.id)
 
     session1.close()
 
     # Second session should reset state
-    session2 = flamepy.create_session(application=FLM_TEST_SVC_APP, common_data=None)
+    common_data2 = f"session2-{random_string()}"
+    session2 = flamepy.create_session(
+        application=FLM_TEST_SVC_APP,
+        common_data=serialize_common_data(TestContext(common_data=common_data2), FLM_TEST_SVC_APP),
+    )
 
-    request = TestRequest(input="session2_task_1")
+    request = TestRequest(input="session2_task_1", request_session_context=True)
     response = invoke_task(session2, request)
 
     # Task count should be reset for new session
     assert response.service_state["task_count"] == 1
+    assert response.output == "session2_task_1"
+    assert response.common_data == common_data2
+    assert response.session_context.session_id == session2.id
     assert response.service_state["session_enter_count"] >= 1
     assert response.service_state["session_enter_count"] == response.service_state["session_leave_count"] + 1
 

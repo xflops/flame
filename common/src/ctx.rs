@@ -188,7 +188,7 @@ pub struct FlameCluster {
 #[derive(Debug, Clone)]
 pub struct FlameExecutors {
     pub shim: Shim,
-    /// Device managers loaded by FEM. An empty list disables device discovery.
+    /// Optional device managers loaded by FEM; CPU and memory are always loaded.
     pub devices: Vec<String>,
 }
 

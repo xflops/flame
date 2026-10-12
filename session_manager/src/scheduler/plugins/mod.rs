@@ -123,7 +123,9 @@ pub trait Plugin: Send + Sync + 'static {
         None
     }
 
-    fn is_preemptible(&self, ssn: &SessionInfoPtr) -> Option<bool> {
+    /// Whether idle bindings may be removed from this session. Return None
+    /// to defer to the next policy; the first explicit result is authoritative.
+    fn is_overused(&self, ssn: &SessionInfoPtr) -> Option<bool> {
         None
     }
 
@@ -143,6 +145,10 @@ pub trait Plugin: Send + Sync + 'static {
     fn on_session_bind(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {}
 
     fn on_session_unbind(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {}
+
+    fn on_executor_interrupt(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {}
+
+    fn on_executor_create(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {}
 
     fn on_executor_pipeline(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {}
 }
@@ -272,12 +278,14 @@ impl PluginManager {
         Ok(false)
     }
 
-    pub fn is_preemptible(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
+    pub fn is_overused(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
         let plugins = lock_ptr!(self.plugins)?;
-
-        Ok(plugins
-            .iter()
-            .all(|(_, plugin)| plugin.is_preemptible(ssn).unwrap_or(false)))
+        for (_, plugin) in plugins.iter() {
+            if let Some(overused) = plugin.is_overused(ssn) {
+                return Ok(overused);
+            }
+        }
+        Ok(false)
     }
 
     /// Check if an executor is available for a session.
@@ -369,6 +377,32 @@ impl PluginManager {
         for (_, plugin) in plugins.iter_mut() {
             plugin.on_session_unbind(exec.clone(), ssn.clone());
         }
+        Ok(())
+    }
+
+    pub fn on_executor_interrupt(
+        &self,
+        exec: ExecutorInfoPtr,
+        ssn: SessionInfoPtr,
+    ) -> Result<(), FlameError> {
+        let mut plugins = lock_ptr!(self.plugins)?;
+        for (_, plugin) in plugins.iter_mut() {
+            plugin.on_executor_interrupt(exec.clone(), ssn.clone());
+        }
+        Ok(())
+    }
+
+    pub fn on_executor_create(
+        &self,
+        exec: ExecutorInfoPtr,
+        ssn: SessionInfoPtr,
+    ) -> Result<(), FlameError> {
+        let mut plugins = lock_ptr!(self.plugins)?;
+
+        for (_, plugin) in plugins.iter_mut() {
+            plugin.on_executor_create(exec.clone(), ssn.clone());
+        }
+
         Ok(())
     }
 
@@ -521,6 +555,49 @@ mod tests {
     use chrono::Utc;
     use common::apis::{ExecutorState, ResourceRequirement, Shim};
 
+    struct OverusePolicy(Option<bool>);
+
+    impl Plugin for OverusePolicy {
+        fn name(&self) -> &'static str {
+            "test-overuse"
+        }
+
+        fn setup(&mut self, _: &SnapShot) -> Result<(), FlameError> {
+            Ok(())
+        }
+
+        fn is_overused(&self, _: &SessionInfoPtr) -> Option<bool> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn overused_uses_first_explicit_policy_result() {
+        let session = Arc::new(SessionInfo::default());
+        for (opinions, expected) in [
+            (vec![None], false),
+            (vec![], false),
+            (vec![Some(true), None], true),
+            (vec![None, Some(true)], true),
+            (vec![Some(true), Some(false)], true),
+            (vec![Some(false), Some(true)], false),
+        ] {
+            let policies = opinions
+                .into_iter()
+                .map(|opinion| {
+                    (
+                        "test-overuse".into(),
+                        Box::new(OverusePolicy(opinion)) as PluginPtr,
+                    )
+                })
+                .collect();
+            let manager = PluginManager {
+                plugins: new_ptr(policies),
+            };
+            assert_eq!(manager.is_overused(&session).unwrap(), expected);
+        }
+    }
+
     /// Create a test executor sized by `n` units (1 unit = (cpu:1, memory:1024, gpu:0)).
     fn create_test_executor(id: &str, n: u32) -> ExecutorInfoPtr {
         Arc::new(ExecutorInfo {
@@ -534,6 +611,7 @@ mod tests {
             shim: Shim::Host,
             application: String::new(),
             task_id: None,
+            signal: None,
             ssn_id: None,
             creation_time: Utc::now(),
             latest_updated_timestamp: Utc::now(),
@@ -598,7 +676,7 @@ mod tests {
         // - is_available: matching resources plus None -> true (executor is available by default)
         // - is_allocatable: None -> true (node is allocatable by default)
         // - is_underused: None -> false (session is NOT underused by default)
-        // - is_preemptible: None -> false (session is NOT preemptible by default)
+        // - is_overused: first explicit result wins; None -> false if all policies abstain
         // - is_reclaimable: None -> true (executor is reclaimable by default)
         //
         // This allows plugins to only implement the checks they care about,

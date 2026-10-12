@@ -21,7 +21,7 @@ use crate::controller::ControllerPtr;
 use crate::model::{ExecutorInfo, ExecutorInfoPtr, NodeInfoPtr, SessionInfoPtr, SnapShotPtr};
 use crate::scheduler::actions::{ActionPtr, AllocateAction, DispatchAction, ShuffleAction};
 use crate::scheduler::plugins::{PluginManager, PluginManagerPtr, PluginsOptions};
-use common::apis::{ExecutorID, ExecutorState};
+use common::apis::{ExecutorID, ExecutorState, Signal};
 use common::FlameError;
 
 /// One scheduling cycle: a single `Context` (one [`PluginManager::setup`] on the current
@@ -59,8 +59,8 @@ impl Context {
         self.plugins.is_ready(ssn)
     }
 
-    pub fn is_preemptible(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
-        self.plugins.is_preemptible(ssn)
+    pub fn is_overused(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
+        self.plugins.is_overused(ssn)
     }
 
     pub fn is_allocatable(
@@ -69,6 +69,10 @@ impl Context {
         ssn: &SessionInfoPtr,
     ) -> Result<bool, FlameError> {
         self.plugins.is_allocatable(node, ssn)
+    }
+
+    pub fn is_reclaimable(&self, exec: &ExecutorInfoPtr) -> Result<bool, FlameError> {
+        self.plugins.is_reclaimable(exec)
     }
 
     pub fn is_available(
@@ -122,7 +126,7 @@ impl Context {
             .await?;
         let exec_info = Arc::new(ExecutorInfo::from(&executor));
         self.snapshot.add_executor(exec_info.clone())?;
-        self.plugins.on_executor_pipeline(exec_info, ssn.clone())
+        self.plugins.on_executor_create(exec_info, ssn.clone())
     }
 
     /// Accounts for an executor reserved by this scheduling cycle.
@@ -153,15 +157,18 @@ impl Context {
         Ok(())
     }
 
-    pub async fn unbind_session(
+    pub async fn interrupt_executor(
         &self,
         exec: &ExecutorInfoPtr,
         ssn: &SessionInfoPtr,
     ) -> Result<(), FlameError> {
-        self.controller.unbind_executor(exec.id.clone()).await?;
-        self.plugins.on_session_unbind(exec.clone(), ssn.clone())?;
-        self.snapshot
-            .update_executor_state(exec.clone(), ExecutorState::Unbinding)?;
+        self.controller.interrupt_executor(exec.id.clone()).await?;
+        self.plugins
+            .on_executor_interrupt(exec.clone(), ssn.clone())?;
+        self.snapshot.update_executor(Arc::new(ExecutorInfo {
+            signal: Some(Signal::Interrupt),
+            ..exec.as_ref().clone()
+        }))?;
 
         Ok(())
     }

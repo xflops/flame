@@ -520,6 +520,46 @@ mod tests {
     }
 
     #[test]
+    fn test_allocation_without_drf_stops_at_node_capacity() -> Result<(), FlameError> {
+        for capacity in [
+            ResourceRequirement {
+                cpu: 2,
+                memory: 10240,
+                gpu: 0,
+            },
+            ResourceRequirement {
+                cpu: 10,
+                memory: 2048,
+                gpu: 0,
+            },
+        ] {
+            let (env, session_id, mut options) = instance_limit_env(1000, None)?;
+            options.policies = vec!["priority".into(), "das".into()];
+            let mut node = new_test_node("node_1".into());
+            node.capacity = capacity.clone();
+            node.allocatable = capacity;
+            tokio_test::block_on(env.controller.storage().register_node(&node))?;
+            for _ in 0..10 {
+                tokio_test::block_on(env.controller.create_task(session_id.clone(), None, None))?;
+            }
+            for cycle in 0..5 {
+                let mut context = Context::new(env.controller.clone(), &options)?;
+                tokio_test::block_on(DispatchAction::new_ptr().execute(&mut context))?;
+                tokio_test::block_on(AllocateAction::new_ptr().execute(&mut context))?;
+                let executors = env.controller.list_executors()?;
+                assert!(executors.len() <= 2, "cycle {cycle}");
+                for executor in executors {
+                    if executor.state == common::apis::ExecutorState::Void {
+                        tokio_test::block_on(env.controller.register_executor(&executor))?;
+                    }
+                }
+            }
+            assert_eq!(env.controller.list_executors()?.len(), 2);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_drf_gpu_allocation_stops_at_task_demand_while_binding() -> Result<(), FlameError> {
         let (env, session_id, options) = instance_limit_env(1000, None)?;
         let controller = &env.controller;

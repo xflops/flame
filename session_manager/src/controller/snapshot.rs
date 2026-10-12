@@ -21,8 +21,8 @@ use stdng::{lock_ptr, MutexPtr};
 use common::apis::{
     Application, ApplicationFilter, ApplicationState, Executor, ExecutorFilter, ExecutorID,
     ExecutorState, Node, NodeState, ResourceRequirement, Session, SessionFilter, SessionID,
-    SessionPredicate, SessionState, Shim, Task, TaskID, TaskState, ALL_APPLICATION, ALL_EXECUTOR,
-    BOUND_EXECUTOR, IDLE_EXECUTOR, OPEN_SESSION, READY_SESSION, VOID_EXECUTOR,
+    SessionPredicate, SessionState, Shim, Signal, Task, TaskID, TaskState, ALL_APPLICATION,
+    ALL_EXECUTOR, BOUND_EXECUTOR, IDLE_EXECUTOR, OPEN_SESSION, READY_SESSION, VOID_EXECUTOR,
 };
 use common::ctx::DEFAULT_SESSION_RETRY_LIMITS;
 use common::FlameError;
@@ -162,8 +162,20 @@ pub struct ExecutorInfo {
     /// Last in-memory lifecycle update, used to age Idle retained instances.
     pub latest_updated_timestamp: DateTime<Utc>,
     pub state: ExecutorState,
+    pub signal: Option<Signal>,
     /// Last accepted volatile attributes for the retained service instance.
     pub attributes: HashSet<Bytes>,
+}
+
+impl ExecutorInfo {
+    pub fn is_interrupted(&self) -> bool {
+        self.signal == Some(Signal::Interrupt)
+    }
+
+    pub fn is_binding(&self, ssn_id: &SessionID) -> bool {
+        self.ssn_id.as_ref() == Some(ssn_id)
+            && matches!(self.state, ExecutorState::Binding | ExecutorState::Bound)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -223,6 +235,7 @@ impl From<&Executor> for ExecutorInfo {
             creation_time: exec.creation_time,
             latest_updated_timestamp: exec.latest_updated_timestamp,
             state: exec.state,
+            signal: exec.signal,
             attributes: exec.attributes.clone(),
         }
     }
@@ -648,6 +661,11 @@ impl SnapShot {
         Ok(())
     }
 
+    pub fn update_executor(&self, exec: ExecutorInfoPtr) -> Result<(), FlameError> {
+        self.delete_executor(exec.clone())?;
+        self.add_executor(exec)
+    }
+
     pub fn delete_executor(&self, exec: ExecutorInfoPtr) -> Result<(), FlameError> {
         {
             let mut executors = lock_ptr!(self.executors)?;
@@ -679,13 +697,11 @@ impl SnapShot {
             creation_time: exec.creation_time,
             latest_updated_timestamp: Utc::now(),
             state,
+            signal: exec.signal,
             attributes: exec.attributes.clone(),
         });
 
-        self.delete_executor(new_exec.clone())?;
-        self.add_executor(new_exec)?;
-
-        Ok(())
+        self.update_executor(new_exec)
     }
 
     ///
@@ -821,6 +837,7 @@ mod tests {
             creation_time: Utc::now(),
             latest_updated_timestamp: Utc::now(),
             state,
+            signal: None,
             attributes: HashSet::new(),
         })
     }
@@ -1086,6 +1103,50 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(nonexistent.len(), 0);
+    }
+
+    #[test]
+    fn interrupted_executors_remain_visible_in_actual_state_indexes() {
+        let snapshot = SnapShot::new();
+        snapshot
+            .add_executor(create_test_executor(
+                "executor",
+                slots_rr(2),
+                ExecutorState::Bound,
+            ))
+            .unwrap();
+        let states = [
+            ExecutorState::Bound,
+            ExecutorState::Unbinding,
+            ExecutorState::Idle,
+        ];
+        for state in states {
+            let signal = (state != ExecutorState::Idle).then_some(Signal::Interrupt);
+            let exec = Arc::new(ExecutorInfo {
+                signal,
+                ..create_test_executor("executor", slots_rr(2), state)
+                    .as_ref()
+                    .clone()
+            });
+            // Repeated updates preserve a single entry and remove old state indexes.
+            for _ in 0..2 {
+                snapshot.update_executor(exec.clone()).unwrap();
+                let all = snapshot.find_executors(ALL_EXECUTOR).unwrap();
+                assert_eq!(all.len(), 1);
+                assert_eq!(all[&exec.id].state, state);
+                assert_eq!(all[&exec.id].signal, signal);
+                for indexed_state in states {
+                    let indexed = snapshot
+                        .find_executors(Some(ExecutorFilter {
+                            state: Some(indexed_state),
+                            ids: None,
+                            node: None,
+                        }))
+                        .unwrap();
+                    assert_eq!(indexed.len(), usize::from(indexed_state == state));
+                }
+            }
+        }
     }
 
     /// Test that delete_executor removes from both main map and index.

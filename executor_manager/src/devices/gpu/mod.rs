@@ -129,9 +129,12 @@ impl GpuManager {
                 .iter()
                 .map(|device| format!("nvidia.com/gpu={device}"))
                 .collect::<Vec<_>>();
-            if assignment.envs != expected_envs || assignment.cdi != expected_cdi {
+            if assignment.envs != expected_envs
+                || assignment.cdi != expected_cdi
+                || assignment.value() != assignment.devices().len() as u64
+            {
                 return Err(FlameError::InvalidConfig(
-                    "persisted GPU assignment environment or CDI devices do not match inventory"
+                    "persisted GPU assignment value, environment or CDI devices do not match inventory"
                         .into(),
                 ));
             }
@@ -202,7 +205,7 @@ impl DeviceManager for GpuManager {
             .iter()
             .map(|device| format!("nvidia.com/gpu={device}"))
             .collect();
-        let mut assignment = DeviceAssignment::new(devices);
+        let mut assignment = DeviceAssignment::new(devices).with_value(count as u64);
         assignment
             .envs
             .insert("CUDA_VISIBLE_DEVICES".to_string(), visibility);
@@ -270,7 +273,7 @@ mod tests {
         let default = GpuManager::new();
         assert_eq!(default.workdir, Path::new("."));
         let (directory, _manager) = manager();
-        assert!(!directory.path().join("gpu").exists());
+        assert!(!directory.path().join(crate::devices::GPU).exists());
     }
 
     #[test]
@@ -312,7 +315,7 @@ mod tests {
             assert!(manager.allocate(&request).is_err(), "{id:?}");
             assert!(manager.release(&request).is_err());
         }
-        assert!(!directory.path().join("gpu").exists());
+        assert!(!directory.path().join(crate::devices::GPU).exists());
         assert!(manager.allocate(&executor(-1)).is_err());
         assert!(manager.allocate(&executor(3)).is_err());
         assert!(manager.allocate(&executor(2)).is_ok());
@@ -327,6 +330,17 @@ mod tests {
         assert_eq!(assignment.envs["CUDA_VISIBLE_DEVICES"], "");
         assert_eq!(manager.allocate(&request).unwrap(), assignment);
         assert!(manager.allocate(&executor(2)).is_ok());
+    }
+
+    #[test]
+    fn assignment_value_is_gpu_count_and_survives_reload() {
+        let (directory, manager) = manager();
+        let request = executor(2);
+        let assignment = manager.allocate(&request).unwrap();
+        assert_eq!(assignment.value(), 2);
+        let restored = storage::load(directory.path()).unwrap();
+        assert_eq!(restored[&request.id], assignment);
+        assert_eq!(restored[&request.id].value(), 2);
     }
 
     #[test]
@@ -418,11 +432,12 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path(&manager, &first)).unwrap()).unwrap();
         let fields = json.as_object().unwrap();
-        assert_eq!(fields.len(), 3);
+        assert_eq!(fields.len(), 4);
         assert!(
             fields.contains_key("devices")
                 && fields.contains_key("envs")
                 && fields.contains_key("cdi")
+                && fields["value"] == 1
         );
         std::fs::write(directory.path().join("unrelated.txt"), "keep").unwrap();
         drop(manager);
@@ -565,7 +580,7 @@ mod tests {
         let (directory, manager) = manager();
         let request = executor(1);
         manager.allocate(&request).unwrap();
-        let gpu_dir = directory.path().join("gpu");
+        let gpu_dir = directory.path().join(crate::devices::GPU);
         let temporary = gpu_dir.join(format!(".gpu-assignment-{}.tmp", uuid::Uuid::new_v4()));
         std::fs::write(&temporary, b"unfinished").unwrap();
         manager

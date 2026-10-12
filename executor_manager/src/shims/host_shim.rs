@@ -538,6 +538,7 @@ mod tests {
             task: None,
             context: None,
             app_mgr: None,
+            dev_mgr: None,
             shim_instance: None,
             assignments: Default::default(),
             state: ExecutorState::Idle,
@@ -565,8 +566,10 @@ mod tests {
             ("CUDA_VISIBLE_DEVICES".to_string(), "0,1,2,3".to_string()),
             ("OTHER_VARIABLE".to_string(), "preserved".to_string()),
         ]);
-        let assignments =
-            crate::devices::DeviceAssignments::from([("gpu".to_string(), assignment)]);
+        let assignments = crate::devices::DeviceAssignments::from([(
+            crate::devices::GPU.to_string(),
+            assignment,
+        )]);
         HostShim::apply_assignments(&mut environment, &assignments).unwrap();
         assert_eq!(environment["CUDA_VISIBLE_DEVICES"], "GPU-first,GPU-second");
         assert_eq!(environment["OTHER_VARIABLE"], "preserved");
@@ -588,7 +591,7 @@ mod tests {
         let mut executor = test_executor();
         executor.resreq.gpu = 1;
         executor.assignments.insert(
-            "gpu".to_string(),
+            crate::devices::GPU.to_string(),
             allocator
                 .allocate(&crate::devices::test_executor(
                     (common::apis::ResourceRequirement {
@@ -646,7 +649,7 @@ mod tests {
             .with_inventory(Vec::new())
             .unwrap();
         let assignments = crate::devices::DeviceAssignments::from([(
-            "gpu".to_string(),
+            crate::devices::GPU.to_string(),
             gpu.allocate(&crate::devices::test_executor(
                 (common::apis::ResourceRequirement {
                     gpu: 0,

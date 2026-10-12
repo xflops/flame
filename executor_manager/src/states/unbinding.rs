@@ -148,7 +148,7 @@ mod tests {
                 ..Default::default()
             },
             assignments: std::collections::HashMap::from([(
-                "gpu".to_string(),
+                crate::devices::GPU.to_string(),
                 allocator
                     .allocate(&crate::devices::test_executor(
                         (common::apis::ResourceRequirement {
@@ -165,6 +165,7 @@ mod tests {
             task: None,
             context: None,
             app_mgr: None,
+            dev_mgr: None,
             shim_instance: Some(shim.clone()),
             state: ExecutorState::Unbinding,
         };
@@ -186,7 +187,12 @@ mod tests {
             ))
             .is_err());
         assert_eq!(
-            state.executor.assignments.get("gpu").unwrap().devices(),
+            state
+                .executor
+                .assignments
+                .get(crate::devices::GPU)
+                .unwrap()
+                .devices(),
             ["GPU-a"]
         );
         assert!(Arc::ptr_eq(
@@ -209,6 +215,7 @@ mod tests {
             task: None,
             context: None,
             app_mgr: None,
+            dev_mgr: None,
             shim_instance: Some(shim.clone()),
             state: ExecutorState::Unbinding,
         };

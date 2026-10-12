@@ -199,7 +199,7 @@ impl Storage {
                 .iter()
                 .filter_map(|(id, ssn_ptr)| {
                     let ssn = lock_ptr!(ssn_ptr).ok()?;
-                    if ssn.status.state == SessionState::Closed {
+                    if ssn.is_closed() {
                         // Use completion_time if available, otherwise use creation_time
                         let time = ssn.completion_time.unwrap_or(ssn.creation_time);
                         Some((id.clone(), time))
@@ -363,6 +363,7 @@ impl Storage {
                     application: exec.application.clone(),
                     task_id: exec.task_id,
                     ssn_id: exec.ssn_id.clone(),
+                    signal: exec.signal,
                     attributes: exec.attributes.clone(),
                     creation_time: exec.creation_time,
                     latest_updated_timestamp: exec.latest_updated_timestamp,
@@ -1052,6 +1053,7 @@ impl Storage {
             application,
             task_id: None,
             ssn_id: None,
+            signal: None,
             attributes: Default::default(),
             creation_time: now,
             latest_updated_timestamp: now,

@@ -331,6 +331,7 @@ impl Backend for Flame {
             shim,
             application: spec.application,
             task_id: None,
+            signal: None,
             ssn_id: None,
             attributes: Default::default(),
             creation_time: now,

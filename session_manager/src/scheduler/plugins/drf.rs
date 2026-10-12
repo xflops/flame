@@ -106,34 +106,34 @@ impl Plugin for DRFPlugin {
 
         let executors = ss.find_executors(ALL_EXECUTOR)?;
         for exec in executors.values() {
-            // Idle retained instances and executors still releasing continue
-            // to occupy node resources even though they have no session owner.
-            // Void executors are charged when pipelined below; Released
-            // executors no longer occupy capacity.
-            if !matches!(
-                exec.state,
-                common::apis::ExecutorState::Void | common::apis::ExecutorState::Released
-            ) {
+            // Creation reserves node capacity, including executors still starting
+            // or departing. Pipelining existing capacity must not reserve it again.
+            if exec.state != common::apis::ExecutorState::Released {
                 if let Some(node_alloc) = self.node_allocations.get_mut(&exec.node) {
                     node_alloc.add(&exec.resreq);
                 }
             }
 
-            if let Some(ssn_id) = &exec.ssn_id {
-                let entry = self
-                    .ssn_map
-                    .entry(ssn_id.clone())
-                    .or_insert_with(|| DRFSessionInfo {
-                        id: ssn_id.clone(),
-                        ..Default::default()
-                    });
-                entry.allocated.cpu += exec.resreq.cpu;
-                entry.allocated.memory += exec.resreq.memory;
-                entry.allocated.gpu += exec.resreq.gpu;
+            let Some(ssn_id) = &exec.ssn_id else {
+                continue;
+            };
+            if !exec.is_binding(ssn_id) || exec.is_interrupted() {
+                continue;
             }
+            let entry = self
+                .ssn_map
+                .entry(ssn_id.clone())
+                .or_insert_with(|| DRFSessionInfo {
+                    id: ssn_id.clone(),
+                    ..Default::default()
+                });
+            entry.allocated.cpu += exec.resreq.cpu;
+            entry.allocated.memory += exec.resreq.memory;
+            entry.allocated.gpu += exec.resreq.gpu;
         }
 
         let sessions = ss.find_sessions(OPEN_SESSION)?;
+        self.ssn_map.retain(|id, _| sessions.contains_key(id));
         for ssn in sessions.values() {
             let ssn_id = ssn.id.clone();
             let _ = self
@@ -207,6 +207,14 @@ impl Plugin for DRFPlugin {
         Some(self.calculate_dominant_share(&supplied) >= 1.0 / num_sessions)
     }
 
+    fn is_overused(&self, ssn: &SessionInfoPtr) -> Option<bool> {
+        let info = self.ssn_map.get(&ssn.id)?;
+        let minimum = self.get_session_resreq(ssn).mul(ssn.min_instances);
+        let minimum_share = self.calculate_dominant_share(&minimum);
+        let fair_share = 1.0 / self.ssn_map.len().max(1) as f64;
+        (info.dominant_share > fair_share.max(minimum_share)).then_some(true)
+    }
+
     fn is_allocatable(&self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Option<bool> {
         let node_alloc = self.node_allocations.get(&node.name)?;
         let ssn_resreq = self.get_session_resreq(ssn);
@@ -222,19 +230,25 @@ impl Plugin for DRFPlugin {
         Some(cpu_ok && mem_ok && gpu_ok)
     }
 
+    fn on_executor_create(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
+        if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
+            entry.allocated.add(&exec.resreq);
+        }
+        if let Some(node_alloc) = self.node_allocations.get_mut(&exec.node) {
+            node_alloc.add(&exec.resreq);
+        }
+        if let Some(entry) = self.ssn_map.get(&ssn.id) {
+            let share = self.calculate_dominant_share(&entry.allocated);
+            if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
+                entry.dominant_share = share;
+            }
+        }
+    }
+
     fn on_executor_pipeline(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
+        // Reserve a future share while waiting for existing capacity to be released.
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
             entry.pipelined.add(&exec.resreq);
-        }
-
-        // Void executors are deliberately excluded from setup's node usage.
-        // Pipeline them here so they reserve capacity exactly once for the
-        // current cycle. Every other live state was already charged by setup,
-        // including an Unbinding executor whose session ID was cleared.
-        if exec.state == common::apis::ExecutorState::Void {
-            if let Some(node_alloc) = self.node_allocations.get_mut(&exec.node) {
-                node_alloc.add(&exec.resreq);
-            }
         }
     }
 
@@ -250,6 +264,20 @@ impl Plugin for DRFPlugin {
             let ds = self.calculate_dominant_share(&entry.allocated);
             if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
                 entry.dominant_share = ds;
+            }
+        }
+    }
+
+    fn on_executor_interrupt(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
+        if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
+            entry.allocated.cpu = entry.allocated.cpu.saturating_sub(exec.resreq.cpu);
+            entry.allocated.memory = entry.allocated.memory.saturating_sub(exec.resreq.memory);
+            entry.allocated.gpu = entry.allocated.gpu.saturating_sub(exec.resreq.gpu);
+        }
+        if let Some(entry) = self.ssn_map.get(&ssn.id) {
+            let share = self.calculate_dominant_share(&entry.allocated);
+            if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
+                entry.dominant_share = share;
             }
         }
     }
@@ -313,12 +341,186 @@ mod tests {
             shim: Shim::Host,
             application: String::new(),
             task_id: None,
+            signal: None,
             ssn_id: None,
             creation_time: Utc::now(),
             latest_updated_timestamp: Utc::now(),
             state: ExecutorState::Void,
             attributes: Default::default(),
         })
+    }
+
+    #[test]
+    fn overuse_balances_each_dominant_resource_and_preserves_minimum() {
+        for resource in [
+            ResourceRequirement {
+                cpu: 1,
+                ..Default::default()
+            },
+            ResourceRequirement {
+                memory: 1,
+                ..Default::default()
+            },
+            ResourceRequirement {
+                gpu: 1,
+                ..Default::default()
+            },
+        ] {
+            let ssn = Arc::new(SessionInfo {
+                min_instances: 2,
+                tasks_status: [(TaskState::Pending, 10)].into_iter().collect(),
+                resreq: Some(resource.clone()),
+                ..session().as_ref().clone()
+            });
+            let mut total = resource.clone();
+            total.add(&resource);
+            total.add(&resource);
+            total.add(&resource);
+            let mut allocated = resource.clone();
+            allocated.add(&resource);
+            allocated.add(&resource);
+            let mut plugin = DRFPlugin {
+                total,
+                ssn_map: HashMap::from([
+                    (
+                        ssn.id.clone(),
+                        DRFSessionInfo {
+                            allocated,
+                            ..Default::default()
+                        },
+                    ),
+                    ("other".into(), DRFSessionInfo::default()),
+                ]),
+                node_allocations: HashMap::new(),
+            };
+            plugin.ssn_map.get_mut(&ssn.id).unwrap().dominant_share = 0.75;
+            assert_eq!(plugin.is_overused(&ssn), Some(true));
+            let interrupted = Arc::new(crate::model::ExecutorInfo {
+                resreq: resource.clone(),
+                ..void_executor("interrupted").as_ref().clone()
+            });
+            plugin.on_executor_interrupt(interrupted.clone(), ssn.clone());
+            assert_eq!(plugin.is_overused(&ssn), None);
+            plugin.on_session_bind(interrupted, ssn.clone());
+            assert_eq!(plugin.is_overused(&ssn), Some(true));
+            plugin.on_session_unbind(void_executor("one"), ssn.clone());
+            assert_eq!(plugin.is_overused(&ssn), None);
+            let minimum = Arc::new(SessionInfo {
+                min_instances: 3,
+                ..ssn.as_ref().clone()
+            });
+            plugin.on_session_bind(void_executor("one"), ssn.clone());
+            assert_eq!(plugin.is_overused(&minimum), None);
+            plugin.ssn_map.remove("other");
+            assert_eq!(plugin.is_overused(&ssn), None);
+        }
+    }
+
+    #[test]
+    fn overuse_excludes_departures_and_closed_sessions_after_refresh() {
+        use crate::scheduler::plugins::{PluginManager, PluginsOptions};
+
+        let snapshot = SnapShot::new();
+        snapshot
+            .add_node(Arc::new(crate::model::NodeInfo {
+                name: "node-1".into(),
+                allocatable: rr(4),
+                state: common::apis::NodeState::Ready,
+            }))
+            .unwrap();
+        let ssn = Arc::new(SessionInfo {
+            tasks_status: [(TaskState::Pending, 10)].into_iter().collect(),
+            ..session().as_ref().clone()
+        });
+        snapshot.add_session(ssn.clone()).unwrap();
+        snapshot
+            .add_session(Arc::new(SessionInfo {
+                id: "other".into(),
+                ..ssn.as_ref().clone()
+            }))
+            .unwrap();
+        snapshot
+            .add_session(Arc::new(SessionInfo {
+                id: "closed".into(),
+                state: SessionState::Closed,
+                ..ssn.as_ref().clone()
+            }))
+            .unwrap();
+        for (id, owner, state) in [
+            ("one", ssn.id.as_str(), ExecutorState::Bound),
+            ("two", ssn.id.as_str(), ExecutorState::Bound),
+            ("three", ssn.id.as_str(), ExecutorState::Binding),
+            ("departing", ssn.id.as_str(), ExecutorState::Unbinding),
+            ("closed-executor", "closed", ExecutorState::Bound),
+        ] {
+            snapshot
+                .add_executor(Arc::new(crate::model::ExecutorInfo {
+                    ssn_id: Some(owner.into()),
+                    state,
+                    ..void_executor(id).as_ref().clone()
+                }))
+                .unwrap();
+        }
+        let options = PluginsOptions {
+            policies: vec!["drf".into()],
+            ..Default::default()
+        };
+        let manager = PluginManager::setup(&snapshot, &options).unwrap();
+        // MinMax abstains because demand exceeds three active bindings; DRF approves.
+        assert!(manager.is_overused(&ssn).unwrap());
+        let departing = snapshot.find_executors(ALL_EXECUTOR).unwrap()["one"].clone();
+        manager
+            .on_executor_interrupt(departing.clone(), ssn.clone())
+            .unwrap();
+        assert!(!manager.is_overused(&ssn).unwrap());
+        snapshot
+            .update_executor_state(departing, ExecutorState::Unbinding)
+            .unwrap();
+        let refreshed = PluginManager::setup(&snapshot, &options).unwrap();
+        assert!(!refreshed.is_overused(&ssn).unwrap());
+        // A deferred interrupt must exclude the same allocation before the
+        // worker has transitioned its lifecycle state to Unbinding.
+        let original = snapshot.find_executors(ALL_EXECUTOR).unwrap()["one"].clone();
+        snapshot
+            .update_executor(Arc::new(crate::model::ExecutorInfo {
+                state: ExecutorState::Bound,
+                signal: Some(common::apis::Signal::Interrupt),
+                ..original.as_ref().clone()
+            }))
+            .unwrap();
+        let interrupted = PluginManager::setup(&snapshot, &options).unwrap();
+        assert!(!interrupted.is_overused(&ssn).unwrap());
+    }
+
+    #[test]
+    fn interrupted_executor_capacity_is_accounted_without_session_share() {
+        let snapshot = SnapShot::new();
+        let node = Arc::new(crate::model::NodeInfo {
+            name: "node-1".into(),
+            allocatable: rr(1),
+            state: common::apis::NodeState::Ready,
+        });
+        snapshot.add_node(node.clone()).unwrap();
+        let ssn = session();
+        snapshot.add_session(ssn.clone()).unwrap();
+        snapshot
+            .add_executor(Arc::new(crate::model::ExecutorInfo {
+                state: ExecutorState::Bound,
+                signal: Some(common::apis::Signal::Interrupt),
+                ssn_id: Some(ssn.id.clone()),
+                ..void_executor("interrupted").as_ref().clone()
+            }))
+            .unwrap();
+        let mut plugin = DRFPlugin {
+            total: rr(0),
+            ssn_map: HashMap::new(),
+            node_allocations: HashMap::new(),
+        };
+        plugin.setup(&snapshot).unwrap();
+        assert_eq!(snapshot.find_executors(ALL_EXECUTOR).unwrap().len(), 1);
+        assert_eq!(plugin.node_allocations[&node.name], rr(1));
+        assert_eq!(plugin.ssn_map[&ssn.id].allocated, rr(0));
+        assert_eq!(plugin.is_allocatable(&node, &ssn), Some(false));
     }
 
     #[test]
@@ -345,28 +547,61 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_accounts_void_capacity_without_changing_allocated_ownership() {
+    fn creation_allocates_capacity_without_pipelining() {
         let ssn = session();
         let mut plugin = DRFPlugin {
             total: rr(4),
-            ssn_map: HashMap::from([(
-                ssn.id.clone(),
-                DRFSessionInfo {
-                    id: ssn.id.clone(),
-                    ..Default::default()
-                },
-            )]),
-            node_allocations: HashMap::from([("node-1".to_string(), rr(0))]),
+            ssn_map: HashMap::from([(ssn.id.clone(), DRFSessionInfo::default())]),
+            node_allocations: HashMap::from([("node-1".into(), rr(0))]),
         };
-
         for i in 0..4 {
-            plugin.on_executor_pipeline(void_executor(&format!("exec-{i}")), ssn.clone());
+            plugin.on_executor_create(void_executor(&format!("new-{i}")), ssn.clone());
         }
+        let info = &plugin.ssn_map[&ssn.id];
+        assert_eq!(info.allocated, rr(4));
+        assert_eq!(info.pipelined, rr(0));
+        assert_eq!(info.dominant_share, 1.0);
+        assert_eq!(plugin.node_allocations["node-1"], rr(4));
+        assert_eq!(plugin.is_underused(&ssn), Some(false));
+        assert_eq!(plugin.is_ready(&ssn), Some(true));
+    }
 
-        let info = plugin.ssn_map.get(&ssn.id).unwrap();
+    #[test]
+    fn pipeline_reserves_future_share_without_allocating_more_node_capacity() {
+        let snapshot = SnapShot::new();
+        snapshot
+            .add_node(Arc::new(crate::model::NodeInfo {
+                name: "node-1".into(),
+                allocatable: rr(4),
+                state: common::apis::NodeState::Ready,
+            }))
+            .unwrap();
+        let ssn = session();
+        snapshot.add_session(ssn.clone()).unwrap();
+        let mut departing = Vec::new();
+        for i in 0..4 {
+            let exec = Arc::new(crate::model::ExecutorInfo {
+                state: ExecutorState::Unbinding,
+                ..void_executor(&format!("departing-{i}")).as_ref().clone()
+            });
+            snapshot.add_executor(exec.clone()).unwrap();
+            departing.push(exec);
+        }
+        let mut plugin = DRFPlugin {
+            total: rr(0),
+            ssn_map: HashMap::new(),
+            node_allocations: HashMap::new(),
+        };
+        plugin.setup(&snapshot).unwrap();
+        assert_eq!(plugin.node_allocations["node-1"], rr(4));
+        for exec in departing {
+            plugin.on_executor_pipeline(exec, ssn.clone());
+        }
+        let info = &plugin.ssn_map[&ssn.id];
         assert_eq!(info.allocated, rr(0));
         assert_eq!(info.pipelined, rr(4));
-        assert_eq!(plugin.node_allocations.get("node-1"), Some(&rr(4)));
+        assert_eq!(info.dominant_share, 0.0);
+        assert_eq!(plugin.node_allocations["node-1"], rr(4));
         assert_eq!(plugin.is_underused(&ssn), Some(true));
         assert_eq!(plugin.is_ready(&ssn), Some(true));
     }

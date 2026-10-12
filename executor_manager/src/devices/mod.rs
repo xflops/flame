@@ -11,7 +11,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod cpu;
 pub mod gpu;
+mod ledger;
+pub mod memory;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -21,6 +24,10 @@ use common::apis::ResourceRequirement;
 use common::FlameError;
 use serde_derive::{Deserialize, Serialize};
 
+pub const CPU: &str = "cpu";
+pub const MEMORY: &str = "memory";
+pub const GPU: &str = "gpu";
+
 /// A copyable description of a manager-owned allocation. Dropping it does not
 /// release devices; FEM calls DeviceManager::release after service cleanup.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +36,8 @@ pub struct DeviceAssignment {
     pub envs: HashMap<String, String>,
     pub cdi: Vec<String>,
     devices: Vec<String>,
+    /// Reserved quantity: CPU cores, memory bytes or GPU count.
+    value: u64,
 }
 
 impl DeviceAssignment {
@@ -37,7 +46,17 @@ impl DeviceAssignment {
             envs: HashMap::new(),
             cdi: Vec::new(),
             devices,
+            value: 0,
         }
+    }
+
+    pub(crate) fn with_value(mut self, value: u64) -> Self {
+        self.value = value;
+        self
+    }
+
+    pub fn value(&self) -> u64 {
+        self.value
     }
 
     pub fn devices(&self) -> &[String] {
@@ -83,16 +102,25 @@ impl DeviceManagers {
                     "duplicate device manager '{name}'"
                 )));
             }
-            if name != "gpu" {
+            if matches!(name.as_str(), CPU | MEMORY) {
+                return Err(FlameError::InvalidConfig(format!(
+                    "device manager '{name}' is mandatory and cannot be configured"
+                )));
+            }
+            if name != GPU {
                 return Err(FlameError::InvalidConfig(format!(
                     "unsupported device manager '{name}'; available: gpu"
                 )));
             }
         }
-        let mut managers = Vec::new();
+        // CPU and memory are node capacity and always loaded; names select extras.
+        let mut managers: Vec<(String, Arc<dyn DeviceManager>)> = vec![
+            (CPU.into(), Arc::new(cpu::CpuManager::new())),
+            (MEMORY.into(), Arc::new(memory::MemoryManager::new())),
+        ];
         for name in names {
             let manager: Box<dyn DeviceManager> = match name.as_str() {
-                "gpu" => Box::new(gpu::GpuManager::new()),
+                GPU => Box::new(gpu::GpuManager::new()),
                 _ => unreachable!("validated manager name"),
             };
             manager.discover()?;
@@ -144,7 +172,7 @@ impl DeviceManagers {
     }
 
     pub(crate) fn with_gpu(manager: gpu::GpuManager) -> Self {
-        Self::with_manager("gpu", Arc::new(manager))
+        Self::with_manager(GPU, Arc::new(manager))
     }
 
     pub(crate) fn with_manager(name: &str, manager: Arc<dyn DeviceManager>) -> Self {
@@ -168,6 +196,7 @@ pub(crate) fn test_executor(resreq: ResourceRequirement) -> Executor {
         task: None,
         context: None,
         app_mgr: None,
+        dev_mgr: None,
         shim_instance: None,
         state: common::apis::ExecutorState::Idle,
     }
@@ -192,16 +221,26 @@ mod tests {
     }
 
     #[test]
-    fn empty_registry_has_no_device_validation() {
+    fn empty_config_loads_only_mandatory_host_managers() {
         let managers = DeviceManagers::load(&[]).unwrap();
-        assert_eq!(managers.capacity(), ResourceRequirement::default());
-        assert!(managers.allocate(&request()).unwrap().is_empty());
+        let capacity = managers.capacity();
+        assert!(capacity.cpu > 0);
+        assert_eq!(capacity.gpu, 0);
+        let assignments = managers.allocate(&request()).unwrap();
+        assert!(assignments.values().all(|a| a.devices().is_empty()));
+        assert!(!assignments.contains_key(GPU));
         managers.release(&request()).unwrap();
     }
 
     #[test]
     fn duplicate_or_unsupported_managers_fail_before_discovery() {
-        for names in [vec!["gpu", "gpu"], vec!["tpu"], vec!["gpu", "unknown"]] {
+        for names in [
+            vec![GPU, GPU],
+            vec!["tpu"],
+            vec![GPU, "unknown"],
+            vec![CPU],
+            vec![MEMORY],
+        ] {
             assert!(DeviceManagers::load(
                 &names.into_iter().map(str::to_string).collect::<Vec<_>>(),
             )
@@ -231,7 +270,7 @@ mod tests {
         let gpu = Arc::new(gpu(directory.path()));
         let managers = DeviceManagers {
             managers: vec![
-                ("gpu".into(), gpu.clone()),
+                (GPU.into(), gpu.clone()),
                 ("other".into(), Arc::new(Unavailable)),
             ],
         };
@@ -278,7 +317,7 @@ mod tests {
         let failure = Arc::new(AtomicBool::new(true));
         let managers = DeviceManagers {
             managers: vec![(
-                "gpu".into(),
+                GPU.into(),
                 Arc::new(Recorder {
                     gpu: gpu(directory.path()),
                     releases: releases.clone(),

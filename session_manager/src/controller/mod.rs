@@ -19,8 +19,8 @@ use std::sync::Arc;
 use common::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationState, CommonData, Event,
     EventOwner, ExecutorID, ExecutorState, FlameResult, Node, NodeState, Session,
-    SessionAttributes, SessionID, SessionPtr, SessionState, Task, TaskGID, TaskID, TaskInput,
-    TaskOptions, TaskPtr, TaskResult, TaskState,
+    SessionAttributes, SessionID, SessionPtr, SessionState, Signal, Task, TaskGID, TaskID,
+    TaskInput, TaskOptions, TaskPtr, TaskResult, TaskState,
 };
 
 use common::FlameError;
@@ -223,6 +223,26 @@ impl Controller {
         // Check if node exists to preserve its state
         let existing_state = self.storage.get_node(&node.name)?.map(|n| n.state);
 
+        // Get executors from DB for this node
+        let db_executors = self
+            .storage
+            .list_executors(Some(&ExecutorFilter::by_node(&node.name)))?;
+
+        // The node may only report executors this Session Manager knows. An unknown
+        // one is capacity nothing counts (a new node, or executors deleted while the
+        // node was away), so the site admin clears the node (for example by
+        // restarting it) before it joins. Nothing is stored for a rejected node.
+        let unknown = reported_executors
+            .iter()
+            .filter(|reported| !db_executors.iter().any(|db_exec| db_exec.id == reported.id))
+            .count();
+        if unknown > 0 {
+            return Err(FlameError::InvalidState(format!(
+                "node <{}> reports {} executors unknown to Session Manager; clear them before it joins",
+                node.name, unknown
+            )));
+        }
+
         // Create node with preserved state (or use input state for new nodes)
         let node_to_store = if let Some(state) = existing_state {
             Node {
@@ -245,16 +265,7 @@ impl Controller {
             .map(|executor| executor.id.as_str())
             .collect();
 
-        // Get executors from DB for this node
-        let db_executors = self
-            .storage
-            .list_executors(Some(&ExecutorFilter::by_node(&node.name)))?;
-
-        let db_ids: HashSet<String> = db_executors.iter().map(|e| e.id.clone()).collect();
-
-        // Compare both directions and release mismatched executors
-
-        // 1. DB executors not reported by the node have lost their in-memory
+        // DB executors not reported by the node have lost their in-memory
         // shim. Retain the record and ask the executor-manager run loop to
         // perform targeted cleanup by persisted executor ID. The interrupted
         // task is failed only after cleanup is acknowledged by unregister_executor.
@@ -280,27 +291,6 @@ impl Controller {
             // Only replay executors whose runtime was actually reported.
             if let Err(e) = sender.send(db_exec.clone()).await {
                 tracing::warn!("Failed to send executor <{}> to node: {:?}", db_exec.id, e);
-            }
-        }
-
-        // 2. Reported executors not in DB - unknown to DB, node should release them
-        for reported_exec in reported_executors {
-            if !db_ids.contains(&reported_exec.id) {
-                tracing::info!(
-                    "Executor <{}> reported by node <{}> but not in DB. Sending release signal.",
-                    reported_exec.id,
-                    node.name
-                );
-                // Send the executor with released state so node knows to clean it up
-                let mut exec_to_release = reported_exec.clone();
-                exec_to_release.state = common::apis::ExecutorState::Released;
-                if let Err(e) = sender.send(exec_to_release).await {
-                    tracing::warn!(
-                        "Failed to send release signal for executor <{}>: {:?}",
-                        reported_exec.id,
-                        e
-                    );
-                }
             }
         }
 
@@ -447,7 +437,7 @@ impl Controller {
 
     pub fn is_session_open(&self, id: &SessionID) -> Result<bool, FlameError> {
         let session = self.storage.get_session_ptr(id.clone())?;
-        let is_open = lock_ptr!(session)?.status.state != SessionState::Closed;
+        let is_open = !lock_ptr!(session)?.is_closed();
         Ok(is_open)
     }
 
@@ -653,7 +643,7 @@ impl Controller {
         };
 
         let ssn = lock_ptr!(ssn_ptr)?;
-        if ssn.status.state == SessionState::Closed {
+        if ssn.is_closed() {
             return Ok(None);
         }
 
@@ -784,8 +774,7 @@ impl Controller {
             }
         };
 
-        let task_ptr = self.wait_for_task(&ssn_ptr, &ssn_id).await?;
-
+        let task_ptr = self.wait_for_task(&ssn_ptr, &exe_ptr).await?;
         let Some(task_ptr) = task_ptr else {
             return Ok(None);
         };
@@ -813,40 +802,40 @@ impl Controller {
 
     async fn wait_for_task(
         &self,
-        ssn: &SessionPtr,
-        ssn_id: &SessionID,
+        session: &SessionPtr,
+        executor: &ExecutorPtr,
     ) -> Result<Option<TaskPtr>, FlameError> {
-        let app_name = {
-            let ssn_guard = lock_ptr!(ssn)?;
-            ssn_guard.application.clone()
-        };
-        let app = self.storage.get_application(app_name).await?;
-        let delay_secs = app.delay_release.num_seconds().max(0) as u64;
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(delay_secs);
-
-        let mut rx = self.notifier.tasks.subscribe(ssn_id)?;
+        let session_id = lock_ptr!(session)?.id.clone();
+        let executor_id = lock_ptr!(executor)?.id.clone();
+        let mut tasks_rx = self.notifier.tasks.subscribe(&session_id)?;
+        let mut executors_rx = self.notifier.executors.subscribe(&executor_id)?;
 
         loop {
             {
-                let mut ssn_guard = lock_ptr!(ssn)?;
-                if let Some(task_ptr) = ssn_guard.pop_pending_task() {
-                    return Ok(Some(task_ptr));
-                }
-                if ssn_guard.status.state == SessionState::Closed {
+                let mut session = lock_ptr!(session)?;
+                let executor = lock_ptr!(executor)?;
+                if session.is_closed()
+                    || executor.is_unbinding(&session_id)
+                    || executor.is_interrupted()
+                {
                     return Ok(None);
+                }
+                if let Some(task) = session.pop_pending_task() {
+                    return Ok(Some(task));
                 }
             }
 
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Ok(None);
-            }
-
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Err(_) | Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                    return Ok(None);
+            tokio::select! {
+                task = tasks_rx.recv() => {
+                    if matches!(task, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                        return Ok(None);
+                    }
                 }
-                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                changed = executors_rx.changed() => {
+                    if changed.is_err() {
+                        return Ok(None);
+                    }
+                }
             }
         }
     }
@@ -930,6 +919,18 @@ impl Controller {
         Ok(())
     }
 
+    /// Request unbinding at the next task-poll round, preserving in-flight work.
+    pub async fn interrupt_executor(&self, id: ExecutorID) -> Result<(), FlameError> {
+        let executor_ptr = self.storage.get_executor_ptr(id.clone())?;
+        {
+            let mut executor = lock_ptr!(executor_ptr)?;
+            executor.signal = Some(Signal::Interrupt);
+        }
+        self.notifier.executors.notify(&id)?;
+        Ok(())
+    }
+
+    /// Acknowledge the worker beginning its normal unbinding handshake.
     pub async fn unbind_executor(&self, id: ExecutorID) -> Result<(), FlameError> {
         trace_fn!("Controller::unbind_executor");
         let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
@@ -941,6 +942,7 @@ impl Controller {
             (*exe).clone()
         };
         self.storage.update_executor(&executor).await?;
+        self.notifier.executors.notify(&id)?;
 
         if let Err(e) = self
             .connection_manager
@@ -1384,6 +1386,253 @@ mod tests {
             controller.get_executor(id),
             Err(FlameError::NotFound(_))
         ));
+    }
+
+    async fn bound_task_waiter(minimum: u32) -> (ControllerPtr, String) {
+        let config = FlameClusterContext {
+            cluster: FlameCluster {
+                storage: "none".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let controller = new_ptr(crate::storage::new_ptr(&config).await.unwrap());
+        let executor_id = create_binding_executor(&controller, "task-wait-session").await;
+        {
+            let session = controller
+                .storage
+                .get_session_ptr("task-wait-session".into())
+                .unwrap();
+            lock_ptr!(session).unwrap().min_instances = minimum;
+        }
+        controller
+            .bind_executor_completed(executor_id.clone(), None, None)
+            .await
+            .unwrap();
+        (controller, executor_id)
+    }
+
+    #[tokio::test]
+    async fn minimum_binding_waits_for_tasks_and_session_close() {
+        use tokio::time::{timeout, Duration};
+        let (controller, executor_id) = bound_task_waiter(1).await;
+        let waiting = controller.launch_task(executor_id.clone());
+        tokio::pin!(waiting);
+        assert!(timeout(Duration::from_millis(20), &mut waiting)
+            .await
+            .is_err());
+        assert_eq!(
+            controller.get_executor(executor_id.clone()).unwrap().state,
+            ExecutorState::Bound
+        );
+        controller
+            .create_task("task-wait-session".into(), None, None)
+            .await
+            .unwrap();
+        let task = timeout(Duration::from_millis(100), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            controller
+                .get_task("task-wait-session".into(), task.id)
+                .unwrap()
+                .state,
+            TaskState::Running
+        );
+        controller
+            .complete_task(
+                executor_id.clone(),
+                TaskResult {
+                    state: TaskState::Succeed,
+                    output: None,
+                    message: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let waiting = controller.launch_task(executor_id.clone());
+        tokio::pin!(waiting);
+        assert!(timeout(Duration::from_millis(20), &mut waiting)
+            .await
+            .is_err());
+        controller
+            .close_session("task-wait-session".into())
+            .await
+            .unwrap();
+        assert!(timeout(Duration::from_millis(100), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+        controller
+            .unbind_executor(executor_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            controller.get_executor(executor_id.clone()).unwrap().state,
+            ExecutorState::Unbinding
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_task_subscription_releases_minimum_waiter() {
+        use tokio::time::{timeout, Duration};
+        let (controller, executor_id) = bound_task_waiter(1).await;
+        let waiting = controller.launch_task(executor_id.clone());
+        tokio::pin!(waiting);
+        assert!(timeout(Duration::from_millis(20), &mut waiting)
+            .await
+            .is_err());
+        controller
+            .notifier
+            .tasks
+            .remove(&"task-wait-session".into())
+            .unwrap();
+        assert!(timeout(Duration::from_millis(100), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+        controller
+            .unbind_executor(executor_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            controller.get_executor(executor_id.clone()).unwrap().state,
+            ExecutorState::Unbinding
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_unbind_wakes_task_wait_and_preserves_pending_work() {
+        use tokio::time::{timeout, Duration};
+        let (controller, executor_id) = bound_task_waiter(0).await;
+        let waiting = controller.launch_task(executor_id.clone());
+        tokio::pin!(waiting);
+        assert!(timeout(Duration::from_millis(20), &mut waiting)
+            .await
+            .is_err());
+        controller
+            .interrupt_executor(executor_id.clone())
+            .await
+            .unwrap();
+        let task = controller
+            .create_task("task-wait-session".into(), None, None)
+            .await
+            .unwrap();
+        assert!(timeout(Duration::from_millis(100), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            controller
+                .get_task("task-wait-session".into(), task.id)
+                .unwrap()
+                .state,
+            TaskState::Pending
+        );
+        controller
+            .unbind_executor(executor_id.clone())
+            .await
+            .unwrap();
+        controller
+            .unbind_executor_completed(executor_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            controller.get_executor(executor_id.clone()).unwrap().state,
+            ExecutorState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_task_launch_preserves_completion_and_stops_next_poll() {
+        let (controller, executor_id) = bound_task_waiter(0).await;
+        let task = controller
+            .create_task("task-wait-session".into(), None, None)
+            .await
+            .unwrap();
+        let executor = controller
+            .storage
+            .get_executor_ptr(executor_id.clone())
+            .unwrap();
+        let session = controller
+            .storage
+            .get_session_ptr("task-wait-session".into())
+            .unwrap();
+        let task_ptr = controller
+            .wait_for_task(&session, &executor)
+            .await
+            .unwrap()
+            .unwrap();
+        let state = executors::from(controller.storage.clone(), executor.clone()).unwrap();
+        // Reproduce Shuffle interrupting after Pending is popped but before
+        // launch_task persists Running and publishes executor task ownership.
+        controller
+            .interrupt_executor(executor_id.clone())
+            .await
+            .unwrap();
+        controller
+            .interrupt_executor(executor_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(lock_ptr!(executor).unwrap().state, ExecutorState::Bound);
+        state.launch_task(session, task_ptr).await.unwrap().unwrap();
+        // Completion retry must still recover this task before handling the signal.
+        assert_eq!(
+            controller
+                .launch_task(executor_id.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            task.id
+        );
+        controller
+            .complete_task(
+                executor_id.clone(),
+                TaskResult {
+                    state: TaskState::Succeed,
+                    output: None,
+                    message: None,
+                },
+                Some(rpc::ExecutorAttributes {
+                    attr: vec![b"completed-key".to_vec()],
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            controller
+                .get_task("task-wait-session".into(), task.id)
+                .unwrap()
+                .state,
+            TaskState::Succeed
+        );
+        assert!(controller
+            .launch_task(executor_id.clone())
+            .await
+            .unwrap()
+            .is_none());
+        controller
+            .unbind_executor(executor_id.clone())
+            .await
+            .unwrap();
+        let leaving = controller.get_executor(executor_id.clone()).unwrap();
+        assert_eq!(leaving.state, ExecutorState::Unbinding);
+        assert!(leaving.is_interrupted());
+        controller
+            .unbind_executor_completed(executor_id.clone())
+            .await
+            .unwrap();
+        let idle = controller.get_executor(executor_id).unwrap();
+        assert_eq!(idle.state, ExecutorState::Idle);
+        assert!(!idle.is_interrupted());
     }
 
     #[tokio::test]
@@ -2018,6 +2267,63 @@ mod tests {
                 controller.get_executor(executor_id).unwrap().application,
                 "test-app"
             );
+        }
+
+        #[tokio::test]
+        async fn test_register_node_rejects_a_new_node_that_reports_executors() {
+            let storage = create_test_storage().await;
+            let controller = new_ptr(storage.clone());
+            let node = create_test_node("new-busy-node");
+            let reported = Executor {
+                id: "running-executor".to_string(),
+                node: "new-busy-node".to_string(),
+                application: "test-app".to_string(),
+                state: ExecutorState::Bound,
+                ..Default::default()
+            };
+
+            let result = controller.register_node(&node, &[reported]).await;
+
+            assert!(matches!(result, Err(FlameError::InvalidState(_))));
+            // Nothing was recorded for the rejected node.
+            assert!(storage.get_node("new-busy-node").unwrap().is_none());
+            assert!(matches!(
+                controller.get_executor("running-executor".to_string()),
+                Err(FlameError::NotFound(_))
+            ));
+
+            // After the admin clears it, it joins with no executors.
+            controller.register_node(&node, &[]).await.unwrap();
+            assert!(storage.get_node("new-busy-node").unwrap().is_some());
+        }
+
+        #[tokio::test]
+        async fn test_register_node_rejects_executors_unknown_to_a_known_node() {
+            let controller = new_ptr(create_test_storage().await);
+            let known_id =
+                create_binding_executor(&controller, "known-node-unknown-executor").await;
+            let known = controller.get_executor(known_id.clone()).unwrap();
+            let node = create_test_node("bind-node");
+            let unknown = Executor {
+                id: "unknown-executor".to_string(),
+                node: "bind-node".to_string(),
+                application: "test-app".to_string(),
+                state: ExecutorState::Bound,
+                ..Default::default()
+            };
+
+            let result = controller.register_node(&node, &[known, unknown]).await;
+
+            assert!(matches!(result, Err(FlameError::InvalidState(_))));
+            // The rejection changes nothing: the known executor is untouched.
+            assert_eq!(
+                controller.get_executor(known_id).unwrap().state,
+                ExecutorState::Binding
+            );
+            assert!(matches!(
+                controller.get_executor("unknown-executor".to_string()),
+                Err(FlameError::NotFound(_))
+            ));
         }
 
         #[tokio::test]
