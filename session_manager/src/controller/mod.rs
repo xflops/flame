@@ -535,15 +535,28 @@ impl Controller {
         self.storage.list_executors(None)
     }
 
+    /// Prepare lifecycle changes privately; storage publishes them after saving.
+    fn clone_executor_ptr(&self, id: ExecutorID) -> Result<ExecutorPtr, FlameError> {
+        let executor = self.storage.get_executor_ptr(id)?;
+        let snapshot = lock_ptr!(executor)?.clone();
+        Ok(stdng::new_ptr(snapshot))
+    }
+
     pub async fn register_executor(&self, e: &Executor) -> Result<(), FlameError> {
         trace_fn!("Controller::register_executor");
 
-        let exe_ptr = self.storage.get_executor_ptr(e.id.clone())?;
+        let exe_ptr = self.clone_executor_ptr(e.id.clone())?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         state.register_executor().await?;
+        let executor = lock_ptr!(exe_ptr)?.clone();
+        self.storage.update_executor(&executor).await?;
 
         // Notify the node about the executor registration
-        if let Err(err) = self.connection_manager.notify_executor(&e.node, e).await {
+        if let Err(err) = self
+            .connection_manager
+            .notify_executor(&executor.node, &executor)
+            .await
+        {
             tracing::debug!(
                 "Failed to notify node <{}> about executor registration: {}",
                 e.node,
@@ -656,7 +669,7 @@ impl Controller {
     pub async fn bind_session(&self, id: ExecutorID, ssn_id: SessionID) -> Result<(), FlameError> {
         trace_fn!("Controller::bind_session");
 
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
+        let exe_ptr = self.clone_executor_ptr(id.clone())?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
 
         let ssn_ptr = self.storage.get_session_ptr(ssn_id)?;
@@ -691,7 +704,7 @@ impl Controller {
     ) -> Result<(), FlameError> {
         trace_fn!("Controller::bind_session_completed");
 
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
+        let exe_ptr = self.clone_executor_ptr(id.clone())?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
 
         state.bind_session_completed(result).await?;
@@ -936,7 +949,7 @@ impl Controller {
     /// Acknowledge the worker beginning its normal unbinding handshake.
     pub async fn unbind_executor(&self, id: ExecutorID) -> Result<(), FlameError> {
         trace_fn!("Controller::unbind_executor");
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
+        let exe_ptr = self.clone_executor_ptr(id.clone())?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         state.unbind_executor().await?;
 
@@ -964,7 +977,7 @@ impl Controller {
 
     pub async fn unbind_executor_completed(&self, id: ExecutorID) -> Result<(), FlameError> {
         trace_fn!("Controller::unbind_executor_completed");
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
+        let exe_ptr = self.clone_executor_ptr(id.clone())?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
 
         state.unbind_executor_completed().await?;
@@ -993,7 +1006,7 @@ impl Controller {
 
     pub async fn release_executor(&self, id: ExecutorID) -> Result<(), FlameError> {
         trace_fn!("Controller::release_executor");
-        let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
+        let exe_ptr = self.clone_executor_ptr(id.clone())?;
         let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         state.release_executor().await?;
 
@@ -1058,10 +1071,13 @@ impl Controller {
             let _ = self.notifier.tasks.notify(ssn_id, task_id);
         }
 
-        let state = executors::from(self.storage.clone(), exe_ptr)?;
+        let next = stdng::new_ptr(executor.clone());
+        let state = executors::from(self.storage.clone(), next.clone())?;
         state.unregister_executor().await?;
 
         self.storage.delete_executor(id.clone()).await?;
+        // Existing waiters can retain the pointer after it leaves the map.
+        *lock_ptr!(exe_ptr)? = lock_ptr!(next)?.clone();
         self.notifier.executors.remove(&id)?;
 
         // Notify the node about the executor deletion.
@@ -2055,6 +2071,212 @@ mod tests {
     mod wait_for_session_tests {
         use super::*;
         use uuid::Uuid;
+
+        async fn persistent_lifecycle_executor(
+        ) -> (tempfile::TempDir, ControllerPtr, Executor, String) {
+            let directory = tempfile::TempDir::new().unwrap();
+            let url = format!("sqlite://{}", directory.path().join("binding.db").display());
+            let ctx = FlameClusterContext {
+                cluster: FlameCluster {
+                    storage: url.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let controller = new_ptr(crate::storage::new_ptr(&ctx).await.unwrap());
+            let session_id = "persist-before-assignment".to_string();
+            controller
+                .register_application("test-app".to_string(), create_test_application())
+                .await
+                .unwrap();
+            controller
+                .storage()
+                .register_node(&create_test_node("persist-binding-node"))
+                .await
+                .unwrap();
+            controller
+                .create_session(create_test_session_attr(&session_id))
+                .await
+                .unwrap();
+            let executor = controller
+                .create_executor("persist-binding-node".to_string(), session_id.clone())
+                .await
+                .unwrap();
+            (directory, controller, executor, url)
+        }
+
+        async fn assert_transition_is_staged<F>(
+            pool: &sqlx::SqlitePool,
+            executor: &ExecutorPtr,
+            transition: F,
+            expected: ExecutorState,
+        ) where
+            F: std::future::Future<Output = Result<(), FlameError>>,
+        {
+            use tokio::time::{timeout, Duration};
+
+            let before = lock_ptr!(executor).unwrap().clone();
+            let mut transaction = pool.begin().await.unwrap();
+            sqlx::query("UPDATE executors SET state = state WHERE id = ?")
+                .bind(&before.id)
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+            tokio::pin!(transition);
+            assert!(timeout(Duration::from_millis(50), &mut transition)
+                .await
+                .is_err());
+            {
+                let current = lock_ptr!(executor).unwrap();
+                assert_eq!(current.state, before.state);
+                assert_eq!(current.ssn_id, before.ssn_id);
+                assert_eq!(current.task_id, before.task_id);
+                assert_eq!(current.signal, before.signal);
+            }
+            transaction.commit().await.unwrap();
+            timeout(Duration::from_secs(1), transition)
+                .await
+                .expect("transition should finish after persistence is unblocked")
+                .unwrap();
+            assert_eq!(lock_ptr!(executor).unwrap().state, expected);
+            let persisted: Option<i32> =
+                sqlx::query_scalar("SELECT state FROM executors WHERE id = ?")
+                    .bind(&before.id)
+                    .fetch_optional(pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                persisted,
+                (expected != ExecutorState::Released).then(|| i32::from(expected))
+            );
+        }
+
+        #[tokio::test]
+        async fn lifecycle_transitions_are_visible_only_after_persistence() {
+            let (_directory, controller, executor, url) = persistent_lifecycle_executor().await;
+            let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+            let shared = controller
+                .storage()
+                .get_executor_ptr(executor.id.clone())
+                .unwrap();
+            assert_eq!(lock_ptr!(shared).unwrap().state, ExecutorState::Void);
+            assert_transition_is_staged(
+                &pool,
+                &shared,
+                controller.register_executor(&executor),
+                ExecutorState::Idle,
+            )
+            .await;
+            assert_transition_is_staged(
+                &pool,
+                &shared,
+                controller
+                    .bind_session(executor.id.clone(), "persist-before-assignment".to_string()),
+                ExecutorState::Binding,
+            )
+            .await;
+            assert_transition_is_staged(
+                &pool,
+                &shared,
+                controller.bind_executor_completed(executor.id.clone(), None, None),
+                ExecutorState::Bound,
+            )
+            .await;
+            assert_transition_is_staged(
+                &pool,
+                &shared,
+                controller.unbind_executor(executor.id.clone()),
+                ExecutorState::Unbinding,
+            )
+            .await;
+            controller
+                .interrupt_executor(executor.id.clone())
+                .await
+                .unwrap();
+            assert_eq!(lock_ptr!(shared).unwrap().signal, Some(Signal::Interrupt));
+            assert_transition_is_staged(
+                &pool,
+                &shared,
+                controller.unbind_executor_completed(executor.id.clone()),
+                ExecutorState::Idle,
+            )
+            .await;
+            assert_eq!(lock_ptr!(shared).unwrap().signal, None);
+            assert_transition_is_staged(
+                &pool,
+                &shared,
+                controller.release_executor(executor.id.clone()),
+                ExecutorState::Releasing,
+            )
+            .await;
+            assert_transition_is_staged(
+                &pool,
+                &shared,
+                controller.unregister_executor(executor.id.clone()),
+                ExecutorState::Released,
+            )
+            .await;
+            assert!(matches!(
+                controller.get_executor(executor.id),
+                Err(FlameError::NotFound(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn assignment_is_visible_only_after_binding_is_persisted() {
+            use tokio::time::{timeout, Duration};
+
+            let (_directory, controller, executor, url) = persistent_lifecycle_executor().await;
+            let session_id = "persist-before-assignment".to_string();
+            controller.register_executor(&executor).await.unwrap();
+
+            // An external transaction holds SQLite's write lock while the
+            // scheduler attempts to persist the new executor assignment.
+            let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+            let mut transaction = pool.begin().await.unwrap();
+            sqlx::query("UPDATE executors SET state = state WHERE id = ?")
+                .bind(&executor.id)
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+            let binding = controller.bind_session(executor.id.clone(), session_id.clone());
+            tokio::pin!(binding);
+            assert!(timeout(Duration::from_millis(50), &mut binding)
+                .await
+                .is_err());
+
+            let current = controller.get_executor(executor.id.clone()).unwrap();
+            assert_eq!(current.state, ExecutorState::Idle);
+            assert_eq!(current.ssn_id, None);
+            let waiting = controller.wait_for_session(executor.id.clone());
+            tokio::pin!(waiting);
+            assert!(timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err());
+
+            transaction.commit().await.unwrap();
+            timeout(Duration::from_secs(1), binding)
+                .await
+                .expect("binding should finish after persistence is unblocked")
+                .unwrap();
+            let assigned = timeout(Duration::from_secs(1), waiting)
+                .await
+                .expect("persisted assignment should wake the executor")
+                .unwrap()
+                .unwrap();
+            assert_eq!(assigned.id, session_id);
+            timeout(
+                Duration::from_secs(1),
+                controller.bind_executor_completed(executor.id.clone(), None, None),
+            )
+            .await
+            .expect("bind acknowledgement should finish")
+            .unwrap();
+            assert_eq!(
+                controller.get_executor(executor.id).unwrap().state,
+                ExecutorState::Bound
+            );
+        }
 
         #[tokio::test]
         async fn returns_none_when_assigned_session_is_closed() {

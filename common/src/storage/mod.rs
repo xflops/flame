@@ -1085,7 +1085,7 @@ impl Storage {
         let exe_map = lock_ptr!(self.executors)?;
         if let Some(exe_ptr) = exe_map.get(&executor.id) {
             let mut exe = lock_ptr!(exe_ptr)?;
-            exe.state = executor.state;
+            exe.set_state(executor.state);
             exe.task_id = executor.task_id;
             exe.ssn_id = executor.ssn_id.clone();
             exe.latest_updated_timestamp = executor.latest_updated_timestamp;
