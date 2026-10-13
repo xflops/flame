@@ -16,6 +16,8 @@ pub mod snapshot;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use tokio::sync::broadcast::error::RecvError;
+
 use common::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationState, CommonData, Event,
     EventOwner, ExecutorID, ExecutorState, FlameResult, Node, NodeState, Session,
@@ -631,7 +633,8 @@ impl Controller {
                 }
             }
 
-            if rx.changed().await.is_err() {
+            // A lagged wakeup still requires reconciling the current executor state.
+            if matches!(rx.recv().await, Err(RecvError::Closed)) {
                 return Ok(None);
             }
         };
@@ -664,7 +667,7 @@ impl Controller {
             (*exe).clone()
         };
         self.storage.update_executor(&executor).await?;
-        self.notifier.executors.notify(&id)?;
+        self.notifier.executors.notify(&id, id.clone())?;
 
         if let Err(e) = self
             .connection_manager
@@ -827,12 +830,12 @@ impl Controller {
 
             tokio::select! {
                 task = tasks_rx.recv() => {
-                    if matches!(task, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                    if matches!(task, Err(RecvError::Closed)) {
                         return Ok(None);
                     }
                 }
-                changed = executors_rx.changed() => {
-                    if changed.is_err() {
+                changed = executors_rx.recv() => {
+                    if matches!(changed, Err(RecvError::Closed)) {
                         return Ok(None);
                     }
                 }
@@ -926,7 +929,7 @@ impl Controller {
             let mut executor = lock_ptr!(executor_ptr)?;
             executor.signal = Some(Signal::Interrupt);
         }
-        self.notifier.executors.notify(&id)?;
+        self.notifier.executors.notify(&id, id.clone())?;
         Ok(())
     }
 
@@ -942,7 +945,7 @@ impl Controller {
             (*exe).clone()
         };
         self.storage.update_executor(&executor).await?;
-        self.notifier.executors.notify(&id)?;
+        self.notifier.executors.notify(&id, id.clone())?;
 
         if let Err(e) = self
             .connection_manager
@@ -999,7 +1002,7 @@ impl Controller {
             (*exe).clone()
         };
         self.storage.update_executor(&executor).await?;
-        self.notifier.executors.notify(&id)?;
+        self.notifier.executors.notify(&id, id.clone())?;
 
         if let Err(e) = self
             .connection_manager
@@ -1505,6 +1508,38 @@ mod tests {
             controller.get_executor(executor_id.clone()).unwrap().state,
             ExecutorState::Unbinding
         );
+    }
+
+    #[tokio::test]
+    async fn lagged_executor_wakeups_keep_task_waiter_until_interrupted() {
+        use tokio::time::{timeout, Duration};
+        let (controller, executor_id) = bound_task_waiter(0).await;
+        let waiting = controller.launch_task(executor_id.clone());
+        tokio::pin!(waiting);
+        assert!(timeout(Duration::from_millis(20), &mut waiting)
+            .await
+            .is_err());
+
+        // Overflow the bounded wakeup queue without polling the waiter.
+        for _ in 0..4096 {
+            controller
+                .notifier
+                .executors
+                .notify(&executor_id, executor_id.clone())
+                .unwrap();
+        }
+        assert!(timeout(Duration::from_millis(20), &mut waiting)
+            .await
+            .is_err());
+        controller
+            .interrupt_executor(executor_id.clone())
+            .await
+            .unwrap();
+        assert!(timeout(Duration::from_millis(100), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

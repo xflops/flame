@@ -12,165 +12,107 @@ limitations under the License.
 */
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, watch, Notify};
+use tokio::sync::{broadcast, Notify};
 use tokio::time::Duration;
 
 use common::apis::{ExecutorID, SessionID, TaskID};
 use common::FlameError;
 use stdng::{lock_ptr, MutexPtr};
 
-const SESSION_TASK_UPDATE_CAPACITY: usize = 1024;
+const NOTIFICATION_CAPACITY: usize = 1024;
 
-struct WatchChannel {
-    tx: watch::Sender<u64>,
-    rx: watch::Receiver<u64>,
-}
-
-impl WatchChannel {
-    fn new() -> Self {
-        let (tx, rx) = watch::channel(0u64);
-        Self { tx, rx }
-    }
-
-    fn notify(&self) {
-        self.tx.send_modify(|v| *v = v.wrapping_add(1));
-    }
-
-    fn subscribe(&self) -> watch::Receiver<u64> {
-        self.rx.clone()
-    }
-}
-
+/// Keyed event fanout. Channels exist only while subscribers are present.
 #[derive(Clone)]
-pub struct TaskNotifier {
-    channels: MutexPtr<HashMap<SessionID, broadcast::Sender<TaskID>>>,
+pub struct Notifier<K, V> {
+    channels: MutexPtr<HashMap<K, broadcast::Sender<V>>>,
 }
 
-pub struct TaskSubscription {
-    receiver: Option<broadcast::Receiver<TaskID>>,
-    channels: MutexPtr<HashMap<SessionID, broadcast::Sender<TaskID>>>,
-    session_id: SessionID,
+pub struct Subscription<K: Eq + Hash, V> {
+    receiver: Option<broadcast::Receiver<V>>,
+    channels: MutexPtr<HashMap<K, broadcast::Sender<V>>>,
+    key: K,
 }
 
-impl TaskSubscription {
-    pub async fn recv(&mut self) -> Result<TaskID, broadcast::error::RecvError> {
+impl<K: Eq + Hash, V: Clone> Subscription<K, V> {
+    pub async fn recv(&mut self) -> Result<V, broadcast::error::RecvError> {
         self.receiver
             .as_mut()
-            .expect("task subscription closed")
+            .expect("notification subscription closed")
             .recv()
             .await
     }
 
     #[cfg(test)]
-    pub fn try_recv(&mut self) -> Result<TaskID, broadcast::error::TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<V, broadcast::error::TryRecvError> {
         self.receiver
             .as_mut()
-            .expect("task subscription closed")
+            .expect("notification subscription closed")
             .try_recv()
     }
 }
 
-impl Drop for TaskSubscription {
+impl<K: Eq + Hash, V> Drop for Subscription<K, V> {
     fn drop(&mut self) {
         // Dropping the receiver first makes receiver_count reflect this watcher.
         self.receiver.take();
         if let Ok(mut channels) = lock_ptr!(self.channels) {
             if channels
-                .get(&self.session_id)
+                .get(&self.key)
                 .is_some_and(|sender| sender.receiver_count() == 0)
             {
-                channels.remove(&self.session_id);
+                channels.remove(&self.key);
             }
         }
     }
 }
 
-impl TaskNotifier {
+impl<K: Eq + Hash + Clone, V: Clone> Notifier<K, V> {
     pub fn new() -> Self {
         Self {
             channels: stdng::new_ptr(HashMap::new()),
         }
     }
 
-    pub fn subscribe(&self, ssn_id: &SessionID) -> Result<TaskSubscription, FlameError> {
+    pub fn subscribe(&self, key: &K) -> Result<Subscription<K, V>, FlameError> {
         let mut channels = lock_ptr!(self.channels)?;
-        let sender = channels.entry(ssn_id.clone()).or_insert_with(|| {
-            let (sender, _) = broadcast::channel(SESSION_TASK_UPDATE_CAPACITY);
+        let sender = channels.entry(key.clone()).or_insert_with(|| {
+            let (sender, _) = broadcast::channel(NOTIFICATION_CAPACITY);
             sender
         });
-        Ok(TaskSubscription {
+        Ok(Subscription {
             receiver: Some(sender.subscribe()),
             channels: self.channels.clone(),
-            session_id: ssn_id.clone(),
+            key: key.clone(),
         })
     }
 
-    pub fn notify(&self, ssn_id: &SessionID, task_id: TaskID) -> Result<(), FlameError> {
+    pub fn notify(&self, key: &K, event: V) -> Result<(), FlameError> {
         let channels = lock_ptr!(self.channels)?;
-        if let Some(sender) = channels.get(ssn_id) {
-            let _ = sender.send(task_id);
+        if let Some(sender) = channels.get(key) {
+            let _ = sender.send(event);
         }
         Ok(())
     }
 
-    pub fn remove(&self, ssn_id: &SessionID) -> Result<(), FlameError> {
+    pub fn remove(&self, key: &K) -> Result<(), FlameError> {
         let mut channels = lock_ptr!(self.channels)?;
-        channels.remove(ssn_id);
+        channels.remove(key);
         Ok(())
     }
 }
 
-impl Default for TaskNotifier {
+impl<K: Eq + Hash + Clone, V: Clone> Default for Notifier<K, V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[derive(Clone)]
-pub struct ExecutorNotifier {
-    channels: MutexPtr<HashMap<ExecutorID, Arc<WatchChannel>>>,
-}
-
-impl ExecutorNotifier {
-    pub fn new() -> Self {
-        Self {
-            channels: stdng::new_ptr(HashMap::new()),
-        }
-    }
-
-    fn get_or_create_channel(&self, id: &ExecutorID) -> Result<Arc<WatchChannel>, FlameError> {
-        let mut channels = lock_ptr!(self.channels)?;
-        Ok(channels
-            .entry(id.clone())
-            .or_insert_with(|| Arc::new(WatchChannel::new()))
-            .clone())
-    }
-
-    pub fn subscribe(&self, id: &ExecutorID) -> Result<watch::Receiver<u64>, FlameError> {
-        let channel = self.get_or_create_channel(id)?;
-        Ok(channel.subscribe())
-    }
-
-    pub fn notify(&self, id: &ExecutorID) -> Result<(), FlameError> {
-        let channel = self.get_or_create_channel(id)?;
-        channel.notify();
-        Ok(())
-    }
-
-    pub fn remove(&self, id: &ExecutorID) -> Result<(), FlameError> {
-        let mut channels = lock_ptr!(self.channels)?;
-        channels.remove(id);
-        Ok(())
-    }
-}
-
-impl Default for ExecutorNotifier {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub type TaskNotifier = Notifier<SessionID, TaskID>;
+pub type TaskSubscription = Subscription<SessionID, TaskID>;
+pub type ExecutorNotifier = Notifier<ExecutorID, ExecutorID>;
 
 #[derive(Default)]
 pub struct SchedulerNotifier {
@@ -292,7 +234,7 @@ mod tests {
             let session = "session-1".to_string();
             let mut updates = notifier.subscribe(&session).unwrap();
 
-            for _ in 0..=SESSION_TASK_UPDATE_CAPACITY {
+            for _ in 0..=NOTIFICATION_CAPACITY {
                 notifier.notify(&session, 42).unwrap();
             }
             assert!(matches!(
@@ -353,46 +295,54 @@ mod tests {
     mod executor_notifier_tests {
         use super::*;
 
-        #[test]
-        fn test_subscribe_creates_entry() {
+        #[tokio::test]
+        async fn executor_subscribers_all_wake() {
             let notifier = ExecutorNotifier::new();
             let id = "executor-1".to_string();
-
-            let rx = notifier.subscribe(&id).unwrap();
-            assert_eq!(*rx.borrow(), 0);
+            let mut first = notifier.subscribe(&id).unwrap();
+            let mut second = notifier.subscribe(&id).unwrap();
+            notifier.notify(&id, id.clone()).unwrap();
+            assert_eq!(first.recv().await, Ok(id.clone()));
+            assert_eq!(second.recv().await, Ok(id.clone()));
         }
 
         #[test]
-        fn test_notify_increments_version() {
+        fn executor_updates_without_subscribers_do_not_allocate_channels() {
             let notifier = ExecutorNotifier::new();
-            let id = "executor-1".to_string();
-
-            let rx = notifier.subscribe(&id).unwrap();
-            notifier.notify(&id).unwrap();
-
-            assert_eq!(*rx.borrow(), 1);
+            notifier
+                .notify(&"executor-1".to_string(), "executor-1".to_string())
+                .unwrap();
+            assert!(lock_ptr!(notifier.channels).unwrap().is_empty());
         }
 
         #[tokio::test]
-        async fn test_notify_wakes_waiter() {
+        async fn executor_removal_closes_stream_and_old_drop_preserves_replacement() {
             let notifier = ExecutorNotifier::new();
             let id = "executor-1".to_string();
+            let mut old = notifier.subscribe(&id).unwrap();
+            notifier.remove(&id).unwrap();
+            assert_eq!(old.recv().await, Err(broadcast::error::RecvError::Closed));
+            let mut current = notifier.subscribe(&id).unwrap();
+            drop(old);
+            notifier.notify(&id, id.clone()).unwrap();
+            assert_eq!(current.recv().await, Ok(id.clone()));
+            drop(current);
+            assert!(lock_ptr!(notifier.channels).unwrap().is_empty());
+        }
 
-            let mut rx = notifier.subscribe(&id).unwrap();
-
-            let id_clone = id.clone();
-            let notifier_clone = notifier.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                notifier_clone.notify(&id_clone).unwrap();
-            });
-
-            tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.changed())
-                .await
-                .expect("should complete")
-                .expect("channel should not close");
-
-            assert_eq!(*rx.borrow(), 1);
+        #[tokio::test]
+        async fn executor_updates_report_lag_and_resume() {
+            let notifier = ExecutorNotifier::new();
+            let id = "executor-1".to_string();
+            let mut updates = notifier.subscribe(&id).unwrap();
+            for _ in 0..=NOTIFICATION_CAPACITY {
+                notifier.notify(&id, id.clone()).unwrap();
+            }
+            assert_eq!(
+                updates.recv().await,
+                Err(broadcast::error::RecvError::Lagged(1))
+            );
+            assert_eq!(updates.recv().await, Ok(id.clone()));
         }
     }
 
