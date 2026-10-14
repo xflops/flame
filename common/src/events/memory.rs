@@ -47,6 +47,10 @@ impl Default for MemoryEventManager {
 }
 
 impl EventManager for MemoryEventManager {
+    fn setup_events(&self, _session_id: SessionID) -> Result<(), FlameError> {
+        Ok(())
+    }
+
     fn record_event(&self, owner: EventOwner, event: Event) -> Result<(), FlameError> {
         let mut events = lock_ptr!(self.events)?;
         events

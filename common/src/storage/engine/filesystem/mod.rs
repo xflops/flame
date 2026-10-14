@@ -39,15 +39,14 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
+use tokio::sync::{OwnedRwLockWriteGuard, RwLock as AsyncRwLock};
 
 use async_trait::async_trait;
-use bincode::{Decode, Encode};
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
 
 use crate::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationSchema, ApplicationState,
@@ -58,234 +57,118 @@ use crate::apis::{
 use crate::{FlameError, FLAME_HOME};
 
 use crate::apis::{ApplicationFilter, Executor, SessionFilter, TaskFilter};
+
 use crate::storage::engine::{Engine, EnginePtr};
 
-/// Task metadata stored in tasks.bin with fixed-size records.
-///
-/// Uses `bincode` with `fixint` encoding to ensure constant serialized size.
-/// The checksum is calculated using `crc32fast` for data integrity.
-#[derive(Encode, Decode, Debug, Clone, Default)]
-struct TaskMetadata {
-    /// Task ID (index in file)
-    pub id: u64,
-    /// Optimistic locking version
-    pub version: u32,
-    /// CRC32 checksum of the record (excluding this field)
-    pub checksum: u32,
-    /// Task state (TaskState enum as u8)
-    pub state: u8,
-    /// Unix timestamp of creation
-    pub creation_time: i64,
-    /// Unix timestamp of completion (0 if not completed)
-    pub completion_time: i64,
-    /// Offset in inputs.bin where input data starts
-    pub input_offset: u64,
-    /// Length of input data in bytes
-    pub input_len: u64,
-    /// Offset in outputs.bin where output data starts
-    pub output_offset: u64,
-    /// Length of output data in bytes
-    pub output_len: u64,
-    /// Offset in affinity.bin where the encoded affinity vector starts
-    pub affinity_offset: u64,
-    /// Length of the encoded affinity vector in bytes
-    pub affinity_len: u64,
-}
+mod payload;
+#[cfg(test)]
+mod payload_tests;
+mod types;
+use payload::Part;
+use types::{
+    bincode_config, calculate_checksum, task_record_size, ApplicationEntry, ApplicationMetadata,
+    ApplicationSchemaMetadata, ExecutorEntry, ExecutorMetadata, NodeEntry, NodeMetadata,
+    SessionEntry, SessionMetadata, TaskMetadata,
+};
 
-/// Session metadata stored as JSON.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct SessionMetadata {
-    pub id: String,
-    pub application: String,
-    pub version: u32,
-    pub state: i32,
-    pub creation_time: i64,
-    pub completion_time: Option<i64>,
-    pub min_instances: u32,
-    pub max_instances: Option<u32>,
-    #[serde(default = "default_batch_size")]
-    pub batch_size: u32,
-    #[serde(default)]
-    pub priority: u32,
-    pub common_data_len: u64,
-    #[serde(default)]
-    pub tokens: HashMap<String, String>,
-    #[serde(default)]
-    pub resreq_cpu: Option<u64>,
-    #[serde(default)]
-    pub resreq_memory: Option<u64>,
-    #[serde(default)]
-    pub resreq_gpu: Option<i32>,
-}
-
-fn default_batch_size() -> u32 {
-    1
-}
-
-/// Application metadata stored as JSON.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct ApplicationMetadata {
-    pub name: String,
-    pub version: u32,
-    pub state: i32,
-    pub creation_time: i64,
-    #[serde(default)]
-    pub shim: i32, // 0 = Host (default), 1 = Wasm, 3 = Cri
-    pub image: Option<String>,
-    pub description: Option<String>,
-    pub labels: Vec<String>,
-    pub command: Option<String>,
-    pub arguments: Vec<String>,
-    pub environments: std::collections::HashMap<String, String>,
-    pub working_directory: Option<String>,
-    pub max_instances: u32,
-    pub delay_release_seconds: i64,
-    pub schema: Option<ApplicationSchemaMetadata>,
-    pub url: Option<String>,
-    #[serde(default)]
-    pub installer: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct ApplicationSchemaMetadata {
-    pub input: Option<String>,
-    pub output: Option<String>,
-    pub common_data: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct NodeMetadata {
-    pub name: String,
-    pub state: i32,
-    pub capacity_cpu: u64,
-    pub capacity_memory: u64,
-    #[serde(default)]
-    pub capacity_gpu: i32,
-    pub allocatable_cpu: u64,
-    pub allocatable_memory: u64,
-    #[serde(default)]
-    pub allocatable_gpu: i32,
-    pub info_arch: String,
-    pub info_os: String,
-    pub creation_time: i64,
-    pub last_heartbeat: i64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct ExecutorMetadata {
-    pub id: String,
-    pub node: String,
-    pub application: String,
-    pub resreq_cpu: u64,
-    pub resreq_memory: u64,
-    #[serde(default)]
-    pub resreq_gpu: i32,
-    pub shim: i32,
-    pub task_id: Option<i64>,
-    pub ssn_id: Option<String>,
-    pub creation_time: i64,
-    pub state: i32,
-}
-
-/// Bincode configuration for fixed-size encoding.
-fn bincode_config() -> impl bincode::config::Config {
-    bincode::config::standard()
-        .with_fixed_int_encoding()
-        .with_little_endian()
-}
-
-/// Calculate the fixed record size for TaskMetadata.
-fn task_record_size() -> usize {
-    // Calculate the serialized size of a default TaskMetadata
-    let meta = TaskMetadata::default();
-    bincode::encode_to_vec(&meta, bincode_config())
-        .expect("Failed to calculate record size")
-        .len()
-}
-
-/// Calculate CRC32 checksum for task metadata (excluding the checksum field itself).
-fn calculate_checksum(meta: &TaskMetadata) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&meta.id.to_le_bytes());
-    hasher.update(&meta.version.to_le_bytes());
-    hasher.update(&[meta.state]);
-    hasher.update(&meta.creation_time.to_le_bytes());
-    hasher.update(&meta.completion_time.to_le_bytes());
-    hasher.update(&meta.input_offset.to_le_bytes());
-    hasher.update(&meta.input_len.to_le_bytes());
-    hasher.update(&meta.output_offset.to_le_bytes());
-    hasher.update(&meta.output_len.to_le_bytes());
-    hasher.finalize()
+fn poisoned<T>(e: PoisonError<T>) -> FlameError {
+    FlameError::Storage(format!("Storage lock poisoned: {e}"))
 }
 
 pub struct FilesystemEngine {
     base_path: PathBuf,
     record_size: usize,
-    ssn_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
-    node_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
-    executor_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+    /// Short lookups only: never held across I/O or an await.
+    sessions: RwLock<HashMap<String, Arc<AsyncRwLock<SessionEntry>>>>,
+    /// Per-application lock; coordinates session creation with application
+    /// deletion and update without blocking unrelated sessions.
+    applications: RwLock<HashMap<String, Arc<AsyncRwLock<ApplicationEntry>>>>,
+    nodes: RwLock<HashMap<String, Arc<AsyncRwLock<NodeEntry>>>>,
+    executors: RwLock<HashMap<String, Arc<AsyncRwLock<ExecutorEntry>>>>,
 }
 
+/// Shared session entry: close and delete take the write side of this lock.
 macro_rules! lock_ssn {
-    ($self:expr, $ssn_id:expr) => {
-        let __fs_local_ssn_lock = {
-            let locks = $self
-                .ssn_locks
-                .read()
-                .map_err(|e| FlameError::Storage(format!("Session lock poisoned: {}", e)))?;
-            locks.get($ssn_id).cloned().ok_or_else(|| {
-                FlameError::NotFound(format!("Session lock not found: {}", $ssn_id))
-            })?
-        };
-        let __fs_local_ssn_guard = __fs_local_ssn_lock
-            .lock()
-            .map_err(|e| FlameError::Storage(format!("Session lock poisoned: {}", e)))?;
+    ($self:expr, $ssn_id:expr, $entry:ident) => {
+        let __fs_session = $self.session_entry($ssn_id)?;
+        let $entry = __fs_session.read().await;
+        validate_entry(&$self.sessions, $ssn_id, &__fs_session)?;
     };
 }
 
-macro_rules! lock_app {
-    ($self:expr) => {
-        $self
-            .ssn_locks
-            .write()
-            .map_err(|e| FlameError::Storage(format!("App lock poisoned: {}", e)))
-    };
+/// Registry guards never span entity waits or filesystem I/O.
+/// Look up an existing entry; the registry guard is released before it returns.
+fn lookup_entry<T>(
+    registry: &RwLock<HashMap<String, Arc<AsyncRwLock<T>>>>,
+    id: &str,
+    kind: &str,
+) -> Result<Arc<AsyncRwLock<T>>, FlameError> {
+    registry
+        .read()
+        .map_err(poisoned)?
+        .get(id)
+        .cloned()
+        .ok_or_else(|| FlameError::NotFound(format!("{kind} {id} not found")))
 }
 
-macro_rules! lock_node {
-    ($self:expr, $node_name:expr) => {
-        let __fs_local_node_lock = {
-            let mut locks = $self
-                .node_locks
-                .write()
-                .map_err(|e| FlameError::Storage(format!("Node lock poisoned: {}", e)))?;
-            locks
-                .entry($node_name.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let __fs_local_node_guard = __fs_local_node_lock
-            .lock()
-            .map_err(|e| FlameError::Storage(format!("Node lock poisoned: {}", e)))?;
-    };
+/// Create a new entry, or fail if one exists. It is published already
+/// write-locked, so nobody sees it before its caller persists it; the guard's
+/// `rwlock()` gives the entry back for `remove_entry` if that fails.
+fn new_entry<T>(
+    registry: &RwLock<HashMap<String, Arc<AsyncRwLock<T>>>>,
+    id: &str,
+    kind: &str,
+    value: T,
+) -> Result<OwnedRwLockWriteGuard<T>, FlameError> {
+    let entry = Arc::new(AsyncRwLock::new(value));
+    // A fresh lock is uncontended, so this never waits under the registry guard.
+    let guard = entry
+        .clone()
+        .try_write_owned()
+        .map_err(|e| FlameError::Internal(format!("Fresh entry lock was held: {e}")))?;
+    let mut entries = registry.write().map_err(poisoned)?;
+    if entries.contains_key(id) {
+        return Err(FlameError::AlreadyExist(format!(
+            "{kind} '{id}' already exists"
+        )));
+    }
+    entries.insert(id.to_string(), entry);
+    Ok(guard)
 }
 
-macro_rules! lock_executor {
-    ($self:expr, $executor_id:expr) => {
-        let __fs_local_exec_lock = {
-            let mut locks = $self
-                .executor_locks
-                .write()
-                .map_err(|e| FlameError::Storage(format!("Executor lock poisoned: {}", e)))?;
-            locks
-                .entry($executor_id.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let __fs_local_exec_guard = __fs_local_exec_lock
-            .lock()
-            .map_err(|e| FlameError::Storage(format!("Executor lock poisoned: {}", e)))?;
-    };
+/// A waiter must still belong to the registered entry after taking its gate.
+fn validate_entry<T>(
+    registry: &RwLock<HashMap<String, Arc<AsyncRwLock<T>>>>,
+    id: &str,
+    shared: &Arc<AsyncRwLock<T>>,
+) -> Result<(), FlameError> {
+    if registry
+        .read()
+        .map_err(poisoned)?
+        .get(id)
+        .is_some_and(|current| Arc::ptr_eq(current, shared))
+    {
+        Ok(())
+    } else {
+        Err(FlameError::NotFound(format!("Entry was deleted: {id}")))
+    }
+}
+
+fn remove_entry<T>(
+    registry: &RwLock<HashMap<String, Arc<AsyncRwLock<T>>>>,
+    id: &str,
+    shared: &Arc<AsyncRwLock<T>>,
+) -> Result<(), FlameError> {
+    let mut entries = registry.write().map_err(poisoned)?;
+    if entries
+        .get(id)
+        .is_some_and(|current| Arc::ptr_eq(current, shared))
+    {
+        entries.remove(id);
+        Ok(())
+    } else {
+        Err(FlameError::NotFound(format!("Entry was deleted: {id}")))
+    }
 }
 
 impl FilesystemEngine {
@@ -315,13 +198,79 @@ impl FilesystemEngine {
             record_size
         );
 
-        Ok(Arc::new(FilesystemEngine {
+        let engine = FilesystemEngine {
             base_path: path,
             record_size,
-            ssn_locks: RwLock::new(HashMap::new()),
-            node_locks: RwLock::new(HashMap::new()),
-            executor_locks: RwLock::new(HashMap::new()),
-        }))
+            sessions: RwLock::new(HashMap::new()),
+            applications: RwLock::new(HashMap::new()),
+            nodes: RwLock::new(HashMap::new()),
+            executors: RwLock::new(HashMap::new()),
+        };
+        engine.load_entities()?;
+        Ok(Arc::new(engine))
+    }
+
+    /// Load applications, nodes and executors once. Entries then live until the
+    /// entity is deleted; unreadable records are logged and skipped.
+    fn load_entities(&self) -> Result<(), FlameError> {
+        for id in Self::child_names(&self.base_path.join("sessions")) {
+            match self.read_session_metadata(&id) {
+                Ok(metadata) => {
+                    let entry = SessionEntry::new(metadata, self.session_path(&id));
+                    self.sessions
+                        .write()
+                        .map_err(poisoned)?
+                        .insert(id, Arc::new(AsyncRwLock::new(entry)));
+                }
+                Err(e) => tracing::warn!("Skipping session <{id}>: {e}"),
+            }
+        }
+        for name in Self::child_names(&self.base_path.join("applications")) {
+            match self.read_application_metadata(&name) {
+                Ok(metadata) => {
+                    self.applications.write().map_err(poisoned)?.insert(
+                        name,
+                        Arc::new(AsyncRwLock::new(ApplicationEntry { metadata })),
+                    );
+                }
+                Err(e) => tracing::warn!("Skipping application <{name}>: {e}"),
+            }
+        }
+        for node in Self::child_names(&self.base_path.join("nodes")) {
+            match self.read_node_metadata(&node) {
+                Ok(metadata) => {
+                    self.nodes.write().map_err(poisoned)?.insert(
+                        node.clone(),
+                        Arc::new(AsyncRwLock::new(NodeEntry { metadata })),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Skipping node <{node}>: {e}");
+                    continue;
+                }
+            }
+            for id in Self::child_names(&self.node_path(&node).join("executors")) {
+                match self.read_executor_metadata(&node, &id) {
+                    Ok(metadata) => {
+                        self.executors
+                            .write()
+                            .map_err(poisoned)?
+                            .insert(id, Arc::new(AsyncRwLock::new(ExecutorEntry { metadata })));
+                    }
+                    Err(e) => tracing::warn!("Skipping executor <{id}> of node <{node}>: {e}"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn child_names(dir: &std::path::Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|file| file.file_name().to_string_lossy().to_string())
+            .collect()
     }
 
     /// Parse the storage URL to extract the base path.
@@ -345,6 +294,30 @@ impl FilesystemEngine {
                 std::env::var(FLAME_HOME).unwrap_or_else(|_| "/usr/local/flame".to_string());
             Ok(PathBuf::from(flame_home).join(path))
         }
+    }
+
+    fn session_entry(&self, id: &str) -> Result<Arc<AsyncRwLock<SessionEntry>>, FlameError> {
+        self.sessions
+            .read()
+            .map_err(|e| FlameError::Storage(format!("Session registry poisoned: {e}")))?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| FlameError::NotFound(format!("Session lock not found: {id}")))
+    }
+
+    fn application_entry(
+        &self,
+        name: &str,
+    ) -> Result<Arc<AsyncRwLock<ApplicationEntry>>, FlameError> {
+        lookup_entry(&self.applications, name, "Application")
+    }
+
+    fn node_entry(&self, name: &str) -> Result<Arc<AsyncRwLock<NodeEntry>>, FlameError> {
+        lookup_entry(&self.nodes, name, "Node")
+    }
+
+    fn executor_entry(&self, id: &str) -> Result<Arc<AsyncRwLock<ExecutorEntry>>, FlameError> {
+        lookup_entry(&self.executors, id, "Executor")
     }
 
     fn session_path(&self, session_id: &str) -> PathBuf {
@@ -583,26 +556,20 @@ impl FilesystemEngine {
         Ok(())
     }
 
-    fn find_executor_node(&self, executor_id: &str) -> Result<String, FlameError> {
-        let nodes_dir = self.base_path.join("nodes");
-        if let Ok(entries) = fs::read_dir(&nodes_dir) {
-            for entry in entries.flatten() {
-                let node_name = entry.file_name().to_string_lossy().to_string();
-                let exec_path = self.executor_path(&node_name, executor_id).join("metadata");
-                if exec_path.exists() {
-                    return Ok(node_name);
-                }
-            }
-        }
-        Err(FlameError::NotFound(format!(
-            "Executor {executor_id} not found"
-        )))
-    }
-
-    /// Read task metadata from tasks.bin.
+    /// Read one task record under the task's read lock, so it never observes a
+    /// writer mid-update.
     fn read_task_metadata(
         &self,
-        session_id: &str,
+        entry: &SessionEntry,
+        task_id: TaskID,
+    ) -> Result<TaskMetadata, FlameError> {
+        entry.with_task_read(task_id, || self.read_task_record(entry, task_id))
+    }
+
+    /// Read and verify one task record. The caller holds the task's lock.
+    fn read_task_record(
+        &self,
+        entry: &SessionEntry,
         task_id: TaskID,
     ) -> Result<TaskMetadata, FlameError> {
         if task_id < 1 {
@@ -611,19 +578,14 @@ impl FilesystemEngine {
             )));
         }
 
-        let path = self.session_path(session_id).join("tasks.bin");
-
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&path)
+        let tasks = entry
+            .part(Part::Tasks)
             .map_err(|e| FlameError::NotFound(format!("Tasks file not found: {e}")))?;
-
         let offset = (task_id as u64 - 1) * self.record_size as u64;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| FlameError::Storage(format!("Failed to seek to task {task_id}: {e}")))?;
-
         let mut buffer = vec![0u8; self.record_size];
-        file.read_exact(&mut buffer)
+        tasks
+            .file
+            .read_exact_at(&mut buffer, offset)
             .map_err(|e| FlameError::NotFound(format!("Task {task_id} not found: {e}")))?;
 
         let (meta, _): (TaskMetadata, _) = bincode::decode_from_slice(&buffer, bincode_config())
@@ -631,7 +593,6 @@ impl FilesystemEngine {
                 FlameError::Storage(format!("Failed to deserialize task metadata: {e}"))
             })?;
 
-        // Verify checksum
         let expected_checksum = calculate_checksum(&meta);
         if meta.checksum != expected_checksum {
             return Err(FlameError::Storage(format!(
@@ -639,71 +600,94 @@ impl FilesystemEngine {
                 meta.checksum
             )));
         }
-
         Ok(meta)
     }
 
-    /// Write task metadata to tasks.bin at the specified offset.
-    fn write_task_metadata(&self, session_id: &str, meta: &TaskMetadata) -> Result<(), FlameError> {
-        let path = self.session_path(session_id).join("tasks.bin");
-
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|e| FlameError::Storage(format!("Failed to open tasks file: {e}")))?;
-
+    /// Write an existing task record in place and sync it.
+    fn write_task_metadata(
+        &self,
+        entry: &SessionEntry,
+        meta: &TaskMetadata,
+    ) -> Result<(), FlameError> {
+        let tasks = entry.part(Part::Tasks)?;
         let offset = (meta.id - 1) * self.record_size as u64;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| FlameError::Storage(format!("Failed to seek to task {}: {e}", meta.id)))?;
-
         let buffer = bincode::encode_to_vec(meta, bincode_config())
             .map_err(|e| FlameError::Storage(format!("Failed to serialize task metadata: {e}")))?;
 
-        file.write_all(&buffer)
+        tasks
+            .file
+            .write_all_at(&buffer, offset)
             .map_err(|e| FlameError::Storage(format!("Failed to write task metadata: {e}")))?;
-
-        file.sync_data()
+        tasks
+            .file
+            .sync_data()
             .map_err(|e| FlameError::Storage(format!("Failed to sync task metadata: {e}")))?;
 
         Ok(())
     }
 
-    /// Append data to a file and return the offset where it was written.
+    /// Select the next dense task ID and write its record. The caller holds the
+    /// session's commit gate, so this is the only writer extending tasks.bin.
+    ///
+    /// An incomplete tail left by an earlier failed write is not a committed task:
+    /// it is discarded so the committed prefix stays dense. Write and sync errors
+    /// are returned to the caller, which can retry the operation.
+    fn commit_task(
+        &self,
+        entry: &SessionEntry,
+        mut meta: TaskMetadata,
+    ) -> Result<TaskMetadata, FlameError> {
+        let tasks = entry.part(Part::Tasks)?;
+        let record_size = self.record_size as u64;
+
+        let mut len = tasks
+            .file
+            .metadata()
+            .map_err(|e| FlameError::Storage(format!("Failed to stat tasks.bin: {e}")))?
+            .len();
+        if len % record_size != 0 {
+            len -= len % record_size;
+            tasks.file.set_len(len).map_err(|e| {
+                FlameError::Storage(format!("Failed to discard incomplete task record: {e}"))
+            })?;
+        }
+
+        meta.id = len / record_size + 1;
+        meta.checksum = calculate_checksum(&meta);
+        let buffer = bincode::encode_to_vec(&meta, bincode_config())
+            .map_err(|e| FlameError::Storage(format!("Failed to serialize task metadata: {e}")))?;
+
+        // Readers of the new ID (a scan up to the file length) wait for the write.
+        let written = entry.with_task(meta.id as TaskID, || {
+            tasks
+                .file
+                .write_all_at(&buffer, len)
+                .and_then(|_| tasks.file.sync_data())
+        });
+        if let Err(e) = written {
+            return Err(FlameError::Storage(format!(
+                "Failed to commit task record: {e}"
+            )));
+        }
+
+        Ok(meta)
+    }
+
+    /// Append an immutable payload and return its offset.
     fn append_data(
         &self,
-        session_id: &str,
-        filename: &str,
+        entry: &SessionEntry,
+        part: Part,
         data: &[u8],
     ) -> Result<u64, FlameError> {
-        let path = self.session_path(session_id).join(filename);
-
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| FlameError::Storage(format!("Failed to open {filename}: {e}")))?;
-
-        // Get current file size (this is where we'll write)
-        let offset = file.seek(SeekFrom::End(0)).map_err(|e| {
-            FlameError::Storage(format!("Failed to seek to end of {filename}: {e}"))
-        })?;
-
-        file.write_all(data)
-            .map_err(|e| FlameError::Storage(format!("Failed to write to {filename}: {e}")))?;
-
-        file.sync_data()
-            .map_err(|e| FlameError::Storage(format!("Failed to sync {filename}: {e}")))?;
-
-        Ok(offset)
+        entry.part(part)?.append(part.file_name(), data)
     }
 
     /// Read data from a file at the specified offset and length.
     fn read_data(
         &self,
-        session_id: &str,
-        filename: &str,
+        entry: &SessionEntry,
+        part: Part,
         offset: u64,
         len: u64,
     ) -> Result<Vec<u8>, FlameError> {
@@ -711,25 +695,17 @@ impl FilesystemEngine {
             return Ok(Vec::new());
         }
 
-        let path = self.session_path(session_id).join(filename);
-
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .map_err(|e| FlameError::Storage(format!("Failed to open {filename}: {e}")))?;
-
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| FlameError::Storage(format!("Failed to seek in {filename}: {e}")))?;
-
+        let file = entry.part(part)?;
         let mut buffer = vec![0u8; len as usize];
-        file.read_exact(&mut buffer)
-            .map_err(|e| FlameError::Storage(format!("Failed to read from {filename}: {e}")))?;
+        file.file.read_exact_at(&mut buffer, offset).map_err(|e| {
+            FlameError::Storage(format!("Failed to read from {}: {e}", part.file_name()))
+        })?;
 
         Ok(buffer)
     }
 
     /// Count tasks matching the filter.
-    fn _count_task(&self, filter: &TaskFilter) -> Result<u64, FlameError> {
+    fn _count_task(&self, entry: &SessionEntry, filter: &TaskFilter) -> Result<u64, FlameError> {
         let path = self.session_path(&filter.session).join("tasks.bin");
 
         let task_count = match fs::metadata(&path) {
@@ -742,7 +718,7 @@ impl FilesystemEngine {
 
         let mut count = 0;
         for task_id in 1..=task_count {
-            let metadata = self.read_task_metadata(&filter.session, task_id as TaskID)?;
+            let metadata = self.read_task_metadata(entry, task_id as TaskID)?;
             let state = TaskState::try_from(metadata.state as i32)?;
             if states.contains(&state) {
                 count += 1;
@@ -772,27 +748,21 @@ impl FilesystemEngine {
         Ok(())
     }
 
-    /// Convert TaskMetadata to Task.
+    /// Convert TaskMetadata to Task, reading its immutable payloads.
     fn task_from_metadata(
         &self,
-        session_id: &str,
+        entry: &SessionEntry,
         meta: &TaskMetadata,
     ) -> Result<Task, FlameError> {
         let input = if meta.input_len > 0 {
-            let data =
-                self.read_data(session_id, "inputs.bin", meta.input_offset, meta.input_len)?;
+            let data = self.read_data(entry, Part::Inputs, meta.input_offset, meta.input_len)?;
             Some(Bytes::from(data))
         } else {
             None
         };
 
         let output = if meta.output_len > 0 {
-            let data = self.read_data(
-                session_id,
-                "outputs.bin",
-                meta.output_offset,
-                meta.output_len,
-            )?;
+            let data = self.read_data(entry, Part::Outputs, meta.output_offset, meta.output_len)?;
             Some(Bytes::from(data))
         } else {
             None
@@ -800,8 +770,8 @@ impl FilesystemEngine {
 
         let affinity: std::collections::HashSet<Bytes> = if meta.affinity_len > 0 {
             let data = self.read_data(
-                session_id,
-                "affinity.bin",
+                entry,
+                Part::Affinity,
                 meta.affinity_offset,
                 meta.affinity_len,
             )?;
@@ -812,6 +782,17 @@ impl FilesystemEngine {
             Default::default()
         };
 
+        Self::task_with_data(&entry.metadata.id, meta, input, output, affinity)
+    }
+
+    /// Build a Task from a record and payloads the caller already holds.
+    fn task_with_data(
+        session_id: &str,
+        meta: &TaskMetadata,
+        input: Option<Bytes>,
+        output: Option<Bytes>,
+        affinity: std::collections::HashSet<Bytes>,
+    ) -> Result<Task, FlameError> {
         let state = TaskState::try_from(meta.state as i32)?;
         let completion_time = if meta.completion_time > 0 {
             DateTime::from_timestamp(meta.completion_time, 0)
@@ -834,7 +815,6 @@ impl FilesystemEngine {
         })
     }
 
-    /// Convert SessionMetadata to Session.
     fn session_from_metadata(&self, meta: &SessionMetadata) -> Result<Session, FlameError> {
         let state = SessionState::try_from(meta.state)?;
         let common_data = self.read_common_data(&meta.id, meta.common_data_len)?;
@@ -900,25 +880,99 @@ impl FilesystemEngine {
         })
     }
 
+    fn node_from_metadata(meta: &NodeMetadata) -> Node {
+        Node {
+            name: meta.name.clone(),
+            state: NodeState::from(meta.state),
+            capacity: ResourceRequirement {
+                cpu: meta.capacity_cpu,
+                memory: meta.capacity_memory,
+                gpu: meta.capacity_gpu,
+            },
+            allocatable: ResourceRequirement {
+                cpu: meta.allocatable_cpu,
+                memory: meta.allocatable_memory,
+                gpu: meta.allocatable_gpu,
+            },
+            info: NodeInfo {
+                arch: meta.info_arch.clone(),
+                os: meta.info_os.clone(),
+            },
+        }
+    }
+
+    fn executor_from_metadata(meta: &ExecutorMetadata) -> Executor {
+        Executor {
+            id: meta.id.clone(),
+            node: meta.node.clone(),
+            resreq: ResourceRequirement {
+                cpu: meta.resreq_cpu,
+                memory: meta.resreq_memory,
+                gpu: meta.resreq_gpu,
+            },
+            shim: Shim::try_from(meta.shim).unwrap_or_default(),
+            application: meta.application.clone(),
+            task_id: meta.task_id,
+            ssn_id: meta.ssn_id.clone(),
+            signal: None,
+            attributes: Default::default(),
+            creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
+            latest_updated_timestamp: Utc::now(),
+            state: ExecutorState::from(meta.state),
+        }
+    }
+
+    /// Save an executor's metadata and remove its previous node's copy when it
+    /// moved. The caller holds the executor's gate and its node's read gate.
+    fn persist_executor(
+        &self,
+        executor: &Executor,
+        metadata: &ExecutorMetadata,
+        previous: Option<&ExecutorMetadata>,
+    ) -> Result<(), FlameError> {
+        self.write_executor_metadata(&executor.node, &executor.id, metadata)?;
+        if let Some(previous) = previous.filter(|old| old.node != executor.node) {
+            match fs::remove_dir_all(self.executor_path(&previous.node, &executor.id)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(FlameError::Storage(format!(
+                        "Failed to remove previous executor metadata: {e}"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read-modify-write one task record. The caller holds the task's write gate
+    /// (or the exclusive session lifecycle gate).
+    fn update_task(
+        &self,
+        entry: &SessionEntry,
+        task_id: TaskID,
+        op: impl FnOnce(&mut TaskMetadata),
+    ) -> Result<TaskMetadata, FlameError> {
+        let mut meta = self.read_task_record(entry, task_id)?;
+        op(&mut meta);
+        meta.version += 1;
+        meta.checksum = calculate_checksum(&meta);
+        self.write_task_metadata(entry, &meta)?;
+        Ok(meta)
+    }
+
     fn _update_task_state(
         &self,
-        ssn_id: &SessionID,
-        task_id: &TaskID,
+        entry: &SessionEntry,
+        task_id: TaskID,
         task_state: TaskState,
-    ) -> Result<Task, FlameError> {
-        let mut meta = self.read_task_metadata(ssn_id, *task_id)?;
-
-        meta.state = task_state as u8;
-        meta.version += 1;
-
-        if task_state.is_terminal() {
-            meta.completion_time = Utc::now().timestamp();
-        }
-
-        meta.checksum = calculate_checksum(&meta);
-
-        self.write_task_metadata(ssn_id, &meta)?;
-        self.task_from_metadata(ssn_id, &meta)
+    ) -> Result<TaskMetadata, FlameError> {
+        self.update_task(entry, task_id, |meta| {
+            meta.state = task_state as u8;
+            if task_state.is_terminal() {
+                meta.completion_time = Utc::now().timestamp();
+            }
+        })
     }
 }
 
@@ -929,13 +983,6 @@ impl Engine for FilesystemEngine {
         name: String,
         attr: ApplicationAttributes,
     ) -> Result<Application, FlameError> {
-        if self.read_application_metadata(&name).is_ok() {
-            return Err(FlameError::AlreadyExist(format!(
-                "Application '{}' already exists",
-                name
-            )));
-        }
-
         let schema = attr.schema.map(|s| ApplicationSchemaMetadata {
             input: s.input,
             output: s.output,
@@ -962,8 +1009,24 @@ impl Engine for FilesystemEngine {
             installer: attr.installer,
         };
 
-        self.write_application_metadata(&name, &meta)?;
-        Self::application_from_metadata(&meta)
+        let application = Self::application_from_metadata(&meta)?;
+        let entry = new_entry(
+            &self.applications,
+            &name,
+            "Application",
+            ApplicationEntry {
+                metadata: meta.clone(),
+            },
+        )?;
+        if let Err(error) = self.write_application_metadata(&name, &meta) {
+            remove_entry(
+                &self.applications,
+                &name,
+                OwnedRwLockWriteGuard::rwlock(&entry),
+            )?;
+            return Err(error);
+        }
+        Ok(application)
     }
 
     async fn update_application_state(
@@ -971,21 +1034,27 @@ impl Engine for FilesystemEngine {
         name: ApplicationID,
         state: ApplicationState,
     ) -> Result<Application, FlameError> {
-        let _guard = lock_app!(self)?;
-        let mut meta = self.read_application_metadata(&name)?;
+        let shared = self.application_entry(&name)?;
+        let mut entry = shared.write().await;
+        validate_entry(&self.applications, &name, &shared)?;
+        let mut meta = entry.metadata.clone();
         if meta.state == state as i32 {
             return Self::application_from_metadata(&meta);
         }
 
         meta.state = state as i32;
         meta.version += 1;
+        let application = Self::application_from_metadata(&meta)?;
         self.write_application_metadata(&name, &meta)?;
-        Self::application_from_metadata(&meta)
+        entry.metadata = meta;
+        Ok(application)
     }
 
     async fn delete_application(&self, name: ApplicationID) -> Result<(), FlameError> {
-        let _guard = lock_app!(self)?;
-        let app = self.read_application_metadata(&name)?;
+        let shared = self.application_entry(&name)?;
+        let entry = shared.write().await;
+        validate_entry(&self.applications, &name, &shared)?;
+        let app = &entry.metadata;
         if app.state != ApplicationState::Disabled as i32 {
             return Err(FlameError::InvalidState(format!(
                 "application <{name}> is not disabled"
@@ -1008,6 +1077,7 @@ impl Engine for FilesystemEngine {
             FlameError::Storage(format!("Failed to delete application '{}': {e}", name))
         })?;
 
+        remove_entry(&self.applications, &name, &shared)?;
         Ok(())
     }
 
@@ -1016,9 +1086,10 @@ impl Engine for FilesystemEngine {
         name: String,
         attr: ApplicationAttributes,
     ) -> Result<Application, FlameError> {
-        let _guard = lock_app!(self)?;
-
-        let mut meta = self.read_application_metadata(&name)?;
+        let shared = self.application_entry(&name)?;
+        let mut entry = shared.write().await;
+        validate_entry(&self.applications, &name, &shared)?;
+        let mut meta = entry.metadata.clone();
         if meta.state != ApplicationState::Enabled as i32 {
             return Err(FlameError::InvalidState(format!(
                 "application <{name}> is not enabled"
@@ -1058,52 +1129,69 @@ impl Engine for FilesystemEngine {
         meta.url = attr.url;
         meta.installer = attr.installer;
 
+        let application = Self::application_from_metadata(&meta)?;
         self.write_application_metadata(&name, &meta)?;
-        Self::application_from_metadata(&meta)
+        entry.metadata = meta;
+        Ok(application)
     }
 
     async fn get_application(&self, id: ApplicationID) -> Result<Application, FlameError> {
-        let meta = self.read_application_metadata(&id)?;
-        Self::application_from_metadata(&meta)
+        let shared = self.application_entry(&id)?;
+        let entry = shared.read().await;
+        validate_entry(&self.applications, &id, &shared)?;
+        let metadata = &entry.metadata;
+        Self::application_from_metadata(metadata)
     }
 
     async fn find_applications(
         &self,
         filter: Option<&ApplicationFilter>,
     ) -> Result<Vec<Application>, FlameError> {
+        let names = self
+            .applications
+            .read()
+            .map_err(poisoned)?
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut apps = Vec::new();
-        let apps_dir = self.base_path.join("applications");
-
-        if let Ok(entries) = fs::read_dir(&apps_dir) {
-            for entry in entries.flatten() {
-                let app_name = entry.file_name().to_string_lossy().to_string();
-                if let Ok(meta) = self.read_application_metadata(&app_name) {
-                    if let Ok(app) = Self::application_from_metadata(&meta) {
-                        let matches = filter.is_none_or(|filter| {
-                            filter.state.is_none_or(|state| app.state == state)
-                        });
-                        if matches {
-                            apps.push(app);
-                        }
-                    }
+        for name in names {
+            if let Ok(app) = self.get_application(name).await {
+                if filter.is_none_or(|filter| filter.state.is_none_or(|state| app.state == state)) {
+                    apps.push(app);
                 }
             }
         }
-
         Ok(apps)
     }
 
     async fn create_session(&self, attr: SessionAttributes) -> Result<Session, FlameError> {
+        if attr.application.is_empty() {
+            return Err(FlameError::InvalidConfig(
+                "Session application must not be empty".to_string(),
+            ));
+        }
+        // Storage does not require the application to be registered; only an
+        // existing one needs coordination with its deletion and update.
+        let application = match self.application_entry(&attr.application) {
+            Ok(application) => Some(application),
+            Err(FlameError::NotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let _application = match application.as_ref() {
+            Some(application) => {
+                let guard = application.read().await;
+                validate_entry(&self.applications, &attr.application, application)?;
+                Some(guard)
+            }
+            None => None,
+        };
+
         if self.read_session_metadata(&attr.id).is_ok() {
             return Err(FlameError::AlreadyExist(format!(
                 "Session '{}' already exists",
                 attr.id
             )));
-        }
-
-        {
-            let mut locks = lock_app!(self)?;
-            locks.insert(attr.id.clone(), Arc::new(Mutex::new(())));
         }
 
         let session_dir = self.session_path(&attr.id);
@@ -1135,8 +1223,6 @@ impl Engine for FilesystemEngine {
             resreq_gpu: attr.resreq.as_ref().map(|r| r.gpu),
         };
 
-        self.write_session_metadata(&attr.id, &meta)?;
-
         let tasks_path = session_dir.join("tasks.bin");
         let inputs_path = session_dir.join("inputs.bin");
         let outputs_path = session_dir.join("outputs.bin");
@@ -1148,12 +1234,24 @@ impl Engine for FilesystemEngine {
         fs::write(&outputs_path, [])
             .map_err(|e| FlameError::Storage(format!("Failed to create outputs.bin: {e}")))?;
 
-        self.session_from_metadata(&meta)
+        self.write_session_metadata(&attr.id, &meta)?;
+        let session = self.session_from_metadata(&meta)?;
+        self.sessions
+            .write()
+            .map_err(|e| FlameError::Storage(format!("Session registry poisoned: {e}")))?
+            .entry(attr.id.clone())
+            .or_insert_with(|| Arc::new(AsyncRwLock::new(SessionEntry::new(meta, session_dir))));
+
+        Ok(session)
     }
 
     async fn get_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        let meta = self.read_session_metadata(&id)?;
-        self.session_from_metadata(&meta)
+        let entry = self
+            .session_entry(&id)
+            .map_err(|_| FlameError::NotFound(format!("Session {id} not found")))?;
+        let meta = entry.read().await;
+        validate_entry(&self.sessions, &id, &entry)?;
+        self.session_from_metadata(&meta.metadata)
     }
 
     async fn open_session(
@@ -1161,128 +1259,102 @@ impl Engine for FilesystemEngine {
         id: SessionID,
         spec: Option<SessionAttributes>,
     ) -> Result<Session, FlameError> {
-        // Try to get existing session
-        match self.read_session_metadata(&id) {
-            Ok(meta) => {
-                // Session exists - validate state
-                if meta.state != SessionState::Open as i32 {
+        match self.get_session(id.clone()).await {
+            Ok(ssn) => {
+                if ssn.status.state != SessionState::Open {
                     return Err(FlameError::InvalidState(format!(
                         "Session {id} is not open"
                     )));
                 }
-
-                let ssn = self.session_from_metadata(&meta)?;
-
-                // If spec provided, validate full session attributes (same as sqlite engine
-                // and in-memory cache). Only checking application was insufficient:
-                // a persisted session could have min_instances/max_instances that differ from
-                // the client spec, leading to surprising scheduling behavior.
                 if let Some(ref attr) = spec {
                     ssn.validate_spec(attr)?;
                 }
-
                 Ok(ssn)
             }
-            Err(_) => {
-                // Session doesn't exist
-                match spec {
-                    Some(attr) => self.create_session(attr).await,
-                    None => Err(FlameError::NotFound(format!("Session {id} not found"))),
-                }
-            }
+            Err(FlameError::NotFound(_)) => match spec {
+                Some(attr) => self.create_session(attr).await,
+                None => Err(FlameError::NotFound(format!("Session {id} not found"))),
+            },
+            Err(e) => Err(e),
         }
     }
 
     async fn close_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        lock_ssn!(self, &id);
+        let shared = self.session_entry(&id)?;
+        let mut entry = shared.write().await;
+        validate_entry(&self.sessions, &id, &shared)?;
+        if entry.metadata.state == SessionState::Closed as i32 {
+            entry.release_files();
+            return self.session_from_metadata(&entry.metadata);
+        }
 
-        let mut meta = self.read_session_metadata(&id)?;
-
-        let task_count = self._count_task(&TaskFilter::by_session(&id))?;
+        let task_count = self._count_task(&entry, &TaskFilter::by_session(&id))?;
         let mut pending_tasks = Vec::new();
-
-        // First pass: check for running tasks and collect pending tasks
         for task_id in 1..=task_count {
-            if let Ok(task_meta) = self.read_task_metadata(&id, task_id as TaskID) {
-                let state = match TaskState::try_from(task_meta.state as i32) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Task {}/{} has corrupted state ({}): {}, treating as incomplete",
-                            id,
-                            task_id,
-                            task_meta.state,
-                            e
-                        );
-                        return Err(FlameError::Storage(
-                            "Cannot close session with corrupted task state".to_string(),
-                        ));
-                    }
-                };
-                if state == TaskState::Running {
-                    return Err(FlameError::Storage(
-                        "Cannot close session with running tasks".to_string(),
-                    ));
-                }
-                if state == TaskState::Pending {
-                    pending_tasks.push(task_id as TaskID);
-                }
+            // Do not close over an unreadable task whose state is unknown.
+            let task_meta = self.read_task_metadata(&entry, task_id as TaskID)?;
+            let state = TaskState::try_from(task_meta.state as i32)?;
+            if state == TaskState::Running {
+                return Err(FlameError::Storage(
+                    "Cannot close session with running tasks".to_string(),
+                ));
+            }
+            if state == TaskState::Pending {
+                pending_tasks.push(task_id as TaskID);
             }
         }
-
-        // Second pass: cancel pending tasks
         for task_id in pending_tasks {
-            self._update_task_state(&id, &task_id, TaskState::Cancelled)?;
+            self._update_task_state(&entry, task_id, TaskState::Cancelled)?;
         }
 
-        meta.state = SessionState::Closed as i32;
-        meta.completion_time = Some(Utc::now().timestamp());
-        meta.version += 1;
-
-        self.write_session_metadata(&id, &meta)?;
-        self.session_from_metadata(&meta)
+        let mut metadata = entry.metadata.clone();
+        metadata.state = SessionState::Closed as i32;
+        metadata.completion_time = Some(Utc::now().timestamp());
+        metadata.version += 1;
+        self.write_session_metadata(&id, &metadata)?;
+        entry.metadata = metadata;
+        entry.release_files();
+        self.session_from_metadata(&entry.metadata)
     }
 
     async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        let meta = self.read_session_metadata(&id)?;
-
-        if meta.state != SessionState::Closed as i32 {
+        let shared = self.session_entry(&id)?;
+        let entry = shared.write().await;
+        validate_entry(&self.sessions, &id, &shared)?;
+        if entry.metadata.state != SessionState::Closed as i32 {
             return Err(FlameError::Storage(
                 "Cannot delete open session".to_string(),
             ));
         }
-
-        if self._count_task(&TaskFilter::non_terminal(&id))? > 0 {
+        if self._count_task(&entry, &TaskFilter::non_terminal(&id))? > 0 {
             return Err(FlameError::Storage(
                 "Cannot delete session with non-terminal tasks".to_string(),
             ));
         }
-
-        let session = self.session_from_metadata(&meta)?;
-
-        let session_dir = self.session_path(&id);
-        fs::remove_dir_all(&session_dir)
+        let session = self.session_from_metadata(&entry.metadata)?;
+        fs::remove_dir_all(&entry.dir)
             .map_err(|e| FlameError::Storage(format!("Failed to delete session: {e}")))?;
-
-        {
-            let mut locks = lock_app!(self)?;
-            locks.remove(&id);
-        }
-
+        entry.release_files();
+        self.sessions.write().map_err(poisoned)?.remove(&id);
         Ok(session)
     }
 
     async fn find_sessions(&self) -> Result<Vec<Session>, FlameError> {
+        let entries = self
+            .sessions
+            .read()
+            .map_err(poisoned)?
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.clone()))
+            .collect::<Vec<_>>();
         let mut sessions = Vec::new();
-        for (session_id, metadata) in self._list_sessions_metadata(None)? {
-            let session = self.session_from_metadata(&metadata)?;
-            {
-                let mut locks = lock_app!(self)?;
-                locks.insert(session_id, Arc::new(Mutex::new(())));
+        for (id, shared) in entries {
+            let entry = shared.read().await;
+            // A session deleted while we waited is simply no longer listed.
+            if validate_entry(&self.sessions, &id, &shared).is_ok() {
+                sessions.push(self.session_from_metadata(&entry.metadata)?);
             }
-            sessions.push(session);
         }
-
         Ok(sessions)
     }
 
@@ -1292,37 +1364,34 @@ impl Engine for FilesystemEngine {
         input: Option<TaskInput>,
         options: Option<TaskOptions>,
     ) -> Result<Task, FlameError> {
-        let ssn_meta = self.read_session_metadata(&ssn_id)?;
-        if ssn_meta.state != SessionState::Open as i32 {
-            return Err(FlameError::InvalidState(
-                "Cannot create task in closed session".to_string(),
-            ));
-        }
+        lock_ssn!(self, &ssn_id, entry);
 
-        lock_ssn!(self, &ssn_id);
+        entry.ensure_open()?;
 
-        let task_count = self._count_task(&TaskFilter::by_session(&ssn_id))?;
-        let task_id = task_count + 1;
-
+        // Stage the immutable payloads first. Their ranges are reserved
+        // atomically, so neither the writes nor their syncs hold a gate, and an
+        // abandoned creation only leaves an unreferenced range.
+        let input = input.filter(|data| !data.is_empty());
         let (input_offset, input_len) = if let Some(ref data) = input {
-            let offset = self.append_data(&ssn_id, "inputs.bin", data)?;
+            let offset = self.append_data(&entry, Part::Inputs, data)?;
             (offset, data.len() as u64)
         } else {
             (0, 0)
         };
 
-        let affinity_data = options
-            .unwrap_or_default()
-            .affinity
-            .iter()
-            .map(|key| key.to_vec())
-            .collect::<Vec<_>>();
-        let affinity_data = bincode::encode_to_vec(affinity_data, bincode_config())
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-        let affinity_offset = self.append_data(&ssn_id, "affinity.bin", &affinity_data)?;
+        let affinity = options.unwrap_or_default().affinity;
+        let (affinity_offset, affinity_len) = if affinity.is_empty() {
+            (0, 0)
+        } else {
+            let keys = affinity.iter().map(|key| key.to_vec()).collect::<Vec<_>>();
+            let encoded = bincode::encode_to_vec(keys, bincode_config())
+                .map_err(|e| FlameError::Storage(e.to_string()))?;
+            let offset = self.append_data(&entry, Part::Affinity, &encoded)?;
+            (offset, encoded.len() as u64)
+        };
 
-        let mut meta = TaskMetadata {
-            id: task_id,
+        let meta = TaskMetadata {
+            id: 0,
             version: 1,
             checksum: 0,
             state: TaskState::Pending as u8,
@@ -1333,33 +1402,38 @@ impl Engine for FilesystemEngine {
             output_offset: 0,
             output_len: 0,
             affinity_offset,
-            affinity_len: affinity_data.len() as u64,
+            affinity_len,
         };
 
-        meta.checksum = calculate_checksum(&meta);
+        // The commit gate covers task ID selection and the record write only. It
+        // never waits for a task gate: the ID is not visible to anyone until this
+        // returns, so no other operation can reference the new task.
+        let meta = {
+            let _commit = entry.commit.lock().await;
+            self.commit_task(&entry, meta)?
+        };
 
-        self.write_task_metadata(&ssn_id, &meta)?;
-
-        self.task_from_metadata(&ssn_id, &meta)
+        // The request already owns these immutable fields; reading them back would
+        // add I/O without validating anything new.
+        Self::task_with_data(&ssn_id, &meta, input, None, affinity)
     }
 
     async fn get_task(&self, gid: TaskGID) -> Result<Task, FlameError> {
-        lock_ssn!(self, &gid.ssn_id);
-        let meta = self.read_task_metadata(&gid.ssn_id, gid.task_id)?;
-        self.task_from_metadata(&gid.ssn_id, &meta)
+        lock_ssn!(self, &gid.ssn_id, entry);
+        let meta = self.read_task_metadata(&entry, gid.task_id)?;
+        self.task_from_metadata(&entry, &meta)
     }
 
     async fn retry_task(&self, gid: TaskGID) -> Result<Task, FlameError> {
-        lock_ssn!(self, &gid.ssn_id);
+        lock_ssn!(self, &gid.ssn_id, entry);
+        entry.ensure_open()?;
 
-        let mut meta = self.read_task_metadata(&gid.ssn_id, gid.task_id)?;
-
-        meta.state = TaskState::Pending as u8;
-        meta.version += 1;
-        meta.checksum = calculate_checksum(&meta);
-
-        self.write_task_metadata(&gid.ssn_id, &meta)?;
-        self.task_from_metadata(&gid.ssn_id, &meta)
+        let meta = entry.with_task(gid.task_id, || {
+            self.update_task(&entry, gid.task_id, |meta| {
+                meta.state = TaskState::Pending as u8;
+            })
+        })?;
+        self.task_from_metadata(&entry, &meta)
     }
 
     async fn update_task_state(
@@ -1368,9 +1442,13 @@ impl Engine for FilesystemEngine {
         task_state: TaskState,
         _message: Option<String>,
     ) -> Result<Task, FlameError> {
-        lock_ssn!(self, &gid.ssn_id);
+        lock_ssn!(self, &gid.ssn_id, entry);
+        entry.ensure_open()?;
 
-        self._update_task_state(&gid.ssn_id, &gid.task_id, task_state)
+        let meta = entry.with_task(gid.task_id, || {
+            self._update_task_state(&entry, gid.task_id, task_state)
+        })?;
+        self.task_from_metadata(&entry, &meta)
     }
 
     async fn update_task_result(
@@ -1378,38 +1456,44 @@ impl Engine for FilesystemEngine {
         gid: TaskGID,
         task_result: TaskResult,
     ) -> Result<Task, FlameError> {
-        lock_ssn!(self, &gid.ssn_id);
+        lock_ssn!(self, &gid.ssn_id, entry);
+        entry.ensure_open()?;
 
-        let mut meta = self.read_task_metadata(&gid.ssn_id, gid.task_id)?;
+        // Stage the output before taking the task gate. If the update is later
+        // rejected or fails, the range stays unreferenced.
+        let output = match task_result.output.as_ref() {
+            Some(output) if !output.is_empty() => Some((
+                self.append_data(&entry, Part::Outputs, output)?,
+                output.len() as u64,
+            )),
+            Some(_) => Some((0, 0)),
+            None => None,
+        };
 
-        if let Some(ref output) = task_result.output {
-            let offset = self.append_data(&gid.ssn_id, "outputs.bin", output)?;
-            meta.output_offset = offset;
-            meta.output_len = output.len() as u64;
-        }
-
-        meta.state = task_result.state as u8;
-        meta.version += 1;
-
-        if task_result.state.is_terminal() {
-            meta.completion_time = Utc::now().timestamp();
-        }
-
-        meta.checksum = calculate_checksum(&meta);
-
-        self.write_task_metadata(&gid.ssn_id, &meta)?;
-        self.task_from_metadata(&gid.ssn_id, &meta)
+        let meta = entry.with_task(gid.task_id, || {
+            self.update_task(&entry, gid.task_id, |meta| {
+                if let Some((offset, len)) = output {
+                    meta.output_offset = offset;
+                    meta.output_len = len;
+                }
+                meta.state = task_result.state as u8;
+                if task_result.state.is_terminal() {
+                    meta.completion_time = Utc::now().timestamp();
+                }
+            })
+        })?;
+        self.task_from_metadata(&entry, &meta)
     }
 
     async fn find_tasks(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
-        lock_ssn!(self, &ssn_id);
+        lock_ssn!(self, &ssn_id, entry);
 
         let mut tasks = Vec::new();
-        let task_count = self._count_task(&TaskFilter::by_session(&ssn_id))?;
+        let task_count = self._count_task(&entry, &TaskFilter::by_session(&ssn_id))?;
 
         for task_id in 1..=task_count {
-            if let Ok(meta) = self.read_task_metadata(&ssn_id, task_id as TaskID) {
-                if let Ok(task) = self.task_from_metadata(&ssn_id, &meta) {
+            if let Ok(meta) = self.read_task_metadata(&entry, task_id as TaskID) {
+                if let Ok(task) = self.task_from_metadata(&entry, &meta) {
                     tasks.push(task);
                 }
             }
@@ -1419,208 +1503,167 @@ impl Engine for FilesystemEngine {
     }
 
     async fn create_node(&self, node: &Node) -> Result<Node, FlameError> {
-        lock_node!(self, &node.name);
-
-        let now = Utc::now().timestamp();
-        let meta = NodeMetadata {
-            name: node.name.clone(),
-            state: i32::from(node.state),
-            capacity_cpu: node.capacity.cpu,
-            capacity_memory: node.capacity.memory,
-            capacity_gpu: node.capacity.gpu,
-            allocatable_cpu: node.allocatable.cpu,
-            allocatable_memory: node.allocatable.memory,
-            allocatable_gpu: node.allocatable.gpu,
-            info_arch: node.info.arch.clone(),
-            info_os: node.info.os.clone(),
-            creation_time: now,
-            last_heartbeat: now,
-        };
-
-        self.write_node_metadata(&node.name, &meta)?;
+        let metadata = NodeMetadata::from_node(node, Utc::now().timestamp());
+        let mut entry = new_entry(
+            &self.nodes,
+            &node.name,
+            "Node",
+            NodeEntry {
+                metadata: metadata.clone(),
+            },
+        )?;
+        if let Err(error) = self.write_node_metadata(&node.name, &metadata) {
+            remove_entry(
+                &self.nodes,
+                &node.name,
+                OwnedRwLockWriteGuard::rwlock(&entry),
+            )?;
+            return Err(error);
+        }
+        entry.metadata = metadata;
         Ok(node.clone())
     }
 
     async fn get_node(&self, name: &str) -> Result<Option<Node>, FlameError> {
-        lock_node!(self, name);
-
-        match self.read_node_metadata(name) {
-            Ok(meta) => Ok(Some(Node {
-                name: meta.name,
-                state: NodeState::from(meta.state),
-                capacity: ResourceRequirement {
-                    cpu: meta.capacity_cpu,
-                    memory: meta.capacity_memory,
-                    gpu: meta.capacity_gpu,
-                },
-                allocatable: ResourceRequirement {
-                    cpu: meta.allocatable_cpu,
-                    memory: meta.allocatable_memory,
-                    gpu: meta.allocatable_gpu,
-                },
-                info: NodeInfo {
-                    arch: meta.info_arch,
-                    os: meta.info_os,
-                },
-            })),
-            Err(FlameError::NotFound(_)) => Ok(None),
-            Err(e) => Err(e),
-        }
+        let shared = match self.node_entry(name) {
+            Ok(shared) => shared,
+            Err(FlameError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let entry = shared.read().await;
+        validate_entry(&self.nodes, name, &shared)?;
+        Ok(Some(Self::node_from_metadata(&entry.metadata)))
     }
 
     async fn update_node(&self, node: &Node) -> Result<Node, FlameError> {
-        lock_node!(self, &node.name);
-
-        let existing = self.read_node_metadata(&node.name).ok();
-        let creation_time = existing
-            .as_ref()
-            .map(|m| m.creation_time)
-            .unwrap_or_else(|| Utc::now().timestamp());
-
-        let meta = NodeMetadata {
-            name: node.name.clone(),
-            state: i32::from(node.state),
-            capacity_cpu: node.capacity.cpu,
-            capacity_memory: node.capacity.memory,
-            capacity_gpu: node.capacity.gpu,
-            allocatable_cpu: node.allocatable.cpu,
-            allocatable_memory: node.allocatable.memory,
-            allocatable_gpu: node.allocatable.gpu,
-            info_arch: node.info.arch.clone(),
-            info_os: node.info.os.clone(),
-            creation_time,
-            last_heartbeat: Utc::now().timestamp(),
-        };
-
-        self.write_node_metadata(&node.name, &meta)?;
+        let shared = self.node_entry(&node.name)?;
+        let mut entry = shared.write().await;
+        validate_entry(&self.nodes, &node.name, &shared)?;
+        let metadata = NodeMetadata::from_node(node, entry.metadata.creation_time);
+        self.write_node_metadata(&node.name, &metadata)?;
+        entry.metadata = metadata;
         Ok(node.clone())
     }
 
     async fn delete_node(&self, name: &str) -> Result<(), FlameError> {
-        lock_node!(self, name);
-
-        let node_dir = self.node_path(name);
-        if node_dir.exists() {
-            fs::remove_dir_all(&node_dir)
-                .map_err(|e| FlameError::Storage(format!("Failed to delete node {name}: {e}")))?;
+        let shared = match self.node_entry(name) {
+            Ok(shared) => shared,
+            Err(FlameError::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let _entry = shared.write().await;
+        validate_entry(&self.nodes, name, &shared)?;
+        match fs::remove_dir_all(self.node_path(name)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(FlameError::Storage(format!(
+                    "Failed to delete node {name}: {e}"
+                )))
+            }
         }
-
-        {
-            let mut locks = self
-                .node_locks
-                .write()
-                .map_err(|e| FlameError::Storage(format!("Node lock poisoned: {}", e)))?;
-            locks.remove(name);
+        let executors = self
+            .executors
+            .read()
+            .map_err(poisoned)?
+            .iter()
+            .map(|(id, shared)| (id.clone(), shared.clone()))
+            .collect::<Vec<_>>();
+        // Node -> executor: active operations on this node have finished; a
+        // concurrent move to another node is protected by the executor gate.
+        for (id, executor) in executors {
+            let entry = executor.write().await;
+            // An executor deleted while we waited for its gate is already gone.
+            if entry.metadata.node == name
+                && validate_entry(&self.executors, &id, &executor).is_ok()
+            {
+                remove_entry(&self.executors, &id, &executor)?;
+            }
         }
-
+        remove_entry(&self.nodes, name, &shared)?;
         Ok(())
     }
 
     async fn find_nodes(&self) -> Result<Vec<Node>, FlameError> {
+        let names = self
+            .nodes
+            .read()
+            .map_err(poisoned)?
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut nodes = Vec::new();
-        let nodes_dir = self.base_path.join("nodes");
-
-        if let Ok(entries) = fs::read_dir(&nodes_dir) {
-            for entry in entries.flatten() {
-                let node_name = entry.file_name().to_string_lossy().to_string();
-                if let Ok(meta) = self.read_node_metadata(&node_name) {
-                    nodes.push(Node {
-                        name: meta.name,
-                        state: NodeState::from(meta.state),
-                        capacity: ResourceRequirement {
-                            cpu: meta.capacity_cpu,
-                            memory: meta.capacity_memory,
-                            gpu: meta.capacity_gpu,
-                        },
-                        allocatable: ResourceRequirement {
-                            cpu: meta.allocatable_cpu,
-                            memory: meta.allocatable_memory,
-                            gpu: meta.allocatable_gpu,
-                        },
-                        info: NodeInfo {
-                            arch: meta.info_arch,
-                            os: meta.info_os,
-                        },
-                    });
-                }
+        for name in names {
+            if let Some(node) = self.get_node(&name).await? {
+                nodes.push(node);
             }
         }
-
         Ok(nodes)
     }
 
     async fn create_executor(&self, executor: &Executor) -> Result<Executor, FlameError> {
-        lock_executor!(self, &executor.id);
-
-        let meta = ExecutorMetadata {
-            id: executor.id.clone(),
-            node: executor.node.clone(),
-            application: executor.application.clone(),
-            resreq_cpu: executor.resreq.cpu,
-            resreq_memory: executor.resreq.memory,
-            resreq_gpu: executor.resreq.gpu,
-            shim: i32::from(executor.shim),
-            task_id: executor.task_id,
-            ssn_id: executor.ssn_id.clone(),
-            creation_time: executor.creation_time.timestamp(),
-            state: i32::from(executor.state),
-        };
-
-        self.write_executor_metadata(&executor.node, &executor.id, &meta)?;
+        let parent = self.node_entry(&executor.node)?;
+        let _parent = parent.read().await;
+        validate_entry(&self.nodes, &executor.node, &parent)?;
+        let metadata = ExecutorMetadata::from_executor(executor);
+        let mut entry = new_entry(
+            &self.executors,
+            &executor.id,
+            "Executor",
+            ExecutorEntry {
+                metadata: metadata.clone(),
+            },
+        )?;
+        if let Err(error) = self.persist_executor(executor, &metadata, None) {
+            remove_entry(
+                &self.executors,
+                &executor.id,
+                OwnedRwLockWriteGuard::rwlock(&entry),
+            )?;
+            return Err(error);
+        }
+        entry.metadata = metadata;
         Ok(executor.clone())
     }
 
     async fn get_executor(&self, id: &ExecutorID) -> Result<Option<Executor>, FlameError> {
-        lock_executor!(self, id);
-
-        let node_name = match self.find_executor_node(id) {
-            Ok(name) => name,
-            Err(FlameError::NotFound(_)) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-
-        match self.read_executor_metadata(&node_name, id) {
-            Ok(meta) => Ok(Some(Executor {
-                id: meta.id,
-                node: meta.node,
-                resreq: ResourceRequirement {
-                    cpu: meta.resreq_cpu,
-                    memory: meta.resreq_memory,
-                    gpu: meta.resreq_gpu,
-                },
-                shim: Shim::try_from(meta.shim).unwrap_or_default(),
-                application: meta.application,
-                task_id: meta.task_id.map(|t| t as TaskID),
-                ssn_id: meta.ssn_id,
-                signal: None,
-                attributes: Default::default(),
-                creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
-                latest_updated_timestamp: Utc::now(),
-                state: ExecutorState::from(meta.state),
-            })),
-            Err(FlameError::NotFound(_)) => Ok(None),
-            Err(e) => Err(e),
+        loop {
+            let shared = match self.executor_entry(id) {
+                Ok(shared) => shared,
+                Err(FlameError::NotFound(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let node = {
+                let entry = shared.read().await;
+                validate_entry(&self.executors, id, &shared)?;
+                entry.metadata.node.clone()
+            };
+            let parent = match self.node_entry(&node) {
+                Ok(parent) => parent,
+                Err(FlameError::NotFound(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let _parent = parent.read().await;
+            validate_entry(&self.nodes, &node, &parent)?;
+            let entry = shared.read().await;
+            validate_entry(&self.executors, id, &shared)?;
+            if entry.metadata.node != node {
+                continue;
+            }
+            return Ok(Some(Self::executor_from_metadata(&entry.metadata)));
         }
     }
 
     async fn update_executor(&self, executor: &Executor) -> Result<Executor, FlameError> {
-        lock_executor!(self, &executor.id);
-
-        let meta = ExecutorMetadata {
-            id: executor.id.clone(),
-            node: executor.node.clone(),
-            application: executor.application.clone(),
-            resreq_cpu: executor.resreq.cpu,
-            resreq_memory: executor.resreq.memory,
-            resreq_gpu: executor.resreq.gpu,
-            shim: i32::from(executor.shim),
-            task_id: executor.task_id,
-            ssn_id: executor.ssn_id.clone(),
-            creation_time: executor.creation_time.timestamp(),
-            state: i32::from(executor.state),
-        };
-
-        self.write_executor_metadata(&executor.node, &executor.id, &meta)?;
+        let parent = self.node_entry(&executor.node)?;
+        let _parent = parent.read().await;
+        validate_entry(&self.nodes, &executor.node, &parent)?;
+        let shared = self.executor_entry(&executor.id)?;
+        let mut entry = shared.write().await;
+        validate_entry(&self.executors, &executor.id, &shared)?;
+        let metadata = ExecutorMetadata::from_executor(executor);
+        self.persist_executor(executor, &metadata, Some(&entry.metadata))?;
+        entry.metadata = metadata;
         Ok(executor.clone())
     }
 
@@ -1629,106 +1672,83 @@ impl Engine for FilesystemEngine {
         id: &ExecutorID,
         state: ExecutorState,
     ) -> Result<Executor, FlameError> {
-        lock_executor!(self, id);
-
-        let node_name = self.find_executor_node(id)?;
-        let mut meta = self.read_executor_metadata(&node_name, id)?;
-        meta.state = i32::from(state);
-        self.write_executor_metadata(&node_name, id, &meta)?;
-
-        Ok(Executor {
-            id: meta.id,
-            node: meta.node,
-            resreq: ResourceRequirement {
-                cpu: meta.resreq_cpu,
-                memory: meta.resreq_memory,
-                gpu: meta.resreq_gpu,
-            },
-            shim: Shim::try_from(meta.shim).unwrap_or_default(),
-            application: meta.application,
-            task_id: meta.task_id.map(|t| t as TaskID),
-            ssn_id: meta.ssn_id,
-            signal: None,
-            attributes: Default::default(),
-            creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
-            latest_updated_timestamp: Utc::now(),
-            state,
-        })
+        loop {
+            let shared = self.executor_entry(id)?;
+            let node = {
+                let entry = shared.read().await;
+                validate_entry(&self.executors, id, &shared)?;
+                entry.metadata.node.clone()
+            };
+            let parent = self.node_entry(&node)?;
+            let _parent = parent.read().await;
+            validate_entry(&self.nodes, &node, &parent)?;
+            let mut entry = shared.write().await;
+            validate_entry(&self.executors, id, &shared)?;
+            if entry.metadata.node != node {
+                continue;
+            }
+            let mut metadata = entry.metadata.clone();
+            metadata.state = i32::from(state);
+            self.write_executor_metadata(&node, id, &metadata)?;
+            entry.metadata = metadata;
+            return Ok(Self::executor_from_metadata(&entry.metadata));
+        }
     }
 
     async fn delete_executor(&self, id: &ExecutorID) -> Result<(), FlameError> {
-        lock_executor!(self, id);
-
-        let node_name = match self.find_executor_node(id) {
-            Ok(name) => name,
-            Err(FlameError::NotFound(_)) => return Ok(()),
-            Err(e) => return Err(e),
-        };
-
-        let exec_dir = self.executor_path(&node_name, id);
-        if exec_dir.exists() {
-            fs::remove_dir_all(&exec_dir)
-                .map_err(|e| FlameError::Storage(format!("Failed to delete executor {id}: {e}")))?;
+        loop {
+            let shared = match self.executor_entry(id) {
+                Ok(shared) => shared,
+                Err(FlameError::NotFound(_)) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            let node = {
+                let entry = shared.read().await;
+                validate_entry(&self.executors, id, &shared)?;
+                entry.metadata.node.clone()
+            };
+            let parent = match self.node_entry(&node) {
+                Ok(parent) => parent,
+                Err(FlameError::NotFound(_)) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            let _parent = parent.read().await;
+            validate_entry(&self.nodes, &node, &parent)?;
+            let entry = shared.write().await;
+            validate_entry(&self.executors, id, &shared)?;
+            if entry.metadata.node != node {
+                continue;
+            }
+            match fs::remove_dir_all(self.executor_path(&node, id)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(FlameError::Storage(format!(
+                        "Failed to delete executor {id}: {e}"
+                    )))
+                }
+            }
+            remove_entry(&self.executors, id, &shared)?;
+            return Ok(());
         }
-
-        {
-            let mut locks = self
-                .executor_locks
-                .write()
-                .map_err(|e| FlameError::Storage(format!("Executor lock poisoned: {}", e)))?;
-            locks.remove(id);
-        }
-
-        Ok(())
     }
 
     async fn find_executors(&self, node: Option<&str>) -> Result<Vec<Executor>, FlameError> {
+        let ids = self
+            .executors
+            .read()
+            .map_err(poisoned)?
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut executors = Vec::new();
-        let nodes_dir = self.base_path.join("nodes");
-
-        let node_names: Vec<String> = match node {
-            Some(n) => vec![n.to_string()],
-            None => {
-                let mut names = Vec::new();
-                if let Ok(entries) = fs::read_dir(&nodes_dir) {
-                    for entry in entries.flatten() {
-                        names.push(entry.file_name().to_string_lossy().to_string());
-                    }
-                }
-                names
-            }
-        };
-
-        for node_name in node_names {
-            let executors_dir = self.node_path(&node_name).join("executors");
-            if let Ok(entries) = fs::read_dir(&executors_dir) {
-                for entry in entries.flatten() {
-                    let executor_id = entry.file_name().to_string_lossy().to_string();
-                    if let Ok(meta) = self.read_executor_metadata(&node_name, &executor_id) {
-                        executors.push(Executor {
-                            id: meta.id,
-                            node: meta.node,
-                            resreq: ResourceRequirement {
-                                cpu: meta.resreq_cpu,
-                                memory: meta.resreq_memory,
-                                gpu: meta.resreq_gpu,
-                            },
-                            shim: Shim::try_from(meta.shim).unwrap_or_default(),
-                            application: meta.application,
-                            task_id: meta.task_id.map(|t| t as TaskID),
-                            ssn_id: meta.ssn_id,
-                            signal: None,
-                            attributes: Default::default(),
-                            creation_time: DateTime::from_timestamp(meta.creation_time, 0)
-                                .unwrap_or_default(),
-                            latest_updated_timestamp: Utc::now(),
-                            state: ExecutorState::from(meta.state),
-                        });
-                    }
+        for id in ids {
+            if let Some(executor) = self.get_executor(&id).await? {
+                if node.is_none_or(|name| executor.node == name) {
+                    executors.push(executor);
                 }
             }
         }
-
         Ok(executors)
     }
 }
@@ -1746,9 +1766,10 @@ mod tests {
         let engine = FilesystemEngine {
             base_path: temp_dir.path().to_path_buf(),
             record_size: task_record_size(),
-            ssn_locks: RwLock::new(HashMap::new()),
-            node_locks: RwLock::new(HashMap::new()),
-            executor_locks: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
+            applications: RwLock::new(HashMap::new()),
+            nodes: RwLock::new(HashMap::new()),
+            executors: RwLock::new(HashMap::new()),
         };
 
         (engine, temp_dir)
@@ -2565,5 +2586,663 @@ mod tests {
 
         let executors = engine.find_executors(None).await.unwrap();
         assert_eq!(executors.len(), 0);
+    }
+
+    async fn engine_with_session(id: &str) -> (Arc<FilesystemEngine>, TempDir) {
+        let (engine, dir) = create_test_engine().await;
+        let app_attr = ApplicationAttributes {
+            shim: Shim::Host,
+            image: None,
+            description: None,
+            labels: vec![],
+            command: Some("/bin/test".to_string()),
+            arguments: vec![],
+            environments: std::collections::HashMap::new(),
+            working_directory: None,
+            max_instances: 10,
+            delay_release: Duration::seconds(0),
+            schema: None,
+            url: None,
+            installer: None,
+        };
+        engine
+            .register_application("test-app".to_string(), app_attr)
+            .await
+            .unwrap();
+        engine
+            .create_session(SessionAttributes {
+                id: id.to_string(),
+                application: "test-app".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        (Arc::new(engine), dir)
+    }
+
+    fn gid(ssn: &str, task_id: TaskID) -> TaskGID {
+        TaskGID {
+            ssn_id: ssn.to_string(),
+            task_id,
+        }
+    }
+
+    fn test_node_named(name: &str) -> Node {
+        let resreq = ResourceRequirement {
+            cpu: 4,
+            memory: 8192,
+            gpu: 0,
+        };
+        Node {
+            name: name.to_string(),
+            state: NodeState::Ready,
+            capacity: resreq.clone(),
+            allocatable: resreq,
+            info: NodeInfo {
+                arch: "x86_64".to_string(),
+                os: "linux".to_string(),
+            },
+        }
+    }
+
+    fn test_executor_on(id: &str, node: &str) -> Executor {
+        Executor {
+            id: id.to_string(),
+            node: node.to_string(),
+            resreq: ResourceRequirement {
+                cpu: 1,
+                memory: 1024,
+                gpu: 0,
+            },
+            shim: Shim::Host,
+            application: "test-app".to_string(),
+            task_id: None,
+            ssn_id: None,
+            signal: None,
+            attributes: Default::default(),
+            creation_time: Utc::now(),
+            latest_updated_timestamp: Utc::now(),
+            state: ExecutorState::Void,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_executor_moves_and_node_deletes_do_not_deadlock() {
+        let (engine, _dir) = create_test_engine().await;
+        let engine = Arc::new(engine);
+        let shared_engine = engine.clone();
+        for node in ["node-a", "node-b"] {
+            engine.create_node(&test_node_named(node)).await.unwrap();
+        }
+        engine
+            .create_executor(&test_executor_on("mover", "node-a"))
+            .await
+            .unwrap();
+
+        let workload = async {
+            let mut tasks = vec![];
+            for round in 0..20 {
+                let target = if round % 2 == 0 { "node-b" } else { "node-a" };
+                let engine = Arc::clone(&shared_engine);
+                tasks.push(tokio::spawn(async move {
+                    let _ = engine
+                        .update_executor(&test_executor_on("mover", target))
+                        .await;
+                }));
+                let engine = Arc::clone(&shared_engine);
+                tasks.push(tokio::spawn(async move {
+                    let _ = engine
+                        .update_executor_state(&"mover".to_string(), ExecutorState::Idle)
+                        .await;
+                    let _ = engine.get_executor(&"mover".to_string()).await;
+                    let _ = engine.find_executors(None).await;
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), workload)
+            .await
+            .expect("executor moves deadlocked");
+
+        // Exactly one copy of the executor remains, on the node it last moved to.
+        let all = engine.find_executors(None).await.unwrap();
+        assert_eq!(all.len(), 1);
+        let stored = engine
+            .get_executor(&"mover".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.node, all[0].node);
+
+        let deleting = engine.clone();
+        let node = stored.node.clone();
+        within_a_second(async move { deleting.delete_node(&node).await })
+            .await
+            .expect("node delete deadlocked")
+            .unwrap();
+        assert!(engine
+            .get_executor(&"mover".to_string())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_application_create_admits_one() {
+        let (engine, _dir) = create_test_engine().await;
+        let engine = Arc::new(engine);
+        let attempts = (0..8).map(|_| {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .register_application("race-app".to_string(), ApplicationAttributes::default())
+                    .await
+            })
+        });
+        let mut results = vec![];
+        for attempt in attempts.collect::<Vec<_>>() {
+            results.push(attempt.await);
+        }
+        let admitted = results
+            .iter()
+            .filter(|r| r.as_ref().unwrap().is_ok())
+            .count();
+        assert_eq!(admitted, 1, "exactly one concurrent create must win");
+        assert!(engine.get_application("race-app".to_string()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_session_rejects_empty_application() {
+        let (engine, dir) = create_test_engine().await;
+        let error = engine
+            .create_session(SessionAttributes {
+                id: "empty-app".to_string(),
+                application: String::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FlameError::InvalidConfig(_)));
+        assert!(!dir.path().join("sessions/empty-app").exists());
+    }
+
+    #[tokio::test]
+    async fn test_missing_entities_are_not_cached() {
+        let (engine, _dir) = create_test_engine().await;
+        assert!(engine.get_node("ghost").await.unwrap().is_none());
+        assert!(engine
+            .get_executor(&"ghost".to_string())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            engine.get_application("ghost".to_string()).await,
+            Err(FlameError::NotFound(_))
+        ));
+        assert!(engine.nodes.read().unwrap().is_empty());
+        assert!(engine.executors.read().unwrap().is_empty());
+        assert!(engine.applications.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_executor_requires_existing_node_and_failed_create_leaves_no_entry() {
+        let (engine, _dir) = create_test_engine().await;
+        let error = engine
+            .create_executor(&test_executor_on("orphan", "no-such-node"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FlameError::NotFound(_)));
+        assert!(engine.executors.read().unwrap().is_empty());
+        assert!(engine
+            .get_executor(&"orphan".to_string())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_deleted_application_can_be_registered_again() {
+        let (engine, _dir) = create_test_engine().await;
+        let name = "cycle-app".to_string();
+        engine
+            .register_application(name.clone(), ApplicationAttributes::default())
+            .await
+            .unwrap();
+        engine
+            .update_application_state(name.clone(), ApplicationState::Disabled)
+            .await
+            .unwrap();
+        engine.delete_application(name.clone()).await.unwrap();
+        assert!(engine.applications.read().unwrap().is_empty());
+        assert!(matches!(
+            engine.get_application(name.clone()).await,
+            Err(FlameError::NotFound(_))
+        ));
+
+        let again = engine
+            .register_application(name.clone(), ApplicationAttributes::default())
+            .await
+            .unwrap();
+        assert_eq!(again.version, 1);
+        assert!(matches!(
+            engine
+                .register_application(name, ApplicationAttributes::default())
+                .await,
+            Err(FlameError::AlreadyExist(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_restart_loads_entities_once() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("filesystem://{}", dir.path().display());
+        {
+            let engine = FilesystemEngine::new_ptr(&url).await.unwrap();
+            engine
+                .register_application("restart-app".to_string(), ApplicationAttributes::default())
+                .await
+                .unwrap();
+            engine
+                .create_node(&test_node_named("restart-node"))
+                .await
+                .unwrap();
+            engine
+                .create_executor(&test_executor_on("restart-exec", "restart-node"))
+                .await
+                .unwrap();
+            engine
+                .create_session(SessionAttributes {
+                    id: "restart-ssn".to_string(),
+                    application: "restart-app".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        let engine = FilesystemEngine::new_ptr(&url).await.unwrap();
+        assert!(engine
+            .get_application("restart-app".to_string())
+            .await
+            .is_ok());
+        assert!(engine.get_node("restart-node").await.unwrap().is_some());
+        let executor = engine
+            .get_executor(&"restart-exec".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(executor.node, "restart-node");
+        assert_eq!(
+            engine
+                .find_executors(Some("restart-node"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(engine.find_sessions().await.unwrap().len(), 1);
+        assert!(engine.get_session("restart-ssn".to_string()).await.is_ok());
+        assert!(matches!(
+            engine.get_session("missing".to_string()).await,
+            Err(FlameError::NotFound(_))
+        ));
+        assert!(matches!(
+            engine
+                .register_application("restart-app".to_string(), ApplicationAttributes::default())
+                .await,
+            Err(FlameError::AlreadyExist(_))
+        ));
+    }
+
+    fn within_a_second<F: std::future::IntoFuture>(
+        future: F,
+    ) -> tokio::time::Timeout<F::IntoFuture> {
+        tokio::time::timeout(std::time::Duration::from_secs(1), future)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_creates_get_dense_ids_and_distinct_payloads() {
+        let (engine, dir) = engine_with_session("dense").await;
+
+        let mut handles = vec![];
+        for i in 0..32u8 {
+            let engine = engine.clone();
+            handles.push(tokio::spawn(async move {
+                engine
+                    .create_task("dense".to_string(), Some(Bytes::from(vec![i; 16])), None)
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut tasks = vec![];
+        for handle in handles {
+            tasks.push(handle.await.unwrap());
+        }
+
+        let mut ids: Vec<_> = tasks.iter().map(|task| task.id).collect();
+        ids.sort();
+        assert_eq!(ids, (1..=32).collect::<Vec<_>>());
+
+        let url = format!("filesystem://{}", dir.path().display());
+        let reopened = FilesystemEngine::new_ptr(&url).await.unwrap();
+        reopened.find_sessions().await.unwrap();
+        for task in &tasks {
+            let stored = reopened.get_task(gid("dense", task.id)).await.unwrap();
+            assert_eq!(stored.input, task.input, "task {} payload", task.id);
+            assert_eq!(stored.state, TaskState::Pending);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gates_do_not_block_unrelated_operations() {
+        let (engine, _dir) = engine_with_session("gates").await;
+        for _ in 0..2 {
+            engine
+                .create_task("gates".to_string(), None, None)
+                .await
+                .unwrap();
+        }
+        let shared = engine.session_entry("gates").unwrap();
+        let entry = shared.read().await;
+
+        // Creation commit gate held: updates to existing tasks proceed.
+        {
+            let _commit = entry.commit.lock().await;
+            within_a_second(engine.update_task_state(gid("gates", 1), TaskState::Running, None))
+                .await
+                .expect("update waited for the creation commit gate")
+                .unwrap();
+        }
+
+        // Another task's lock is held: creation must still commit, and an unrelated
+        // task must still update and be read.
+        {
+            let _held = entry.task_lock(2).write_arc();
+            within_a_second(engine.update_task_state(gid("gates", 1), TaskState::Succeed, None))
+                .await
+                .expect("unrelated task waited for a held task lock")
+                .unwrap();
+            within_a_second(engine.get_task(gid("gates", 1)))
+                .await
+                .expect("unrelated read waited for a held task lock")
+                .unwrap();
+            let created = within_a_second(engine.create_task("gates".to_string(), None, None))
+                .await
+                .expect("creation waited for another task's lock")
+                .unwrap();
+            assert_eq!(created.id, 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_persistent_checksum_mismatch_is_corruption() {
+        let (engine, dir) = engine_with_session("corrupt").await;
+        engine
+            .create_task("corrupt".to_string(), None, None)
+            .await
+            .unwrap();
+
+        let tasks = dir.path().join("sessions/corrupt/tasks.bin");
+        let file = fs::OpenOptions::new().write(true).open(&tasks).unwrap();
+        // id (8 bytes) + version (4 bytes) precede the checksum.
+        file.write_all_at(&[0xFF; 4], 12).unwrap();
+
+        let err = engine.get_task(gid("corrupt", 1)).await.unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_incomplete_tail_is_discarded_before_next_id() {
+        let (engine, dir) = engine_with_session("tail").await;
+        engine
+            .create_task("tail".to_string(), None, None)
+            .await
+            .unwrap();
+
+        let tasks = dir.path().join("sessions/tail/tasks.bin");
+        let file = fs::OpenOptions::new().write(true).open(&tasks).unwrap();
+        let record_size = engine.record_size as u64;
+        file.write_all_at(&[0xAB; 5], record_size).unwrap();
+
+        let second = engine
+            .create_task("tail".to_string(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(second.id, 2);
+        assert_eq!(fs::metadata(&tasks).unwrap().len(), 2 * record_size);
+        engine.get_task(gid("tail", 2)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_failed_commit_reports_error_and_retry_succeeds() {
+        let (engine, dir) = engine_with_session("retry-commit").await;
+        let shared = engine.session_entry("retry-commit").unwrap();
+        {
+            let entry = shared.read().await;
+            let path = dir.path().join("sessions/retry-commit/tasks.bin");
+            // A read-only descriptor forces a task-record write failure.
+            *entry.files[Part::Tasks as usize].lock().unwrap() =
+                Some(Arc::new(payload::PayloadFile::open(&path, false).unwrap()));
+        }
+        let error = engine
+            .create_task("retry-commit".into(), None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FlameError::Storage(_)));
+        assert!(error.to_string().contains("Failed to commit task record"));
+        // Restore write access as a transient storage failure would recover.
+        *shared.read().await.files[Part::Tasks as usize]
+            .lock()
+            .unwrap() = None;
+        let task = engine
+            .create_task("retry-commit".into(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(task.id, 1);
+        assert_eq!(
+            engine
+                .get_task(gid("retry-commit", task.id))
+                .await
+                .unwrap()
+                .state,
+            TaskState::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn test_closed_session_retains_no_descriptors_and_stays_readable() {
+        let (engine, _dir) = engine_with_session("closing").await;
+        let task = engine
+            .create_task("closing".to_string(), Some(Bytes::from("data")), None)
+            .await
+            .unwrap();
+        let shared = engine.session_entry("closing").unwrap();
+        assert!(shared.read().await.files[Part::Tasks as usize]
+            .lock()
+            .unwrap()
+            .is_some());
+
+        engine.close_session("closing".to_string()).await.unwrap();
+        let retained = |entry: &SessionEntry| {
+            entry
+                .files
+                .iter()
+                .filter(|slot| slot.lock().unwrap().is_some())
+                .count()
+        };
+        assert_eq!(retained(&*shared.read().await), 0);
+
+        let stored = engine.get_task(gid("closing", task.id)).await.unwrap();
+        assert_eq!(stored.input, Some(Bytes::from("data")));
+        assert_eq!(retained(&*shared.read().await), 0);
+    }
+
+    #[tokio::test]
+    async fn test_empty_affinity_writes_no_payload() {
+        let (engine, dir) = engine_with_session("affinity").await;
+        let task = engine
+            .create_task("affinity".to_string(), None, None)
+            .await
+            .unwrap();
+        assert!(task.affinity.is_empty());
+        assert!(!dir.path().join("sessions/affinity/affinity.bin").exists());
+
+        let stored = engine.get_task(gid("affinity", task.id)).await.unwrap();
+        assert!(stored.affinity.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_operations_after_delete_observe_the_tombstone() {
+        let (engine, _dir) = engine_with_session("gone").await;
+        engine.close_session("gone".to_string()).await.unwrap();
+        engine.delete_session("gone".to_string()).await.unwrap();
+
+        let err = engine
+            .create_task("gone".to_string(), None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FlameError::NotFound(_)), "{err}");
+    }
+    #[tokio::test]
+    async fn test_closed_session_rejects_every_task_mutation_before_payload_write() {
+        let (engine, dir) = engine_with_session("closed-writes").await;
+        let task = engine
+            .create_task("closed-writes".into(), Some(Bytes::from("input")), None)
+            .await
+            .unwrap();
+        engine.close_session("closed-writes".into()).await.unwrap();
+        let tasks_path = dir.path().join("sessions/closed-writes/tasks.bin");
+        let records = fs::read(&tasks_path).unwrap();
+        let output_path = dir.path().join("sessions/closed-writes/outputs.bin");
+        let outputs = fs::read(&output_path).unwrap();
+        let results = [
+            engine
+                .create_task("closed-writes".into(), Some(Bytes::from("late")), None)
+                .await,
+            engine.retry_task(gid("closed-writes", task.id)).await,
+            engine
+                .update_task_state(gid("closed-writes", task.id), TaskState::Running, None)
+                .await,
+            engine
+                .update_task_result(
+                    gid("closed-writes", task.id),
+                    TaskResult {
+                        state: TaskState::Succeed,
+                        output: Some(Bytes::from("late output")),
+                        message: None,
+                    },
+                )
+                .await,
+        ];
+        for result in results {
+            assert!(matches!(result, Err(FlameError::InvalidState(_))));
+        }
+        assert_eq!(fs::read(&tasks_path).unwrap(), records);
+        assert_eq!(fs::read(&output_path).unwrap(), outputs);
+        let stored = engine
+            .get_task(gid("closed-writes", task.id))
+            .await
+            .unwrap();
+        assert_eq!(stored.state, TaskState::Cancelled);
+        assert_eq!(stored.input, Some(Bytes::from("input")));
+    }
+
+    #[tokio::test]
+    async fn test_session_entry_json_and_runtime_recovery() {
+        let (_engine, dir) = engine_with_session("entry-json").await;
+        let path = dir.path().join("sessions/entry-json/metadata");
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 15);
+        for field in ["dir", "commit", "tasks", "files"] {
+            assert!(
+                json.get(field).is_none(),
+                "runtime field persisted: {field}"
+            );
+        }
+        let reopened = FilesystemEngine::new_ptr(&format!("filesystem://{}", dir.path().display()))
+            .await
+            .unwrap();
+        reopened.find_sessions().await.unwrap();
+        let task = reopened
+            .create_task("entry-json".into(), Some(Bytes::from("recovered")), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .get_task(gid("entry-json", task.id))
+                .await
+                .unwrap()
+                .input,
+            task.input
+        );
+        reopened.close_session("entry-json".into()).await.unwrap();
+        let closed = FilesystemEngine::new_ptr(&format!("filesystem://{}", dir.path().display()))
+            .await
+            .unwrap();
+        closed.find_sessions().await.unwrap();
+        assert!(matches!(
+            closed.retry_task(gid("entry-json", task.id)).await,
+            Err(FlameError::InvalidState(_))
+        ));
+        assert_eq!(
+            closed
+                .get_task(gid("entry-json", task.id))
+                .await
+                .unwrap()
+                .state,
+            TaskState::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn test_waiting_reader_rejects_deleted_entry_after_session_id_reuse() {
+        let (engine, _dir) = engine_with_session("reuse").await;
+        let task = engine
+            .create_task("reuse".into(), None, None)
+            .await
+            .unwrap();
+        engine.close_session("reuse".into()).await.unwrap();
+        let old = engine.session_entry("reuse").unwrap();
+        let mut deleting = Box::pin(engine.delete_session("reuse".into()));
+        let mut reading = Box::pin(engine.get_task(gid("reuse", task.id)));
+        {
+            let _held = old.write().await;
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                    deleting.as_mut(),
+                    cx
+                )))
+                .await
+                .is_pending()
+            );
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                    reading.as_mut(),
+                    cx
+                )))
+                .await
+                .is_pending()
+            );
+        }
+        deleting.await.unwrap();
+        engine
+            .create_session(SessionAttributes {
+                id: "reuse".into(),
+                application: "test-app".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine
+            .create_task("reuse".into(), None, None)
+            .await
+            .unwrap();
+        assert!(matches!(reading.await, Err(FlameError::NotFound(_))));
+        assert_eq!(
+            engine.get_task(gid("reuse", 1)).await.unwrap().state,
+            TaskState::Pending
+        );
     }
 }

@@ -68,6 +68,13 @@ Task files under `tasks/` are local agent notes. Keep them out of commits and PR
 
 ---
 
+## Coding Conventions
+
+- Do not call `drop()` to release a guard or value early. Scope it with a block
+  (`{ ... }`) so its lifetime is visible in the code.
+
+---
+
 ## Global Architecture Assumption
 
 - A service instance is application/executor scoped, not session scoped. Create

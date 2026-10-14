@@ -131,11 +131,26 @@ impl Storage {
     pub async fn load_data(&self) -> Result<(), FlameError> {
         let ssn_list = self.engine.find_sessions().await?;
         for ssn in ssn_list {
+            if ssn.status.state == SessionState::Closed {
+                event_result(
+                    self.event_manager.remove_events(ssn.id.clone()),
+                    "remove",
+                    &ssn.id,
+                );
+            } else {
+                event_result(
+                    self.event_manager.setup_events(ssn.id.clone()),
+                    "create",
+                    &ssn.id,
+                );
+            }
             let task_list = self.engine.find_tasks(ssn.id.clone()).await?;
             let mut ssn = ssn.clone();
             for task in task_list {
                 let task = match task.state {
-                    TaskState::Running => self.engine.retry_task(task.gid()).await?,
+                    TaskState::Running if ssn.status.state == SessionState::Open => {
+                        self.engine.retry_task(task.gid()).await?
+                    }
                     _ => task,
                 };
 
@@ -444,6 +459,11 @@ impl Storage {
     pub async fn create_session(&self, attr: SessionAttributes) -> Result<Session, FlameError> {
         trace_fn!("Storage::create_session");
         let ssn = self.engine.create_session(attr).await?;
+        event_result(
+            self.event_manager.setup_events(ssn.id.clone()),
+            "create",
+            &ssn.id,
+        );
 
         {
             let mut ssn_map = lock_ptr!(self.sessions)?;
@@ -521,6 +541,10 @@ impl Storage {
                 ssn.update_task(&task)?;
             }
 
+            // Publish Closed before cleanup so a cleanup failure cannot allow
+            // later event writers to recreate the session's files.
+            ssn.events.clear();
+            event_result(self.event_manager.remove_events(id.clone()), "remove", &id);
             ssn.clone()
         };
 
@@ -533,9 +557,12 @@ impl Storage {
         let ssn_ptr = self.get_session_ptr(id)?;
         let ssn = lock_ptr!(ssn_ptr)?;
         let mut ssn = ssn.clone();
-        ssn.events = self
-            .event_manager
-            .find_events(EventOwner::session(ssn.id.clone()))?;
+        ssn.events = event_result(
+            self.event_manager
+                .find_events(EventOwner::session(ssn.id.clone())),
+            "load",
+            &ssn.id,
+        );
         Ok(ssn)
     }
 
@@ -611,7 +638,7 @@ impl Storage {
             ssn_map.get(&id).cloned()
         };
 
-        let ssn = match cached {
+        let ssn = match cached.as_ref() {
             Some(ssn_ptr) => {
                 let ssn = lock_ptr!(ssn_ptr)?.clone();
                 if let Err(error) = self.engine.delete_session(id.clone()).await {
@@ -629,7 +656,14 @@ impl Storage {
             ssn_map.remove(&id);
         }
 
-        self.event_manager.remove_events(id)?;
+        if let Some(ssn_ptr) = cached {
+            let mut cached_ssn = lock_ptr!(ssn_ptr)?;
+            cached_ssn.status.state = SessionState::Closed;
+            cached_ssn.events.clear();
+            event_result(self.event_manager.remove_events(id.clone()), "remove", &id);
+        } else {
+            event_result(self.event_manager.remove_events(id.clone()), "remove", &id);
+        }
 
         Ok(ssn)
     }
@@ -647,9 +681,12 @@ impl Storage {
         for ssn in ssn_map.deref().values() {
             let ssn = lock_ptr!(ssn)?;
             let mut ssn = ssn.clone();
-            ssn.events = self
-                .event_manager
-                .find_events(EventOwner::session(ssn.id.clone()))?;
+            ssn.events = event_result(
+                self.event_manager
+                    .find_events(EventOwner::session(ssn.id.clone())),
+                "load",
+                &ssn.id,
+            );
             let matches = filter.is_none_or(|filter| {
                 filter
                     .application
@@ -749,27 +786,37 @@ impl Storage {
             .await?;
 
         let ssn = self.get_session_ptr(ssn_id.clone())?;
-        let mut ssn = lock_ptr!(ssn)?;
-        ssn.update_task(&task)?;
+        {
+            let mut ssn = lock_ptr!(ssn)?;
+            if ssn.status.state != SessionState::Open {
+                return Err(FlameError::InvalidState(format!(
+                    "Session <{}> is not open",
+                    ssn.id
+                )));
+            }
+            ssn.update_task(&task)?;
+        }
 
-        self.event_manager.record_event(
+        self.record_event(
             EventOwner::from(&task),
             Event {
                 code: task.state.into(),
                 message: Some(format!("Task was created with state <{:?}>", task.state)),
                 creation_time: Utc::now(),
             },
-        )?;
+        )
+        .await?;
 
         Ok(task)
     }
 
     pub fn get_task(&self, ssn_id: SessionID, id: TaskID) -> Result<Task, FlameError> {
         let mut task = self.get_task_metadata(ssn_id, id)?;
-        let events = self
-            .event_manager
-            .find_events(EventOwner::from(task.gid()))?;
-        task.events = events;
+        task.events = event_result(
+            self.event_manager.find_events(EventOwner::from(task.gid())),
+            "load",
+            &task.ssn_id,
+        );
 
         Ok(task)
     }
@@ -928,17 +975,26 @@ impl Storage {
             Err(e) => return Err(e),
         };
 
-        let mut ssn_ptr = lock_ptr!(ssn)?;
-        ssn_ptr.update_task(&updated_task)?;
+        {
+            let mut ssn_ptr = lock_ptr!(ssn)?;
+            if ssn_ptr.status.state != SessionState::Open {
+                return Err(FlameError::InvalidState(format!(
+                    "Session <{}> is not open",
+                    ssn_ptr.id
+                )));
+            }
+            ssn_ptr.update_task(&updated_task)?;
+        }
 
-        self.event_manager.record_event(
+        self.record_event(
             EventOwner::from(updated_task.gid()),
             Event {
                 code: task_state.into(),
                 message: Some(format!("Task state was updated to <{:?}>", task_state)),
                 creation_time: Utc::now(),
             },
-        )?;
+        )
+        .await?;
 
         Ok(())
     }
@@ -990,8 +1046,16 @@ impl Storage {
             Err(e) => return Err(e),
         };
 
-        let mut ssn_ptr = lock_ptr!(ssn)?;
-        ssn_ptr.update_task(&updated_task)?;
+        {
+            let mut ssn_ptr = lock_ptr!(ssn)?;
+            if ssn_ptr.status.state != SessionState::Open {
+                return Err(FlameError::InvalidState(format!(
+                    "Session <{}> is not open",
+                    ssn_ptr.id
+                )));
+            }
+            ssn_ptr.update_task(&updated_task)?;
+        }
 
         let event_message = match task_state {
             TaskState::Failed => {
@@ -1000,14 +1064,15 @@ impl Storage {
             _ => format!("Task was completed with state <{:?}>", task_state),
         };
 
-        self.event_manager.record_event(
+        self.record_event(
             EventOwner::from(updated_task.gid()),
             Event {
                 code: updated_task.state.into(),
                 message: Some(event_message),
                 creation_time: Utc::now(),
             },
-        )?;
+        )
+        .await?;
 
         Ok(())
     }
@@ -1106,8 +1171,29 @@ impl Storage {
 
     pub async fn record_event(&self, owner: EventOwner, event: Event) -> Result<(), FlameError> {
         trace_fn!("Storage::record_event");
-        self.event_manager.record_event(owner, event)
+        let session = self.get_session_ptr(owner.session_id.clone())?;
+        let session = lock_ptr!(session)?;
+        // Serialize event recording with cached Closed publication and cleanup.
+        // Late diagnostic notifications must not block executor cleanup.
+        if session.status.state == SessionState::Closed {
+            return Ok(());
+        }
+        let session_id = owner.session_id.clone();
+        event_result(
+            self.event_manager.record_event(owner, event),
+            "record",
+            &session_id,
+        );
+        Ok(())
     }
+}
+
+/// Events are diagnostic: a failure is logged and never fails the operation.
+fn event_result<T: Default>(result: Result<T, FlameError>, action: &str, session_id: &str) -> T {
+    result.unwrap_or_else(|e| {
+        tracing::error!("Failed to {action} events of session <{session_id}>: {e}");
+        T::default()
+    })
 }
 
 #[cfg(test)]
@@ -1136,3 +1222,326 @@ mod load_data_tests;
 
 #[cfg(test)]
 mod derive_events_path_tests;
+
+#[cfg(test)]
+mod event_lifecycle_tests {
+    use super::*;
+    use crate::events::EventManager;
+
+    fn event(message: &str) -> Event {
+        Event {
+            code: 1,
+            message: Some(message.to_string()),
+            creation_time: Utc::now(),
+        }
+    }
+
+    async fn test_storage(url: &str, events: EventManagerPtr) -> Storage {
+        let context = FlameClusterContext {
+            cluster: crate::ctx::FlameCluster {
+                storage: "none".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut storage = (*new_ptr(&context).await.unwrap()).clone();
+        storage.engine = engine::connect(url).await.unwrap();
+        storage.event_manager = events;
+        storage
+    }
+
+    fn test_urls(dir: &std::path::Path) -> [String; 3] {
+        [
+            "none".to_string(),
+            format!("sqlite://{}", dir.join("events.db").display()),
+            format!("fs://{}", dir.join("filesystem").display()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn close_removes_session_and_task_events_and_skips_late_writes() {
+        let engine_dir = tempfile::tempdir().unwrap();
+        for url in test_urls(engine_dir.path()) {
+            let dir = tempfile::tempdir().unwrap();
+            let events = Arc::new(FsEventManager::new(dir.path().to_str().unwrap()).unwrap());
+            let storage = test_storage(&url, events).await;
+            let session = storage
+                .create_session(SessionAttributes {
+                    id: "close-events".to_string(),
+                    application: "test-app".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let owner = EventOwner::session(session.id.clone());
+            storage
+                .record_event(owner.clone(), event("session"))
+                .await
+                .unwrap();
+            storage
+                .record_event(
+                    EventOwner {
+                        session_id: session.id.clone(),
+                        task_id: 1,
+                    },
+                    event("task"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                storage
+                    .get_session(session.id.clone())
+                    .unwrap()
+                    .events
+                    .len(),
+                1
+            );
+
+            let closed = storage.close_session(session.id.clone()).await.unwrap();
+            assert_eq!(closed.status.state, SessionState::Closed);
+            assert!(closed.events.is_empty());
+            assert!(storage
+                .get_session(session.id.clone())
+                .unwrap()
+                .events
+                .is_empty());
+            assert!(!dir.path().join(&session.id).exists());
+            storage.record_event(owner, event("late")).await.unwrap();
+            assert!(!dir.path().join(&session.id).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_close_preserves_open_session_events() {
+        let engine_dir = tempfile::tempdir().unwrap();
+        for url in test_urls(engine_dir.path()) {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = test_storage(
+                &url,
+                Arc::new(FsEventManager::new(dir.path().to_str().unwrap()).unwrap()),
+            )
+            .await;
+            let id = "running-events".to_string();
+            storage
+                .create_session(SessionAttributes {
+                    id: id.clone(),
+                    application: "test-app".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let owner = EventOwner::session(id.clone());
+            storage
+                .record_event(owner.clone(), event("before"))
+                .await
+                .unwrap();
+            let task = storage.create_task(id.clone(), None, None).await.unwrap();
+            storage
+                .update_task_state(
+                    storage.get_session_ptr(id.clone()).unwrap(),
+                    storage.get_task_ptr(task.gid()).unwrap(),
+                    TaskState::Running,
+                    None,
+                )
+                .await
+                .unwrap();
+            let previous = storage.get_task(id.clone(), task.id).unwrap().events.len();
+            assert!(storage.close_session(id.clone()).await.is_err());
+            let session = storage.get_session(id.clone()).unwrap();
+            assert_eq!(session.status.state, SessionState::Open);
+            assert_eq!(session.events[0].message.as_deref(), Some("before"));
+            assert_eq!(
+                storage.get_task(id.clone(), task.id).unwrap().events.len(),
+                previous
+            );
+            assert!(dir.path().join(&id).exists());
+            storage.record_event(owner, event("after")).await.unwrap();
+            assert_eq!(storage.get_session(id).unwrap().events.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_drops_events_from_writers_with_a_retained_cache_pointer() {
+        let engine_dir = tempfile::tempdir().unwrap();
+        for url in test_urls(engine_dir.path()) {
+            let events = Arc::new(MemoryEventManager::new());
+            let storage = test_storage(&url, events.clone()).await;
+            let id = "delete-events".to_string();
+            storage
+                .create_session(SessionAttributes {
+                    id: id.clone(),
+                    application: "test-app".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let retained = storage.get_session_ptr(id.clone()).unwrap();
+            storage
+                .record_event(EventOwner::session(id.clone()), event("before"))
+                .await
+                .unwrap();
+            if url != "none" {
+                // Persistent engines require Closed before deletion. Keep the
+                // retained cache pointer Open to model a delayed cache writer.
+                storage.engine.close_session(id.clone()).await.unwrap();
+            }
+            storage.delete_session(id.clone()).await.unwrap();
+            assert_eq!(
+                lock_ptr!(retained).unwrap().status.state,
+                SessionState::Closed
+            );
+            assert!(matches!(
+                storage
+                    .record_event(EventOwner::session(id.clone()), event("late"))
+                    .await,
+                Err(FlameError::NotFound(_))
+            ));
+            assert!(events
+                .find_events(EventOwner::session(id))
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_cleans_closed_events_and_keeps_open_events() {
+        let engine_dir = tempfile::tempdir().unwrap();
+        for url in test_urls(engine_dir.path()).into_iter().skip(1) {
+            let dir = tempfile::tempdir().unwrap();
+            let events = Arc::new(FsEventManager::new(dir.path().to_str().unwrap()).unwrap());
+            let storage = test_storage(&url, events).await;
+            for id in ["closed", "open"] {
+                storage
+                    .create_session(SessionAttributes {
+                        id: id.to_string(),
+                        application: "test-app".to_string(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                storage
+                    .record_event(EventOwner::session(id.to_string()), event(id))
+                    .await
+                    .unwrap();
+            }
+            // Model an older server or a crash after persisting Closed but before
+            // releasing its event files.
+            storage
+                .engine
+                .close_session("closed".to_string())
+                .await
+                .unwrap();
+            let recovered = Storage {
+                sessions: stdng::new_ptr(HashMap::new()),
+                event_manager: Arc::new(FsEventManager::new(dir.path().to_str().unwrap()).unwrap()),
+                ..storage.clone()
+            };
+            recovered.load_data().await.unwrap();
+            assert!(recovered
+                .get_session("closed".to_string())
+                .unwrap()
+                .events
+                .is_empty());
+            assert!(!dir.path().join("closed").exists());
+            assert_eq!(
+                recovered.get_session("open".to_string()).unwrap().events[0]
+                    .message
+                    .as_deref(),
+                Some("open")
+            );
+            assert!(dir.path().join("open").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_preserves_running_task_history_in_closed_sessions() {
+        let engine_dir = tempfile::tempdir().unwrap();
+        let url = test_urls(engine_dir.path())[1].clone();
+        let storage = test_storage(&url, Arc::new(MemoryEventManager::new())).await;
+        let id = "closed-running-history".to_string();
+        storage
+            .create_session(SessionAttributes {
+                id: id.clone(),
+                application: "test-app".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let task = storage.create_task(id.clone(), None, None).await.unwrap();
+        storage.engine.close_session(id.clone()).await.unwrap();
+        // Older engines allowed late task writers to publish Running after
+        // Closed. Recovery preserves that history without retrying its task.
+        let persisted = storage
+            .engine
+            .update_task_state(task.gid(), TaskState::Running, None)
+            .await
+            .unwrap();
+        let recovered = Storage {
+            sessions: stdng::new_ptr(HashMap::new()),
+            ..storage.clone()
+        };
+        recovered.load_data().await.unwrap();
+        assert_eq!(
+            recovered.get_session(id.clone()).unwrap().status.state,
+            SessionState::Closed
+        );
+        let history = recovered.get_task_metadata(id, task.id).unwrap();
+        assert_eq!(history.state, TaskState::Running);
+        assert_eq!(history.version, persisted.version);
+        let on_disk = storage.engine.get_task(task.gid()).await.unwrap();
+        assert_eq!(on_disk.state, TaskState::Running);
+        assert_eq!(on_disk.version, persisted.version);
+    }
+
+    struct CleanupFailure(MemoryEventManager);
+
+    impl EventManager for CleanupFailure {
+        fn setup_events(&self, id: SessionID) -> Result<(), FlameError> {
+            self.0.setup_events(id)
+        }
+        fn record_event(&self, owner: EventOwner, event: Event) -> Result<(), FlameError> {
+            self.0.record_event(owner, event)
+        }
+        fn find_events(&self, owner: EventOwner) -> Result<Vec<Event>, FlameError> {
+            self.0.find_events(owner)
+        }
+        fn remove_events(&self, _id: SessionID) -> Result<(), FlameError> {
+            Err(FlameError::Storage("cleanup failed".to_string()))
+        }
+        fn clear(&self) -> Result<(), FlameError> {
+            self.0.clear()
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_keeps_cached_session_closed() {
+        let storage =
+            test_storage("none", Arc::new(CleanupFailure(MemoryEventManager::new()))).await;
+        storage
+            .create_session(SessionAttributes {
+                id: "failure".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Event cleanup failure is logged, not returned.
+        storage.close_session("failure".to_string()).await.unwrap();
+        assert_eq!(
+            storage
+                .get_session("failure".to_string())
+                .unwrap()
+                .status
+                .state,
+            SessionState::Closed
+        );
+        storage
+            .record_event(EventOwner::session("failure".to_string()), event("late"))
+            .await
+            .unwrap();
+        assert!(storage
+            .get_session("failure".to_string())
+            .unwrap()
+            .events
+            .is_empty());
+    }
+}

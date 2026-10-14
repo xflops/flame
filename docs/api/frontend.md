@@ -165,7 +165,8 @@ Opens an existing session or creates one if spec is provided.
 
 ### CloseSession
 
-Closes a session, preventing new task submissions.
+Closes a session, preventing new task submissions. A successful close removes all
+session and task events; events are retained while the session remains open.
 
 **Request:** `CloseSessionRequest`
 

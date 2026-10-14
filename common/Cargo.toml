@@ -10,6 +10,7 @@ rpc = { path = "../rpc"}
 stdng = { path = "../stdng" }
 
 tokio = { workspace = true }
+parking_lot = { version = "0.12", features = ["arc_lock"] }
 tonic = { workspace = true }
 prost = { workspace = true }
 tracing = { workspace = true }

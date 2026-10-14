@@ -1950,6 +1950,58 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn failed_bind_after_session_close_moves_executor_to_unbinding_without_events() {
+            let storage = create_test_storage_with_retry_limits(1).await;
+            let controller = new_ptr(storage);
+            let ssn_id = format!("closed-bind-failed-{}", Uuid::new_v4());
+            let executor_id = create_binding_executor(&controller, &ssn_id).await;
+            controller
+                .record_event(
+                    EventOwner::session(ssn_id.clone()),
+                    Event {
+                        code: SESSION_BIND_FAILED,
+                        message: Some("earlier binding failure".to_string()),
+                        creation_time: chrono::Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                controller.get_session(ssn_id.clone()).unwrap().events.len(),
+                1
+            );
+
+            controller.close_session(ssn_id.clone()).await.unwrap();
+            assert_eq!(
+                controller.get_executor(executor_id.clone()).unwrap().state,
+                ExecutorState::Binding
+            );
+
+            // The worker can finish its failed bind after the session has closed.
+            // Both failure and retry-limit events must be ignored without
+            // preventing the executor from completing its unbinding handshake.
+            fail_binding(&controller, &executor_id).await.unwrap();
+
+            let executor = controller.get_executor(executor_id.clone()).unwrap();
+            assert_eq!(executor.state, ExecutorState::Unbinding);
+            assert_eq!(executor.ssn_id, None);
+            assert_eq!(executor.task_id, None);
+            let session = controller.get_session(ssn_id.clone()).unwrap();
+            assert_eq!(session.status.state, SessionState::Closed);
+            assert!(session.events.is_empty());
+
+            controller
+                .unbind_executor_completed(executor_id.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                controller.get_executor(executor_id).unwrap().state,
+                ExecutorState::Idle
+            );
+            assert!(controller.get_session(ssn_id).unwrap().events.is_empty());
+        }
+
+        #[tokio::test]
         async fn records_retry_limit_once_and_allows_count_to_exceed_limit() {
             let storage = create_test_storage_with_retry_limits(2).await;
             let controller = new_ptr(storage.clone());

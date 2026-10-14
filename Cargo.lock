@@ -859,6 +859,7 @@ dependencies = [
  "crc32fast",
  "gethostname",
  "humantime",
+ "parking_lot",
  "pprof",
  "prost 0.14.3",
  "rand 0.9.4",

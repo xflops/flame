@@ -23,6 +23,9 @@ pub use fs::FsEventManager;
 pub use memory::MemoryEventManager;
 
 pub trait EventManager: Send + Sync {
+    /// Prepare event storage for a new session. Idempotent; the storage then lives
+    /// until `remove_events`.
+    fn setup_events(&self, session_id: SessionID) -> Result<(), FlameError>;
     fn record_event(&self, owner: EventOwner, event: Event) -> Result<(), FlameError>;
     fn find_events(&self, owner: EventOwner) -> Result<Vec<Event>, FlameError>;
     fn remove_events(&self, session_id: SessionID) -> Result<(), FlameError>;
@@ -37,6 +40,7 @@ mod tests {
     use chrono::Utc;
 
     fn test_event_manager_impl(manager: &dyn EventManager) {
+        manager.setup_events(String::from("1")).unwrap();
         manager
             .record_event(
                 EventOwner {
@@ -82,6 +86,7 @@ mod tests {
     fn test_fs_event_manager_multiple_events_same_task() {
         let temp_dir = tempfile::tempdir().unwrap();
         let manager = FsEventManager::new(temp_dir.path().to_str().unwrap()).unwrap();
+        manager.setup_events("session-1".to_string()).unwrap();
 
         let owner = EventOwner {
             session_id: "session-1".to_string(),
@@ -114,6 +119,7 @@ mod tests {
         let manager = FsEventManager::new(temp_dir.path().to_str().unwrap()).unwrap();
 
         let session_id = "session-1".to_string();
+        manager.setup_events(session_id.clone()).unwrap();
 
         for task_id in 1..=3 {
             manager
@@ -147,6 +153,9 @@ mod tests {
     fn test_fs_event_manager_multiple_sessions() {
         let temp_dir = tempfile::tempdir().unwrap();
         let manager = FsEventManager::new(temp_dir.path().to_str().unwrap()).unwrap();
+        for i in 1..=3 {
+            manager.setup_events(format!("session-{}", i)).unwrap();
+        }
 
         for i in 1..=3 {
             manager
@@ -182,6 +191,7 @@ mod tests {
         let manager = FsEventManager::new(temp_dir.path().to_str().unwrap()).unwrap();
 
         let session_id = "session-to-remove".to_string();
+        manager.setup_events(session_id.clone()).unwrap();
         let owner = EventOwner {
             session_id: session_id.clone(),
             task_id: 1,
@@ -225,6 +235,7 @@ mod tests {
     fn test_fs_event_manager_find_nonexistent_task() {
         let temp_dir = tempfile::tempdir().unwrap();
         let manager = FsEventManager::new(temp_dir.path().to_str().unwrap()).unwrap();
+        manager.setup_events("session-1".to_string()).unwrap();
 
         manager
             .record_event(
@@ -261,6 +272,7 @@ mod tests {
 
         {
             let manager = FsEventManager::new(&path).unwrap();
+            manager.setup_events(owner.session_id.clone()).unwrap();
             manager
                 .record_event(
                     owner.clone(),
@@ -291,6 +303,7 @@ mod tests {
 
         let events_path = format!("{}/events", temp_path);
         let manager = FsEventManager::new(&events_path).unwrap();
+        manager.setup_events("test-session".to_string()).unwrap();
 
         let owner = EventOwner {
             session_id: "test-session".to_string(),
@@ -318,6 +331,7 @@ mod tests {
     fn test_fs_event_manager_empty_message() {
         let temp_dir = tempfile::tempdir().unwrap();
         let manager = FsEventManager::new(temp_dir.path().to_str().unwrap()).unwrap();
+        manager.setup_events("session-1".to_string()).unwrap();
 
         let owner = EventOwner {
             session_id: "session-1".to_string(),

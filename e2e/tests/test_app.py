@@ -930,7 +930,9 @@ class TestFlmrunApplication:
             constructor_args=(10,),
         )
         common_data_bytes = serialize_service_context(ctx, app_name)
-        ssn = flamepy.create_session(app_name, common_data_bytes)
+        # Retained class state belongs to an executor. Keep one executor bound
+        # so sequential calls exercise the same object rather than autoscaling.
+        ssn = flamepy.create_session(app_name, common_data_bytes, min_instances=1, max_instances=1)
 
         try:
             req = app.ServiceRequest(method="increment")
