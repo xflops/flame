@@ -222,7 +222,7 @@ impl StreamHandler {
                 ticker.tick().await;
 
                 // Refresh and collect current node status
-                let (node_name, status) = match node_ptr.lock() {
+                let (node_name, status) = match lock_ptr!(node_ptr) {
                     Ok(mut node) => {
                         // Refresh node to get current resource status
                         if let Err(error) = Self::refresh_node(&mut node, &dev_mgr) {

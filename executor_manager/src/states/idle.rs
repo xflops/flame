@@ -14,7 +14,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use stdng::{logs::TraceFn, trace_fn};
+use stdng::{async_ptr, await_ptr, lock_ptr, logs::TraceFn, trace_fn};
 
 use crate::appmgr::ApplicationManager;
 use crate::client::BackendClient;
@@ -136,7 +136,7 @@ impl State for IdleState {
         };
 
         let enter_result = {
-            let mut shim = shim_ptr.lock().await;
+            let mut shim = await_ptr!(shim_ptr);
             shim.on_session_enter(&ssn).await
         };
         let response = match enter_result {
@@ -163,8 +163,7 @@ impl State for IdleState {
                     message: None,
                 }),
                 response.executor_attributes.map(|attributes| {
-                    attributes
-                        .lock()
+                    lock_ptr!(attributes)
                         .expect("executor attributes mutex poisoned")
                         .clone()
                 }),
@@ -192,11 +191,11 @@ impl IdleState {
     ) -> Result<(), FlameError> {
         self.executor.shim_instance = Some(shim.clone());
         let result = {
-            let mut service = shim.lock().await;
+            let mut service = await_ptr!(shim);
             service.create_instance(app_mgr).await
         };
         if result.is_err() {
-            let cleanup = shim.lock().await.destroy_instance().await;
+            let cleanup = await_ptr!(shim).destroy_instance().await;
             if let Err(error) = cleanup {
                 // Preserve the tracked shim and allocation. The executor loop
                 // retries destruction through Releasing, rather than rebinding
@@ -339,11 +338,11 @@ mod tests {
             client: BackendClient::default(),
             executor,
         };
-        let shim: shims::ShimPtr = Arc::new(tokio::sync::Mutex::new(CountDestroy {
+        let shim: shims::ShimPtr = async_ptr(CountDestroy {
             destroyed: destroyed.clone(),
             fail_start,
             fail_cleanup,
-        }));
+        });
         (state, shim, destroyed, workdir, allocator)
     }
 
@@ -404,7 +403,7 @@ mod tests {
             state.executor.shim_instance.as_ref().unwrap(),
             &shim
         ));
-        shim.lock().await.destroy_instance().await.unwrap();
+        await_ptr!(shim).destroy_instance().await.unwrap();
         assert_eq!(destroyed.load(Ordering::SeqCst), 1);
         assert!(allocator
             .allocate(&crate::devices::test_executor((request).clone()))

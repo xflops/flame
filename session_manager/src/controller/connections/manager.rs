@@ -17,13 +17,13 @@ limitations under the License.
 //! operations to the appropriate state handlers via the State Pattern.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
 use common::FlameError;
-use stdng::{lock_ptr, MutexPtr};
+use stdng::{lock_ptr, new_ptr, MutexPtr};
 
 use super::from;
 use crate::model::{
@@ -65,7 +65,7 @@ impl<C: ConnectionCallbacks> ConnectionManager<C> {
     /// Creates a new ConnectionManager with custom drain timeout.
     pub fn with_timeout(callbacks: C, drain_timeout: Duration) -> Self {
         ConnectionManager {
-            connections: Arc::new(Mutex::new(HashMap::new())),
+            connections: new_ptr(HashMap::new()),
             drain_timeout,
             callbacks: Arc::new(callbacks),
         }
@@ -92,7 +92,7 @@ impl<C: ConnectionCallbacks> ConnectionManager<C> {
             } else {
                 // Create new connection in Connected state
                 let conn = NodeConnection::new(node_name.to_string());
-                let conn_ptr = Arc::new(Mutex::new(conn));
+                let conn_ptr = new_ptr(conn);
                 connections.insert(node_name.to_string(), conn_ptr.clone());
                 tracing::info!("Node <{}> connection created", node_name);
                 conn_ptr

@@ -13,7 +13,8 @@ limitations under the License.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use stdng::{lock_ptr, MutexPtr};
 
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -52,7 +53,7 @@ const MAX_EXECUTOR_ATTRIBUTES_BYTES: usize = 64 * 1_024;
 
 #[derive(Clone, Debug, Default)]
 pub struct Publisher {
-    attributes: Arc<Mutex<HashSet<Vec<u8>>>>,
+    attributes: MutexPtr<HashSet<Vec<u8>>>,
     attributes_bytes: Arc<AtomicUsize>,
 }
 
@@ -83,10 +84,7 @@ impl Publisher {
             }
         }
 
-        let mut current = self
-            .attributes
-            .lock()
-            .map_err(|_| FlameError::Internal("publisher mutex poisoned".to_string()))?;
+        let mut current = lock_ptr!(self.attributes)?;
         let current_bytes = self.attributes_bytes.load(Ordering::Relaxed);
         let (added_count, added_bytes) = snapshot
             .difference(&current)
@@ -108,7 +106,7 @@ impl Publisher {
 
     #[doc(hidden)]
     pub fn take(&self) -> rpc::ExecutorAttributes {
-        let mut attributes = self.attributes.lock().expect("publisher mutex poisoned");
+        let mut attributes = lock_ptr!(self.attributes).expect("publisher mutex poisoned");
         self.attributes_bytes.store(0, Ordering::Relaxed);
         rpc::ExecutorAttributes {
             attr: std::mem::take(&mut *attributes).into_iter().collect(),
@@ -609,9 +607,7 @@ mod tests {
         .into_inner();
         assert_eq!(failed_enter.result.unwrap().return_code, -1);
         assert!(failed_enter.attributes.is_none());
-        assert!(publisher
-            .attributes
-            .lock()
+        assert!(lock_ptr!(publisher.attributes)
             .unwrap()
             .contains(b"failed-enter-key".as_slice()));
 
@@ -692,9 +688,7 @@ mod tests {
         Instance::on_session_leave(&shim, Request::new(rpc::EmptyRequest {}))
             .await
             .unwrap();
-        assert!(publisher
-            .attributes
-            .lock()
+        assert!(lock_ptr!(publisher.attributes)
             .unwrap()
             .contains(b"retained-key".as_slice()));
 

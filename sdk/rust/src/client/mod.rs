@@ -14,13 +14,13 @@ limitations under the License.
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use chrono::{DateTime, Duration, Utc};
 // use serde::{Deserialize, Serialize};
 use serde_derive::{Deserialize, Serialize};
-use stdng::{lock_ptr, trace_fn};
+use stdng::{lock_ptr, trace_fn, MutexPtr};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
@@ -120,7 +120,7 @@ pub struct Event {
 #[derive(Clone)]
 pub struct Connection {
     pub(crate) channel: Channel,
-    watch_managers: Arc<Mutex<HashMap<SessionID, Arc<WatchManager>>>>,
+    watch_managers: MutexPtr<HashMap<SessionID, Arc<WatchManager>>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -706,7 +706,7 @@ pub struct Task {
     pub events: Vec<Event>,
 }
 
-pub type TaskInformerPtr = Arc<Mutex<dyn TaskInformer>>;
+pub type TaskInformerPtr = MutexPtr<dyn TaskInformer>;
 
 pub trait TaskInformer: Send + Sync + 'static {
     fn on_update(&mut self, task: Task);
@@ -795,10 +795,7 @@ where
 
 impl Connection {
     fn watch_manager(&self, session_id: &SessionID) -> Arc<WatchManager> {
-        let mut managers = self
-            .watch_managers
-            .lock()
-            .expect("watch manager lock poisoned");
+        let mut managers = lock_ptr!(self.watch_managers).expect("watch manager lock poisoned");
         managers
             .entry(session_id.clone())
             .or_insert_with(|| Arc::new(WatchManager::default()))
@@ -933,9 +930,7 @@ impl Connection {
             })
             .await?;
 
-        let manager = self
-            .watch_managers
-            .lock()
+        let manager = lock_ptr!(self.watch_managers)
             .expect("watch manager lock poisoned")
             .remove(id);
         if let Some(manager) = manager {
@@ -1754,6 +1749,7 @@ mod tests {
     use bytes::Bytes;
     use chrono::TimeZone;
     use serde_derive::{Deserialize, Serialize};
+    use stdng::new_ptr;
 
     #[test]
     fn node_conversion_preserves_gpu_capacity() {
@@ -1857,7 +1853,7 @@ mod tests {
             .clone()
             .attach_session(&response, FlameClient::new(channel))
             .unwrap();
-        assert!(connection.watch_managers.lock().unwrap().is_empty());
+        assert!(lock_ptr!(connection.watch_managers).unwrap().is_empty());
         let first_manager = first.connection.as_ref().unwrap().watch_manager(&first.id);
         let second_manager = second
             .connection
@@ -1899,11 +1895,9 @@ mod tests {
         let live = connection.watch_manager(&"ssn-1".to_string());
         let weak = Arc::downgrade(&live);
         drop(live);
-        assert_eq!(connection.watch_managers.lock().unwrap().len(), 1);
+        assert_eq!(lock_ptr!(connection.watch_managers).unwrap().len(), 1);
         assert!(weak.upgrade().is_some());
-        let manager = connection
-            .watch_managers
-            .lock()
+        let manager = lock_ptr!(connection.watch_managers)
             .unwrap()
             .remove("ssn-1")
             .unwrap();
@@ -1912,13 +1906,13 @@ mod tests {
         assert!(weak.upgrade().is_none());
     }
 
-    struct ErrorRecorder(Arc<Mutex<Vec<String>>>);
+    struct ErrorRecorder(MutexPtr<Vec<String>>);
 
     impl TaskInformer for ErrorRecorder {
         fn on_update(&mut self, _task: Task) {}
 
         fn on_error(&mut self, error: FlameError) {
-            self.0.lock().unwrap().push(error.to_string());
+            lock_ptr!(self.0).unwrap().push(error.to_string());
         }
     }
 
@@ -1958,14 +1952,14 @@ mod tests {
             requests,
             task: stream.abort_handle(),
         });
-        let errors = Arc::new(Mutex::new(Vec::new()));
-        let informer: TaskInformerPtr = Arc::new(Mutex::new(ErrorRecorder(errors.clone())));
+        let errors = new_ptr(Vec::new());
+        let informer: TaskInformerPtr = new_ptr(ErrorRecorder(errors.clone()));
 
         assert!(session
             .watch_task("ssn-1".to_string(), "task-1".to_string(), informer)
             .await
             .is_err());
-        assert_eq!(errors.lock().unwrap().len(), 1);
+        assert_eq!(lock_ptr!(errors).unwrap().len(), 1);
         stream.abort();
     }
 

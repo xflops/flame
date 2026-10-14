@@ -12,11 +12,11 @@ limitations under the License.
 */
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
-use stdng::{lock_ptr, MutexPtr};
+use stdng::{lock_ptr, new_ptr, MutexPtr};
 
 use common::apis::{
     Application, ApplicationFilter, ApplicationState, Executor, ExecutorFilter, ExecutorID,
@@ -64,12 +64,12 @@ impl SnapShot {
     pub fn new_with_session_retry_limits(session_retry_limits: u32) -> Self {
         SnapShot {
             session_retry_limits,
-            applications: Arc::new(Mutex::new(HashMap::new())),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            ssn_index: Arc::new(Mutex::new(HashMap::new())),
-            executors: Arc::new(Mutex::new(HashMap::new())),
-            exec_index: Arc::new(Mutex::new(HashMap::new())),
-            nodes: Arc::new(Mutex::new(HashMap::new())),
+            applications: new_ptr(HashMap::new()),
+            sessions: new_ptr(HashMap::new()),
+            ssn_index: new_ptr(HashMap::new()),
+            executors: new_ptr(HashMap::new()),
+            exec_index: new_ptr(HashMap::new()),
+            nodes: new_ptr(HashMap::new()),
         }
     }
 

@@ -15,8 +15,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use stdng::{logs::TraceFn, trace_fn};
-use tokio::sync::Mutex;
+use stdng::{async_ptr, logs::TraceFn, trace_fn};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -35,7 +34,7 @@ wasmtime::component::bindgen!({
 
 // Note: We use synchronous Wasm calls here because wasmtime-wasi 43's WasiCtx
 // is not Sync-safe, which prevents using async instantiation with the Shim trait's
-// Arc<Mutex<dyn Shim>> pattern. The Wasm tasks are expected to be short-lived
+// AsyncPtr<dyn Shim> pattern. The Wasm tasks are expected to be short-lived
 // and non-blocking. For long-running Wasm tasks, consider using tokio::task::spawn_blocking.
 
 pub struct WasmShim {
@@ -53,11 +52,11 @@ impl WasmShim {
     pub fn new_ptr(_: &Executor, app: &apis::ApplicationContext) -> ShimPtr {
         trace_fn!("WasmShim::new_ptr");
 
-        Arc::new(Mutex::new(WasmShim {
+        async_ptr(WasmShim {
             app: app.clone(),
             runtime: None,
             session_context: None,
-        }))
+        })
     }
 }
 

@@ -295,7 +295,8 @@ fn path_error(path: &Path, action: &str, error: std::io::Error) -> FlameError {
 mod tests {
     use std::ffi::OsString;
     use std::fs;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use stdng::{lock_ptr, new_ptr};
 
     use common::apis::{ApplicationState, SessionAttributes};
     use tempfile::tempdir;
@@ -490,7 +491,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconciliation_registers_missing_application_without_update() {
-        let updates = Arc::new(Mutex::new(Vec::new()));
+        let updates = new_ptr(Vec::new());
         let captured_updates = updates.clone();
         reconcile(
             vec![ConfiguredApplication {
@@ -501,7 +502,7 @@ mod tests {
             move |name, _attributes| {
                 let updates = captured_updates.clone();
                 async move {
-                    updates.lock().unwrap().push(name);
+                    lock_ptr!(updates).unwrap().push(name);
                     Ok(())
                 }
             },
@@ -509,12 +510,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(updates.lock().unwrap().is_empty());
+        assert!(lock_ptr!(updates).unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn reconciliation_updates_existing_application_with_manifest() {
-        let updates = Arc::new(Mutex::new(Vec::new()));
+        let updates = new_ptr(Vec::new());
         let captured_updates = updates.clone();
         let attributes = ApplicationAttributes {
             command: Some("configured-command".into()),
@@ -529,7 +530,7 @@ mod tests {
             move |name, attributes| {
                 let updates = captured_updates.clone();
                 async move {
-                    updates.lock().unwrap().push((name, attributes.command));
+                    lock_ptr!(updates).unwrap().push((name, attributes.command));
                     Ok(())
                 }
             },
@@ -538,7 +539,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            *updates.lock().unwrap(),
+            *lock_ptr!(updates).unwrap(),
             vec![(
                 "existing".to_string(),
                 Some("configured-command".to_string())

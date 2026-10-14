@@ -28,7 +28,7 @@ pub use python::{get_python_runtime, PythonRuntime};
 use std::string::FromUtf8Error;
 
 use prost::UnknownEnumValue;
-use std::sync::Arc;
+
 use thiserror::Error;
 use time::macros::format_description;
 use tonic::Status;
@@ -125,12 +125,6 @@ impl From<std::io::Error> for FlameError {
     fn from(value: std::io::Error) -> Self {
         FlameError::Storage(value.to_string())
     }
-}
-
-pub type AsyncMutexPtr<T> = Arc<tokio::sync::Mutex<T>>;
-
-pub fn new_async_ptr<T>(t: T) -> AsyncMutexPtr<T> {
-    Arc::new(tokio::sync::Mutex::new(t))
 }
 
 pub const FLAME_HOME: &str = "FLAME_HOME";

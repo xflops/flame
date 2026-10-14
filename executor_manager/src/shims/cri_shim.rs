@@ -26,7 +26,7 @@ use cri_rs::{
     ContainerRuntimeState, ContainerSecurityContext, ContainerSpec, Mount, ResourceLimits,
     WorkloadFilter, WorkloadHandle, WorkloadManager, WorkloadMetadata, WorkloadSpec,
 };
-use tokio::sync::Mutex;
+use stdng::{async_ptr, await_ptr};
 use url::Url;
 use uuid::Uuid;
 
@@ -59,14 +59,14 @@ pub struct CriShim {
 
 impl CriShim {
     pub fn new_ptr(executor: &Executor, app: Option<&ApplicationContext>) -> ShimPtr {
-        Arc::new(Mutex::new(Self {
+        async_ptr(Self {
             executor: executor.clone(),
             app: app.cloned(),
             manager: None,
             handle: None,
             instance_client: None,
             work_dir: None,
-        }))
+        })
     }
 
     /// Reconnect a surviving executor service after device assignments have
@@ -1014,9 +1014,7 @@ mod tests {
         let mut executor = test_executor();
         executor.id = "../executor".into();
         let shim = CriShim::new_ptr(&executor, None);
-        let error = shim
-            .lock()
-            .await
+        let error = await_ptr!(shim)
             .create_instance(Arc::new(ApplicationManager::new().unwrap()))
             .await
             .unwrap_err();

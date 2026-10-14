@@ -12,8 +12,8 @@ limitations under the License.
 */
 
 use std::convert::TryFrom;
-use std::sync::{Arc, Mutex};
-use stdng::{lock_ptr, logs::TraceFn, trace_fn};
+use std::sync::Arc;
+use stdng::{lock_ptr, logs::TraceFn, trace_fn, MutexPtr};
 
 use crate::appmgr::ApplicationManager;
 use crate::client::BackendClient;
@@ -55,7 +55,7 @@ pub struct Executor {
     pub state: ExecutorState,
 }
 
-pub type ExecutorPtr = Arc<Mutex<Executor>>;
+pub type ExecutorPtr = MutexPtr<Executor>;
 
 impl TryFrom<&rpc::Executor> for Executor {
     type Error = FlameError;
@@ -164,7 +164,7 @@ impl Executor {
 pub fn start(client: BackendClient, executor: ExecutorPtr) -> Result<(), FlameError> {
     tokio::task::spawn(async move {
         loop {
-            let exec = match executor.lock() {
+            let exec = match lock_ptr!(executor) {
                 Ok(exec) => exec.clone(),
                 Err(error) => {
                     tracing::error!("Failed to lock executor: {error}");
@@ -184,7 +184,7 @@ pub fn start(client: BackendClient, executor: ExecutorPtr) -> Result<(), FlameEr
             };
             match state.execute().await {
                 Ok(next) => {
-                    let mut shared = match executor.lock() {
+                    let mut shared = match lock_ptr!(executor) {
                         Ok(shared) => shared,
                         Err(error) => {
                             tracing::error!(executor_id = %exec.id, %error, "Failed to update executor state");
@@ -213,6 +213,7 @@ mod tests {
     use crate::devices::DeviceManager;
     use crate::shims::{SessionEnterResponse, Shim as ShimService, TaskInvokeResponse};
     use async_trait::async_trait;
+    use stdng::{async_ptr, await_ptr};
     use tokio::sync::Notify;
 
     struct DelayedDestroy {
@@ -289,15 +290,15 @@ mod tests {
             context: None,
             app_mgr: None,
             dev_mgr: None,
-            shim_instance: Some(Arc::new(tokio::sync::Mutex::new(DelayedDestroy {
+            shim_instance: Some(async_ptr(DelayedDestroy {
                 fail_first: false,
                 entered: entered.clone(),
                 finish: finish.clone(),
-            }))),
+            })),
             state: ExecutorState::Bound,
         };
         let shim = executor.shim_instance.clone().unwrap();
-        let cleanup = tokio::spawn(async move { shim.lock().await.destroy_instance().await });
+        let cleanup = tokio::spawn(async move { await_ptr!(shim).destroy_instance().await });
         entered.notified().await;
         assert!(allocator
             .allocate(&crate::devices::test_executor((request).clone()))
@@ -329,7 +330,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(executor.lock().unwrap().state, ExecutorState::Released);
+        assert_eq!(lock_ptr!(executor).unwrap().state, ExecutorState::Released);
     }
 
     #[tokio::test]
@@ -350,17 +351,17 @@ mod tests {
         metadata.state = ExecutorState::Releasing;
         let entered = Arc::new(Notify::new());
         let finish = Arc::new(Notify::new());
-        metadata.shim_instance = Some(Arc::new(tokio::sync::Mutex::new(DelayedDestroy {
+        metadata.shim_instance = Some(async_ptr(DelayedDestroy {
             fail_first: false,
             entered: entered.clone(),
             finish: finish.clone(),
-        })));
+        }));
         let executor = stdng::new_ptr(metadata);
         start(BackendClient::default(), executor.clone()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
             .await
             .unwrap();
-        assert_eq!(executor.lock().unwrap().state, ExecutorState::Releasing);
+        assert_eq!(lock_ptr!(executor).unwrap().state, ExecutorState::Releasing);
         let mut competing = crate::devices::test_executor(ResourceRequirement {
             gpu: 1,
             ..Default::default()
@@ -373,11 +374,11 @@ mod tests {
         assert!(workdir
             .path()
             .join(crate::devices::GPU)
-            .join(format!("{}.json", executor.lock().unwrap().id))
+            .join(format!("{}.json", lock_ptr!(executor).unwrap().id))
             .exists());
         assert!(devices.allocate(&competing).is_err());
-        assert_eq!(executor.lock().unwrap().state, ExecutorState::Releasing);
-        executor.lock().unwrap().state = ExecutorState::Released;
+        assert_eq!(lock_ptr!(executor).unwrap().state, ExecutorState::Releasing);
+        lock_ptr!(executor).unwrap().state = ExecutorState::Released;
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while Arc::strong_count(&executor) != 1 {
                 tokio::task::yield_now().await;
@@ -386,7 +387,7 @@ mod tests {
         .await
         .unwrap();
         assert!(devices.allocate(&competing).is_err());
-        devices.release(&executor.lock().unwrap()).unwrap();
+        devices.release(&lock_ptr!(executor).unwrap()).unwrap();
         assert!(devices.allocate(&competing).is_ok());
     }
 }

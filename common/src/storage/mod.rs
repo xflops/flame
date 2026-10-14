@@ -734,14 +734,14 @@ impl Storage {
         let Some(filter) = filter else {
             return Ok(exe_map
                 .values()
-                .filter_map(|exe_ptr| exe_ptr.lock().ok().map(|e| e.clone()))
+                .filter_map(|exe_ptr| lock_ptr!(exe_ptr).ok().map(|e| e.clone()))
                 .collect());
         };
 
         let exe_list: Vec<Executor> = exe_map
             .values()
             .filter_map(|exe_ptr| {
-                let exe = exe_ptr.lock().ok()?;
+                let exe = lock_ptr!(exe_ptr).ok()?;
 
                 // Filter by state if specified
                 if let Some(state) = filter.state {

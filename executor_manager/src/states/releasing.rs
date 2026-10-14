@@ -12,7 +12,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use stdng::{logs::TraceFn, trace_fn};
+use stdng::{await_ptr, logs::TraceFn, trace_fn};
 
 use crate::client::BackendClient;
 use crate::executor::Executor;
@@ -38,7 +38,7 @@ impl State for ReleasingState {
             None => None,
         };
         if let Some(shim_ptr) = shim_ptr {
-            shim_ptr.lock().await.destroy_instance().await?;
+            await_ptr!(shim_ptr).destroy_instance().await?;
             self.executor.shim_instance = None;
         }
 
@@ -75,7 +75,7 @@ mod tests {
     use crate::shims::{SessionEnterResponse, Shim as ShimService, ShimPtr, TaskInvokeResponse};
     use common::apis::{ResourceRequirement, SessionContext, Shim, TaskContext};
     use std::sync::Arc;
-    use tokio::sync::Mutex;
+    use stdng::async_ptr;
 
     struct TestShim;
 
@@ -126,7 +126,7 @@ mod tests {
         });
         executor.assignments = manager.allocate(&executor).unwrap();
         executor.dev_mgr = Some(manager.clone());
-        executor.shim_instance = Some(Arc::new(Mutex::new(TestShim)));
+        executor.shim_instance = Some(async_ptr(TestShim));
         executor.state = ExecutorState::Releasing;
         let saved = gpu_workdir
             .path()
@@ -167,7 +167,7 @@ mod tests {
             gpu: 1,
             ..Default::default()
         };
-        let shim: ShimPtr = Arc::new(Mutex::new(TestShim));
+        let shim: ShimPtr = async_ptr(TestShim);
         let executor = Executor {
             id: "executor-1".to_string(),
             application: "test-app".to_string(),
@@ -200,13 +200,7 @@ mod tests {
         assert!(allocator
             .allocate(&crate::devices::test_executor((request).clone()))
             .is_err());
-        state
-            .executor
-            .shim_instance
-            .as_ref()
-            .unwrap()
-            .lock()
-            .await
+        await_ptr!(state.executor.shim_instance.as_ref().unwrap())
             .destroy_instance()
             .await
             .unwrap();

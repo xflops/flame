@@ -20,7 +20,7 @@ use bytesize::ByteSize;
 use common::net::host_for_uri;
 use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 use regex::Regex;
-use stdng::{lock_ptr, new_ptr, MutexPtr};
+use stdng::{async_rw_ptr, lock_ptr, new_ptr, write_async, AsyncRWPtr, MutexPtr};
 use url::Url;
 
 use common::ctx::{FlameCache, FlameCluster};
@@ -396,7 +396,7 @@ pub struct ObjectCache {
     metadata: MutexPtr<HashMap<String, ObjectMetadata>>,
     eviction_policy: EvictionPolicyPtr,
     /// Per-key locks coordinate concurrent PUT/PATCH writes with GET snapshots.
-    key_locks: MutexPtr<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
+    key_locks: MutexPtr<HashMap<String, AsyncRWPtr<()>>>,
 }
 
 impl ObjectCache {
@@ -441,11 +441,11 @@ impl ObjectCache {
         Ok(())
     }
 
-    fn get_key_lock(&self, key: &str) -> Result<Arc<tokio::sync::RwLock<()>>, FlameError> {
+    fn get_key_lock(&self, key: &str) -> Result<AsyncRWPtr<()>, FlameError> {
         let mut locks = lock_ptr!(self.key_locks)?;
         Ok(locks
             .entry(key.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .or_insert_with(|| async_rw_ptr(()))
             .clone())
     }
 
@@ -501,7 +501,7 @@ impl ObjectCache {
 
         // Acquire per-key lock to prevent concurrent version increments
         let key_lock = self.get_key_lock(&key_str)?;
-        let _guard = key_lock.write().await;
+        let _guard = write_async!(key_lock);
 
         let version_from_memory = {
             let metadata = lock_ptr!(self.metadata)?;
@@ -593,7 +593,7 @@ impl ObjectCache {
 
         // Acquire per-key lock to prevent concurrent version increments
         let key_lock = self.get_key_lock(&key_str)?;
-        let _guard = key_lock.write().await;
+        let _guard = write_async!(key_lock);
 
         let current_object = {
             let objects = lock_ptr!(self.objects)?;
@@ -685,7 +685,7 @@ impl ObjectCache {
     ) -> Result<bool, FlameError> {
         let key = ObjectKey::try_from(expected.key.as_str())?;
         let key_lock = self.get_key_lock(&expected.key)?;
-        let _guard = key_lock.write().await;
+        let _guard = write_async!(key_lock);
 
         let unchanged = {
             let metadata = lock_ptr!(self.metadata)?;

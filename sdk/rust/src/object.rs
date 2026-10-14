@@ -16,9 +16,9 @@ use std::future::Future;
 use std::io::Cursor;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
+use stdng::{lock_ptr, new_ptr};
 
 use bson::{doc, Bson, Document};
 use bytes::Bytes;
@@ -862,7 +862,7 @@ async fn do_put_file(
     let file = tokio::fs::File::open(path).await.map_err(|e| {
         FlameError::InvalidConfig(format!("failed to open {}: {}", path.display(), e))
     })?;
-    let read_error = Arc::new(Mutex::new(None));
+    let read_error = new_ptr(None);
     let error_for_stream = read_error.clone();
     let header = put_header(key, data_type);
     let input = stream::unfold((file, Some(header)), move |(mut file, header)| {
@@ -879,7 +879,7 @@ async fn do_put_file(
                     Some((put_chunk(Bytes::from(chunk)), (file, None)))
                 }
                 Err(error) => {
-                    *read_error.lock().expect("upload error mutex poisoned") = Some(error);
+                    *lock_ptr!(read_error).expect("upload error mutex poisoned") = Some(error);
                     None
                 }
             }
@@ -887,8 +887,7 @@ async fn do_put_file(
     });
     let mut client = ObjectCacheServiceClient::new(connect_cache(endpoint, tls).await?);
     let response = client.put(cache_request(endpoint, input)?).await;
-    if let Some(error) = read_error
-        .lock()
+    if let Some(error) = lock_ptr!(read_error)
         .expect("upload error mutex poisoned")
         .take()
     {

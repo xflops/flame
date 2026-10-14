@@ -26,8 +26,7 @@ use async_trait::async_trait;
 use nix::sys::signal::{killpg, Signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
-use stdng::{logs::TraceFn, trace_fn};
-use tokio::sync::Mutex;
+use stdng::{async_ptr, logs::TraceFn, trace_fn};
 
 use crate::appmgr::ApplicationManager;
 use crate::executor::Executor;
@@ -149,13 +148,13 @@ const DEFAULT_SVC_LOG_LEVEL: &str = "info";
 impl HostShim {
     pub fn new_ptr(executor: &Executor, app: &ApplicationContext) -> ShimPtr {
         trace_fn!("HostShim::new_ptr");
-        Arc::new(Mutex::new(Self {
+        async_ptr(Self {
             executor: executor.clone(),
             app: app.clone(),
             instance: None,
             instance_client: None,
             work_dir: None,
-        }))
+        })
     }
 
     fn create_dir(path: &Path, name: &str) -> Result<(), FlameError> {

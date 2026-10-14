@@ -21,10 +21,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use stdng::{AsyncPtr, MutexPtr};
 
 use async_trait::async_trait;
-use std::sync::Mutex as StdMutex;
-use tokio::sync::Mutex;
 
 use self::cri_shim::CriShim;
 use self::host_shim::HostShim;
@@ -39,8 +38,8 @@ use common::apis::{
 use common::{FlameError, FLAME_WORKING_DIRECTORY};
 use rpc::flame::v1::ExecutorAttributes;
 
-pub type ShimPtr = Arc<Mutex<dyn Shim>>;
-pub type ExecutorAttributesPtr = Arc<StdMutex<ExecutorAttributes>>;
+pub type ShimPtr = AsyncPtr<dyn Shim>;
+pub type ExecutorAttributesPtr = MutexPtr<ExecutorAttributes>;
 
 /// Result returned by a shim after entering a session.
 #[derive(Debug)]

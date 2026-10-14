@@ -31,9 +31,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
-use stdng::{lock_ptr, MutexPtr};
+use stdng::{async_rw_ptr, lock_ptr, new_ptr, read_async, write_async, AsyncRWPtr, MutexPtr};
 use tar::Archive;
-use tokio::sync::RwLock;
 use tonic::transport::ClientTlsConfig;
 
 use common::apis::ApplicationContext;
@@ -207,7 +206,7 @@ fn installation_mounts(
 }
 
 pub struct ApplicationManager {
-    apps: MutexPtr<HashMap<InstallKey, Arc<RwLock<AppInstaller>>>>,
+    apps: MutexPtr<HashMap<InstallKey, AsyncRWPtr<AppInstaller>>>,
     flame_home: PathBuf,
     downloader: DownloaderRegistry,
 }
@@ -223,7 +222,7 @@ impl ApplicationManager {
             .unwrap_or_else(|_| PathBuf::from("/opt/flame"));
 
         Ok(Self {
-            apps: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            apps: new_ptr(HashMap::new()),
             flame_home,
             downloader: DownloaderRegistry::new_with_tls(tls_config),
         })
@@ -271,7 +270,7 @@ impl ApplicationManager {
                 apps.get(&install_key).cloned()
             };
             if let Some(installed) = app_entry {
-                let installed = installed.read().await;
+                let installed = read_async!(installed);
                 if installed.state == InstallState::Installed {
                     return Ok(installed.installation());
                 }
@@ -282,15 +281,12 @@ impl ApplicationManager {
             let mut apps = lock_ptr!(self.apps)?;
             apps.entry(install_key.clone())
                 .or_insert_with(|| {
-                    Arc::new(RwLock::new(AppInstaller::new(
-                        &app.name,
-                        installer_type.clone(),
-                    )))
+                    async_rw_ptr(AppInstaller::new(&app.name, installer_type.clone()))
                 })
                 .clone()
         };
 
-        let mut installed = app_entry.write().await;
+        let mut installed = write_async!(app_entry);
 
         if installed.state == InstallState::Installed {
             return Ok(installed.installation());

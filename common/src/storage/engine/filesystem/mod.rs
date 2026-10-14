@@ -42,7 +42,8 @@ use std::fs;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock};
-use tokio::sync::{OwnedRwLockWriteGuard, RwLock as AsyncRwLock};
+use stdng::{async_rw_ptr, read_async, write_async, AsyncRWPtr};
+use tokio::sync::OwnedRwLockWriteGuard;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -79,19 +80,19 @@ pub struct FilesystemEngine {
     base_path: PathBuf,
     record_size: usize,
     /// Short lookups only: never held across I/O or an await.
-    sessions: RwLock<HashMap<String, Arc<AsyncRwLock<SessionEntry>>>>,
+    sessions: RwLock<HashMap<String, AsyncRWPtr<SessionEntry>>>,
     /// Per-application lock; coordinates session creation with application
     /// deletion and update without blocking unrelated sessions.
-    applications: RwLock<HashMap<String, Arc<AsyncRwLock<ApplicationEntry>>>>,
-    nodes: RwLock<HashMap<String, Arc<AsyncRwLock<NodeEntry>>>>,
-    executors: RwLock<HashMap<String, Arc<AsyncRwLock<ExecutorEntry>>>>,
+    applications: RwLock<HashMap<String, AsyncRWPtr<ApplicationEntry>>>,
+    nodes: RwLock<HashMap<String, AsyncRWPtr<NodeEntry>>>,
+    executors: RwLock<HashMap<String, AsyncRWPtr<ExecutorEntry>>>,
 }
 
 /// Shared session entry: close and delete take the write side of this lock.
 macro_rules! lock_ssn {
     ($self:expr, $ssn_id:expr, $entry:ident) => {
         let __fs_session = $self.session_entry($ssn_id)?;
-        let $entry = __fs_session.read().await;
+        let $entry = read_async!(__fs_session);
         validate_entry(&$self.sessions, $ssn_id, &__fs_session)?;
     };
 }
@@ -99,10 +100,10 @@ macro_rules! lock_ssn {
 /// Registry guards never span entity waits or filesystem I/O.
 /// Look up an existing entry; the registry guard is released before it returns.
 fn lookup_entry<T>(
-    registry: &RwLock<HashMap<String, Arc<AsyncRwLock<T>>>>,
+    registry: &RwLock<HashMap<String, AsyncRWPtr<T>>>,
     id: &str,
     kind: &str,
-) -> Result<Arc<AsyncRwLock<T>>, FlameError> {
+) -> Result<AsyncRWPtr<T>, FlameError> {
     registry
         .read()
         .map_err(poisoned)?
@@ -115,12 +116,12 @@ fn lookup_entry<T>(
 /// write-locked, so nobody sees it before its caller persists it; the guard's
 /// `rwlock()` gives the entry back for `remove_entry` if that fails.
 fn new_entry<T>(
-    registry: &RwLock<HashMap<String, Arc<AsyncRwLock<T>>>>,
+    registry: &RwLock<HashMap<String, AsyncRWPtr<T>>>,
     id: &str,
     kind: &str,
     value: T,
 ) -> Result<OwnedRwLockWriteGuard<T>, FlameError> {
-    let entry = Arc::new(AsyncRwLock::new(value));
+    let entry = async_rw_ptr(value);
     // A fresh lock is uncontended, so this never waits under the registry guard.
     let guard = entry
         .clone()
@@ -138,9 +139,9 @@ fn new_entry<T>(
 
 /// A waiter must still belong to the registered entry after taking its gate.
 fn validate_entry<T>(
-    registry: &RwLock<HashMap<String, Arc<AsyncRwLock<T>>>>,
+    registry: &RwLock<HashMap<String, AsyncRWPtr<T>>>,
     id: &str,
-    shared: &Arc<AsyncRwLock<T>>,
+    shared: &AsyncRWPtr<T>,
 ) -> Result<(), FlameError> {
     if registry
         .read()
@@ -155,9 +156,9 @@ fn validate_entry<T>(
 }
 
 fn remove_entry<T>(
-    registry: &RwLock<HashMap<String, Arc<AsyncRwLock<T>>>>,
+    registry: &RwLock<HashMap<String, AsyncRWPtr<T>>>,
     id: &str,
-    shared: &Arc<AsyncRwLock<T>>,
+    shared: &AsyncRWPtr<T>,
 ) -> Result<(), FlameError> {
     let mut entries = registry.write().map_err(poisoned)?;
     if entries
@@ -220,7 +221,7 @@ impl FilesystemEngine {
                     self.sessions
                         .write()
                         .map_err(poisoned)?
-                        .insert(id, Arc::new(AsyncRwLock::new(entry)));
+                        .insert(id, async_rw_ptr(entry));
                 }
                 Err(e) => tracing::warn!("Skipping session <{id}>: {e}"),
             }
@@ -228,10 +229,10 @@ impl FilesystemEngine {
         for name in Self::child_names(&self.base_path.join("applications")) {
             match self.read_application_metadata(&name) {
                 Ok(metadata) => {
-                    self.applications.write().map_err(poisoned)?.insert(
-                        name,
-                        Arc::new(AsyncRwLock::new(ApplicationEntry { metadata })),
-                    );
+                    self.applications
+                        .write()
+                        .map_err(poisoned)?
+                        .insert(name, async_rw_ptr(ApplicationEntry { metadata }));
                 }
                 Err(e) => tracing::warn!("Skipping application <{name}>: {e}"),
             }
@@ -239,10 +240,10 @@ impl FilesystemEngine {
         for node in Self::child_names(&self.base_path.join("nodes")) {
             match self.read_node_metadata(&node) {
                 Ok(metadata) => {
-                    self.nodes.write().map_err(poisoned)?.insert(
-                        node.clone(),
-                        Arc::new(AsyncRwLock::new(NodeEntry { metadata })),
-                    );
+                    self.nodes
+                        .write()
+                        .map_err(poisoned)?
+                        .insert(node.clone(), async_rw_ptr(NodeEntry { metadata }));
                 }
                 Err(e) => {
                     tracing::warn!("Skipping node <{node}>: {e}");
@@ -255,7 +256,7 @@ impl FilesystemEngine {
                         self.executors
                             .write()
                             .map_err(poisoned)?
-                            .insert(id, Arc::new(AsyncRwLock::new(ExecutorEntry { metadata })));
+                            .insert(id, async_rw_ptr(ExecutorEntry { metadata }));
                     }
                     Err(e) => tracing::warn!("Skipping executor <{id}> of node <{node}>: {e}"),
                 }
@@ -296,7 +297,7 @@ impl FilesystemEngine {
         }
     }
 
-    fn session_entry(&self, id: &str) -> Result<Arc<AsyncRwLock<SessionEntry>>, FlameError> {
+    fn session_entry(&self, id: &str) -> Result<AsyncRWPtr<SessionEntry>, FlameError> {
         self.sessions
             .read()
             .map_err(|e| FlameError::Storage(format!("Session registry poisoned: {e}")))?
@@ -305,18 +306,15 @@ impl FilesystemEngine {
             .ok_or_else(|| FlameError::NotFound(format!("Session lock not found: {id}")))
     }
 
-    fn application_entry(
-        &self,
-        name: &str,
-    ) -> Result<Arc<AsyncRwLock<ApplicationEntry>>, FlameError> {
+    fn application_entry(&self, name: &str) -> Result<AsyncRWPtr<ApplicationEntry>, FlameError> {
         lookup_entry(&self.applications, name, "Application")
     }
 
-    fn node_entry(&self, name: &str) -> Result<Arc<AsyncRwLock<NodeEntry>>, FlameError> {
+    fn node_entry(&self, name: &str) -> Result<AsyncRWPtr<NodeEntry>, FlameError> {
         lookup_entry(&self.nodes, name, "Node")
     }
 
-    fn executor_entry(&self, id: &str) -> Result<Arc<AsyncRwLock<ExecutorEntry>>, FlameError> {
+    fn executor_entry(&self, id: &str) -> Result<AsyncRWPtr<ExecutorEntry>, FlameError> {
         lookup_entry(&self.executors, id, "Executor")
     }
 
@@ -1035,7 +1033,7 @@ impl Engine for FilesystemEngine {
         state: ApplicationState,
     ) -> Result<Application, FlameError> {
         let shared = self.application_entry(&name)?;
-        let mut entry = shared.write().await;
+        let mut entry = write_async!(shared);
         validate_entry(&self.applications, &name, &shared)?;
         let mut meta = entry.metadata.clone();
         if meta.state == state as i32 {
@@ -1052,7 +1050,7 @@ impl Engine for FilesystemEngine {
 
     async fn delete_application(&self, name: ApplicationID) -> Result<(), FlameError> {
         let shared = self.application_entry(&name)?;
-        let entry = shared.write().await;
+        let entry = write_async!(shared);
         validate_entry(&self.applications, &name, &shared)?;
         let app = &entry.metadata;
         if app.state != ApplicationState::Disabled as i32 {
@@ -1087,7 +1085,7 @@ impl Engine for FilesystemEngine {
         attr: ApplicationAttributes,
     ) -> Result<Application, FlameError> {
         let shared = self.application_entry(&name)?;
-        let mut entry = shared.write().await;
+        let mut entry = write_async!(shared);
         validate_entry(&self.applications, &name, &shared)?;
         let mut meta = entry.metadata.clone();
         if meta.state != ApplicationState::Enabled as i32 {
@@ -1137,7 +1135,7 @@ impl Engine for FilesystemEngine {
 
     async fn get_application(&self, id: ApplicationID) -> Result<Application, FlameError> {
         let shared = self.application_entry(&id)?;
-        let entry = shared.read().await;
+        let entry = read_async!(shared);
         validate_entry(&self.applications, &id, &shared)?;
         let metadata = &entry.metadata;
         Self::application_from_metadata(metadata)
@@ -1180,7 +1178,7 @@ impl Engine for FilesystemEngine {
         };
         let _application = match application.as_ref() {
             Some(application) => {
-                let guard = application.read().await;
+                let guard = read_async!(application);
                 validate_entry(&self.applications, &attr.application, application)?;
                 Some(guard)
             }
@@ -1240,7 +1238,7 @@ impl Engine for FilesystemEngine {
             .write()
             .map_err(|e| FlameError::Storage(format!("Session registry poisoned: {e}")))?
             .entry(attr.id.clone())
-            .or_insert_with(|| Arc::new(AsyncRwLock::new(SessionEntry::new(meta, session_dir))));
+            .or_insert_with(|| async_rw_ptr(SessionEntry::new(meta, session_dir)));
 
         Ok(session)
     }
@@ -1249,7 +1247,7 @@ impl Engine for FilesystemEngine {
         let entry = self
             .session_entry(&id)
             .map_err(|_| FlameError::NotFound(format!("Session {id} not found")))?;
-        let meta = entry.read().await;
+        let meta = read_async!(entry);
         validate_entry(&self.sessions, &id, &entry)?;
         self.session_from_metadata(&meta.metadata)
     }
@@ -1281,7 +1279,7 @@ impl Engine for FilesystemEngine {
 
     async fn close_session(&self, id: SessionID) -> Result<Session, FlameError> {
         let shared = self.session_entry(&id)?;
-        let mut entry = shared.write().await;
+        let mut entry = write_async!(shared);
         validate_entry(&self.sessions, &id, &shared)?;
         if entry.metadata.state == SessionState::Closed as i32 {
             entry.release_files();
@@ -1319,7 +1317,7 @@ impl Engine for FilesystemEngine {
 
     async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError> {
         let shared = self.session_entry(&id)?;
-        let entry = shared.write().await;
+        let entry = write_async!(shared);
         validate_entry(&self.sessions, &id, &shared)?;
         if entry.metadata.state != SessionState::Closed as i32 {
             return Err(FlameError::Storage(
@@ -1349,7 +1347,7 @@ impl Engine for FilesystemEngine {
             .collect::<Vec<_>>();
         let mut sessions = Vec::new();
         for (id, shared) in entries {
-            let entry = shared.read().await;
+            let entry = read_async!(shared);
             // A session deleted while we waited is simply no longer listed.
             if validate_entry(&self.sessions, &id, &shared).is_ok() {
                 sessions.push(self.session_from_metadata(&entry.metadata)?);
@@ -1530,14 +1528,14 @@ impl Engine for FilesystemEngine {
             Err(FlameError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let entry = shared.read().await;
+        let entry = read_async!(shared);
         validate_entry(&self.nodes, name, &shared)?;
         Ok(Some(Self::node_from_metadata(&entry.metadata)))
     }
 
     async fn update_node(&self, node: &Node) -> Result<Node, FlameError> {
         let shared = self.node_entry(&node.name)?;
-        let mut entry = shared.write().await;
+        let mut entry = write_async!(shared);
         validate_entry(&self.nodes, &node.name, &shared)?;
         let metadata = NodeMetadata::from_node(node, entry.metadata.creation_time);
         self.write_node_metadata(&node.name, &metadata)?;
@@ -1551,7 +1549,7 @@ impl Engine for FilesystemEngine {
             Err(FlameError::NotFound(_)) => return Ok(()),
             Err(error) => return Err(error),
         };
-        let _entry = shared.write().await;
+        let _entry = write_async!(shared);
         validate_entry(&self.nodes, name, &shared)?;
         match fs::remove_dir_all(self.node_path(name)) {
             Ok(()) => {}
@@ -1572,7 +1570,7 @@ impl Engine for FilesystemEngine {
         // Node -> executor: active operations on this node have finished; a
         // concurrent move to another node is protected by the executor gate.
         for (id, executor) in executors {
-            let entry = executor.write().await;
+            let entry = write_async!(executor);
             // An executor deleted while we waited for its gate is already gone.
             if entry.metadata.node == name
                 && validate_entry(&self.executors, &id, &executor).is_ok()
@@ -1603,7 +1601,7 @@ impl Engine for FilesystemEngine {
 
     async fn create_executor(&self, executor: &Executor) -> Result<Executor, FlameError> {
         let parent = self.node_entry(&executor.node)?;
-        let _parent = parent.read().await;
+        let _parent = read_async!(parent);
         validate_entry(&self.nodes, &executor.node, &parent)?;
         let metadata = ExecutorMetadata::from_executor(executor);
         let mut entry = new_entry(
@@ -1634,7 +1632,7 @@ impl Engine for FilesystemEngine {
                 Err(error) => return Err(error),
             };
             let node = {
-                let entry = shared.read().await;
+                let entry = read_async!(shared);
                 validate_entry(&self.executors, id, &shared)?;
                 entry.metadata.node.clone()
             };
@@ -1643,9 +1641,9 @@ impl Engine for FilesystemEngine {
                 Err(FlameError::NotFound(_)) => return Ok(None),
                 Err(error) => return Err(error),
             };
-            let _parent = parent.read().await;
+            let _parent = read_async!(parent);
             validate_entry(&self.nodes, &node, &parent)?;
-            let entry = shared.read().await;
+            let entry = read_async!(shared);
             validate_entry(&self.executors, id, &shared)?;
             if entry.metadata.node != node {
                 continue;
@@ -1656,10 +1654,10 @@ impl Engine for FilesystemEngine {
 
     async fn update_executor(&self, executor: &Executor) -> Result<Executor, FlameError> {
         let parent = self.node_entry(&executor.node)?;
-        let _parent = parent.read().await;
+        let _parent = read_async!(parent);
         validate_entry(&self.nodes, &executor.node, &parent)?;
         let shared = self.executor_entry(&executor.id)?;
-        let mut entry = shared.write().await;
+        let mut entry = write_async!(shared);
         validate_entry(&self.executors, &executor.id, &shared)?;
         let metadata = ExecutorMetadata::from_executor(executor);
         self.persist_executor(executor, &metadata, Some(&entry.metadata))?;
@@ -1675,14 +1673,14 @@ impl Engine for FilesystemEngine {
         loop {
             let shared = self.executor_entry(id)?;
             let node = {
-                let entry = shared.read().await;
+                let entry = read_async!(shared);
                 validate_entry(&self.executors, id, &shared)?;
                 entry.metadata.node.clone()
             };
             let parent = self.node_entry(&node)?;
-            let _parent = parent.read().await;
+            let _parent = read_async!(parent);
             validate_entry(&self.nodes, &node, &parent)?;
-            let mut entry = shared.write().await;
+            let mut entry = write_async!(shared);
             validate_entry(&self.executors, id, &shared)?;
             if entry.metadata.node != node {
                 continue;
@@ -1703,7 +1701,7 @@ impl Engine for FilesystemEngine {
                 Err(error) => return Err(error),
             };
             let node = {
-                let entry = shared.read().await;
+                let entry = read_async!(shared);
                 validate_entry(&self.executors, id, &shared)?;
                 entry.metadata.node.clone()
             };
@@ -1712,9 +1710,9 @@ impl Engine for FilesystemEngine {
                 Err(FlameError::NotFound(_)) => return Ok(()),
                 Err(error) => return Err(error),
             };
-            let _parent = parent.read().await;
+            let _parent = read_async!(parent);
             validate_entry(&self.nodes, &node, &parent)?;
-            let entry = shared.write().await;
+            let entry = write_async!(shared);
             validate_entry(&self.executors, id, &shared)?;
             if entry.metadata.node != node {
                 continue;
@@ -2945,7 +2943,7 @@ mod tests {
                 .unwrap();
         }
         let shared = engine.session_entry("gates").unwrap();
-        let entry = shared.read().await;
+        let entry = read_async!(shared);
 
         // Creation commit gate held: updates to existing tasks proceed.
         {
@@ -3020,7 +3018,7 @@ mod tests {
         let (engine, dir) = engine_with_session("retry-commit").await;
         let shared = engine.session_entry("retry-commit").unwrap();
         {
-            let entry = shared.read().await;
+            let entry = read_async!(shared);
             let path = dir.path().join("sessions/retry-commit/tasks.bin");
             // A read-only descriptor forces a task-record write failure.
             *entry.files[Part::Tasks as usize].lock().unwrap() =
@@ -3033,7 +3031,7 @@ mod tests {
         assert!(matches!(error, FlameError::Storage(_)));
         assert!(error.to_string().contains("Failed to commit task record"));
         // Restore write access as a transient storage failure would recover.
-        *shared.read().await.files[Part::Tasks as usize]
+        *read_async!(shared).files[Part::Tasks as usize]
             .lock()
             .unwrap() = None;
         let task = engine
@@ -3059,7 +3057,7 @@ mod tests {
             .await
             .unwrap();
         let shared = engine.session_entry("closing").unwrap();
-        assert!(shared.read().await.files[Part::Tasks as usize]
+        assert!(read_async!(shared).files[Part::Tasks as usize]
             .lock()
             .unwrap()
             .is_some());
@@ -3072,11 +3070,11 @@ mod tests {
                 .filter(|slot| slot.lock().unwrap().is_some())
                 .count()
         };
-        assert_eq!(retained(&*shared.read().await), 0);
+        assert_eq!(retained(&*read_async!(shared)), 0);
 
         let stored = engine.get_task(gid("closing", task.id)).await.unwrap();
         assert_eq!(stored.input, Some(Bytes::from("data")));
-        assert_eq!(retained(&*shared.read().await), 0);
+        assert_eq!(retained(&*read_async!(shared)), 0);
     }
 
     #[tokio::test]
@@ -3208,7 +3206,7 @@ mod tests {
         let mut deleting = Box::pin(engine.delete_session("reuse".into()));
         let mut reading = Box::pin(engine.get_task(gid("reuse", task.id)));
         {
-            let _held = old.write().await;
+            let _held = write_async!(old);
             assert!(
                 std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
                     deleting.as_mut(),

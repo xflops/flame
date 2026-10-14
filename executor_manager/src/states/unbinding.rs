@@ -12,7 +12,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use stdng::{logs::TraceFn, trace_fn};
+use stdng::{await_ptr, logs::TraceFn, trace_fn};
 
 use crate::client::BackendClient;
 use crate::executor::Executor;
@@ -55,7 +55,7 @@ impl State for UnbindingState {
 impl UnbindingState {
     async fn leave_session(&self) {
         if let Some(shim_ptr) = self.executor.shim_instance.clone() {
-            let mut shim = shim_ptr.lock().await;
+            let mut shim = await_ptr!(shim_ptr);
             if let Err(error) = shim.on_session_leave().await {
                 tracing::warn!(
                     "Executor <{}> session leave failed; completing unbind and retaining the application service: {}",
@@ -88,7 +88,7 @@ mod tests {
     use crate::shims::{SessionEnterResponse, Shim, ShimPtr, TaskInvokeResponse};
     use common::apis::{ResourceRequirement, SessionContext, Shim as ShimType, TaskContext};
     use std::sync::Arc;
-    use tokio::sync::Mutex;
+    use stdng::async_ptr;
 
     struct TestShim {
         fail_leave: bool,
@@ -139,7 +139,7 @@ mod tests {
             .with_workdir(gpu_workdir.path())
             .with_inventory(vec!["GPU-a".to_string()])
             .unwrap();
-        let shim: ShimPtr = Arc::new(Mutex::new(TestShim { fail_leave: false }));
+        let shim: ShimPtr = async_ptr(TestShim { fail_leave: false });
         let executor = Executor {
             id: "executor-1".to_string(),
             application: "test-app".to_string(),
@@ -203,7 +203,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_session_leave_does_not_destroy_application_instance() {
-        let shim: ShimPtr = Arc::new(Mutex::new(TestShim { fail_leave: true }));
+        let shim: ShimPtr = async_ptr(TestShim { fail_leave: true });
         let executor = Executor {
             id: "executor-1".to_string(),
             application: "test-app".to_string(),

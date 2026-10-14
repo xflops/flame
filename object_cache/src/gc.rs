@@ -377,6 +377,7 @@ fn now_millis() -> i64 {
 mod tests {
     use std::collections::{HashSet, VecDeque};
     use std::sync::Mutex;
+    use stdng::{lock_ptr, new_ptr, MutexPtr};
 
     use super::*;
 
@@ -483,13 +484,13 @@ mod tests {
 
     struct MockLister {
         responses: VecDeque<Result<ApplicationMap, FlameError>>,
-        calls: Arc<Mutex<usize>>,
+        calls: MutexPtr<usize>,
     }
 
     #[async_trait]
     impl ApplicationLister for MockLister {
         async fn list_applications(&mut self) -> Result<ApplicationMap, FlameError> {
-            *self.calls.lock().unwrap() += 1;
+            *lock_ptr!(self.calls).unwrap() += 1;
             self.responses.pop_front().expect("unexpected list call")
         }
     }
@@ -518,7 +519,7 @@ mod tests {
     fn collector(
         cache: Arc<MockCache>,
         responses: Vec<Result<ApplicationMap, FlameError>>,
-        calls: Arc<Mutex<usize>>,
+        calls: MutexPtr<usize>,
     ) -> ApplicationGarbageCollector {
         ApplicationGarbageCollector::with_dependencies(
             cache,
@@ -536,7 +537,7 @@ mod tests {
             deleted: Mutex::new(Vec::new()),
             fail_keys: HashSet::new(),
         });
-        let calls = Arc::new(Mutex::new(0));
+        let calls = new_ptr(0);
         let appeared = HashMap::from([(
             "app".to_string(),
             ApplicationSnapshot {
@@ -552,7 +553,7 @@ mod tests {
 
         let stats = collector.reconcile(20_000).await.unwrap();
 
-        assert_eq!(*calls.lock().unwrap(), 2);
+        assert_eq!(*lock_ptr!(calls).unwrap(), 2);
         assert_eq!(stats.candidates, 1);
         assert_eq!(stats.deleted, 0);
         assert!(cache.deleted.lock().unwrap().is_empty());
@@ -568,7 +569,7 @@ mod tests {
             deleted: Mutex::new(Vec::new()),
             fail_keys: HashSet::new(),
         });
-        let calls = Arc::new(Mutex::new(0));
+        let calls = new_ptr(0);
         let applications = HashMap::from([(
             "app".to_string(),
             ApplicationSnapshot {
@@ -584,7 +585,7 @@ mod tests {
 
         let stats = collector.reconcile(30_000).await.unwrap();
 
-        assert_eq!(*calls.lock().unwrap(), 2);
+        assert_eq!(*lock_ptr!(calls).unwrap(), 2);
         assert_eq!(stats.deleted, 1);
         assert_eq!(&*cache.deleted.lock().unwrap(), &["app/session/old"]);
     }
@@ -606,7 +607,7 @@ mod tests {
                 creation_time: 15_000,
             },
         )]);
-        let calls = Arc::new(Mutex::new(0));
+        let calls = new_ptr(0);
         let mut collector = collector(
             cache.clone(),
             vec![
@@ -637,7 +638,7 @@ mod tests {
                 creation_time: 20_000,
             },
         )]);
-        let calls = Arc::new(Mutex::new(0));
+        let calls = new_ptr(0);
         let mut collector = collector(
             cache.clone(),
             vec![Ok(applications.clone()), Ok(applications)],

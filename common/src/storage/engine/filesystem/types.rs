@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+use stdng::{read_ptr, write_ptr, RWPtr};
 use tokio::sync::Mutex;
 
 /// Task metadata stored in tasks.bin with fixed-size records.
@@ -234,7 +235,7 @@ pub(super) struct SessionEntry {
     pub(super) metadata: SessionMetadata,
     pub(super) dir: PathBuf,
     pub(super) commit: Mutex<()>,
-    pub(super) tasks: parking_lot::Mutex<HashMap<TaskID, Arc<parking_lot::RwLock<()>>>>,
+    pub(super) tasks: parking_lot::Mutex<HashMap<TaskID, RWPtr<()>>>,
     pub(super) files: [StdMutex<Option<Arc<PayloadFile>>>; Part::COUNT],
 }
 
@@ -263,7 +264,7 @@ impl SessionEntry {
 
     /// The lock of one task, created on first use and kept for the life of the
     /// session entry.
-    pub(super) fn task_lock(&self, task_id: TaskID) -> Arc<parking_lot::RwLock<()>> {
+    pub(super) fn task_lock(&self, task_id: TaskID) -> RWPtr<()> {
         self.tasks.lock().entry(task_id).or_default().clone()
     }
 
@@ -272,14 +273,14 @@ impl SessionEntry {
     /// record read-modify-write.
     pub(super) fn with_task<R>(&self, task_id: TaskID, f: impl FnOnce() -> R) -> R {
         let lock = self.task_lock(task_id);
-        let _guard = lock.write();
+        let _guard = write_ptr!(lock).unwrap();
         f()
     }
 
     /// Run `f` holding the task's read lock: no writer is mid-update.
     pub(super) fn with_task_read<R>(&self, task_id: TaskID, f: impl FnOnce() -> R) -> R {
         let lock = self.task_lock(task_id);
-        let _guard = lock.read();
+        let _guard = read_ptr!(lock).unwrap();
         f()
     }
 

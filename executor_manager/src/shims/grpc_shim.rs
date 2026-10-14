@@ -35,7 +35,7 @@ use crate::appmgr::ApplicationManager;
 use crate::shims::{ExecutorWorkDir, Shim};
 use common::apis::{SessionContext, TaskContext, TaskResult, TaskState};
 use common::FlameError;
-use stdng::{logs::TraceFn, trace_fn};
+use stdng::{logs::TraceFn, new_ptr, trace_fn};
 
 pub struct GrpcShim {
     client: Option<InstanceClient<Channel>>,
@@ -171,9 +171,7 @@ impl Shim for GrpcShim {
                 return Err(FlameError::Internal(result.message.unwrap_or_default()));
             }
             return Ok(super::SessionEnterResponse {
-                executor_attributes: output
-                    .attributes
-                    .map(|attributes| std::sync::Arc::new(std::sync::Mutex::new(attributes))),
+                executor_attributes: output.attributes.map(new_ptr),
             });
         } else {
             return Err(FlameError::Internal(format!(

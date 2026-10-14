@@ -12,13 +12,13 @@ Unless required by applicable law or agreed to in writing, software
 
 use std::collections::HashMap;
 use std::fs;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
 use common::apis::ExecutorState;
 use common::{ctx::FlameClusterContext, FlameError};
-use stdng::{lock_ptr, MutexPtr};
+use stdng::{lock_ptr, new_ptr, MutexPtr};
 
 use crate::appmgr::ApplicationManager;
 use crate::client::BackendClient;
@@ -63,7 +63,7 @@ impl ExecutorManager {
 
         Ok(Self {
             ctx: ctx.clone(),
-            executors: Arc::new(Mutex::new(HashMap::new())),
+            executors: new_ptr(HashMap::new()),
             client,
             app_mgr,
             dev_mgr,
@@ -120,7 +120,7 @@ impl ExecutorManager {
         executor.context = Some(self.ctx.clone());
         executor.shim = self.ctx.cluster.executors.shim;
         executor.assignments = self.dev_mgr.allocate(&executor)?;
-        let pointer = Arc::new(Mutex::new(executor));
+        let pointer = new_ptr(executor);
         lock_ptr!(self.executors)?.insert(executor_id, pointer.clone());
         executor::start(self.client.clone(), pointer)?;
 
@@ -144,7 +144,7 @@ mod tests {
     fn manager(workdir: &std::path::Path) -> ExecutorManager {
         ExecutorManager {
             ctx: FlameClusterContext::default(),
-            executors: Arc::new(Mutex::new(HashMap::new())),
+            executors: new_ptr(HashMap::new()),
             client: BackendClient::default(),
             app_mgr: Arc::new(ApplicationManager::new().unwrap()),
             dev_mgr: Arc::new(DeviceManagers::with_gpu(
@@ -206,7 +206,7 @@ mod tests {
         let mut existing = executor("executor-1", ExecutorState::Idle);
         existing.app_mgr = Some(manager.app_mgr.clone());
         existing.assignments = manager.dev_mgr.allocate(&existing).unwrap();
-        let pointer = Arc::new(Mutex::new(existing));
+        let pointer = new_ptr(existing);
         lock_ptr!(manager.executors)
             .unwrap()
             .insert("executor-1".to_string(), pointer.clone());
@@ -299,7 +299,7 @@ mod tests {
         manager.dev_mgr.release(&existing).unwrap();
         lock_ptr!(manager.executors)
             .unwrap()
-            .insert("executor-1".into(), Arc::new(Mutex::new(existing)));
+            .insert("executor-1".into(), new_ptr(existing));
         manager
             .handle_executor_update(executor("executor-1", ExecutorState::Released))
             .await
@@ -320,7 +320,7 @@ mod tests {
         // Releasing frees the devices before the executor is Released.
         manager.dev_mgr.release(&completed).unwrap();
         completed.release().unwrap();
-        let pointer = Arc::new(Mutex::new(completed));
+        let pointer = new_ptr(completed);
         lock_ptr!(manager.executors)
             .unwrap()
             .insert("executor-1".into(), pointer);

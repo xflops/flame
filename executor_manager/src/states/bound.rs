@@ -12,7 +12,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use stdng::{logs::TraceFn, trace_fn};
+use stdng::{await_ptr, logs::TraceFn, trace_fn};
 
 use crate::client::BackendClient;
 use crate::executor::Executor;
@@ -52,7 +52,7 @@ impl State for BoundState {
                             "no shim instance in bound state".to_string(),
                         ))?;
                 let response = {
-                    let mut shim = shim_ptr.lock().await;
+                    let mut shim = await_ptr!(shim_ptr);
                     match shim.on_task_invoke(&task_ctx).await {
                         Ok(result) => result,
                         Err(e) => {
