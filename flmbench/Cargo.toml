@@ -1,0 +1,18 @@
+[package]
+name = "flmbench"
+version = "0.6.0"
+edition = "2021"
+description = "Flame benchmark: burst workloads over multiple sessions with latency percentiles and cluster health sampling"
+
+[dependencies]
+flame-rs = { path = "../sdk/rust", features = ["macros"] }
+stdng = { path = "../stdng" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_derive = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+clap = { workspace = true }
+comfy-table = { workspace = true }
+byte-unit = "5.2"

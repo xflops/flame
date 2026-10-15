@@ -1889,6 +1889,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "flmbench"
+version = "0.6.0"
+dependencies = [
+ "byte-unit",
+ "clap",
+ "comfy-table",
+ "flame-rs",
+ "futures",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "stdng",
+ "tokio",
+]
+
+[[package]]
 name = "flmctl"
 version = "0.6.0"
 dependencies = [

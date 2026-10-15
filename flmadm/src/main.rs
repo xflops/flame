@@ -56,7 +56,7 @@ enum Commands {
         #[arg(long)]
         cache: bool,
 
-        /// Install client components (flmping, flmexec, flamepy)
+        /// Install client components (flmctl, flmping, flmexec, flmbench, flamepy)
         #[arg(long)]
         client: bool,
 

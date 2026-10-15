@@ -5,6 +5,7 @@ members = [
     "flmctl",
     "flmadm",
     "flmping",
+    "flmbench",
     "flmexec",
     "session_manager",
     "executor_manager",

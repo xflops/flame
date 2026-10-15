@@ -183,6 +183,7 @@ impl InstallationManager {
                 paths.bin.join("flmping-service"),
             ),
             ("flmexec", &artifacts.flmexec, paths.bin.join("flmexec")),
+            ("flmbench", &artifacts.flmbench, paths.bin.join("flmbench")),
             (
                 "flmexec-service",
                 &artifacts.flmexec_service,
@@ -739,6 +740,7 @@ mod tests {
 
             assert!(components.contains(&"flmctl".to_string()));
             assert!(components.contains(&"flmping".to_string()));
+            assert!(components.contains(&"flmbench".to_string()));
             assert!(components.contains(&"flamepy".to_string()));
         }
 

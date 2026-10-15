@@ -20,7 +20,7 @@ impl InstallProfile {
                 "flmexec-service",
                 "flamepy",
             ],
-            InstallProfile::Client => &["flmctl", "flmping", "flmexec", "flamepy"],
+            InstallProfile::Client => &["flmctl", "flmping", "flmexec", "flmbench", "flamepy"],
             InstallProfile::Cache => &["flame-object-cache"],
         }
     }
@@ -225,6 +225,7 @@ pub struct BuildArtifacts {
     pub flmping_service: PathBuf,
     pub flmexec: PathBuf,
     pub flmexec_service: PathBuf,
+    pub flmbench: PathBuf,
 }
 
 impl BuildArtifacts {
@@ -259,10 +260,11 @@ impl BuildArtifacts {
             flmping_service: target_dir.join("flmping-service"),
             flmexec: target_dir.join("flmexec"),
             flmexec_service: target_dir.join("flmexec-service"),
+            flmbench: target_dir.join("flmbench"),
         }
     }
 
-    fn entries(&self) -> [(&'static str, &Path); 9] {
+    fn entries(&self) -> [(&'static str, &Path); 10] {
         [
             ("flame-session-manager", &self.session_manager),
             ("flame-executor-manager", &self.executor_manager),
@@ -273,6 +275,7 @@ impl BuildArtifacts {
             ("flmping-service", &self.flmping_service),
             ("flmexec", &self.flmexec),
             ("flmexec-service", &self.flmexec_service),
+            ("flmbench", &self.flmbench),
         ]
     }
 
@@ -344,6 +347,7 @@ mod tests {
             assert!(components.contains(&"flmctl"));
             assert!(components.contains(&"flmping"));
             assert!(components.contains(&"flmexec"));
+            assert!(components.contains(&"flmbench"));
             assert!(components.contains(&"flamepy"));
         }
 
@@ -529,6 +533,7 @@ mod tests {
             touch(&target.join("flmctl"));
             touch(&target.join("flmping"));
             touch(&target.join("flmexec"));
+            touch(&target.join("flmbench"));
 
             let artifacts = BuildArtifacts::from_source_dir_for_profiles(
                 tmp.path(),
