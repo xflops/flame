@@ -14,42 +14,94 @@ limitations under the License.
 //! FEM GPU inventory for resource advertisement and executor assignment.
 
 use std::collections::HashSet;
+use std::fmt;
+use std::sync::OnceLock;
 
 use common::FlameError;
+use nvml_wrapper::Nvml;
 
-/// Return identifiers suitable for CUDA_VISIBLE_DEVICES. Explicit visibility is
-/// preserved, including physical UUID and MIG identifiers. Without a restriction,
-/// use NVML UUIDs so allocation is independent of CUDA's device ordering.
-pub fn discover_gpu_devices() -> Result<Vec<String>, FlameError> {
-    match std::env::var("CUDA_VISIBLE_DEVICES") {
-        Ok(devices) => return parse_visible_devices(&devices),
-        Err(std::env::VarError::NotPresent) => {}
-        Err(error) => {
-            return Err(FlameError::InvalidConfig(format!(
-                "invalid CUDA_VISIBLE_DEVICES: {error}"
-            )))
+/// Keeps a resource after its first successful initialization. A failed
+/// initialization is not remembered, so it is attempted again on the next call.
+struct Retained<T> {
+    value: OnceLock<T>,
+}
+
+impl<T> Default for Retained<T> {
+    fn default() -> Self {
+        Self {
+            value: OnceLock::new(),
         }
     }
+}
 
-    let nvml = match nvml_wrapper::Nvml::init() {
-        Ok(nvml) => nvml,
-        Err(error) => {
-            tracing::debug!("NVML unavailable, GPU discovery skipped: {error}");
-            return Ok(Vec::new());
+impl<T> Retained<T> {
+    fn get_or_init(&self, init: impl FnOnce() -> Option<T>) -> Option<&T> {
+        if self.value.get().is_none() {
+            if let Some(value) = init() {
+                // A concurrent caller may have stored one first; keep that one.
+                let _ = self.value.set(value);
+            }
         }
-    };
-    let count = nvml
-        .device_count()
-        .map_err(|error| FlameError::Internal(format!("failed to discover GPU count: {error}")))?;
-    (0..count)
-        .map(|index| {
-            nvml.device_by_index(index)
-                .and_then(|device| device.uuid())
-                .map_err(|error| {
-                    FlameError::Internal(format!("failed to discover GPU {index}: {error}"))
-                })
-        })
-        .collect()
+        self.value.get()
+    }
+}
+
+/// Finds the GPUs of this node. NVML is initialized once and kept for the life of
+/// the owner: each `Nvml::init()` loads the driver library, starts NVML's helper
+/// threads and event descriptors, and dropping the handle unloads the library
+/// without releasing all of them, so initializing on every node refresh leaks
+/// descriptors and threads until the process hits its open-file limit.
+#[derive(Default)]
+pub struct GpuDiscovery {
+    nvml: Retained<Nvml>,
+}
+
+impl fmt::Debug for GpuDiscovery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GpuDiscovery")
+            .field("nvml_initialized", &self.nvml.value.get().is_some())
+            .finish()
+    }
+}
+
+impl GpuDiscovery {
+    /// Return identifiers suitable for CUDA_VISIBLE_DEVICES. Explicit visibility is
+    /// preserved, including physical UUID and MIG identifiers. Without a restriction,
+    /// use NVML UUIDs so allocation is independent of CUDA's device ordering.
+    pub fn devices(&self) -> Result<Vec<String>, FlameError> {
+        match std::env::var("CUDA_VISIBLE_DEVICES") {
+            Ok(devices) => return parse_visible_devices(&devices),
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => {
+                return Err(FlameError::InvalidConfig(format!(
+                    "invalid CUDA_VISIBLE_DEVICES: {error}"
+                )))
+            }
+        }
+
+        let Some(nvml) = self.nvml.get_or_init(|| match Nvml::init() {
+            Ok(nvml) => Some(nvml),
+            Err(error) => {
+                tracing::debug!("NVML unavailable, GPU discovery skipped: {error}");
+                None
+            }
+        }) else {
+            return Ok(Vec::new());
+        };
+        let count = nvml.device_count().map_err(|error| {
+            FlameError::Internal(format!("failed to discover GPU count: {error}"))
+        })?;
+        (0..count)
+            .map(|index| {
+                nvml.device_by_index(index)
+                    .and_then(|device| device.uuid())
+                    .map_err(|error| {
+                        FlameError::Internal(format!("failed to discover GPU {index}: {error}"))
+                    })
+            })
+            .collect()
+    }
 }
 
 fn parse_visible_devices(value: &str) -> Result<Vec<String>, FlameError> {
@@ -140,6 +192,7 @@ fn canonical_gpu_identifier(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     const A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 
@@ -209,6 +262,54 @@ mod tests {
             format!("MIG-{A},MIG-GPU-{B}/1/2"),
         ] {
             assert!(parse_visible_devices(&value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn a_successful_initialization_is_kept_and_never_repeated() {
+        let retained = Retained::<u32>::default();
+        let inits = Cell::new(0);
+        for _ in 0..50 {
+            let value = retained.get_or_init(|| {
+                inits.set(inits.get() + 1);
+                Some(7)
+            });
+            assert_eq!(value, Some(&7));
+        }
+        assert_eq!(inits.get(), 1, "initialized once, not on every call");
+    }
+
+    #[test]
+    fn a_failed_initialization_is_retried() {
+        let retained = Retained::<u32>::default();
+        let attempts = Cell::new(0);
+        for _ in 0..3 {
+            assert_eq!(
+                retained.get_or_init(|| {
+                    attempts.set(attempts.get() + 1);
+                    None
+                }),
+                None
+            );
+        }
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(retained.get_or_init(|| Some(9)), Some(&9));
+        assert_eq!(
+            retained.get_or_init(|| panic!("already initialized")),
+            Some(&9)
+        );
+    }
+
+    #[test]
+    fn discovery_without_nvml_reports_no_devices_and_keeps_retrying() {
+        if std::env::var_os("CUDA_VISIBLE_DEVICES").is_some() {
+            return;
+        }
+        let discovery = GpuDiscovery::default();
+        // Hosts without the NVIDIA driver skip discovery instead of failing.
+        if Nvml::init().is_err() {
+            assert_eq!(discovery.devices().unwrap(), Vec::<String>::new());
+            assert!(discovery.nvml.value.get().is_none());
         }
     }
 }

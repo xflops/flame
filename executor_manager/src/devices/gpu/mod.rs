@@ -16,7 +16,7 @@ limitations under the License.
 mod discovery;
 mod storage;
 
-use discovery::discover_gpu_devices;
+use discovery::GpuDiscovery;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -38,6 +38,8 @@ struct GpuState {
 pub struct GpuManager {
     state: Mutex<GpuState>,
     workdir: PathBuf,
+    /// Owns the NVML handle, so it is initialized once per executor manager.
+    discovery: GpuDiscovery,
 }
 
 impl Default for GpuManager {
@@ -51,6 +53,7 @@ impl GpuManager {
         Self {
             state: Mutex::new(GpuState::default()),
             workdir: PathBuf::from("."),
+            discovery: GpuDiscovery::default(),
         }
     }
 
@@ -156,7 +159,7 @@ impl GpuManager {
 impl DeviceManager for GpuManager {
     fn discover(&self) -> Result<(), FlameError> {
         // Hardware discovery may be slow; it does not hold the allocation lock.
-        self.refresh_inventory(discover_gpu_devices()?)
+        self.refresh_inventory(self.discovery.devices()?)
     }
 
     fn capacity(&self) -> ResourceRequirement {
