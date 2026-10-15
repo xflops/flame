@@ -10,7 +10,7 @@ mode="$1"
 registry="$2"
 value="$3"
 metadata="$4"
-images=(flame-session-manager flame-object-cache flame-executor-manager flame-console flame-instance-runtime)
+images=(flame-session-manager flame-object-cache flame-executor-manager flame-console flame-test flame-instance-runtime)
 
 digest() {
     local image="$1" file="$2" result
@@ -47,12 +47,15 @@ case "$mode" in
                 flame-console)
                     docker run --rm --platform "linux/${value}" --entrypoint /usr/local/flame/bin/flmctl "$ref" --help
                     ;;
+                flame-test)
+                    docker run --rm --platform "linux/${value}" "$ref" flame-test help
+                    ;;
                 flame-instance-runtime)
                     docker run --rm --platform "linux/${value}" --entrypoint /usr/local/flame/bin/uv "$ref" --version
                     ;;
             esac
             case "$image" in
-                flame-executor-manager|flame-console|flame-instance-runtime)
+                flame-executor-manager|flame-console|flame-test|flame-instance-runtime)
                     docker run --rm --platform "linux/${value}" --entrypoint /bin/bash "$ref" -lc \
                         'source /usr/local/flame/sbin/flmenv.sh --python-version 3.12 && python3 -c "import flamepy"'
                     ;;
@@ -60,7 +63,7 @@ case "$mode" in
         done
         ;;
     merge)
-        # Validate all ten digests before writing any final tag.
+        # Validate every digest before writing any final tag.
         amd64=() arm64=() refs=()
         for image in "${images[@]}"; do
             amd64+=("${registry}/${image}@$(digest "$image" "${metadata}/digests-amd64.json")")

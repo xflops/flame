@@ -121,9 +121,9 @@ jobs:
       - name: Run Python E2E tests
         timeout-minutes: 20
         run: |
-          export PYTHONPATH="$(pwd)/e2e/src:$PYTHONPATH"
+          export PYTHONPATH="$(pwd)/testing/e2e/src:$PYTHONPATH"
           export FLAME_LOG=DEBUG
-          cd e2e
+          cd testing/e2e
           pytest -vv --durations=0 tests/test_app.py tests/test_flmexec.py
 
       - name: Show service logs on failure
@@ -207,9 +207,9 @@ jobs:
       - name: Run shared Python E2E cases through CRI
         timeout-minutes: 90
         run: |
-          export PYTHONPATH="$(pwd)/e2e/src:$PYTHONPATH"
+          export PYTHONPATH="$(pwd)/testing/e2e/src:$PYTHONPATH"
           export FLAME_LOG=DEBUG
-          cd e2e
+          cd testing/e2e
           pytest -vv --durations=0 \
             tests/test_app.py \
             tests/test_flmexec.py \

@@ -10,21 +10,21 @@ This document describes the enhancements made to the e2e test suite to support b
 
 **Before:**
 ```
-e2e/src/e2e/
+testing/e2e/src/e2e/
   - service.py         (FlameInstance-based)
   - api.py
-e2e/tests/
+testing/e2e/tests/
   - test_session.py
   - test_application.py
 ```
 
 **After:**
 ```
-e2e/src/e2e/
+testing/e2e/src/e2e/
   - instance_svc.py    (serving.Instance-based, renamed from service.py)
   - basic_svc.py       (NEW: FlameService-based)
   - api.py             (ENHANCED with context info classes)
-e2e/tests/
+testing/e2e/tests/
   - test_service.py     (tests for instance_svc.py)
   - test_core.py        (tests for basic_svc.py)
   - test_app.py
@@ -231,16 +231,16 @@ session.close()
 
 ```bash
 # Run all e2e tests
-pytest e2e/tests/ -v
+pytest testing/e2e/tests/ -v
 
 # Run instance-based tests only
-pytest e2e/tests/test_service.py -v
+pytest testing/e2e/tests/test_service.py -v
 
 # Run service-based tests only
-pytest e2e/tests/test_core.py -v
+pytest testing/e2e/tests/test_core.py -v
 
 # Run specific test
-pytest e2e/tests/test_core.py::test_all_context_info -v
+pytest testing/e2e/tests/test_core.py::test_all_context_info -v
 ```
 
 ## Benefits

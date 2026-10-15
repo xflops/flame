@@ -11,7 +11,7 @@ wall time and throughput ranges without imposing a performance threshold.
 From a configured client environment, run from the repository root:
 
 ```sh
-cd benchmarks
+cd testing/system/perf
 python3 core.py
 python3 app.py
 ```

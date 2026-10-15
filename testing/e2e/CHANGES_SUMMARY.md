@@ -186,7 +186,7 @@ docker compose exec -w /opt/e2e flame-console uv run -n pytest -v tests/test_ses
 ## Files Changed
 
 ```
-e2e/
+testing/e2e/
 ├── src/e2e/
 │   ├── api.py              ✨ Enhanced with 3 context info classes
 │   ├── instance_svc.py     📝 Renamed from service.py

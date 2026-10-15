@@ -5,7 +5,7 @@ variable "SOURCE_CONTEXT" { default = "." }
 variable "SOURCE_SHA" { default = "" }
 
 group "default" {
-  targets = ["flame-session-manager", "flame-object-cache", "flame-executor-manager", "flame-console", "flame-instance-runtime"]
+  targets = ["flame-session-manager", "flame-object-cache", "flame-executor-manager", "flame-console", "flame-test", "flame-instance-runtime"]
 }
 
 // Build all images in one invocation so their common Cargo stage is shared.
@@ -50,6 +50,20 @@ target "flame-console" {
   tags = ["${IMAGE_REGISTRY}/flame-console:${IMAGE_TAG}-${ARCH}"]
   cache-from = ["type=gha,scope=flame-console-${ARCH}"]
   cache-to = ["type=gha,mode=max,scope=flame-console-${ARCH}"]
+}
+
+// flame-test is flame-console plus testing/, built from the console target of
+// this same invocation, so it never depends on a published console image.
+target "flame-test" {
+  inherits = ["image"]
+  dockerfile = "docker/Dockerfile.test"
+  contexts = {
+    flame-console = "target:flame-console"
+    testing = "${SOURCE_CONTEXT}/testing"
+  }
+  tags = ["${IMAGE_REGISTRY}/flame-test:${IMAGE_TAG}-${ARCH}"]
+  cache-from = ["type=gha,scope=flame-test-${ARCH}"]
+  cache-to = ["type=gha,mode=max,scope=flame-test-${ARCH}"]
 }
 
 target "flame-instance-runtime" {

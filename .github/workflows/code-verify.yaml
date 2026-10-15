@@ -19,7 +19,7 @@ jobs:
         run: |
           for arch in amd64 arm64; do
             ARCH="$arch" docker buildx bake --file ci/release/image-bake.hcl --print > "bake-${arch}.json"
-            jq -e --arg platform "linux/${arch}" '.target | length == 5 and all(.[]; .platforms == [$platform])' "bake-${arch}.json"
+            jq -e --arg platform "linux/${arch}" '.target | length == 6 and all(.[]; .platforms == [$platform])' "bake-${arch}.json"
           done
 
   rust:

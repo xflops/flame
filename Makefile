@@ -123,7 +123,7 @@ format-python: ## Format Python code with ruff
 	cd sdk/python && make format
 
 format-e2e: ## Format E2E code with ruff
-	cd e2e && uv run --extra dev ruff format src tests
+	cd testing/e2e && uv run --extra dev ruff format src tests
 
 format: format-rust format-python format-e2e ## Format both Rust, Python and E2E code
 
@@ -135,13 +135,13 @@ e2e-py-docker: ## Run Python E2E tests with docker compose
 	$(CONTAINER_CLI) compose exec -w /opt/e2e flame-console bash -c "source /usr/local/flame/sbin/flmenv.sh && PYTHONPATH=/opt/e2e/src:\$$PYTHONPATH python3 -m pytest -vv --durations=0 ."
 
 e2e-py-local: ## Run Python E2E tests against local cluster (requires flamepy installed via pip)
-	cd e2e && PYTHONPATH="$(CURDIR)/e2e/src:$$PYTHONPATH" FLAME_ENDPOINT=$(FLAME_ENDPOINT) pytest -vv --durations=0 .
+	cd testing/e2e && PYTHONPATH="$(CURDIR)/testing/e2e/src:$$PYTHONPATH" FLAME_ENDPOINT=$(FLAME_ENDPOINT) pytest -vv --durations=0 .
 
 e2e-py-system-docker: ## Run opt-in Python system tests with docker compose (E2E_SYSTEM_PROFILE=all|stress|longevity|app)
-	$(CONTAINER_CLI) compose exec -w /opt/e2e flame-console bash -c "source /usr/local/flame/sbin/flmenv.sh && FLAME_E2E_SYSTEM_TESTS=$(E2E_SYSTEM_PROFILE) PYTHONPATH=/opt/e2e/src:\$$PYTHONPATH python3 -m pytest -vv --durations=0 tests/test_system.py $(E2E_SYSTEM_PYTEST_ARGS)"
+	$(CONTAINER_CLI) compose exec -w /opt/testing/system flame-console bash -c "source /usr/local/flame/sbin/flmenv.sh && FLAME_E2E_SYSTEM_TESTS=$(E2E_SYSTEM_PROFILE) python3 -m pytest -vv --durations=0 . $(E2E_SYSTEM_PYTEST_ARGS)"
 
 e2e-py-system-local: ## Run opt-in Python system tests against local cluster (E2E_SYSTEM_PROFILE=all|stress|longevity|app)
-	cd e2e && FLAME_E2E_SYSTEM_TESTS=$(E2E_SYSTEM_PROFILE) PYTHONPATH="$(CURDIR)/e2e/src:$$PYTHONPATH" FLAME_ENDPOINT=$(FLAME_ENDPOINT) pytest -vv --durations=0 tests/test_system.py $(E2E_SYSTEM_PYTEST_ARGS)
+	cd testing/system && FLAME_E2E_SYSTEM_TESTS=$(E2E_SYSTEM_PROFILE) FLAME_ENDPOINT=$(FLAME_ENDPOINT) pytest -vv --durations=0 . $(E2E_SYSTEM_PYTEST_ARGS)
 
 e2e-py-system-stress: ## Run Python system stress tests with docker compose
 	$(MAKE) e2e-py-system-docker E2E_SYSTEM_PROFILE=stress E2E_SYSTEM_PYTEST_ARGS="-m stress"
@@ -214,10 +214,19 @@ release-images-build: require-release-image-tag ## Build local multi-arch releas
 			$(CONTAINER_CLI) build --platform "$$platform" --manifest "$(IMAGE_REGISTRY)/$$image:$(DOCKER_TAG)" -f "$$dockerfile" .; \
 		done; \
 	}; \
+	build_test_image() { \
+		for platform in $$platforms; do \
+			echo "$(CONTAINER_CLI) build --platform $$platform --manifest $(IMAGE_REGISTRY)/flame-test:$(DOCKER_TAG) -f docker/Dockerfile.test"; \
+			$(CONTAINER_CLI) build --platform "$$platform" --manifest "$(IMAGE_REGISTRY)/flame-test:$(DOCKER_TAG)" -f docker/Dockerfile.test \
+				--build-context flame-console="container-image://$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)" \
+				--build-context testing=testing .; \
+		done; \
+	}; \
 	build_image flame-session-manager docker/Dockerfile.fsm; \
 	build_image flame-object-cache docker/Dockerfile.foc; \
 	build_image flame-executor-manager docker/Dockerfile.fem; \
 	build_image flame-console docker/Dockerfile.console; \
+	build_test_image; \
 	build_image flame-instance-runtime docker/Dockerfile.flmrt
 
 release-images-inspect: require-release-image-tag ## Inspect local release image manifests
@@ -225,6 +234,7 @@ release-images-inspect: require-release-image-tag ## Inspect local release image
 	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-object-cache:$(DOCKER_TAG)"
 	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)"
 	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)"
+	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-test:$(DOCKER_TAG)"
 	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-instance-runtime:$(DOCKER_TAG)"
 
 release-images-push: require-release-image-tag ## Push release manifest lists
@@ -232,6 +242,7 @@ release-images-push: require-release-image-tag ## Push release manifest lists
 	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-object-cache:$(DOCKER_TAG)" "docker://$(IMAGE_REGISTRY)/flame-object-cache:$(DOCKER_TAG)"
 	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)" "docker://$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)"
 	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)" "docker://$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)"
+	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-test:$(DOCKER_TAG)" "docker://$(IMAGE_REGISTRY)/flame-test:$(DOCKER_TAG)"
 	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-instance-runtime:$(DOCKER_TAG)" "docker://$(IMAGE_REGISTRY)/flame-instance-runtime:$(DOCKER_TAG)"
 
 release-images: require-release-image-tag ## Build, inspect, and push release image manifests
@@ -251,6 +262,7 @@ release-images-verify: require-release-image-tag ## Verify remote release image 
 	check_image "$(IMAGE_REGISTRY)/flame-object-cache:$(DOCKER_TAG)"; \
 	check_image "$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)"; \
 	check_image "$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)"; \
+	check_image "$(IMAGE_REGISTRY)/flame-test:$(DOCKER_TAG)"; \
 	check_image "$(IMAGE_REGISTRY)/flame-instance-runtime:$(DOCKER_TAG)"
 
 release-images-pull-bases: ## Pull release base images with the detected container CLI

@@ -84,8 +84,9 @@ services:
       - ./ci/docker/flame.yaml:/root/.flame/flame.yaml
       - ./ci/docker/certs:/etc/flame/certs:ro
       - ./examples:/opt/examples
-      - ./e2e:/opt/e2e
-      - ./benchmarks:/opt/benchmarks
+      - ./testing/e2e:/opt/e2e
+      - ./testing:/opt/testing
+      - ./testing/system/perf:/opt/benchmarks
       - ./work/cache:/usr/local/flame/data/cache
     depends_on:
       - flame-object-cache

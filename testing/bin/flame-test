@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Run a Flame test suite from the flame-test image (or a checkout of testing/).
+set -euo pipefail
+
+ROOT="${FLAME_TEST_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+
+usage() {
+    cat <<USAGE
+usage: flame-test <suite> [options]
+
+  e2e [pytest args]   end-to-end tests (pytest)
+  perf core|app       performance benchmarks
+  stress              flmbench stress ladder (PROFILE=smoke|default|heavy)
+  stress py [pytest args]     Python stress cases (session API and flamepy.app)
+  longevity           flmbench sustained load (DURATION=1h SESSIONS=10 TASKS=3000)
+  longevity py [pytest args]  Python longevity cases (FLAME_LONGEVITY_DURATION_SECONDS=60)
+  bench [flmbench args]  one flmbench burst
+
+Needs a configured Flame client (~/.flame/flame.yaml or FLAME_ENDPOINT).
+USAGE
+}
+
+suite="${1:-help}"
+[ "$#" -gt 0 ] && shift
+args=("$@")  # flmenv.sh rewrites the positional parameters when sourced
+
+case "$suite" in
+    e2e)
+        cd "$ROOT/e2e"
+        set +u; source /usr/local/flame/sbin/flmenv.sh; set -u
+        PYTHONPATH="$ROOT/e2e/src:${PYTHONPATH:-}" exec python3 -m pytest -vv --durations=0 "${args[@]:-.}"
+        ;;
+    perf)
+        cd "$ROOT/system/perf"
+        set +u; source /usr/local/flame/sbin/flmenv.sh; set -u
+        exec python3 "${args[0]:?perf needs core or app}.py"
+        ;;
+    stress|longevity)
+        if [ "${args[0]:-}" = py ]; then
+            cd "$ROOT/system/$suite"
+            set +u; source /usr/local/flame/sbin/flmenv.sh; set -u
+            FLAME_E2E_SYSTEM_TESTS="$suite" exec python3 -m pytest -vv --durations=0 -m "$suite" "${args[@]:1}"
+        fi
+        exec bash "$ROOT/system/$suite/run.sh"
+        ;;
+    bench) exec flmbench "${args[@]}" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; exit 2 ;;
+esac

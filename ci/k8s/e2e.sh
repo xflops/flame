@@ -453,7 +453,7 @@ run_smoke_tests() {
     flmctl --config "${HOME}/.flame/flame.yaml" list -a
     flmctl --config "${HOME}/.flame/flame.yaml" list -n
     flmping -t "$FLMPING_TASKS"
-    PYTHONPATH="${ROOT_DIR}/e2e/src:${PYTHONPATH:-}" python3 -m e2e.app \
+    PYTHONPATH="${ROOT_DIR}/testing/e2e/src:${PYTHONPATH:-}" python3 -m e2e.app \
         --name "${RELEASE}-app-e2e" \
         --tasks "$APP_E2E_TASKS" \
         --json
@@ -467,8 +467,8 @@ run_smoke_tests() {
 
 run_e2e_tests() {
     log "Running E2E tests directly from the VM"
-    pushd "${ROOT_DIR}/e2e" >/dev/null
-    PYTHONPATH="${ROOT_DIR}/e2e/src:${PYTHONPATH}" \
+    pushd "${ROOT_DIR}/testing/e2e" >/dev/null
+    PYTHONPATH="${ROOT_DIR}/testing/e2e/src:${PYTHONPATH}" \
         FLAME_LOG=DEBUG \
         uv run --no-project \
         --with pytest \

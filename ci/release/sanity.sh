@@ -10,7 +10,7 @@ K8S_E2E="${RELEASE_SANITY_K8S_E2E:-0}"
 COMPOSE_E2E="${RELEASE_SANITY_COMPOSE_E2E:-0}"
 METADATA_CHECKS="${RELEASE_SANITY_METADATA_CHECKS:-1}"
 EXPECTED_PLATFORMS="${RELEASE_SANITY_EXPECTED_PLATFORMS:-linux/amd64 linux/arm64}"
-IMAGE_REPOSITORIES="${RELEASE_SANITY_IMAGE_REPOSITORIES:-flame-session-manager flame-object-cache flame-executor-manager flame-console flame-instance-runtime}"
+IMAGE_REPOSITORIES="${RELEASE_SANITY_IMAGE_REPOSITORIES:-flame-session-manager flame-object-cache flame-executor-manager flame-console flame-test flame-instance-runtime}"
 CONTAINER_CLI="${RELEASE_SANITY_CONTAINER_CLI:-${RELEASE_SANITY_CONTAINER_RUNTIME:-${CONTAINER_RUNTIME:-}}}"
 COMPOSE_PROJECT_NAME="${RELEASE_SANITY_COMPOSE_PROJECT_NAME:-flame-release-sanity}"
 COMPOSE_NETWORK_NAME="${RELEASE_SANITY_COMPOSE_NETWORK_NAME:-flame-release-sanity-flame-net}"
@@ -456,7 +456,7 @@ run_pypi_compose_e2e() {
     run "$CONTAINER_CLI" run --rm \
         --network "$COMPOSE_NETWORK_NAME" \
         -v "$ROOT_DIR/ci/docker/certs:/etc/flame/certs:ro" \
-        -v "$ROOT_DIR/e2e/src:/tmp/e2e-src:ro" \
+        -v "$ROOT_DIR/testing/e2e/src:/tmp/e2e-src:ro" \
         -v "$PYPI_CHECK_SCRIPT:/tmp/flame-release-sanity-pypi-check.sh:ro" \
         -e "PYPI_INDEX_URL=${PYPI_INDEX_URL}" \
         -e "PYTHON_VERSION=${PYTHON_VERSION}" \

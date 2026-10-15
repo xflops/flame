@@ -3,7 +3,7 @@
 ## File Structure
 
 ```
-e2e/
+testing/e2e/
 ├── src/e2e/
 │   ├── api.py              # Shared API definitions with context info classes
 │   ├── instance_svc.py     # serving.Instance-based service (simple)
@@ -132,16 +132,16 @@ response = TestResponse(
 
 ```bash
 # All e2e tests
-pytest e2e/tests/ -v
+pytest testing/e2e/tests/ -v
 
 # Instance tests only (serving.Instance-based)
-pytest e2e/tests/test_service.py -v
+pytest testing/e2e/tests/test_service.py -v
 
 # Service tests only (FlameService-based with context)
-pytest e2e/tests/test_core.py -v
+pytest testing/e2e/tests/test_core.py -v
 
 # Specific test
-pytest e2e/tests/test_core.py::test_all_context_info -v
+pytest testing/e2e/tests/test_core.py::test_all_context_info -v
 ```
 
 ## Test Categories in test_core.py

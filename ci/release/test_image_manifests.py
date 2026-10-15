@@ -14,6 +14,7 @@ IMAGES = [
     "flame-object-cache",
     "flame-executor-manager",
     "flame-console",
+    "flame-test",
     "flame-instance-runtime",
 ]
 
@@ -68,14 +69,14 @@ class ImageManifestsTest(unittest.TestCase):
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
-        self.assertEqual(len(calls), 10)
-        for image, command in zip(IMAGES, calls[:5]):
+        self.assertEqual(len(calls), 2 * len(IMAGES))
+        for image, command in zip(IMAGES, calls[: len(IMAGES)]):
             self.assertEqual(command, [
                 "buildx", "imagetools", "create", "--tag", f"docker.io/xflops/{image}:sha-test",
                 f"docker.io/xflops/{image}@sha256:" + "a" * 64,
                 f"docker.io/xflops/{image}@sha256:" + "b" * 64,
             ])
-        self.assertTrue(all(command[:3] == ["buildx", "imagetools", "inspect"] for command in calls[5:]))
+        self.assertTrue(all(command[:3] == ["buildx", "imagetools", "inspect"] for command in calls[len(IMAGES) :]))
 
     def test_missing_last_digest_prevents_all_registry_writes(self):
         self.metadata("arm64", {image: {"containerimage.digest": "sha256:" + "b" * 64} for image in IMAGES[:-1]})
@@ -104,9 +105,9 @@ class ImageManifestsTest(unittest.TestCase):
                 result = self.run_script("check", arch, self.root / f"digests-{arch}.json")
                 self.assertEqual(result.returncode, 0, result.stderr)
         runs = [command for command in self.calls() if command[0] == "run"]
-        self.assertEqual(len(runs), 16)
+        self.assertEqual(len(runs), 20)
         sdk = [command for command in runs if "import flamepy" in command[-1]]
-        self.assertEqual(len(sdk), 6)
+        self.assertEqual(len(sdk), 8)
 
     def test_wrong_native_architecture_fails_before_running_binary(self):
         self.env["TEST_ARCH"] = "arm64"
