@@ -56,7 +56,7 @@ target "flame-console" {
 // this same invocation, so it never depends on a published console image.
 target "flame-test" {
   inherits = ["image"]
-  dockerfile = "docker/Dockerfile.test"
+  dockerfile = "docker/Dockerfile.testing"
   contexts = {
     flame-console = "target:flame-console"
     testing = "${SOURCE_CONTEXT}/testing"

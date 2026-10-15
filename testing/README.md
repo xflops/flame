@@ -21,7 +21,7 @@ DURATION=8h flame-test longevity
 flame-test bench -s 4 -t 10000 -n 3
 ```
 
-It is built and published with the other images (`docker/Dockerfile.test`, a
+It is built and published with the other images (`docker/Dockerfile.testing`, a
 `flame-test` target in `ci/release/image-bake.hcl`). Bake builds it from the
 `flame-console` target of the same invocation, so it never depends on a console image
 that is already published.

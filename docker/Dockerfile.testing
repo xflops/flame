@@ -1,0 +1,17 @@
+# flame-test: the flame-console image (flmctl, flmbench, flmping, flmexec, flamepy,
+# pytest, jq) plus the test suites from testing/.
+#
+# It is built in the same invocation as flame-console (ci/release/image-bake.hcl),
+# which supplies both named contexts below. To build it alone:
+#   docker build -f docker/Dockerfile.testing \
+#     --build-context flame-console=docker-image://xflops/flame-console:latest \
+#     --build-context testing=testing .
+FROM flame-console
+
+RUN pip3 install --break-system-packages pytest-asyncio
+
+COPY --from=testing . /opt/testing
+RUN ln -s /opt/testing/bin/flame-test /usr/local/bin/flame-test
+
+WORKDIR /opt/testing
+CMD ["flame-test", "help"]

@@ -216,8 +216,8 @@ release-images-build: require-release-image-tag ## Build local multi-arch releas
 	}; \
 	build_test_image() { \
 		for platform in $$platforms; do \
-			echo "$(CONTAINER_CLI) build --platform $$platform --manifest $(IMAGE_REGISTRY)/flame-test:$(DOCKER_TAG) -f docker/Dockerfile.test"; \
-			$(CONTAINER_CLI) build --platform "$$platform" --manifest "$(IMAGE_REGISTRY)/flame-test:$(DOCKER_TAG)" -f docker/Dockerfile.test \
+			echo "$(CONTAINER_CLI) build --platform $$platform --manifest $(IMAGE_REGISTRY)/flame-test:$(DOCKER_TAG) -f docker/Dockerfile.testing"; \
+			$(CONTAINER_CLI) build --platform "$$platform" --manifest "$(IMAGE_REGISTRY)/flame-test:$(DOCKER_TAG)" -f docker/Dockerfile.testing \
 				--build-context flame-console="container-image://$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)" \
 				--build-context testing=testing .; \
 		done; \
