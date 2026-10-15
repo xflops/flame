@@ -105,8 +105,13 @@ pub fn request(cli: &Cli) -> Result<PingRequest, Box<dyn Error>> {
     })
 }
 
+/// Sessions are named `flmbench-<suffix>` so they are easy to tell from the application.
+const SESSION_PREFIX: &str = "flmbench";
+
 fn session_options(cli: &Cli) -> SessionOptions {
-    let mut options = SessionOptions::new(APPLICATION).priority(cli.priority);
+    let mut options = SessionOptions::new(APPLICATION)
+        .id(format!("{SESSION_PREFIX}-{}", stdng::rand::short_name()))
+        .priority(cli.priority);
     if let Some(resreq) = cli.resreq.as_deref() {
         options = options.resreq(resreq);
     }
@@ -322,6 +327,15 @@ pub fn summarize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sessions_are_named_flmbench_and_unique() {
+        let cli = <Cli as clap::Parser>::try_parse_from(["flmbench"]).unwrap();
+        let (a, b) = (session_options(&cli), session_options(&cli));
+        let (a, b) = (a.id.unwrap(), b.id.unwrap());
+        assert!(a.starts_with("flmbench-"), "{a}");
+        assert_ne!(a, b);
+    }
 
     fn ms(value: u64) -> Duration {
         Duration::from_millis(value)
