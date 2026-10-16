@@ -272,25 +272,31 @@ create_external_access() {
     local cache_grpc_port="$3"
     local cache_target_expression=""
     local client_ca_file=""
-    local pod_ip=""
-    local -a cache_pod_ips=()
+    local pod_name=""
+    local headless_service=""
+    local -a cache_pod_names=()
 
-    mapfile -t cache_pod_ips < <(kubectl -n "$NAMESPACE" get pod \
+    # Object refs carry the stable per-pod name <pod>.<headless service>.<namespace>.svc.
+    headless_service="$(kubectl -n "$NAMESPACE" get statefulset \
+        -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=object-cache" \
+        -o jsonpath='{.items[0].spec.serviceName}')"
+    : "${headless_service:?missing serviceName on the object-cache StatefulSet}"
+    mapfile -t cache_pod_names < <(kubectl -n "$NAMESPACE" get pod \
         -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=object-cache" \
         -o json | jq -r \
-        '.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .status.podIP')
-    if [[ "${#cache_pod_ips[@]}" -ne "$OBJECT_CACHE_REPLICAS" ]]; then
-        log "Expected ${OBJECT_CACHE_REPLICAS} ready object-cache pod IPs, found ${#cache_pod_ips[@]}"
+        '.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name')
+    if [[ "${#cache_pod_names[@]}" -ne "$OBJECT_CACHE_REPLICAS" ]]; then
+        log "Expected ${OBJECT_CACHE_REPLICAS} ready object-cache pods, found ${#cache_pod_names[@]}"
         return 1
     fi
 
-    for pod_ip in "${cache_pod_ips[@]}"; do
+    for pod_name in "${cache_pod_names[@]}"; do
         if [[ -n "$cache_target_expression" ]]; then
             cache_target_expression+=" || "
         fi
-        cache_target_expression+="request.headers['x-flame-object-cache'] == '${pod_ip}:${cache_grpc_port}'"
+        cache_target_expression+="request.headers['x-flame-object-cache'] == '${pod_name}.${headless_service}.${NAMESPACE}.svc:${cache_grpc_port}'"
     done
-    : "${cache_target_expression:?no object-cache pod IPs found}"
+    : "${cache_target_expression:?no object-cache pods found}"
 
     export EXTERNAL_SESSION_SERVICE NAMESPACE RELEASE SESSION_NODE_PORT
     export CACHE_GATEWAY_NODE_PORT CACHE_GATEWAY_HOST GATEWAY_CLASS GATEWAY
@@ -340,7 +346,7 @@ create_external_access() {
         | grep -qx "${CACHE_GATEWAY_NODE_PORT}"
 
     # Referencing the internal Service above is intentional for bootstrap calls.
-    # Object refs carry podIP:port in x-flame-object-cache. The second route
+    # Object refs carry <pod>.<headless service>.<namespace>.svc:port in x-flame-object-cache. The second route
     # rewrites the upstream host and restricts targets to current cache replicas.
 }
 
@@ -355,7 +361,7 @@ configure_external_access() {
         -o jsonpath='{.items[0].metadata.name}')"
     cache_service="$(kubectl -n "$NAMESPACE" get service \
         -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=object-cache" \
-        -o jsonpath='{.items[0].metadata.name}')"
+        -o jsonpath='{.items[?(@.spec.clusterIP!="None")].metadata.name}')"
     session_frontend_port="$(kubectl -n "$NAMESPACE" get service "$session_service" \
         -o jsonpath='{.spec.ports[?(@.name=="frontend")].port}')"
     cache_grpc_port="$(kubectl -n "$NAMESPACE" get service "$cache_service" \
