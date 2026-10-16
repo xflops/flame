@@ -15,5 +15,5 @@ cluster:
       max_executors: 16
 cache:
   endpoint: "grpc://10.250.0.1:9090"
-  network_interface: "flame0"
+  advertise: "flame0"
   storage: "/opt/flame-test/data/cache"

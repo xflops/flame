@@ -154,6 +154,21 @@ helm install flame ./charts/flame \
   --set objectCache.replicas=3
 ```
 
+Each replica advertises a stable, namespace-qualified name,
+`<pod>.<release>-object-cache-headless.<namespace>.svc:<port>`, in the object
+references it returns. The chart builds it from the pod name and namespace in
+the `FLAME_CACHE_ADVERTISE` environment variable, which is used when
+`cache.advertise` is not set in the shared configuration. `cache.advertise` is
+an optional network interface name or address; the old `networkInterface` value
+is removed. Without either, a cache advertises the first private IPv4 address of
+a non-loopback interface.
+
+Writes go through the load-balanced `ClusterIP` Service. Reads dial the owner
+named by the reference through the headless Service, so they reach the replica
+that holds the object, and references survive pod restarts. With
+`tls.enabled=true` the cache certificate must cover the per-pod names
+(for example a `*.<release>-object-cache-headless.<namespace>.svc` wildcard).
+
 ## Verify
 
 ```bash

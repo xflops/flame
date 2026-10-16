@@ -37,7 +37,6 @@ pub const DEFAULT_SESSION_RETRY_LIMITS: u32 = 5;
 const DEFAULT_SCHEDULE_INTERVAL: u64 = 100;
 const DEFAULT_SHIM: &str = "host";
 const DEFAULT_FLAME_CACHE_ENDPOINT: &str = "http://127.0.0.1:9090";
-const DEFAULT_FLAME_CACHE_NETWORK_INTERFACE: &str = "eth0";
 const DEFAULT_EVICTION_POLICY: &str = "lru";
 const DEFAULT_MAX_MEMORY: &str = "1G";
 
@@ -127,7 +126,9 @@ struct FlameTlsYaml {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FlameCacheYaml {
     pub endpoint: Option<String>,
-    pub network_interface: Option<String>,
+    /// Address placed in object references: a network interface name (regex)
+    /// or an address (defaults to `endpoint`)
+    pub advertise: Option<String>,
     pub storage: Option<String>,
     pub eviction: Option<FlameEvictionYaml>,
     pub gc: Option<FlameCacheGcYaml>,
@@ -294,7 +295,10 @@ impl FlameTls {
 #[derive(Debug, Clone, Default)]
 pub struct FlameCache {
     pub endpoint: String,
-    pub network_interface: String,
+    /// Address placed in the references returned by the cache, reachable by
+    /// every client: a network interface name (its first IPv4 address is used)
+    /// or an address. `None` uses the environment or the host's private address.
+    pub advertise: Option<String>,
     pub storage: Option<String>,
     pub eviction: FlameEviction,
     pub gc: FlameCacheGc,
@@ -680,9 +684,7 @@ impl TryFrom<FlameCacheYaml> for FlameCache {
             endpoint: cache
                 .endpoint
                 .unwrap_or(DEFAULT_FLAME_CACHE_ENDPOINT.to_string()),
-            network_interface: cache
-                .network_interface
-                .unwrap_or(DEFAULT_FLAME_CACHE_NETWORK_INTERFACE.to_string()),
+            advertise: cache.advertise.filter(|advertise| !advertise.is_empty()),
             storage: cache.storage,
             eviction: cache
                 .eviction
@@ -895,7 +897,6 @@ cluster:
     shim: host
 cache:
   endpoint: "grpc://127.0.0.1:9090"
-  network_interface: "eth0"
   storage: "/var/lib/flame/cache"
   eviction:
     policy: "lru"
@@ -913,12 +914,54 @@ cache:
         assert!(ctx.cache.is_some());
         let cache = ctx.cache.unwrap();
         assert_eq!(cache.endpoint, "grpc://127.0.0.1:9090");
-        assert_eq!(cache.network_interface, "eth0");
         assert_eq!(cache.storage, Some("/var/lib/flame/cache".to_string()));
         assert_eq!(cache.eviction.policy, "lru");
         assert_eq!(cache.eviction.max_memory, 512 * 1024 * 1024); // 512MB in bytes
         assert_eq!(cache.eviction.max_objects, Some(5000));
 
+        Ok(())
+    }
+
+    fn cache_context(cache_yaml: &str) -> Result<FlameCache, FlameError> {
+        let context_string = format!(
+            "---\ncluster:\n  name: flame\n  endpoint: \"http://flame-session-manager:8080\"\ncache:\n{}",
+            cache_yaml
+        );
+        let tmp_dir = TempDir::new().unwrap();
+        let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
+        fs::write(&tmp_file, context_string).map_err(|e| FlameError::Internal(e.to_string()))?;
+        let ctx = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()))?;
+        Ok(ctx.cache.unwrap())
+    }
+
+    #[test]
+    fn test_flame_context_cache_advertise_default() -> Result<(), FlameError> {
+        let cache = cache_context("  endpoint: \"grpc://127.0.0.1:9090\"\n")?;
+        assert_eq!(cache.advertise, None);
+        // An empty value counts as unset.
+        let cache = cache_context("  advertise: \"\"\n")?;
+        assert_eq!(cache.advertise, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_flame_context_cache_advertise() -> Result<(), FlameError> {
+        let cache = cache_context("  advertise: \"grpc://cache-0.cache.flame.svc:9090\"\n")?;
+        assert_eq!(
+            cache.advertise.as_deref(),
+            Some("grpc://cache-0.cache.flame.svc:9090")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_flame_context_cache_ignores_legacy_network_interface() -> Result<(), FlameError> {
+        // Old configs that still set `network_interface` keep loading.
+        let cache = cache_context(
+            "  endpoint: \"grpc://127.0.0.1:9090\"\n  network_interface: \"eth0\"\n",
+        )?;
+        assert_eq!(cache.endpoint, "grpc://127.0.0.1:9090");
+        assert_eq!(cache.advertise, None);
         Ok(())
     }
 

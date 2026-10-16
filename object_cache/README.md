@@ -25,7 +25,7 @@ The `flame-object-cache` is a standalone service that stores opaque client-encod
 ```yaml
 cache:
   endpoint: "grpc://0.0.0.0:9090"
-  network_interface: "eth0"
+  advertise: "eth0"
   storage: "fs:///var/lib/flame/cache"
   eviction:
     policy: lru
@@ -33,6 +33,23 @@ cache:
   gc:
     interval: 60s
 ```
+
+The cache binds `0.0.0.0:<port of endpoint>`. Object references carry the
+address the cache advertises, and clients read, patch and delete through the
+address in the reference, so with several instances every reference identifies
+the instance that holds the object. The advertised address is, in order:
+
+1. `cache.advertise`, when set;
+2. the `FLAME_CACHE_ADVERTISE` environment variable, when set (for instances
+   that share one configuration file, such as StatefulSet pods);
+3. the first private IPv4 address of a non-loopback interface;
+4. `cache.endpoint` as configured.
+
+A value is matched first (unanchored regex) against network interface names and
+becomes that interface's first IPv4 address, with the scheme and port of
+`endpoint`. A value containing `://` is used verbatim. Otherwise it is an
+address: a bare `host` or `host:port` takes the missing scheme and port from
+`endpoint`.
 
 Stale application-data garbage collection is always enabled. The `gc` section
 only overrides its 60-second default interval.

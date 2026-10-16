@@ -12,6 +12,7 @@ limitations under the License.
 */
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -323,48 +324,6 @@ impl CacheEndpoint {
             host_for_uri(&self.host),
             self.port
         )
-    }
-
-    fn get_host(cache_config: &FlameCache) -> Result<String, FlameError> {
-        let network_interfaces =
-            NetworkInterface::show().map_err(|e| FlameError::Network(e.to_string()))?;
-
-        let reg = Regex::new(cache_config.network_interface.as_str())
-            .map_err(|e| FlameError::InvalidConfig(e.to_string()))?;
-        let host = network_interfaces
-            .iter()
-            .find(|iface| reg.is_match(iface.name.as_str()))
-            .ok_or(FlameError::InvalidConfig(format!(
-                "network interface <{}> not found",
-                cache_config.network_interface
-            )))?
-            .clone();
-
-        Ok(host
-            .addr
-            .iter()
-            .find(|ip| ip.ip().is_ipv4())
-            .ok_or(FlameError::InvalidConfig(format!(
-                "network interface <{}> has no IPv4 addresses",
-                cache_config.network_interface
-            )))?
-            .ip()
-            .to_string())
-    }
-}
-
-impl TryFrom<&FlameCache> for CacheEndpoint {
-    type Error = FlameError;
-
-    fn try_from(cache_config: &FlameCache) -> Result<Self, Self::Error> {
-        let endpoint = CacheEndpoint::try_from(&cache_config.endpoint)?;
-        let host = Self::get_host(cache_config)?;
-
-        Ok(Self {
-            scheme: endpoint.scheme,
-            host,
-            port: endpoint.port,
-        })
     }
 }
 
@@ -720,6 +679,113 @@ impl ObjectCache {
     }
 }
 
+/// Environment variable with the advertised address, used when `cache.advertise`
+/// is unset. Instances of one deployment share a configuration file, so a
+/// per-instance address comes from the environment.
+const ADVERTISE_ENV: &str = "FLAME_CACHE_ADVERTISE";
+
+/// Network interface addresses by interface name. Lookups that pick one entry
+/// go in name order, so the result does not depend on the map's iteration order.
+type InterfaceList = HashMap<String, Vec<IpAddr>>;
+
+fn system_interfaces() -> Result<InterfaceList, FlameError> {
+    let mut interfaces = InterfaceList::new();
+    for iface in NetworkInterface::show().map_err(|e| FlameError::Network(e.to_string()))? {
+        interfaces
+            .entry(iface.name)
+            .or_default()
+            .extend(iface.addr.iter().map(|addr| addr.ip()));
+    }
+    Ok(interfaces)
+}
+
+/// Resolve an `advertise` value. A name matching a network interface (regex,
+/// as `network_interface` was) gives that interface's first IPv4 address with
+/// the scheme and port of `endpoint`. Otherwise the value is an address: a full
+/// `scheme://host:port` URL is used as is, a bare `host` or `host:port` takes
+/// the missing scheme and port from `endpoint`.
+fn resolve_advertise(
+    value: &str,
+    endpoint: &CacheEndpoint,
+    interfaces: impl FnOnce() -> Result<InterfaceList, FlameError>,
+) -> Result<CacheEndpoint, FlameError> {
+    if value.contains("://") {
+        return CacheEndpoint::try_from(&value.to_string());
+    }
+
+    if let Ok(reg) = Regex::new(value) {
+        let interfaces = interfaces()?;
+        let matched = interfaces
+            .iter()
+            .filter(|(name, _)| reg.is_match(name))
+            .min_by_key(|(name, _)| name.as_str());
+        if let Some((_, addrs)) = matched {
+            let ip = addrs.iter().find(|ip| ip.is_ipv4()).ok_or_else(|| {
+                FlameError::InvalidConfig(format!(
+                    "network interface <{}> has no IPv4 addresses",
+                    value
+                ))
+            })?;
+            return Ok(CacheEndpoint {
+                scheme: endpoint.scheme.clone(),
+                host: ip.to_string(),
+                port: endpoint.port,
+            });
+        }
+    }
+
+    let url = Url::parse(&format!("{}://{}", endpoint.scheme, value))
+        .map_err(|_| FlameError::InvalidConfig(format!("invalid advertise <{}>", value)))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| FlameError::InvalidConfig(format!("no host in advertise <{}>", value)))?;
+    Ok(CacheEndpoint {
+        scheme: endpoint.scheme.clone(),
+        host: host.to_string(),
+        port: url.port().unwrap_or(endpoint.port),
+    })
+}
+
+/// The address placed in object references. `cache.advertise` is optional.
+/// When set it is resolved by `resolve_advertise` (an interface's address, or
+/// else the value itself); when unset the environment override is resolved the
+/// same way; with neither, the first private (intranet) IPv4 address of a
+/// non-loopback interface, or `cache.endpoint` as configured if there is none.
+fn advertised_endpoint(
+    cache_config: &FlameCache,
+    from_env: Option<String>,
+    interfaces: impl FnOnce() -> Result<InterfaceList, FlameError>,
+) -> Result<CacheEndpoint, FlameError> {
+    let endpoint = CacheEndpoint::try_from(&cache_config.endpoint)?;
+    let value = cache_config
+        .advertise
+        .clone()
+        .filter(|advertise| !advertise.is_empty())
+        .or_else(|| from_env.filter(|advertise| !advertise.is_empty()));
+    if let Some(advertise) = value {
+        return resolve_advertise(&advertise, &endpoint, interfaces);
+    }
+
+    let interfaces = interfaces()?;
+    let mut names: Vec<_> = interfaces.keys().collect();
+    names.sort();
+    let private = names
+        .into_iter()
+        .flat_map(|name| &interfaces[name])
+        .find_map(|ip| match ip {
+            IpAddr::V4(ip) if ip.is_private() => Some(*ip),
+            _ => None,
+        });
+    Ok(match private {
+        Some(ip) => CacheEndpoint {
+            scheme: endpoint.scheme.clone(),
+            host: ip.to_string(),
+            port: endpoint.port,
+        },
+        None => endpoint,
+    })
+}
+
 /// Run the object cache server.
 ///
 /// # Arguments
@@ -732,8 +798,14 @@ pub async fn run(
     // Clients may use a Service to select a cache replica for the initial
     // request. References returned by that replica must identify the replica
     // itself because cached objects are replica-local.
-    let endpoint = CacheEndpoint::try_from(cache_config)?;
-    let address_str = format!("{}:{}", endpoint.host, endpoint.port);
+    // The cache serves the port of `endpoint` on every interface. References
+    // carry `advertise` (an interface name or an address), else
+    // `FLAME_CACHE_ADVERTISE`, else a private address of this host.
+    let serving = CacheEndpoint::try_from(&cache_config.endpoint)?;
+    let address_str = format!("0.0.0.0:{}", serving.port);
+    let env_advertise = std::env::var(ADVERTISE_ENV).ok();
+    let advertised = advertised_endpoint(cache_config, env_advertise, system_interfaces)?;
+    tracing::info!("Advertising {}", advertised.to_uri());
 
     let storage_url = cache_config.storage.as_deref().unwrap_or("none");
     let storage = crate::storage::connect(storage_url).await?;
@@ -751,7 +823,11 @@ pub async fn run(
         cache_config.eviction.max_objects
     );
 
-    let cache = Arc::new(ObjectCache::new(endpoint, storage, Some(&eviction_config))?);
+    let cache = Arc::new(ObjectCache::new(
+        advertised,
+        storage,
+        Some(&eviction_config),
+    )?);
 
     cache.load_from_storage().await?;
 
@@ -1323,6 +1399,191 @@ mod tests {
             assert_eq!(meta.delta_count, 5);
             assert_eq!(meta.creation_time, 1234);
             assert_eq!(meta.endpoint, "grpc://10.0.0.42:9090");
+        }
+    }
+
+    mod advertise {
+        use super::*;
+
+        fn endpoint(host: &str) -> CacheEndpoint {
+            CacheEndpoint {
+                scheme: "grpc".to_string(),
+                host: host.to_string(),
+                port: 9090,
+            }
+        }
+
+        #[tokio::test]
+        async fn refs_carry_advertised_address() {
+            let storage = crate::storage::connect("none").await.unwrap();
+            let cache =
+                ObjectCache::new(endpoint("cache-1.cache.flame.svc"), storage, None).unwrap();
+
+            let key = ObjectKey::from_path("app/session").unwrap();
+            let meta = cache.put(key, Object::new(0, vec![7u8; 10])).await.unwrap();
+            assert_eq!(meta.endpoint, "grpc://cache-1.cache.flame.svc:9090");
+
+            let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
+            let patched = cache.patch(&key, Object::new(0, vec![1u8])).await.unwrap();
+            assert_eq!(patched.endpoint, "grpc://cache-1.cache.flame.svc:9090");
+        }
+
+        fn interfaces() -> Result<InterfaceList, FlameError> {
+            Ok(InterfaceList::from([
+                (
+                    "lo".to_string(),
+                    vec!["::1".parse().unwrap(), "127.0.0.1".parse().unwrap()],
+                ),
+                ("eth0".to_string(), vec!["10.1.2.3".parse().unwrap()]),
+                ("v6only".to_string(), vec!["fe80::1".parse().unwrap()]),
+            ]))
+        }
+
+        fn advertised(config: &FlameCache, env: Option<&str>) -> Result<String, FlameError> {
+            advertised_endpoint(config, env.map(str::to_string), interfaces).map(|e| e.to_uri())
+        }
+
+        #[test]
+        fn advertised_endpoint_precedence() {
+            let mut config = FlameCache {
+                endpoint: "grpcs://cache.flame.svc:9443".to_string(),
+                ..FlameCache::default()
+            };
+            // Neither set: the first private address of a non-loopback interface.
+            assert_eq!(
+                advertised(&config, None).unwrap(),
+                "grpc+tls://10.1.2.3:9443"
+            );
+            assert_eq!(
+                advertised(&config, Some("")).unwrap(),
+                "grpc+tls://10.1.2.3:9443"
+            );
+
+            // Only the environment set.
+            assert_eq!(
+                advertised(&config, Some("grpcs://cache-2.cache.flame.svc:9090")).unwrap(),
+                "grpc+tls://cache-2.cache.flame.svc:9090"
+            );
+            assert!(advertised(&config, Some("grpc://")).is_err());
+
+            // `cache.advertise` wins over the environment.
+            config.advertise = Some("grpc://from-config:9091".to_string());
+            assert_eq!(
+                advertised(&config, Some("grpc://from-env:9092")).unwrap(),
+                "grpc://from-config:9091"
+            );
+            assert_eq!(
+                advertised(&config, None).unwrap(),
+                "grpc://from-config:9091"
+            );
+        }
+
+        #[test]
+        fn interface_picks_go_in_name_order() {
+            let two = || -> Result<InterfaceList, FlameError> {
+                Ok(InterfaceList::from([
+                    ("eth1".to_string(), vec!["10.0.0.2".parse().unwrap()]),
+                    ("eth0".to_string(), vec!["10.0.0.1".parse().unwrap()]),
+                ]))
+            };
+            let mut config = FlameCache {
+                endpoint: "grpc://0.0.0.0:9090".to_string(),
+                ..FlameCache::default()
+            };
+            // The first private address, and the first interface a pattern matches.
+            for _ in 0..8 {
+                let advertised = advertised_endpoint(&config, None, two).unwrap();
+                assert_eq!(advertised.to_uri(), "grpc://10.0.0.1:9090");
+            }
+            config.advertise = Some("eth".to_string());
+            for _ in 0..8 {
+                let advertised = advertised_endpoint(&config, None, two).unwrap();
+                assert_eq!(advertised.to_uri(), "grpc://10.0.0.1:9090");
+            }
+        }
+
+        #[test]
+        fn advertise_falls_back_to_endpoint_without_private_address() {
+            let config = FlameCache {
+                endpoint: "grpc://127.0.0.1:9090".to_string(),
+                ..FlameCache::default()
+            };
+            let only_loopback = || -> Result<InterfaceList, FlameError> {
+                Ok(InterfaceList::from([(
+                    "lo".to_string(),
+                    vec!["127.0.0.1".parse().unwrap()],
+                )]))
+            };
+            let advertised = advertised_endpoint(&config, None, only_loopback).unwrap();
+            assert_eq!(advertised.to_uri(), "grpc://127.0.0.1:9090");
+        }
+
+        #[test]
+        fn advertise_resolves_interface_first() {
+            let mut config = FlameCache {
+                endpoint: "grpcs://0.0.0.0:9443".to_string(),
+                advertise: Some("eth0".to_string()),
+                ..FlameCache::default()
+            };
+            assert_eq!(
+                advertised(&config, None).unwrap(),
+                "grpc+tls://10.1.2.3:9443"
+            );
+            // The configuration wins over the environment, also for interfaces.
+            assert_eq!(
+                advertised(&config, Some("lo")).unwrap(),
+                "grpc+tls://10.1.2.3:9443"
+            );
+            // The environment value is resolved the same way.
+            config.advertise = None;
+            assert_eq!(
+                advertised(&config, Some("lo")).unwrap(),
+                "grpc+tls://127.0.0.1:9443"
+            );
+            // An interface without IPv4 is a configuration error.
+            config.advertise = Some("v6only".to_string());
+            assert!(matches!(
+                advertised(&config, None),
+                Err(FlameError::InvalidConfig(_))
+            ));
+        }
+
+        #[test]
+        fn advertise_literal_address_forms() {
+            let config = |advertise: &str| FlameCache {
+                endpoint: "grpcs://0.0.0.0:9443".to_string(),
+                advertise: Some(advertise.to_string()),
+                ..FlameCache::default()
+            };
+            assert_eq!(
+                advertised(&config("grpc://pod-0.svc:9000"), None).unwrap(),
+                "grpc://pod-0.svc:9000"
+            );
+            assert_eq!(
+                advertised(&config("pod-0.svc"), None).unwrap(),
+                "grpc+tls://pod-0.svc:9443"
+            );
+            assert_eq!(
+                advertised(&config("pod-0.svc:9000"), None).unwrap(),
+                "grpc+tls://pod-0.svc:9000"
+            );
+            assert_eq!(
+                advertised(&config("192.168.1.5"), None).unwrap(),
+                "grpc+tls://192.168.1.5:9443"
+            );
+        }
+
+        #[test]
+        fn advertise_does_not_list_interfaces_for_urls() {
+            let config = FlameCache {
+                endpoint: "grpc://0.0.0.0:9090".to_string(),
+                advertise: Some("grpc://x:1".to_string()),
+                ..FlameCache::default()
+            };
+            let result = advertised_endpoint(&config, None, || {
+                Err(FlameError::Network("must not be called".to_string()))
+            });
+            assert!(result.is_ok());
         }
     }
 

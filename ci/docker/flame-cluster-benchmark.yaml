@@ -19,7 +19,7 @@ cluster:
     ca_file: "/etc/flame/certs/ca.crt"
 cache:
   endpoint: "grpcs://flame-object-cache:9090"
-  network_interface: "eth0"
+  advertise: "eth0"
   eviction:
     policy: "lru"
     max_memory: "1024M"

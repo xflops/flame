@@ -48,7 +48,6 @@ data:
       {{- end }}
     cache:
       endpoint: {{ include "flame.cacheEndpoint" . | quote }}
-      network_interface: {{ .Values.objectCache.networkInterface | quote }}
       storage: {{ .Values.objectCache.storage | quote }}
       eviction:
         policy: {{ .Values.objectCache.eviction.policy | quote }}

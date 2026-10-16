@@ -46,6 +46,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s-object-cache" (include "flame.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{- define "flame.objectCache.headlessName" -}}
+{{- printf "%s-headless" (include "flame.objectCache.name" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{- define "flame.executorManager.name" -}}
 {{- printf "%s-executor-manager" (include "flame.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}

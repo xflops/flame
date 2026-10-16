@@ -17,4 +17,26 @@ spec:
   selector:
     {{- include "flame.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: object-cache
+---
+# Gives each StatefulSet pod a stable DNS name. Object references name the
+# owning pod through it, so reads reach the instance that holds the object.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "flame.objectCache.headlessName" . }}
+  labels:
+    {{- include "flame.labels" . | nindent 4 }}
+    app.kubernetes.io/component: object-cache
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: grpc
+      port: {{ .Values.objectCache.service.port }}
+      targetPort: grpc
+      protocol: TCP
+      appProtocol: kubernetes.io/h2c
+  selector:
+    {{- include "flame.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: object-cache
 {{- end }}

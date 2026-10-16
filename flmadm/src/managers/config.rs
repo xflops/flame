@@ -113,7 +113,7 @@ cluster:
     max_executors: 128
 cache:
   endpoint: "grpc://127.0.0.1:9090"
-  network_interface: "lo"
+  advertise: "lo"
   storage: "{prefix}/data/cache"
 "#,
             prefix = prefix

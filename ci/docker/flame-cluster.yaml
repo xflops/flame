@@ -20,7 +20,7 @@ cluster:
     ca_file: "/etc/flame/certs/ca.crt"
 cache:
   endpoint: "grpcs://flame-object-cache:9090"
-  network_interface: "eth0"
+  advertise: "eth0"
   storage: "/var/lib/flame/cache"
   eviction:
     policy: "lru"
