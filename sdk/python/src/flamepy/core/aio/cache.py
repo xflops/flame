@@ -25,7 +25,6 @@ from typing import Any, AsyncIterator, Optional
 from urllib.parse import urlparse
 
 import grpc
-import pyarrow as pa
 
 from flamepy.core import cache as common
 from flamepy.core.cache import Deserializer, FetchResult, ObjectKey, ObjectRef, Ref, ValueRef
@@ -323,6 +322,7 @@ async def _download_file(ref: ObjectRef, dest_path: str) -> None:
                         await asyncio.to_thread(compressed.write, response.chunk.data)
 
                     def decompress_file():
+                        pa = common._pyarrow()
                         compressed.seek(0)
                         with pa.CompressedInputStream(pa.input_stream(compressed), common._COMPRESSION_ZSTD) as stream:
                             while data := stream.read(common._UPLOAD_CHUNK_SIZE):

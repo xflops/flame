@@ -17,8 +17,23 @@ limitations under the License.
 # Import proto module first to ensure types_pb2 is loaded before frontend_pb2
 from flamepy import proto  # noqa: F401
 
-# Import domain submodules (only as submodules)
-from . import agent, app, serving, util
+# The domain submodules (agent, app, serving, util) are imported on first use:
+# serving pulls in fastapi and the others the SDK clients, and a worker that
+# imports only what it needs starts faster.
+import importlib
+
+_LAZY_SUBMODULES = ("agent", "app", "serving", "util")
+
+
+def __getattr__(name):
+    if name in _LAZY_SUBMODULES:
+        return importlib.import_module(f"{__name__}.{name}")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY_SUBMODULES))
+
 
 # Export all core classes/types at top level
 from .core import (  # Type aliases; Constants; Enums; Exception classes; Data classes; Context and utility classes; Client functions; Client classes; Service constants; Service context classes; Service base classes; Service functions

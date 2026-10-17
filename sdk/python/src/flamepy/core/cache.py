@@ -12,6 +12,7 @@ limitations under the License.
 """
 
 import atexit
+import importlib
 import os
 import sys
 import threading
@@ -24,12 +25,15 @@ from urllib.parse import urlparse
 
 import bson
 import cloudpickle
-import pyarrow as pa
 
 from flamepy.core.types import FlameClientCache, FlameClientTls, FlameContext
 
+# numpy, pandas, polars and pyarrow are heavy to import, so they are imported when
+# a value needs them. A value of one of their types means the module is already
+# imported, so serializing other values never loads them.
 if TYPE_CHECKING:
     import numpy as np
+    import pyarrow as pa
 
 # Type identifiers live in cache metadata; payload bytes contain only the codec output.
 _TYPE_CLOUDPICKLE = "cloudpickle"
@@ -52,29 +56,18 @@ _ZSTD_OBJECT_TYPES = {
 }
 
 
-try:
-    import numpy as np
+def _pyarrow() -> Any:
+    import pyarrow as pa
 
-    _HAS_NUMPY = True
-except ImportError:
-    np = None  # type: ignore[assignment]
-    _HAS_NUMPY = False
+    return pa
 
-try:
-    import pandas as pd
 
-    _HAS_PANDAS = True
-except ImportError:
-    pd = None  # type: ignore[assignment]
-    _HAS_PANDAS = False
+def _required_module(name: str) -> Any:
+    try:
+        return importlib.import_module(name)
+    except ImportError as exc:
+        raise ImportError(f"{name} is required to deserialize this object") from exc
 
-try:
-    import polars as pl
-
-    _HAS_POLARS = True
-except ImportError:
-    pl = None  # type: ignore[assignment]
-    _HAS_POLARS = False
 
 # Turns the data parts of an object, in the order they were written, into a value.
 Deserializer = Callable[[List[Any]], Any]
@@ -366,6 +359,7 @@ class ObjectKey:
 
 def _serialize_numpy(arr: "np.ndarray") -> bytes:
     """Serialize numpy array using Arrow's zero-copy tensor format."""
+    pa = _pyarrow()
     tensor = pa.Tensor.from_numpy(arr)
     sink = pa.BufferOutputStream()
     pa.ipc.write_tensor(tensor, sink)
@@ -374,41 +368,47 @@ def _serialize_numpy(arr: "np.ndarray") -> bytes:
 
 def _deserialize_numpy(data: bytes) -> "np.ndarray":
     """Deserialize numpy array from Arrow tensor format."""
+    pa = _pyarrow()
     reader = pa.BufferReader(data)
     tensor = pa.ipc.read_tensor(reader)
     return tensor.to_numpy()
 
 
-def _serialize_arrow_table(table: pa.Table) -> bytes:
+def _serialize_arrow_table(table: "pa.Table") -> bytes:
     """Serialize PyArrow Table using IPC stream format."""
+    pa = _pyarrow()
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, table.schema) as writer:
         writer.write_table(table)
     return sink.getvalue().to_pybytes()
 
 
-def _deserialize_arrow_table(data: bytes) -> pa.Table:
+def _deserialize_arrow_table(data: bytes) -> "pa.Table":
     """Deserialize PyArrow Table from IPC stream format."""
+    pa = _pyarrow()
     reader = pa.ipc.open_stream(pa.BufferReader(data))
     return reader.read_all()
 
 
-def _serialize_arrow_batch(batch: pa.RecordBatch) -> bytes:
+def _serialize_arrow_batch(batch: "pa.RecordBatch") -> bytes:
     """Serialize PyArrow RecordBatch using IPC stream format."""
+    pa = _pyarrow()
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, batch.schema) as writer:
         writer.write_batch(batch)
     return sink.getvalue().to_pybytes()
 
 
-def _deserialize_arrow_batch(data: bytes) -> pa.RecordBatch:
+def _deserialize_arrow_batch(data: bytes) -> "pa.RecordBatch":
     """Deserialize PyArrow RecordBatch from IPC stream format."""
+    pa = _pyarrow()
     reader = pa.ipc.open_stream(pa.BufferReader(data))
     return reader.read_next_batch()
 
 
-def _serialize_arrow_array(arr: pa.Array) -> bytes:
+def _serialize_arrow_array(arr: "pa.Array") -> bytes:
     """Serialize PyArrow Array by wrapping in a RecordBatch."""
+    pa = _pyarrow()
     batch = pa.RecordBatch.from_arrays([arr], names=["data"])
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, batch.schema) as writer:
@@ -416,8 +416,9 @@ def _serialize_arrow_array(arr: pa.Array) -> bytes:
     return sink.getvalue().to_pybytes()
 
 
-def _deserialize_arrow_array(data: bytes) -> pa.Array:
+def _deserialize_arrow_array(data: bytes) -> "pa.Array":
     """Deserialize PyArrow Array from IPC stream format."""
+    pa = _pyarrow()
     reader = pa.ipc.open_stream(pa.BufferReader(data))
     batch = reader.read_next_batch()
     return batch.column(0)
@@ -435,25 +436,32 @@ def _deserialize_cloudpickle(data: bytes) -> Any:
 
 def _serialize_object_data(obj: Any) -> tuple[str, bytes]:
     """Encode a value and return its type tag separately from its payload."""
-    if _HAS_NUMPY and isinstance(obj, np.ndarray):
+    # A value of a library's type means the library is already imported.
+    np = sys.modules.get("numpy")
+    if np is not None and isinstance(obj, np.ndarray):
         if obj.flags.c_contiguous or obj.flags.f_contiguous:
             return _TYPE_NUMPY, _serialize_numpy(obj)
-    if _HAS_PANDAS and isinstance(obj, pd.DataFrame):
-        return _TYPE_PANDAS_DATAFRAME, _serialize_arrow_table(pa.Table.from_pandas(obj))
-    if _HAS_POLARS and isinstance(obj, (pl.DataFrame, pl.LazyFrame)):
+    pd = sys.modules.get("pandas")
+    if pd is not None and isinstance(obj, pd.DataFrame):
+        return _TYPE_PANDAS_DATAFRAME, _serialize_arrow_table(_pyarrow().Table.from_pandas(obj))
+    pl = sys.modules.get("polars")
+    if pl is not None and isinstance(obj, (pl.DataFrame, pl.LazyFrame)):
         frame = obj.collect() if isinstance(obj, pl.LazyFrame) else obj
         return _TYPE_POLARS_DATAFRAME, _serialize_arrow_table(frame.to_arrow())
-    if isinstance(obj, pa.Table):
-        return _TYPE_ARROW_TABLE, _serialize_arrow_table(obj)
-    if isinstance(obj, pa.RecordBatch):
-        return _TYPE_ARROW_BATCH, _serialize_arrow_batch(obj)
-    if isinstance(obj, pa.Array):
-        return _TYPE_ARROW_ARRAY, _serialize_arrow_array(obj)
+    pa = sys.modules.get("pyarrow")
+    if pa is not None:
+        if isinstance(obj, pa.Table):
+            return _TYPE_ARROW_TABLE, _serialize_arrow_table(obj)
+        if isinstance(obj, pa.RecordBatch):
+            return _TYPE_ARROW_BATCH, _serialize_arrow_batch(obj)
+        if isinstance(obj, pa.Array):
+            return _TYPE_ARROW_ARRAY, _serialize_arrow_array(obj)
     if hasattr(obj, "to_arrow"):
         try:
             arrow_obj = obj.to_arrow()
         except TypeError:
             arrow_obj = None
+        pa = _pyarrow()
         if isinstance(arrow_obj, pa.Table):
             return _TYPE_ARROW_TABLE, _serialize_arrow_table(arrow_obj)
         if isinstance(arrow_obj, pa.RecordBatch):
@@ -466,8 +474,7 @@ def _deserialize_object_data(data_type: str, data: bytes) -> Any:
     if data_type == _TYPE_CLOUDPICKLE:
         return _deserialize_cloudpickle(data)
     if data_type == _TYPE_NUMPY:
-        if not _HAS_NUMPY:
-            raise ImportError("numpy is required to deserialize this object")
+        _required_module("numpy")
         return _deserialize_numpy(data)
     if data_type == _TYPE_ARROW_TABLE:
         return _deserialize_arrow_table(data)
@@ -476,13 +483,10 @@ def _deserialize_object_data(data_type: str, data: bytes) -> Any:
     if data_type == _TYPE_ARROW_ARRAY:
         return _deserialize_arrow_array(data)
     if data_type == _TYPE_PANDAS_DATAFRAME:
-        if not _HAS_PANDAS:
-            raise ImportError("pandas is required to deserialize this object")
+        _required_module("pandas")
         return _deserialize_arrow_table(data).to_pandas()
     if data_type == _TYPE_POLARS_DATAFRAME:
-        if not _HAS_POLARS:
-            raise ImportError("polars is required to deserialize this object")
-        return pl.from_arrow(_deserialize_arrow_table(data))
+        return _required_module("polars").from_arrow(_deserialize_arrow_table(data))
     raise ValueError(f"Unsupported cache data type: {data_type}")
 
 
@@ -501,12 +505,13 @@ def _type_and_compression(data_type: str) -> tuple[str, str]:
 def _compress_data(data: bytes, compression: str) -> bytes:
     if _validate_compression(compression) == _COMPRESSION_NONE:
         return data
-    return pa.Codec(_COMPRESSION_ZSTD).compress(data, asbytes=True)
+    return _pyarrow().Codec(_COMPRESSION_ZSTD).compress(data, asbytes=True)
 
 
 def _decompress_data(data: bytes, compression: str) -> bytes:
     if _validate_compression(compression) == _COMPRESSION_NONE:
         return data
+    pa = _pyarrow()
     with pa.CompressedInputStream(pa.BufferReader(data), _COMPRESSION_ZSTD) as stream:
         return stream.read()
 
@@ -517,7 +522,8 @@ def _encode_object_data(obj: Any) -> tuple[str, bytes]:
     torch_module = sys.modules.get("torch")
     tensor_type = getattr(torch_module, "Tensor", None)
     is_tensor = isinstance(tensor_type, type) and isinstance(obj, tensor_type)
-    is_numpy = _HAS_NUMPY and isinstance(obj, np.ndarray)
+    numpy_module = sys.modules.get("numpy")
+    is_numpy = numpy_module is not None and isinstance(obj, numpy_module.ndarray)
     if data_type in _ZSTD_OBJECT_TYPES or is_numpy or is_tensor:
         return f"{data_type}.zstd", _compress_data(data, _COMPRESSION_ZSTD)
     return data_type, data

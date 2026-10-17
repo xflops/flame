@@ -9,6 +9,7 @@ spec:
     - run
     - --python
     - /usr/bin/python3
+    - --no-project
     - python
     - -m
     - flamepy.app.runpy

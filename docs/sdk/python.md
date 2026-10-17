@@ -172,7 +172,10 @@ flmctl deploy --name script-app --application ./main.py
 ```
 
 This packages `main.py` as `main.py.tar.gz` and runs it with `python3` without
-installing project dependencies. Use a directory with Python package metadata
+installing project dependencies. A directory whose `pyproject.toml` declares no
+dependencies, scripts or extension modules (and has no `src/` layout) is not
+installed either: the executor uses it from its source directory, which saves
+the install on every node. Use a directory with Python package metadata
 when the script needs dependencies. The SDK can also register an application
 directly:
 

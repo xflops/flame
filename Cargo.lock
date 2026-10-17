@@ -1731,6 +1731,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
  "tower",
  "tracing",

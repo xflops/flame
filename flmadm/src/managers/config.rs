@@ -254,6 +254,7 @@ mod tests {
                 "run",
                 "--python",
                 "python${FLAME_PYTHON_VERSION}",
+                "--no-project",
                 "python",
                 "-m",
                 "flamepy.app.runpy",

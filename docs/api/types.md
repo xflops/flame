@@ -299,7 +299,7 @@ message ApplicationSpec {
 | `delay_release` | int64 | Base executor release delay in seconds (default: 60); retained Idle executors use twice this delay |
 | `schema` | ApplicationSchema | Input/output schema definitions |
 | `url` | string | Service URL for remote services |
-| `installer` | string | Optional installer name used by the executor before launching the application |
+| `installer` | string | Optional installer name used by the executor before launching the application. The `python` installer installs the package with `uv`, except a package that declares no dependencies, scripts or extension modules (and has no `src/` layout), which has nothing to install and is used from its source directory |
 
 ### Shim
 
