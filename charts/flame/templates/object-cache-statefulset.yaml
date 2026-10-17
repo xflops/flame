@@ -114,7 +114,13 @@ spec:
           emptyDir: {}
         {{- if not .Values.objectCache.persistence.enabled }}
         - name: cache-data
-          emptyDir: {}
+          emptyDir:
+            {{- with .Values.objectCache.emptyDir.medium }}
+            medium: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.objectCache.emptyDir.sizeLimit }}
+            sizeLimit: {{ . | quote }}
+            {{- end }}
         {{- end }}
         {{- if .Values.tls.enabled }}
         - name: cluster-tls

@@ -75,6 +75,11 @@ objectCache:
     size: 100Gi
     accessModes:
       - ReadWriteOnce
+  # Used when persistence is disabled. Set medium to "Memory" to keep cached
+  # objects in RAM; they count against the pod's memory.
+  emptyDir:
+    medium: ""
+    sizeLimit: ""
   eviction:
     policy: lru
     maxMemory: 1G
