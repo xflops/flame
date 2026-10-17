@@ -71,11 +71,21 @@ jobs:
           files: ci/release/image-bake.hcl
           push: true
 
+      # Only the digests are needed. The full build metadata embeds the commit
+      # message of the pushed commit once per image, so it can grow past the
+      # 128 KiB limit of one environment variable (Argument list too long).
       - name: Save image digests
         env:
-          BUILD_METADATA: ${{ steps.build.outputs.metadata }}
+          BUILD_DIGESTS: >-
+            ${{ format('{{"flame-session-manager":{{"containerimage.digest":"{0}"}},"flame-object-cache":{{"containerimage.digest":"{1}"}},"flame-executor-manager":{{"containerimage.digest":"{2}"}},"flame-console":{{"containerimage.digest":"{3}"}},"flame-test":{{"containerimage.digest":"{4}"}},"flame-instance-runtime":{{"containerimage.digest":"{5}"}}}}',
+            fromJSON(steps.build.outputs.metadata)['flame-session-manager']['containerimage.digest'],
+            fromJSON(steps.build.outputs.metadata)['flame-object-cache']['containerimage.digest'],
+            fromJSON(steps.build.outputs.metadata)['flame-executor-manager']['containerimage.digest'],
+            fromJSON(steps.build.outputs.metadata)['flame-console']['containerimage.digest'],
+            fromJSON(steps.build.outputs.metadata)['flame-test']['containerimage.digest'],
+            fromJSON(steps.build.outputs.metadata)['flame-instance-runtime']['containerimage.digest']) }}
           ARCH: ${{ matrix.arch }}
-        run: printf '%s\n' "$BUILD_METADATA" > "${RUNNER_TEMP}/digests-${ARCH}.json"
+        run: printf '%s\n' "$BUILD_DIGESTS" > "${RUNNER_TEMP}/digests-${ARCH}.json"
 
       - name: Smoke test native images
         env:
