@@ -225,22 +225,14 @@ Object keys use either a prefix, `<app>/<session>`, or a full key, `<app>/<sessi
 use flame_rs as flame;
 
 let reference = flame::put_object("pi/shared", &model_config).await?;
-let loaded: ModelConfig = reference.get().await?;
+let loaded: ModelConfig = reference.get().await?; // the newest data part
 
-let updated = flame::update_object(&reference, &next_model_config).await?;
-let loaded_again: ModelConfig = flame::get_object(updated).await?;
+let patched = flame::patch_object(&reference, &model_patch).await?;
 ```
 
-Use `patch_object()` for versioned delta updates, `upload_object()` and `download_object()` for files, and `delete_objects()` to remove an object or prefix. `ObjectRef` carries the cache endpoint, full key, and object version.
+An object is created once and then only grows by appended data: use `patch_object()` to append to it and `delete_objects()` to remove an object or prefix. `upload_package(context, app, filename, path)` uploads an application package, stored at `package_key(app, filename)`, `<app>/pkg/<filename>`, replacing one of the same name. These helpers match the Python SDK (`put_object`, `get_object`, `patch_object`, `delete_objects`, `upload_package`); all but `upload_package` use the default Flame context. `ObjectRef` carries the cache endpoint, full key, and object version.
 
-The typed helpers use the `raw` data type. For caller-defined encodings, use
-`put_object_bytes()`, `update_object_bytes()`, or `patch_object_bytes()` with
-the encoded bytes and a data type such as `raw.zstd`. `get_object_bytes()`
-returns that type and the stored base and patch bytes without decoding them.
-File transfers are also opaque: `upload_object_with_data_type()` sends a file
-with a caller-defined type, and `download_object_with_data_type()` writes the
-stored bytes and returns their type. The caller handles any compression or
-value decoding.
+The helpers use the `raw` data type and the `FlameMessage` encoding. `get_object::<T>(reference)` (or `reference.get::<T>()`) makes a `T` of the data parts of the object, as `Vec<Bytes>` in the order they were written, so `T` must implement `TryFrom<Vec<Bytes>, Error = FlameError>`. A type that derives `FlameMessage` gets that implementation and is made of the newest part; implement it yourself to combine the parts, like the Python `deserializer(parts)`.
 
 ## Deploy And Run
 
@@ -266,7 +258,7 @@ honor nested `.flmignore` and `.flameignore` files with Gitignore-style rules.
 | Tasks | `Session::run()`, `Session::invoke()`, `Session::create_task()`, `Session::watch_task()` |
 | Services | `flame_rs::run()`, `FlameService`, `#[flame::entrypoint]`, `#[flame::instance]` |
 | Messages | `FlameMessage`, `IntoTaskInput`, `FromTaskOutput`, `IntoCommonData` |
-| Objects | `put_object()`, `get_object()`, `update_object()`, `patch_object()`, `upload_object()`, `download_object()` |
+| Objects | `put_object()`, `get_object()`, `patch_object()`, `delete_objects()`, `upload_package()` |
 
 See also:
 

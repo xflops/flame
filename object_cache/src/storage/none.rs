@@ -12,59 +12,95 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::stream::BoxStream;
+use futures::TryStreamExt;
 
 use common::FlameError;
 
-use crate::cache::{Object, ObjectKey, ObjectMetadata};
+#[cfg(test)]
+use crate::cache::Object;
+use crate::cache::{ObjectData, ObjectKey, ObjectMetadata};
 
-use super::StorageEngine;
+use super::{ObjectStat, StorageEngine};
 
-pub struct NoneStorage;
+/// The absence of a store: writes are accepted and discarded, and nothing is
+/// ever found. `ResidentStorage` over it is a cache that is the only copy of
+/// its objects.
+pub struct NoStorage;
 
-impl NoneStorage {
+impl NoStorage {
     pub fn new() -> Self {
         tracing::info!("Using none storage engine (no persistence)");
         Self
     }
 }
 
-impl Default for NoneStorage {
+impl Default for NoStorage {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl StorageEngine for NoneStorage {
-    async fn write_object(&self, _key: &ObjectKey, _object: &Object) -> Result<(), FlameError> {
-        Ok(())
+impl StorageEngine for NoStorage {
+    async fn write_stream(
+        &self,
+        _key: &ObjectKey,
+        meta: ObjectMetadata,
+        chunks: BoxStream<'_, Result<Bytes, FlameError>>,
+    ) -> Result<ObjectMetadata, FlameError> {
+        let size = chunks
+            .try_fold(
+                0u64,
+                |size, chunk| async move { Ok(size + chunk.len() as u64) },
+            )
+            .await?;
+        Ok(meta.with_size(size))
     }
 
-    async fn read_object(&self, _key: &ObjectKey) -> Result<Option<Object>, FlameError> {
+    async fn read_range(
+        &self,
+        key: &ObjectKey,
+        _patch: usize,
+        _offset: u64,
+        _len: usize,
+    ) -> Result<Bytes, FlameError> {
+        Err(FlameError::NotFound(format!(
+            "object <{:?}> not found",
+            key.to_key()
+        )))
+    }
+
+    async fn stat(&self, _key: &ObjectKey) -> Result<Option<ObjectStat>, FlameError> {
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    async fn read_object(
+        &self,
+        _key: &ObjectKey,
+        _version: u64,
+    ) -> Result<Option<Object>, FlameError> {
         Ok(None)
     }
 
     async fn patch_object(
         &self,
         key: &ObjectKey,
-        _delta: &Object,
+        _data: &ObjectData,
     ) -> Result<ObjectMetadata, FlameError> {
-        Ok(ObjectMetadata {
-            endpoint: String::new(),
-            key: key.to_key().unwrap_or_default(),
-            version: 0,
-            size: 0,
-            delta_count: 0,
-            creation_time: 0,
-            data_type: String::new(),
-        })
+        Ok(ObjectMetadata::new()
+            .with_key(key.to_key().unwrap_or_default())
+            .with_creation_time(0)
+            .with_data_type(""))
     }
 
     async fn delete_objects(&self, _key: &ObjectKey) -> Result<(), FlameError> {
         Ok(())
     }
 
-    async fn load_objects(&self) -> Result<Vec<(ObjectKey, Object)>, FlameError> {
+    async fn scan(&self) -> Result<Vec<(ObjectKey, ObjectStat)>, FlameError> {
         Ok(Vec::new())
     }
 }
@@ -72,50 +108,55 @@ impl StorageEngine for NoneStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::Object;
 
     fn test_key() -> ObjectKey {
-        ObjectKey {
-            app_name: "app".to_string(),
-            session_id: "session".to_string(),
-            object_id: Some("obj1".to_string()),
-        }
+        ObjectKey::from_path("app/session")
+            .unwrap()
+            .with_object_id("obj1".to_string())
+            .unwrap()
     }
 
     #[tokio::test]
-    async fn test_none_storage_basic_operations() {
-        let storage = NoneStorage::new();
-
+    async fn writes_are_discarded_and_nothing_is_found() {
+        let storage = NoStorage::new();
         let key = test_key();
-        let object = Object::new(1, vec![1, 2, 3]);
-        storage.write_object(&key, &object).await.unwrap();
+        storage
+            .write_object(&key, &Object::new().append_data(vec![1, 2, 3]))
+            .await
+            .unwrap();
 
-        let result = storage.read_object(&key).await.unwrap();
-        assert!(result.is_none());
+        assert!(storage.stat(&key).await.unwrap().is_none());
+        assert!(storage.read_object(&key, 0).await.unwrap().is_none());
+        assert!(storage.read_range(&key, 0, 0, 1).await.is_err());
+        assert!(storage.scan().await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn test_none_storage_patch_returns_ok() {
-        let storage = NoneStorage::new();
+    async fn a_failed_stream_is_an_error() {
+        let storage = NoStorage::new();
+        let chunks = futures::stream::iter([
+            Ok(Bytes::from_static(b"a")),
+            Err(FlameError::Internal("broken".to_string())),
+        ]);
+        let result = storage
+            .write_stream(
+                &test_key(),
+                ObjectMetadata::new().with_version(1),
+                Box::pin(chunks),
+            )
+            .await;
+        assert!(result.is_err());
+    }
 
+    #[tokio::test]
+    async fn append_and_delete_succeed() {
+        let storage = NoStorage::new();
         let key = test_key();
-        let delta = Object::new(1, vec![4, 5, 6]);
-        let result = storage.patch_object(&key, &delta).await;
-
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_none_storage_delete_objects() {
-        let storage = NoneStorage::new();
-        let key = ObjectKey::from_path("app/session").unwrap();
+        storage
+            .patch_object(&key, &ObjectData::new().with_data(vec![4]))
+            .await
+            .unwrap();
         storage.delete_objects(&key).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_none_storage_load_objects() {
-        let storage = NoneStorage::new();
-
-        let objects = storage.load_objects().await.unwrap();
-        assert!(objects.is_empty());
     }
 }

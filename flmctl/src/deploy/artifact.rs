@@ -54,13 +54,13 @@ pub struct PreparedApplication {
 }
 
 impl PreparedApplication {
+    /// The file name of the package of an application: content addressed.
+    pub fn package_filename(&self, app_name: &str) -> String {
+        format!("{}-{}.tar.gz", app_name, &self.sha256[..16])
+    }
+
     pub fn object_key(&self, app_name: &str) -> String {
-        format!(
-            "{}/pkg/{}-{}.tar.gz",
-            app_name,
-            app_name,
-            &self.sha256[..16]
-        )
+        flame_rs::object::package_key(app_name, &self.package_filename(app_name))
     }
 }
 

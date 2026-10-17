@@ -13,42 +13,42 @@ class ReplayBuffer:
     maintains its own best-effort materialized cache.
     """
 
-    def __init__(self, force_full_get: bool = False):
-        from flamepy.core import ObjectRef, get_object, patch_object, update_object
+    def __init__(self, read_all_parts: bool = False):
+        from flamepy.core import ObjectRef, get_object, patch_object
 
         self.buffer_ref = app.put({"transitions": [], "total_added": 0})
-        self.force_full_get = force_full_get
+        self.read_all_parts = read_all_parts
         self._object_ref = ObjectRef
         self._get_object = get_object
-        self._update_object = update_object
         self._patch_object = patch_object
-        self._materialized_base = None
+        self._materialized_first = None
         self._materialized_data: dict[str, Any] | None = None
-        self._materialized_patch_count = 0
+        self._materialized_appended_count = 0
 
-    def _deserializer(self, base: dict, deltas: List) -> dict:
+    def _deserializer(self, parts: List) -> dict:
+        first, *appended = parts
         if (
             self._materialized_data is None
-            or self._materialized_base is not base
-            or self._materialized_patch_count > len(deltas)
+            or self._materialized_first is not first
+            or self._materialized_appended_count > len(appended)
         ):
-            self._materialized_base = base
+            self._materialized_first = first
             self._materialized_data = {
-                "transitions": list(base.get("transitions", [])),
-                "total_added": base.get("total_added", 0),
+                "transitions": list(first.get("transitions", [])),
+                "total_added": first.get("total_added", 0),
             }
-            self._materialized_patch_count = 0
+            self._materialized_appended_count = 0
 
-        for delta in deltas[self._materialized_patch_count :]:
-            self._materialized_data["transitions"].extend(delta)
-            self._materialized_data["total_added"] += len(delta)
+        for data in appended[self._materialized_appended_count :]:
+            self._materialized_data["transitions"].extend(data)
+            self._materialized_data["total_added"] += len(data)
 
-        self._materialized_patch_count = len(deltas)
+        self._materialized_appended_count = len(appended)
         return self._materialized_data
 
     def _fetch(self) -> dict:
         ref = self.buffer_ref
-        if self.force_full_get:
+        if self.read_all_parts:
             ref = self._object_ref(endpoint=ref.endpoint, key=ref.key, version=0)
         return self._get_object(ref, deserializer=self._deserializer)
 
@@ -56,8 +56,9 @@ class ReplayBuffer:
         self._patch_object(self.buffer_ref, transitions)
 
     def merge(self) -> None:
+        # An object only grows by appended data, so the merged buffer is a new object.
         data = self._fetch()
-        self.buffer_ref = self._update_object(self.buffer_ref, data)
+        self.buffer_ref = app.put(data)
 
     def get(self) -> dict:
         return self._fetch()

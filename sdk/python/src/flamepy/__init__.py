@@ -78,7 +78,6 @@ from .core import (  # Type aliases; Constants; Enums; Exception classes; Data c
     register_application,
     run,
     unregister_application,
-    update_object,
 )
 
 __version__ = "0.6.0"
@@ -154,7 +153,6 @@ __all__ = [
     # Cache functions
     "get_object",
     "put_object",
-    "update_object",
     # Submodules
     "agent",
     "app",

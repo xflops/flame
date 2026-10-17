@@ -110,24 +110,24 @@ Top-level `flamepy` exports:
 - `ObjectRef`
 - `put_object(key_prefix, obj)`
 - `get_object(ref, deserializer=None)`
-- `update_object(ref, new_obj)`
 
 `flamepy.core` also exports:
 
 - `ObjectKey`
 - `WILDCARD_SESSION`
 - `patch_object(ref, delta)`
-- `upload_object(key_or_prefix, file_path)`
-- `download_object(ref, dest_path)`
+- `upload_package(app_name, file_path, filename=None)`
+- `download_package(app_name, filename, dest_path)`
+- `delete_package(app_name, filename)`
 
 `flamepy.cache` exports `delete_objects(key_prefix)` in addition to the basic cache helpers.
 
 Object references are versioned:
 
 - `version=0` forces a fresh download.
-- `version>=1` lets the client reuse a cached base object and fetch only newer patches when the server can provide them.
-- Without a custom deserializer, `get_object()` returns only the base object for backward compatibility.
-- With a deserializer, `get_object(ref, deserializer)` calls `deserializer(base, deltas)`.
+- `version>=1` lets the client reuse its cached parts and fetch only the data after that version.
+- Without a deserializer, `get_object()` returns the newest data part of the object.
+- With a deserializer, `get_object(ref, deserializer)` calls `deserializer(parts)` with all the data parts in the order they were written.
 
 ## Service API
 
@@ -135,6 +135,7 @@ Host-shim Python services subclass `flamepy.FlameService` and run with `flamepy.
 
 ```python
 import flamepy
+
 
 class Echo(flamepy.FlameService):
     def on_session_enter(self, context):
@@ -145,6 +146,7 @@ class Echo(flamepy.FlameService):
 
     def on_session_leave(self):
         pass
+
 
 if __name__ == "__main__":
     flamepy.run(Echo())

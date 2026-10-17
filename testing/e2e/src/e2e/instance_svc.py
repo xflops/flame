@@ -24,7 +24,7 @@ def e2e_service_entrypoint(req: TestRequest) -> TestResponse:
     data = cxt.common_data if cxt is not None else None
 
     if req.update_common_data:
-        instance.update_context(TestContext(common_data=req.input))
+        instance.patch_context(TestContext(common_data=req.input))
 
     return TestResponse(output=req.input, common_data=data)
 

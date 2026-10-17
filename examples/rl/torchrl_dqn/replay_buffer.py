@@ -209,7 +209,7 @@ def _require_torchrl_storage() -> None:
 
 
 class FlameObjectStorage(_TorchRLStorage):
-    """TorchRL storage backed by a Flame object plus append-only patches."""
+    """TorchRL storage backed by a Flame object plus appended data."""
 
     ndim = 1
 
@@ -217,7 +217,7 @@ class FlameObjectStorage(_TorchRLStorage):
         _require_torchrl_storage()
         super().__init__(max_size)
 
-        from flamepy.core import get_object, patch_object, update_object
+        from flamepy.core import get_object, patch_object
 
         _validate_positive("max_size", max_size)
         _validate_non_negative("sample_work", sample_work)
@@ -227,11 +227,10 @@ class FlameObjectStorage(_TorchRLStorage):
         self.object_ref = app.put({"batch": None, "total_added": 0})
         self._get_object = get_object
         self._patch_object = patch_object
-        self._update_object = update_object
-        self._materialized_base = None
+        self._materialized_first = None
         self._materialized_batch = None
         self._materialized_total_added = 0
-        self._materialized_patch_count = 0
+        self._materialized_appended_count = 0
 
     @property
     def size(self) -> int:
@@ -263,14 +262,12 @@ class FlameObjectStorage(_TorchRLStorage):
         return self.snapshot()
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.object_ref = self._update_object(self.object_ref, state_dict)
+        # An object only grows by appended data, so the loaded state is a new object.
+        self.object_ref = app.put(state_dict)
         self._reset_materialized()
 
     def _empty(self) -> None:
-        self.object_ref = self._update_object(
-            self.object_ref,
-            {"batch": None, "total_added": 0},
-        )
+        self.object_ref = app.put({"batch": None, "total_added": 0})
         self._reset_materialized()
 
     def snapshot(self) -> dict[str, Any]:
@@ -280,40 +277,42 @@ class FlameObjectStorage(_TorchRLStorage):
             "total_added": data.get("total_added", 0),
         }
 
-    def _count_deserializer(self, base: dict, deltas: list[Any]) -> dict[str, int]:
-        base_size = _batch_len(base.get("batch"))
-        delta_size = sum(_batch_len(delta) for delta in deltas)
-        total_added = base.get("total_added", base_size) + delta_size
+    def _count_deserializer(self, parts: list[Any]) -> dict[str, int]:
+        first, *appended = parts
+        first_size = _batch_len(first.get("batch"))
+        appended_size = sum(_batch_len(data) for data in appended)
+        total_added = first.get("total_added", first_size) + appended_size
         return {
-            "size": min(self.max_size, base_size + delta_size),
+            "size": min(self.max_size, first_size + appended_size),
             "total_added": total_added,
         }
 
-    def _deserializer(self, base: dict, deltas: list[Any]) -> dict:
+    def _deserializer(self, parts: list[Any]) -> dict:
+        first, *appended = parts
         if (
             self._materialized_batch is None
-            or self._materialized_base is not base
-            or self._materialized_patch_count > len(deltas)
+            or self._materialized_first is not first
+            or self._materialized_appended_count > len(appended)
         ):
-            self._materialized_base = base
+            self._materialized_first = first
             self._materialized_batch = _trim_batch(
-                _clone_batch(base.get("batch")),
+                _clone_batch(first.get("batch")),
                 self.max_size,
             )
-            self._materialized_total_added = base.get(
+            self._materialized_total_added = first.get(
                 "total_added",
                 _batch_len(self._materialized_batch),
             )
-            self._materialized_patch_count = 0
+            self._materialized_appended_count = 0
 
-        for delta in deltas[self._materialized_patch_count :]:
+        for data in appended[self._materialized_appended_count :]:
             self._materialized_batch = _concat_batches(
-                [self._materialized_batch, delta],
+                [self._materialized_batch, data],
                 max_size=self.max_size,
             )
-            self._materialized_total_added += _batch_len(delta)
+            self._materialized_total_added += _batch_len(data)
 
-        self._materialized_patch_count = len(deltas)
+        self._materialized_appended_count = len(appended)
         return {
             "batch": self._materialized_batch,
             "total_added": self._materialized_total_added,
@@ -323,10 +322,10 @@ class FlameObjectStorage(_TorchRLStorage):
         return self._get_object(self.object_ref, deserializer=self._deserializer)
 
     def _reset_materialized(self) -> None:
-        self._materialized_base = None
+        self._materialized_first = None
         self._materialized_batch = None
         self._materialized_total_added = 0
-        self._materialized_patch_count = 0
+        self._materialized_appended_count = 0
 
 
 class LocalObjectStorage(_TorchRLStorage):

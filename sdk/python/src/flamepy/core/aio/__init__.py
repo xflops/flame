@@ -2,12 +2,12 @@
 
 from flamepy.core.aio.cache import (
     delete_objects,
-    download_object,
+    delete_package,
+    download_package,
     get_object,
     patch_object,
     put_object,
-    update_object,
-    upload_object,
+    upload_package,
 )
 from flamepy.core.aio.client import Connection, Session, TaskIterator, TaskWatcher, connect
 from flamepy.core.aio.service import FlameInstanceServer, FlameService, run
@@ -66,9 +66,9 @@ __all__ = [
     "run",
     "put_object",
     "get_object",
-    "update_object",
     "patch_object",
     "delete_objects",
-    "upload_object",
-    "download_object",
+    "upload_package",
+    "download_package",
+    "delete_package",
 ]

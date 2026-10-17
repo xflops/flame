@@ -144,6 +144,26 @@ fn expand_flame_message(input: syn::DeriveInput) -> Result<TokenStream2> {
                     .map_err(|err| #crate_path::apis::FlameError::InvalidConfig(err.to_string()))
             }
         }
+
+        // The value of an object of this type is its newest data part.
+        impl #impl_generics ::std::convert::TryFrom<::std::vec::Vec<#crate_path::__private::bytes::Bytes>>
+            for #name #ty_generics #where_clause
+        {
+            type Error = #crate_path::apis::FlameError;
+
+            fn try_from(
+                parts: ::std::vec::Vec<#crate_path::__private::bytes::Bytes>,
+            ) -> ::std::result::Result<Self, Self::Error> {
+                match parts.last() {
+                    ::std::option::Option::Some(part) => {
+                        <Self as #crate_path::message::FlameMessage>::decode(part)
+                    }
+                    ::std::option::Option::None => ::std::result::Result::Err(
+                        #crate_path::apis::FlameError::NotFound("object has no data".to_string()),
+                    ),
+                }
+            }
+        }
     })
 }
 

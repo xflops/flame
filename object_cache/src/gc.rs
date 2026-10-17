@@ -396,15 +396,12 @@ mod tests {
     }
 
     fn object(key: &str, creation_time: i64) -> ObjectMetadata {
-        ObjectMetadata {
-            endpoint: "grpc://cache:9090".to_string(),
-            key: key.to_string(),
-            version: 1,
-            size: 10,
-            delta_count: 0,
-            creation_time,
-            data_type: "raw".to_string(),
-        }
+        ObjectMetadata::new()
+            .with_endpoint("grpc://cache:9090")
+            .with_key(key)
+            .with_version(1)
+            .with_size(10)
+            .with_creation_time(creation_time)
     }
 
     #[test]

@@ -19,7 +19,6 @@ import types
 import uuid
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
-from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -77,14 +76,10 @@ except ImportError:
     pl = None  # type: ignore[assignment]
     _HAS_POLARS = False
 
-Deserializer = Callable[[Any, List[Any]], Any]
+# Turns the data parts of an object, in the order they were written, into a value.
+Deserializer = Callable[[List[Any]], Any]
 
 WILDCARD_SESSION = "*"
-
-
-class FetchMode(str, Enum):
-    FULL = "full"
-    PATCHES = "patches"
 
 
 class Ref:
@@ -123,31 +118,23 @@ class ObjectRef(Ref):
 
 
 @dataclass
-class Patch:
-    version: int
-    data: Any
-
-
-@dataclass
 class Object:
-    """Cached object with base data, versioned patches, and materialized views.
-
-    The `data` field stores the base object to preserve the existing public
-    behavior where get_object(..., deserializer=None) returns only the base.
-    """
+    """Cached object: its data parts in the order they were written, the first
+    at version 1, and the values the deserializers made of them."""
 
     version: int
-    data: Any
-    patches: List[Patch] = field(default_factory=list)
+    data: List[Any]
     materialized: Dict[Any, Any] = field(default_factory=dict)
 
 
 @dataclass
 class FetchResult:
-    mode: FetchMode
+    """What a Get returned: the version of the object, and its data parts after
+    the version the client asked for, one part per version (all of them for
+    version 0)."""
+
     version: int
-    base: Any = None
-    patches: List[Patch] = field(default_factory=list)
+    data: List[Any]
 
 
 class _IdentityKey:
@@ -185,22 +172,6 @@ def _cache_get(key: tuple) -> Optional[Object]:
         return _object_cache[key]
 
 
-def _cache_put(key: tuple, obj: Object) -> Object:
-    """Put to cache with LRU eviction (O(1) with OrderedDict)."""
-    with _cache_lock:
-        current = _object_cache.get(key)
-        if current is not None and current.version > obj.version:
-            _object_cache.move_to_end(key)
-            return current
-        if key in _object_cache:
-            _object_cache.move_to_end(key)
-        _object_cache[key] = obj
-
-        while len(_object_cache) > _CACHE_MAX_SIZE:
-            _object_cache.popitem(last=False)
-        return obj
-
-
 def _cache_remove(key: tuple) -> None:
     """Remove from cache."""
     with _cache_lock:
@@ -222,46 +193,54 @@ def _materialized_cache_key(deserializer: Optional[Deserializer]) -> Any:
 
 
 def _materialize_object(obj: Object, deserializer: Optional[Deserializer] = None) -> Any:
+    """The value of an object: the newest data part, or what `deserializer`
+    makes of all the parts."""
     materialized_key = _materialized_cache_key(deserializer)
     while True:
         with _cache_lock:
             if materialized_key in obj.materialized:
                 return obj.materialized[materialized_key]
             version = obj.version
-            base = obj.data
-            patches = [patch.data for patch in obj.patches]
+            data = list(obj.data)
 
         # A user deserializer may be slow or may call another cache operation.
         # Never hold the cache lock while invoking it.
-        data = base if deserializer is None else deserializer(base, patches)
+        value = data[-1] if deserializer is None else deserializer(data)
         with _cache_lock:
             if obj.version != version:
                 continue
-            return obj.materialized.setdefault(materialized_key, data)
+            return obj.materialized.setdefault(materialized_key, value)
 
 
-def _cache_apply_patches(
-    key: tuple,
-    expected_version: int,
-    new_version: int,
-    patches: List[Patch],
-) -> Optional[Object]:
-    """Apply patch rows only if the cache is still at the requested version."""
+def _cache_append_parts(key: tuple, result: FetchResult, requested_version: int = 0) -> Optional[Object]:
+    """Add the data parts of a Get result, asked for after `requested_version`,
+    to the cache and return the cached object: it is created if it is not cached
+    and the parts are appended to it otherwise, except for the ones it already
+    has. Returns None if the object is not cached but the result is only the
+    data after `requested_version`, or if the cache is behind it: the caller must
+    get all the data.
+    """
     with _cache_lock:
         cached = _object_cache.get(key)
         if cached is None:
-            return None
-
-        if cached.version == expected_version:
-            if new_version <= cached.version:
+            if requested_version:
                 return None
-            cached.patches.extend(patches)
-            cached.version = new_version
-            cached.materialized.clear()
-        elif cached.version < new_version:
-            return None
+            cached = Object(version=result.version, data=list(result.data))
+            _object_cache[key] = cached
+        else:
+            # Parts the cache got after the request, from another call, are
+            # already in it.
+            have = cached.version - requested_version
+            if have < 0:
+                return None
+            if cached.version < result.version:
+                cached.data.extend(result.data[have:])
+                cached.version = result.version
+                cached.materialized.clear()
 
         _object_cache.move_to_end(key)
+        while len(_object_cache) > _CACHE_MAX_SIZE:
+            _object_cache.popitem(last=False)
         return cached
 
 
@@ -688,27 +667,27 @@ def put_object(key_prefix: str, obj: Any) -> ObjectRef:
 
 def get_object(ref: Ref, deserializer: Optional[Deserializer] = None) -> Any:
     if isinstance(ref, ValueRef):
-        return ref.value if deserializer is None else deserializer(ref.value, [])
+        return ref.value if deserializer is None else deserializer([ref.value])
     if not isinstance(ref, ObjectRef):
         raise TypeError(f"Expected ValueRef or ObjectRef, got {type(ref).__name__}")
     return _call_aio_cache("get_object", ref, deserializer)
 
 
-def update_object(ref: ObjectRef, new_obj: Any) -> ObjectRef:
-    return _call_aio_cache("update_object", ref, new_obj)
+def patch_object(ref: ObjectRef, data: Any) -> ObjectRef:
+    return _call_aio_cache("patch_object", ref, data)
 
 
-def patch_object(ref: ObjectRef, delta: Any) -> ObjectRef:
-    return _call_aio_cache("patch_object", ref, delta)
+def delete_objects(key_prefix: str, endpoint: Optional[str] = None) -> None:
+    _call_aio_cache("delete_objects", key_prefix, endpoint)
 
 
-def delete_objects(key_prefix: str) -> None:
-    _call_aio_cache("delete_objects", key_prefix)
+def upload_package(app_name: str, file_path: str, filename: Optional[str] = None, endpoint: Optional[str] = None) -> ObjectRef:
+    return _call_aio_cache("upload_package", app_name, file_path, filename, endpoint)
 
 
-def upload_object(key_or_prefix: str, file_path: str, endpoint: Optional[str] = None) -> ObjectRef:
-    return _call_aio_cache("upload_object", key_or_prefix, file_path, endpoint)
+def download_package(app_name: str, filename: str, dest_path: str, endpoint: Optional[str] = None) -> None:
+    _call_aio_cache("download_package", app_name, filename, dest_path, endpoint)
 
 
-def download_object(ref: ObjectRef, dest_path: str) -> None:
-    _call_aio_cache("download_object", ref, dest_path)
+def delete_package(app_name: str, filename: str, endpoint: Optional[str] = None) -> None:
+    _call_aio_cache("delete_package", app_name, filename, endpoint)

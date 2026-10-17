@@ -3,12 +3,13 @@ import shutil
 import subprocess
 from types import SimpleNamespace
 
+import cloudpickle
 import grpc
 import pytest
 
 from flamepy.core import cache as cache_module
 from flamepy.core.aio import cache as aio_cache
-from flamepy.core.cache import FetchMode, FetchResult, Object, ObjectRef, Patch, _cache_lock, _object_cache
+from flamepy.core.cache import FetchResult, ObjectRef, ValueRef, _cache_lock, _object_cache
 from flamepy.core.types import FlameClientTls
 from flamepy.proto import cache_pb2, cache_pb2_grpc
 
@@ -174,36 +175,100 @@ class TestAioCache:
         with pytest.raises(ValueError, match="Invalid object cache endpoint"):
             cache_module._resolve_cache_endpoint(endpoint)
 
-    def test_full_cached_patch_and_version_zero(self, monkeypatch):
+    @staticmethod
+    def _pickled(*values):
+        return [cloudpickle.dumps(value) for value in values]
+
+    def test_decode_parts_of_the_whole_object(self):
+        header = SimpleNamespace(version=3, data_type="cloudpickle")
+        parts = list(zip([1, 2, 3], self._pickled("first", "second", "third")))
+
+        result = aio_cache._decode_parts(header, parts)
+
+        assert (result.version, result.data) == (3, ["first", "second", "third"])
+
+    def test_decode_parts_after_a_version(self):
+        header = SimpleNamespace(version=4, data_type="cloudpickle")
+        parts = list(zip([3, 4], self._pickled("third", "fourth")))
+
+        result = aio_cache._decode_parts(header, parts)
+
+        assert (result.version, result.data) == (4, ["third", "fourth"])
+
+    def test_decode_parts_without_data_is_unchanged(self):
+        assert aio_cache._decode_parts(SimpleNamespace(version=2, data_type=""), []) is None
+
+    @pytest.mark.parametrize("versions", [[1, 3], [2, 1], [1, 2]])
+    def test_decode_parts_rejects_inconsistent_versions(self, versions):
+        header = SimpleNamespace(version=3, data_type="cloudpickle")
+        parts = list(zip(versions, self._pickled(*range(len(versions)))))
+
+        with pytest.raises(ValueError, match="consecutive"):
+            aio_cache._decode_parts(header, parts)
+
+    def test_inline_value_is_a_single_part(self):
+        async def run():
+            ref = ValueRef(7)
+            assert await aio_cache.get_object(ref) == 7
+            assert await aio_cache.get_object(ref, lambda parts: parts) == [7]
+
+        asyncio.run(run())
+
+    def test_get_creates_then_appends_and_version_zero_starts_over(self, monkeypatch):
         versions = []
 
         async def fetch(ref, version):
             versions.append(version)
             if version == 0:
-                return FetchResult(FetchMode.FULL, 2, [1], [Patch(2, [2])])
-            return FetchResult(FetchMode.PATCHES, 3, None, [Patch(3, [3])])
+                return FetchResult(2, [[1], [2]])
+            return FetchResult(3, [[3]])
 
         monkeypatch.setattr(aio_cache, "_fetch_object_data", fetch)
         ref = ObjectRef("grpc://cache:1", "app/session/key", 2)
 
         async def run():
-            assert await aio_cache.get_object(ref, lambda base, patches: base + [item for patch in patches for item in patch]) == [1, 2]
-            assert await aio_cache.get_object(ref, lambda base, patches: base + [item for patch in patches for item in patch]) == [1, 2, 3]
-            assert await aio_cache.get_object(ObjectRef(ref.endpoint, ref.key, 0)) == [1]
+            assert await aio_cache.get_object(ref, lambda parts: [item for part in parts for item in part]) == [1, 2]
+            assert await aio_cache.get_object(ref, lambda parts: [item for part in parts for item in part]) == [1, 2, 3]
+            # Version 0 is a forced refresh: the cached object is dropped and made again.
+            assert await aio_cache.get_object(ObjectRef(ref.endpoint, ref.key, 0)) == [2]
 
         asyncio.run(run())
         assert versions == [0, 2, 0]
 
+    def test_cache_entry_dropped_while_fetching_gets_all_the_data(self, monkeypatch):
+        key = ("grpc://cache:1", "app/session/key")
+        versions = []
+
+        async def fetch(ref, version):
+            versions.append(version)
+            if version == 2:
+                # The cached object is dropped while the Get is in flight.
+                cache_module._cache_remove(key)
+                return FetchResult(3, [[3]])
+            return FetchResult(3, [[1], [2], [3]])
+
+        cache_module._cache_append_parts(key, FetchResult(2, [[1], [2]]))
+        monkeypatch.setattr(aio_cache, "_fetch_object_data", fetch)
+        ref = ObjectRef(*key, version=2)
+
+        async def run():
+            merged = await aio_cache.get_object(ref, lambda parts: [item for part in parts for item in part])
+            assert merged == [1, 2, 3]
+
+        asyncio.run(run())
+        assert versions == [2, 0]
+        assert cache_module._cache_get(key).version == 3
+
     def test_not_modified_and_patch_fallback(self, monkeypatch):
         versions = []
         key = ("grpc://cache:1", "app/session/key")
-        cache_module._cache_put(key, Object(version=1, data="old"))
+        cache_module._cache_append_parts(key, FetchResult(1, ["old"]))
 
         async def fetch(ref, version):
             versions.append(version)
             if version == 1:
-                return FetchResult(FetchMode.PATCHES, 2, None, [Patch(2, "delta")])
-            return FetchResult(FetchMode.FULL, 2, "new")
+                return FetchResult(2, ["second"])
+            return FetchResult(2, ["first", "new"])
 
         monkeypatch.setattr(aio_cache, "_fetch_object_data", fetch)
         ref = ObjectRef(*key, version=1)
@@ -229,8 +294,8 @@ class TestAioCache:
             if calls == 1:
                 first_started.set()
                 await release_first.wait()
-                return FetchResult(FetchMode.FULL, 2, "old")
-            return FetchResult(FetchMode.FULL, 3, "new")
+                return FetchResult(2, ["first", "old"])
+            return FetchResult(3, ["first", "mid", "new"])
 
         monkeypatch.setattr(aio_cache, "_fetch_object_data", fetch)
 
@@ -245,17 +310,17 @@ class TestAioCache:
         assert cache_module._cache_get((ref.endpoint, ref.key)).version == 3
 
     def test_not_modified_reuses_materialized_bound_method(self, monkeypatch):
-        ref = ObjectRef("grpc://cache:1", "app/session/key", 1)
-        cache_module._cache_put((ref.endpoint, ref.key), Object(version=1, data=[1], patches=[Patch(1, [2])]))
+        ref = ObjectRef("grpc://cache:1", "app/session/key", 2)
+        cache_module._cache_append_parts((ref.endpoint, ref.key), FetchResult(2, [[1], [2]]))
         calls = []
 
         class Collector:
-            def merge(self, base, patches):
+            def merge(self, parts):
                 calls.append(True)
-                return base + patches[0]
+                return parts[0] + parts[1]
 
         async def unchanged(ref, version):
-            assert version == 1
+            assert version == 2
             return None
 
         monkeypatch.setattr(aio_cache, "_fetch_object_data", unchanged)
@@ -289,7 +354,7 @@ class TestAioCache:
 
     def test_get_rejects_invalid_stream_order(self):
         async def responses():
-            yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(kind=cache_pb2.CACHE_CHUNK_KIND_BASE, data=b"x"))
+            yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(version=1, data=b"x"))
 
         async def run():
             with pytest.raises(ValueError, match="must start with a header"):
@@ -319,9 +384,9 @@ class TestAioCache:
 
             def Get(self, request):  # noqa: N802 - gRPC method
                 async def responses():
-                    yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(mode=cache_pb2.CACHE_GET_MODE_FULL, version=2, data_type=stored["header"].data_type))
-                    yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(kind=cache_pb2.CACHE_CHUNK_KIND_BASE, version=1, data=stored["payload"]))
-                    yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(kind=cache_pb2.CACHE_CHUNK_KIND_PATCH, version=2, data=stored["patch"]))
+                    yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(version=2, data_type=stored["header"].data_type))
+                    yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(version=1, data=stored["payload"]))
+                    yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(version=2, data=stored["patch"]))
 
                 return responses()
 
@@ -333,7 +398,7 @@ class TestAioCache:
         async def run():
             ref = await aio_cache.put_object("app/session", [1])
             await aio_cache.patch_object(ref, [2])
-            assert await aio_cache.get_object(ref, lambda base, patches: base + patches[0]) == [1, 2]
+            assert await aio_cache.get_object(ref, lambda parts: parts[0] + parts[1]) == [1, 2]
             await aio_cache.delete_objects("app/session")
 
         asyncio.run(run())
@@ -349,42 +414,46 @@ class TestAioCache:
         monkeypatch.setattr(cache_module, "_get_cached_context", lambda: SimpleNamespace(cache=endpoint))
 
         class FileClient:
+            async def Delete(self, request):  # noqa: N802 - gRPC method
+                return cache_pb2.CacheDeleteResponse()
+
             async def Put(self, requests, timeout=None):  # noqa: N802 - gRPC method
                 items = [item async for item in requests]
                 stored["type"] = items[0].header.data_type
                 stored["payload"] = b"".join(item.data for item in items[1:])
-                return SimpleNamespace(endpoint=endpoint, key="app/session/file.tar.gz", version=1)
+                return SimpleNamespace(endpoint=endpoint, key="app/pkg/file.tar.gz", version=1)
 
             def Get(self, request):  # noqa: N802 - gRPC method
                 async def responses():
-                    yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(mode=cache_pb2.CACHE_GET_MODE_FULL, data_type=stored["type"], version=1))
-                    yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(kind=cache_pb2.CACHE_CHUNK_KIND_BASE, version=1, data=stored["payload"][:7]))
-                    yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(kind=cache_pb2.CACHE_CHUNK_KIND_BASE, version=1, data=stored["payload"][7:]))
+                    yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(data_type=stored["type"], version=1))
+                    yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(version=1, data=stored["payload"][:7]))
+                    yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(version=1, data=stored["payload"][7:]))
 
                 return responses()
 
         monkeypatch.setattr(aio_cache, "_get_client", lambda endpoint, tls=None: FileClient())
 
         async def run():
-            ref = await aio_cache.upload_object("app/session/file.tar.gz", str(source))
+            ref = await aio_cache.upload_package("app", str(source), "file.tar.gz")
+            assert ref.key == "app/pkg/file.tar.gz"
             assert stored["type"] == "raw"
             assert stored["payload"] == payload
             output = tmp_path / "output.tar.gz"
-            await aio_cache.download_object(ref, str(output))
+            await aio_cache.download_package("app", "file.tar.gz", str(output), endpoint="grpc://cache:1")
             assert output.read_bytes() == payload
             stored["type"] = "raw.zstd"
             stored["payload"] = cache_module._compress_data(payload, "zstd")
-            await aio_cache.download_object(ref, str(output))
+            await aio_cache.download_package("app", "file.tar.gz", str(output), endpoint="grpc://cache:1")
             assert output.read_bytes() == payload
 
         asyncio.run(run())
 
-    def test_download_rejects_patches_and_removes_partial_file(self, monkeypatch, tmp_path):
+    def test_download_rejects_appended_data_and_removes_partial_file(self, monkeypatch, tmp_path):
         class FakeClient:
             def Get(self, request):  # noqa: N802 - gRPC method
                 async def responses():
-                    yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(mode=cache_pb2.CACHE_GET_MODE_FULL, data_type="raw", version=2))
-                    yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(kind=cache_pb2.CACHE_CHUNK_KIND_PATCH, version=2, data=b"bad"))
+                    yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(data_type="raw", version=2))
+                    yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(version=2, data=b"bad"))
 
                 return responses()
 
@@ -392,20 +461,59 @@ class TestAioCache:
         output = tmp_path / "bad"
 
         async def run():
-            with pytest.raises(ValueError, match="raw base chunks only"):
-                await aio_cache.download_object(ObjectRef("grpc://cache:1", "app/session/key"), str(output))
+            with pytest.raises(ValueError, match="raw data of the first version only"):
+                await aio_cache.download_package("app", "key", str(output), endpoint="grpc://cache:1")
 
         asyncio.run(run())
         assert not output.exists()
 
+    def test_package_functions_use_the_package_key(self, monkeypatch, tmp_path):
+        calls = []
+
+        async def delete_objects(key_prefix, endpoint=None):
+            calls.append(("delete", key_prefix, endpoint))
+
+        async def upload_file(key, file_path, endpoint):
+            calls.append(("upload", key, endpoint))
+            return ObjectRef("grpc://cache:1", key, 1)
+
+        async def download_file(ref, dest_path):
+            calls.append(("download", ref.key, ref.endpoint))
+
+        monkeypatch.setattr(aio_cache, "delete_objects", delete_objects)
+        monkeypatch.setattr(aio_cache, "_upload_file", upload_file)
+        monkeypatch.setattr(aio_cache, "_download_file", download_file)
+        source = tmp_path / "pkg.tar.gz"
+        source.write_bytes(b"package")
+
+        async def run():
+            # An existing package is deleted first; the file name is the default.
+            ref = await aio_cache.upload_package("app", str(source), endpoint="grpc://cache:1")
+            assert ref.key == "app/pkg/pkg.tar.gz"
+            await aio_cache.upload_package("app", str(source), "other.tar.gz", endpoint="grpc://cache:1")
+            await aio_cache.download_package("app", "pkg.tar.gz", str(tmp_path / "out"), endpoint="grpc://cache:1")
+            await aio_cache.delete_package("app", "pkg.tar.gz", endpoint="grpc://cache:1")
+            with pytest.raises(FileNotFoundError):
+                await aio_cache.upload_package("app", str(tmp_path / "missing"))
+
+        asyncio.run(run())
+        assert calls == [
+            ("delete", "app/pkg/pkg.tar.gz", "grpc://cache:1"),
+            ("upload", "app/pkg/pkg.tar.gz", "grpc://cache:1"),
+            ("delete", "app/pkg/other.tar.gz", "grpc://cache:1"),
+            ("upload", "app/pkg/other.tar.gz", "grpc://cache:1"),
+            ("download", "app/pkg/pkg.tar.gz", "grpc://cache:1"),
+            ("delete", "app/pkg/pkg.tar.gz", "grpc://cache:1"),
+        ]
+
     def test_upload_validates_path_before_rpc(self, tmp_path):
         async def run():
             with pytest.raises(FileNotFoundError):
-                await aio_cache.upload_object("app/session/key", str(tmp_path / "missing"))
+                await aio_cache.upload_package("app", str(tmp_path / "missing"))
             source = tmp_path / "source"
             source.write_bytes(b"data")
-            with pytest.raises(ValueError, match="Invalid object key"):
-                await aio_cache.upload_object("bad", str(source))
+            with pytest.raises(ValueError, match="invalid characters"):
+                await aio_cache.upload_package("bad/app", str(source))
 
         asyncio.run(run())
 
@@ -423,24 +531,27 @@ class TestAioCache:
             async def Patch(self, request_iterator, context):  # noqa: N802 - gRPC method
                 requests = [request async for request in request_iterator]
                 key = requests[0].header.key
-                data_type, base, patches = self.objects[key]
-                patches.append(b"".join(request.data for request in requests[1:]))
-                return cache_pb2.CacheObjectMetadata(endpoint=self.endpoint, key=key, version=1 + len(patches))
+                data_type, first, appended = self.objects[key]
+                appended.append(b"".join(request.data for request in requests[1:]))
+                return cache_pb2.CacheObjectMetadata(endpoint=self.endpoint, key=key, version=1 + len(appended))
 
             async def GetMetadata(self, request, context):  # noqa: N802 - gRPC method
-                data_type, _, patches = self.objects[request.key]
-                return cache_pb2.CacheObjectMetadata(endpoint=self.endpoint, key=request.key, version=1 + len(patches), data_type=data_type)
+                data_type, _, appended = self.objects[request.key]
+                return cache_pb2.CacheObjectMetadata(endpoint=self.endpoint, key=request.key, version=1 + len(appended), data_type=data_type)
 
             async def Get(self, request, context):  # noqa: N802 - gRPC method
-                data_type, base, patches = self.objects[request.key]
-                version = 1 + len(patches)
-                if request.client_version == version:
-                    yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(mode=cache_pb2.CACHE_GET_MODE_NOT_MODIFIED, version=version))
+                data_type, first, appended = self.objects[request.key]
+                version = 1 + len(appended)
+                if request.version == version:
+                    yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(version=version))
                     return
-                yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(mode=cache_pb2.CACHE_GET_MODE_FULL, version=version, data_type=data_type))
-                yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(kind=cache_pb2.CACHE_CHUNK_KIND_BASE, version=1, data=base))
-                for index, patch in enumerate(patches, start=2):
-                    yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(kind=cache_pb2.CACHE_CHUNK_KIND_PATCH, version=index, data=patch))
+                if request.version > version:
+                    await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "version is ahead of the object")
+                yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(version=version, data_type=data_type))
+                # The data after the version asked for: all of it for 0.
+                for index, data in enumerate([first, *appended], start=1):
+                    if index > request.version:
+                        yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(version=index, data=data))
 
         async def run():
             service = CacheService()
@@ -454,7 +565,15 @@ class TestAioCache:
                 ref = await aio_cache.put_object("app/session", [1])
                 assert await aio_cache.get_object(ref) == [1]
                 ref = await aio_cache.patch_object(ref, [2])
-                assert await aio_cache.get_object(ref, lambda base, patches: base + patches[0]) == [1, 2]
+                assert await aio_cache.get_object(ref, lambda parts: parts[0] + parts[1]) == [1, 2]
+                assert cache_module._cache_get((ref.endpoint, ref.key)).version == 2
+
+                # The key holds another, shorter object now: the cached version
+                # is ahead of it, so the server refuses it and the client starts over.
+                data_type, payload = cache_module._encode_object_data(["created again"])
+                service.objects[ref.key] = (data_type, payload, [])
+                assert await aio_cache.get_object(ref) == ["created again"]
+                assert cache_module._cache_get((ref.endpoint, ref.key)).version == 1
                 assert asyncio.get_running_loop() in aio_cache._clients
             finally:
                 await aio_cache.close()

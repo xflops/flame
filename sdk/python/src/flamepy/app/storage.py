@@ -315,14 +315,13 @@ class CacheStorage(StorageBackend):
         self._endpoint = f"{self._scheme}://{self._host}:{self._port}"
 
     def upload(self, local_path: str, filename: str) -> str:
-        from flamepy.core.cache import upload_object
+        from flamepy.core.cache import upload_package
 
         if not self._app_name:
             raise FlameError(FlameErrorCode.INVALID_CONFIG, "app_name is required for upload")
 
         try:
-            key = f"{self._app_name}/pkg/{filename}"
-            ref = upload_object(key, local_path, endpoint=self._endpoint)
+            ref = upload_package(self._app_name, local_path, filename, endpoint=self._endpoint)
             # Preserve the server-returned owning-cache endpoint so consumers
             # such as executor-manager do not receive this external client's
             # proxy endpoint. Arrow Flight spells secure locations as
@@ -337,29 +336,26 @@ class CacheStorage(StorageBackend):
             raise FlameError(FlameErrorCode.INTERNAL, f"Failed to upload package to cache: {str(e)}")
 
     def download(self, filename: str, local_path: str) -> None:
-        from flamepy.core.cache import ObjectRef, download_object
+        from flamepy.core.cache import download_package
 
         if not self._app_name:
             raise FlameError(FlameErrorCode.INVALID_CONFIG, "app_name is required for download")
 
         try:
-            key = f"{self._app_name}/pkg/{filename}"
-            ref = ObjectRef(endpoint=self._endpoint, key=key, version=0)
-            download_object(ref, local_path)
-            logger.debug(f"Downloaded package from cache: {key} -> {local_path}")
+            download_package(self._app_name, filename, local_path, endpoint=self._endpoint)
+            logger.debug(f"Downloaded package from cache: {self._app_name}/pkg/{filename} -> {local_path}")
         except Exception as e:
             raise FlameError(FlameErrorCode.INTERNAL, f"Failed to download package from cache: {str(e)}")
 
     def delete(self, filename: str) -> None:
-        from flamepy.core.cache import ObjectKey, delete_objects
+        from flamepy.core.cache import delete_package
 
         if not self._app_name:
             return
 
         try:
-            key = str(ObjectKey(app_name=self._app_name, session_id="pkg", object_id=filename))
-            delete_objects(key)
-            logger.debug(f"Deleted package from cache: {key}")
+            delete_package(self._app_name, filename, endpoint=self._endpoint)
+            logger.debug(f"Deleted package from cache: {self._app_name}/pkg/{filename}")
         except Exception as e:
             logger.warning(f"Error deleting package from cache: {e}")
 

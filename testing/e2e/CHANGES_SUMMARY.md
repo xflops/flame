@@ -112,7 +112,7 @@ Decorator-based → Automatic lifecycle → Limited context access
 ```
 - Uses `@instance.entrypoint` decorator
 - SDK manages lifecycle automatically
-- Simple API: `instance.context()`, `instance.update_context()`
+- Simple API: `instance.context()`, `instance.patch_context()`
 - No direct access to SessionContext/ApplicationContext
 - Best for: Quick prototypes, simple services
 

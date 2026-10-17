@@ -79,4 +79,3 @@ axum = "0.8"
 pprof = { version = "0.14", features = ["flamegraph", "prost-codec"] }
 
 # parallelism
-rayon = "1.10"

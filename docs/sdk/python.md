@@ -245,7 +245,7 @@ instance = serving.Instance()
 def answer(question: str) -> str:
     history = instance.context() or []
     history.append(question)
-    instance.update_context(history)
+    instance.patch_context(history)
     return f"received {question}"
 
 
@@ -281,15 +281,19 @@ import flamepy
 ref = flamepy.put_object("my-app/shared", {"temperature": 0.8})
 value = flamepy.get_object(ref)
 
-next_ref = flamepy.update_object(ref, {"temperature": 0.7})
+# An object is created once and then only grows by appended data.
+next_ref = flamepy.patch_object(ref, {"temperature": 0.7})
+# get_object returns the newest data part; a deserializer gets all of them.
 next_value = flamepy.get_object(next_ref)
+all_values = flamepy.get_object(next_ref, deserializer=lambda parts: parts)
 ```
 
-Object references are versioned. `version=0` forces a fresh download. Nonzero versions allow the client to reuse cached state and request newer patches when the cache server can provide them.
+Object references are versioned: an object's version is its number of data parts, so a new object is version 1. `version=0` forces a fresh download. Nonzero versions allow the client to reuse cached state and request only the data after that version. Objects are never replaced; `patch_object()` appends data.
 
 Lower-level helpers under `flamepy.core` expose `ObjectKey`,
-`patch_object()`, `upload_object()`, `download_object()`, and
-`delete_objects()`. The `flamepy.cache` namespace provides common object cache
+`delete_objects()`, and the application package helpers `upload_package()`,
+`download_package()` and `delete_package()`, which keep a package at
+`<app>/pkg/<filename>` and replace one of the same name. The `flamepy.cache` namespace provides common object cache
 operations and reference types.
 
 For asyncio callers, `flamepy.core.aio.cache` exposes awaitable versions of
@@ -423,7 +427,7 @@ The repository-level check validates the `flmrun` template, App package upload/i
 | Tasks | `Session.run()`, `Session.submit()`, `Session.create_task()`, `Session.watch_task()` |
 | Applications | `register_application()`, `unregister_application()`, `get_application()`, `list_applications()` |
 | Services | `FlameService`, `flamepy.run()`, `flamepy.serving.Instance`, `flamepy.serving.open_session()` |
-| Objects | `put_object()`, `get_object()`, `update_object()`, `patch_object()`, `upload_object()`, `download_object()` |
+| Objects | `put_object()`, `get_object()`, `patch_object()`, `delete_objects()`, `upload_package()`, `download_package()` |
 | App | `flamepy.app.init()`, `flamepy.app.service()`, `flamepy.app.destroy()`, `flamepy.app.session_context()`, `flamepy.app.publish_attributes()`, `ServiceInstance`, `ObjectFuture` |
 
 See also:

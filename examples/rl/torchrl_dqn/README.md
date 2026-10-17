@@ -26,7 +26,7 @@ app collector service -> ReplayBuffer(FlameObjectStorage) sampler -> DQNLoss -> 
 - `FlameObjectStorage` is a custom TorchRL `Storage` that stores its backing state in a Flame object created by `app.put()`.
 - Rollout batches stay as TorchRL `TensorDict` objects through collection, replay sampling, and `DQNLoss`.
 - TorchRL `ReplayBuffer.extend()` writes call `FlameObjectStorage.set()`, which appends transition batches with `patch_object()` instead of sending them through a central service.
-- TorchRL `ReplayBuffer.sample()` reads through `FlameObjectStorage.get()`, which calls `get_object(..., deserializer=...)` to incrementally materialize new Flame object patches.
+- TorchRL `ReplayBuffer.sample()` reads through `FlameObjectStorage.get()`, which calls `get_object(..., deserializer=...)` to incrementally materialize the data newly appended to a Flame object.
 - Replay state reads use a count-only deserializer, so the driver can check shard sizes without rebuilding sampled transition data.
 - `distributed.py` initializes the fixed `torchrl-dqn` app and declares the collector and replay sampler services at module scope. Only distributed mode imports it.
 - The replay sampler retains raw TorchRL `ReplayBuffer` objects per executor while the driver performs the TorchRL loss and optimizer step locally.

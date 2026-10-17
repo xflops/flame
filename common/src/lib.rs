@@ -66,6 +66,10 @@ pub enum FlameError {
 
     #[error("{0}")]
     VersionMismatch(String),
+
+    /// A version the object does not have: the client's version is ahead of it.
+    #[error("{0}")]
+    InvalidVersion(String),
 }
 
 impl From<stdng::Error> for FlameError {
@@ -79,9 +83,9 @@ impl From<FlameError> for Status {
         match value {
             FlameError::NotFound(msg) => Status::not_found(msg),
             FlameError::AlreadyExist(msg) => Status::already_exists(msg),
-            FlameError::InvalidConfig(msg) | FlameError::InvalidState(msg) => {
-                Status::invalid_argument(msg)
-            }
+            FlameError::InvalidConfig(msg)
+            | FlameError::InvalidState(msg)
+            | FlameError::InvalidVersion(msg) => Status::invalid_argument(msg),
             FlameError::Internal(msg)
             | FlameError::Network(msg)
             | FlameError::Uninitialized(msg)
@@ -248,6 +252,11 @@ mod tests {
         assert_eq!(status.message(), "test");
 
         let error = FlameError::InvalidState("test".to_string());
+        let status = Status::from(error);
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "test");
+
+        let error = FlameError::InvalidVersion("test".to_string());
         let status = Status::from(error);
         assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(status.message(), "test");

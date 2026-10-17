@@ -22,9 +22,7 @@ use tonic::transport::ClientTlsConfig;
 
 use common::FlameError;
 use rpc::flame::v1::object_cache_service_client::ObjectCacheServiceClient;
-use rpc::flame::v1::{
-    cache_get_response, CacheChunkKind, CacheGetMode, CacheGetRequest, CacheGetResponse,
-};
+use rpc::flame::v1::{cache_get_response, CacheGetRequest, CacheGetResponse};
 
 const HTTP_TIMEOUT_SECS: u64 = 300;
 const GRPC_CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -176,7 +174,7 @@ impl PackageDownloader for GrpcDownloader {
         let mut stream = client
             .get(CacheGetRequest {
                 key: key.to_string(),
-                client_version: 0,
+                version: 0,
             })
             .await
             .map_err(|e| FlameError::Internal(format!("cache get failed: {}", e)))?
@@ -207,12 +205,6 @@ where
             "cache get returned data before its header".to_string(),
         ));
     };
-    if header.mode != CacheGetMode::Full as i32 {
-        return Err(FlameError::Internal(format!(
-            "cache get returned unexpected mode: {}",
-            header.mode
-        )));
-    }
     let compressed = match header.data_type.as_str() {
         "raw" => false,
         "raw.zstd" => true,
@@ -236,8 +228,9 @@ where
             .map_err(|e| FlameError::Internal(format!("failed to create temp file: {}", e)))?;
 
         let mut total_size = 0usize;
-        let mut saw_base = false;
-        let mut saw_patch = false;
+        // All the parts are requested: they follow each other from
+        // version 1, and a package is all of them, one after the other.
+        let mut version = 0;
         while let Some(message) = stream.next().await {
             let message = message
                 .map_err(|e| FlameError::Internal(format!("cache get stream failed: {}", e)))?;
@@ -246,36 +239,21 @@ where
                     "cache get returned an unexpected message".to_string(),
                 ));
             };
-            if chunk.kind != CacheChunkKind::Base as i32
-                && chunk.kind != CacheChunkKind::Patch as i32
-            {
+            if chunk.version < version || (version == 0 && chunk.version != 1) {
                 return Err(FlameError::Internal(format!(
-                    "cache get returned unexpected chunk kind: {}",
-                    chunk.kind
+                    "cache get returned version {} out of order",
+                    chunk.version
                 )));
             }
-            if chunk.kind == CacheChunkKind::Base as i32 {
-                if saw_patch {
-                    return Err(FlameError::Internal(
-                        "cache get returned a base after a patch".to_string(),
-                    ));
-                }
-                saw_base = true;
-            } else if !saw_base {
-                return Err(FlameError::Internal(
-                    "cache get returned a patch before the base".to_string(),
-                ));
-            } else {
-                saw_patch = true;
-            }
+            version = chunk.version;
             file.write_all(&chunk.data)
                 .await
                 .map_err(|e| FlameError::Internal(format!("failed to write chunk: {}", e)))?;
             total_size += chunk.data.len();
         }
-        if !saw_base {
+        if version == 0 {
             return Err(FlameError::Internal(
-                "cache get omitted the base object".to_string(),
+                "cache get omitted the object data".to_string(),
             ));
         }
 
@@ -604,73 +582,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_grpc_download_stream_writes_base_and_patch_chunks() {
+    async fn test_grpc_download_stream_writes_all_parts_in_order() {
         let temp_dir = TempDir::new().unwrap();
         let dest_path = temp_dir.path().join("package.tar.gz");
         let responses = vec![
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
-                    mode: CacheGetMode::Full as i32,
                     version: 2,
                     data_type: "raw".to_string(),
                 })),
             }),
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                    kind: CacheChunkKind::Base as i32,
                     version: 1,
-                    data: b"base".to_vec().into(),
+                    data: b"first".to_vec().into(),
                 })),
             }),
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                    kind: CacheChunkKind::Patch as i32,
                     version: 2,
-                    data: b"patch".to_vec().into(),
+                    data: b"second".to_vec().into(),
                 })),
             }),
         ];
         let size = write_cache_stream(&mut futures_util::stream::iter(responses), &dest_path)
             .await
             .unwrap();
-        assert_eq!(size, 9);
-        assert_eq!(tokio::fs::read(dest_path).await.unwrap(), b"basepatch");
+        assert_eq!(size, 11);
+        assert_eq!(tokio::fs::read(dest_path).await.unwrap(), b"firstsecond");
     }
 
     #[tokio::test]
-    async fn test_grpc_download_stream_decodes_compressed_base_and_patch() {
+    async fn test_grpc_download_stream_decodes_each_compressed_part() {
         let temp_dir = TempDir::new().unwrap();
         let dest_path = temp_dir.path().join("package.tar.gz");
-        let base = zstd::stream::encode_all(b"base".as_slice(), 0).unwrap();
-        let patch = zstd::stream::encode_all(b"patch".as_slice(), 0).unwrap();
+        let first = zstd::stream::encode_all(b"first".as_slice(), 0).unwrap();
+        let second = zstd::stream::encode_all(b"second".as_slice(), 0).unwrap();
         let responses = vec![
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
-                    mode: CacheGetMode::Full as i32,
                     version: 2,
                     data_type: "raw.zstd".to_string(),
                 })),
             }),
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                    kind: CacheChunkKind::Base as i32,
                     version: 1,
-                    data: base.into(),
+                    data: first.into(),
                 })),
             }),
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                    kind: CacheChunkKind::Patch as i32,
                     version: 2,
-                    data: patch.into(),
+                    data: second.into(),
                 })),
             }),
         ];
         let size = write_cache_stream(&mut futures_util::stream::iter(responses), &dest_path)
             .await
             .unwrap();
-        assert!(size > 9);
-        assert_eq!(tokio::fs::read(dest_path).await.unwrap(), b"basepatch");
+        assert!(size > 11);
+        assert_eq!(tokio::fs::read(dest_path).await.unwrap(), b"firstsecond");
+    }
+
+    fn header_response(data_type: &str) -> Result<CacheGetResponse, tonic::Status> {
+        Ok(CacheGetResponse {
+            payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
+                version: 2,
+                data_type: data_type.to_string(),
+            })),
+        })
+    }
+
+    fn chunk_response(version: u64, data: &[u8]) -> Result<CacheGetResponse, tonic::Status> {
+        Ok(CacheGetResponse {
+            payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
+                version,
+                data: data.to_vec().into(),
+            })),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_grpc_download_stream_rejects_parts_out_of_order() {
+        let temp_dir = TempDir::new().unwrap();
+        let dest_path = temp_dir.path().join("package.tar.gz");
+
+        // The parts must start at version 1 and not go back.
+        for versions in [vec![2], vec![1, 2, 1], vec![]] {
+            let mut responses = vec![header_response("raw")];
+            responses.extend(
+                versions
+                    .iter()
+                    .map(|version| chunk_response(*version, b"x")),
+            );
+            let result =
+                write_cache_stream(&mut futures_util::stream::iter(responses), &dest_path).await;
+            assert!(result.is_err(), "versions {versions:?} must be rejected");
+            assert!(!dest_path.exists());
+            assert!(!dest_path.with_extension("tmp").exists());
+        }
     }
 
     #[tokio::test]
@@ -680,14 +691,12 @@ mod tests {
         let responses = vec![
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
-                    mode: CacheGetMode::Full as i32,
                     version: 1,
                     data_type: "raw.zstd".to_string(),
                 })),
             }),
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                    kind: CacheChunkKind::Base as i32,
                     version: 1,
                     data: b"invalid".to_vec().into(),
                 })),
@@ -710,14 +719,12 @@ mod tests {
         let responses = vec![
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
-                    mode: CacheGetMode::Full as i32,
                     version: 1,
                     data_type: "raw".to_string(),
                 })),
             }),
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                    kind: CacheChunkKind::Base as i32,
                     version: 1,
                     data: b"partial".to_vec().into(),
                 })),
@@ -738,14 +745,12 @@ mod tests {
         let responses = vec![
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
-                    mode: CacheGetMode::Full as i32,
                     version: 1,
                     data_type: "arrow".to_string(),
                 })),
             }),
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                    kind: CacheChunkKind::Base as i32,
                     version: 1,
                     data: b"encoded".to_vec().into(),
                 })),

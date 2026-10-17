@@ -140,8 +140,9 @@ failure path; they are not wrapped in `ServiceResponse`. Cache large values
 explicitly with `flamepy.core.put_object` and pass the `ObjectRef` as an
 argument.
 
-`update_object`, `patch_object`, and `download_object` require an `ObjectRef`;
-a `ValueRef` has no stored cache object to modify or download.
+`patch_object` requires an `ObjectRef`; a `ValueRef` has no stored cache object
+to modify. Application packages use `upload_package` and `download_package`,
+which keep them at `<app>/pkg/<filename>`.
 
 ```python
 import flamepy.app as app

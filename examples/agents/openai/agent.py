@@ -82,9 +82,9 @@ async def my_agent(q: Question) -> Answer:
 
         ctx.messages = session.history()
 
-        logger.info(f"Update context: {ctx}")
-        ins.update_context(ctx)
-        logger.info("Update context done")
+        logger.info(f"Patch context: {ctx}")
+        ins.patch_context(ctx)
+        logger.info("Patch context done")
     else:
         logger.info("Run agent without session")
         result = await Runner.run(agent, q.question)

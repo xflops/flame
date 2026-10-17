@@ -14,22 +14,24 @@ limitations under the License.
 use std::pin::Pin;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use futures::{stream, Stream};
+use common::FlameError;
+use futures::{stream, Stream, TryStreamExt};
 use rpc::flame::v1::object_cache_service_server::ObjectCacheService;
 use rpc::flame::v1::{
-    cache_get_response, cache_write_request, CacheChunkKind, CacheDeleteRequest,
-    CacheDeleteResponse, CacheGetChunk, CacheGetHeader, CacheGetMetadataRequest, CacheGetMode,
-    CacheGetRequest, CacheGetResponse, CacheListRequest, CacheObjectMetadata, CacheWriteRequest,
+    cache_write_request, CacheDeleteRequest, CacheDeleteResponse, CacheGetHeader,
+    CacheGetMetadataRequest, CacheGetRequest, CacheGetResponse, CacheListRequest,
+    CacheObjectMetadata, CacheWriteRequest,
 };
 use stdng::lock_ptr;
 use tonic::{Request, Response, Status, Streaming};
 
-use super::{Object, ObjectCache, ObjectKey, ObjectMetadata};
+use super::response::{response_stream, ObjectPart};
+use super::{Object, ObjectCache, ObjectKey, ObjectMetadata, WriteRequest};
 
-const CHUNK_SIZE: usize = 1024 * 1024;
+/// Largest data chunk exchanged on the wire, in either direction.
+pub(super) const CHUNK_SIZE: usize = 1024 * 1024;
 
-type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+pub(super) type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 pub struct GrpcCacheServer {
     cache: Arc<ObjectCache>,
@@ -48,70 +50,17 @@ impl From<ObjectMetadata> for CacheObjectMetadata {
             key: metadata.key,
             version: metadata.version,
             size: metadata.size,
-            delta_count: metadata.delta_count,
             creation_time: metadata.creation_time,
             data_type: metadata.data_type,
         }
     }
 }
 
-struct ObjectPart {
-    kind: CacheChunkKind,
-    version: u64,
-    data: Bytes,
-}
-
-fn object_part(object: &Object, kind: CacheChunkKind) -> ObjectPart {
-    ObjectPart {
-        kind,
-        version: object.version,
-        data: object.data.clone(),
-    }
-}
-
-fn response_stream(
-    header: CacheGetHeader,
-    parts: Vec<ObjectPart>,
-) -> ResponseStream<CacheGetResponse> {
-    let mut header = Some(header);
-    let mut parts = parts.into_iter();
-    let mut current: Option<ObjectPart> = None;
-    let mut offset = 0;
-    Box::pin(stream::unfold((), move |_| {
-        let response = if let Some(header) = header.take() {
-            Some(CacheGetResponse {
-                payload: Some(cache_get_response::Payload::Header(header)),
-            })
-        } else {
-            if current.is_none() {
-                current = parts.next();
-                offset = 0;
-            }
-            if let Some(part) = current.as_ref() {
-                let end = (offset + CHUNK_SIZE).min(part.data.len());
-                let chunk = CacheGetChunk {
-                    kind: part.kind as i32,
-                    version: part.version,
-                    data: part.data.slice(offset..end),
-                };
-                offset = end;
-                if end == part.data.len() {
-                    current = None;
-                }
-                Some(CacheGetResponse {
-                    payload: Some(cache_get_response::Payload::Chunk(chunk)),
-                })
-            } else {
-                None
-            }
-        };
-        async move { response.map(|response| (Ok(response), ())) }
-    }))
-}
-
-async fn collect_write(
+/// Read the write header, and return the request with the remaining data chunks
+/// as a stream.
+async fn write_request(
     request: Request<Streaming<CacheWriteRequest>>,
-) -> Result<(ObjectKey, String, Bytes), Status> {
+) -> Result<WriteRequest, Status> {
     let mut messages = request.into_inner();
     let first = messages
         .message()
@@ -131,23 +80,29 @@ async fn collect_write(
             "data_type must contain 1 to 128 UTF-8 bytes",
         ));
     }
-    let mut data = Vec::new();
-    while let Some(message) = messages.message().await? {
+    let chunks = stream::try_unfold(messages, |mut messages| async move {
+        let Some(message) = messages.message().await? else {
+            return Ok(None);
+        };
         match message.payload {
             Some(cache_write_request::Payload::Data(chunk)) => {
                 if chunk.len() > CHUNK_SIZE {
-                    return Err(Status::invalid_argument("write chunk exceeds 1 MiB"));
+                    return Err(FlameError::InvalidConfig(
+                        "write chunk exceeds 1 MiB".to_string(),
+                    ));
                 }
-                data.extend_from_slice(&chunk);
+                Ok(Some((chunk, messages)))
             }
-            _ => {
-                return Err(Status::invalid_argument(
-                    "write stream contains another header",
-                ))
-            }
+            _ => Err(FlameError::InvalidConfig(
+                "write stream contains another header".to_string(),
+            )),
         }
-    }
-    Ok((key, header.data_type, Bytes::from(data)))
+    });
+    Ok(WriteRequest {
+        key,
+        data_type: header.data_type,
+        chunks: Box::pin(chunks),
+    })
 }
 
 #[tonic::async_trait]
@@ -159,9 +114,8 @@ impl ObjectCacheService for GrpcCacheServer {
         &self,
         request: Request<Streaming<CacheWriteRequest>>,
     ) -> Result<Response<CacheObjectMetadata>, Status> {
-        let (key, data_type, data) = collect_write(request).await?;
-        let object = Object::new_typed(0, data, data_type);
-        let metadata = self.cache.put(key, object).await.map_err(Status::from)?;
+        let request = write_request(request).await?;
+        let metadata = self.cache.put_stream(request).await.map_err(Status::from)?;
         Ok(Response::new(metadata.into()))
     }
 
@@ -169,13 +123,30 @@ impl ObjectCacheService for GrpcCacheServer {
         &self,
         request: Request<Streaming<CacheWriteRequest>>,
     ) -> Result<Response<CacheObjectMetadata>, Status> {
-        let (key, data_type, data) = collect_write(request).await?;
+        let WriteRequest {
+            key,
+            data_type,
+            chunks,
+        } = write_request(request).await?;
         if key.object_id.is_none() {
-            return Err(Status::invalid_argument("patch requires a full object key"));
+            return Err(Status::invalid_argument(
+                "patch requires a complete object key",
+            ));
         }
+        // The data of a patch is small by construction, so it is buffered in memory.
+        let data = chunks
+            .try_fold(Vec::new(), |mut data, chunk| async move {
+                data.extend_from_slice(&chunk);
+                Ok(data)
+            })
+            .await
+            .map_err(Status::from)?;
         let metadata = self
             .cache
-            .patch(&key, Object::new_typed(0, data, data_type))
+            .patch(
+                &key,
+                Object::new().append_data(data).with_data_type(data_type),
+            )
             .await
             .map_err(Status::from)?;
         Ok(Response::new(metadata.into()))
@@ -191,71 +162,71 @@ impl ObjectCacheService for GrpcCacheServer {
             .cache
             .get_key_lock(&request.key)
             .map_err(Status::from)?;
-        let _guard = key_lock.read().await;
+        let guard = key_lock.read_owned().await;
 
-        let not_modified = |version| CacheGetHeader {
-            mode: CacheGetMode::NotModified as i32,
+        let up_to_date = |version| CacheGetHeader {
             version,
             data_type: String::new(),
         };
-        if request.client_version != 0
-            && self
-                .cache
-                .resident_version(&request.key)
-                .map_err(Status::from)?
-                == Some(request.client_version)
-        {
-            self.cache.eviction_policy.on_access(&request.key);
+        let metadata = self
+            .cache
+            .metadata_of(&request.key)
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("object <{}> not found", request.key)))?;
+        self.cache.storage.touch(&key);
+        if request.version != 0 && metadata.version == request.version {
             return Ok(Response::new(response_stream(
-                not_modified(request.client_version),
+                Arc::clone(&self.cache),
+                key,
+                up_to_date(request.version),
                 Vec::new(),
+                None,
             )));
         }
 
-        let object = self.cache.get(&key).await.map_err(Status::from)?;
-        let server_version = object.current_version();
-        if request.client_version != 0 && server_version == request.client_version {
-            return Ok(Response::new(response_stream(
-                not_modified(server_version),
-                Vec::new(),
-            )));
-        }
+        // The parts are described from storage metadata; payload bytes are
+        // read chunk by chunk while the response is sent.
+        let not_found = || Status::not_found(format!("object <{}> not found", request.key));
+        let stat = self
+            .cache
+            .storage
+            .stat(&key)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(not_found)?;
+        let server_version = stat.version();
 
-        let mut parts = Vec::new();
-        let mut mode = CacheGetMode::Full;
-        if request.client_version != 0
-            && request.client_version <= server_version
-            && object.version <= request.client_version
-        {
-            let needed: Vec<_> = object
-                .deltas
-                .iter()
-                .filter(|delta| delta.version > request.client_version)
-                .collect();
-            let expected = server_version.saturating_sub(request.client_version) as usize;
-            if needed.len() == expected
-                && needed.iter().enumerate().all(|(index, delta)| {
-                    delta.version == request.client_version + index as u64 + 1
-                })
-            {
-                mode = CacheGetMode::Patches;
-                for delta in needed {
-                    parts.push(object_part(delta, CacheChunkKind::Patch));
-                }
-            }
+        // A client that has a version of this object needs only the data after
+        // it, and one that has all of it (version 0) gets it from version 1. A
+        // version the object does not have means the client has another object
+        // of the same key, which it must discard.
+        if request.version > server_version {
+            return Err(Status::from(FlameError::InvalidVersion(format!(
+                "version {} is ahead of version {} of object <{}>",
+                request.version, server_version, request.key
+            ))));
         }
-        if mode == CacheGetMode::Full {
-            parts.push(object_part(&object, CacheChunkKind::Base));
-            for delta in &object.deltas {
-                parts.push(object_part(delta, CacheChunkKind::Patch));
-            }
-        }
+        let first = request.version as usize;
+        let parts: Vec<_> = (first..stat.records.len())
+            .map(|index| ObjectPart {
+                index,
+                len: stat.records[index].len,
+            })
+            .collect();
         let header = CacheGetHeader {
-            mode: mode as i32,
             version: server_version,
-            data_type: object.data_type.clone(),
+            data_type: stat.data_type,
         };
-        Ok(Response::new(response_stream(header, parts)))
+        // Every part is read from storage, so keep writers out until the
+        // response ends.
+        let guard = (!parts.is_empty()).then_some(guard);
+        Ok(Response::new(response_stream(
+            Arc::clone(&self.cache),
+            key,
+            header,
+            parts,
+            guard,
+        )))
     }
 
     async fn delete(
@@ -297,6 +268,7 @@ impl ObjectCacheService for GrpcCacheServer {
 mod tests {
     use super::*;
     use crate::cache::CacheEndpoint;
+    use bytes::Bytes;
     use rpc::flame::v1::object_cache_service_client::ObjectCacheServiceClient;
     use rpc::flame::v1::object_cache_service_server::ObjectCacheServiceServer;
     use rpc::flame::v1::{cache_get_response, cache_write_request, CacheWriteHeader};
@@ -304,6 +276,20 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
 
     async fn client() -> ObjectCacheServiceClient<tonic::transport::Channel> {
+        client_with_storage("none").await.0
+    }
+
+    /// Bytes the cache holds in memory on top of its storage engine.
+    fn resident(cache: &ObjectCache) -> (usize, u64) {
+        cache.storage.resident()
+    }
+
+    async fn client_with_storage(
+        storage: &str,
+    ) -> (
+        ObjectCacheServiceClient<tonic::transport::Channel>,
+        Arc<ObjectCache>,
+    ) {
         let cache = Arc::new(
             ObjectCache::new(
                 CacheEndpoint {
@@ -311,23 +297,31 @@ mod tests {
                     host: "127.0.0.1".to_string(),
                     port: 9090,
                 },
-                crate::storage::connect("none").await.unwrap(),
-                None,
+                crate::storage::connect(storage, None).await.unwrap(),
             )
             .unwrap(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let server = GrpcCacheServer::new(Arc::clone(&cache));
         tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(ObjectCacheServiceServer::new(GrpcCacheServer::new(cache)))
+                .add_service(ObjectCacheServiceServer::new(server))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
         });
-        ObjectCacheServiceClient::connect(format!("http://{address}"))
+        let client = ObjectCacheServiceClient::connect(format!("http://{address}"))
             .await
-            .unwrap()
+            .unwrap();
+        (client, cache)
+    }
+
+    fn chunk_data(response: &CacheGetResponse) -> (u64, &Bytes) {
+        let Some(cache_get_response::Payload::Chunk(chunk)) = &response.payload else {
+            panic!("expected chunk")
+        };
+        (chunk.version, &chunk.data)
     }
 
     fn write_messages(key: &str, data_type: &str, data: &[u8]) -> Vec<CacheWriteRequest> {
@@ -350,12 +344,12 @@ mod tests {
     async fn get_responses(
         client: &mut ObjectCacheServiceClient<tonic::transport::Channel>,
         key: &str,
-        client_version: u64,
+        version: u64,
     ) -> Vec<CacheGetResponse> {
         let mut stream = client
             .get(CacheGetRequest {
                 key: key.to_string(),
-                client_version,
+                version,
             })
             .await
             .unwrap()
@@ -368,70 +362,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grpc_put_get_patch_conditional_and_delete() {
+    async fn grpc_put_get_append_versions_and_delete() {
         let mut client = client().await;
         let put = client
             .put(stream::iter(write_messages(
                 "app/session",
                 "arrow.table",
-                b"base",
+                b"first",
             )))
             .await
             .unwrap()
             .into_inner();
         assert_eq!(put.version, 1);
-        assert_eq!(put.size, 4);
+        assert_eq!(put.size, 5);
         assert_eq!(put.data_type, "arrow.table");
         assert!(put.creation_time > 0);
 
-        let full = get_responses(&mut client, &put.key, 0).await;
-        assert_eq!(full.len(), 2);
-        let Some(cache_get_response::Payload::Header(header)) = &full[0].payload else {
+        let all = get_responses(&mut client, &put.key, 0).await;
+        assert_eq!(all.len(), 2);
+        let Some(cache_get_response::Payload::Header(header)) = &all[0].payload else {
             panic!("expected response header")
         };
-        assert_eq!(header.mode, CacheGetMode::Full as i32);
         assert_eq!(header.data_type, "arrow.table");
-        let Some(cache_get_response::Payload::Chunk(chunk)) = &full[1].payload else {
-            panic!("expected base chunk")
+        let Some(cache_get_response::Payload::Chunk(chunk)) = &all[1].payload else {
+            panic!("expected first chunk")
         };
-        assert_eq!(chunk.kind, CacheChunkKind::Base as i32);
-        assert_eq!(chunk.data, b"base".as_slice());
+        assert_eq!(chunk.version, 1);
+        assert_eq!(chunk.data, b"first".as_slice());
 
-        let patched = client
+        let appended = client
             .patch(stream::iter(write_messages(
                 &put.key,
                 "arrow.table",
-                b"patch",
+                b"second",
             )))
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(patched.version, 2);
-        assert_eq!(patched.delta_count, 1);
+        assert_eq!(appended.version, 2);
         let suffix = get_responses(&mut client, &put.key, 1).await;
         assert_eq!(suffix.len(), 2);
         let Some(cache_get_response::Payload::Header(header)) = &suffix[0].payload else {
             panic!("expected response header")
         };
-        assert_eq!(header.mode, CacheGetMode::Patches as i32);
         assert_eq!(header.data_type, "arrow.table");
         let Some(cache_get_response::Payload::Chunk(chunk)) = &suffix[1].payload else {
-            panic!("expected patch chunk")
+            panic!("expected second chunk")
         };
-        assert_eq!(chunk.kind, CacheChunkKind::Patch as i32);
         assert_eq!(chunk.version, 2);
-        assert_eq!(chunk.data, b"patch".as_slice());
+        assert_eq!(chunk.data, b"second".as_slice());
 
-        let full_with_patch = get_responses(&mut client, &put.key, 0).await;
-        assert_eq!(full_with_patch.len(), 3);
-        let Some(cache_get_response::Payload::Chunk(base)) = &full_with_patch[1].payload else {
-            panic!("expected base chunk")
+        let full_with_second = get_responses(&mut client, &put.key, 0).await;
+        assert_eq!(full_with_second.len(), 3);
+        let Some(cache_get_response::Payload::Chunk(first)) = &full_with_second[1].payload else {
+            panic!("expected first chunk")
         };
-        let Some(cache_get_response::Payload::Chunk(patch)) = &full_with_patch[2].payload else {
-            panic!("expected patch chunk")
+        let Some(cache_get_response::Payload::Chunk(second)) = &full_with_second[2].payload else {
+            panic!("expected second chunk")
         };
-        assert_eq!(base.kind, CacheChunkKind::Base as i32);
-        assert_eq!(patch.kind, CacheChunkKind::Patch as i32);
+        assert_eq!((first.version, second.version), (1, 2));
 
         let mismatched = client
             .patch(stream::iter(write_messages(
@@ -451,12 +440,22 @@ mod tests {
             .await;
         assert!(mismatched_codec_suffix.is_err());
 
+        // A version the object does not have is an error, not another object.
+        let ahead = client
+            .get(CacheGetRequest {
+                key: put.key.clone(),
+                version: 3,
+            })
+            .await;
+        assert_eq!(ahead.unwrap_err().code(), tonic::Code::InvalidArgument);
+
         let unchanged = get_responses(&mut client, &put.key, 2).await;
         assert_eq!(unchanged.len(), 1);
         let Some(cache_get_response::Payload::Header(header)) = &unchanged[0].payload else {
             panic!("expected response header")
         };
-        assert_eq!(header.mode, CacheGetMode::NotModified as i32);
+        // Nothing after the client's version: the header alone.
+        assert_eq!(header.version, 2);
 
         let metadata = client
             .get_metadata(CacheGetMetadataRequest {
@@ -476,7 +475,7 @@ mod tests {
         assert!(client
             .get(CacheGetRequest {
                 key: put.key,
-                client_version: 0,
+                version: 0,
             })
             .await
             .is_err());
@@ -493,7 +492,7 @@ mod tests {
         let responses = get_responses(&mut client, &put.key, 0).await;
         assert_eq!(responses.len(), 2);
         let Some(cache_get_response::Payload::Chunk(chunk)) = &responses[1].payload else {
-            panic!("expected empty base chunk")
+            panic!("expected empty first chunk")
         };
         assert!(chunk.data.is_empty());
         let Some(cache_get_response::Payload::Header(header)) = &responses[0].payload else {
@@ -525,5 +524,122 @@ mod tests {
         };
         assert_eq!(header.data_type, "cloudpickle.zstd");
         assert_eq!(chunk.data, stored.as_slice());
+    }
+
+    #[tokio::test]
+    async fn grpc_streams_large_object_from_storage_through_open_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut client, cache) = client_with_storage(directory.path().to_str().unwrap()).await;
+
+        // Many chunks and not a multiple of the chunk size.
+        let data: Vec<u8> = (0..8 * CHUNK_SIZE + CHUNK_SIZE / 2)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let put = client
+            .put(stream::iter(write_messages("app/session", "raw", &data)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(put.size, data.len() as u64);
+        // Nothing is read yet, so nothing is resident.
+        assert_eq!(resident(&cache).0, 0);
+
+        let all = get_responses(&mut client, &put.key, 0).await;
+        let Some(cache_get_response::Payload::Header(header)) = &all[0].payload else {
+            panic!("expected response header")
+        };
+        assert_eq!(header.version, 1);
+        let mut received = Vec::new();
+        for response in &all[1..] {
+            let (version, chunk) = chunk_data(response);
+            assert_eq!(version, 1);
+            assert!(chunk.len() <= CHUNK_SIZE);
+            received.extend_from_slice(chunk);
+        }
+        assert_eq!(all.len(), 1 + data.len().div_ceil(CHUNK_SIZE));
+        assert!(received == data);
+        // Only the open files of the object are resident, no payload bytes.
+        let (count, bytes) = resident(&cache);
+        assert_eq!(count, 1);
+        assert!(bytes < 1024);
+
+        let appended = client
+            .patch(stream::iter(write_messages(&put.key, "raw", b"second")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(appended.version, 2);
+        assert_eq!(appended.size, data.len() as u64 + 6);
+
+        let suffix = get_responses(&mut client, &put.key, 1).await;
+        assert_eq!(suffix.len(), 2);
+        let Some(cache_get_response::Payload::Header(header)) = &suffix[0].payload else {
+            panic!("expected response header")
+        };
+        assert_eq!(header.version, 2);
+        let (version, chunk) = chunk_data(&suffix[1]);
+        assert_eq!(version, 2);
+        assert_eq!(chunk.as_ref(), b"second");
+
+        let all = get_responses(&mut client, &put.key, 0).await;
+        let (version, chunk) = chunk_data(all.last().unwrap());
+        assert_eq!(version, 2);
+        assert_eq!(chunk.as_ref(), b"second");
+        assert_eq!(all.len(), 2 + data.len().div_ceil(CHUNK_SIZE));
+
+        let unchanged = get_responses(&mut client, &put.key, 2).await;
+        assert_eq!(unchanged.len(), 1);
+        assert!(resident(&cache).1 < 1024);
+    }
+
+    #[tokio::test]
+    async fn grpc_streams_large_object_under_none_from_the_only_copy() {
+        let (mut client, cache) = client_with_storage("none").await;
+
+        let data: Vec<u8> = (0..8 * CHUNK_SIZE + CHUNK_SIZE / 2)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let put = client
+            .put(stream::iter(write_messages("app/session", "raw", &data)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(put.size, data.len() as u64);
+
+        let all = get_responses(&mut client, &put.key, 0).await;
+        let mut received = Vec::new();
+        for response in &all[1..] {
+            let (version, chunk) = chunk_data(response);
+            assert_eq!(version, 1);
+            assert!(chunk.len() <= CHUNK_SIZE);
+            received.extend_from_slice(chunk);
+        }
+        assert_eq!(all.len(), 1 + data.len().div_ceil(CHUNK_SIZE));
+        assert!(received == data);
+
+        // The resident copy is the only one, whatever the object's size.
+        let small = client
+            .put(stream::iter(write_messages("app/session", "raw", b"small")))
+            .await
+            .unwrap()
+            .into_inner();
+        let responses = get_responses(&mut client, &small.key, 0).await;
+        assert_eq!(first_bytes(&responses).1, b"small");
+        assert_eq!(resident(&cache), (2, data.len() as u64 + 5));
+    }
+
+    /// The payload of a get response of version 0: its version and the first data.
+    fn first_bytes(responses: &[CacheGetResponse]) -> (u64, Vec<u8>) {
+        let Some(cache_get_response::Payload::Header(header)) = &responses[0].payload else {
+            panic!("expected response header")
+        };
+        let mut data = Vec::new();
+        for response in &responses[1..] {
+            let (version, chunk) = chunk_data(response);
+            if version == 1 {
+                data.extend_from_slice(chunk);
+            }
+        }
+        (header.version, data)
     }
 }

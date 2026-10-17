@@ -24,15 +24,15 @@ use bson::{doc, Bson, Document};
 use bytes::Bytes;
 use futures::stream;
 use serde_derive::{Deserialize, Serialize as DeriveSerialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tonic::transport::Channel;
 use tonic::Request;
 use url::Url;
 
 use crate::apis::flame::v1::object_cache_service_client::ObjectCacheServiceClient;
 use crate::apis::flame::v1::{
-    cache_get_response, cache_write_request, CacheChunkKind, CacheDeleteRequest, CacheGetChunk,
-    CacheGetHeader, CacheGetMode, CacheGetRequest, CacheWriteHeader, CacheWriteRequest,
+    cache_get_response, cache_write_request, CacheDeleteRequest, CacheGetChunk, CacheGetHeader,
+    CacheGetRequest, CacheWriteHeader, CacheWriteRequest,
 };
 use crate::apis::{FlameClientCache, FlameClientTls, FlameContext, FlameError};
 use crate::message::FlameMessage;
@@ -43,19 +43,13 @@ const CONNECT_TIMEOUT_SECS: u64 = 30;
 const UPLOAD_CHUNK_SIZE: usize = 1024 * 1024;
 const CACHE_TARGET_HEADER: &str = "x-flame-object-cache";
 
-/// The cache returns bytes and their client-defined type without interpreting either.
+/// An object as the cache returns it: its data parts in the order they were
+/// written, the first at version 1, and their client-defined type.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ObjectBytes {
-    pub data_type: String,
-    pub version: u64,
-    pub base: ObjectBytePart,
-    pub patches: Vec<ObjectBytePart>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ObjectBytePart {
-    pub version: u64,
-    pub data: Bytes,
+struct ObjectParts {
+    data_type: String,
+    version: u64,
+    parts: Vec<Bytes>,
 }
 
 type ObjectFutureInner<T> = Pin<Box<dyn Future<Output = Result<T, FlameError>> + Send + 'static>>;
@@ -271,9 +265,10 @@ impl ObjectRef {
         object_ref_from_doc(doc)
     }
 
+    /// The value of the object: see `get_object`.
     pub fn get<T>(&self) -> ObjectFuture<T>
     where
-        T: FlameMessage + Send + 'static,
+        T: TryFrom<Vec<Bytes>, Error = FlameError> + Send + 'static,
     {
         get_object(self.clone())
     }
@@ -304,102 +299,42 @@ where
     T: FlameMessage,
 {
     let context = FlameContext::from_file_with_env(None)?;
-    put_object_with_context(&context, key_prefix, object).await
-}
-
-pub async fn put_object_with_context<T>(
-    context: &FlameContext,
-    key_prefix: impl AsRef<str>,
-    object: &T,
-) -> Result<ObjectRef, FlameError>
-where
-    T: FlameMessage,
-{
-    put_object_bytes_with_context(context, key_prefix, object.encode()?, "raw").await
-}
-
-pub async fn put_object_bytes(
-    key_prefix: impl AsRef<str>,
-    bytes: impl Into<Bytes>,
-    data_type: impl AsRef<str>,
-) -> Result<ObjectRef, FlameError> {
-    let context = FlameContext::from_file_with_env(None)?;
-    put_object_bytes_with_context(&context, key_prefix, bytes, data_type).await
-}
-
-pub async fn put_object_bytes_with_context(
-    context: &FlameContext,
-    key_prefix: impl AsRef<str>,
-    bytes: impl Into<Bytes>,
-    data_type: impl AsRef<str>,
-) -> Result<ObjectRef, FlameError> {
     let object_key = ObjectKey::from_prefix(key_prefix.as_ref())?;
-    let cache = cache_from_context(context)?;
+    let cache = cache_from_context(&context)?;
     do_put_bytes(
         &cache.endpoint,
         cache.tls.as_ref(),
         object_key.to_prefix(),
         false,
-        bytes.into(),
-        data_type.as_ref(),
+        object.encode()?,
+        "raw",
     )
     .await
 }
 
+/// Get an object as a `T` made of its data parts, in the order they were
+/// written (the first is the data the object was created with). A type that
+/// derives `FlameMessage` is made of the newest part.
 pub fn get_object<T>(reference: ObjectRef) -> ObjectFuture<T>
 where
-    T: FlameMessage + Send + 'static,
+    T: TryFrom<Vec<Bytes>, Error = FlameError> + Send + 'static,
 {
     ObjectFuture::new(async move {
-        let object = get_object_bytes(&reference).await?;
+        let object = fetch_object(&reference).await?;
         if object.data_type != "raw" {
             return Err(FlameError::InvalidConfig(format!(
                 "object {} has type {}, expected raw",
                 reference.key, object.data_type
             )));
         }
-        T::decode(&object.base.data)
+        T::try_from(object.parts)
     })
 }
 
-pub async fn update_object<T>(reference: &ObjectRef, object: &T) -> Result<ObjectRef, FlameError>
+pub async fn patch_object<T>(reference: &ObjectRef, data: &T) -> Result<ObjectRef, FlameError>
 where
     T: FlameMessage,
 {
-    update_object_bytes(reference, object.encode()?, "raw").await
-}
-
-pub async fn update_object_bytes(
-    reference: &ObjectRef,
-    bytes: impl Into<Bytes>,
-    data_type: impl AsRef<str>,
-) -> Result<ObjectRef, FlameError> {
-    ObjectKey::from_key(&reference.key)?;
-    let endpoint = endpoint_for_reference(&reference.endpoint)?;
-    let tls = current_cache_tls()?;
-    do_put_bytes(
-        &endpoint,
-        tls.as_ref(),
-        reference.key.clone(),
-        false,
-        bytes.into(),
-        data_type.as_ref(),
-    )
-    .await
-}
-
-pub async fn patch_object<T>(reference: &ObjectRef, delta: &T) -> Result<ObjectRef, FlameError>
-where
-    T: FlameMessage,
-{
-    patch_object_bytes(reference, delta.encode()?, "raw").await
-}
-
-pub async fn patch_object_bytes(
-    reference: &ObjectRef,
-    bytes: impl Into<Bytes>,
-    data_type: impl AsRef<str>,
-) -> Result<ObjectRef, FlameError> {
     ObjectKey::from_key(&reference.key)?;
     let endpoint = endpoint_for_reference(&reference.endpoint)?;
     let tls = current_cache_tls()?;
@@ -408,16 +343,20 @@ pub async fn patch_object_bytes(
         tls.as_ref(),
         reference.key.clone(),
         true,
-        bytes.into(),
-        data_type.as_ref(),
+        data.encode()?,
+        "raw",
     )
     .await
 }
 
 pub async fn delete_objects(key_prefix: impl AsRef<str>) -> Result<(), FlameError> {
-    let object_key = ObjectKey::from_path(key_prefix.as_ref())?;
     let context = FlameContext::from_file_with_env(None)?;
-    let cache = cache_from_context(&context)?;
+    delete_with_context(&context, key_prefix.as_ref()).await
+}
+
+async fn delete_with_context(context: &FlameContext, key_prefix: &str) -> Result<(), FlameError> {
+    let object_key = ObjectKey::from_path(key_prefix)?;
+    let cache = cache_from_context(context)?;
     let mut client =
         ObjectCacheServiceClient::new(connect_cache(&cache.endpoint, cache.tls.as_ref()).await?);
     client
@@ -429,155 +368,36 @@ pub async fn delete_objects(key_prefix: impl AsRef<str>) -> Result<(), FlameErro
     Ok(())
 }
 
-pub async fn upload_object(
-    key_or_prefix: impl AsRef<str>,
-    file_path: impl AsRef<Path>,
-) -> Result<ObjectRef, FlameError> {
-    let context = FlameContext::from_file_with_env(None)?;
-    upload_object_with_context(&context, key_or_prefix, file_path).await
+/// Application packages are objects of the `pkg` session of their application.
+const PACKAGE_SESSION: &str = "pkg";
+
+/// The key of the package `filename` of an application: `<app>/pkg/<filename>`.
+pub fn package_key(app_name: &str, filename: &str) -> String {
+    format!("{}/{}/{}", app_name, PACKAGE_SESSION, filename)
 }
 
-pub async fn upload_object_with_data_type(
-    key_or_prefix: impl AsRef<str>,
-    file_path: impl AsRef<Path>,
-    data_type: impl AsRef<str>,
-) -> Result<ObjectRef, FlameError> {
-    let context = FlameContext::from_file_with_env(None)?;
-    upload_object_with_context_and_data_type(&context, key_or_prefix, file_path, data_type).await
-}
-
-pub async fn upload_object_with_context(
+/// Upload the application package `file_path` as `<app>/pkg/<filename>`, with
+/// the cache configured by `context` (the other helpers use the default
+/// context). An object is never replaced, so a package of the same name is
+/// deleted first.
+pub async fn upload_package(
     context: &FlameContext,
-    key_or_prefix: impl AsRef<str>,
+    app_name: &str,
+    filename: &str,
     file_path: impl AsRef<Path>,
 ) -> Result<ObjectRef, FlameError> {
-    upload_object_with_context_and_data_type(context, key_or_prefix, file_path, "raw").await
-}
-
-pub async fn upload_object_with_context_and_data_type(
-    context: &FlameContext,
-    key_or_prefix: impl AsRef<str>,
-    file_path: impl AsRef<Path>,
-    data_type: impl AsRef<str>,
-) -> Result<ObjectRef, FlameError> {
-    let object_key = ObjectKey::from_path(key_or_prefix.as_ref())?;
-    if object_key.is_all_sessions() {
-        return Err(FlameError::InvalidConfig(format!(
-            "invalid object key path '{}'",
-            key_or_prefix.as_ref()
-        )));
-    }
+    let key = package_key(app_name, filename);
+    ObjectKey::from_key(&key)?;
     let cache = cache_from_context(context)?;
+    delete_with_context(context, &key).await?;
     do_put_file(
         &cache.endpoint,
         cache.tls.as_ref(),
-        object_key.to_string(),
+        key,
         file_path.as_ref(),
-        data_type.as_ref(),
+        "raw",
     )
     .await
-}
-
-pub async fn download_object(
-    reference: &ObjectRef,
-    dest_path: impl AsRef<Path>,
-) -> Result<(), FlameError> {
-    download_object_with_data_type(reference, dest_path)
-        .await
-        .map(|_| ())
-}
-
-pub async fn download_object_with_data_type(
-    reference: &ObjectRef,
-    dest_path: impl AsRef<Path>,
-) -> Result<String, FlameError> {
-    ObjectKey::from_key(&reference.key)?;
-    let endpoint = endpoint_for_reference(&reference.endpoint)?;
-    let tls = current_cache_tls()?;
-    let mut client = ObjectCacheServiceClient::new(connect_cache(&endpoint, tls.as_ref()).await?);
-    let mut stream = client
-        .get(cache_request(
-            &endpoint,
-            CacheGetRequest {
-                key: reference.key.clone(),
-                client_version: 0,
-            },
-        )?)
-        .await
-        .map_err(|e| FlameError::Internal(format!("cache download failed: {}", e)))?
-        .into_inner();
-    let data_type = read_full_header(&mut stream, &reference.key)
-        .await?
-        .data_type;
-
-    if let Some(parent) = dest_path.as_ref().parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            FlameError::Internal(format!(
-                "failed to create download directory {}: {}",
-                parent.display(),
-                e
-            ))
-        })?;
-    }
-    let temp_path = dest_path.as_ref().with_extension("tmp");
-    let result = async {
-        let mut file = tokio::fs::File::create(&temp_path).await.map_err(|e| {
-            FlameError::Internal(format!("failed to create {}: {}", temp_path.display(), e))
-        })?;
-        let mut found_base = false;
-        while let Some(message) = stream
-            .message()
-            .await
-            .map_err(|e| FlameError::Internal(format!("cache download failed: {}", e)))?
-        {
-            match message.payload {
-                Some(cache_get_response::Payload::Chunk(chunk)) => {
-                    match CacheChunkKind::try_from(chunk.kind) {
-                        Ok(CacheChunkKind::Base) => {
-                            found_base = true;
-                            file.write_all(&chunk.data).await.map_err(|e| {
-                                FlameError::Internal(format!(
-                                    "failed to write download chunk: {}",
-                                    e
-                                ))
-                            })?;
-                        }
-                        Ok(CacheChunkKind::Patch) => {
-                            return Err(FlameError::InvalidConfig(format!(
-                                "object {} contains patch rows and cannot be downloaded as a file",
-                                reference.key
-                            )))
-                        }
-                        _ => {
-                            return Err(FlameError::InvalidConfig(
-                                "invalid object response chunk kind".to_string(),
-                            ))
-                        }
-                    }
-                }
-                _ => {
-                    return Err(FlameError::InvalidConfig(
-                        "invalid object response: expected data chunk".to_string(),
-                    ))
-                }
-            }
-        }
-        if !found_base {
-            return Err(FlameError::NotFound(reference.key.clone()));
-        }
-        file.sync_all()
-            .await
-            .map_err(|e| FlameError::Internal(format!("failed to sync download: {}", e)))?;
-        drop(file);
-        tokio::fs::rename(&temp_path, dest_path.as_ref())
-            .await
-            .map_err(|e| FlameError::Internal(format!("failed to finish download: {}", e)))
-    }
-    .await;
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-    }
-    result.map(|_| data_type)
 }
 
 #[derive(Debug, Clone)]
@@ -902,9 +722,8 @@ async fn do_put_file(
     object_ref_from_metadata(metadata)
 }
 
-async fn read_full_header(
+async fn read_header(
     stream: &mut tonic::Streaming<crate::apis::flame::v1::CacheGetResponse>,
-    key: &str,
 ) -> Result<CacheGetHeader, FlameError> {
     let first = stream
         .message()
@@ -916,24 +735,10 @@ async fn read_full_header(
             "cache response must start with header".to_string(),
         ));
     };
-    match CacheGetMode::try_from(header.mode) {
-        Ok(CacheGetMode::Full) => {}
-        Ok(CacheGetMode::NotModified) => {
-            return Err(FlameError::InvalidConfig(format!(
-                "unexpected unchanged response for full object {}",
-                key
-            )))
-        }
-        _ => {
-            return Err(FlameError::InvalidConfig(
-                "unexpected cache response mode".to_string(),
-            ))
-        }
-    }
     Ok(header)
 }
 
-pub async fn get_object_bytes(reference: &ObjectRef) -> Result<ObjectBytes, FlameError> {
+async fn fetch_object(reference: &ObjectRef) -> Result<ObjectParts, FlameError> {
     ObjectKey::from_key(&reference.key)?;
     let endpoint = endpoint_for_reference(&reference.endpoint)?;
     let tls = current_cache_tls()?;
@@ -943,14 +748,14 @@ pub async fn get_object_bytes(reference: &ObjectRef) -> Result<ObjectBytes, Flam
             &endpoint,
             CacheGetRequest {
                 key: reference.key.clone(),
-                client_version: 0,
+                version: 0,
             },
         )?)
         .await
         .map_err(|e| FlameError::Internal(format!("cache get failed: {}", e)))?
         .into_inner();
-    let header = read_full_header(&mut stream, &reference.key).await?;
-    let mut builder = ObjectBytesBuilder::new(header);
+    let header = read_header(&mut stream).await?;
+    let mut builder = ObjectPartsBuilder::new(header);
     while let Some(message) = stream
         .message()
         .await
@@ -966,83 +771,53 @@ pub async fn get_object_bytes(reference: &ObjectRef) -> Result<ObjectBytes, Flam
     builder.finish(&reference.key)
 }
 
-struct ObjectBytesBuilder {
+struct ObjectPartsBuilder {
     data_type: String,
     version: u64,
-    base: Option<(u64, Vec<u8>)>,
-    patches: Vec<(u64, Vec<u8>)>,
+    /// The data parts by version, starting at 1.
+    parts: Vec<(u64, Vec<u8>)>,
 }
 
-impl ObjectBytesBuilder {
+impl ObjectPartsBuilder {
     fn new(header: CacheGetHeader) -> Self {
         Self {
             data_type: header.data_type,
             version: header.version,
-            base: None,
-            patches: Vec::new(),
+            parts: Vec::new(),
         }
     }
 
     fn push(&mut self, chunk: CacheGetChunk) -> Result<(), FlameError> {
-        match CacheChunkKind::try_from(chunk.kind) {
-            Ok(CacheChunkKind::Base) => {
-                if !self.patches.is_empty() {
-                    return Err(FlameError::InvalidConfig(
-                        "invalid object response: base after patch".to_string(),
-                    ));
-                }
-                match self.base.as_mut() {
-                    Some((version, data)) if *version == chunk.version => {
-                        data.extend_from_slice(&chunk.data);
-                    }
-                    Some(_) => {
-                        return Err(FlameError::InvalidConfig(
-                            "invalid object response: base version changed".to_string(),
-                        ));
-                    }
-                    None => self.base = Some((chunk.version, chunk.data.to_vec())),
-                }
+        match self.parts.last_mut() {
+            Some((version, data)) if *version == chunk.version => {
+                data.extend_from_slice(&chunk.data);
             }
-            Ok(CacheChunkKind::Patch) => {
-                if self.base.is_none() {
-                    return Err(FlameError::InvalidConfig(
-                        "invalid object response: patch before base".to_string(),
-                    ));
-                }
-                match self.patches.last_mut() {
-                    Some((version, data)) if *version == chunk.version => {
-                        data.extend_from_slice(&chunk.data);
-                    }
-                    _ => self.patches.push((chunk.version, chunk.data.to_vec())),
-                }
-            }
-            _ => {
+            Some((version, _)) if *version + 1 != chunk.version => {
                 return Err(FlameError::InvalidConfig(
-                    "invalid object response chunk kind".to_string(),
+                    "invalid object response: versions must be consecutive".to_string(),
                 ));
             }
+            None if chunk.version != 1 => {
+                return Err(FlameError::InvalidConfig(
+                    "invalid object response: the data must start at version 1".to_string(),
+                ));
+            }
+            _ => self.parts.push((chunk.version, chunk.data.to_vec())),
         }
         Ok(())
     }
 
-    fn finish(self, key: &str) -> Result<ObjectBytes, FlameError> {
-        let Some((base_version, base_data)) = self.base else {
+    fn finish(self, key: &str) -> Result<ObjectParts, FlameError> {
+        if self.parts.is_empty() {
             return Err(FlameError::NotFound(key.to_string()));
-        };
-        Ok(ObjectBytes {
+        }
+        Ok(ObjectParts {
             data_type: self.data_type,
             version: self.version,
-            base: ObjectBytePart {
-                version: base_version,
-                data: Bytes::from(base_data),
-            },
-            patches: self
-                .patches
+            parts: self
+                .parts
                 .into_iter()
-                .map(|(version, data)| ObjectBytePart {
-                    version,
-                    data: Bytes::from(data),
-                })
+                .map(|(_, data)| Bytes::from(data))
                 .collect(),
         })
     }
@@ -1307,22 +1082,20 @@ mod tests {
     }
 
     #[test]
-    fn opaque_response_assembles_parts_with_versions() {
-        let mut builder = ObjectBytesBuilder::new(CacheGetHeader {
-            mode: CacheGetMode::Full as i32,
-            version: 13,
+    fn response_assembles_one_part_per_version() {
+        let mut builder = ObjectPartsBuilder::new(CacheGetHeader {
+            version: 3,
             data_type: "custom.binary".to_string(),
         });
-        for (kind, version, data) in [
-            (CacheChunkKind::Base, 10, b"ba".as_slice()),
-            (CacheChunkKind::Base, 10, b"se".as_slice()),
-            (CacheChunkKind::Patch, 11, b"pa".as_slice()),
-            (CacheChunkKind::Patch, 11, b"tch".as_slice()),
-            (CacheChunkKind::Patch, 13, b"next".as_slice()),
+        for (version, data) in [
+            (1, b"fir".as_slice()),
+            (1, b"st".as_slice()),
+            (2, b"sec".as_slice()),
+            (2, b"ond".as_slice()),
+            (3, b"next".as_slice()),
         ] {
             builder
                 .push(CacheGetChunk {
-                    kind: kind as i32,
                     version,
                     data: Bytes::copy_from_slice(data),
                 })
@@ -1330,26 +1103,36 @@ mod tests {
         }
         let object = builder.finish("app/session/object").unwrap();
         assert_eq!(object.data_type, "custom.binary");
-        assert_eq!(object.version, 13);
+        assert_eq!(object.version, 3);
         assert_eq!(
-            object.base,
-            ObjectBytePart {
-                version: 10,
-                data: Bytes::from_static(b"base")
-            }
-        );
-        assert_eq!(
-            object.patches,
+            object.parts,
             vec![
-                ObjectBytePart {
-                    version: 11,
-                    data: Bytes::from_static(b"patch")
-                },
-                ObjectBytePart {
-                    version: 13,
-                    data: Bytes::from_static(b"next")
-                },
+                Bytes::from_static(b"first"),
+                Bytes::from_static(b"second"),
+                Bytes::from_static(b"next"),
             ]
         );
+    }
+
+    #[test]
+    fn response_must_start_at_version_one_and_be_consecutive() {
+        let chunk = |version| CacheGetChunk {
+            version,
+            data: Bytes::new(),
+        };
+        let header = || CacheGetHeader {
+            version: 3,
+            data_type: "raw".to_string(),
+        };
+        let mut late = ObjectPartsBuilder::new(header());
+        assert!(late.push(chunk(2)).is_err());
+        let mut gap = ObjectPartsBuilder::new(header());
+        gap.push(chunk(1)).unwrap();
+        assert!(gap.push(chunk(3)).is_err());
+        let empty = ObjectPartsBuilder::new(header());
+        assert!(matches!(
+            empty.finish("app/session/object"),
+            Err(FlameError::NotFound(_))
+        ));
     }
 }

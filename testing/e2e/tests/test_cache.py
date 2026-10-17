@@ -20,7 +20,17 @@ import flamepy.core.cache as cache_module
 import grpc
 import pyarrow as pa
 import pytest
-from flamepy.core import FlameContext, ObjectRef, get_object, patch_object, put_object, update_object
+from flamepy.core import (
+    FlameContext,
+    ObjectRef,
+    delete_objects,
+    delete_package,
+    download_package,
+    get_object,
+    patch_object,
+    put_object,
+    upload_package,
+)
 from flamepy.proto import cache_pb2, cache_pb2_grpc
 
 
@@ -55,20 +65,25 @@ def _remote_metadata(ref: ObjectRef):
         return client.GetMetadata(cache_pb2.CacheGetMetadataRequest(key=ref.key), metadata=metadata)
 
 
-def _remote_write(ref: ObjectRef, data_type: str, data: bytes, *, patch: bool = False) -> ObjectRef:
+def _remote_write(rpc: str, ref: ObjectRef, data_type: str, data: bytes) -> ObjectRef:
     def requests():
         yield cache_pb2.CacheWriteRequest(header=cache_pb2.CacheWriteHeader(key=ref.key, data_type=data_type))
         for offset in range(0, len(data), cache_module._UPLOAD_CHUNK_SIZE):
             yield cache_pb2.CacheWriteRequest(data=data[offset : offset + cache_module._UPLOAD_CHUNK_SIZE])
 
     with _remote_cache_client(ref) as (client, routing):
-        response = (client.Patch if patch else client.Put)(requests(), metadata=routing)
+        response = getattr(client, rpc)(requests(), metadata=routing)
     return ObjectRef(endpoint=response.endpoint, key=response.key, version=response.version)
 
 
-def _remote_get(ref: ObjectRef, client_version: int):
+def _remote_delete(ref: ObjectRef) -> None:
     with _remote_cache_client(ref) as (client, metadata):
-        responses = list(client.Get(cache_pb2.CacheGetRequest(key=ref.key, client_version=client_version), metadata=metadata))
+        client.Delete(cache_pb2.CacheDeleteRequest(key=ref.key), metadata=metadata)
+
+
+def _remote_get(ref: ObjectRef, version: int):
+    with _remote_cache_client(ref) as (client, metadata):
+        responses = list(client.Get(cache_pb2.CacheGetRequest(key=ref.key, version=version), metadata=metadata))
     assert responses and responses[0].WhichOneof("payload") == "header"
     assert all(response.WhichOneof("payload") == "chunk" for response in responses[1:])
     return responses[0].header, [response.chunk for response in responses[1:]]
@@ -91,19 +106,18 @@ def test_cache_put_and_get():
     assert result == test_data
 
 
-def test_cache_cloudpickle_object_and_patch_remain_raw():
-    """Arbitrary Python objects remain uncompressed, including their patches."""
+def test_cache_cloudpickle_object_and_appended_data_remain_raw():
+    """Arbitrary Python objects remain uncompressed, including appended data."""
     key_prefix = f"test-app/test-cloudpickle-{uuid.uuid4().hex[:8]}"
-    base = {"text": "repeat-me" * 2000}
-    delta = {"text": "another-repeat" * 2000}
+    first = {"text": "repeat-me" * 2000}
+    second = {"text": "another-repeat" * 2000}
 
-    ref = put_object(key_prefix, base)
+    ref = put_object(key_prefix, first)
     metadata = _remote_metadata(ref)
     assert metadata.data_type == "cloudpickle"
-    patched = patch_object(ref, delta)
-    result = get_object(patched, deserializer=lambda value, patches: (value, patches))
+    appended = patch_object(ref, second)
 
-    assert result == (base, [delta])
+    assert get_object(appended, deserializer=_parts) == [first, second]
 
 
 def test_cache_zstd_arrow_table():
@@ -131,39 +145,6 @@ def test_cache_put_and_get_native_arrow_table():
     assert isinstance(result, pa.Table)
     assert result.to_pydict() == table.to_pydict()
     assert b"flame.cache.format" not in (result.schema.metadata or {})
-
-
-def test_cache_native_arrow_table_update():
-    """Test that Arrow table updates rewrite the base object."""
-    key_prefix = f"test-app/test-native-arrow-update-{uuid.uuid4().hex[:8]}"
-    table = pa.table({"value": [1, 2, 3]})
-    updated = pa.table({"value": [4, 5], "label": ["x", "y"]})
-
-    ref = put_object(key_prefix, table)
-    updated_ref = update_object(ref, updated)
-
-    assert updated_ref.key == ref.key
-    assert updated_ref.version == ref.version + 1
-
-    result = get_object(updated_ref)
-    assert isinstance(result, pa.Table)
-    assert result.to_pydict() == updated.to_pydict()
-
-
-def test_cache_update():
-    """Test update operation."""
-    key_prefix = "test-app/test-session-002"
-    original_data = {"count": 0}
-    updated_data = {"count": 1}
-
-    ref = put_object(key_prefix, original_data)
-    new_ref = update_object(ref, updated_data)
-
-    assert new_ref.key == ref.key
-    assert new_ref.endpoint == ref.endpoint
-
-    result = get_object(new_ref)
-    assert result == updated_data
 
 
 def test_cache_with_complex_objects():
@@ -204,25 +185,24 @@ def test_objectref_encode_decode():
 
 
 # ============================================================================
-# PATCH Operation Tests
+# Appending data (patch_object) and versioned reads
 # ============================================================================
+#
+# An object is a list of data parts: put_object creates it with one part
+# (version 1), every patch_object appends a part (versions 2, 3, ...), and an
+# object is never replaced. get_object returns the newest part, or a value made
+# of all the parts, in the order they were written, by a deserializer.
 
 
-def _raw_deserializer(base, deltas):
-    """Deserializer that returns base and deltas as a dict for testing."""
-    return {"base": base, "deltas": deltas}
+def _parts(parts):
+    """Deserializer that returns all the data parts of an object."""
+    return parts
 
 
-def _remote_patch_without_local_cache_invalidation(ref: ObjectRef, delta):
-    """Patch through gRPC directly to emulate another client process."""
-    data_type, data = cache_module._serialize_object_data(delta)
-    return _remote_write(ref, data_type, data, patch=True)
-
-
-def _remote_update_without_local_cache_invalidation(ref: ObjectRef, new_obj):
-    """Update through gRPC directly to emulate another client process."""
-    data_type, data = cache_module._serialize_object_data(new_obj)
-    return _remote_write(ref, data_type, data)
+def _remote_patch_without_local_cache_invalidation(ref: ObjectRef, data):
+    """Append through gRPC directly to emulate another client process."""
+    data_type, payload = cache_module._serialize_object_data(data)
+    return _remote_write("Patch", ref, data_type, payload)
 
 
 def _cached_object(ref: ObjectRef):
@@ -230,153 +210,160 @@ def _cached_object(ref: ObjectRef):
         return cache_module._object_cache[(ref.endpoint, ref.key)]
 
 
-def test_patch_single_delta():
-    """Test patching an object with a single delta."""
-    key_prefix = "test-app/test-patch-001"
-    base_data = {"logs": []}
-    delta_data = {"worker": 1, "log": "started"}
+def test_object_is_created_with_one_part_at_version_one():
+    ref = put_object(f"test-app/test-parts-{uuid.uuid4().hex[:8]}", {"first": True})
 
-    ref = put_object(key_prefix, base_data)
-    patched_ref = patch_object(ref, delta_data)
-
-    assert patched_ref.key == ref.key
-    assert patched_ref.endpoint == ref.endpoint
-
-    result = get_object(patched_ref, deserializer=_raw_deserializer)
-
-    assert result["base"] == base_data
-    assert len(result["deltas"]) == 1
-    assert result["deltas"][0] == delta_data
+    assert ref.version == 1
+    assert get_object(ref, deserializer=_parts) == [{"first": True}]
+    assert _remote_metadata(ref).version == 1
 
 
-def test_patch_multiple_deltas():
-    """Test patching an object with multiple deltas."""
-    key_prefix = "test-app/test-patch-002"
-    base_data = {"results": []}
+def test_put_cannot_replace_an_existing_object():
+    """An object is created once: a put to an existing key fails and changes nothing."""
+    ref = put_object(f"test-app/test-create-only-{uuid.uuid4().hex[:8]}", {"first": True})
+    data_type, payload = cache_module._serialize_object_data({"second": True})
 
-    ref = put_object(key_prefix, base_data)
+    with pytest.raises(grpc.RpcError) as error:
+        _remote_write("Put", ref, data_type, payload)
+    assert error.value.code() == grpc.StatusCode.ALREADY_EXISTS
 
-    delta1 = {"worker": 1, "result": 100}
-    delta2 = {"worker": 2, "result": 200}
-    delta3 = {"worker": 3, "result": 300}
-
-    ref = patch_object(ref, delta1)
-    ref = patch_object(ref, delta2)
-    ref = patch_object(ref, delta3)
-
-    result = get_object(ref, deserializer=_raw_deserializer)
-
-    assert result["base"] == base_data
-    assert len(result["deltas"]) == 3
-    assert result["deltas"][0] == delta1
-    assert result["deltas"][1] == delta2
-    assert result["deltas"][2] == delta3
+    assert get_object(ref, deserializer=_parts) == [{"first": True}]
+    assert _remote_metadata(ref).version == 1
 
 
-def test_incremental_get_applies_remote_patch_only_response():
-    """Test a cached client applies only patches appended by another client."""
-    key_prefix = f"test-app/test-incremental-patch-{uuid.uuid4().hex[:8]}"
-    base_data = {"items": ["base"]}
-    delta_data_1 = {"items": ["patch-1"]}
-    delta_data_2 = {"items": ["patch-2"]}
+def test_patch_appends_a_part_and_bumps_the_version():
+    ref = put_object(f"test-app/test-append-{uuid.uuid4().hex[:8]}", {"logs": []})
+    appended = patch_object(ref, {"worker": 1, "log": "started"})
 
-    ref = put_object(key_prefix, base_data)
-    assert get_object(ref, deserializer=_raw_deserializer) == {"base": base_data, "deltas": []}
-
-    patched_ref = _remote_patch_without_local_cache_invalidation(ref, delta_data_1)
-    header, chunks = _remote_get(ref, ref.version)
-    assert header.mode == cache_pb2.CACHE_GET_MODE_PATCHES
-    assert header.version == patched_ref.version
-    assert [(chunk.kind, chunk.version) for chunk in chunks] == [(cache_pb2.CACHE_CHUNK_KIND_PATCH, patched_ref.version)]
-
-    result = get_object(ref, deserializer=_raw_deserializer)
-    assert result == {"base": base_data, "deltas": [delta_data_1]}
-
-    cached = _cached_object(ref)
-    assert cached.version == patched_ref.version
-    assert [patch.data for patch in cached.patches] == [delta_data_1]
-
-    patched_ref_2 = _remote_patch_without_local_cache_invalidation(ref, delta_data_2)
-    header, chunks = _remote_get(ref, cached.version)
-    assert header.mode == cache_pb2.CACHE_GET_MODE_PATCHES
-    assert header.version == patched_ref_2.version
-    assert [(chunk.kind, chunk.version) for chunk in chunks] == [(cache_pb2.CACHE_CHUNK_KIND_PATCH, patched_ref_2.version)]
-
-    result = get_object(ref, deserializer=_raw_deserializer)
-    assert result == {"base": base_data, "deltas": [delta_data_1, delta_data_2]}
-
-    cached = _cached_object(ref)
-    assert cached.version == patched_ref_2.version
-    assert [patch.data for patch in cached.patches] == [delta_data_1, delta_data_2]
+    assert appended.key == ref.key
+    assert appended.endpoint == ref.endpoint
+    assert appended.version == ref.version + 1
+    assert get_object(appended, deserializer=_parts) == [{"logs": []}, {"worker": 1, "log": "started"}]
 
 
-def test_version_zero_forces_full_response_with_cached_object():
-    """Test version=0 gets the full base plus patches even with a local cache."""
-    key_prefix = f"test-app/test-incremental-full-{uuid.uuid4().hex[:8]}"
-    base_data = {"items": ["base"]}
-    delta_data = {"items": ["patch-1"]}
+def test_get_without_a_deserializer_returns_the_newest_part():
+    ref = put_object(f"test-app/test-newest-{uuid.uuid4().hex[:8]}", {"n": 0})
+    assert get_object(ref) == {"n": 0}
 
-    ref = put_object(key_prefix, base_data)
-    assert get_object(ref, deserializer=_raw_deserializer) == {"base": base_data, "deltas": []}
-    patched_ref = _remote_patch_without_local_cache_invalidation(ref, delta_data)
-
-    forced_ref = ObjectRef(endpoint=ref.endpoint, key=ref.key, version=0)
-    header, chunks = _remote_get(forced_ref, 0)
-    assert header.mode == cache_pb2.CACHE_GET_MODE_FULL
-    assert header.version == patched_ref.version
-    assert [(chunk.kind, chunk.version) for chunk in chunks] == [(cache_pb2.CACHE_CHUNK_KIND_BASE, ref.version), (cache_pb2.CACHE_CHUNK_KIND_PATCH, patched_ref.version)]
-
-    result = get_object(forced_ref, deserializer=_raw_deserializer)
-    assert result == {"base": base_data, "deltas": [delta_data]}
+    for n in (1, 2, 3):
+        ref = patch_object(ref, {"n": n})
+        assert get_object(ref) == {"n": n}
 
 
-def test_incremental_get_falls_back_to_full_after_remote_update():
-    """Test stale cached base is replaced by a full response after update."""
-    key_prefix = f"test-app/test-incremental-update-{uuid.uuid4().hex[:8]}"
-    base_data = {"version": 1}
-    updated_data = {"version": 2}
-
-    ref = put_object(key_prefix, base_data)
-    assert get_object(ref, deserializer=_raw_deserializer) == {"base": base_data, "deltas": []}
-
-    updated_ref = _remote_update_without_local_cache_invalidation(ref, updated_data)
-    header, chunks = _remote_get(ref, ref.version)
-    assert header.mode == cache_pb2.CACHE_GET_MODE_FULL
-    assert header.version == updated_ref.version
-    assert [(chunk.kind, chunk.version) for chunk in chunks] == [(cache_pb2.CACHE_CHUNK_KIND_BASE, updated_ref.version)]
-
-    result = get_object(ref, deserializer=_raw_deserializer)
-    assert result == {"base": updated_data, "deltas": []}
-
-    cached = _cached_object(ref)
-    assert cached.version == updated_ref.version
-    assert cached.data == updated_data
-    assert cached.patches == []
-
-
-def test_patch_preserves_delta_order():
-    """Test that deltas are returned in the order they were appended."""
-    key_prefix = "test-app/test-patch-003"
-    base_data = {"sequence": "start"}
-
-    ref = put_object(key_prefix, base_data)
+def test_multiple_appends_keep_their_order_and_versions():
+    ref = put_object(f"test-app/test-order-{uuid.uuid4().hex[:8]}", {"sequence": "start"})
+    versions = [ref.version]
 
     for i in range(5):
-        ref = patch_object(ref, {"index": i, "value": f"delta_{i}"})
+        ref = patch_object(ref, {"index": i, "value": f"part_{i}"})
+        versions.append(ref.version)
 
-    result = get_object(ref, deserializer=_raw_deserializer)
-
-    assert result["base"] == base_data
-    assert len(result["deltas"]) == 5
-    for i, delta in enumerate(result["deltas"]):
-        assert delta["index"] == i
-        assert delta["value"] == f"delta_{i}"
+    assert versions == [1, 2, 3, 4, 5, 6]
+    parts = get_object(ref, deserializer=_parts)
+    assert parts[0] == {"sequence": "start"}
+    assert parts[1:] == [{"index": i, "value": f"part_{i}"} for i in range(5)]
 
 
-def test_patch_with_complex_delta():
-    """Test patching with complex Python objects as deltas."""
-    key_prefix = "test-app/test-patch-004"
+def test_a_deserializer_combines_the_parts():
+    ref = put_object(f"test-app/test-combine-{uuid.uuid4().hex[:8]}", [1, 2])
+    ref = patch_object(ref, [3])
+    ref = patch_object(ref, [4, 5])
 
+    merged = get_object(ref, deserializer=lambda parts: [item for part in parts for item in part])
+    assert merged == [1, 2, 3, 4, 5]
+
+
+def test_get_returns_only_the_data_after_a_version():
+    """A Get with a version returns the parts after it, and nothing at the current version."""
+    ref = put_object(f"test-app/test-after-{uuid.uuid4().hex[:8]}", {"n": 1})
+    for n in (2, 3, 4):
+        ref = patch_object(ref, {"n": n})
+    assert ref.version == 4
+
+    for version, expected in [(0, [1, 2, 3, 4]), (1, [2, 3, 4]), (2, [3, 4]), (3, [4]), (4, [])]:
+        header, chunks = _remote_get(ref, version)
+        assert header.version == 4
+        assert [chunk.version for chunk in chunks] == expected
+        if chunks:
+            assert header.data_type == "cloudpickle"
+
+    # A version the object does not have is an error, not another object.
+    with pytest.raises(grpc.RpcError) as error:
+        _remote_get(ref, 9)
+    assert error.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_incremental_get_applies_only_the_data_another_client_appended():
+    """A cached client fetches and applies only the parts appended by another client."""
+    ref = put_object(f"test-app/test-incremental-{uuid.uuid4().hex[:8]}", {"items": ["first"]})
+    assert get_object(ref, deserializer=_parts) == [{"items": ["first"]}]
+    assert _cached_object(ref).version == 1
+
+    second = _remote_patch_without_local_cache_invalidation(ref, {"items": ["second"]})
+    header, chunks = _remote_get(ref, ref.version)
+    assert header.version == second.version
+    assert [chunk.version for chunk in chunks] == [second.version]
+
+    assert get_object(ref, deserializer=_parts) == [{"items": ["first"]}, {"items": ["second"]}]
+    cached = _cached_object(ref)
+    assert cached.version == second.version
+    assert cached.data == [{"items": ["first"]}, {"items": ["second"]}]
+
+    third = _remote_patch_without_local_cache_invalidation(ref, {"items": ["third"]})
+    header, chunks = _remote_get(ref, cached.version)
+    assert header.version == third.version
+    assert [chunk.version for chunk in chunks] == [third.version]
+
+    assert get_object(ref, deserializer=_parts)[-1] == {"items": ["third"]}
+    assert _cached_object(ref).version == third.version
+    assert len(_cached_object(ref).data) == 3
+
+
+def test_version_zero_gets_all_the_parts_even_with_a_cached_object():
+    ref = put_object(f"test-app/test-version-zero-{uuid.uuid4().hex[:8]}", {"items": ["first"]})
+    assert get_object(ref, deserializer=_parts) == [{"items": ["first"]}]
+    appended = _remote_patch_without_local_cache_invalidation(ref, {"items": ["second"]})
+
+    forced = ObjectRef(endpoint=ref.endpoint, key=ref.key, version=0)
+    header, chunks = _remote_get(forced, 0)
+    assert header.version == appended.version
+    assert [chunk.version for chunk in chunks] == [1, 2]
+
+    assert get_object(forced, deserializer=_parts) == [{"items": ["first"]}, {"items": ["second"]}]
+
+
+def test_get_after_the_object_was_created_again():
+    """A client whose cached version is ahead of a new object of the same key starts over."""
+    ref = put_object(f"test-app/test-again-{uuid.uuid4().hex[:8]}", {"n": 1})
+    ref = patch_object(ref, {"n": 2})
+    ref = patch_object(ref, {"n": 3})
+    assert get_object(ref, deserializer=_parts) == [{"n": 1}, {"n": 2}, {"n": 3}]
+    assert _cached_object(ref).version == 3
+
+    # Another client deletes the object and creates it again, shorter.
+    _remote_delete(ref)
+    data_type, payload = cache_module._serialize_object_data({"again": True})
+    _remote_write("Put", ref, data_type, payload)
+
+    assert get_object(ref, deserializer=_parts) == [{"again": True}]
+    assert _cached_object(ref).version == 1
+
+
+def test_appending_keeps_the_cached_parts_of_the_object():
+    """The cached parts stay valid after an append: the next get adds only the new data."""
+    ref = put_object(f"test-app/test-keep-{uuid.uuid4().hex[:8]}", {"n": 1})
+    assert get_object(ref, deserializer=_parts) == [{"n": 1}]
+    cached = _cached_object(ref)
+
+    ref = patch_object(ref, {"n": 2})
+
+    assert _cached_object(ref) is cached
+    assert get_object(ref, deserializer=_parts) == [{"n": 1}, {"n": 2}]
+    assert _cached_object(ref) is cached
+    assert cached.version == 2
+
+
+def test_patch_with_complex_python_objects():
     class LogEntry:
         def __init__(self, level, message):
             self.level = level
@@ -385,69 +372,48 @@ def test_patch_with_complex_delta():
         def __eq__(self, other):
             return self.level == other.level and self.message == other.message
 
-    base_data = {"log_name": "app.log"}
-    delta1 = LogEntry("INFO", "Application started")
-    delta2 = LogEntry("WARNING", "Low memory")
-    delta3 = LogEntry("ERROR", "Connection failed")
+    entries = [LogEntry("INFO", "Application started"), LogEntry("WARNING", "Low memory"), LogEntry("ERROR", "Connection failed")]
+    ref = put_object(f"test-app/test-complex-{uuid.uuid4().hex[:8]}", LogEntry("DEBUG", "created"))
+    for entry in entries:
+        ref = patch_object(ref, entry)
 
-    ref = put_object(key_prefix, base_data)
-
-    ref = patch_object(ref, delta1)
-    ref = patch_object(ref, delta2)
-    ref = patch_object(ref, delta3)
-
-    result = get_object(ref, deserializer=_raw_deserializer)
-
-    assert result["base"] == base_data
-    assert len(result["deltas"]) == 3
-    assert result["deltas"][0] == delta1
-    assert result["deltas"][1] == delta2
-    assert result["deltas"][2] == delta3
+    parts = get_object(ref, deserializer=_parts)
+    assert parts == [LogEntry("DEBUG", "created"), *entries]
 
 
-def test_update_clears_deltas():
-    """Test that update operation clears all existing deltas."""
-    key_prefix = "test-app/test-patch-005"
-    base_data = {"version": 1}
+def test_patch_with_nested_binary_and_none_data():
+    ref = put_object(f"test-app/test-shapes-{uuid.uuid4().hex[:8]}", {"root": {"level1": {"level2": []}}})
+    nested = {"nested": {"deep": {"data": [1, 2, 3], "more": {"key": "value"}}}}
+    binary = {"binary": b"\x00\x01\x02\x03\xff\xfe\xfd"}
+    nones = {"key": None, "list": [None, 1, None]}
+    for data in (nested, binary, nones):
+        ref = patch_object(ref, data)
 
-    ref = put_object(key_prefix, base_data)
-
-    ref = patch_object(ref, {"delta": 1})
-    ref = patch_object(ref, {"delta": 2})
-    ref = patch_object(ref, {"delta": 3})
-
-    result = get_object(ref, deserializer=_raw_deserializer)
-    assert len(result["deltas"]) == 3
-
-    new_base = {"version": 2}
-    ref = update_object(ref, new_base)
-
-    result = get_object(ref, deserializer=_raw_deserializer)
-    assert result["base"] == new_base
-    assert result["deltas"] == []
+    assert get_object(ref, deserializer=_parts)[1:] == [nested, binary, nones]
 
 
-def test_put_clears_deltas():
-    """Test that put operation on same key clears existing deltas."""
-    key_prefix = "test-app/test-patch-006"
-    base_data = {"initial": True}
+def test_many_appends():
+    ref = put_object(f"test-app/test-many-{uuid.uuid4().hex[:8]}", {"counter": 0})
+    for i in range(50):
+        ref = patch_object(ref, {"increment": i + 1})
 
-    ref = put_object(key_prefix, base_data)
+    assert ref.version == 51
+    parts = get_object(ref, deserializer=_parts)
+    assert [part.get("increment") for part in parts[1:]] == list(range(1, 51))
 
-    ref = patch_object(ref, {"delta": "a"})
-    ref = patch_object(ref, {"delta": "b"})
 
-    result = get_object(ref, deserializer=_raw_deserializer)
-    assert len(result["deltas"]) == 2
+def test_patch_rejects_data_of_another_type_and_changes_nothing():
+    ref = put_object(f"test-app/test-type-{uuid.uuid4().hex[:8]}", {"kind": "pickle"})
 
-    new_ref = put_object(key_prefix, {"new": True})
+    with pytest.raises(Exception):
+        patch_object(ref, pa.table({"a": [1]}))
 
-    new_result = get_object(new_ref)
-    assert new_result == {"new": True}
+    assert _remote_metadata(ref).version == 1
+    assert get_object(ref, deserializer=_parts) == [{"kind": "pickle"}]
 
 
 def test_patch_nonexistent_object():
-    """Test that patching a non-existent object raises an error."""
+    """Appending to an object that does not exist is an error."""
     ctx = FlameContext()
     cache_config = ctx.cache
     cache_endpoint = cache_config.get("endpoint") if isinstance(cache_config, dict) else cache_config
@@ -455,80 +421,92 @@ def test_patch_nonexistent_object():
     fake_ref = ObjectRef(endpoint=cache_endpoint, key="test-app/nonexistent-session/nonexistent-object", version=0)
 
     with pytest.raises(Exception):
-        patch_object(fake_ref, {"delta": "data"})
+        patch_object(fake_ref, {"data": "data"})
 
 
-def test_patch_with_nested_data():
-    """Test patching with deeply nested data structures."""
-    key_prefix = "test-app/test-patch-007"
-    base_data = {"root": {"level1": {"level2": []}}}
+def test_delete_objects_removes_the_object():
+    ref = put_object(f"test-app/test-delete-{uuid.uuid4().hex[:8]}", {"first": True})
+    ref = patch_object(ref, {"second": True})
+    assert get_object(ref, deserializer=_parts) == [{"first": True}, {"second": True}]
 
-    ref = put_object(key_prefix, base_data)
+    delete_objects(ref.key)
 
-    delta = {"nested": {"deep": {"data": [1, 2, 3], "more": {"key": "value"}}}}
-    ref = patch_object(ref, delta)
-
-    result = get_object(ref, deserializer=_raw_deserializer)
-    assert result["base"] == base_data
-    assert len(result["deltas"]) == 1
-    assert result["deltas"][0] == delta
+    with pytest.raises(Exception):
+        get_object(ObjectRef(endpoint=ref.endpoint, key=ref.key, version=0))
 
 
-def test_patch_with_binary_data():
-    """Test patching with binary data."""
-    key_prefix = "test-app/test-patch-008"
-    base_data = {"type": "binary_container"}
+def test_put_after_delete_creates_a_new_object_at_version_one():
+    prefix = f"test-app/test-recreate-{uuid.uuid4().hex[:8]}"
+    ref = put_object(prefix, {"first": True})
+    ref = patch_object(ref, {"second": True})
+    delete_objects(ref.key)
 
-    ref = put_object(key_prefix, base_data)
+    new_ref = put_object(prefix, {"new": True})
 
-    binary_delta = {"binary": b"\x00\x01\x02\x03\xff\xfe\xfd"}
-    ref = patch_object(ref, binary_delta)
-
-    result = get_object(ref, deserializer=_raw_deserializer)
-    assert result["base"] == base_data
-    assert len(result["deltas"]) == 1
-    assert result["deltas"][0]["binary"] == binary_delta["binary"]
-
-
-def test_patch_with_none_values():
-    """Test patching with None values in data."""
-    key_prefix = "test-app/test-patch-009"
-    base_data = {"value": None}
-
-    ref = put_object(key_prefix, base_data)
-
-    delta = {"key": None, "list": [None, 1, None]}
-    ref = patch_object(ref, delta)
-
-    result = get_object(ref, deserializer=_raw_deserializer)
-    assert result["base"] == base_data
-    assert len(result["deltas"]) == 1
-    assert result["deltas"][0] == delta
-
-
-def test_patch_large_number_of_deltas():
-    """Test patching with a large number of deltas."""
-    key_prefix = "test-app/test-patch-010"
-    base_data = {"counter": 0}
-
-    ref = put_object(key_prefix, base_data)
-
-    num_deltas = 50
-    for i in range(num_deltas):
-        ref = patch_object(ref, {"increment": i + 1})
-
-    result = get_object(ref, deserializer=_raw_deserializer)
-    assert result["base"] == base_data
-    assert len(result["deltas"]) == num_deltas
-
-    for i, delta in enumerate(result["deltas"]):
-        assert delta["increment"] == i + 1
+    assert new_ref.key != ref.key
+    assert new_ref.version == 1
+    assert get_object(new_ref, deserializer=_parts) == [{"new": True}]
 
 
 @pytest.mark.skip(reason="MAX_DELTAS_PER_OBJECT=1000 is too slow for E2E; tested via unit tests")
-def test_patch_max_deltas_limit():
-    """Test that patching beyond MAX_DELTAS_PER_OBJECT (1000) raises an error."""
+def test_patch_limit():
+    """Appending beyond the limit of 1000 parts raises an error."""
     pass
+
+
+# ============================================================================
+# Application packages
+# ============================================================================
+
+
+def test_package_upload_download_replace_and_delete(tmp_path):
+    app_name = f"test-pkg-{uuid.uuid4().hex[:8]}"
+    filename = "app.tar.gz"
+    source = tmp_path / filename
+    source.write_bytes(b"first package" * 1000)
+
+    ref = upload_package(app_name, str(source))
+    assert ref.key == f"{app_name}/pkg/{filename}"
+    assert ref.version == 1
+
+    downloaded = tmp_path / "downloaded.tar.gz"
+    download_package(app_name, filename, str(downloaded))
+    assert downloaded.read_bytes() == source.read_bytes()
+
+    # A package with the same name is replaced.
+    source.write_bytes(b"second package" * 1000)
+    replaced = upload_package(app_name, str(source))
+    assert replaced.key == ref.key
+    assert replaced.version == 1
+    download_package(app_name, filename, str(downloaded))
+    assert downloaded.read_bytes() == source.read_bytes()
+
+    # A name can be given for the package, which is how it is kept.
+    renamed = upload_package(app_name, str(source), "other.tar.gz")
+    assert renamed.key == f"{app_name}/pkg/other.tar.gz"
+
+    delete_package(app_name, filename)
+    with pytest.raises(Exception):
+        download_package(app_name, filename, str(tmp_path / "gone.tar.gz"))
+    download_package(app_name, "other.tar.gz", str(downloaded))
+    assert downloaded.read_bytes() == source.read_bytes()
+    delete_package(app_name, "other.tar.gz")
+
+
+def test_package_with_appended_data_cannot_be_downloaded(tmp_path):
+    """A package is a file: an object with more than one part is not."""
+    app_name = f"test-pkg-{uuid.uuid4().hex[:8]}"
+    source = tmp_path / "app.tar.gz"
+    source.write_bytes(b"package")
+    ref = upload_package(app_name, str(source))
+    # A package has the raw type, so the data appended must be raw too.
+    _remote_write("Patch", ref, "raw", b"appended")
+    assert _remote_metadata(ref).version == 2
+
+    with pytest.raises(Exception):
+        download_package(app_name, "app.tar.gz", str(tmp_path / "out.tar.gz"))
+    assert not (tmp_path / "out.tar.gz").exists()
+    delete_package(app_name, "app.tar.gz")
 
 
 # ============================================================================
@@ -683,8 +661,8 @@ class TestCachePressureEdgeCases:
             retrieved = get_object(ref)
             assert retrieved["id"] == i
 
-    def test_object_update_remains_retrievable_after_more_writes(self):
-        """Test that an updated object remains retrievable after more writes."""
+    def test_object_patch_remains_retrievable_after_more_writes(self):
+        """Test that a patched object remains retrievable after more writes."""
         session_id = generate_session_id()
 
         refs = []
@@ -693,8 +671,8 @@ class TestCachePressureEdgeCases:
             ref = put_object(session_id, obj)
             refs.append(ref)
 
-        updated_obj = {"sequence": 0, "version": 2}
-        refs[0] = update_object(refs[0], updated_obj)
+        patched_obj = {"sequence": 0, "version": 2}
+        refs[0] = patch_object(refs[0], patched_obj)
 
         for i in range(5, 15):
             obj = create_large_object(size_kb=100)
@@ -703,7 +681,7 @@ class TestCachePressureEdgeCases:
 
         retrieved = get_object(refs[0])
         assert retrieved["sequence"] == 0
-        assert retrieved["version"] == 2, "Updated object should have new version"
+        assert retrieved["version"] == 2, "Patched object should have the patch's data"
 
     def test_concurrent_session_isolation(self):
         """Test that cache keys are isolated per session."""

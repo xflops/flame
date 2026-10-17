@@ -14,6 +14,7 @@ from flamepy.core.cache import (
     _TYPE_NUMPY,
     _TYPE_PANDAS_DATAFRAME,
     _TYPE_POLARS_DATAFRAME,
+    FetchResult,
     Object,
     ObjectKey,
     ObjectRef,
@@ -134,8 +135,8 @@ class TestMaterializedCache:
             def __init__(self, suffix):
                 self.suffix = suffix
 
-            def __call__(self, base, patches):
-                return base + self.suffix
+            def __call__(self, parts):
+                return parts[0] + self.suffix
 
             def _check_lock(self):
                 assert _cache_lock.acquire(blocking=False), "deserializer method called under cache lock"
@@ -149,13 +150,89 @@ class TestMaterializedCache:
                 self._check_lock()
                 return isinstance(other, ReentrantDeserializer) and self.suffix == other.suffix
 
-        obj = Object(version=1, data="base")
+        obj = Object(version=1, data=["first"])
         first = ReentrantDeserializer("-first")
         second = ReentrantDeserializer("-second")
 
-        assert _materialize_object(obj, first) == "base-first"
-        assert _materialize_object(obj, first) == "base-first"
-        assert _materialize_object(obj, second) == "base-second"
+        assert _materialize_object(obj, first) == "first-first"
+        assert _materialize_object(obj, first) == "first-first"
+        assert _materialize_object(obj, second) == "first-second"
+
+
+class TestMaterializedObject:
+    def test_value_is_the_newest_part_without_a_deserializer(self):
+        obj = Object(version=3, data=["first", "second", "third"])
+        assert _materialize_object(obj) == "third"
+
+    def test_deserializer_gets_every_part_in_order(self):
+        obj = Object(version=3, data=[[1], [2, 3], [4]])
+        seen = []
+
+        def merge(parts):
+            seen.append(parts)
+            return [item for part in parts for item in part]
+
+        assert _materialize_object(obj, merge) == [1, 2, 3, 4]
+        assert seen == [[[1], [2, 3], [4]]]
+        # The value is kept until the object changes.
+        assert _materialize_object(obj, merge) == [1, 2, 3, 4]
+        assert len(seen) == 1
+
+
+class TestAppendParts:
+    KEY = ("grpc://cache:1", "app/session/parts")
+
+    def setup_method(self):
+        cache_module._cache_remove(self.KEY)
+
+    def test_the_object_is_created_from_the_data_of_version_zero(self):
+        cached = cache_module._cache_append_parts(self.KEY, FetchResult(2, ["first", "second"]))
+
+        assert (cached.version, cached.data) == (2, ["first", "second"])
+        assert cache_module._cache_get(self.KEY) is cached
+
+    def test_data_after_a_version_cannot_create_the_object(self):
+        assert cache_module._cache_append_parts(self.KEY, FetchResult(3, ["third"]), 2) is None
+        assert cache_module._cache_get(self.KEY) is None
+
+    def test_data_after_the_cached_version_is_appended(self):
+        cache_module._cache_append_parts(self.KEY, FetchResult(1, ["first"]))
+
+        cached = cache_module._cache_append_parts(self.KEY, FetchResult(3, ["second", "third"]), 1)
+
+        assert (cached.version, cached.data) == (3, ["first", "second", "third"])
+
+    def test_appending_drops_the_values_made_of_the_old_parts(self):
+        cached = cache_module._cache_append_parts(self.KEY, FetchResult(1, ["first"]))
+        assert _materialize_object(cached, lambda parts: list(parts)) == ["first"]
+
+        cache_module._cache_append_parts(self.KEY, FetchResult(2, ["second"]), 1)
+
+        assert _materialize_object(cached, lambda parts: list(parts)) == ["first", "second"]
+
+    def test_parts_the_cache_got_after_the_request_are_not_added_twice(self):
+        # Asked for after version 1, while another call took the cache to version 2.
+        cache_module._cache_append_parts(self.KEY, FetchResult(2, ["first", "second"]))
+
+        cached = cache_module._cache_append_parts(self.KEY, FetchResult(3, ["second", "third"]), 1)
+
+        assert (cached.version, cached.data) == (3, ["first", "second", "third"])
+
+    def test_a_result_the_cache_already_has_leaves_it_as_it_is(self):
+        cache_module._cache_append_parts(self.KEY, FetchResult(2, ["first", "second"]))
+
+        same = cache_module._cache_append_parts(self.KEY, FetchResult(2, ["other"]), 1)
+        older = cache_module._cache_append_parts(self.KEY, FetchResult(1, ["older"]))
+
+        assert same is older
+        assert (same.version, same.data) == (2, ["first", "second"])
+
+    def test_a_cache_behind_the_request_is_refused(self):
+        cache_module._cache_append_parts(self.KEY, FetchResult(1, ["first"]))
+
+        # Asked for after version 3 but the cache only has version 1.
+        assert cache_module._cache_append_parts(self.KEY, FetchResult(4, ["fourth"]), 3) is None
+        assert cache_module._cache_get(self.KEY).data == ["first"]
 
 
 class TestObjectKey:

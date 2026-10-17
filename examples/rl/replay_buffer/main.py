@@ -1,7 +1,7 @@
 """
 Distributed Replay Buffer using patch_object for efficient data movement.
 
-ReplayBuffer wraps an ObjectRef - collectors patch transitions directly to it,
+ReplayBuffer wraps an ObjectRef - collectors append transitions directly to it,
 avoiding data transfer through the service. The service handles merging and sampling.
 
 Use --local flag for local mode without a Flame cluster.
@@ -11,12 +11,12 @@ from replay_buffer import ReplayBuffer
 
 import flamepy.app as app
 
-DEFAULT_FULL_GET_MERGE_EVERY = 5
+DEFAULT_READ_ALL_PARTS_MERGE_EVERY = 5
 DEFAULT_SAMPLE_PARALLELISM = 2
 
 
 def _resolve_merge_every(
-    force_full_get: bool,
+    read_all_parts: bool,
     requested_merge_every: int | None,
     no_merge: bool,
 ) -> int | None:
@@ -24,7 +24,7 @@ def _resolve_merge_every(
         return None
     if requested_merge_every is not None:
         return requested_merge_every
-    return DEFAULT_FULL_GET_MERGE_EVERY if force_full_get else None
+    return DEFAULT_READ_ALL_PARTS_MERGE_EVERY if read_all_parts else None
 
 
 def _sample_request_sizes(batch_size: int, sample_parallelism: int) -> list[int]:
@@ -49,7 +49,7 @@ def run_distributed(
     batch_size: int = 64,
     merge_every: int | None = None,
     metrics_json: str | None = None,
-    force_full_get: bool = False,
+    read_all_parts: bool = False,
     sample_parallelism: int = DEFAULT_SAMPLE_PARALLELISM,
 ):
     import json
@@ -68,7 +68,7 @@ def run_distributed(
     print(f"  Batch size: {batch_size}")
     print(f"  Sample parallelism: {sample_parallelism}")
     print(f"  Merge every: {merge_every if merge_every else 'disabled'}")
-    print(f"  Force full get: {force_full_get}")
+    print(f"  Read all parts: {read_all_parts}")
     print("\nStarting distributed collection...")
 
     start_time = time.time()
@@ -79,7 +79,7 @@ def run_distributed(
     try:
         from distributed import BufferService, CollectorService
 
-        buffer = ReplayBuffer(force_full_get=force_full_get)
+        buffer = ReplayBuffer(read_all_parts=read_all_parts)
         buffer_service = BufferService.remote()
         collector_service = CollectorService.remote()
 
@@ -171,7 +171,7 @@ def run_distributed(
                         "batch_size": batch_size,
                         "sample_parallelism": sample_parallelism,
                         "merge_every": merge_every,
-                        "force_full_get": force_full_get,
+                        "read_all_parts": read_all_parts,
                     },
                     "summary": {
                         "total_time_secs": elapsed,
@@ -316,24 +316,24 @@ def main():
         type=int,
         default=None,
         help=(
-            "Merge replay-buffer patches every N iterations. "
-            "By default this is 5 for --force-full-get and disabled for incremental reads."
+            "Merge the data appended to the replay buffer every N iterations. "
+            "By default this is 5 for --read-all-parts and disabled for incremental reads."
         ),
     )
     parser.add_argument(
         "--no-merge",
         action="store_true",
-        help="Disable replay-buffer patch merging",
+        help="Disable merging of the replay buffer",
     )
     parser.add_argument(
-        "--force-full-get",
+        "--read-all-parts",
         action="store_true",
-        help="Force replay-buffer reads to request full objects with version 0",
+        help="Make replay-buffer reads request all the data (version 0)",
     )
 
     args = parser.parse_args()
     merge_every = _resolve_merge_every(
-        force_full_get=args.force_full_get,
+        read_all_parts=args.read_all_parts,
         requested_merge_every=args.merge_every,
         no_merge=args.no_merge,
     )
@@ -354,7 +354,7 @@ def main():
             batch_size=args.batch_size,
             merge_every=merge_every,
             metrics_json=args.metrics_json,
-            force_full_get=args.force_full_get,
+            read_all_parts=args.read_all_parts,
             sample_parallelism=args.sample_parallelism,
         )
 

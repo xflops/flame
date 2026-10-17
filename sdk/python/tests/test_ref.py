@@ -16,7 +16,7 @@ def test_ref_subclasses_and_inline_sync_get():
 
     with patch("flamepy.core.cache._call_aio_cache") as remote:
         assert get_object(inline) is None
-        assert get_object(ValueRef(7), lambda value, patches: (value, patches)) == (7, [])
+        assert get_object(ValueRef(7), lambda parts: parts) == [7]
     remote.assert_not_called()
 
 
@@ -24,7 +24,7 @@ def test_ref_subclasses_and_inline_sync_get():
 async def test_inline_aio_get_avoids_remote_cache():
     with patch("flamepy.core.aio.cache._get_client") as client:
         assert await aio_get_object(ValueRef("value")) == "value"
-        assert await aio_get_object(ValueRef(7), lambda value, patches: (value, patches)) == (7, [])
+        assert await aio_get_object(ValueRef(7), lambda parts: parts) == [7]
     client.assert_not_called()
 
 

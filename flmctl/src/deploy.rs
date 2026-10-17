@@ -186,9 +186,10 @@ pub async fn run(ctx: &FlameContext, options: &Options) -> Result<(), FlameError
     let (uploaded_key, package_endpoint) = if plan.dry_run {
         (object_key, plan.cache_endpoint.clone())
     } else {
-        let object_ref = flame::object::upload_object_with_context(
+        let object_ref = flame::object::upload_package(
             ctx,
-            &object_key,
+            &plan.app_name,
+            &plan.prepared.package_filename(&plan.app_name),
             &plan.prepared.package_path,
         )
         .await?;

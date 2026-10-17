@@ -52,9 +52,9 @@ app.destroy()
 - `ReplayBuffer` holds an `ObjectRef` pointing to shared data in Flame cache
 - When pickled as parameter, collectors get the same `ObjectRef`
 - `buffer.push()` calls `patch_object` - writes directly to cache
-- `get_object` returns only new patch batches after the buffer service has a local cache entry
+- `get_object` returns only the newly appended batches after the buffer service has a local cache entry
 - The fixed-size buffer service can run sample requests on different instances
-- Each buffer service instance keeps its own materialized buffer and merges only newly seen patch batches for requests that land on that instance
+- Each buffer service instance keeps its own materialized buffer and merges only newly seen appended batches for requests that land on that instance
 
 ## Usage
 
@@ -84,13 +84,13 @@ uv run main.py --local
 | `--batch-size` | Sample batch size | 64 |
 | `--sample-parallelism` | Distributed sample requests issued per iteration | 2 |
 | `--metrics-json` | Write distributed-mode metrics to a JSON file | Off |
-| `--merge-every` | Override replay-buffer patch merge cadence | Auto |
-| `--no-merge` | Disable patch merging, including forced-full runs | Off |
-| `--force-full-get` | Force replay-buffer reads to request full objects with version 0 | Off |
+| `--merge-every` | Override the replay-buffer merge cadence | Auto |
+| `--no-merge` | Disable merging, including runs that read all parts | Off |
+| `--read-all-parts` | Make replay-buffer reads request all the data (version 0) | Off |
 
 ## Performance Comparison
 
-Run the baseline and incremental cases on the same cluster, code revision, and workload shape. The baseline forces every replay-buffer read to request version `0`, so the cache returns the full base object plus all patches and the example keeps the default merge cadence of every 5 iterations. The incremental case uses the cached nonzero version after the first read, disables merge by default, and each buffer service instance applies only newly seen patch batches to its own local materialized buffer.
+Run the baseline and incremental cases on the same cluster, code revision, and workload shape. The baseline forces every replay-buffer read to request version `0`, so the cache returns all the data parts and the example keeps the default merge cadence of every 5 iterations. The incremental case uses the cached nonzero version after the first read, disables merge by default, and each buffer service instance applies only newly seen appended batches to its own local materialized buffer.
 
 ```shell
 docker compose exec -it flame-console /bin/bash
@@ -98,8 +98,8 @@ cd /opt/examples/rl/replay_buffer
 mkdir -p /tmp/replay-buffer-metrics
 
 uv run main.py \
-  --force-full-get \
-  --metrics-json /tmp/replay-buffer-metrics/full.json \
+  --read-all-parts \
+  --metrics-json /tmp/replay-buffer-metrics/all-parts.json \
   --iterations 50 \
   --collections 20 \
   --steps-per-collection 500 \
@@ -127,7 +127,7 @@ python - <<'PY'
 import json
 import statistics
 
-full = json.load(open("/tmp/replay-buffer-metrics/full.json"))
+all_parts = json.load(open("/tmp/replay-buffer-metrics/all-parts.json"))
 incremental = json.load(open("/tmp/replay-buffer-metrics/incremental.json"))
 
 
@@ -140,7 +140,7 @@ def pct_improvement(old, new):
     return 0.0 if old == 0 else (old - new) / old * 100.0
 
 
-for label, report in [("full", full), ("incremental", incremental)]:
+for label, report in [("all parts", all_parts), ("incremental", incremental)]:
     print(
         f"{label:12} throughput={report['summary']['throughput']:.1f}/s "
         f"median_state={median_metric(report, 'state_secs'):.4f}s "
@@ -149,16 +149,16 @@ for label, report in [("full", full), ("incremental", incremental)]:
 
 print(
     "state improvement: "
-    f"{pct_improvement(median_metric(full, 'state_secs'), median_metric(incremental, 'state_secs')):.1f}%"
+    f"{pct_improvement(median_metric(all_parts, 'state_secs'), median_metric(incremental, 'state_secs')):.1f}%"
 )
 print(
     "sample improvement: "
-    f"{pct_improvement(median_metric(full, 'sample_secs'), median_metric(incremental, 'sample_secs')):.1f}%"
+    f"{pct_improvement(median_metric(all_parts, 'sample_secs'), median_metric(incremental, 'sample_secs')):.1f}%"
 )
 PY
 ```
 
-This default comparison intentionally keeps merge enabled for the forced-full baseline and disabled for incremental reads. Use `--merge-every` only when you want to override that policy.
+This default comparison intentionally keeps merge enabled for the read-all-parts baseline and disabled for incremental reads. Use `--merge-every` only when you want to override that policy.
 
 Use `--sample-parallelism N` when you want the learner to issue `N` replay-buffer sample requests in parallel. Distributed mode lazily imports `distributed.py`, whose top-level declarations initialize the fixed `replay-buffer` application. The buffer service keeps a configuration-independent warmup of two and can autoscale beyond that; the collector service also autoscales. Local mode never imports that module and does not initialize Flame.
 
@@ -168,13 +168,13 @@ Example result from a 500,000-transition run after disabling merge for the incre
 |------|------------|------------|
 | Local baseline | 2.24s | 223,376.4 transitions/sec |
 | Incremental reads | 6.58s | 76,016.1 transitions/sec |
-| Forced full reads | 71.84s | 6,959.5 transitions/sec |
+| Reads of all parts | 71.84s | 6,959.5 transitions/sec |
 
 | Comparison | Runtime | Throughput |
 |------------|---------|------------|
-| Incremental vs forced full | 90.8% lower | 10.9x higher |
+| Incremental vs all parts | 90.8% lower | 10.9x higher |
 | Local vs incremental distributed | 66.0% lower | 2.9x higher |
-| Local vs forced full | 96.9% lower | 32.1x higher |
+| Local vs all parts | 96.9% lower | 32.1x higher |
 
 The local baseline remains faster than incremental distributed reads because it avoids Flame service, scheduler, network, and cache overhead. Exact numbers depend on cluster size, cache placement, and environment stepping cost, so compare runs from the same cluster and workload shape.
 
@@ -193,7 +193,7 @@ Configuration:
   Batch size: 64
   Sample parallelism: 2
   Merge every: disabled
-  Force full get: False
+  Read all parts: False
 
 Starting distributed collection...
 Iteration  0 | Buffer:  10000 | Total added:  10000 | Avg Reward:    21.4

@@ -181,3 +181,20 @@ fn flame_message_encode_errors_are_internal() {
 
     assert!(matches!(err, FlameError::Internal(_)));
 }
+
+#[test]
+fn flame_message_is_made_of_the_newest_object_part() {
+    use flame_rs::__private::bytes::Bytes;
+
+    let parts = vec![
+        Bytes::from_static(br#"{"value":"first"}"#),
+        Bytes::from_static(br#"{"value":"newest"}"#),
+    ];
+    let request = EchoRequest::try_from(parts).unwrap();
+    assert_eq!(request.value, "newest");
+
+    let err = EchoRequest::try_from(Vec::<Bytes>::new()).unwrap_err();
+    assert!(matches!(err, FlameError::NotFound(_)));
+    let err = EchoRequest::try_from(vec![Bytes::from_static(b"{")]).unwrap_err();
+    assert!(matches!(err, FlameError::InvalidConfig(_)));
+}

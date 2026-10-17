@@ -964,7 +964,7 @@ def test_context_returns_deserialized_data(instance, monkeypatch):
 
     monkeypatch.setattr(
         "flamepy.serving.instance.get_object",
-        lambda ref: b"serialized-ctx",
+        lambda ref, deserializer=None: b"serialized-ctx",
     )
     monkeypatch.setattr(
         "flamepy.serving.instance.cloudpickle",
@@ -983,16 +983,16 @@ def test_context_returns_none_when_no_ref(instance):
     assert result is None
 
 
-def test_update_context_serializes_and_updates(instance, monkeypatch):
-    """Test update_context() serializes data and updates cache."""
+def test_patch_context_serializes_and_appends(instance, monkeypatch):
+    """Test patch_context() serializes data and appends it to the cached object."""
     instance._object_ref = DummyObjectRef()
     updated_refs = []
 
-    def mock_update(ref, data):
+    def mock_patch(ref, data):
         updated_refs.append((ref, data))
         return DummyObjectRef(data)
 
-    monkeypatch.setattr("flamepy.serving.instance.update_object", mock_update)
+    monkeypatch.setattr("flamepy.serving.instance.patch_object", mock_patch)
     monkeypatch.setattr(
         "flamepy.serving.instance.cloudpickle",
         types.SimpleNamespace(
@@ -1001,22 +1001,22 @@ def test_update_context_serializes_and_updates(instance, monkeypatch):
         ),
     )
 
-    instance.update_context({"new": "data"})
+    instance.patch_context({"new": "data"})
 
     assert len(updated_refs) == 1
     assert updated_refs[0][1] == b"serialized:{'new': 'data'}"
 
 
-def test_update_context_noop_when_no_ref(instance, monkeypatch):
-    """Test update_context() does nothing when no object_ref."""
+def test_patch_context_noop_when_no_ref(instance, monkeypatch):
+    """Test patch_context() does nothing when no object_ref."""
     instance._object_ref = None
     called = []
 
     monkeypatch.setattr(
-        "flamepy.serving.instance.update_object",
+        "flamepy.serving.instance.patch_object",
         lambda ref, data: called.append(True),
     )
 
-    instance.update_context({"data": 1})
+    instance.patch_context({"data": 1})
 
     assert len(called) == 0

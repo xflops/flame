@@ -249,7 +249,7 @@ Services can read common data from `FlameInstance` when using `#[flame::instance
 | Close a session | `Session::close()` |
 | Define typed payloads | `#[derive(flame_rs::FlameMessage)]` |
 | Define a function service | `#[flame::entrypoint]` and `flame::run(handler)` |
-| Store shared objects | `flame_rs::put_object()`, `get_object()`, `update_object()` |
+| Store shared objects | `flame_rs::put_object()`, `get_object()`, `patch_object()` |
 
 ## Troubleshooting
 

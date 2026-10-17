@@ -19,7 +19,6 @@ from flamepy.core.cache import (
     get_object,
     patch_object,
     put_object,
-    update_object,
 )
 
 __all__ = [
@@ -30,5 +29,4 @@ __all__ = [
     "get_object",
     "patch_object",
     "put_object",
-    "update_object",
 ]

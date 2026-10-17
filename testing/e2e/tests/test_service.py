@@ -103,8 +103,8 @@ def test_invoke_task_with_context():
     session.close()
 
 
-def test_update_context():
-    """Test updating context using the service Session API."""
+def test_patch_context():
+    """Test changing context by appending to it using the service Session API."""
     sys_context = random_string()
 
     session = open_session(FLM_TEST_APP, ctx=TestContext(common_data=sys_context))

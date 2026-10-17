@@ -27,10 +27,8 @@ pub use client::{
 pub use flame_rs_macros::{entrypoint, instance, FlameMessage};
 pub use message::{FlameMessage, FromTaskOutput, IntoCommonData, IntoTaskInput};
 pub use object::{
-    delete_objects, download_object, download_object_with_data_type, get_object, get_object_bytes,
-    patch_object, patch_object_bytes, put_object, put_object_bytes, put_object_bytes_with_context,
-    update_object, update_object_bytes, upload_object, upload_object_with_data_type,
-    ObjectBytePart, ObjectBytes, ObjectFuture, ObjectKey, ObjectRef,
+    delete_objects, get_object, package_key, patch_object, put_object, upload_package,
+    ObjectFuture, ObjectKey, ObjectRef,
 };
 
 #[doc(hidden)]

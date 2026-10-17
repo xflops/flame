@@ -231,12 +231,12 @@ class TestCacheStorage:
         test_file = tmp_path / "myapp-1.0.0.tar.gz"
         test_file.write_bytes(b"package content")
 
-        def mock_upload_object(key, file_path, endpoint=None):
-            assert key == "myapp/pkg/myapp-1.0.0.tar.gz"
+        def mock_upload_package(app_name, file_path, filename=None, endpoint=None):
+            assert (app_name, filename) == ("myapp", "myapp-1.0.0.tar.gz")
             assert endpoint == "grpc://host:9090"
-            return ObjectRef(endpoint="grpc://host:9090", key=key, version=1)
+            return ObjectRef(endpoint="grpc://host:9090", key=f"{app_name}/pkg/{filename}", version=1)
 
-        monkeypatch.setattr("flamepy.core.cache.upload_object", mock_upload_object)
+        monkeypatch.setattr("flamepy.core.cache.upload_package", mock_upload_package)
 
         storage = CacheStorage("grpc://host:9090", app_name="myapp")
         url = storage.upload(str(test_file), "myapp-1.0.0.tar.gz")
@@ -249,11 +249,11 @@ class TestCacheStorage:
         test_file = tmp_path / "myapp-1.0.0.tar.gz"
         test_file.write_bytes(b"package content")
 
-        def mock_upload_object(key, file_path, endpoint=None):
+        def mock_upload_package(app_name, file_path, filename=None, endpoint=None):
             assert endpoint == "grpcs-proxy://gateway.example:443"
-            return ObjectRef(endpoint="grpc://10.0.0.42:9090", key=key, version=1)
+            return ObjectRef(endpoint="grpc://10.0.0.42:9090", key=f"{app_name}/pkg/{filename}", version=1)
 
-        monkeypatch.setattr("flamepy.core.cache.upload_object", mock_upload_object)
+        monkeypatch.setattr("flamepy.core.cache.upload_package", mock_upload_package)
 
         storage = CacheStorage("grpcs-proxy://gateway.example:443", app_name="myapp")
         url = storage.upload(str(test_file), "myapp-1.0.0.tar.gz")
@@ -266,11 +266,11 @@ class TestCacheStorage:
         test_file = tmp_path / "myapp-1.0.0.tar.gz"
         test_file.write_bytes(b"package content")
 
-        def mock_upload_object(key, file_path, endpoint=None):
+        def mock_upload_package(app_name, file_path, filename=None, endpoint=None):
             assert endpoint == "grpcs://cache-service:9090"
-            return ObjectRef(endpoint="grpc+tls://10.0.0.42:9090", key=key, version=1)
+            return ObjectRef(endpoint="grpc+tls://10.0.0.42:9090", key=f"{app_name}/pkg/{filename}", version=1)
 
-        monkeypatch.setattr("flamepy.core.cache.upload_object", mock_upload_object)
+        monkeypatch.setattr("flamepy.core.cache.upload_package", mock_upload_package)
 
         storage = CacheStorage("grpcs://cache-service:9090", app_name="myapp")
         url = storage.upload(str(test_file), "myapp-1.0.0.tar.gz")
@@ -280,12 +280,13 @@ class TestCacheStorage:
     def test_download(self, monkeypatch, tmp_path):
         dest_file = tmp_path / "downloaded.tar.gz"
 
-        def mock_download_object(ref, dest_path):
-            assert ref.key == "myapp/pkg/myapp-1.0.0.tar.gz"
+        def mock_download_package(app_name, filename, dest_path, endpoint=None):
+            assert (app_name, filename) == ("myapp", "myapp-1.0.0.tar.gz")
+            assert endpoint == "grpc://host:9090"
             with open(dest_path, "wb") as f:
                 f.write(b"downloaded content")
 
-        monkeypatch.setattr("flamepy.core.cache.download_object", mock_download_object)
+        monkeypatch.setattr("flamepy.core.cache.download_package", mock_download_package)
 
         storage = CacheStorage("grpc://host:9090", app_name="myapp")
         storage.download("myapp-1.0.0.tar.gz", str(dest_file))
@@ -296,11 +297,12 @@ class TestCacheStorage:
     def test_delete(self, monkeypatch):
         deleted_key = None
 
-        def mock_delete_objects(key):
+        def mock_delete_package(app_name, filename, endpoint=None):
             nonlocal deleted_key
-            deleted_key = key
+            deleted_key = f"{app_name}/pkg/{filename}"
+            assert endpoint == "grpc://host:9090"
 
-        monkeypatch.setattr("flamepy.core.cache.delete_objects", mock_delete_objects)
+        monkeypatch.setattr("flamepy.core.cache.delete_package", mock_delete_package)
 
         storage = CacheStorage("grpc://host:9090", app_name="myapp")
         storage.delete("myapp-1.0.0.tar.gz")

@@ -4,19 +4,20 @@ Object cache service for Flame distributed system.
 
 ## Overview
 
-The `flame-object-cache` is a standalone service that stores opaque client-encoded bytes. It uses a streaming gRPC API, keeps hot payloads in memory, and persists them as binary files. Clients choose their own value encoding, including Arrow IPC for table values, and provide a data type such as `raw.zstd` when they compress the bytes.
+The `flame-object-cache` is a standalone service that stores opaque client-encoded bytes. It uses a streaming gRPC API end to end: payloads are written to and read from storage in chunks and are never held in memory in one piece. The open files of recently used objects of a persistent store are kept in memory; `storage: none` has no store at all, only the in-memory cache. Clients choose their own value encoding, including Arrow IPC for table values, and provide a data type such as `raw.zstd` when they compress the bytes.
 
 ## Features
 
 - **Standalone Service**: Runs as a dedicated process/container for centralized caching
-- **Version Tracking**: Each object has a version number, incremented on mutations
+- **Version Tracking**: The version of an object is its number of data parts: 1 when created, incremented by each append
 - **Conditional Get**: Clients can check if their cached copy is still valid (RFE426)
 - **Client-Side Caching**: Python SDK caches objects locally, reducing network round-trips
-- **Persistent Storage**: Opaque objects and patches are stored in binary files
-- **Streaming gRPC API**: Chunked transfer without server-side value encoding
+- **Persistent Storage**: An object is a directory of `metadata.json`, `index.bin` and `data.bin` files, or with `storage: none` not at all (the in-memory cache is then the only copy, and nothing survives a restart)
+- **Streaming gRPC API**: Chunked transfer without server-side value encoding; memory per write is one chunk, and a read holds one chunk at a time
+- **Metadata-Only Startup**: Startup scans object metadata; payloads are never loaded at startup
 - **Client-Side Compression**: The Python SDK compresses structured data and tensors; the cache stores their bytes unchanged
-- **Delta Support**: Append-only patches without rewriting the base object
-- **Eviction Policies**: LRU eviction with configurable memory limits
+- **Create-Only Objects**: An object is created once and then only grows by appended data, like the layers of an overlay filesystem; it is never replaced
+- **Eviction Policies**: LRU eviction with `max_memory` and `max_objects` limits for the resident (in-memory) data. With a disk store the resident data is only the handle of an object, its key, data type, number of parts and open `index.bin` and `data.bin`, so reads need no open or close and never hold payload or index bytes: a read seeks to the part's fixed-size record in `index.bin`, then to its payload in `data.bin`. Data is appended through the same handle, so the handle stays valid; an evicted handle is opened again. Under `storage: none` there is no store to read back from: every object is resident with all its parts whatever its size, eviction applies, and an evicted object is lost. A `none` cache cannot stream objects larger than memory, because a write is assembled in memory (bounded by `max_memory`)
 
 ## Configuration
 
@@ -53,6 +54,14 @@ address: a bare `host` or `host:port` takes the missing scheme and port from
 
 Stale application-data garbage collection is always enabled. The `gc` section
 only overrides its 60-second default interval.
+
+Disk reads and writes use positional file I/O on blocking threads. An object is
+created in a temporary directory, synced and renamed into place, so an aborted
+or failed upload leaves nothing behind. An append adds its payload to
+`data.bin` and is committed by its record in `index.bin`. A `Get` holds the object's
+read lock until its response ends, so a slow client delays writers and
+deleters of that object: put, patch and delete take the object's write lock,
+and a delete of a prefix takes the lock of every object it matches.
 
 Disk storage removes empty session and application directories after deletion.
 Startup recovery also removes empty directories left by earlier versions.
@@ -143,25 +152,23 @@ print(f"Stored at: {ref.key}, version: {ref.version}")
 # of payload size; their data type gains a .zstd suffix. Arbitrary pickled
 # objects and raw file uploads, including .tar.gz packages, remain uncompressed.
 
-# Get an object (uses client-side cache if version matches)
+# Get an object (uses client-side cache if version matches). The value is the
+# newest data part, so an object with appended data returns the newest.
 data = get_object(ref)
 
 # Force fresh fetch (bypass cache)
 ref.version = 0
 fresh_data = get_object(ref)
 
-# Update replaces the object (increments version)
-new_ref = update_object(ref, new_data)
-print(f"New version: {new_ref.version}")  # version=2
-
-# Patch appends delta without replacing base
+# Patch appends data to the object
 patched_ref = patch_object(ref, delta_data)
 
-# Get with custom deserializer to combine base + deltas
-def merge_lists(base, deltas):
-    result = base.copy()
-    for delta in deltas:
-        result.extend(delta)
+# Get with a deserializer that makes a value of all the data parts, in the
+# order they were written (the first is the data the object was created with)
+def merge_lists(parts):
+    result = []
+    for part in parts:
+        result.extend(part)
     return result
 
 merged = get_object(ref, deserializer=merge_lists)
@@ -171,10 +178,9 @@ merged = get_object(ref, deserializer=merge_lists)
 
 Objects have version numbers that enable efficient client-side caching:
 
-1. **PUT**: Creates object with `version=1`
-2. **UPDATE**: Replaces object, increments version
-3. **PATCH**: Appends delta, increments version
-4. **GET**: Conditional get - returns `not_modified` if client has current version
+1. **PUT**: Creates object with `version=1`; an existing key is an error
+2. **PATCH**: Appends data, increments version
+3. **GET**: Get the data after a version: nothing if the client has the current version
 
 Client-side caching workflow:
 ```
@@ -184,7 +190,7 @@ Client                              Server
   |<-- [header, bytes] ---------------|  (client caches object, version=1)
   |                                    |
   |-- Get(key, version=1) ------------>|  (client has version 1)
-  |<-- [NOT_MODIFIED header] ----------|  (no payload transfer)
+  |<-- [header] -----------------------|  (no data: nothing after version 1)
 ```
 
 ## Storage Structure
@@ -193,18 +199,30 @@ Client                              Server
 /var/lib/flame/cache/
 └── app_name/
     └── session_id/
-        ├── object1.bin          # Opaque base payload with cache header
-        ├── object1.deltas/
-        │   ├── 0.bin            # Opaque patch
-        │   └── 1.bin            # Opaque patch
-        └── object2.bin          # Another opaque base payload
+        └── object1/
+            ├── metadata.json   # data type, shared by all the parts
+            ├── index.bin       # one 24-byte record per part: offset, length, creation time
+            └── data.bin        # payloads of the parts, concatenated, append-only
 ```
 
-Opaque payloads are stored directly in binary files with a small cache header
-for version, creation time, and client-provided data type. All patches have
-the same type as the base. Clients encode Arrow tables to bytes and optionally
-compress them before uploading. The cache does not decompress hot or persisted
-objects.
+An object is a list of data parts, like the layers of an overlay filesystem: they
+are all alike, and the first is the one written when the object was created. The
+version of a part is its index + 1, so no version is stored. The index gives each payload's offset and length
+in `data.bin`, so a payload is read with one positional read. An append is two writes: its payload to `data.bin`, then its fixed-size record to
+`index.bin`, which commits it. Payload bytes without a record, left by an
+interrupted append, are ignored, and a partial record is cut off when the object
+is opened.
+All the parts have the same data type, kept once in `metadata.json`. Clients encode
+Arrow tables to bytes and optionally compress them before uploading. The cache
+does not decompress hot or persisted objects.
+
+Storage is accessed through a streaming interface (`write_stream`, `read_range`,
+`open`, `stat`, `scan`, `patch_object`). `DiskStorage` implements it on files and
+`ResidentStorage` decorates an engine with a cache of open object handles.
+`storage::connect(url, eviction)` builds the stack from the storage url: a path
+gives a `ResidentStorage` over `DiskStorage`. For `storage: none` the engine is
+`NoStorage`, which discards writes, so `ResidentStorage` alone holds the objects
+(cache only).
 
 ## API
 
@@ -212,39 +230,46 @@ The cache server implements `ObjectCacheService` in `cache.proto`:
 
 | Operation | Description |
 |-----------|-------------|
-| `Put` | Stream a new or replacement object; return its metadata |
+| `Put` | Stream a new object; return its metadata |
 | `Patch` | Stream a delta for an existing object; return updated metadata |
-| `Get` | Stream a full object, later patches, or a not-modified header |
+| `Get` | Stream an object's data after a version: all of it for 0 |
 | `GetMetadata` | Get metadata for one object |
 | `List` | Stream metadata for all objects |
 | `Delete` | Delete a key or prefix, including `{app}/*` |
 
 ### Wire Protocol Details
 
-**Conditional GET (`Get`)**:
-- Request: full key and `client_version`
-- If `client_version == 0`: Always returns full object (force refresh)
-- If `client_version == server_version`: Returns `NOT_MODIFIED` without payload chunks
-- If a contiguous patch suffix is available: Returns only later patches
-- Otherwise: Returns the base object and all patches
-- Chunks for one base or patch share a kind and version. A new part or the end
-  of the stream completes that part. Empty parts have one empty chunk.
-- The response header carries the shared data type for the base and patches.
+**GET (`Get`)**:
+- Request: full key and `version`
+- If `version == 0`: Returns all the data of the object (force refresh)
+- If `0 < version < server_version`: Returns only the data after `version`
+- If `version == server_version`: Returns the header only, no chunks
+- If `version` is ahead of the server's: Fails with `INVALID_ARGUMENT` (invalid version): the client has another object of the same key, which it must discard and get again from version 0
+- The header carries the current version and the data type shared by all data.
+- A chunk carries the version of the data it belongs to: its position in the
+  object, starting at 1. A client tells data from the start (version 1) from later
+  data by the version of the first chunk. A new version or the end of the stream completes
+  a part. Empty parts have one empty chunk.
 - The Python SDK interprets types such as `arrow.table.zstd` and decompresses
-  each base or patch before decoding its value. Other clients receive the type
-  and bytes unchanged. The cache does not parse the type.
+  each part before decoding its value. Other clients receive the type and bytes
+  unchanged. The cache does not parse the type.
 
-**PUT/UPDATE (`Put`)**:
+**PUT (`Put`)**:
 - Starts with a key or prefix and client-provided data type, followed by
   byte chunks of at most 1 MiB
 - New objects are created with `version=1`
-- Existing objects are overwritten (version incremented server-side)
+- An existing object is not replaced: the request fails with `AlreadyExist`
 
 **PATCH (`Patch`)**:
-- Starts with a full object key and the same data type as the base, followed
+- Starts with a full object key and the same data type as the object, followed
   by byte chunks
-- Appends delta to existing object, increments version
-- Returns error if base object doesn't exist
+- Appends the data to the object, increments version
+- Returns an error if the object doesn't exist
+
+**gRPC server settings**: the server uses 16 MiB HTTP/2 stream windows and a
+64 MiB connection window (the 64 KiB default caps the upload rate of one stream
+at about window / round-trip time) and enables TCP no-delay. Chunks stay at
+1 MiB.
 
 ## Building
 
@@ -264,9 +289,8 @@ Run the opt-in microbenchmarks with optimized code and one test thread:
 cargo test -p flame-object-cache --release cache_benchmarks -- --ignored --nocapture --test-threads=1
 ```
 
-The opaque-object benchmark compares copying an 8 MiB payload with sharing its
-cached snapshot. The disk benchmarks measure 8 MiB opaque writes and object reloads, plus
-sequential 1 KiB patch appends. Reloads bypass the in-memory object cache but
+The disk benchmarks measure 8 MiB opaque writes and object reloads, plus
+sequential 1 KiB appends. Reloads bypass the resident cache but
 may be served by the operating system's page cache; these timings are not
 physical cold-disk measurements.
 

@@ -23,7 +23,7 @@ from fastapi import FastAPI
 from fastapi import Request as FastAPIRequest
 from fastapi import Response as FastAPIResponse
 
-from flamepy.core import ObjectRef, get_object, update_object
+from flamepy.core import ObjectRef, get_object, patch_object
 from flamepy.core.service import (
     FLAME_INSTANCE_ENDPOINT,
     FlameService,
@@ -47,6 +47,7 @@ class Instance(FlameService):
         """Get the current agent context.
 
         For service module: use stored ObjectRef to get from cache, then deserialize.
+        The context is the newest data part of the object.
         """
         if self._object_ref is None:
             return None
@@ -56,11 +57,14 @@ class Instance(FlameService):
         # Deserialize using cloudpickle
         return cloudpickle.loads(serialized_ctx)
 
-    def update_context(self, data: Any):
-        """Update the agent context.
+    def patch_context(self, data: Any):
+        """Change the agent context by appending data to its cached object.
+
+        The newest part is the context, so `context()` returns `data` afterwards.
+        An object holds a limited number of parts.
 
         Note: SessionContext no longer supports updating common_data directly.
-        This method updates the ObjectRef in cache, but the update won't be reflected
+        This method appends to the object of the ObjectRef in cache, but the change won't be reflected
         in SessionContext until the session is recreated. For persistent updates,
         recreate the session with new common_data on the client side.
         """
@@ -70,8 +74,8 @@ class Instance(FlameService):
         # Serialize the data using cloudpickle
         serialized_data = cloudpickle.dumps(data, protocol=cloudpickle.DEFAULT_PROTOCOL)
 
-        # Update existing ObjectRef with latest version in cache
-        self._object_ref = update_object(self._object_ref, serialized_data)
+        # Append to the object; the ObjectRef gets the new version
+        self._object_ref = patch_object(self._object_ref, serialized_data)
 
     def entrypoint(self, func):
         logger = logging.getLogger(__name__)

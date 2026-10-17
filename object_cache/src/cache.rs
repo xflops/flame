@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use bytesize::ByteSize;
 use common::net::host_for_uri;
+use futures::stream::BoxStream;
 use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 use regex::Regex;
 use stdng::{async_rw_ptr, lock_ptr, new_ptr, write_async, AsyncRWPtr, MutexPtr};
@@ -27,15 +28,25 @@ use url::Url;
 use common::ctx::{FlameCache, FlameCluster};
 use common::FlameError;
 
-use crate::eviction::{new_policy, EvictionConfig, EvictionPolicyPtr};
+use crate::eviction::EvictionConfig;
 use crate::gc::ApplicationGarbageCollector;
+use crate::storage::{ObjectStat, StorageEnginePtr};
 
 mod grpc;
+mod response;
+
+/// Chunks of a write, after its header.
+type ChunkStream = BoxStream<'static, Result<Bytes, FlameError>>;
+
+/// A write request: what the header names, and the data chunks that follow it.
+struct WriteRequest {
+    key: ObjectKey,
+    data_type: String,
+    chunks: ChunkStream,
+}
+
 use grpc::GrpcCacheServer;
 use rpc::flame::v1::object_cache_service_server::ObjectCacheServiceServer;
-
-/// Default batch size for eviction operations
-const EVICTION_BATCH_SIZE: usize = 10;
 
 /// Wildcard session identifier for matching all sessions of an application
 pub const WILDCARD_SESSION: &str = "*";
@@ -207,87 +218,118 @@ fn current_time_millis() -> i64 {
     i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
-/// Object with optional delta support. Payload interpretation belongs to clients.
+/// An object is a list of `ObjectData` in the order it was written, like the
+/// layers of an overlay filesystem: the first is written when the object is
+/// created and every later one appends to it. All of them are alike; the
+/// version of an object is its number of `ObjectData`. They share the object's
+/// data type. Payload interpretation belongs to clients.
+///
+/// `version` says which parts of the object `data` holds: 0 (the default) is all
+/// of them; above 0, `data` is only what was written after that version.
 #[derive(Debug, Clone)]
 pub struct Object {
     pub version: u64,
-    pub creation_time: i64,
-    pub data: Bytes,
     pub data_type: String,
-    pub deltas: Vec<Object>,
+    pub data: Vec<ObjectData>,
 }
 
 impl Object {
-    /// Create a new Object with no deltas.
-    #[allow(dead_code)] // Raw constructor remains available to internal callers and tests.
-    pub fn new(version: u64, data: impl Into<Bytes>) -> Self {
-        Self::new_at(version, data, current_time_millis())
-    }
-
-    pub fn new_typed(version: u64, data: impl Into<Bytes>, data_type: impl Into<String>) -> Self {
-        Self::new_typed_at(version, data, data_type, current_time_millis())
-    }
-
-    #[allow(dead_code)] // Used by storage tests to set a deterministic creation time.
-    pub(crate) fn new_at(version: u64, data: impl Into<Bytes>, creation_time: i64) -> Self {
-        Self::new_typed_at(version, data, "raw", creation_time)
-    }
-
-    pub(crate) fn new_typed_at(
-        version: u64,
-        data: impl Into<Bytes>,
-        data_type: impl Into<String>,
-        creation_time: i64,
-    ) -> Self {
+    /// Create a default Object: version 0 (all the parts) with the raw data
+    /// type and no data yet. Add data with `append_data`.
+    pub fn new() -> Self {
         Self {
-            version,
-            creation_time,
-            data: data.into(),
-            data_type: data_type.into(),
-            deltas: Vec::new(),
-        }
-    }
-
-    /// Create a new Object with deltas.
-    #[cfg(test)]
-    pub fn with_deltas(version: u64, data: Vec<u8>, deltas: Vec<Object>) -> Self {
-        Self {
-            version,
-            creation_time: current_time_millis(),
-            data: data.into(),
+            version: 0,
             data_type: "raw".to_string(),
-            deltas,
+            data: Vec::new(),
         }
     }
 
-    pub(crate) fn with_data_at(
-        version: u64,
-        data: Bytes,
-        data_type: String,
-        deltas: Vec<Object>,
-        creation_time: i64,
-    ) -> Self {
-        Self {
-            version,
-            creation_time,
-            data,
-            data_type,
-            deltas,
-        }
+    /// Append an `ObjectData` after the existing ones. Bytes convert into an
+    /// `ObjectData` created now.
+    pub fn append_data(mut self, data: impl Into<ObjectData>) -> Self {
+        self.data.push(data.into());
+        self
     }
 
+    /// Set the data type.
+    pub fn with_data_type(mut self, data_type: impl Into<String>) -> Self {
+        self.data_type = data_type.into();
+        self
+    }
+
+    #[cfg(test)]
     pub fn opaque_data(&self) -> Result<&[u8], FlameError> {
-        Ok(&self.data)
+        Ok(&self.data[0].data)
     }
 
+    #[cfg(test)]
+    /// The version of the object: the parts before `data`, and those in it, one
+    /// version each.
     pub fn current_version(&self) -> u64 {
-        self.deltas
-            .iter()
-            .fold(self.version, |current, delta| current.max(delta.version))
+        self.version + self.data.len() as u64
+    }
+
+    /// The part of this object after `version`: all of it for 0, else the parts
+    /// after that version. None if `version` is outside what this
+    /// object holds.
+    #[cfg(test)]
+    pub fn since(&self, version: u64) -> Option<Object> {
+        let skip = version.checked_sub(self.version)? as usize;
+        Some(Object {
+            version,
+            data_type: self.data_type.clone(),
+            data: self.data.get(skip..)?.to_vec(),
+        })
     }
 
     pub fn size_bytes(&self) -> u64 {
-        self.data.len() as u64 + self.deltas.iter().map(Object::size_bytes).sum::<u64>()
+        self.data.iter().map(ObjectData::size_bytes).sum()
+    }
+}
+
+/// One piece of an object's data, written at one time. It has no data type of
+/// its own: the type belongs to the object.
+#[derive(Debug, Clone)]
+pub struct ObjectData {
+    pub creation_time: i64,
+    pub data: Bytes,
+}
+
+impl From<Vec<u8>> for ObjectData {
+    fn from(data: Vec<u8>) -> Self {
+        Self::new().with_data(data)
+    }
+}
+
+impl From<Bytes> for ObjectData {
+    fn from(data: Bytes) -> Self {
+        Self::new().with_data(data)
+    }
+}
+
+impl ObjectData {
+    /// Create default data: no bytes, created now.
+    pub fn new() -> Self {
+        Self {
+            creation_time: current_time_millis(),
+            data: Bytes::new(),
+        }
+    }
+
+    /// Set the creation time.
+    pub fn with_creation_time(mut self, creation_time: i64) -> Self {
+        self.creation_time = creation_time;
+        self
+    }
+
+    /// Set the data.
+    pub fn with_data(mut self, data: impl Into<Bytes>) -> Self {
+        self.data = data.into();
+        self
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.data.len() as u64
     }
 }
 
@@ -297,9 +339,59 @@ pub struct ObjectMetadata {
     pub key: String,
     pub version: u64,
     pub size: u64,
-    pub delta_count: u64,
     pub creation_time: i64,
     pub data_type: String,
+}
+
+impl ObjectMetadata {
+    /// Metadata with default values: empty endpoint and key, version 0, empty
+    /// payload, created now, and a "raw" data type.
+    pub(crate) fn new() -> Self {
+        Self {
+            endpoint: String::new(),
+            key: String::new(),
+            version: 0,
+            size: 0,
+            creation_time: current_time_millis(),
+            data_type: "raw".to_string(),
+        }
+    }
+
+    pub(crate) fn with_endpoint(self, endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            ..self
+        }
+    }
+
+    pub(crate) fn with_key(self, key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            ..self
+        }
+    }
+
+    pub(crate) fn with_version(self, version: u64) -> Self {
+        Self { version, ..self }
+    }
+
+    pub(crate) fn with_size(self, size: u64) -> Self {
+        Self { size, ..self }
+    }
+
+    pub(crate) fn with_creation_time(self, creation_time: i64) -> Self {
+        Self {
+            creation_time,
+            ..self
+        }
+    }
+
+    pub(crate) fn with_data_type(self, data_type: impl Into<String>) -> Self {
+        Self {
+            data_type: data_type.into(),
+            ..self
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -349,53 +441,34 @@ impl TryFrom<&String> for CacheEndpoint {
 }
 
 pub struct ObjectCache {
+    /// Address placed in the references returned to clients.
     endpoint: CacheEndpoint,
-    storage: crate::storage::StorageEnginePtr,
-    objects: MutexPtr<HashMap<String, Arc<Object>>>,
+    storage: StorageEnginePtr,
     metadata: MutexPtr<HashMap<String, ObjectMetadata>>,
-    eviction_policy: EvictionPolicyPtr,
     /// Per-key locks coordinate concurrent PUT/PATCH writes with GET snapshots.
     key_locks: MutexPtr<HashMap<String, AsyncRWPtr<()>>>,
 }
 
 impl ObjectCache {
-    fn new(
-        endpoint: CacheEndpoint,
-        storage: crate::storage::StorageEnginePtr,
-        eviction_config: Option<&EvictionConfig>,
-    ) -> Result<Self, FlameError> {
-        let eviction_policy = new_policy(eviction_config);
-
+    fn new(endpoint: CacheEndpoint, storage: StorageEnginePtr) -> Result<Self, FlameError> {
         Ok(Self {
             endpoint,
             storage,
-            objects: new_ptr(HashMap::new()),
             metadata: new_ptr(HashMap::new()),
-            eviction_policy,
             key_locks: new_ptr(HashMap::new()),
         })
     }
 
+    /// Load object metadata only; objects become resident on demand.
     async fn load_from_storage(&self) -> Result<(), FlameError> {
-        let items = self.storage.load_objects().await?;
+        let items = self.storage.scan().await?;
 
-        let mut objects = lock_ptr!(self.objects)?;
         let mut metadata = lock_ptr!(self.metadata)?;
-
-        for (key, object) in items {
-            let key_str = key.to_key().expect("loaded key must have object_id");
-            let size = object.size_bytes();
-            let meta = self.create_metadata(key_str.clone(), &object);
-
-            objects.insert(key_str.clone(), Arc::new(object));
-            metadata.insert(key_str.clone(), meta);
-
-            self.eviction_policy.on_add(&key_str, size);
+        for (key, stat) in items {
+            let key_str = key.to_key().expect("scanned key must have object_id");
+            let meta = self.stat_metadata(key_str.clone(), &stat);
+            metadata.insert(key_str, meta);
         }
-
-        drop(objects);
-        drop(metadata);
-        self.run_eviction()?;
 
         Ok(())
     }
@@ -408,47 +481,39 @@ impl ObjectCache {
             .clone())
     }
 
-    fn create_metadata(&self, key: String, object: &Object) -> ObjectMetadata {
-        ObjectMetadata {
-            endpoint: self.endpoint.to_uri(),
-            key,
-            version: object.current_version(),
-            size: object.size_bytes(),
-            delta_count: object.deltas.len() as u64,
-            creation_time: object.creation_time,
-            data_type: object.data_type.clone(),
-        }
+    fn stat_metadata(&self, key: String, stat: &ObjectStat) -> ObjectMetadata {
+        ObjectMetadata::new()
+            .with_endpoint(self.endpoint.to_uri())
+            .with_key(key)
+            .with_version(stat.version())
+            .with_size(stat.size())
+            .with_creation_time(stat.creation_time())
+            .with_data_type(stat.data_type.clone())
     }
 
-    fn resident_version(&self, key: &str) -> Result<Option<u64>, FlameError> {
-        let objects = lock_ptr!(self.objects)?;
-        if !objects.contains_key(key) {
-            return Ok(None);
-        }
+    fn metadata_of(&self, key: &str) -> Result<Option<ObjectMetadata>, FlameError> {
         let metadata = lock_ptr!(self.metadata)?;
-        Ok(metadata.get(key).map(|meta| meta.version))
+        Ok(metadata.get(key).cloned())
     }
 
-    fn run_eviction(&self) -> Result<(), FlameError> {
-        loop {
-            let keys_to_evict = self.eviction_policy.victims(EVICTION_BATCH_SIZE);
-            if keys_to_evict.is_empty() {
-                break;
-            }
-
-            let mut objects = lock_ptr!(self.objects)?;
-            for key in keys_to_evict {
-                if objects.contains_key(&key) {
-                    objects.remove(&key);
-                    self.eviction_policy.on_evict(&key);
-                    tracing::debug!("Evicted object from memory: {}", key);
-                }
-            }
-        }
-        Ok(())
-    }
-
+    #[cfg(test)]
     async fn put(&self, key: ObjectKey, object: Object) -> Result<ObjectMetadata, FlameError> {
+        let chunks = futures::stream::once(futures::future::ready(Ok(object.data[0].data.clone())));
+        self.put_stream(WriteRequest {
+            key,
+            data_type: object.data_type,
+            chunks: Box::pin(chunks),
+        })
+        .await
+    }
+
+    /// Store an object from the chunks of a write request. Memory use is one chunk.
+    async fn put_stream(&self, request: WriteRequest) -> Result<ObjectMetadata, FlameError> {
+        let WriteRequest {
+            key,
+            data_type,
+            chunks,
+        } = request;
         let key = match key.object_id {
             Some(_) => key,
             None => key.with_generated_id(),
@@ -462,90 +527,54 @@ impl ObjectCache {
         let key_lock = self.get_key_lock(&key_str)?;
         let _guard = write_async!(key_lock);
 
-        let version_from_memory = {
+        // Objects are created once and then only appended to, never replaced.
+        let exists = {
             let metadata = lock_ptr!(self.metadata)?;
-            metadata.get(&key_str).map(|m| m.version)
-        };
+            metadata.contains_key(&key_str)
+        } || self.storage.stat(&key).await?.is_some();
+        if exists {
+            return Err(FlameError::AlreadyExist(format!(
+                "object <{}> already exists",
+                key_str
+            )));
+        }
 
-        let current_version = match version_from_memory {
-            Some(v) => v,
-            None => self
-                .storage
-                .read_object(&key)
-                .await?
-                .map(|obj| obj.current_version())
-                .unwrap_or(0),
-        };
-        let new_version = current_version + 1;
-
-        let creation_time = current_time_millis();
-        let versioned_object =
-            Object::new_typed_at(new_version, object.data, object.data_type, creation_time);
-        let size = versioned_object.size_bytes();
-
-        self.storage.write_object(&key, &versioned_object).await?;
-
-        let meta = self.create_metadata(key_str.clone(), &versioned_object);
-
+        let meta = ObjectMetadata::new()
+            .with_key(key_str.clone())
+            .with_version(1)
+            .with_data_type(data_type);
+        let meta = self
+            .storage
+            .write_stream(&key, meta, Box::pin(chunks))
+            .await?
+            .with_endpoint(self.endpoint.to_uri());
         {
-            let mut objects = lock_ptr!(self.objects)?;
             let mut metadata = lock_ptr!(self.metadata)?;
-
-            objects.insert(key_str.clone(), Arc::new(versioned_object));
             metadata.insert(key_str.clone(), meta.clone());
         }
 
-        self.eviction_policy.on_add(&key_str, size);
-        self.run_eviction()?;
-
-        tracing::debug!("Object put: {} (version={})", key_str, new_version);
+        tracing::debug!("Object put: {}", key_str);
 
         Ok(meta)
     }
 
+    #[cfg(test)]
     async fn get(&self, key: &ObjectKey) -> Result<Arc<Object>, FlameError> {
-        let key_str = key.to_key().ok_or_else(|| {
-            FlameError::InvalidConfig("ObjectKey requires object_id for get".to_string())
-        })?;
-
-        self.eviction_policy.on_access(&key_str);
-
-        {
-            let objects = lock_ptr!(self.objects)?;
-            if let Some(object) = objects.get(&key_str) {
-                tracing::debug!("Object get from memory: {}", key_str);
-                return Ok(object.clone());
-            }
-        }
-
-        if let Some(object) = self.storage.read_object(key).await? {
-            let size = object.size_bytes();
-            let object = Arc::new(object);
-
-            {
-                let mut objects = lock_ptr!(self.objects)?;
-                let mut metadata = lock_ptr!(self.metadata)?;
-
-                objects.insert(key_str.clone(), Arc::clone(&object));
-
-                let meta = self.create_metadata(key_str.clone(), &object);
-                metadata.insert(key_str.clone(), meta);
-            }
-
-            self.eviction_policy.on_add(&key_str, size);
-            self.run_eviction()?;
-
-            tracing::debug!("Object loaded from storage: {}", key_str);
-            return Ok(object);
-        }
-
-        Err(FlameError::NotFound(format!(
-            "object <{}> not found",
-            key_str
-        )))
+        self.get_since(key, 0).await
     }
 
-    async fn patch(&self, key: &ObjectKey, delta: Object) -> Result<ObjectMetadata, FlameError> {
+    /// Get an object after `version`: all the parts for 0, else only the parts
+    /// after that version, like a `Get` request with a version.
+    #[cfg(test)]
+    async fn get_since(&self, key: &ObjectKey, version: u64) -> Result<Arc<Object>, FlameError> {
+        self.storage
+            .read_object(key, version)
+            .await?
+            .map(Arc::new)
+            .ok_or_else(|| FlameError::NotFound(format!("object <{:?}> not found", key.to_key())))
+    }
+
+    async fn patch(&self, key: &ObjectKey, appended: Object) -> Result<ObjectMetadata, FlameError> {
         let key_str = key.to_key().ok_or_else(|| {
             FlameError::InvalidConfig("ObjectKey requires object_id for patch".to_string())
         })?;
@@ -554,63 +583,40 @@ impl ObjectCache {
         let key_lock = self.get_key_lock(&key_str)?;
         let _guard = write_async!(key_lock);
 
-        let current_object = {
-            let objects = lock_ptr!(self.objects)?;
-            objects.get(&key_str).cloned()
-        };
-
-        let current_object = match current_object {
-            Some(object) => object,
-            None => Arc::new(self.storage.read_object(key).await?.ok_or_else(|| {
-                FlameError::NotFound(format!("object <{}> not found for patch", key_str))
-            })?),
-        };
-        if delta.data_type != current_object.data_type {
+        let stat = self.storage.stat(key).await?.ok_or_else(|| {
+            FlameError::NotFound(format!("object <{}> not found for patch", key_str))
+        })?;
+        if appended.data_type != stat.data_type {
             return Err(FlameError::InvalidConfig(format!(
                 "Patch data type '{}' does not match object data type '{}'",
-                delta.data_type, current_object.data_type
+                appended.data_type, stat.data_type
             )));
         }
-        let current_version = current_object.current_version();
-        let creation_time = current_object.creation_time;
-        let new_version = current_version + 1;
+        let new_version = stat.version() + 1;
 
-        let versioned_delta = Object::new_typed(new_version, delta.data, delta.data_type);
-        let mut meta = self.storage.patch_object(key, &versioned_delta).await?;
+        let part = ObjectData::new().with_data(appended.data[0].data.clone());
+        // The engine's returned metadata is not used: the cache owns every field.
+        self.storage.patch_object(key, &part).await?;
 
-        let mut patched_object = (*current_object).clone();
-        patched_object.deltas.push(versioned_delta);
-        let size = patched_object.size_bytes();
-
-        meta.endpoint = self.endpoint.to_uri();
-        meta.version = new_version;
-        meta.size = size;
-        meta.delta_count = patched_object.deltas.len() as u64;
-        meta.creation_time = creation_time;
-        meta.data_type = patched_object.data_type.clone();
+        let meta = self
+            .stat_metadata(key_str.clone(), &stat)
+            .with_version(new_version)
+            .with_size(stat.size() + part.size_bytes());
 
         {
-            let mut objects = lock_ptr!(self.objects)?;
             let mut metadata = lock_ptr!(self.metadata)?;
-
-            objects.insert(key_str.clone(), Arc::new(patched_object));
             metadata.insert(key_str.clone(), meta.clone());
         }
 
-        self.eviction_policy.on_update(&key_str, size);
-        self.run_eviction()?;
-
-        tracing::debug!(
-            "Object patch: {} (version={}, delta_count={})",
-            key_str,
-            new_version,
-            meta.delta_count
-        );
+        tracing::debug!("Object patch: {} (version={})", key_str, new_version);
         Ok(meta)
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), FlameError> {
-        let keys_to_remove: Vec<String> = {
+        // Wait for the readers and writers of every object it deletes, like a
+        // put or a patch: a `Get` holds the read lock until its response ends.
+        // The locks are taken in key order, so two deletes cannot deadlock.
+        let mut keys: Vec<String> = {
             let metadata = lock_ptr!(self.metadata)?;
             metadata
                 .keys()
@@ -618,19 +624,21 @@ impl ObjectCache {
                 .cloned()
                 .collect()
         };
+        keys.sort();
+        let mut locks = Vec::with_capacity(keys.len());
+        for key_str in &keys {
+            locks.push(self.get_key_lock(key_str)?);
+        }
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.write_owned().await);
+        }
 
         self.storage.delete_objects(key).await?;
 
         {
-            let mut objects = lock_ptr!(self.objects)?;
             let mut metadata = lock_ptr!(self.metadata)?;
-
-            objects.retain(|k, _| !key.matches(k));
             metadata.retain(|k, _| !key.matches(k));
-        }
-
-        for k in &keys_to_remove {
-            self.eviction_policy.on_remove(k);
         }
 
         tracing::debug!("Deleted: <{}>", key.to_prefix());
@@ -663,12 +671,9 @@ impl ObjectCache {
         self.storage.delete_objects(&key).await?;
 
         {
-            let mut objects = lock_ptr!(self.objects)?;
             let mut metadata = lock_ptr!(self.metadata)?;
-            objects.remove(&expected.key);
             metadata.remove(&expected.key);
         }
-        self.eviction_policy.on_remove(&expected.key);
 
         Ok(true)
     }
@@ -678,6 +683,12 @@ impl ObjectCache {
         Ok(metadata.values().cloned().collect())
     }
 }
+
+/// HTTP/2 flow-control windows of the server. A sender can have one window of
+/// data in flight per round trip, so the 64 KiB default limits the upload rate
+/// of one stream to about window / round-trip time; large windows lift that.
+const HTTP2_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
+const HTTP2_CONNECTION_WINDOW: u32 = 64 * 1024 * 1024;
 
 /// Environment variable with the advertised address, used when `cache.advertise`
 /// is unset. Instances of one deployment share a configuration file, so a
@@ -807,9 +818,6 @@ pub async fn run(
     let advertised = advertised_endpoint(cache_config, env_advertise, system_interfaces)?;
     tracing::info!("Advertising {}", advertised.to_uri());
 
-    let storage_url = cache_config.storage.as_deref().unwrap_or("none");
-    let storage = crate::storage::connect(storage_url).await?;
-
     let eviction_config = EvictionConfig {
         policy: Some(cache_config.eviction.policy.clone()),
         max_memory: Some(ByteSize::b(cache_config.eviction.max_memory).to_string()),
@@ -823,11 +831,10 @@ pub async fn run(
         cache_config.eviction.max_objects
     );
 
-    let cache = Arc::new(ObjectCache::new(
-        advertised,
-        storage,
-        Some(&eviction_config),
-    )?);
+    let storage_url = cache_config.storage.as_deref().unwrap_or("none");
+    let storage = crate::storage::connect(storage_url, Some(&eviction_config)).await?;
+
+    let cache = Arc::new(ObjectCache::new(advertised, storage)?);
 
     cache.load_from_storage().await?;
 
@@ -846,7 +853,10 @@ pub async fn run(
         .parse()
         .map_err(|e| FlameError::InvalidConfig(format!("Invalid address: {}", e)))?;
 
-    let mut builder = tonic::transport::Server::builder();
+    let mut builder = tonic::transport::Server::builder()
+        .initial_stream_window_size(HTTP2_STREAM_WINDOW)
+        .initial_connection_window_size(HTTP2_CONNECTION_WINDOW)
+        .tcp_nodelay(true);
 
     if cache_config.requires_tls() {
         let tls_config = cache_config.tls.as_ref().ok_or_else(|| {
@@ -960,39 +970,79 @@ mod tests {
         use super::*;
 
         #[test]
-        fn new_creates_object_without_deltas() {
-            let obj = Object::new(1, vec![1, 2, 3]);
-            assert_eq!(obj.version, 1);
+        fn append_data_appends_in_order() {
+            let obj = Object::new().append_data(vec![1, 2, 3]);
+            assert_eq!(obj.data.len(), 1);
+            assert_eq!(obj.current_version(), 1);
             assert_eq!(obj.opaque_data().unwrap(), &[1, 2, 3]);
-            assert!(obj.deltas.is_empty());
+            assert!(obj.data[1..].is_empty());
         }
 
         #[test]
-        fn with_deltas_creates_object_with_deltas() {
-            let delta1 = Object::new(1, vec![4, 5]);
-            let delta2 = Object::new(2, vec![6, 7]);
-            let obj = Object::with_deltas(0, vec![1, 2, 3], vec![delta1.clone(), delta2.clone()]);
+        fn with_item_appends_after_the_first() {
+            let second = ObjectData::new().with_data(vec![4, 5]);
+            let third = ObjectData::new().with_data(vec![6, 7]);
+            let obj = Object::new()
+                .append_data(vec![1, 2, 3])
+                .append_data(second)
+                .append_data(third);
 
-            assert_eq!(obj.version, 0);
+            assert_eq!(obj.current_version(), 3);
             assert_eq!(obj.opaque_data().unwrap(), &[1, 2, 3]);
-            assert_eq!(obj.deltas.len(), 2);
-            assert_eq!(obj.deltas[0].opaque_data().unwrap(), &[4, 5]);
-            assert_eq!(obj.deltas[1].opaque_data().unwrap(), &[6, 7]);
+            assert_eq!(obj.data[1..].len(), 2);
+            assert_eq!(&obj.data[1..][0].data[..], &[4, 5]);
+            assert_eq!(&obj.data[1..][1].data[..], &[6, 7]);
         }
 
         #[test]
-        fn current_version_includes_base_version() {
-            let delta = Object::new(3, vec![4, 5]);
-            let obj = Object::with_deltas(5, vec![1, 2, 3], vec![delta]);
+        fn since_selects_the_data_after_a_version() {
+            let all = Object::new()
+                .append_data(vec![1])
+                .append_data(ObjectData::new().with_data(vec![2]))
+                .append_data(ObjectData::new().with_data(vec![3]));
+            assert_eq!((all.version, all.current_version()), (0, 3));
 
-            assert_eq!(obj.current_version(), 5);
+            // Version 0 is all the parts.
+            let from_zero = all.since(0).unwrap();
+            assert_eq!((from_zero.version, from_zero.data.len()), (0, 3));
+            // Above 0, only the data after that version.
+            let tail = all.since(1).unwrap();
+            assert_eq!((tail.version, tail.current_version()), (1, 3));
+            assert_eq!(&tail.data[0].data[..], &[2]);
+            assert!(all.since(3).unwrap().data.is_empty());
+            assert!(all.since(4).is_none());
+            // A part can be narrowed further, never widened.
+            assert_eq!(tail.since(2).unwrap().data.len(), 1);
+            assert!(tail.since(0).is_none());
+        }
+
+        #[test]
+        fn object_data_builders() {
+            let default = ObjectData::new();
+            assert!(default.data.is_empty());
+            assert!(default.creation_time > 0);
+
+            let part = ObjectData::new().with_data(vec![1, 2, 3]);
+            assert_eq!(&part.data[..], &[1, 2, 3]);
+            assert_eq!(part.size_bytes(), 3);
+        }
+
+        #[test]
+        fn version_and_size_count_every_part() {
+            let obj = Object::new()
+                .append_data(vec![1, 2, 3])
+                .append_data(ObjectData::new().with_data(vec![4, 5]))
+                .append_data(ObjectData::new().with_data(vec![6]));
+
+            assert_eq!(obj.current_version(), 3);
+            assert_eq!(obj.size_bytes(), 6);
         }
 
         #[test]
         fn object_clone_works() {
-            let obj = Object::new(42, vec![10, 20, 30]);
+            let obj = Object::new().append_data(vec![10, 20, 30]);
             let cloned = obj.clone();
-            assert_eq!(cloned.version, obj.version);
+            assert_eq!(cloned.current_version(), obj.current_version());
             assert_eq!(cloned.opaque_data().unwrap(), obj.opaque_data().unwrap());
         }
     }
@@ -1062,64 +1112,20 @@ mod tests {
     mod object_cache_operations {
         use super::*;
 
-        #[tokio::test]
-        async fn resident_reads_share_payload_and_patch_preserves_snapshot() {
-            let cache = create_test_cache().await;
-            let meta = cache
-                .put(
-                    ObjectKey::from_path("app/session").unwrap(),
-                    Object::new(0, vec![7; 1024]),
-                )
-                .await
-                .unwrap();
-            let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
-
-            let first = cache.get(&key).await.unwrap();
-            let second = cache.get(&key).await.unwrap();
-            assert!(Arc::ptr_eq(&first, &second));
-
-            cache
-                .patch(&key, Object::new(0, b"delta".to_vec()))
-                .await
-                .unwrap();
-            let patched = cache.get(&key).await.unwrap();
-            assert_eq!(first.current_version(), 1);
-            assert_eq!(patched.current_version(), 2);
-            assert_eq!(
-                first.opaque_data().unwrap().as_ptr(),
-                patched.opaque_data().unwrap().as_ptr()
-            );
-        }
-
         async fn create_test_cache() -> ObjectCache {
             let endpoint = CacheEndpoint {
                 scheme: "grpc".to_string(),
                 host: "localhost".to_string(),
                 port: 9090,
             };
-            let storage = crate::storage::connect("none").await.unwrap();
-            ObjectCache::new(endpoint, storage, None).unwrap()
-        }
-
-        async fn create_test_cache_with_max_memory(max_memory: &str) -> ObjectCache {
-            let endpoint = CacheEndpoint {
-                scheme: "grpc".to_string(),
-                host: "localhost".to_string(),
-                port: 9090,
-            };
-            let storage = crate::storage::connect("none").await.unwrap();
-            let eviction_config = EvictionConfig {
-                policy: Some("lru".to_string()),
-                max_memory: Some(max_memory.to_string()),
-                max_objects: None,
-            };
-            ObjectCache::new(endpoint, storage, Some(&eviction_config)).unwrap()
+            let storage = crate::storage::connect("none", None).await.unwrap();
+            ObjectCache::new(endpoint, storage).unwrap()
         }
 
         #[tokio::test]
         async fn put_and_get_object() {
             let cache = create_test_cache().await;
-            let obj = Object::new(1, vec![1, 2, 3]);
+            let obj = Object::new().append_data(vec![1, 2, 3]);
 
             let key = ObjectKey::from_path("test-app/test-session").unwrap();
             let meta = cache.put(key, obj.clone()).await.unwrap();
@@ -1128,68 +1134,83 @@ mod tests {
 
             let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
             let retrieved = cache.get(&key).await.unwrap();
-            assert_eq!(retrieved.version, 1);
+            assert_eq!(retrieved.current_version(), 1);
             assert_eq!(retrieved.opaque_data().unwrap(), &[1, 2, 3]);
         }
 
         #[tokio::test]
-        async fn patch_keeps_object_readable_with_none_storage() {
+        async fn append_keeps_object_readable_with_none_storage() {
             let cache = create_test_cache().await;
 
             let key = ObjectKey::from_path("app/session").unwrap();
             let meta = cache
-                .put(key, Object::new_typed(0, b"base".to_vec(), "arrow_table"))
+                .put(
+                    key,
+                    Object::new()
+                        .append_data(b"first".to_vec())
+                        .with_data_type("arrow_table"),
+                )
                 .await
                 .unwrap();
             let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
 
-            let patch_meta = cache
-                .patch(&key, Object::new_typed(0, b"patch".to_vec(), "arrow_table"))
+            let appended_meta = cache
+                .patch(
+                    &key,
+                    Object::new()
+                        .append_data(b"second".to_vec())
+                        .with_data_type("arrow_table"),
+                )
                 .await
                 .unwrap();
 
-            assert_eq!(patch_meta.version, 2);
-            assert_eq!(patch_meta.size, 9);
-            assert_eq!(patch_meta.delta_count, 1);
-            assert_eq!(patch_meta.data_type, "arrow_table");
+            assert_eq!(appended_meta.version, 2);
+            assert_eq!(appended_meta.size, 11);
+            assert_eq!(appended_meta.data_type, "arrow_table");
 
             let object = cache.get(&key).await.unwrap();
-            assert_eq!(object.version, 1);
             assert_eq!(object.current_version(), 2);
-            assert_eq!(object.opaque_data().unwrap(), b"base");
+            assert_eq!(object.opaque_data().unwrap(), b"first");
             assert_eq!(object.data_type, "arrow_table");
-            assert_eq!(object.deltas.len(), 1);
-            assert_eq!(object.deltas[0].version, 2);
-            assert_eq!(object.deltas[0].data_type, "arrow_table");
-            assert_eq!(object.deltas[0].opaque_data().unwrap(), b"patch");
+            assert_eq!(object.data[1..].len(), 1);
+            assert_eq!(&object.data[1..][0].data[..], b"second");
         }
 
         #[tokio::test]
-        async fn patch_rejects_mismatched_data_type() {
+        async fn append_rejects_mismatched_data_type() {
             let cache = create_test_cache().await;
             let meta = cache
                 .put(
                     ObjectKey::from_path("app/session/object").unwrap(),
-                    Object::new_typed(0, b"base".to_vec(), "arrow_table"),
+                    Object::new()
+                        .append_data(b"first".to_vec())
+                        .with_data_type("arrow_table"),
                 )
                 .await
                 .unwrap();
             let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
 
             let result = cache
-                .patch(&key, Object::new_typed(0, b"patch".to_vec(), "numpy"))
+                .patch(
+                    &key,
+                    Object::new()
+                        .append_data(b"second".to_vec())
+                        .with_data_type("numpy"),
+                )
                 .await;
             assert!(matches!(result, Err(FlameError::InvalidConfig(_))));
             assert_eq!(cache.get(&key).await.unwrap().current_version(), 1);
         }
 
         #[tokio::test]
-        async fn patch_preserves_codec_suffix_and_rejects_mismatch() {
+        async fn append_preserves_codec_suffix_and_rejects_mismatch() {
             let cache = create_test_cache().await;
             let meta = cache
                 .put(
                     ObjectKey::from_path("app/session/object").unwrap(),
-                    Object::new_typed(0, b"base".to_vec(), "raw.zstd"),
+                    Object::new()
+                        .append_data(b"first".to_vec())
+                        .with_data_type("raw.zstd"),
                 )
                 .await
                 .unwrap();
@@ -1197,48 +1218,34 @@ mod tests {
             let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
 
             let mismatch = cache
-                .patch(&key, Object::new_typed(0, b"patch".to_vec(), "raw"))
+                .patch(
+                    &key,
+                    Object::new()
+                        .append_data(b"second".to_vec())
+                        .with_data_type("raw"),
+                )
                 .await;
             assert!(matches!(mismatch, Err(FlameError::InvalidConfig(_))));
             assert_eq!(cache.get(&key).await.unwrap().current_version(), 1);
 
-            let patch = cache
-                .patch(&key, Object::new_typed(0, b"patch".to_vec(), "raw.zstd"))
+            let appended = cache
+                .patch(
+                    &key,
+                    Object::new()
+                        .append_data(b"second".to_vec())
+                        .with_data_type("raw.zstd"),
+                )
                 .await
                 .unwrap();
-            assert_eq!(patch.data_type, "raw.zstd");
+            assert_eq!(appended.data_type, "raw.zstd");
             let object = cache.get(&key).await.unwrap();
             assert_eq!(object.data_type, "raw.zstd");
-            assert_eq!(object.deltas[0].data_type, "raw.zstd");
-        }
-
-        #[tokio::test]
-        async fn patch_replaces_eviction_accounting_for_resident_object() {
-            let cache = create_test_cache_with_max_memory("10").await;
-
-            let key = ObjectKey::from_path("app/session").unwrap();
-            let meta = cache
-                .put(key, Object::new(0, b"base".to_vec()))
-                .await
-                .unwrap();
-            let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
-
-            let patch_meta = cache
-                .patch(&key, Object::new(0, b"patch".to_vec()))
-                .await
-                .unwrap();
-
-            assert_eq!(patch_meta.size, 9);
-
-            let object = cache.get(&key).await.unwrap();
-            assert_eq!(object.size_bytes(), 9);
-            assert_eq!(object.deltas.len(), 1);
         }
 
         #[tokio::test]
         async fn put_with_custom_id() {
             let cache = create_test_cache().await;
-            let obj = Object::new(0, vec![42]);
+            let obj = Object::new().append_data(vec![42]);
 
             let key = ObjectKey::from_path("app/session")
                 .unwrap()
@@ -1270,16 +1277,19 @@ mod tests {
 
             let key = ObjectKey::from_path("app/session-to-delete").unwrap();
             cache
-                .put(key.clone(), Object::new(0, vec![1]))
+                .put(key.clone(), Object::new().append_data(vec![1]))
                 .await
                 .unwrap();
             cache
-                .put(key.clone(), Object::new(0, vec![2]))
+                .put(key.clone(), Object::new().append_data(vec![2]))
                 .await
                 .unwrap();
 
             let other_key = ObjectKey::from_path("app/other-session").unwrap();
-            cache.put(other_key, Object::new(0, vec![3])).await.unwrap();
+            cache
+                .put(other_key, Object::new().append_data(vec![3]))
+                .await
+                .unwrap();
 
             let delete_key = ObjectKey::from_path("app/session-to-delete").unwrap();
             cache.delete(&delete_key).await.unwrap();
@@ -1295,11 +1305,11 @@ mod tests {
 
             let key = ObjectKey::from_path("app/session").unwrap();
             let meta1 = cache
-                .put(key.clone(), Object::new(0, vec![1]))
+                .put(key.clone(), Object::new().append_data(vec![1]))
                 .await
                 .unwrap();
             let meta2 = cache
-                .put(key.clone(), Object::new(0, vec![2]))
+                .put(key.clone(), Object::new().append_data(vec![2]))
                 .await
                 .unwrap();
 
@@ -1312,15 +1322,80 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn delete_waits_for_a_reader_of_the_object() {
+            let cache = Arc::new(create_test_cache().await);
+            let meta = cache
+                .put(
+                    ObjectKey::from_path("app/session").unwrap(),
+                    Object::new().append_data(vec![1]),
+                )
+                .await
+                .unwrap();
+            let key = ObjectKey::from_path(&meta.key).unwrap();
+
+            // A reader holds the lock of the object, like a `Get` that is being sent.
+            let deleting = {
+                let lock = cache.get_key_lock(&meta.key).unwrap();
+                let _reader = lock.read_owned().await;
+                let deleting = tokio::spawn({
+                    let cache = Arc::clone(&cache);
+                    let key = key.clone();
+                    async move { cache.delete(&key).await }
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                assert!(!deleting.is_finished());
+                assert!(cache.get(&key).await.is_ok());
+                deleting
+            };
+
+            deleting.await.unwrap().unwrap();
+            assert!(cache.get(&key).await.is_err());
+            assert!(cache.list_all().await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn delete_of_a_prefix_waits_for_every_object() {
+            let cache = Arc::new(create_test_cache().await);
+            let prefix = ObjectKey::from_path("app/session").unwrap();
+            let first = cache
+                .put(prefix.clone(), Object::new().append_data(vec![1]))
+                .await
+                .unwrap();
+            cache
+                .put(prefix.clone(), Object::new().append_data(vec![2]))
+                .await
+                .unwrap();
+
+            let deleting = {
+                let lock = cache.get_key_lock(&first.key).unwrap();
+                let _reader = lock.read_owned().await;
+                let deleting = tokio::spawn({
+                    let cache = Arc::clone(&cache);
+                    let prefix = prefix.clone();
+                    async move { cache.delete(&prefix).await }
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                assert!(!deleting.is_finished());
+                deleting
+            };
+
+            deleting.await.unwrap().unwrap();
+            assert!(cache.list_all().await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
         async fn delete_if_unchanged_removes_only_the_expected_object() {
             let cache = create_test_cache().await;
 
             let key = ObjectKey::from_path("app/session").unwrap();
             let expected = cache
-                .put(key.clone(), Object::new(0, vec![1]))
+                .put(key.clone(), Object::new().append_data(vec![1]))
                 .await
                 .unwrap();
-            let retained = cache.put(key, Object::new(0, vec![2])).await.unwrap();
+            let retained = cache
+                .put(key, Object::new().append_data(vec![2]))
+                .await
+                .unwrap();
 
             assert!(cache.delete_if_unchanged(&expected).await.unwrap());
 
@@ -1330,7 +1405,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn delete_if_unchanged_preserves_a_replaced_object() {
+        async fn delete_if_unchanged_preserves_an_object_with_appended_data() {
             let cache = create_test_cache().await;
 
             let key = ObjectKey::from_path("app/session")
@@ -1338,19 +1413,21 @@ mod tests {
                 .with_object_id("object".to_string())
                 .unwrap();
             let original = cache
-                .put(key.clone(), Object::new(0, vec![1]))
+                .put(key.clone(), Object::new().append_data(vec![1]))
                 .await
                 .unwrap();
-            let replacement = cache
-                .put(key.clone(), Object::new(0, vec![2]))
+            let appended = cache
+                .patch(&key, Object::new().append_data(vec![2]))
                 .await
                 .unwrap();
 
             assert!(!cache.delete_if_unchanged(&original).await.unwrap());
 
             let current = cache.get(&key).await.unwrap();
-            assert_eq!(current.version, replacement.version);
-            assert_eq!(current.opaque_data().unwrap(), &[2]);
+            assert_eq!(current.current_version(), appended.version);
+            assert_eq!(current.opaque_data().unwrap(), &[1]);
+            assert!(cache.delete_if_unchanged(&appended).await.unwrap());
+            assert!(cache.get(&key).await.is_err());
         }
 
         #[tokio::test]
@@ -1358,10 +1435,16 @@ mod tests {
             let cache = create_test_cache().await;
 
             let key1 = ObjectKey::from_path("app/s1").unwrap();
-            cache.put(key1, Object::new(0, vec![1])).await.unwrap();
+            cache
+                .put(key1, Object::new().append_data(vec![1]))
+                .await
+                .unwrap();
 
             let key2 = ObjectKey::from_path("app/s2").unwrap();
-            cache.put(key2, Object::new(0, vec![2])).await.unwrap();
+            cache
+                .put(key2, Object::new().append_data(vec![2]))
+                .await
+                .unwrap();
 
             let all = cache.list_all().await.unwrap();
             assert_eq!(all.len(), 2);
@@ -1379,26 +1462,234 @@ mod tests {
             let result = key.with_object_id("../bad".to_string());
             assert!(result.is_err());
         }
+    }
+
+    mod bounded_memory {
+        use super::*;
+        use crate::storage::{DiskStorage, ResidentStorage};
+        use std::path::Path;
+        use tempfile::tempdir;
+
+        const MIB: usize = 1024 * 1024;
+
+        fn endpoint() -> CacheEndpoint {
+            CacheEndpoint {
+                scheme: "grpc".to_string(),
+                host: "localhost".to_string(),
+                port: 9090,
+            }
+        }
+
+        fn eviction(max_memory: &str) -> EvictionConfig {
+            EvictionConfig {
+                policy: Some("lru".to_string()),
+                max_memory: Some(max_memory.to_string()),
+                max_objects: None,
+            }
+        }
+
+        fn disk_cache(path: &Path, max_memory: &str) -> ObjectCache {
+            let storage = Box::new(ResidentStorage::new(
+                Box::new(DiskStorage::new(path.to_path_buf()).unwrap()),
+                Some(&eviction(max_memory)),
+            ));
+            ObjectCache::new(endpoint(), storage).unwrap()
+        }
+
+        /// `count` chunks of 1 MiB, produced lazily; chunk `i` is filled with `i`.
+        fn chunks(count: usize) -> BoxStream<'static, Result<Bytes, FlameError>> {
+            Box::pin(futures::stream::iter(
+                (0..count).map(|index| Ok(Bytes::from(vec![index as u8; MIB]))),
+            ))
+        }
+
+        /// A `raw` write of `count` chunks to `key`.
+        fn raw_request(key: ObjectKey, count: usize) -> WriteRequest {
+            WriteRequest {
+                key,
+                data_type: "raw".to_string(),
+                chunks: chunks(count),
+            }
+        }
+
+        fn object_key(name: &str) -> ObjectKey {
+            ObjectKey::from_path("app/session")
+                .unwrap()
+                .with_object_id(name.to_string())
+                .unwrap()
+        }
 
         #[tokio::test]
-        async fn create_metadata_includes_endpoint() {
-            let endpoint = CacheEndpoint {
-                scheme: "grpc".to_string(),
-                host: "10.0.0.42".to_string(),
-                port: 9090,
-            };
-            let storage = crate::storage::connect("none").await.unwrap();
-            let cache = ObjectCache::new(endpoint, storage, None).unwrap();
-            let mut object = Object::new_typed_at(1, vec![0; 100], "raw", 1234);
-            object.deltas = vec![Object::new(1, Vec::<u8>::new()); 5];
-            let meta = cache.create_metadata("app/session/key".to_string(), &object);
+        async fn streamed_put_keeps_no_payload_resident() {
+            let directory = tempdir().unwrap();
+            let cache = disk_cache(directory.path(), "4M");
 
-            assert_eq!(meta.key, "app/session/key");
+            let key = object_key("big");
+            let meta = cache
+                .put_stream(raw_request(key.clone(), 12))
+                .await
+                .unwrap();
+            assert_eq!(meta.size, (12 * MIB) as u64);
             assert_eq!(meta.version, 1);
-            assert_eq!(meta.size, 100);
-            assert_eq!(meta.delta_count, 5);
-            assert_eq!(meta.creation_time, 1234);
-            assert_eq!(meta.endpoint, "grpc://10.0.0.42:9090");
+            assert_eq!(cache.storage.resident().0, 0);
+
+            // Ranges are served across chunk boundaries, from the open files;
+            // only the handle is resident.
+            let range = cache
+                .storage
+                .read_range(&key, 0, (3 * MIB - 1) as u64, 2)
+                .await
+                .unwrap();
+            assert_eq!(range.as_ref(), &[2, 3]);
+            let (count, bytes) = cache.storage.resident();
+            assert_eq!(count, 1);
+            assert!(bytes < 1024);
+        }
+
+        #[tokio::test]
+        async fn startup_loads_metadata_only() {
+            let directory = tempdir().unwrap();
+            let writer = disk_cache(directory.path(), "100M");
+            for name in ["a", "b", "c"] {
+                writer
+                    .put_stream(raw_request(object_key(name), 3))
+                    .await
+                    .unwrap();
+            }
+
+            let cache = disk_cache(directory.path(), "4M");
+            cache.load_from_storage().await.unwrap();
+            assert_eq!(cache.storage.resident().0, 0);
+            let all = cache.list_all().await.unwrap();
+            assert_eq!(all.len(), 3);
+            assert!(all
+                .iter()
+                .all(|meta| meta.version == 1 && meta.size == (3 * MIB) as u64));
+        }
+
+        #[tokio::test]
+        async fn put_of_an_existing_object_is_rejected() {
+            let directory = tempdir().unwrap();
+            let key = object_key("created");
+            disk_cache(directory.path(), "100M")
+                .put_stream(raw_request(key.clone(), 2))
+                .await
+                .unwrap();
+
+            // Not loaded: the object is found in storage.
+            let cache = disk_cache(directory.path(), "100M");
+            let again = cache.put_stream(raw_request(key.clone(), 1)).await;
+            assert!(matches!(again, Err(FlameError::AlreadyExist(_))));
+
+            // The same after a metadata-only startup, and nothing changed.
+            let cache = disk_cache(directory.path(), "100M");
+            cache.load_from_storage().await.unwrap();
+            let again = cache.put_stream(raw_request(key.clone(), 1)).await;
+            assert!(matches!(again, Err(FlameError::AlreadyExist(_))));
+            let meta = cache.metadata_of("app/session/created").unwrap().unwrap();
+            assert_eq!((meta.version, meta.size), (1, (2 * MIB) as u64));
+        }
+
+        #[tokio::test]
+        async fn get_since_a_version_returns_only_later_data() {
+            let directory = tempdir().unwrap();
+            let cache = disk_cache(directory.path(), "100M");
+            let key = object_key("appended");
+            cache.put_stream(raw_request(key.clone(), 2)).await.unwrap();
+            cache
+                .patch(&key, Object::new().append_data(b"second".to_vec()))
+                .await
+                .unwrap();
+
+            let all = cache.get(&key).await.unwrap();
+            assert_eq!((all.version, all.current_version()), (0, 2));
+            let tail = cache.get_since(&key, 1).await.unwrap();
+            assert_eq!((tail.version, tail.current_version()), (1, 2));
+            assert_eq!(tail.data.len(), 1);
+            assert_eq!(&tail.data[0].data[..], b"second");
+        }
+
+        #[tokio::test]
+        async fn append_to_a_large_object_updates_metadata() {
+            let directory = tempdir().unwrap();
+            let cache = disk_cache(directory.path(), "100M");
+            let key = object_key("appended");
+            cache.put_stream(raw_request(key.clone(), 9)).await.unwrap();
+
+            let meta = cache
+                .patch(
+                    &key,
+                    Object::new()
+                        .append_data(b"second".to_vec())
+                        .with_data_type("raw"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(meta.version, 2);
+            assert_eq!(meta.size, (9 * MIB + 6) as u64);
+            // The append opened the object and left its handle resident.
+            assert_eq!(cache.storage.resident().0, 1);
+
+            let stored = cache.metadata_of("app/session/appended").unwrap().unwrap();
+            assert_eq!(stored.version, 2);
+        }
+    }
+
+    mod none_storage {
+        use super::*;
+
+        const MIB: usize = 1024 * 1024;
+
+        fn key(name: &str) -> ObjectKey {
+            ObjectKey::from_path("app/session")
+                .unwrap()
+                .with_object_id(name.to_string())
+                .unwrap()
+        }
+
+        /// A `none` cache that holds at most two objects.
+        async fn small_budget_cache() -> ObjectCache {
+            let eviction = EvictionConfig {
+                policy: Some("lru".to_string()),
+                max_memory: Some("1M".to_string()),
+                max_objects: Some(2),
+            };
+            let storage = crate::storage::connect("none", Some(&eviction))
+                .await
+                .unwrap();
+            ObjectCache::new(
+                CacheEndpoint {
+                    scheme: "grpc".to_string(),
+                    host: "localhost".to_string(),
+                    port: 9090,
+                },
+                storage,
+            )
+            .unwrap()
+        }
+
+        /// Without a store the cache holds the only copy of an object, so an
+        /// evicted object is lost.
+        #[tokio::test]
+        async fn eviction_loses_objects() {
+            let cache = small_budget_cache().await;
+            for index in 0..3 {
+                let chunks = futures::stream::once(futures::future::ready(Ok(Bytes::from(vec![
+                    index as u8;
+                    MIB / 4
+                ]))));
+                cache
+                    .put_stream(WriteRequest {
+                        key: key(&format!("o{index}")),
+                        data_type: "raw".to_string(),
+                        chunks: Box::pin(chunks),
+                    })
+                    .await
+                    .unwrap();
+            }
+            // Eviction removes whole batches, so what remains is at most the limit.
+            assert!(cache.get(&key("o0")).await.is_err());
+            assert!(cache.storage.resident().0 <= 2);
         }
     }
 
@@ -1415,17 +1706,31 @@ mod tests {
 
         #[tokio::test]
         async fn refs_carry_advertised_address() {
-            let storage = crate::storage::connect("none").await.unwrap();
-            let cache =
-                ObjectCache::new(endpoint("cache-1.cache.flame.svc"), storage, None).unwrap();
+            let storage = crate::storage::connect("none", None).await.unwrap();
+            let cache = ObjectCache::new(endpoint("cache-1.cache.flame.svc"), storage).unwrap();
 
             let key = ObjectKey::from_path("app/session").unwrap();
-            let meta = cache.put(key, Object::new(0, vec![7u8; 10])).await.unwrap();
+            let chunks =
+                futures::stream::once(futures::future::ready(Ok(Bytes::from(vec![7u8; 10]))));
+            let meta = cache
+                .put_stream(WriteRequest {
+                    key,
+                    data_type: "raw".to_string(),
+                    chunks: Box::pin(chunks),
+                })
+                .await
+                .unwrap();
             assert_eq!(meta.endpoint, "grpc://cache-1.cache.flame.svc:9090");
 
             let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
-            let patched = cache.patch(&key, Object::new(0, vec![1u8])).await.unwrap();
-            assert_eq!(patched.endpoint, "grpc://cache-1.cache.flame.svc:9090");
+            let appended = cache
+                .patch(
+                    &key,
+                    Object::new().append_data(vec![1u8]).with_data_type("raw"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(appended.endpoint, "grpc://cache-1.cache.flame.svc:9090");
         }
 
         fn interfaces() -> Result<InterfaceList, FlameError> {
@@ -1596,14 +1901,14 @@ mod tests {
                 host: "localhost".to_string(),
                 port: 9090,
             };
-            let storage = crate::storage::connect("none").await.unwrap();
-            ObjectCache::new(endpoint, storage, None).unwrap()
+            let storage = crate::storage::connect("none", None).await.unwrap();
+            ObjectCache::new(endpoint, storage).unwrap()
         }
 
         #[tokio::test]
         async fn put_initializes_version_to_one() {
             let cache = create_test_cache().await;
-            let obj = Object::new(0, vec![1, 2, 3]);
+            let obj = Object::new().append_data(vec![1, 2, 3]);
 
             let key = ObjectKey::from_path("test-app/test-session").unwrap();
             let meta = cache.put(key, obj).await.unwrap();
@@ -1612,23 +1917,23 @@ mod tests {
 
             let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
             let retrieved = cache.get(&key).await.unwrap();
-            assert_eq!(retrieved.version, 1);
+            assert_eq!(retrieved.current_version(), 1);
         }
 
         #[tokio::test]
         async fn version_persists_after_get() {
             let cache = create_test_cache().await;
-            let obj = Object::new(0, vec![1, 2, 3]);
+            let obj = Object::new().append_data(vec![1, 2, 3]);
 
             let key = ObjectKey::from_path("app/session").unwrap();
             let meta = cache.put(key, obj).await.unwrap();
 
             let key = ObjectKey::try_from(meta.key.as_str()).unwrap();
             let retrieved1 = cache.get(&key).await.unwrap();
-            assert_eq!(retrieved1.version, 1);
+            assert_eq!(retrieved1.current_version(), 1);
 
             let retrieved2 = cache.get(&key).await.unwrap();
-            assert_eq!(retrieved2.version, 1);
+            assert_eq!(retrieved2.current_version(), 1);
         }
     }
 
@@ -1641,7 +1946,7 @@ mod tests {
         #[test]
         #[ignore = "manual performance benchmark"]
         fn opaque_snapshot_clone() {
-            let object = Object::new(1, vec![42; 8 * 1024 * 1024]);
+            let object = Object::new().append_data(vec![42; 8 * 1024 * 1024]);
             let shared = Arc::new(object.clone());
             let iterations = 256;
 

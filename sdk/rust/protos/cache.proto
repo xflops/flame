@@ -39,52 +39,42 @@ message CacheObjectMetadata {
   string key = 2;
   uint64 version = 3;
   uint64 size = 4;
-  uint64 delta_count = 5;
   // Unix timestamp in milliseconds, retained for cache lifecycle accounting.
   int64 creation_time = 6;
-  // Client-defined type shared by the base object and all patches.
+  // Client-defined type shared by all the data parts of the object.
   string data_type = 7;
 }
 
 message CacheGetRequest {
   string key = 1;
-  // Zero forces a full response. Otherwise the server may return unchanged or
-  // a contiguous suffix of patches after this version.
-  uint64 client_version = 2;
-}
-
-enum CacheGetMode {
-  CACHE_GET_MODE_UNSPECIFIED = 0;
-  CACHE_GET_MODE_FULL = 1;
-  CACHE_GET_MODE_PATCHES = 2;
-  CACHE_GET_MODE_NOT_MODIFIED = 3;
+  // The data parts after this version are returned: all of them for zero, none
+  // if the client has the current version. A version ahead of the object's is an
+  // INVALID_ARGUMENT error (invalid version): the client has another object of
+  // the same key.
+  uint64 version = 2;
 }
 
 message CacheGetHeader {
-  CacheGetMode mode = 1;
-  uint64 version = 2;
-  // Client-defined type shared by the base object and all patches. Empty for
-  // NOT_MODIFIED, which carries no object bytes.
-  string data_type = 3;
-}
-
-enum CacheChunkKind {
-  CACHE_CHUNK_KIND_UNSPECIFIED = 0;
-  CACHE_CHUNK_KIND_BASE = 1;
-  CACHE_CHUNK_KIND_PATCH = 2;
+  // The current version of the object: its number of data parts.
+  uint64 version = 1;
+  // Client-defined type shared by all data parts of the object.
+  string data_type = 2;
 }
 
 message CacheGetChunk {
-  CacheChunkKind kind = 1;
-  uint64 version = 2;
-  bytes data = 3;
-  // Chunks for a part are contiguous and share a kind and version. The next
-  // kind/version pair or the end of the stream completes the current part.
-  // Empty parts are sent as one chunk with empty data.
+  // The version of the data part this chunk belongs to: its position in the
+  // object, starting at 1. The parts returned start at version 1 for request
+  // version zero, and at the version after the request's otherwise.
+  uint64 version = 1;
+  bytes data = 2;
+  // Chunks for a part are contiguous and share a version. The next version or
+  // the end of the stream completes the current part. Empty parts are sent as
+  // one chunk with empty data.
 }
 
 message CacheGetResponse {
-  // The first message is always a header. NOT_MODIFIED has no chunks.
+  // The first message is always a header. It is followed by the chunks of the
+  // data parts, none if the client already has the current version.
   oneof payload {
     CacheGetHeader header = 1;
     CacheGetChunk chunk = 2;

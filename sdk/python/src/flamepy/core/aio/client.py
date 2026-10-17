@@ -456,8 +456,16 @@ class Session:
                 if not result.done():
                     result.set_exception(FlameError(FlameErrorCode.INTERNAL, "connection closed during task watch"))
                 raise
-            except Exception as error:
-                await finish(error=error if isinstance(error, FlameError) else FlameError(FlameErrorCode.INTERNAL, f"Watch failed: {error}"))
+            except Exception as exc:
+                if self.connection._closed:
+                    # Closing can win the race with starting the watch, which then
+                    # fails because the connection is closed.
+                    error = FlameError(FlameErrorCode.INTERNAL, "connection closed during task watch")
+                elif isinstance(exc, FlameError):
+                    error = exc
+                else:
+                    error = FlameError(FlameErrorCode.INTERNAL, f"Watch failed: {exc}")
+                await finish(error=error)
             finally:
                 if active_watcher is not None:
                     active_watcher.close()

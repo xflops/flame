@@ -19,12 +19,12 @@ from .cache import (
     Ref,
     ValueRef,
     delete_objects,
-    download_object,
+    delete_package,
+    download_package,
     get_object,
     patch_object,
     put_object,
-    update_object,
-    upload_object,
+    upload_package,
 )
 
 # Client classes
@@ -182,11 +182,11 @@ __all__ = [
     "Ref",
     "ValueRef",
     # Cache functions
-    "download_object",
+    "download_package",
+    "delete_package",
+    "upload_package",
     "delete_objects",
     "get_object",
     "patch_object",
     "put_object",
-    "update_object",
-    "upload_object",
 ]
