@@ -677,6 +677,75 @@ mod tests {
         Ok(())
     }
 
+    /// Runs `cycles` full scheduling cycles (Dispatch then Allocate); between
+    /// cycles every Void executor registers, as its node would. Returns
+    /// (executors that exist, executors bound to the gang session).
+    fn gang_cycles(
+        min_instances: u32,
+        idle: usize,
+        cycles: usize,
+    ) -> Result<(usize, usize), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        tokio_test::block_on(
+            controller
+                .storage()
+                .register_node(&new_test_node("node_1".to_string())),
+        )?;
+        let session =
+            tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+                id: format!("gang-{}", Uuid::new_v4()),
+                application: "flmtest".to_string(),
+                min_instances,
+                resreq: Some(ResourceRequirement {
+                    cpu: 1,
+                    memory: 1024,
+                    gpu: 0,
+                }),
+                ..Default::default()
+            }))?;
+        for _ in 0..idle {
+            let executor = tokio_test::block_on(
+                controller.create_executor("node_1".to_string(), session.id.clone()),
+            )?;
+            tokio_test::block_on(controller.register_executor(&executor))?;
+        }
+
+        for _ in 0..cycles {
+            let mut ctx = Context::new(controller.clone(), &PluginsOptions::default())?;
+            tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
+            tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
+            for executor in controller.list_executors()? {
+                if executor.state == common::apis::ExecutorState::Void {
+                    tokio_test::block_on(controller.register_executor(&executor))?;
+                }
+            }
+        }
+
+        let executors = controller.list_executors()?;
+        let bound = executors
+            .iter()
+            .filter(|executor| executor.ssn_id.as_ref() == Some(&session.id))
+            .count();
+        Ok((executors.len(), bound))
+    }
+
+    #[test]
+    fn test_gang_assembles_from_nothing_without_over_creation() -> Result<(), FlameError> {
+        assert_eq!(gang_cycles(3, 0, 10)?, (3, 3));
+        Ok(())
+    }
+
+    #[test]
+    fn test_gang_assembles_from_partial_idle_without_over_creation() -> Result<(), FlameError> {
+        assert_eq!(gang_cycles(3, 2, 10)?, (3, 3));
+        assert_eq!(gang_cycles(4, 1, 10)?, (4, 4));
+        Ok(())
+    }
+
     fn instance_limit_env(
         application_max: u32,
         session_max: Option<u32>,

@@ -114,13 +114,20 @@ For each session popped from the queue that is underused and not `is_ready`:
 A session with `min_instances` of 0 or 1 is satisfied by its first bind, so it commits one
 bind per turn, as before.
 
-**Allocate is unchanged**, and so is its limitation: it counts only executors that are bound
-or pipelined for the session. An executor Allocate creates has no session (`ssn_id` is none)
-until Dispatch binds it, so Idle executors a gang is waiting on are not counted, and Allocate
-can create more executors than the shortfall while the gang is incomplete. Nothing runs
-partially, because Dispatch binds none of them until the whole minimum is Idle, and the extra
-executors are released after the application's `delay_release`. Fixing it means staging
-Allocate's pipeline and creation in the same `Statement`; see open questions.
+**Allocate is unchanged.** It counts only executors that are bound or pipelined for the session,
+and an executor it creates has no session (`ssn_id` is none) until Dispatch binds it. A gang
+still assembles correctly: Allocate takes one step per session per cycle and pipelines a Void
+executor before creating a new one, so while Dispatch keeps discarding, creation tracks the
+shortfall (`test_gang_assembles_*` run full cycles and end with exactly the minimum). Two
+costs remain:
+
+- a gang of N takes about N cycles to assemble, as Allocate adds one executor per cycle;
+- Allocate does not see the Idle executors Dispatch is waiting on, so a created executor that
+  fails to register can lead to an extra one. Nothing runs partially, and extras are released
+  after the application's `delay_release`.
+
+Counting those Idle executors needs Allocate's pipeline and creation staged in the same
+`Statement`; see open questions.
 
 ### 4.4 Context exported to the service
 
@@ -244,8 +251,8 @@ guide next to `min_instances`, together with `app.context()`.
 
 1. Apply to every session with `min_instances >= 2`, or only to sessions that opt in?
 2. Report a gang that cannot start (a session event or condition) so users see why it is pending.
-3. Stage Allocate's pipeline and creation in the `Statement` too, to remove the over-creation
-   in 4.3? It needs inverse plugin hooks for pipeline and create and deferred executor creation.
+3. Stage Allocate's pipeline and creation in the `Statement` too, so a gang assembles in one
+   cycle and Idle executors it waits on are counted (4.3)? It needs inverse plugin hooks for pipeline and create and deferred executor creation.
 4. A gang that never fits can starve behind small sessions. Reserve capacity for it (backfill
    rules), or leave this to priority and Shuffle?
 5. The WASM shim's `SessionContext` does not carry `min_instances` yet.
