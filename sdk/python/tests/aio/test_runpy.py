@@ -120,6 +120,34 @@ async def test_runpy_resolves_inline_and_cached_refs_in_arguments():
 
 
 @pytest.mark.asyncio
+async def test_runpy_exposes_session_task_and_min_instances_through_context():
+    import flamepy.app as app
+    from flamepy.core.service import ApplicationContext, SessionContext, TaskContext
+
+    class Worker:
+        def run(self):
+            return app.context()
+
+    svc = FlameRunpyService()
+    svc._load_app_context = lambda context: _context(ServiceContext(Worker, constructor_args=()))
+    await svc.on_session_enter(SessionContext(None, "session", ApplicationContext("app"), min_instances=3))
+
+    request = ServiceRequest(method="run")
+    object_ref = SimpleNamespace(encode=lambda: b"result-ref")
+    with patch("flamepy.core.aio.put_object", new=AsyncMock(return_value=object_ref)):
+        result = await svc.on_task_invoke(TaskContext("task-7", "session", cloudpickle.dumps(request)))
+
+    assert cloudpickle.loads(result) == ServiceResponse(ValueRef(app.InstanceContext("session", "task-7", 3)))
+
+
+def test_context_requires_an_invocation():
+    import flamepy.app as app
+
+    with pytest.raises(RuntimeError):
+        app.context()
+
+
+@pytest.mark.asyncio
 async def test_runpy_binds_session_context_and_publishes_invocation_attributes():
     import flamepy.app as app
     from flamepy.core.service import ApplicationContext, SessionContext, TaskContext

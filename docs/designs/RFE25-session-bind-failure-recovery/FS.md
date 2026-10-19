@@ -553,7 +553,6 @@ Expected outcome: no bind failure event.
 **Related Documents:**
 
 - `docs/designs/RFE384-flame-recovery/FS.md`
-- `docs/designs/RFE400-batch-session/FS.md`
 
 **Implementation References:**
 

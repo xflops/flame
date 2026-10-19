@@ -211,7 +211,7 @@ class FlameRunpyService(AioFlameService):
     async def on_task_invoke(self, context: TaskContext) -> Optional[TaskOutput]:
         method, raw_args, raw_kwargs, session_context = await asyncio.to_thread(self._prepare_task, context)
         args, kwargs = await self._resolve_object_refs(raw_args, raw_kwargs)
-        with _bind_invocation_context(session_context) as invocation_context:
+        with _bind_invocation_context(session_context, context) as invocation_context:
             try:
                 if inspect.iscoroutinefunction(method):
                     result = await method(*args, **kwargs)

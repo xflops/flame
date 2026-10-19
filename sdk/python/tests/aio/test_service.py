@@ -209,6 +209,34 @@ def test_close_cancels_stalled_async_hook_after_timeout(monkeypatch):
     asyncio.run(exercise())
 
 
+def test_session_enter_receives_min_instances():
+    received = []
+
+    class Service(aio_service.FlameService):
+        async def on_session_enter(self, context):
+            received.append(context.min_instances)
+
+        async def on_task_invoke(self, context):
+            return None
+
+        async def on_session_leave(self):
+            pass
+
+    async def exercise():
+        servicer = aio_service.FlameInstanceServicer(Service())
+        await servicer.OnSessionEnter(
+            shim_pb2.SessionContext(
+                session_id="session",
+                application=shim_pb2.ApplicationContext(name="app"),
+                min_instances=4,
+            ),
+            None,
+        )
+
+    asyncio.run(exercise())
+    assert received == [4]
+
+
 def test_close_does_not_wait_indefinitely_for_sync_hook(monkeypatch):
     monkeypatch.setattr(aio_service, "_SHUTDOWN_TIMEOUT", 0.05)
     started = threading.Event()

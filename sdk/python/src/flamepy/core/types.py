@@ -200,7 +200,6 @@ class SessionAttributes:
     tokens: Dict[str, str] = field(default_factory=dict, repr=False)
     min_instances: int = 0
     max_instances: Optional[int] = None
-    batch_size: int = 1
     resreq: Optional[ResourceRequirement] = None
 
 

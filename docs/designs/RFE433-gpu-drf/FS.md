@@ -124,7 +124,6 @@ message SessionSpec {
   optional bytes common_data = 4;
   uint32 min_instances = 5;
   optional uint32 max_instances = 6;
-  uint32 batch_size = 7;
   uint32 priority = 8;
   optional ResourceRequirement resreq = 9;  // NEW: Explicit resource request
 }
@@ -261,7 +260,6 @@ class SessionAttributes:
     common_data: Any = None
     min_instances: int = 0
     max_instances: Optional[int] = None
-    batch_size: int = 1
 
 @dataclass
 class ResourceRequirement:  # NEW
@@ -281,7 +279,6 @@ pub struct SessionAttributes {
     pub common_data: Option<Vec<u8>>,
     pub min_instances: u32,
     pub max_instances: Option<u32>,
-    pub batch_size: u32,
 }
 ```
 
@@ -321,7 +318,6 @@ pub struct SessionAttributes {
 | Feature | Interaction |
 |---------|-------------|
 | **PriorityPlugin (RFE413)** | Orthogonal; priority ordering applies to GPU sessions equally |
-| **GangPlugin (RFE400)** | Orthogonal; batch constraints apply to GPU sessions |
 
 **Required Updates:**
 
@@ -796,7 +792,6 @@ let attr = SessionAttributes {
     common_data: ssn_spec.common_data.map(apis::CommonData::from),
     min_instances: ssn_spec.min_instances,
     max_instances: ssn_spec.max_instances,
-    batch_size: ssn_spec.batch_size.max(1),
     priority: ssn_spec.priority,
     resreq: Some(resreq),  // always populated by resolver
 };
@@ -1042,8 +1037,6 @@ With DRF:
 
 ### Related Documents
 
-- [RFE400 - Batch Support in Session](../RFE400-batch-session/FS.md)
-- [RFE408 - Enhance Fairshare for batch_size](../RFE408-fairshare-batch-size/FS.md)
 - [RFE413 - Priority Scheduling](../RFE413-priority-scheduling/FS.md)
 
 ### External References

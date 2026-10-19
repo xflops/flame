@@ -344,6 +344,7 @@ mod tests {
             },
             common_data: None,
             tokens: Default::default(),
+            min_instances: 0,
         };
 
         let result = shim.on_session_enter(&ctx).await;

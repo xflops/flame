@@ -44,7 +44,6 @@ pub async fn run(
         tokens: Default::default(),
         min_instances: 0,
         max_instances: None,
-        batch_size: 1,
         priority: *priority,
         resreq,
     };

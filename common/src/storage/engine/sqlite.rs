@@ -248,9 +248,8 @@ impl SqliteEngine {
             ),
             None => (None, None, None),
         };
-        let sql = r#"INSERT INTO sessions (id, application, common_data, tokens, creation_time, state, min_instances, max_instances, batch_size, priority, resreq_cpu, resreq_memory, resreq_gpu)
+        let sql = r#"INSERT INTO sessions (id, application, common_data, tokens, creation_time, state, min_instances, max_instances, priority, resreq_cpu, resreq_memory, resreq_gpu)
             VALUES (
-                ?,
                 ?,
                 ?,
                 ?,
@@ -274,7 +273,6 @@ impl SqliteEngine {
             .bind(SessionState::Open as i32)
             .bind(attr.min_instances as i64)
             .bind(attr.max_instances.map(|v| v as i64))
-            .bind(1_i64)
             .bind(attr.priority as i64)
             .bind(resreq_cpu)
             .bind(resreq_memory)
@@ -1334,31 +1332,27 @@ mod tests {
     }
 
     #[test]
-    fn test_create_session_normalizes_batch_size() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_create_session_normalizes_batch_size");
+    fn test_create_session_stores_tokens() -> Result<(), FlameError> {
+        let url = crate::temp_sqlite_url("flame_test_create_session_stores_tokens");
         let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
 
         for (name, attr) in test_applications() {
             tokio_test::block_on(storage.register_application(name.clone(), attr))?;
         }
 
-        let ssn_id = format!("ssn-batch-{}", Utc::now().timestamp());
-        let ssn = tokio_test::block_on(storage.create_session(SessionAttributes {
+        let ssn_id = format!("ssn-tokens-{}", Utc::now().timestamp());
+        tokio_test::block_on(storage.create_session(SessionAttributes {
             tokens: [("service".into(), "credential".into())].into(),
             id: ssn_id.clone(),
             application: "flmexec".to_string(),
             common_data: None,
             min_instances: 2,
             max_instances: Some(4),
-            batch_size: 2,
             priority: 0,
             resreq: None,
         }))?;
 
-        assert_eq!(ssn.batch_size, 1);
-
         let ssn = tokio_test::block_on(storage.get_session(ssn_id))?;
-        assert_eq!(ssn.batch_size, 1);
         assert_eq!(
             ssn.tokens.get("service").map(String::as_str),
             Some("credential")
@@ -1384,7 +1378,6 @@ mod tests {
             common_data: None,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         }))?;
@@ -1538,7 +1531,6 @@ mod tests {
             common_data: None,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         }))?;
@@ -1883,7 +1875,6 @@ mod tests {
             common_data: None,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         }))?;
@@ -1937,7 +1928,6 @@ mod tests {
             common_data: None,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         }))?;
@@ -1974,7 +1964,6 @@ mod tests {
             common_data: None,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         }))?;
@@ -2029,7 +2018,6 @@ mod tests {
             common_data: None,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         }))?;
@@ -2071,7 +2059,6 @@ mod tests {
             common_data: None,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         }))?;
@@ -2105,7 +2092,6 @@ mod tests {
             common_data: None,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         }))?;
@@ -2148,7 +2134,6 @@ mod tests {
             common_data: None,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         }))?;

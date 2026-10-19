@@ -384,6 +384,7 @@ mod tests {
             },
             common_data: None,
             tokens: Default::default(),
+            min_instances: 0,
         };
         assert!(state
             .bind_executor_failed(

@@ -199,7 +199,6 @@ mod tests {
                 common_data: None,
                 min_instances: 1,
                 max_instances: None,
-                batch_size: 1,
                 priority: 0,
                 resreq: Some(ResourceRequirement::default()),
             }

@@ -123,6 +123,19 @@ pub trait Plugin: Send + Sync + 'static {
         None
     }
 
+    /// Whether the session holds the minimum it needs to run, counting
+    /// capacity bound or pipelined in this cycle.
+    ///
+    /// This is the all-or-nothing check for a gang (`min_instances`): a
+    /// `Statement` that binds executors to the session is committed only when
+    /// it is true, and discarded otherwise. It is not `is_ready`, which asks
+    /// whether the session has been given enough capacity *this cycle* and
+    /// also counts demand and fairness. `None` means the plugin sets no
+    /// minimum for the session.
+    fn is_satisfied(&self, ssn: &SessionInfoPtr) -> Option<bool> {
+        None
+    }
+
     /// Whether idle bindings may be removed from this session. Return None
     /// to defer to the next policy; the first explicit result is authoritative.
     fn is_overused(&self, ssn: &SessionInfoPtr) -> Option<bool> {
@@ -276,6 +289,18 @@ impl PluginManager {
             }
         }
         Ok(false)
+    }
+
+    /// Whether the session holds the minimum it needs to run.
+    ///
+    /// The first plugin with an opinion wins. Unlike `is_ready`, no opinion
+    /// means satisfied: a session without a minimum has nothing to wait for.
+    pub fn is_satisfied(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
+        let plugins = lock_ptr!(self.plugins)?;
+        Ok(plugins
+            .iter()
+            .find_map(|(_, plugin)| plugin.is_satisfied(ssn))
+            .unwrap_or(true))
     }
 
     pub fn is_overused(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {

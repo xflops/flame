@@ -1,0 +1,251 @@
+# Design: Gang Scheduling for `min_instances`
+
+**Status:** Draft
+**Created:** 2026-10-17
+**Issue:** [#591](https://github.com/xflops/flame/issues/591)
+
+---
+
+## 1. Motivation
+
+A session with `min_instances >= 2` often needs all of its executors at once: data-parallel
+training over NCCL, tensor-parallel inference, MPI-style jobs. The scheduler gives such a
+session executors one at a time. `DispatchAction` binds one Idle executor per step and
+`AllocateAction` pipelines or allocates one executor per step; each step takes effect at once.
+
+When the cluster can supply only part of the minimum, the session keeps what it got and waits:
+
+- a group that blocks until all members are present (a collective `init_process_group`)
+  occupies its executors without making progress;
+- other sessions that could have used those executors are starved;
+- two such sessions can each hold part of the cluster and neither starts.
+
+## 2. Goals and non-goals
+
+**Goals**
+
+1. A session is bound to executors only when it holds `min_instances` after the bind, decided
+   in one scheduling step; if the Idle executors cannot cover the minimum, nothing is bound.
+2. The same flow serves every session, as in kube-batch: a minimum of 0 or 1 is met by the
+   first bind, so those sessions behave as before.
+3. The change is confined to `DispatchAction`, the plugin hook that asks "is the minimum
+   held" and a small `Statement` type. Allocate and Shuffle are unchanged.
+4. A gang member can read the session id, the task id and `min_instances` at run time.
+
+**Non-goals**
+
+- Gang sizes other than `min_instances`.
+- Preemption of other sessions to make room for a gang (Shuffle is unchanged).
+- Node or topology placement rules.
+- Gang-aware executor creation in Allocate (see 4.3).
+
+## 3. Current behavior
+
+`Context::actions` runs Dispatch, Allocate, then Shuffle each cycle on one snapshot.
+
+| Action | Supply it uses | Step |
+| ------ | -------------- | ---- |
+| Dispatch | Idle executors with no session | `select_executor` + `bind_session` |
+| Allocate | Void executors, then Unbinding executors | `pipeline_executor` |
+| Allocate | Node capacity (`is_allocatable`) | `allocate_executor` (creates one) |
+
+Dispatch loops over sessions ordered by the plugins, skips a session that is not underused or
+is `is_ready`, binds one executor, and re-queues the session while it is still underused.
+MinMax counts `session_executors` (bound plus pipelined plus created in this cycle) and
+reports a session not ready while that count is below `min_instances`.
+
+`is_ready` means "the session was given enough capacity this cycle, stop adding": it also
+counts demand and DRF fair share, so it can be false at the minimum and true below it. It
+cannot tell whether the minimum is held.
+
+The plugin hooks (`on_session_bind`, `on_executor_pipeline`, `on_executor_create`) mutate
+plugin state. `on_session_unbind` is the exact inverse of `on_session_bind`; the other two have
+no inverse, which is why only binds are staged.
+
+## 4. Design
+
+Dispatch follows the kube-batch allocate loop: stage the decisions in a `Statement`, then
+commit if the session satisfies its gang, otherwise discard.
+
+### 4.1 `Statement`
+
+`scheduler/statement.rs`. A batch of Dispatch decisions that takes effect all at once.
+
+| Method | Effect |
+| ------ | ------ |
+| `bind(exec, ssn)` | Stage: run `on_session_bind` and mark the executor Binding in the cycle's snapshot. The controller is untouched. |
+| `commit()` | Call `Controller::bind_session` for each staged bind, in order. |
+| `discard()` | Undo, newest first: `on_session_unbind` and the executor back to Idle in the snapshot. Returns the executors. |
+
+Staging updates the plugins and the snapshot immediately, so later decisions in the cycle
+(including other sessions) see them. Only `commit` makes a bind real.
+
+If a controller call fails during `commit`, the binds already applied cannot be undone. The
+statement keeps them, discards the rest from the plugins and the snapshot, and returns the
+error. The next cycle sees the remaining shortfall and completes the gang.
+
+### 4.2 `is_satisfied`
+
+A new plugin hook, the equivalent of kube-batch `JobReady`:
+
+```
+fn is_satisfied(&self, ssn) -> Option<bool>       // Plugin
+PluginManager::is_satisfied -> bool               // first opinion wins; no opinion = true
+```
+
+MinMax answers `session_executors >= min(min_instances, session max_executors)`. It counts
+executors bound or staged in this cycle. The cap keeps a gang larger than the session limit
+from waiting forever.
+
+It is not `is_ready`: see section 3.
+
+### 4.3 Dispatch
+
+For each session popped from the queue that is underused and not `is_ready`:
+
+1. Open a `Statement`.
+2. While there is an eligible Idle executor (`select_executor`): stage a bind, remove the
+   executor from the pool, and stop once `is_satisfied` holds.
+3. If nothing was staged, or `is_satisfied` is false: discard and return the executors to the
+   pool for the next session.
+4. Otherwise commit, and re-queue the session while it is still underused and not ready, so
+   executors beyond the minimum are bound one per turn as before.
+
+A session with `min_instances` of 0 or 1 is satisfied by its first bind, so it commits one
+bind per turn, as before.
+
+**Allocate is unchanged**, and so is its limitation: it counts only executors that are bound
+or pipelined for the session. An executor Allocate creates has no session (`ssn_id` is none)
+until Dispatch binds it, so Idle executors a gang is waiting on are not counted, and Allocate
+can create more executors than the shortfall while the gang is incomplete. Nothing runs
+partially, because Dispatch binds none of them until the whole minimum is Idle, and the extra
+executors are released after the application's `delay_release`. Fixing it means staging
+Allocate's pipeline and creation in the same `Statement`; see open questions.
+
+### 4.4 Context exported to the service
+
+A gang member must know its session, its task and the size of the gang.
+
+```python
+ctx = flamepy.app.context()
+ctx.session_id      # the session the invocation runs in
+ctx.task_id         # the task being invoked
+ctx.min_instances   # the session's minimum: the gang size (0 if none)
+```
+
+`context()` returns an `InstanceContext` and raises `RuntimeError` outside an invocation.
+`min_instances` travels like the other session fields:
+
+- `rpc/protos/shim.proto`: `uint32 min_instances = 5;` in `SessionContext` (copied to
+  `sdk/rust/protos` and `sdk/python/protos`).
+- `common::apis::SessionContext` carries it from the session spec to the shim request.
+- `flamepy.core.service.SessionContext.min_instances`, filled by the aio servicer.
+- `flamepy.app.runpy` binds the `TaskContext` with the session context for each invocation, so
+  `context()` has the task id.
+- The Rust SDK `SessionContext` carries `min_instances`; the WASM shim does not yet.
+
+Notes:
+
+- **Rank.** The rank of a task is `task_id % min_instances`. Task ids of a session are a
+  sequence that starts at 1 and a retried task keeps its id. A gang submits `min_instances`
+  tasks back to back, which get consecutive ids, and N consecutive ids cover every residue
+  mod N exactly once, so the ranks are unique and complete (ids 1..N give ranks 1..N-1, 0).
+  This holds when:
+  1. the N tasks of the gang are submitted together, in one session, without other tasks
+     interleaved by another submitter; and
+  2. each of the N tasks blocks until all members have joined (a collective
+     `init_process_group` or a barrier), so each runs on its own executor.
+
+  The rank is a property of the task, not of the executor: a later call may run on a different
+  executor. A service that needs a stable rank per executor reads it in the blocking call and
+  keeps it. The rendezvous address is shared through the cache: rank 0 publishes its address
+  under a key derived from the session id, the others wait for it.
+
+### 4.5 Removal of the unused `batch_size` field
+
+The session `batch_size` field was reserved for a batch-scheduling feature that was never
+implemented: it is fixed to 1 everywhere and nothing reads it. Gang size comes from
+`min_instances`, so the field is removed:
+
+- `types.proto`: remove `batch_size = 7` from `SessionSpec` and reserve field number 7 and the
+  name, so it is not reused (the three copies of the file stay in sync).
+- Rust API, storage engines and Python/Rust SDKs: remove the field, the builder and keyword
+  argument, and the normalization tests.
+- SQLite: a new migration drops `sessions.batch_size`. The existing migration is unchanged.
+  The filesystem engine ignores the field in sessions written earlier.
+- The design documents of the batch-session and batch-aware fairshare features
+  (RFE400, RFE408) are removed, and other documents drop their references.
+
+The reserved executor column `batch_index` is not part of this change.
+
+### 4.6 What does not change
+
+- Sessions with `min_instances` of 0 or 1.
+- Growth beyond the minimum for pending tasks: it happens one executor at a time as today.
+- `is_underused`, `is_ready`, `is_overused`, and Shuffle.
+- Validation: `max_instances >= min_instances` is already required.
+
+## 5. Edge cases
+
+| Case | Behavior |
+| ---- | -------- |
+| `min_instances > max_instances` | Rejected at session creation. |
+| Gang larger than the session limit | The gang size is capped at the limit (4.2). |
+| Gang larger than the cluster | Never satisfied; Dispatch discards each cycle and logs a debug line. |
+| Executor of a gang session released or interrupted | Count drops below the minimum; Dispatch binds a replacement only when the whole shortfall can be bound. Running tasks are not stopped by the scheduler. |
+| Two gangs competing for Idle executors | Sessions are processed in plugin order. The first stages and commits; the second finds too few Idle executors and discards. |
+| Gang plus a non-gang session | The non-gang session can use executors a blocked gang skipped. A gang that never fits can starve behind a stream of small sessions; see open questions. |
+| `bind_session` fails during commit | Binds already applied stay; the rest are discarded and the next cycle retries (4.1). |
+| Session closed | Demand is zero; the existing release paths run. |
+
+## 6. Alternatives considered
+
+- **Count Idle executors up front and bind the shortfall.** Works for Dispatch alone but needs
+  a shortfall count from the plugin and a separate path for gangs. The `Statement` uses one
+  flow for every session and the plugin only answers "is the minimum held".
+- **Opt-in with a session attribute.** Safer for existing users, but the meaning of
+  `min_instances` already is "at least this many". Open question 1.
+
+## 7. Test plan
+
+Unit tests (`session_manager/src/scheduler`):
+
+- Dispatch: 2 Idle and min 2 binds both; 1 Idle and min 2 binds none; 3 Idle and min 2 binds 2
+  when there are no tasks; min 1 binds one, as before.
+- Dispatch: two gangs, supply for one: the first binds, the second binds none.
+- `Statement`: `discard` restores the plugin counters and the snapshot and never touches the
+  controller; `is_satisfied` flips when the second bind is staged and back on discard.
+- Allocate: unchanged behavior, covered by the existing tests.
+
+SDK (`sdk/python/tests`, `sdk/rust`): `min_instances` reaches `SessionContext`;
+`app.context()` returns the session id, task id and `min_instances` inside an invocation and
+raises outside one.
+
+End-to-end:
+
+- `test_app.py`: `test_app_instance_context` checks `session_id`, `task_id` and
+  `min_instances`; `test_app_gang_members_run_concurrently` runs two long tasks of a
+  `min_instances=2` service and checks unique ranks, distinct executors and overlapping start
+  times.
+- `test_session.py` (`TestGangScheduling`) sizes the cluster from `list_nodes` by picking a cpu
+  request that fits 4 to 6 executors, then checks, using `list_executors`:
+  - a minimum above the capacity binds nothing and its task stays pending;
+  - two gangs that fit together both get all their executors, and a task runs;
+  - two gangs that each fit but not together: the executor count of every gang is always 0 or
+    its minimum, exactly one gang runs, and the other starts once the first is closed;
+  - a gang that cannot start does not hold back a session with `min_instances` of 1.
+
+## 8. Rollout
+
+Behavior changes only for sessions with `min_instances >= 2`. Document it in the user
+guide next to `min_instances`, together with `app.context()`.
+
+## 9. Open questions
+
+1. Apply to every session with `min_instances >= 2`, or only to sessions that opt in?
+2. Report a gang that cannot start (a session event or condition) so users see why it is pending.
+3. Stage Allocate's pipeline and creation in the `Statement` too, to remove the over-creation
+   in 4.3? It needs inverse plugin hooks for pipeline and create and deferred executor creation.
+4. A gang that never fits can starve behind small sessions. Reserve capacity for it (backfill
+   rules), or leave this to priority and Shuffle?
+5. The WASM shim's `SessionContext` does not carry `min_instances` yet.

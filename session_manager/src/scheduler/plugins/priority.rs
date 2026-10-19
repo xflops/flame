@@ -103,7 +103,6 @@ mod tests {
             state: SessionState::Open,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority,
             resreq: Some(ResourceRequirement {
                 cpu: 1,

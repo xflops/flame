@@ -24,11 +24,13 @@ This module tests:
 """
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 
 import flamepy
 import pytest
 from flamepy import SessionState, TaskState
+from flamepy.proto.types_pb2 import NodeState
 
 from e2e.api import TestRequest
 from e2e.helpers import invoke_task, serialize_request
@@ -194,21 +196,6 @@ class TestResourceRequirements:
         request = TestRequest(input="test")
         response = invoke_task(session, request)
         assert response.output == "test"
-
-        session.close()
-
-    def test_session_batch_size(self):
-        """Test that the reserved batch_size argument is normalized to one."""
-        session_id = f"test-batch-{random_string(8)}"
-        session = flamepy.create_session(
-            application=FLM_TEST_SVC_APP,
-            session_id=session_id,
-            batch_size=2,
-            min_instances=2,
-        )
-
-        assert session.id == session_id
-        assert session.state == SessionState.OPEN
 
         session.close()
 
@@ -695,6 +682,143 @@ class TestConcurrentTasks:
         assert len(results) == task_num
 
         session.close()
+
+
+# =============================================================================
+# Gang scheduling tests
+# =============================================================================
+
+
+def _executors_bound_to(session_id):
+    return [executor for executor in flamepy.list_executors() if executor.status.session_id == session_id]
+
+
+def _wait_for_no_executors(timeout_seconds=30):
+    """Let executors retained by earlier tests go away so capacity is known."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not flamepy.list_executors():
+            return
+        time.sleep(0.5)
+
+
+def _gang_capacity():
+    """Pick a per-executor resreq that makes the cluster fit 4 to 6 executors.
+
+    Only cpu is varied, so the capacity is the sum over Ready nodes of
+    allocatable_cpu // cpu. Returns (resreq, capacity), or skips the test.
+    """
+    cpus = [node.status.allocatable.cpu for node in flamepy.list_nodes() if node.status.state == NodeState.Ready]
+    for cpu in range(1, max(cpus, default=0) + 1):
+        capacity = sum(allocatable // cpu for allocatable in cpus)
+        if capacity <= 6:
+            if capacity < 4:
+                break
+            return flamepy.ResourceRequirement(cpu=cpu, memory=1, gpu=0), capacity
+    pytest.skip(f"Cannot size a 4-6 executor cluster from node cpus {cpus}")
+
+
+def _create_gang(resreq, min_instances):
+    return flamepy.create_session(
+        application=FLM_TEST_SVC_APP,
+        session_id=f"test-gang-{random_string(8)}",
+        min_instances=min_instances,
+        resreq=resreq,
+    )
+
+
+def _wait_until(predicate, what, timeout_seconds=60):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.2)
+    pytest.fail(f"Timed out waiting for {what}")
+
+
+def _assert_all_or_nothing(sessions, sizes, seconds):
+    """Over `seconds`, no gang is ever bound to a part of its minimum."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        for session, size in zip(sessions, sizes):
+            bound = len(_executors_bound_to(session.id))
+            assert bound in (0, size), f"Gang {session.id} holds {bound} of {size} executors"
+        time.sleep(0.1)
+
+
+class TestGangScheduling:
+    """A session with min_instances >= 2 is bound to executors all at once or not at all."""
+
+    @pytest.fixture(autouse=True)
+    def cluster(self):
+        _wait_for_no_executors()
+        self.resreq, self.capacity = _gang_capacity()
+        yield
+
+    def test_gang_larger_than_cluster_binds_nothing(self):
+        """A minimum above the cluster capacity never binds any executor."""
+        session = _create_gang(self.resreq, self.capacity + 1)
+        try:
+            session.create_task(serialize_request(TestRequest(input="waiting")))
+            _assert_all_or_nothing([session], [self.capacity + 1], seconds=10)
+            assert not _executors_bound_to(session.id)
+            assert flamepy.get_session(session.id).pending == 1, "The task must stay pending"
+        finally:
+            session.close()
+
+    def test_gangs_within_capacity_all_start(self):
+        """Gangs that together fit the cluster all get their executors."""
+        size = self.capacity // 2
+        sessions = [_create_gang(self.resreq, size), _create_gang(self.resreq, size)]
+        try:
+            for session in sessions:
+                _wait_until(lambda session=session: len(_executors_bound_to(session.id)) == size, f"{session.id} to hold {size} executors")
+            _assert_all_or_nothing(sessions, [size, size], seconds=3)
+
+            response = invoke_task(sessions[0], TestRequest(input="gang_task"))
+            assert response.output == "gang_task"
+        finally:
+            for session in sessions:
+                session.close()
+
+    def test_gangs_beyond_capacity_never_hold_a_partial_set(self):
+        """Gangs that each fit but not together: one runs, the other waits whole, then takes over."""
+        size = self.capacity // 2 + 1
+        first, second = _create_gang(self.resreq, size), _create_gang(self.resreq, size)
+        sessions = [first, second]
+        try:
+            _wait_until(lambda: any(len(_executors_bound_to(session.id)) == size for session in sessions), "one gang to start")
+            _assert_all_or_nothing(sessions, [size, size], seconds=10)
+
+            running = [session for session in sessions if len(_executors_bound_to(session.id)) == size]
+            waiting = [session for session in sessions if session not in running]
+            assert len(running) == 1 and len(waiting) == 1, "Exactly one gang fits at a time"
+            assert not _executors_bound_to(waiting[0].id)
+
+            running[0].close()
+            _wait_until(lambda: len(_executors_bound_to(waiting[0].id)) == size, "the waiting gang to start once capacity frees up")
+        finally:
+            for session in sessions:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+    def test_single_instance_sessions_are_not_held_back(self):
+        """A gang that cannot start does not stop sessions with min_instances of 1."""
+        gang = _create_gang(self.resreq, self.capacity + 1)
+        single = flamepy.create_session(
+            application=FLM_TEST_SVC_APP,
+            session_id=f"test-single-{random_string(8)}",
+            min_instances=1,
+            resreq=self.resreq,
+        )
+        try:
+            _wait_until(lambda: len(_executors_bound_to(single.id)) == 1, "the single-instance session to start")
+            assert not _executors_bound_to(gang.id)
+        finally:
+            gang.close()
+            single.close()
 
 
 # =============================================================================

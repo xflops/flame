@@ -20,13 +20,32 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import FrozenSet, Iterable, Iterator, Optional
 
-from flamepy.core.service import SessionContext, _validate_attributes
+from flamepy.core.service import SessionContext, TaskContext, _validate_attributes
+
+
+@dataclass(frozen=True)
+class InstanceContext:
+    """What the current App invocation knows about its session and task.
+
+    Attributes:
+        session_id: The session the invocation runs in.
+        task_id: The task being invoked.
+        min_instances: The session's minimum number of executors, i.e. the
+            size of a gang (0 if the session has no minimum). A task that
+            blocks until ``min_instances`` members have joined, such as a
+            collective ``init_process_group``, can use it as the world size.
+    """
+
+    session_id: str
+    task_id: Optional[str]
+    min_instances: int
 
 
 @dataclass
 class _InvocationContext:
     session_context: SessionContext
     attributes: set[bytes]
+    task_context: Optional[TaskContext] = None
 
 
 _current_invocation_context: ContextVar[Optional[_InvocationContext]] = ContextVar(
@@ -52,6 +71,19 @@ def session_context() -> SessionContext:
     return context.session_context
 
 
+def context() -> InstanceContext:
+    """Return the session id, task id and ``min_instances`` of the current App invocation."""
+    invocation = _current_invocation_context.get()
+    if invocation is None:
+        raise RuntimeError("App code is not running in a Flame invocation")
+    task = invocation.task_context
+    return InstanceContext(
+        session_id=invocation.session_context.session_id,
+        task_id=task.task_id if task is not None else None,
+        min_instances=invocation.session_context.min_instances,
+    )
+
+
 def publish_attributes(attributes: Iterable[bytes]) -> None:
     """Publish executor-local affinity attributes for the current response."""
     context = _current_invocation_context.get()
@@ -65,12 +97,14 @@ def publish_attributes(attributes: Iterable[bytes]) -> None:
 
 @contextmanager
 def _bind_invocation_context(
-    context: SessionContext,
+    session: SessionContext,
+    task: Optional[TaskContext] = None,
 ) -> Iterator[_InvocationContext]:
     """Bind runtime capabilities while user App code is executing."""
     invocation_context = _InvocationContext(
-        session_context=context,
+        session_context=session,
         attributes=set(),
+        task_context=task,
     )
     token = _current_invocation_context.set(invocation_context)
     try:

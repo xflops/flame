@@ -244,7 +244,6 @@ impl Engine for NoneEngine {
             tokens: attr.tokens,
             min_instances: attr.min_instances,
             max_instances: attr.max_instances,
-            batch_size: 1,
             priority: attr.priority,
             resreq: attr.resreq,
             status: SessionStatus {
@@ -422,7 +421,6 @@ mod tests {
             common_data: None,
             min_instances: 1,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         };
@@ -461,7 +459,6 @@ mod tests {
             common_data: None,
             min_instances: 1,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         };
@@ -497,7 +494,6 @@ mod tests {
             common_data: None,
             min_instances: 1,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         };
@@ -510,7 +506,6 @@ mod tests {
             common_data: None,
             min_instances: 1,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         };
@@ -546,7 +541,6 @@ mod tests {
             common_data: None,
             min_instances: 1,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         };

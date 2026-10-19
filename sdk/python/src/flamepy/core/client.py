@@ -39,11 +39,10 @@ def create_session(
     session_id: Optional[str] = None,
     min_instances: int = 0,
     max_instances: Optional[int] = None,
-    batch_size: int = 1,
     resreq: Optional[ResourceRequirement] = None,
     tokens: Optional[Dict[str, str]] = None,
 ) -> "Session":
-    return ConnectionInstance.instance().create_session(SessionAttributes(id=session_id, application=application, common_data=common_data, tokens=tokens or {}, min_instances=min_instances, max_instances=max_instances, batch_size=1, resreq=resreq))
+    return ConnectionInstance.instance().create_session(SessionAttributes(id=session_id, application=application, common_data=common_data, tokens=tokens or {}, min_instances=min_instances, max_instances=max_instances, resreq=resreq))
 
 
 def open_session(session_id: SessionID, spec: Optional[SessionAttributes] = None) -> "Session":

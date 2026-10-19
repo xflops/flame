@@ -43,7 +43,7 @@ session.close()
 Public helpers:
 
 - `connect(addr, tls_config=None) -> Connection`
-- `create_session(application, common_data=None, session_id=None, min_instances=0, max_instances=None, batch_size=1, resreq=None) -> Session`
+- `create_session(application, common_data=None, session_id=None, min_instances=0, max_instances=None, resreq=None) -> Session`
 - `open_session(session_id, spec=None) -> Session`
 - `register_application(name, app_attrs) -> None`
 - `unregister_application(name) -> None`
@@ -82,7 +82,6 @@ dispatches user completion callbacks away from the shared aio loop.
 - `common_data: bytes | None`
 - `min_instances: int`
 - `max_instances: int | None`
-- `batch_size: int` (reserved for future implementation; currently normalized to `1`)
 - `resreq: ResourceRequirement | None`
 
 `ApplicationAttributes`:
@@ -199,6 +198,12 @@ Key classes and helpers:
 
 - `app.session_context()` returns the active service-side session context
   (`flamepy.SessionContext`) during an App invocation.
+- `app.context()` returns an `app.InstanceContext` with the `session_id`, `task_id`
+  and `min_instances` of the current App invocation. `min_instances` is the
+  session's minimum number of executors, which the scheduler binds all at once
+  or not at all (a gang). A task that blocks until `min_instances` members have
+  joined, such as a collective `init_process_group`, can use it as the world
+  size. It raises `RuntimeError` outside an invocation.
 - `app.publish_attributes(attrs)` adds opaque `bytes` locality keys to the
   current App response; repeated calls in the response accumulate. Session
   Manager unions every response into the executor's retained set.

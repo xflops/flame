@@ -77,7 +77,6 @@ pub struct SessionDao {
     pub state: i32,
     pub min_instances: i64,
     pub max_instances: Option<i64>,
-    pub batch_size: i64,
     pub priority: i64,
 
     pub resreq_cpu: Option<i64>,
@@ -176,7 +175,6 @@ impl TryFrom<&SessionDao> for Session {
             events: vec![],
             min_instances: ssn.min_instances as u32,
             max_instances: ssn.max_instances.map(|v| v as u32),
-            batch_size: 1,
             priority: ssn.priority as u32,
             resreq,
             retry_count: 0,

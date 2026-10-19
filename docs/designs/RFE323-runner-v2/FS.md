@@ -166,7 +166,6 @@ message SessionSpec {
   optional bytes common_data = 4;
   uint32 min_instances = 5;
   optional uint32 max_instances = 6;  // NULL means unlimited
-  uint32 batch_size = 7;
   uint32 priority = 8;
   optional ResourceRequirement resreq = 9;
 }
@@ -841,7 +840,6 @@ message SessionSpec {
   optional bytes common_data = 4;
   uint32 min_instances = 5;  // Minimum number of instances (default: 0)
   optional uint32 max_instances = 6;  // Maximum number of instances (null means unlimited)
-  uint32 batch_size = 7;
   uint32 priority = 8;
   optional ResourceRequirement resreq = 9;
 }

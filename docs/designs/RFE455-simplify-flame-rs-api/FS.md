@@ -218,7 +218,6 @@ pub struct SessionOptions {
     pub common_data: Option<CommonData>,
     pub min_instances: u32,
     pub max_instances: Option<u32>,
-    pub batch_size: u32,
     pub priority: u32,
     pub resreq: Option<ResourceRequirement>,
 }
@@ -229,7 +228,6 @@ impl SessionOptions {
     pub fn common_data(self, data: impl IntoCommonData) -> Result<Self, FlameError>;
     pub fn min_instances(self, value: u32) -> Self;
     pub fn max_instances(self, value: u32) -> Self;
-    pub fn batch_size(self, value: u32) -> Self;
     pub fn priority(self, value: u32) -> Self;
     pub fn resreq(self, value: impl Into<ResourceRequirement>) -> Self;
 }
@@ -239,7 +237,7 @@ impl From<String> for SessionOptions;
 impl From<SessionOptions> for SessionAttributes;
 ```
 
-Defaults match FlamePy and the current Rust examples: a generated session ID using `<application>-<short_name>`, `min_instances = 0`, `max_instances = None`, `batch_size = 1`, `priority = 0`, and no explicit resource requirement.
+Defaults match FlamePy and the current Rust examples: a generated session ID using `<application>-<short_name>`, `min_instances = 0`, `max_instances = None`, `priority = 0`, and no explicit resource requirement.
 
 Payload serialization uses one message trait for task input, task output, and common data:
 
@@ -816,7 +814,6 @@ pub struct SessionOptions {
     common_data: Option<CommonData>,
     min_instances: u32,
     max_instances: Option<u32>,
-    batch_size: u32,
     priority: u32,
     resreq: Option<ResourceRequirement>,
 }

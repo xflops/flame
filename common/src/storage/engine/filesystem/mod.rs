@@ -840,7 +840,6 @@ impl FilesystemEngine {
             status: SessionStatus { state },
             min_instances: meta.min_instances,
             max_instances: meta.max_instances,
-            batch_size: 1,
             priority: meta.priority,
             resreq,
             retry_count: 0,
@@ -1212,7 +1211,6 @@ impl Engine for FilesystemEngine {
             completion_time: None,
             min_instances: attr.min_instances,
             max_instances: attr.max_instances,
-            batch_size: 1,
             priority: attr.priority,
             common_data_len,
             tokens: attr.tokens,
@@ -2071,7 +2069,6 @@ mod tests {
             common_data: Some(Bytes::from("test data")),
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         };
@@ -2142,7 +2139,6 @@ mod tests {
             common_data: None,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         };
@@ -2281,7 +2277,6 @@ mod tests {
             common_data: None,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         };
@@ -2326,7 +2321,6 @@ mod tests {
             common_data: None,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         };
@@ -2393,7 +2387,6 @@ mod tests {
             common_data: None,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
         };
@@ -3152,7 +3145,7 @@ mod tests {
         let (_engine, dir) = engine_with_session("entry-json").await;
         let path = dir.path().join("sessions/entry-json/metadata");
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(json.as_object().unwrap().len(), 15);
+        assert_eq!(json.as_object().unwrap().len(), 14);
         for field in ["dir", "commit", "tasks", "files"] {
             assert!(
                 json.get(field).is_none(),

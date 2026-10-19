@@ -460,19 +460,17 @@ impl Frontend for Flame {
             tokens: ssn_spec.tokens,
             min_instances: ssn_spec.min_instances,
             max_instances: ssn_spec.max_instances,
-            batch_size: 1,
             priority: ssn_spec.priority,
             resreq: Some(resreq),
         };
 
         tracing::debug!(
-            "Creating session with attributes: id={}, application={}, resreq={:?}, min_instances={}, max_instances={:?}, batch_size={}, priority={}",
+            "Creating session with attributes: id={}, application={}, resreq={:?}, min_instances={}, max_instances={:?}, priority={}",
             attr.id,
             attr.application,
             attr.resreq,
             attr.min_instances,
             attr.max_instances,
-            attr.batch_size,
             attr.priority,
         );
 
@@ -528,7 +526,6 @@ impl Frontend for Flame {
                     tokens: ssn_spec.tokens,
                     min_instances: ssn_spec.min_instances,
                     max_instances: ssn_spec.max_instances,
-                    batch_size: 1,
                     priority: ssn_spec.priority,
                     resreq: Some(resreq),
                 })

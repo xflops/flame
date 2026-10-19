@@ -198,7 +198,6 @@ async fn run_session(
         common_data: None,
         min_instances: 0,
         max_instances: None,
-        batch_size: 1,
         priority: 0,
         resreq: None,
         tokens: Default::default(),

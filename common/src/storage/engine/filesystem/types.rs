@@ -214,8 +214,6 @@ pub(super) struct SessionMetadata {
     pub(super) completion_time: Option<i64>,
     pub(super) min_instances: u32,
     pub(super) max_instances: Option<u32>,
-    #[serde(default = "default_batch_size")]
-    pub(super) batch_size: u32,
     #[serde(default)]
     pub(super) priority: u32,
     pub(super) common_data_len: u64,
@@ -237,10 +235,6 @@ pub(super) struct SessionEntry {
     pub(super) commit: Mutex<()>,
     pub(super) tasks: parking_lot::Mutex<HashMap<TaskID, RWPtr<()>>>,
     pub(super) files: [StdMutex<Option<Arc<PayloadFile>>>; Part::COUNT],
-}
-
-fn default_batch_size() -> u32 {
-    1
 }
 
 impl SessionEntry {

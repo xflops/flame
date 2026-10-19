@@ -19,6 +19,7 @@ use stdng::{logs::TraceFn, trace_fn};
 use crate::model::{IDLE_EXECUTOR, READY_SESSION};
 use crate::scheduler::actions::{Action, ActionPtr};
 use crate::scheduler::plugins::ssn_order_fn;
+use crate::scheduler::statement::Statement;
 use crate::scheduler::Context;
 
 use crate::FlameError;
@@ -79,20 +80,44 @@ impl Action for DispatchAction {
                 &ssn.id
             );
 
-            let available = ctx.select_executor(&ssn, &idle_executors)?;
-            if let Some(exec) = available {
-                ctx.bind_session(&exec, &ssn).await?;
+            // Like a kube-batch gang, every session binds through a Statement:
+            // stage binds until the session holds its minimum (`min_instances`,
+            // 0 or 1 is met by the first bind), then commit. A session that
+            // cannot reach its minimum from the Idle executors is discarded,
+            // so a group that blocks until every member is present never holds
+            // a partial set of running executors.
+            let mut statement = Statement::new(ctx);
+            while let Some(exec) = ctx.select_executor(&ssn, &idle_executors)? {
+                statement.bind(&exec, &ssn)?;
                 idle_executors.remove(&exec.id);
-
-                // A session may need more than one executor. Give Dispatch the
-                // first opportunity to satisfy that demand from retained Idle
-                // executors before Allocate creates new ones. `is_underused`
-                // says the session remains eligible for capacity, while
-                // `is_ready` also counts pipelined capacity and prevents us
-                // from requeueing when that in-flight capacity is sufficient.
-                if !idle_executors.is_empty() && ctx.is_underused(&ssn)? && !ctx.is_ready(&ssn)? {
-                    open_ssns.push(ssn);
+                if ctx.is_satisfied(&ssn)? {
+                    break;
                 }
+            }
+
+            if statement.is_empty() || !ctx.is_satisfied(&ssn)? {
+                tracing::debug!(
+                    "Session <{}> cannot be bound from the Idle executors, wait.",
+                    ssn.id
+                );
+                idle_executors.extend(
+                    statement
+                        .discard()?
+                        .into_iter()
+                        .map(|exec| (exec.id.clone(), exec)),
+                );
+                continue;
+            }
+            statement.commit().await?;
+
+            // A session may need more than one executor. Give Dispatch the
+            // first opportunity to satisfy that demand from retained Idle
+            // executors before Allocate creates new ones. `is_underused`
+            // says the session remains eligible for capacity, while
+            // `is_ready` also counts pipelined capacity and prevents us
+            // from requeueing when that in-flight capacity is sufficient.
+            if !idle_executors.is_empty() && ctx.is_underused(&ssn)? && !ctx.is_ready(&ssn)? {
+                open_ssns.push(ssn);
             }
         }
 

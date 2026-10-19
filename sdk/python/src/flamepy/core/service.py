@@ -118,6 +118,8 @@ class SessionContext:
     session_id: str
     application: ApplicationContext
     tokens: Dict[str, str] = field(default_factory=dict, repr=False)
+    min_instances: int = 0
+    """The session's minimum number of executors: the size of a gang (0 if none)."""
 
     def common_data(self) -> Optional[bytes]:
         """Get the common data as bytes."""

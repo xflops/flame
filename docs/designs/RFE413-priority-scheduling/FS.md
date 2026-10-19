@@ -11,7 +11,7 @@
 
 ### Background
 
-The Flame scheduler historically supported **fairshare scheduling** (RFE400/RFE408), which distributed cluster resources proportionally across sessions based on their demand. While fairshare was appropriate for general equal-weight workloads, it did not support explicit prioritization:
+The Flame scheduler historically supported **fairshare scheduling**, which distributed cluster resources proportionally across sessions based on their demand. While fairshare was appropriate for general equal-weight workloads, it did not support explicit prioritization:
 
 - All sessions compete proportionally with no priority ordering
 - There is no way to express that some workloads are more time-critical than others
@@ -71,7 +71,6 @@ message SessionSpec {
   optional bytes common_data = 4;
   uint32 min_instances = 5;
   optional uint32 max_instances = 6;
-  uint32 batch_size = 7;
 
   // NEW: Session priority (default: 0, higher value = higher priority)
   uint32 priority = 8;
@@ -179,7 +178,6 @@ session = flame.open_session(
 | Feature | Interaction |
 | ------- | ----------- |
 | **DRF (RFE433)** | Priority ordering overlays DRF's dominant-resource fairness ordering. Within the same priority level, DRF determines per-session resource shares and session ordering by dominant resource fraction. |
-| **GangPlugin (RFE400)** | Orthogonal. `batch_size` constraints apply within a priority level independently of priority ordering. |
 | **AllocateAction** | Consults `ssn_order_fn` from all plugins; PriorityPlugin's ordering ensures high-priority sessions are processed before low-priority ones. |
 | **DispatchAction** | Consults `is_underused` from all plugins; PriorityPlugin blocks dispatch to lower-priority sessions when any higher-priority session is needy. |
 | **ShuffleAction** | Unchanged in V1. Priority-based preemption (reclaiming executors via ShuffleAction) is deferred. |
@@ -282,7 +280,6 @@ message SessionSpec {
   optional bytes common_data = 4;
   uint32 min_instances = 5;
   optional uint32 max_instances = 6;
-  uint32 batch_size = 7;
   uint32 priority = 8;  // NEW: default 0 (lowest priority)
   optional ResourceRequirement resreq = 9;  // Explicit resource request; server applies cluster default when omitted
 }
@@ -297,7 +294,6 @@ pub struct SessionAttributes {
     pub common_data: Option<CommonData>,
     pub min_instances: u32,
     pub max_instances: Option<u32>,
-    pub batch_size: u32,
     pub priority: u32,  // NEW: default 0
     pub resreq: Option<ResourceRequirement>,
 }
@@ -310,7 +306,6 @@ impl Default for SessionAttributes {
             common_data: None,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,  // NEW
             resreq: None,
         }
@@ -335,7 +330,6 @@ pub struct SessionInfo {
     pub state: SessionState,
     pub min_instances: u32,
     pub max_instances: Option<u32>,
-    pub batch_size: u32,
     pub priority: u32,  // NEW
     pub resreq: Option<ResourceRequirement>,
 }
@@ -366,7 +360,6 @@ fn session_spec_to_attributes(id: &str, spec: &SessionSpec) -> SessionAttributes
         common_data: spec.common_data.clone(),
         min_instances: spec.min_instances,
         max_instances: spec.max_instances,
-        batch_size: spec.batch_size.max(1),
         priority: spec.priority,  // NEW
         resreq: spec.resreq.map(apis::ResourceRequirement::from),
     }
@@ -607,11 +600,7 @@ fn compute_demand(ssn: &SessionInfo, per_task: &ResourceRequirement) -> Resource
             task_count = task_count.saturating_add((*c).max(0) as u32);
         }
     }
-    let batch_size = ssn.batch_size.max(1);
-    // Integer floor: for non-negative counts, `/` is floor.
-    let batched = (task_count / batch_size) * batch_size;
-
-    let mut demand = per_task.mul(batched);
+    let mut demand = per_task.mul(task_count);
 
     if let Some(max_i) = ssn.max_instances {
         // Per-field clamp from above.
@@ -662,7 +651,6 @@ pub async fn run(
     ctx: &FlameContext,
     app: &str,
     resreq: Option<ResourceRequirement>,
-    batch_size: &u32,
     priority: &u32,  // NEW parameter
 ) -> Result<(), Box<dyn Error>> {
     let conn = build_connection(ctx).await?;
@@ -672,7 +660,6 @@ pub async fn run(
         common_data: None,
         min_instances: 0,
         max_instances: None,
-        batch_size: *batch_size,
         priority: *priority,  // NEW
         resreq,
     };
@@ -695,10 +682,6 @@ struct CreateArgs {
     /// when omitted, the server applies `cluster.resreq`.
     #[arg(short = 'r', long)]
     resreq: Option<String>,
-
-    /// Executors per batch (gang scheduling)
-    #[arg(short = 'b', long, default_value = "1")]
-    batch_size: u32,
 
     /// Session priority (higher = more important, default: 0)
     #[arg(short = 'p', long, default_value = "0")]  // NEW
@@ -837,7 +820,7 @@ Because PriorityPlugin caps `Σ ssn_desired ≤ total` per-field (see invariants
 
 #### Example Walkthrough
 
-All sessions below use `batch_size=1` for clarity, so `compute_demand(ssn, per_task) = task_count × per_task` capped/floored as usual (per-field).
+`compute_demand(ssn, per_task) = task_count × per_task` capped/floored as usual (per-field).
 
 **Note on units in these examples.** All three sessions in this walkthrough have `resreq = (cpu=2, memory=2, gpu=0)` for A and B and `resreq = (cpu=4, memory=4, gpu=0)` for C — the numbers happen to coincide with the legacy "slots × unit = (1, 1, 0)" view, so the values below can be read as either cpu units or memory units (gpu = 0 throughout). The per-resource implementation in §3 *PriorityPlugin* is what runs in production.
 
@@ -1095,8 +1078,6 @@ llm-inference pending=0, batch-work becomes eligible.
 
 ### Related Documents
 
-- [RFE400 - Batch Support in Session](../RFE400-batch-session/FS.md)
-- [RFE408 - Enhance Fairshare for batch_size](../RFE408-fairshare-batch-size/FS.md) (historical; fairshare plugin removed)
 
 ### External References
 

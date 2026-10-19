@@ -325,7 +325,6 @@ mod tests {
             state: SessionState::Open,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: Some(rr(1)),
             retry_count: 0,

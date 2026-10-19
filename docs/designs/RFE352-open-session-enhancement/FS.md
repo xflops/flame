@@ -720,7 +720,6 @@ message SessionSpec {
   optional bytes common_data = 4;
   uint32 min_instances = 5;
   optional uint32 max_instances = 6;
-  uint32 batch_size = 7;
   uint32 priority = 8;
   optional ResourceRequirement resreq = 9;
 }

@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from flamepy.app._context import publish_attributes, session_context
+from flamepy.app._context import InstanceContext, context, publish_attributes, session_context
 from flamepy.app.types import ServiceContext, ServiceRequest, ServiceResponse
 from flamepy.core import Ref, ValueRef
 
@@ -35,6 +35,7 @@ from flamepy.app.client import (  # isort: skip
 )
 
 __all__ = [
+    "InstanceContext",
     "ObjectFuture",
     "ObjectFutureIterator",
     "Ref",
@@ -44,6 +45,7 @@ __all__ = [
     "ServiceRequest",
     "ServiceResponse",
     "ValueRef",
+    "context",
     "destroy",
     "get",
     "init",

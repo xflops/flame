@@ -82,7 +82,6 @@ async fn test_create_session() -> Result<(), FlameError> {
         common_data: None,
         min_instances: 0,
         max_instances: None,
-        batch_size: 1,
         priority: 0,
         resreq: None,
         tokens: Default::default(),
@@ -109,7 +108,6 @@ async fn test_create_multiple_sessions() -> Result<(), FlameError> {
             common_data: None,
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: None,
             tokens: Default::default(),
@@ -134,7 +132,6 @@ async fn test_create_session_with_tasks() -> Result<(), FlameError> {
         common_data: None,
         min_instances: 0,
         max_instances: None,
-        batch_size: 1,
         priority: 0,
         resreq: None,
         tokens: Default::default(),
@@ -197,7 +194,6 @@ async fn test_create_multiple_sessions_with_tasks() -> Result<(), FlameError> {
         common_data: None,
         min_instances: 0,
         max_instances: None,
-        batch_size: 1,
         priority: 0,
         resreq: None,
         tokens: Default::default(),
@@ -211,7 +207,6 @@ async fn test_create_multiple_sessions_with_tasks() -> Result<(), FlameError> {
         common_data: None,
         min_instances: 0,
         max_instances: None,
-        batch_size: 1,
         priority: 0,
         resreq: None,
         tokens: Default::default(),
@@ -311,50 +306,6 @@ async fn test_application_lifecycle() -> Result<(), FlameError> {
                 FlameError::Internal(format!("failed to register application <{name}>: {e}"))
             })?;
     }
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_session_normalizes_batch_size() -> Result<(), FlameError> {
-    let conn = get_connection().await?;
-
-    let ssn_attr = SessionAttributes {
-        id: String::from("ssn-normalized-batch-size"),
-        application: FLAME_DEFAULT_APP.to_string(),
-        common_data: None,
-        min_instances: 2,
-        max_instances: None,
-        batch_size: 2,
-        priority: 0,
-        resreq: None,
-        tokens: Default::default(),
-    };
-    let ssn = conn.create_session(&ssn_attr).await?;
-
-    assert_eq!(ssn.state, SessionState::Open);
-
-    let informer = new_ptr(DefaultTaskInformer {
-        succeed: 0,
-        failed: 0,
-        error: 0,
-    });
-
-    let task_num = 4;
-    let mut tasks = vec![];
-    for _ in 0..task_num {
-        let task = ssn.run_task(None, informer.clone());
-        tasks.push(task);
-    }
-
-    try_join_all(tasks).await?;
-
-    {
-        let informer = lock_ptr!(informer)?;
-        assert_eq!(informer.succeed, task_num);
-    }
-
-    ssn.close().await?;
 
     Ok(())
 }

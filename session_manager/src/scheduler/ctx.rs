@@ -21,6 +21,7 @@ use crate::controller::ControllerPtr;
 use crate::model::{ExecutorInfo, ExecutorInfoPtr, NodeInfoPtr, SessionInfoPtr, SnapShotPtr};
 use crate::scheduler::actions::{ActionPtr, AllocateAction, DispatchAction, ShuffleAction};
 use crate::scheduler::plugins::{PluginManager, PluginManagerPtr, PluginsOptions};
+use crate::scheduler::statement::Statement;
 use common::apis::{ExecutorID, ExecutorState, Signal};
 use common::FlameError;
 
@@ -55,8 +56,16 @@ impl Context {
         self.plugins.is_underused(ssn)
     }
 
+    /// Whether the session was given enough capacity this cycle, so no more
+    /// should be added. Not the same as `is_satisfied`.
     pub fn is_ready(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
         self.plugins.is_ready(ssn)
+    }
+
+    /// Whether the session holds its minimum (`min_instances`). Used to commit
+    /// or discard a `Statement`; see `Plugin::is_satisfied`.
+    pub fn is_satisfied(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
+        self.plugins.is_satisfied(ssn)
     }
 
     pub fn is_overused(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
@@ -136,25 +145,6 @@ impl Context {
         ssn: &SessionInfoPtr,
     ) -> Result<(), FlameError> {
         self.plugins.on_executor_pipeline(exec.clone(), ssn.clone())
-    }
-
-    pub async fn bind_session(
-        &self,
-        exec: &ExecutorInfoPtr,
-        ssn: &SessionInfoPtr,
-    ) -> Result<(), FlameError> {
-        self.controller
-            .bind_session(exec.id.clone(), ssn.id.clone())
-            .await?;
-        self.plugins.on_session_bind(exec.clone(), ssn.clone())?;
-        let bound = Arc::new(ExecutorInfo {
-            ssn_id: Some(ssn.id.clone()),
-            ..exec.as_ref().clone()
-        });
-        self.snapshot
-            .update_executor_state(bound, ExecutorState::Binding)?;
-
-        Ok(())
     }
 
     pub async fn interrupt_executor(

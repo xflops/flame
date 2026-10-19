@@ -21,6 +21,7 @@ message SessionContext {
     ApplicationContext application = 2;
     optional bytes common_data = 3;
     map<string, string> tokens = 4;
+    uint32 min_instances = 5;  // Session minimum: the size of a gang (0 if none)
 }
 
 message TaskContext {

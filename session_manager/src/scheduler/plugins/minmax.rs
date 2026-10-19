@@ -114,6 +114,14 @@ impl Plugin for MinMaxPlugin {
         (instances >= compute_demand(ssn) as usize).then_some(true)
     }
 
+    fn is_satisfied(&self, ssn: &SessionInfoPtr) -> Option<bool> {
+        // The minimum cannot exceed what the session limit allows.
+        let minimum = executor_limit(Some(ssn.min_instances), self.limits.session.max_executors)
+            .map_or(ssn.min_instances, |limit| limit.min(ssn.min_instances));
+        let instances = self.session_executors.get(&ssn.id).copied().unwrap_or(0);
+        Some(instances >= minimum as usize)
+    }
+
     fn is_overused(&self, ssn: &SessionInfoPtr) -> Option<bool> {
         let executors = self.session_executors.get(&ssn.id).copied().unwrap_or(0);
         let interrupted = self.session_interrupted.get(&ssn.id).copied().unwrap_or(0);

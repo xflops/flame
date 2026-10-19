@@ -152,7 +152,6 @@ def _session_spec(attrs: SessionAttributes) -> SessionSpec:
         tokens=attrs.tokens,
         min_instances=attrs.min_instances,
         max_instances=attrs.max_instances,
-        batch_size=1,
     )
     if attrs.resreq is not None:
         spec.resreq.CopyFrom(ResourceRequirementProto(cpu=attrs.resreq.cpu, memory=attrs.resreq.memory, gpu=attrs.resreq.gpu))

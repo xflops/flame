@@ -27,6 +27,7 @@ use common::FlameError;
 mod actions;
 mod ctx;
 mod plugins;
+mod statement;
 
 pub fn new(controller: ControllerPtr) -> Arc<dyn FlameThread> {
     Arc::new(ScheduleRunner { controller })
@@ -208,7 +209,6 @@ mod tests {
                 tokens: Default::default(),
                 min_instances: 0,
                 max_instances: None,
-                batch_size: 1,
                 priority: 0,
                 resreq: Some(common::apis::ResourceRequirement {
                     cpu: 1,
@@ -353,7 +353,6 @@ mod tests {
                 tokens: Default::default(),
                 min_instances: 0,
                 max_instances: None,
-                batch_size: 1,
                 priority: 0,
                 resreq: Some(common::apis::ResourceRequirement {
                     cpu: 1,
@@ -481,6 +480,200 @@ mod tests {
             assert_eq!(executor.ssn_id.as_ref(), Some(&session_ids[index]));
         }
 
+        Ok(())
+    }
+
+    /// Runs one Dispatch over `idle` retained Idle executors and a gang of
+    /// `min_instances`; returns the executors bound to the gang session.
+    fn gang_dispatch(min_instances: u32, idle: usize) -> Result<usize, FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        tokio_test::block_on(
+            controller
+                .storage()
+                .register_node(&new_test_node("node_1".to_string())),
+        )?;
+        let session =
+            tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+                id: format!("gang-{}", Uuid::new_v4()),
+                application: "flmtest".to_string(),
+                min_instances,
+                resreq: Some(ResourceRequirement {
+                    cpu: 1,
+                    memory: 1024,
+                    gpu: 0,
+                }),
+                ..Default::default()
+            }))?;
+        for _ in 0..idle {
+            let executor = tokio_test::block_on(
+                controller.create_executor("node_1".to_string(), session.id.clone()),
+            )?;
+            tokio_test::block_on(controller.register_executor(&executor))?;
+        }
+
+        let mut ctx = Context::new(controller.clone(), &PluginsOptions::default())?;
+        tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
+
+        Ok(controller
+            .list_executors()?
+            .iter()
+            .filter(|executor| executor.ssn_id.as_ref() == Some(&session.id))
+            .count())
+    }
+
+    #[test]
+    fn test_dispatch_gang_binds_whole_minimum_at_once() -> Result<(), FlameError> {
+        assert_eq!(gang_dispatch(2, 2)?, 2);
+        assert_eq!(gang_dispatch(3, 3)?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_dispatch_gang_binds_nothing_with_partial_supply() -> Result<(), FlameError> {
+        assert_eq!(gang_dispatch(2, 1)?, 0);
+        assert_eq!(gang_dispatch(3, 2)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_dispatch_gang_binds_only_minimum_without_tasks() -> Result<(), FlameError> {
+        assert_eq!(gang_dispatch(2, 3)?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_dispatch_single_instance_minimum_is_not_a_gang() -> Result<(), FlameError> {
+        assert_eq!(gang_dispatch(1, 1)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_dispatch_two_gangs_with_supply_for_one() -> Result<(), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        tokio_test::block_on(
+            controller
+                .storage()
+                .register_node(&new_test_node("node_1".to_string())),
+        )?;
+        let mut ids = vec![];
+        for index in 0..2 {
+            let session =
+                tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+                    id: format!("gang-{index}"),
+                    application: "flmtest".to_string(),
+                    min_instances: 2,
+                    resreq: Some(ResourceRequirement {
+                        cpu: 1,
+                        memory: 1024,
+                        gpu: 0,
+                    }),
+                    ..Default::default()
+                }))?;
+            ids.push(session.id);
+        }
+        for _ in 0..2 {
+            let executor = tokio_test::block_on(
+                controller.create_executor("node_1".to_string(), ids[0].clone()),
+            )?;
+            tokio_test::block_on(controller.register_executor(&executor))?;
+        }
+
+        let mut ctx = Context::new(controller.clone(), &PluginsOptions::default())?;
+        tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
+
+        let bound = |id: &String| {
+            controller
+                .list_executors()
+                .unwrap()
+                .iter()
+                .filter(|executor| executor.ssn_id.as_ref() == Some(id))
+                .count()
+        };
+        let mut counts = [bound(&ids[0]), bound(&ids[1])];
+        counts.sort();
+        assert_eq!(counts, [0, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_statement_discard_restores_plugins_and_snapshot() -> Result<(), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        tokio_test::block_on(
+            controller
+                .storage()
+                .register_node(&new_test_node("node_1".to_string())),
+        )?;
+        let session =
+            tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+                id: "stmt".to_string(),
+                application: "flmtest".to_string(),
+                min_instances: 2,
+                resreq: Some(ResourceRequirement {
+                    cpu: 1,
+                    memory: 1024,
+                    gpu: 0,
+                }),
+                ..Default::default()
+            }))?;
+        let mut executor_ids = vec![];
+        for _ in 0..2 {
+            let executor = tokio_test::block_on(
+                controller.create_executor("node_1".to_string(), session.id.clone()),
+            )?;
+            tokio_test::block_on(controller.register_executor(&executor))?;
+            executor_ids.push(executor.id);
+        }
+
+        let ctx = Context::new(controller.clone(), &PluginsOptions::default())?;
+        let info = ctx
+            .snapshot
+            .find_sessions(crate::model::READY_SESSION)?
+            .values()
+            .next()
+            .cloned()
+            .unwrap();
+        let idle = ctx
+            .snapshot
+            .find_executors(crate::model::IDLE_EXECUTOR)?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(!ctx.is_satisfied(&info)?);
+
+        let mut statement = crate::scheduler::statement::Statement::new(&ctx);
+        statement.bind(&idle[0], &info)?;
+        assert!(!ctx.is_satisfied(&info)?);
+        statement.bind(&idle[1], &info)?;
+        assert!(ctx.is_satisfied(&info)?);
+        assert!(ctx
+            .snapshot
+            .find_executors(crate::model::IDLE_EXECUTOR)?
+            .is_empty());
+
+        assert_eq!(statement.discard()?.len(), 2);
+        assert!(!ctx.is_satisfied(&info)?);
+        assert_eq!(
+            ctx.snapshot
+                .find_executors(crate::model::IDLE_EXECUTOR)?
+                .len(),
+            2
+        );
+        // The controller was never touched.
+        for id in executor_ids {
+            assert!(controller.get_executor(id)?.ssn_id.is_none());
+        }
         Ok(())
     }
 
@@ -849,7 +1042,6 @@ mod tests {
             tokens: Default::default(),
             min_instances: 0,
             max_instances: None,
-            batch_size: 1,
             priority: 0,
             resreq: Some(common::apis::ResourceRequirement {
                 cpu: 1,

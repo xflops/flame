@@ -285,7 +285,6 @@ class ServiceInstance:
             common_data=common_data_bytes,
             min_instances=app_context.min_instances,
             max_instances=app_context.max_instances,
-            batch_size=1,
             resreq=resource_requirement,
         )
         logger.info(f"[ServiceInstance] Opening session: session_id={session_id}, app={app}")
