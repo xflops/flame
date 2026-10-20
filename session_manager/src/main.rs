@@ -26,6 +26,45 @@ mod provider;
 mod scheduler;
 use common::storage;
 
+// The frontend, the backend (executor managers and their heartbeats) and the scheduler each run
+// on their own runtime, so a stall in one (e.g. blocking storage I/O) cannot starve the others.
+// Worker threads per runtime, as a share of the host's cores. The backend serves every executor
+// manager and executor, so it gets the most.
+fn runtime_threads(divisor: usize, min: usize) -> usize {
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    (cores / divisor).max(min)
+}
+
+/// Runs `future` to completion on a dedicated multi-thread runtime and returns a handle that
+/// resolves with its result, so it can be awaited next to the tasks of the main runtime.
+fn spawn_runtime<F>(
+    name: &'static str,
+    threads: usize,
+    future: F,
+) -> tokio::task::JoinHandle<Result<(), FlameError>>
+where
+    F: std::future::Future<Output = Result<(), FlameError>> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(format!("fsm-{name}"))
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(threads)
+                .thread_name(format!("fsm-{name}-worker"))
+                .enable_all()
+                .build()
+                .map_err(|e| FlameError::Internal(format!("failed to build {name} runtime: {e}")))
+                .and_then(|runtime| runtime.block_on(future));
+            let _ = tx.send(result);
+        })
+        .expect("failed to spawn runtime thread");
+    tokio::spawn(async move {
+        rx.await
+            .unwrap_or_else(|_| Err(FlameError::Internal(format!("{name} runtime panicked"))))
+    })
+}
+
 #[derive(Parser)]
 #[command(name = "flame-session-manager")]
 #[command(author = "XFLOPS <support@xflops.io>")]
@@ -120,7 +159,7 @@ async fn main() -> Result<(), FlameError> {
     {
         let controller = controller.clone();
         let ctx = ctx.clone();
-        let handler = tokio::spawn(async move {
+        let handler = spawn_runtime("frontend", runtime_threads(4, 2), async move {
             let apiserver = apiserver::new_frontend(controller);
             apiserver.run(ctx).await
         });
@@ -131,7 +170,7 @@ async fn main() -> Result<(), FlameError> {
     {
         let controller = controller.clone();
         let ctx = ctx.clone();
-        let handler = tokio::spawn(async move {
+        let handler = spawn_runtime("backend", runtime_threads(2, 4), async move {
             let apiserver = apiserver::new_backend(controller);
             apiserver.run(ctx).await
         });
@@ -142,7 +181,7 @@ async fn main() -> Result<(), FlameError> {
     {
         let controller = controller.clone();
         let ctx = ctx.clone();
-        let handler = tokio::spawn(async move {
+        let handler = spawn_runtime("scheduler", runtime_threads(8, 2), async move {
             let scheduler = scheduler::new(controller);
             scheduler.run(ctx).await
         });
