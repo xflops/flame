@@ -36,8 +36,18 @@ spec:
           image: {{ include "flame.image" (dict "root" . "image" .Values.objectCache.image) | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           workingDir: /usr/local/flame
+          {{- if .Values.objectCache.openFiles }}
+          # Runtimes often start a container with a soft limit of 1024 open
+          # files; the cache keeps two files open per object it serves.
+          command:
+            - /bin/sh
+            - -c
+            - ulimit -n {{ int .Values.objectCache.openFiles }} && exec /usr/local/flame/bin/flame-object-cache "$@"
+            - flame-object-cache
+          {{- else }}
           command:
             - /usr/local/flame/bin/flame-object-cache
+          {{- end }}
           args:
             - --config
             - /usr/local/flame/conf/flame-cluster.yaml
@@ -114,7 +124,13 @@ spec:
           emptyDir: {}
         {{- if not .Values.objectCache.persistence.enabled }}
         - name: cache-data
-          emptyDir: {}
+          emptyDir:
+            {{- with .Values.objectCache.emptyDir.medium }}
+            medium: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.objectCache.emptyDir.sizeLimit }}
+            sizeLimit: {{ . | quote }}
+            {{- end }}
         {{- end }}
         {{- if .Values.tls.enabled }}
         - name: cluster-tls
