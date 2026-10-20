@@ -60,21 +60,18 @@ sessionManager:
   extraVolumeMounts: []
 
 objectCache:
-  enabled: true
   image:
     repository: flame-object-cache
     tag: ""
-  replicas: 1
   service:
     type: ClusterIP
+    # Bound on each worker node's host network.
     port: 9090
   storage: "/var/lib/flame/cache"
   persistence:
     enabled: true
-    storageClassName: ""
-    size: 100Gi
-    accessModes:
-      - ReadWriteOnce
+    # Node directory mounted at `storage`. Data stays on the worker across pod restarts.
+    hostPath: /var/lib/flame/cache
   # Used when persistence is disabled. Set medium to "Memory" to keep cached
   # objects in RAM; they count against the pod's memory.
   emptyDir:
@@ -91,9 +88,6 @@ objectCache:
   gc:
     interval: 60s
   resources: {}
-  nodeSelector: {}
-  tolerations: []
-  affinity: {}
   extraEnv: []
   extraVolumes: []
   extraVolumeMounts: []

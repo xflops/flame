@@ -3,14 +3,15 @@
 This chart installs a static Flame cluster on Kubernetes:
 
 - one `flame-session-manager`
-- a configurable number of `flame-object-cache` replicas
+- one `flame-object-cache` container in each executor-manager pod
 - one privileged Host-shim `flame-executor-manager` per selected worker node
 
 Kubernetes manages persistent FEM workers; Flame schedules application services
-and tasks within those workers. The chart always installs executor managers as a DaemonSet,
-with host networking, host PID access, and root privileges. Object-cache capacity follows
-`objectCache.replicas`; each StatefulSet replica owns its own cache volume when
-persistence is enabled.
+and tasks within those workers. The chart installs executor managers as a DaemonSet,
+with host networking, host PID access, and root privileges. The object cache always runs
+in that pod and uses the same host network, so each worker stores and serves its
+own objects. With persistence enabled, cache files stay on the node's
+`objectCache.persistence.hostPath` across pod restarts.
 
 ## Host workers
 
@@ -87,8 +88,10 @@ FEM does not automatically drain tasks on termination. DaemonSet updates use
 `OnDelete`, so config or image changes are applied by deleting worker Pods during
 the maintenance window.
 
-Session-manager and object-cache Pods retain their own security and networking
-settings. The chart does not create application Pods or use a Kubernetes provider.
+The session manager keeps its own security and networking settings. The object
+cache shares the executor-manager pod's host network and host PID namespace.
+Its container does not use the executor manager's privileged security context.
+The chart does not create application Pods or use a Kubernetes provider.
 
 Image versions are configurable through `global.imageTag`; each component can
 also set its own `image.tag`. For testing with `latest`, use
@@ -145,29 +148,21 @@ helm install flame ./charts/flame \
   --set objectCache.persistence.enabled=false
 ```
 
-To install multiple object-cache replicas:
-
-```bash
-helm install flame ./charts/flame \
-  --namespace flame-system \
-  --create-namespace \
-  --set objectCache.replicas=3
-```
-
-Each replica advertises a stable, namespace-qualified name,
-`<pod>.<release>-object-cache-headless.<namespace>.svc:<port>`, in the object
-references it returns. The chart builds it from the pod name and namespace in
-the `FLAME_CACHE_ADVERTISE` environment variable, which is used when
+Each worker advertises `grpc://<node-ip>:<port>` in the object references it
+returns, or `grpcs://` when TLS is enabled. The chart sets that address from
+the node IP through `FLAME_CACHE_ADVERTISE`, which is used when
 `cache.advertise` is not set in the shared configuration. `cache.advertise` is
 an optional network interface name or address; the old `networkInterface` value
 is removed. Without either, a cache advertises the first private IPv4 address of
 a non-loopback interface.
 
-Writes go through the load-balanced `ClusterIP` Service. Reads dial the owner
-named by the reference through the headless Service, so they reach the replica
-that holds the object, and references survive pod restarts. With
-`tls.enabled=true` the cache certificate must cover the per-pod names
-(for example a `*.<release>-object-cache-headless.<namespace>.svc` wildcard).
+The node IP stays valid across pod restarts on that worker. It changes when
+the node's IP changes. `objectCache.service.port` is bound on every worker, so
+only one cache can run on a node.
+
+Writes go through the load-balanced `ClusterIP` Service, which selects the
+executor-manager pods. Reads dial the node IP named by the reference. With
+`tls.enabled=true` the cache certificate must be valid for those node IPs.
 
 ## Verify
 
@@ -222,7 +217,7 @@ The object-cache proxy must:
 The gateway must restrict replica routing to endpoints belonging to the Flame
 object-cache Service; it must not act as an unrestricted dynamic forward proxy.
 The object-cache Service remains `ClusterIP`. The external LoadBalancer must
-not directly expose the cache StatefulSet or its pods.
+not directly expose the executor-manager pods or the cache port on the nodes.
 
 The external cache endpoint is
 `grpcs-proxy://<address>:<proxy-port>`. Clients dial that proxy over TLS and

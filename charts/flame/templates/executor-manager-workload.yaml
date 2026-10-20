@@ -88,6 +88,86 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+        - name: object-cache
+          image: {{ include "flame.image" (dict "root" . "image" .Values.objectCache.image) | quote }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          workingDir: /usr/local/flame
+          {{- if .Values.objectCache.openFiles }}
+          # Runtimes often start a container with a soft limit of 1024 open
+          # files; the cache keeps two files open per object it serves.
+          command:
+            - /bin/sh
+            - -c
+            - ulimit -n {{ int .Values.objectCache.openFiles }} && exec /usr/local/flame/bin/flame-object-cache "$@"
+            - flame-object-cache
+          {{- else }}
+          command:
+            - /usr/local/flame/bin/flame-object-cache
+          {{- end }}
+          args:
+            - --config
+            - /usr/local/flame/conf/flame-cluster.yaml
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: FLAME_HOME
+              value: /usr/local/flame
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            # Host networking makes this node IP the cache address. It stays
+            # valid across restarts on the same node.
+            - name: FLAME_CACHE_ADVERTISE
+              value: {{ printf "%s://$(HOST_IP):%d" (include "flame.cacheScheme" .) (int .Values.objectCache.service.port) | quote }}
+            {{- with .Values.objectCache.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.objectCache.service.port }}
+              protocol: TCP
+          startupProbe:
+            tcpSocket:
+              port: grpc
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /usr/local/flame/conf/flame-cluster.yaml
+              subPath: flame-cluster.yaml
+              readOnly: true
+            - name: cache-data
+              mountPath: {{ .Values.objectCache.storage | quote }}
+            - name: cache-logs
+              mountPath: /usr/local/flame/logs
+            {{- if .Values.tls.enabled }}
+            - name: cluster-tls
+              mountPath: {{ include "flame.tlsClusterPath" . }}
+              readOnly: true
+            - name: cache-tls
+              mountPath: {{ include "flame.tlsCachePath" . }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.objectCache.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.objectCache.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
       volumes:
         - name: config
           configMap:
@@ -116,6 +196,26 @@ spec:
         - name: cache-tls
           secret:
             secretName: {{ .Values.tls.cache.secretName }}
+        {{- end }}
+        - name: cache-logs
+          emptyDir: {}
+        {{- if .Values.objectCache.persistence.enabled }}
+        - name: cache-data
+          hostPath:
+            path: {{ .Values.objectCache.persistence.hostPath | quote }}
+            type: DirectoryOrCreate
+        {{- else }}
+        - name: cache-data
+          emptyDir:
+            {{- with .Values.objectCache.emptyDir.medium }}
+            medium: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.objectCache.emptyDir.sizeLimit }}
+            sizeLimit: {{ . | quote }}
+            {{- end }}
+        {{- end }}
+        {{- with .Values.objectCache.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
         {{- with .Values.executorManager.extraVolumes }}
         {{- toYaml . | nindent 8 }}

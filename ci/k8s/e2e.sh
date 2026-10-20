@@ -9,7 +9,6 @@ CHART_DIR="${CHART_DIR:-${ROOT_DIR}/charts/flame}"
 IMAGE_REGISTRY="${IMAGE_REGISTRY:-xflops}"
 IMAGE_TAG="${IMAGE_TAG:-ci}"
 IMAGE_PULL_POLICY="${IMAGE_PULL_POLICY:-IfNotPresent}"
-OBJECT_CACHE_REPLICAS="${OBJECT_CACHE_REPLICAS:-2}"
 SESSION_MANAGER_STORAGE="${SESSION_MANAGER_STORAGE:-fs:///var/lib/flame/session}"
 TIMEOUT="${TIMEOUT:-10m}"
 FLMPING_TASKS="${FLMPING_TASKS:-3}"
@@ -60,7 +59,6 @@ HELM_E2E_ARGS=(
     --set cluster.limits.node.maxExecutors=10
     --set sessionManager.persistence.enabled=false
     --set objectCache.persistence.enabled=false
-    --set "objectCache.replicas=${OBJECT_CACHE_REPLICAS}"
 )
 
 log() {
@@ -82,10 +80,12 @@ dump_debug() {
     log "Recent events"
     kubectl -n "$NAMESPACE" get events --sort-by=.lastTimestamp 2>/dev/null || true
 
-    for component in session-manager object-cache executor-manager; do
+    for component in session-manager executor-manager; do
         log "Logs for component=${component}"
         kubectl -n "$NAMESPACE" logs -l "app.kubernetes.io/component=${component}" --all-containers --tail=500 2>/dev/null || true
     done
+    log "Logs for container=object-cache"
+    kubectl -n "$NAMESPACE" logs -l "app.kubernetes.io/component=executor-manager" -c object-cache --tail=500 2>/dev/null || true
 
     log "Envoy Gateway resources"
     kubectl -n "$ENVOY_GATEWAY_NAMESPACE" get all 2>/dev/null || true
@@ -262,7 +262,6 @@ install_flame() {
         "$@"
 
     wait_rollout deployment session-manager
-    wait_rollout statefulset object-cache
     wait_rollout daemonset executor-manager
 }
 
@@ -272,31 +271,27 @@ create_external_access() {
     local cache_grpc_port="$3"
     local cache_target_expression=""
     local client_ca_file=""
-    local pod_name=""
-    local headless_service=""
-    local -a cache_pod_names=()
+    local host_ip=""
+    local -a cache_host_ips=()
 
-    # Object refs carry the stable per-pod name <pod>.<headless service>.<namespace>.svc.
-    headless_service="$(kubectl -n "$NAMESPACE" get statefulset \
-        -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=object-cache" \
-        -o jsonpath='{.items[0].spec.serviceName}')"
-    : "${headless_service:?missing serviceName on the object-cache StatefulSet}"
-    mapfile -t cache_pod_names < <(kubectl -n "$NAMESPACE" get pod \
-        -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=object-cache" \
+    # Object refs carry the worker node address <host-ip>:<port>.
+    mapfile -t cache_host_ips < <(kubectl -n "$NAMESPACE" get pod \
+        -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=executor-manager" \
         -o json | jq -r \
-        '.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name')
-    if [[ "${#cache_pod_names[@]}" -ne "$OBJECT_CACHE_REPLICAS" ]]; then
-        log "Expected ${OBJECT_CACHE_REPLICAS} ready object-cache pods, found ${#cache_pod_names[@]}"
+        '.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .status.hostIP | select(. != null and . != "")' \
+        | sort -u)
+    if [[ "${#cache_host_ips[@]}" -eq 0 ]]; then
+        log "No ready executor-manager pods with a host IP"
         return 1
     fi
 
-    for pod_name in "${cache_pod_names[@]}"; do
+    for host_ip in "${cache_host_ips[@]}"; do
         if [[ -n "$cache_target_expression" ]]; then
             cache_target_expression+=" || "
         fi
-        cache_target_expression+="request.headers['x-flame-object-cache'] == '${pod_name}.${headless_service}.${NAMESPACE}.svc:${cache_grpc_port}'"
+        cache_target_expression+="request.headers['x-flame-object-cache'] == '${host_ip}:${cache_grpc_port}'"
     done
-    : "${cache_target_expression:?no object-cache pods found}"
+    : "${cache_target_expression:?no executor-manager pods found}"
 
     export EXTERNAL_SESSION_SERVICE NAMESPACE RELEASE SESSION_NODE_PORT
     export CACHE_GATEWAY_NODE_PORT CACHE_GATEWAY_HOST GATEWAY_CLASS GATEWAY
@@ -346,8 +341,8 @@ create_external_access() {
         | grep -qx "${CACHE_GATEWAY_NODE_PORT}"
 
     # Referencing the internal Service above is intentional for bootstrap calls.
-    # Object refs carry <pod>.<headless service>.<namespace>.svc:port in x-flame-object-cache. The second route
-    # rewrites the upstream host and restricts targets to current cache replicas.
+    # Object refs carry <node-ip>:<port> in x-flame-object-cache. The second route
+    # rewrites the upstream host and restricts targets to current worker nodes.
 }
 
 configure_external_access() {

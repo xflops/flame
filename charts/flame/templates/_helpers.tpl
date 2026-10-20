@@ -46,10 +46,6 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s-object-cache" (include "flame.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{- define "flame.objectCache.headlessName" -}}
-{{- printf "%s-headless" (include "flame.objectCache.name" .) | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-
 {{- define "flame.executorManager.name" -}}
 {{- printf "%s-executor-manager" (include "flame.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
@@ -119,8 +115,23 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if ne (int .Values.sessionManager.replicas) 1 -}}
 {{- fail "sessionManager.replicas must be 1 for the static chart" -}}
 {{- end -}}
-{{- if and .Values.objectCache.enabled (lt (int .Values.objectCache.replicas) 1) -}}
-{{- fail "objectCache.replicas must be at least 1 when objectCache.enabled=true" -}}
+{{- if hasKey .Values.objectCache "enabled" -}}
+{{- fail "the object cache is mandatory; remove objectCache.enabled" -}}
+{{- end -}}
+{{- if not .Values.executorManager.hostNetwork -}}
+{{- fail "the object cache runs in the executor-manager pod and requires executorManager.hostNetwork=true" -}}
+{{- end -}}
+{{- if hasKey .Values.objectCache "replicas" -}}
+{{- fail "objectCache.replicas is unused; the object cache runs in each executor-manager pod" -}}
+{{- end -}}
+{{- if or (hasKey .Values.objectCache.persistence "storageClassName") (hasKey .Values.objectCache.persistence "size") (hasKey .Values.objectCache.persistence "accessModes") -}}
+{{- fail "object cache data is stored on the executor-manager node; remove objectCache.persistence.storageClassName, size, and accessModes" -}}
+{{- end -}}
+{{- if and .Values.objectCache.persistence.enabled (not .Values.objectCache.persistence.hostPath) -}}
+{{- fail "objectCache.persistence.hostPath is required when objectCache.persistence.enabled=true" -}}
+{{- end -}}
+{{- if or .Values.objectCache.nodeSelector .Values.objectCache.affinity .Values.objectCache.tolerations -}}
+{{- fail "object cache scheduling follows the executor-manager pod; set executorManager.nodeSelector, affinity, and tolerations" -}}
 {{- end -}}
 {{- $expectedBackendPort := add (int .Values.sessionManager.service.frontendPort) 1 -}}
 {{- if ne (int .Values.sessionManager.service.backendPort) (int $expectedBackendPort) -}}
