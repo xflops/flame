@@ -28,11 +28,30 @@ use common::storage;
 
 // The frontend, the backend (executor managers and their heartbeats) and the scheduler each run
 // on their own runtime, so a stall in one (e.g. blocking storage I/O) cannot starve the others.
-// Worker threads per runtime, as a share of the host's cores. The backend serves every executor
-// manager and executor, so it gets the most.
-fn runtime_threads(divisor: usize, min: usize) -> usize {
-    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    (cores / divisor).max(min)
+// Worker threads per runtime, from the host's cores: one for the scheduler, then a third of the
+// rest for the frontend and two thirds for the backend, which serves every executor manager and
+// executor. Each gets at least one.
+#[derive(Default)]
+struct RuntimeThreads {
+    frontend: usize,
+    backend: usize,
+    scheduler: usize,
+}
+
+impl RuntimeThreads {
+    /// Sized for the host's available parallelism.
+    fn new() -> Self {
+        Self::default().with_cores(std::thread::available_parallelism().map_or(4, |n| n.get()))
+    }
+
+    /// Recalculate the threads for `cores`.
+    fn with_cores(mut self, cores: usize) -> Self {
+        let rest = cores.saturating_sub(1);
+        self.frontend = (rest / 3).max(1);
+        self.backend = rest.saturating_sub(self.frontend).max(1);
+        self.scheduler = 1;
+        self
+    }
 }
 
 /// Runs `future` to completion on a dedicated multi-thread runtime and returns a handle that
@@ -86,6 +105,7 @@ async fn main() -> Result<(), FlameError> {
     tracing::info!("flame-session-manager is starting ...");
 
     let mut handlers = vec![];
+    let threads = RuntimeThreads::new();
 
     if let Some(pprof_config) = &ctx.cluster.pprof {
         let port = pprof_config.port;
@@ -159,7 +179,7 @@ async fn main() -> Result<(), FlameError> {
     {
         let controller = controller.clone();
         let ctx = ctx.clone();
-        let handler = spawn_runtime("frontend", runtime_threads(4, 2), async move {
+        let handler = spawn_runtime("frontend", threads.frontend, async move {
             let apiserver = apiserver::new_frontend(controller);
             apiserver.run(ctx).await
         });
@@ -170,7 +190,7 @@ async fn main() -> Result<(), FlameError> {
     {
         let controller = controller.clone();
         let ctx = ctx.clone();
-        let handler = spawn_runtime("backend", runtime_threads(2, 4), async move {
+        let handler = spawn_runtime("backend", threads.backend, async move {
             let apiserver = apiserver::new_backend(controller);
             apiserver.run(ctx).await
         });
@@ -181,7 +201,7 @@ async fn main() -> Result<(), FlameError> {
     {
         let controller = controller.clone();
         let ctx = ctx.clone();
-        let handler = spawn_runtime("scheduler", runtime_threads(8, 2), async move {
+        let handler = spawn_runtime("scheduler", threads.scheduler, async move {
             let scheduler = scheduler::new(controller);
             scheduler.run(ctx).await
         });
@@ -199,4 +219,21 @@ async fn main() -> Result<(), FlameError> {
 #[async_trait::async_trait]
 pub trait FlameThread: Send + Sync + 'static {
     async fn run(&self, ctx: FlameClusterContext) -> Result<(), FlameError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeThreads;
+
+    #[test]
+    fn runtime_threads_follow_the_core_count() {
+        let split = |cores| {
+            let t = RuntimeThreads::new().with_cores(cores);
+            (t.scheduler, t.frontend, t.backend)
+        };
+        assert_eq!(split(16), (1, 5, 10));
+        assert_eq!(split(32), (1, 10, 21));
+        assert_eq!(split(4), (1, 1, 2));
+        assert_eq!(split(1), (1, 1, 1));
+    }
 }

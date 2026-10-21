@@ -601,7 +601,10 @@ impl FilesystemEngine {
         Ok(meta)
     }
 
-    /// Write an existing task record in place and sync it.
+    /// Write an existing task record in place. Only a terminal state (the result) is synced: it
+    /// must survive a crash, while a lost Pending/Running transition is recovered because the
+    /// executor is gone after a restart and the task is retried. A later synced write also
+    /// flushes the earlier unsynced ones of the same file.
     fn write_task_metadata(
         &self,
         entry: &SessionEntry,
@@ -616,10 +619,12 @@ impl FilesystemEngine {
             .file
             .write_all_at(&buffer, offset)
             .map_err(|e| FlameError::Storage(format!("Failed to write task metadata: {e}")))?;
-        tasks
-            .file
-            .sync_data()
-            .map_err(|e| FlameError::Storage(format!("Failed to sync task metadata: {e}")))?;
+        if TaskState::try_from(meta.state as i32)?.is_terminal() {
+            tasks
+                .file
+                .sync_data()
+                .map_err(|e| FlameError::Storage(format!("Failed to sync task metadata: {e}")))?;
+        }
 
         Ok(())
     }
