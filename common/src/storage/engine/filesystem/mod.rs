@@ -601,10 +601,7 @@ impl FilesystemEngine {
         Ok(meta)
     }
 
-    /// Write an existing task record in place. Only a terminal state (the result) is synced: it
-    /// must survive a crash, while a lost Pending/Running transition is recovered because the
-    /// executor is gone after a restart and the task is retried. A later synced write also
-    /// flushes the earlier unsynced ones of the same file.
+    /// Write an existing task record in place. It is not synced explicitly: the kernel writes it back from the page cache.
     fn write_task_metadata(
         &self,
         entry: &SessionEntry,
@@ -619,12 +616,6 @@ impl FilesystemEngine {
             .file
             .write_all_at(&buffer, offset)
             .map_err(|e| FlameError::Storage(format!("Failed to write task metadata: {e}")))?;
-        if TaskState::try_from(meta.state as i32)?.is_terminal() {
-            tasks
-                .file
-                .sync_data()
-                .map_err(|e| FlameError::Storage(format!("Failed to sync task metadata: {e}")))?;
-        }
 
         Ok(())
     }
@@ -661,12 +652,7 @@ impl FilesystemEngine {
             .map_err(|e| FlameError::Storage(format!("Failed to serialize task metadata: {e}")))?;
 
         // Readers of the new ID (a scan up to the file length) wait for the write.
-        let written = entry.with_task(meta.id as TaskID, || {
-            tasks
-                .file
-                .write_all_at(&buffer, len)
-                .and_then(|_| tasks.file.sync_data())
-        });
+        let written = entry.with_task(meta.id as TaskID, || tasks.file.write_all_at(&buffer, len));
         if let Err(e) = written {
             return Err(FlameError::Storage(format!(
                 "Failed to commit task record: {e}"

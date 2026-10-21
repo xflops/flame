@@ -43,7 +43,7 @@ impl Part {
 pub(super) struct PayloadFile {
     pub(super) file: fs::File,
     /// Next unreserved offset. Payloads are immutable once published, so ranges are
-    /// reserved atomically and then written and synced without holding any lock.
+    /// reserved atomically and then written without holding any lock.
     end: AtomicU64,
 }
 
@@ -68,7 +68,8 @@ impl PayloadFile {
         })
     }
 
-    /// Reserve a unique range, write the complete payload there and sync it.
+    /// Reserve a unique range and write the complete payload there. It is never synced
+    /// explicitly: it lives in the page cache and the kernel writes it back.
     ///
     /// A failed or cancelled write leaves an unreferenced range; the allocator is
     /// never rolled back because other reservations may follow it.
@@ -92,10 +93,6 @@ impl PayloadFile {
         self.file
             .write_all_at(data, offset)
             .map_err(|e| FlameError::Storage(format!("Failed to write to {name}: {e}")))?;
-        self.file
-            .sync_data()
-            .map_err(|e| FlameError::Storage(format!("Failed to sync {name}: {e}")))?;
-
         Ok(offset)
     }
 }
