@@ -81,9 +81,9 @@ impl Action for DispatchAction {
             );
 
             // Like a kube-batch gang, every session binds through a Statement:
-            // stage binds until the session holds its minimum (`min_instances`,
-            // 0 or 1 is met by the first bind), then commit. A session that
-            // cannot reach its minimum from the Idle executors is discarded,
+            // stage binds until the session holds its gang (`batch_size`, 1 is
+            // met by the first bind), then commit. A session that cannot
+            // reach its gang from the Idle executors is discarded,
             // so a group that blocks until every member is present never holds
             // a partial set of running executors.
             let mut statement = Statement::new(ctx);

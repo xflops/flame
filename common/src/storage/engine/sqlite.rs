@@ -248,8 +248,9 @@ impl SqliteEngine {
             ),
             None => (None, None, None),
         };
-        let sql = r#"INSERT INTO sessions (id, application, common_data, tokens, creation_time, state, min_instances, max_instances, priority, resreq_cpu, resreq_memory, resreq_gpu)
+        let sql = r#"INSERT INTO sessions (id, application, common_data, tokens, creation_time, state, min_instances, max_instances, batch_size, priority, resreq_cpu, resreq_memory, resreq_gpu)
             VALUES (
+                ?,
                 ?,
                 ?,
                 ?,
@@ -273,6 +274,7 @@ impl SqliteEngine {
             .bind(SessionState::Open as i32)
             .bind(attr.min_instances as i64)
             .bind(attr.max_instances.map(|v| v as i64))
+            .bind(attr.batch_size.max(1) as i64)
             .bind(attr.priority as i64)
             .bind(resreq_cpu)
             .bind(resreq_memory)
@@ -1342,6 +1344,7 @@ mod tests {
 
         let ssn_id = format!("ssn-tokens-{}", Utc::now().timestamp());
         tokio_test::block_on(storage.create_session(SessionAttributes {
+            batch_size: 1,
             tokens: [("service".into(), "credential".into())].into(),
             id: ssn_id.clone(),
             application: "flmexec".to_string(),
@@ -1372,6 +1375,7 @@ mod tests {
 
         let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
+            batch_size: 1,
             tokens: Default::default(),
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),
@@ -1525,6 +1529,7 @@ mod tests {
         let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
 
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
+            batch_size: 1,
             tokens: Default::default(),
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),
@@ -1869,6 +1874,7 @@ mod tests {
 
         let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
+            batch_size: 1,
             tokens: Default::default(),
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),
@@ -1922,6 +1928,7 @@ mod tests {
 
         let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
+            batch_size: 1,
             tokens: Default::default(),
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),
@@ -1958,6 +1965,7 @@ mod tests {
 
         let ssn_2_id = format!("ssn-2-{}", Utc::now().timestamp());
         let ssn_2 = tokio_test::block_on(storage.create_session(SessionAttributes {
+            batch_size: 1,
             tokens: Default::default(),
             id: ssn_2_id.clone(),
             application: "flmping".to_string(),
@@ -2012,6 +2020,7 @@ mod tests {
         }
         let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
+            batch_size: 1,
             tokens: Default::default(),
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),
@@ -2053,6 +2062,7 @@ mod tests {
         }
         let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
+            batch_size: 1,
             tokens: Default::default(),
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),
@@ -2086,6 +2096,7 @@ mod tests {
         }
         let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
+            batch_size: 1,
             tokens: Default::default(),
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),
@@ -2128,6 +2139,7 @@ mod tests {
         }
         let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
         let ssn_1 = tokio_test::block_on(storage.create_session(SessionAttributes {
+            batch_size: 1,
             tokens: Default::default(),
             id: ssn_1_id.clone(),
             application: "flmexec".to_string(),

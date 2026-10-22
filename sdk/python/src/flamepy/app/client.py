@@ -207,6 +207,7 @@ class ServiceInstance:
         resreq: Optional[str] = None,
         constructor_args: Optional[tuple[Any, ...]] = None,
         constructor_kwargs: Optional[dict[str, Any]] = None,
+        batch_size: int = 1,
     ):
         """Initialize a ServiceInstance.
 
@@ -225,6 +226,8 @@ class ServiceInstance:
             resreq: Optional resource requirements string, for example
                     ``"cpu=1,mem=1g"``. When omitted, the server applies
                     cluster.resource_requirement (or its fallback).
+            batch_size: Gang size: the session gets executors only once it can
+                    bind this many together. 1 (default) is not a gang.
         """
         self._app = app
         self._execution_object = execution_object
@@ -285,6 +288,7 @@ class ServiceInstance:
             common_data=common_data_bytes,
             min_instances=app_context.min_instances,
             max_instances=app_context.max_instances,
+            batch_size=batch_size,
             resreq=resource_requirement,
         )
         logger.info(f"[ServiceInstance] Opening session: session_id={session_id}, app={app}")
@@ -572,6 +576,7 @@ class ServiceDefinition:
         autoscale: Optional[bool],
         warmup: int,
         resreq: Optional[str],
+        batch_size: int = 1,
         runtime: Optional["_Runtime"] = None,
     ):
         self._app_name = app_name
@@ -579,6 +584,7 @@ class ServiceDefinition:
         self._autoscale = autoscale
         self._warmup = warmup
         self._resreq = resreq
+        self._batch_size = batch_size
         self._runtime = runtime
         self._shared_lock = threading.Lock()
         self._shared_remote: Optional[ServiceInstance] = None
@@ -629,10 +635,10 @@ class ServiceDefinition:
         except RuntimeError:
             session_context = None
         if session_context is not None:
-            if self._autoscale is not None or self._warmup != 0 or self._resreq is not None:
+            if self._autoscale is not None or self._warmup != 0 or self._resreq is not None or self._batch_size != 1:
                 raise FlameError(
                     FlameErrorCode.INVALID_ARGUMENT,
-                    "Nested services reuse the current session and do not accept autoscale, warmup, or resreq",
+                    "Nested services reuse the current session and do not accept autoscale, warmup, batch_size, or resreq",
                 )
             if args or kwargs:
                 raise TypeError("Nested class services reuse the current execution object and do not accept constructor arguments")
@@ -645,6 +651,7 @@ class ServiceDefinition:
             autoscale=self._autoscale,
             warmup=self._warmup,
             resreq=self._resreq,
+            batch_size=self._batch_size,
             constructor_args=args if is_class else None,
             constructor_kwargs=kwargs if is_class else None,
         )
@@ -660,7 +667,7 @@ class ServiceDefinition:
     def __reduce__(self):
         return (
             _restore_service_definition,
-            (self._app_name, self._execution_object, self._autoscale, self._warmup, self._resreq),
+            (self._app_name, self._execution_object, self._autoscale, self._warmup, self._resreq, self._batch_size),
         )
 
 
@@ -670,6 +677,7 @@ def _restore_service_definition(
     autoscale: Optional[bool],
     warmup: int,
     resreq: Optional[str],
+    batch_size: int = 1,
 ) -> ServiceDefinition:
     return ServiceDefinition(
         app_name,
@@ -677,6 +685,7 @@ def _restore_service_definition(
         autoscale=autoscale,
         warmup=warmup,
         resreq=resreq,
+        batch_size=batch_size,
     )
 
 
@@ -961,6 +970,7 @@ class _Runtime:
         autoscale: Optional[bool] = None,
         warmup: int = 0,
         resreq: Optional[str] = None,
+        batch_size: int = 1,
     ) -> Callable[[Any], Any]:
         """Decorate an execution object with local and remote call forms.
 
@@ -974,6 +984,11 @@ class _Runtime:
             resreq: Optional resource requirements string, for example
                     ``"cpu=1,mem=1g"``. When omitted, the server applies
                     cluster.resource_requirement (or its fallback).
+            batch_size: Gang size: executors are bound to the session only once
+                    this many can be bound together, for work that blocks until
+                    every member is present (a collective ``init_process_group``).
+                    1 (default) is not a gang. Read it at run time with
+                    ``flamepy.app.context().batch_size``.
 
         Returns:
             A decorator that accepts a function or class. Calling the decorated
@@ -1000,6 +1015,7 @@ class _Runtime:
                     autoscale=autoscale,
                     warmup=warmup,
                     resreq=resreq,
+                    batch_size=batch_size,
                     runtime=self,
                 )
 
@@ -1014,6 +1030,7 @@ class _Runtime:
         resreq: Optional[str] = None,
         constructor_args: Optional[tuple[Any, ...]] = None,
         constructor_kwargs: Optional[dict[str, Any]] = None,
+        batch_size: int = 1,
     ) -> ServiceInstance:
         """Create and retain one owned service proxy."""
         with self._lifecycle_lock:
@@ -1031,6 +1048,7 @@ class _Runtime:
                 resreq=resreq,
                 constructor_args=constructor_args,
                 constructor_kwargs=constructor_kwargs,
+                batch_size=batch_size,
             )
             self._services.append(app_service)
 
@@ -1374,6 +1392,7 @@ def service(
     autoscale: Optional[bool] = None,
     warmup: int = 0,
     resreq: Optional[str] = None,
+    batch_size: int = 1,
 ) -> Callable[[Any], Any]:
     """Return a service decorator for the initialized process-wide app."""
     _validate_resreq(resreq)
@@ -1385,10 +1404,10 @@ def service(
             except RuntimeError:
                 session_context = None
             if session_context is not None:
-                if autoscale is not None or warmup != 0 or resreq is not None:
+                if autoscale is not None or warmup != 0 or resreq is not None or batch_size != 1:
                     raise FlameError(
                         FlameErrorCode.INVALID_ARGUMENT,
-                        "Nested services reuse the current session and do not accept autoscale, warmup, or resreq",
+                        "Nested services reuse the current session and do not accept autoscale, warmup, batch_size, or resreq",
                     )
                 if not inspect.isclass(execution_object) and not _is_function(execution_object):
                     raise TypeError("app.service() supports a function or class only")
@@ -1398,13 +1417,14 @@ def service(
                     autoscale=autoscale,
                     warmup=warmup,
                     resreq=resreq,
+                    batch_size=batch_size,
                 )
             if _runtime is None:
                 raise FlameError(
                     FlameErrorCode.INVALID_STATE,
                     "Flame is not initialized; call flamepy.app.init(name) before declaring services",
                 )
-            return _runtime.service(autoscale=autoscale, warmup=warmup, resreq=resreq)(execution_object)
+            return _runtime.service(autoscale=autoscale, warmup=warmup, resreq=resreq, batch_size=batch_size)(execution_object)
 
     return decorator
 

@@ -194,7 +194,7 @@ pub fn validate_application_name(name: &str) -> Result<(), crate::FlameError> {
     Ok(())
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SessionAttributes {
     pub id: SessionID,
     pub application: String,
@@ -202,8 +202,26 @@ pub struct SessionAttributes {
     pub tokens: HashMap<String, String>,
     pub min_instances: u32,
     pub max_instances: Option<u32>,
+    /// Gang size: the session is bound only once it holds this many executors (at least 1).
+    pub batch_size: u32,
     pub priority: u32,
     pub resreq: Option<ResourceRequirement>,
+}
+
+impl Default for SessionAttributes {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            application: String::new(),
+            common_data: None,
+            tokens: HashMap::new(),
+            min_instances: 0,
+            max_instances: None,
+            batch_size: 1,
+            priority: 0,
+            resreq: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for SessionAttributes {
@@ -212,6 +230,7 @@ impl std::fmt::Debug for SessionAttributes {
             .field("id", &self.id)
             .field("application", &self.application)
             .field("min_instances", &self.min_instances)
+            .field("batch_size", &self.batch_size)
             .field("tokens", &"<redacted>")
             .finish_non_exhaustive()
     }
@@ -244,6 +263,7 @@ pub struct Session {
     pub status: SessionStatus,
     pub min_instances: u32,
     pub max_instances: Option<u32>,
+    pub batch_size: u32,
     pub priority: u32,
     pub resreq: Option<ResourceRequirement>,
     pub retry_count: u32,
@@ -364,7 +384,8 @@ pub struct SessionContext {
     pub application: ApplicationContext,
     pub common_data: Option<CommonData>,
     pub tokens: HashMap<String, String>,
-    pub min_instances: u32,
+    /// The session's gang size (1 if it is not a gang).
+    pub batch_size: u32,
 }
 
 impl std::fmt::Debug for SessionContext {

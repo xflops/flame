@@ -831,6 +831,7 @@ impl FilesystemEngine {
             status: SessionStatus { state },
             min_instances: meta.min_instances,
             max_instances: meta.max_instances,
+            batch_size: meta.batch_size,
             priority: meta.priority,
             resreq,
             retry_count: 0,
@@ -1202,6 +1203,7 @@ impl Engine for FilesystemEngine {
             completion_time: None,
             min_instances: attr.min_instances,
             max_instances: attr.max_instances,
+            batch_size: attr.batch_size,
             priority: attr.priority,
             common_data_len,
             tokens: attr.tokens,
@@ -2054,6 +2056,7 @@ mod tests {
 
         // Create session
         let ssn_attr = SessionAttributes {
+            batch_size: 1,
             tokens: [("service".into(), "credential".into())].into(),
             id: "test-session".to_string(),
             application: "test-app".to_string(),
@@ -2124,6 +2127,7 @@ mod tests {
             .unwrap();
 
         let ssn_attr = SessionAttributes {
+            batch_size: 1,
             tokens: Default::default(),
             id: "test-session".to_string(),
             application: "test-app".to_string(),
@@ -2262,6 +2266,7 @@ mod tests {
             .unwrap();
 
         let ssn_attr = SessionAttributes {
+            batch_size: 1,
             tokens: Default::default(),
             id: "test-session".to_string(),
             application: "test-app".to_string(),
@@ -2306,6 +2311,7 @@ mod tests {
             .unwrap();
 
         let ssn_attr = SessionAttributes {
+            batch_size: 1,
             tokens: Default::default(),
             id: "test-session".to_string(),
             application: "test-app".to_string(),
@@ -2372,6 +2378,7 @@ mod tests {
             .unwrap();
 
         let ssn_attr = SessionAttributes {
+            batch_size: 1,
             tokens: Default::default(),
             id: "test-session".to_string(),
             application: "test-app".to_string(),
@@ -3136,7 +3143,7 @@ mod tests {
         let (_engine, dir) = engine_with_session("entry-json").await;
         let path = dir.path().join("sessions/entry-json/metadata");
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(json.as_object().unwrap().len(), 14);
+        assert_eq!(json.as_object().unwrap().len(), 15);
         for field in ["dir", "commit", "tasks", "files"] {
             assert!(
                 json.get(field).is_none(),

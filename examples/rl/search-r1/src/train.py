@@ -61,7 +61,7 @@ def form_trainer_group(trainer, count):
     """Join `count` trainer executors into one NCCL group; return how many nodes they span.
 
     The call is sent `count` times at once and blocks until all have joined (see Trainer.join).
-    Gang scheduling (`min_instances` is `count`) makes sure every call gets an executor.
+    Gang scheduling (`batch_size` is `count`) makes sure every call gets an executor.
     """
     import flamepy.app as app
     from flamepy.core import ObjectKey, put_object

@@ -203,6 +203,7 @@ mod tests {
         let ssn_1_id = format!("ssn-1-{}", Utc::now().timestamp());
         let ssn_1 =
             tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+                batch_size: 1,
                 id: ssn_1_id.clone(),
                 application: "flmtest".to_string(),
                 common_data: None,
@@ -347,6 +348,7 @@ mod tests {
         for task_count in task_counts {
             let ssn_id = format!("reuse-idle-{}", Uuid::new_v4());
             tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+                batch_size: 1,
                 id: ssn_id.clone(),
                 application: "flmtest".to_string(),
                 common_data: None,
@@ -483,9 +485,9 @@ mod tests {
         Ok(())
     }
 
-    /// Runs one Dispatch over `idle` retained Idle executors and a gang of
-    /// `min_instances`; returns the executors bound to the gang session.
-    fn gang_dispatch(min_instances: u32, idle: usize) -> Result<usize, FlameError> {
+    /// Runs one Dispatch over `idle` retained Idle executors and a session of
+    /// `batch_size` with one pending task; returns the executors bound to it.
+    fn gang_dispatch(batch_size: u32, idle: usize) -> Result<usize, FlameError> {
         let env = TestEnv::new()?;
         let controller = env.controller.clone();
         tokio_test::block_on(
@@ -500,7 +502,7 @@ mod tests {
             tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
                 id: format!("gang-{}", Uuid::new_v4()),
                 application: "flmtest".to_string(),
-                min_instances,
+                batch_size,
                 resreq: Some(ResourceRequirement {
                     cpu: 1,
                     memory: 1024,
@@ -508,6 +510,7 @@ mod tests {
                 }),
                 ..Default::default()
             }))?;
+        tokio_test::block_on(controller.create_task(session.id.clone(), None, None))?;
         for _ in 0..idle {
             let executor = tokio_test::block_on(
                 controller.create_executor("node_1".to_string(), session.id.clone()),
@@ -526,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_gang_binds_whole_minimum_at_once() -> Result<(), FlameError> {
+    fn test_dispatch_gang_binds_whole_batch_at_once() -> Result<(), FlameError> {
         assert_eq!(gang_dispatch(2, 2)?, 2);
         assert_eq!(gang_dispatch(3, 3)?, 3);
         Ok(())
@@ -540,13 +543,13 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_gang_binds_only_minimum_without_tasks() -> Result<(), FlameError> {
+    fn test_dispatch_gang_binds_only_batch_size_for_one_pending_task() -> Result<(), FlameError> {
         assert_eq!(gang_dispatch(2, 3)?, 2);
         Ok(())
     }
 
     #[test]
-    fn test_dispatch_single_instance_minimum_is_not_a_gang() -> Result<(), FlameError> {
+    fn test_dispatch_single_instance_batch_is_not_a_gang() -> Result<(), FlameError> {
         assert_eq!(gang_dispatch(1, 1)?, 1);
         Ok(())
     }
@@ -569,7 +572,7 @@ mod tests {
                 tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
                     id: format!("gang-{index}"),
                     application: "flmtest".to_string(),
-                    min_instances: 2,
+                    batch_size: 2,
                     resreq: Some(ResourceRequirement {
                         cpu: 1,
                         memory: 1024,
@@ -577,6 +580,7 @@ mod tests {
                     }),
                     ..Default::default()
                 }))?;
+            tokio_test::block_on(controller.create_task(session.id.clone(), None, None))?;
             ids.push(session.id);
         }
         for _ in 0..2 {
@@ -619,7 +623,7 @@ mod tests {
             tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
                 id: "stmt".to_string(),
                 application: "flmtest".to_string(),
-                min_instances: 2,
+                batch_size: 2,
                 resreq: Some(ResourceRequirement {
                     cpu: 1,
                     memory: 1024,
@@ -627,6 +631,7 @@ mod tests {
                 }),
                 ..Default::default()
             }))?;
+        tokio_test::block_on(controller.create_task(session.id.clone(), None, None))?;
         let mut executor_ids = vec![];
         for _ in 0..2 {
             let executor = tokio_test::block_on(
@@ -681,7 +686,7 @@ mod tests {
     /// cycles every Void executor registers, as its node would. Returns
     /// (executors that exist, executors bound to the gang session).
     fn gang_cycles(
-        min_instances: u32,
+        batch_size: u32,
         idle: usize,
         cycles: usize,
     ) -> Result<(usize, usize), FlameError> {
@@ -699,7 +704,7 @@ mod tests {
             tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
                 id: format!("gang-{}", Uuid::new_v4()),
                 application: "flmtest".to_string(),
-                min_instances,
+                batch_size,
                 resreq: Some(ResourceRequirement {
                     cpu: 1,
                     memory: 1024,
@@ -707,6 +712,7 @@ mod tests {
                 }),
                 ..Default::default()
             }))?;
+        tokio_test::block_on(controller.create_task(session.id.clone(), None, None))?;
         for _ in 0..idle {
             let executor = tokio_test::block_on(
                 controller.create_executor("node_1".to_string(), session.id.clone()),
@@ -1105,6 +1111,7 @@ mod tests {
 
         let ssn_id = format!("not-ready-{}", Uuid::new_v4());
         tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+            batch_size: 1,
             id: ssn_id.clone(),
             application: "flmtest".to_string(),
             common_data: None,

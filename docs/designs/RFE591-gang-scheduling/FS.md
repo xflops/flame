@@ -1,4 +1,4 @@
-# Design: Gang Scheduling for `min_instances`
+# Design: Gang Scheduling with `batch_size`
 
 **Status:** Draft
 **Created:** 2026-10-17
@@ -8,7 +8,7 @@
 
 ## 1. Motivation
 
-A session with `min_instances >= 2` often needs all of its executors at once: data-parallel
+A session whose work needs several executors at once (`batch_size >= 2`): data-parallel
 training over NCCL, tensor-parallel inference, MPI-style jobs. The scheduler gives such a
 session executors one at a time. `DispatchAction` binds one Idle executor per step and
 `AllocateAction` pipelines or allocates one executor per step; each step takes effect at once.
@@ -24,17 +24,20 @@ When the cluster can supply only part of the minimum, the session keeps what it 
 
 **Goals**
 
-1. A session is bound to executors only when it holds `min_instances` after the bind, decided
-   in one scheduling step; if the Idle executors cannot cover the minimum, nothing is bound.
-2. The same flow serves every session, as in kube-batch: a minimum of 0 or 1 is met by the
-   first bind, so those sessions behave as before.
+1. While a session has pending tasks, it is bound to executors only when it holds `batch_size`
+   after the bind, decided in one scheduling step; if the Idle executors cannot cover the gang,
+   nothing is bound.
+2. The same flow serves every session, as in kube-batch: a `batch_size` of 1 (the default) needs
+   no gang, so those sessions behave as before.
 3. The change is confined to `DispatchAction`, the plugin hook that asks "is the minimum
    held" and a small `Statement` type. Allocate and Shuffle are unchanged.
-4. A gang member can read the session id, the task id and `min_instances` at run time.
+4. A gang member can read the session id, the task id and `batch_size` at run time.
+5. `min_instances` keeps its own meaning: long-lived instances that are warmed up and never
+   trimmed. It is not a gang and does not take part in the all-or-nothing bind.
 
 **Non-goals**
 
-- Gang sizes other than `min_instances`.
+- Gang sizes other than `batch_size`.
 - Preemption of other sessions to make room for a gang (Shuffle is unchanged).
 - Node or topology placement rules.
 - Gang-aware executor creation in Allocate (see 4.3).
@@ -52,7 +55,8 @@ When the cluster can supply only part of the minimum, the session keeps what it 
 Dispatch loops over sessions ordered by the plugins, skips a session that is not underused or
 is `is_ready`, binds one executor, and re-queues the session while it is still underused.
 MinMax counts `session_executors` (bound plus pipelined plus created in this cycle) and
-reports a session not ready while that count is below `min_instances`.
+reports a session not ready while that count is below `min_instances` or, for a gang with
+pending tasks, below `batch_size`.
 
 `is_ready` means "the session was given enough capacity this cycle, stop adding": it also
 counts demand and DRF fair share, so it can be false at the minimum and true below it. It
@@ -93,8 +97,10 @@ fn is_satisfied(&self, ssn) -> Option<bool>       // Plugin
 PluginManager::is_satisfied -> bool               // first opinion wins; no opinion = true
 ```
 
-MinMax answers `session_executors >= min(min_instances, session max_executors)`. It counts
-executors bound or staged in this cycle. The cap keeps a gang larger than the session limit
+MinMax answers `session_executors >= min(gang, session max_executors)`, where the gang is
+`batch_size` while the session is a gang (`batch_size > 1`) with pending tasks and 0 otherwise.
+It counts executors bound or staged in this cycle. The same gang size raises the session's
+executor demand, so Allocate creates executors up to it. The cap keeps a gang larger than the session limit
 from waiting forever.
 
 It is not `is_ready`: see section 3.
@@ -111,8 +117,8 @@ For each session popped from the queue that is underused and not `is_ready`:
 4. Otherwise commit, and re-queue the session while it is still underused and not ready, so
    executors beyond the minimum are bound one per turn as before.
 
-A session with `min_instances` of 0 or 1 is satisfied by its first bind, so it commits one
-bind per turn, as before.
+A session that is not a gang (`batch_size` of 1, or no pending task) is satisfied by its first
+bind, so it commits one bind per turn, as before.
 
 **Allocate is unchanged.** It counts only executors that are bound or pipelined for the session,
 and an executor it creates has no session (`ssn_id` is none) until Dispatch binds it. A gang
@@ -137,24 +143,24 @@ A gang member must know its session, its task and the size of the gang.
 ctx = flamepy.app.context()
 ctx.session_id      # the session the invocation runs in
 ctx.task_id         # the task being invoked
-ctx.min_instances   # the session's minimum: the gang size (0 if none)
+ctx.batch_size      # the session's gang size (1 if it is not a gang)
 ```
 
 `context()` returns an `InstanceContext` and raises `RuntimeError` outside an invocation.
-`min_instances` travels like the other session fields:
+`batch_size` travels like the other session fields:
 
-- `rpc/protos/shim.proto`: `uint32 min_instances = 5;` in `SessionContext` (copied to
+- `rpc/protos/shim.proto`: `uint32 batch_size = 5;` in `SessionContext` (copied to
   `sdk/rust/protos` and `sdk/python/protos`).
 - `common::apis::SessionContext` carries it from the session spec to the shim request.
-- `flamepy.core.service.SessionContext.min_instances`, filled by the aio servicer.
+- `flamepy.core.service.SessionContext.batch_size`, filled by the aio servicer.
 - `flamepy.app.runpy` binds the `TaskContext` with the session context for each invocation, so
   `context()` has the task id.
-- The Rust SDK `SessionContext` carries `min_instances`; the WASM shim does not yet.
+- The Rust SDK `SessionContext` carries `batch_size`; the WASM shim does not yet.
 
 Notes:
 
-- **Rank.** The rank of a task is `task_id % min_instances`. Task ids of a session are a
-  sequence that starts at 1 and a retried task keeps its id. A gang submits `min_instances`
+- **Rank.** The rank of a task is `task_id % batch_size`. Task ids of a session are a
+  sequence that starts at 1 and a retried task keeps its id. A gang submits `batch_size`
   tasks back to back, which get consecutive ids, and N consecutive ids cover every residue
   mod N exactly once, so the ranks are unique and complete (ids 1..N give ranks 1..N-1, 0).
   This holds when:
@@ -168,36 +174,38 @@ Notes:
   keeps it. The rendezvous address is shared through the cache: rank 0 publishes its address
   under a key derived from the session id, the others wait for it.
 
-### 4.5 Removal of the unused `batch_size` field
+### 4.5 `batch_size` is the gang size
 
-The session `batch_size` field was reserved for a batch-scheduling feature that was never
-implemented: it is fixed to 1 everywhere and nothing reads it. Gang size comes from
-`min_instances`, so the field is removed:
+The session `batch_size` field was reserved for batch scheduling, fixed to 1 and never read.
+#593 first removed it and used `min_instances` as the gang size; that mixed two meanings, since
+`min_instances` also keeps long-lived instances alive. The field is restored and is now the
+only gang knob:
 
-- `types.proto`: remove `batch_size = 7` from `SessionSpec` and reserve field number 7 and the
-  name, so it is not reused (the three copies of the file stay in sync).
-- Rust API, storage engines and Python/Rust SDKs: remove the field, the builder and keyword
-  argument, and the normalization tests.
-- SQLite: a new migration drops `sessions.batch_size`. The existing migration is unchanged.
-  The filesystem engine ignores the field in sessions written earlier.
-- The design documents of the batch-session and batch-aware fairshare features
-  (RFE400, RFE408) are removed, and other documents drop their references.
+- `types.proto`: `batch_size = 7` in `SessionSpec` again (a value of 0 is treated as 1, as an
+  old client that does not send it).
+- Rust API, storage engines and Python/Rust SDKs carry the field again, with default 1.
+  `@app.service(batch_size=N)` sets it for a Python service.
+- SQLite: a new migration adds `sessions.batch_size` back (the earlier migration that dropped
+  it is unchanged). The filesystem engine reads sessions written without the field as 1.
+- `min_instances` goes back to its meaning before #593: warm-up and the floor that Shuffle and
+  the MinMax plugin keep. It no longer takes part in `is_satisfied`.
 
 The reserved executor column `batch_index` is not part of this change.
 
 ### 4.6 What does not change
 
-- Sessions with `min_instances` of 0 or 1.
+- Sessions with a `batch_size` of 1.
 - Growth beyond the minimum for pending tasks: it happens one executor at a time as today.
 - `is_underused`, `is_ready`, `is_overused`, and Shuffle.
-- Validation: `max_instances >= min_instances` is already required.
+- `min_instances` semantics: warm-up and the retained floor.
 
 ## 5. Edge cases
 
 | Case | Behavior |
 | ---- | -------- |
-| `min_instances > max_instances` | Rejected at session creation. |
+| `batch_size > max_instances` | The gang size is capped at the limit (4.2). |
 | Gang larger than the session limit | The gang size is capped at the limit (4.2). |
+| Gang session with no pending task | Not a gang: it needs and holds only what `min_instances` and its running tasks need. |
 | Gang larger than the cluster | Never satisfied; Dispatch discards each cycle and logs a debug line. |
 | Executor of a gang session released or interrupted | Count drops below the minimum; Dispatch binds a replacement only when the whole shortfall can be bound. Running tasks are not stopped by the scheduler. |
 | Two gangs competing for Idle executors | Sessions are processed in plugin order. The first stages and commits; the second finds too few Idle executors and discards. |
@@ -211,7 +219,7 @@ The reserved executor column `batch_index` is not part of this change.
   a shortfall count from the plugin and a separate path for gangs. The `Statement` uses one
   flow for every session and the plugin only answers "is the minimum held".
 - **Opt-in with a session attribute.** Safer for existing users, but the meaning of
-  `min_instances` already is "at least this many". Open question 1.
+  `min_instances` already is "at least this many". Resolved by a separate `batch_size`.
 
 ## 7. Test plan
 
@@ -224,15 +232,15 @@ Unit tests (`session_manager/src/scheduler`):
   controller; `is_satisfied` flips when the second bind is staged and back on discard.
 - Allocate: unchanged behavior, covered by the existing tests.
 
-SDK (`sdk/python/tests`, `sdk/rust`): `min_instances` reaches `SessionContext`;
-`app.context()` returns the session id, task id and `min_instances` inside an invocation and
+SDK (`sdk/python/tests`, `sdk/rust`): `batch_size` reaches `SessionContext`;
+`app.context()` returns the session id, task id and `batch_size` inside an invocation and
 raises outside one.
 
 End-to-end:
 
 - `test_app.py`: `test_app_instance_context` checks `session_id`, `task_id` and
-  `min_instances`; `test_app_gang_members_run_concurrently` runs two long tasks of a
-  `min_instances=2` service and checks unique ranks, distinct executors and overlapping start
+  `batch_size`; `test_app_gang_members_run_concurrently` runs two long tasks of a
+  `batch_size=2` service and checks unique ranks, distinct executors and overlapping start
   times.
 - `test_session.py` (`TestGangScheduling`) sizes the cluster from `list_nodes` by picking a cpu
   request that fits 4 to 6 executors, then checks, using `list_executors`:
@@ -240,19 +248,19 @@ End-to-end:
   - two gangs that fit together both get all their executors, and a task runs;
   - two gangs that each fit but not together: the executor count of every gang is always 0 or
     its minimum, exactly one gang runs, and the other starts once the first is closed;
-  - a gang that cannot start does not hold back a session with `min_instances` of 1.
+  - a gang that cannot start does not hold back a session that is not a gang.
 
 ## 8. Rollout
 
-Behavior changes only for sessions with `min_instances >= 2`. Document it in the user
-guide next to `min_instances`, together with `app.context()`.
+Behavior changes only for sessions with `batch_size >= 2`. Document it in the user guide next
+to `batch_size`, together with `app.context()`.
 
 ## 9. Open questions
 
-1. Apply to every session with `min_instances >= 2`, or only to sessions that opt in?
+1. Resolved: a session opts in with `batch_size >= 2`; `min_instances` never makes a gang.
 2. Report a gang that cannot start (a session event or condition) so users see why it is pending.
 3. Stage Allocate's pipeline and creation in the `Statement` too, so a gang assembles in one
    cycle and Idle executors it waits on are counted (4.3)? It needs inverse plugin hooks for pipeline and create and deferred executor creation.
 4. A gang that never fits can starve behind small sessions. Reserve capacity for it (backfill
    rules), or leave this to priority and Shuffle?
-5. The WASM shim's `SessionContext` does not carry `min_instances` yet.
+5. The WASM shim's `SessionContext` does not carry `batch_size` yet.

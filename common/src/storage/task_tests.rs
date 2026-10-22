@@ -30,6 +30,7 @@ mod tests {
 
     fn create_session_attr(id: &str) -> SessionAttributes {
         SessionAttributes {
+            batch_size: 1,
             tokens: Default::default(),
             id: id.to_string(),
             application: "test-app".to_string(),

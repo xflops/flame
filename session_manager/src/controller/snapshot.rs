@@ -134,6 +134,7 @@ pub struct SessionInfo {
     pub state: SessionState,
     pub min_instances: u32,
     pub max_instances: Option<u32>,
+    pub batch_size: u32,
     pub priority: u32,
     pub resreq: Option<ResourceRequirement>,
     pub retry_count: u32,
@@ -283,6 +284,7 @@ impl TryFrom<&Session> for SessionInfo {
             state: ssn.status.state,
             min_instances: ssn.min_instances,
             max_instances: ssn.max_instances,
+            batch_size: ssn.batch_size,
             priority: ssn.priority,
             resreq: ssn.resreq.clone(),
             retry_count: ssn.retry_count,
@@ -847,6 +849,7 @@ mod tests {
         state: SessionState,
     ) -> SessionInfoPtr {
         Arc::new(SessionInfo {
+            batch_size: 1,
             id: id.to_string(),
             application: "test-app".to_string(),
             tasks_status: HashMap::from([(TaskState::Pending, 1)]),

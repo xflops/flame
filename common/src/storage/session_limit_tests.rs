@@ -38,6 +38,7 @@ mod tests {
 
         for i in 0..5 {
             let attr = SessionAttributes {
+                batch_size: 1,
                 tokens: Default::default(),
                 id: format!("ssn-{}", i),
                 application: "test-app".to_string(),
@@ -65,6 +66,7 @@ mod tests {
 
         for i in 0..3 {
             let attr = SessionAttributes {
+                batch_size: 1,
                 tokens: Default::default(),
                 id: format!("ssn-{}", i),
                 application: "test-app".to_string(),
@@ -96,6 +98,7 @@ mod tests {
 
         for i in 0..3 {
             let attr = SessionAttributes {
+                batch_size: 1,
                 tokens: Default::default(),
                 id: format!("ssn-{}", i),
                 application: "test-app".to_string(),
@@ -121,6 +124,7 @@ mod tests {
 
         for i in 0..3 {
             let attr = SessionAttributes {
+                batch_size: 1,
                 tokens: Default::default(),
                 id: format!("ssn-{}", i),
                 application: "test-app".to_string(),

@@ -734,33 +734,32 @@ def test_app_destroy_idempotent(check_package_config, check_flmrun_app):
 
 
 def test_app_instance_context(check_package_config, check_flmrun_app):
-    """app.context() exposes the session id, task id and min_instances to the service."""
+    """app.context() exposes the session id, task id and batch_size to the service."""
     with initialized_app("test-app-instance-context"):
 
-        @app.service(autoscale=False, warmup=2)
+        @app.service(autoscale=False, warmup=2, batch_size=2)
         class Probe:
             def describe(self):
                 context = app.context()
-                return context.session_id, context.task_id, context.min_instances
+                return context.session_id, context.task_id, context.batch_size
 
         probe = Probe.remote()
-        session_id, task_id, min_instances = probe.describe().get()
+        session_id, task_id, batch_size = probe.describe().get()
 
         assert session_id == probe._session.id, f"Expected session {probe._session.id}, got {session_id}"
         assert task_id, "Expected a task id"
-        # warmup=2 with autoscale=False fixes the session at two instances.
-        assert min_instances == 2, f"Expected min_instances 2, got {min_instances}"
+        assert batch_size == 2, f"Expected batch_size 2, got {batch_size}"
 
 
 def test_app_gang_members_run_concurrently(check_package_config, check_flmrun_app):
-    """A min_instances=2 gang is bound all at once: two long tasks run side by side.
+    """A batch_size=2 gang is bound all at once: two long tasks run side by side.
 
-    The rank of a task is task_id % min_instances; two tasks submitted back to
+    The rank of a task is task_id % batch_size; two tasks submitted back to
     back get consecutive ids, so the ranks are unique and complete.
     """
     with initialized_app("test-app-gang"):
 
-        @app.service(autoscale=False, warmup=2)
+        @app.service(autoscale=False, warmup=2, batch_size=2)
         class Member:
             def join(self, seconds):
                 import os
@@ -771,7 +770,7 @@ def test_app_gang_members_run_concurrently(check_package_config, check_flmrun_ap
                 started = time.time()
                 time.sleep(seconds)
                 return {
-                    "rank": int(context.task_id) % context.min_instances,
+                    "rank": int(context.task_id) % context.batch_size,
                     "member": (socket.gethostname(), os.getpid()),
                     "started": started,
                 }

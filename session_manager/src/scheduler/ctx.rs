@@ -62,8 +62,8 @@ impl Context {
         self.plugins.is_ready(ssn)
     }
 
-    /// Whether the session holds its minimum (`min_instances`). Used to commit
-    /// or discard a `Statement`; see `Plugin::is_satisfied`.
+    /// Whether the session holds its gang (`batch_size`). Used to commit or
+    /// discard a `Statement`; see `Plugin::is_satisfied`.
     pub fn is_satisfied(&self, ssn: &SessionInfoPtr) -> Result<bool, FlameError> {
         self.plugins.is_satisfied(ssn)
     }

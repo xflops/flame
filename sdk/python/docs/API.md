@@ -43,7 +43,7 @@ session.close()
 Public helpers:
 
 - `connect(addr, tls_config=None) -> Connection`
-- `create_session(application, common_data=None, session_id=None, min_instances=0, max_instances=None, resreq=None) -> Session`
+- `create_session(application, common_data=None, session_id=None, min_instances=0, max_instances=None, batch_size=1, resreq=None) -> Session`
 - `open_session(session_id, spec=None) -> Session`
 - `register_application(name, app_attrs) -> None`
 - `unregister_application(name) -> None`
@@ -80,8 +80,9 @@ dispatches user completion callbacks away from the shared aio loop.
 - `application: str`
 - `id: str | None`
 - `common_data: bytes | None`
-- `min_instances: int`
+- `min_instances: int` (long-lived instances to keep; not a gang)
 - `max_instances: int | None`
+- `batch_size: int` (gang size: executors are bound only once this many can be bound together; `1` is not a gang)
 - `resreq: ResourceRequirement | None`
 
 `ApplicationAttributes`:
@@ -199,11 +200,11 @@ Key classes and helpers:
 - `app.session_context()` returns the active service-side session context
   (`flamepy.SessionContext`) during an App invocation.
 - `app.context()` returns an `app.InstanceContext` with the `session_id`, `task_id`
-  and `min_instances` of the current App invocation. `min_instances` is the
-  session's minimum number of executors, which the scheduler binds all at once
-  or not at all (a gang). A task that blocks until `min_instances` members have
-  joined, such as a collective `init_process_group`, can use it as the world
-  size. It raises `RuntimeError` outside an invocation.
+  and `batch_size` of the current App invocation. `batch_size` is the session's
+  gang size: while the session has pending tasks, the scheduler binds its
+  executors all at once or not at all. A task that blocks until `batch_size`
+  members have joined, such as a collective `init_process_group`, can use it as
+  the world size. It raises `RuntimeError` outside an invocation.
 - `app.publish_attributes(attrs)` adds opaque `bytes` locality keys to the
   current App response; repeated calls in the response accumulate. Session
   Manager unions every response into the executor's retained set.
@@ -213,7 +214,7 @@ Key classes and helpers:
   populates an auto-generated `pyproject.toml` only when the project has no
   existing Python package metadata. `python_version` selects the executor
   Python version through the application template.
-- `app.service(autoscale=None, warmup=0, resreq=None)` is the canonical service
+- `app.service(autoscale=None, warmup=0, resreq=None, batch_size=1)` is the canonical service
   decorator. Functions become `ServiceInstance` proxies. Decorating a class
   declares a service class without creating a session. Calling
   `DecoratedClass(args...)` creates its service handle and session, and
@@ -227,6 +228,9 @@ Key classes and helpers:
   The retained object is executor-local: autoscaling may create one copy per
   executor. Use `autoscale=False, warmup=1` when mutable state must stay on one
   executor.
+- `warmup` keeps that many instances alive (`min_instances`); it does not make
+  them a gang. `batch_size` is the gang size: use `batch_size=N` for work that
+  blocks until N members are present, together with `warmup=N` to keep them.
 - Public class methods must not collide with `ServiceInstance` API names such
   as `close`; handle construction rejects such definitions.
 - The handle returned by `app.init()` also exposes `service(...)` when direct

@@ -120,7 +120,7 @@ impl From<SessionContext> for rpc::SessionContext {
             application: Some(ctx.application.into()),
             common_data: ctx.common_data.map(|d| d.into()),
             tokens: ctx.tokens,
-            min_instances: ctx.min_instances,
+            batch_size: ctx.batch_size,
         }
     }
 }
@@ -214,6 +214,7 @@ impl From<&Session> for rpc::Session {
                 tokens: Default::default(),
                 min_instances: ssn.min_instances,
                 max_instances: ssn.max_instances,
+                batch_size: ssn.batch_size,
                 priority: ssn.priority,
                 resreq: ssn.resreq.clone().map(rpc::ResourceRequirement::from),
             }),

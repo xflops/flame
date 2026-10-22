@@ -120,8 +120,8 @@ pub struct SessionContext {
     pub application: ApplicationContext,
     pub common_data: Option<CommonData>,
     pub tokens: std::collections::HashMap<String, String>,
-    /// The session's minimum number of executors: the size of a gang.
-    pub min_instances: u32,
+    /// The session's gang size (1 if the session is not a gang).
+    pub batch_size: u32,
 }
 
 impl std::fmt::Debug for SessionContext {
@@ -129,7 +129,7 @@ impl std::fmt::Debug for SessionContext {
         f.debug_struct("SessionContext")
             .field("session_id", &self.session_id)
             .field("application", &self.application)
-            .field("min_instances", &self.min_instances)
+            .field("batch_size", &self.batch_size)
             .field("tokens", &"<redacted>")
             .finish_non_exhaustive()
     }
@@ -146,7 +146,7 @@ impl SessionContext {
             application,
             common_data,
             tokens: std::collections::HashMap::new(),
-            min_instances: 0,
+            batch_size: 1,
         }
     }
 }
@@ -377,7 +377,7 @@ impl TryFrom<rpc::SessionContext> for SessionContext {
             ctx.common_data.map(|data| data.into()),
         );
         session.tokens = ctx.tokens;
-        session.min_instances = ctx.min_instances;
+        session.batch_size = ctx.batch_size.max(1);
         Ok(session)
     }
 }
@@ -403,7 +403,7 @@ mod tests {
             application: None,
             common_data: None,
             tokens: Default::default(),
-            min_instances: 0,
+            batch_size: 0,
         };
 
         assert!(SessionContext::try_from(ctx).is_err());
@@ -419,7 +419,7 @@ mod tests {
             }),
             common_data: None,
             tokens: [("service".into(), "credential".into())].into(),
-            min_instances: 0,
+            batch_size: 0,
         };
 
         let session = SessionContext::try_from(ctx).unwrap();
@@ -430,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn session_context_receives_min_instances() {
+    fn session_context_receives_batch_size() {
         let ctx = rpc::SessionContext {
             session_id: "ssn-1".to_string(),
             application: Some(rpc::ApplicationContext {
@@ -439,10 +439,10 @@ mod tests {
             }),
             common_data: None,
             tokens: Default::default(),
-            min_instances: 4,
+            batch_size: 4,
         };
 
-        assert_eq!(SessionContext::try_from(ctx).unwrap().min_instances, 4);
+        assert_eq!(SessionContext::try_from(ctx).unwrap().batch_size, 4);
     }
 
     #[test]
@@ -623,7 +623,7 @@ mod tests {
                 }),
                 common_data: None,
                 tokens: Default::default(),
-                min_instances: 0,
+                batch_size: 0,
             }),
         )
         .await
@@ -645,7 +645,7 @@ mod tests {
                 }),
                 common_data: None,
                 tokens: Default::default(),
-                min_instances: 0,
+                batch_size: 0,
             }),
         )
         .await
@@ -727,7 +727,7 @@ mod tests {
                 }),
                 common_data: None,
                 tokens: Default::default(),
-                min_instances: 0,
+                batch_size: 0,
             }),
         )
         .await
@@ -755,7 +755,7 @@ mod tests {
                 }),
                 common_data: None,
                 tokens: Default::default(),
-                min_instances: 0,
+                batch_size: 0,
             }),
         )
         .await

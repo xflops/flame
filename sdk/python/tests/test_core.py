@@ -37,6 +37,13 @@ def test_session_spec_carries_tokens():
     assert dict(spec.tokens) == {"service": "credential"}
 
 
+def test_session_spec_carries_batch_size_and_defaults_to_one():
+    from flamepy.core.aio.client import _session_spec
+
+    assert _session_spec(SessionAttributes(application="app")).batch_size == 1
+    assert _session_spec(SessionAttributes(application="app", min_instances=1, batch_size=4)).batch_size == 4
+
+
 def test_sync_frontend_api_parity(frontend_server):
     endpoint, service, server_loop = frontend_server
     connection = client.connect(endpoint)

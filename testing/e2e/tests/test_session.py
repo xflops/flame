@@ -718,13 +718,18 @@ def _gang_capacity():
     pytest.skip(f"Cannot size a 4-6 executor cluster from node cpus {cpus}")
 
 
-def _create_gang(resreq, min_instances):
-    return flamepy.create_session(
+def _create_gang(resreq, size):
+    """A gang of `size`: `batch_size` binds its executors all at once while a task waits, and
+    `min_instances` keeps them alive after the task is done."""
+    session = flamepy.create_session(
         application=FLM_TEST_SVC_APP,
         session_id=f"test-gang-{random_string(8)}",
-        min_instances=min_instances,
+        min_instances=size,
+        batch_size=size,
         resreq=resreq,
     )
+    session.create_task(serialize_request(TestRequest(input="gang_start")))
+    return session
 
 
 def _wait_until(predicate, what, timeout_seconds=60):
@@ -737,7 +742,7 @@ def _wait_until(predicate, what, timeout_seconds=60):
 
 
 def _assert_all_or_nothing(sessions, sizes, seconds):
-    """Over `seconds`, no gang is ever bound to a part of its minimum."""
+    """Over `seconds`, no gang is ever bound to a part of its size."""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         for session, size in zip(sessions, sizes):
@@ -747,7 +752,7 @@ def _assert_all_or_nothing(sessions, sizes, seconds):
 
 
 class TestGangScheduling:
-    """A session with min_instances >= 2 is bound to executors all at once or not at all."""
+    """A session with batch_size >= 2 is bound to executors all at once or not at all."""
 
     @pytest.fixture(autouse=True)
     def cluster(self):
@@ -756,10 +761,9 @@ class TestGangScheduling:
         yield
 
     def test_gang_larger_than_cluster_binds_nothing(self):
-        """A minimum above the cluster capacity never binds any executor."""
+        """A gang above the cluster capacity never binds any executor."""
         session = _create_gang(self.resreq, self.capacity + 1)
         try:
-            session.create_task(serialize_request(TestRequest(input="waiting")))
             _assert_all_or_nothing([session], [self.capacity + 1], seconds=10)
             assert not _executors_bound_to(session.id)
             assert flamepy.get_session(session.id).pending == 1, "The task must stay pending"
@@ -805,7 +809,7 @@ class TestGangScheduling:
                     pass
 
     def test_single_instance_sessions_are_not_held_back(self):
-        """A gang that cannot start does not stop sessions with min_instances of 1."""
+        """A gang that cannot start does not stop sessions that are not a gang."""
         gang = _create_gang(self.resreq, self.capacity + 1)
         single = flamepy.create_session(
             application=FLM_TEST_SVC_APP,

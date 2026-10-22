@@ -193,6 +193,7 @@ async fn run_session(
     metrics: Arc<BenchmarkMetrics>,
 ) -> Result<(), FlameError> {
     let ssn_attr = SessionAttributes {
+        batch_size: 1,
         id: session_id,
         application: FLAME_APP.to_string(),
         common_data: None,

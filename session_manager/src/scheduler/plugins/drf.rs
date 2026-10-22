@@ -317,6 +317,7 @@ mod tests {
 
     fn session() -> SessionInfoPtr {
         Arc::new(SessionInfo {
+            batch_size: 1,
             id: "session-1".to_string(),
             application: "app".to_string(),
             tasks_status: [(TaskState::Pending, 1)].into_iter().collect(),

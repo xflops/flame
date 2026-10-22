@@ -38,6 +38,7 @@ pub async fn run(
         .transpose()?;
 
     let attr = SessionAttributes {
+        batch_size: 1,
         id: format!("{app}-{}", stdng::rand::short_name()),
         application: app.to_owned(),
         common_data: None,

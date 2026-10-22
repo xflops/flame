@@ -95,6 +95,7 @@ mod tests {
             tasks_status.insert(TaskState::Pending, pending);
         }
         Arc::new(SessionInfo {
+            batch_size: 1,
             id: id.to_string(),
             application: "test-app".to_string(),
             tasks_status,

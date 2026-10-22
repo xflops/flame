@@ -342,7 +342,7 @@ def test_flame_service_abstract_minimal_implementation():
             self.application = MockAppCtx()
             self.common_data = b"C"
             self.tokens = {"service": "credential"}
-            self.min_instances = 3
+            self.batch_size = 3
 
         def HasField(self, field):  # noqa: N802
             if field == "common_data":
@@ -355,7 +355,7 @@ def test_flame_service_abstract_minimal_implementation():
     # Verify service received a SessionContext with the right fields
     assert svc.called["enter"].session_id == "sess-123"
     assert svc.called["enter"].tokens == {"service": "credential"}
-    assert svc.called["enter"].min_instances == 3
+    assert svc.called["enter"].batch_size == 3
 
     # OnTaskInvoke path
     class MockTaskRequest:
@@ -407,7 +407,7 @@ def test_on_session_enter_exception_path_returns_error():  # noqa: N802
             self.application = MockAppCtx()
             self.common_data = None
             self.tokens = {}
-            self.min_instances = 0
+            self.batch_size = 0
 
         def HasField(self, field):  # noqa: N802
             return False
@@ -481,7 +481,7 @@ def test_service_preserves_empty_optional_bytes():  # noqa: N802
         application = MockAppCtx()
         common_data = b""
         tokens = {}
-        min_instances = 0
+        batch_size = 0
 
         def HasField(self, field):  # noqa: N802
             return field == "common_data"

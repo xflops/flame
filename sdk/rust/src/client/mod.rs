@@ -133,6 +133,8 @@ pub struct SessionAttributes {
     pub tokens: HashMap<String, String>,
     pub min_instances: u32,
     pub max_instances: Option<u32>,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: u32,
     #[serde(default)]
     pub priority: u32,
     #[serde(default)]
@@ -149,6 +151,10 @@ impl std::fmt::Debug for SessionAttributes {
     }
 }
 
+fn default_batch_size() -> u32 {
+    1
+}
+
 #[derive(Clone)]
 pub struct SessionOptions {
     pub id: Option<SessionID>,
@@ -157,6 +163,7 @@ pub struct SessionOptions {
     tokens: HashMap<String, String>,
     pub min_instances: u32,
     pub max_instances: Option<u32>,
+    pub batch_size: u32,
     pub priority: u32,
     pub resreq: Option<ResourceRequirement>,
 }
@@ -189,6 +196,7 @@ impl SessionOptions {
             tokens: HashMap::new(),
             min_instances: 0,
             max_instances: None,
+            batch_size: 1,
             priority: 0,
             resreq: None,
         }
@@ -216,6 +224,12 @@ impl SessionOptions {
 
     pub fn max_instances(mut self, value: u32) -> Self {
         self.max_instances = Some(value);
+        self
+    }
+
+    /// Gang size: the session is bound only once it holds this many executors (at least 1).
+    pub fn batch_size(mut self, value: u32) -> Self {
+        self.batch_size = value.max(1);
         self
     }
 
@@ -264,6 +278,7 @@ impl From<SessionOptions> for SessionAttributes {
             tokens: options.tokens,
             min_instances: options.min_instances,
             max_instances: options.max_instances,
+            batch_size: options.batch_size,
             priority: options.priority,
             resreq: options.resreq,
         }
@@ -818,6 +833,7 @@ impl Connection {
                 tokens: attrs.tokens.clone(),
                 min_instances: attrs.min_instances,
                 max_instances: attrs.max_instances,
+                batch_size: attrs.batch_size.max(1),
                 priority: attrs.priority,
                 resreq: attrs.resreq.as_ref().map(rpc::ResourceRequirement::from),
             }),
@@ -869,6 +885,7 @@ impl Connection {
             tokens: attrs.tokens.clone(),
             min_instances: attrs.min_instances,
             max_instances: attrs.max_instances,
+            batch_size: attrs.batch_size.max(1),
             priority: attrs.priority,
             resreq: attrs.resreq.as_ref().map(rpc::ResourceRequirement::from),
         });
@@ -2194,6 +2211,7 @@ mod tests {
     fn session_options_generate_default_attributes() {
         let attrs = SessionOptions::new("model-app")
             .min_instances(1)
+            .batch_size(2)
             .priority(7)
             .resreq("cpu=4,mem=16g")
             .into_session_attributes()
@@ -2202,6 +2220,7 @@ mod tests {
         assert!(attrs.id.starts_with("model-app-"));
         assert_eq!(attrs.application, "model-app");
         assert_eq!(attrs.min_instances, 1);
+        assert_eq!(attrs.batch_size, 2);
         assert_eq!(attrs.priority, 7);
         let resreq = attrs.resreq.unwrap();
         assert_eq!(resreq.cpu, 4);
@@ -2350,6 +2369,7 @@ mod tests {
                 name: String::new(),
             }),
             spec: Some(rpc::SessionSpec {
+                batch_size: 1,
                 application: "app".to_string(),
                 common_data: None,
                 min_instances: 0,
@@ -2384,6 +2404,7 @@ mod tests {
                 name: String::new(),
             }),
             spec: Some(rpc::SessionSpec {
+                batch_size: 1,
                 application: "app".to_string(),
                 common_data: None,
                 min_instances: 0,
@@ -2467,6 +2488,7 @@ mod tests {
                 name: String::new(),
             }),
             spec: Some(rpc::SessionSpec {
+                batch_size: 1,
                 application: "app".to_string(),
                 common_data: None,
                 min_instances: 0,

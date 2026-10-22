@@ -120,7 +120,7 @@ async def test_runpy_resolves_inline_and_cached_refs_in_arguments():
 
 
 @pytest.mark.asyncio
-async def test_runpy_exposes_session_task_and_min_instances_through_context():
+async def test_runpy_exposes_session_task_and_batch_size_through_context():
     import flamepy.app as app
     from flamepy.core.service import ApplicationContext, SessionContext, TaskContext
 
@@ -130,7 +130,7 @@ async def test_runpy_exposes_session_task_and_min_instances_through_context():
 
     svc = FlameRunpyService()
     svc._load_app_context = lambda context: _context(ServiceContext(Worker, constructor_args=()))
-    await svc.on_session_enter(SessionContext(None, "session", ApplicationContext("app"), min_instances=3))
+    await svc.on_session_enter(SessionContext(None, "session", ApplicationContext("app"), batch_size=3))
 
     request = ServiceRequest(method="run")
     object_ref = SimpleNamespace(encode=lambda: b"result-ref")

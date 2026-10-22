@@ -30,15 +30,15 @@ class InstanceContext:
     Attributes:
         session_id: The session the invocation runs in.
         task_id: The task being invoked.
-        min_instances: The session's minimum number of executors, i.e. the
-            size of a gang (0 if the session has no minimum). A task that
-            blocks until ``min_instances`` members have joined, such as a
+        batch_size: The session's gang size, i.e. the number of executors it
+            needs together (1 if the session is not a gang). A task that
+            blocks until ``batch_size`` members have joined, such as a
             collective ``init_process_group``, can use it as the world size.
     """
 
     session_id: str
     task_id: Optional[str]
-    min_instances: int
+    batch_size: int
 
 
 @dataclass
@@ -72,7 +72,7 @@ def session_context() -> SessionContext:
 
 
 def context() -> InstanceContext:
-    """Return the session id, task id and ``min_instances`` of the current App invocation."""
+    """Return the session id, task id and ``batch_size`` of the current App invocation."""
     invocation = _current_invocation_context.get()
     if invocation is None:
         raise RuntimeError("App code is not running in a Flame invocation")
@@ -80,7 +80,7 @@ def context() -> InstanceContext:
     return InstanceContext(
         session_id=invocation.session_context.session_id,
         task_id=task.task_id if task is not None else None,
-        min_instances=invocation.session_context.min_instances,
+        batch_size=invocation.session_context.batch_size,
     )
 
 

@@ -209,12 +209,12 @@ def test_close_cancels_stalled_async_hook_after_timeout(monkeypatch):
     asyncio.run(exercise())
 
 
-def test_session_enter_receives_min_instances():
+def test_session_enter_receives_batch_size():
     received = []
 
     class Service(aio_service.FlameService):
         async def on_session_enter(self, context):
-            received.append(context.min_instances)
+            received.append(context.batch_size)
 
         async def on_task_invoke(self, context):
             return None
@@ -228,7 +228,7 @@ def test_session_enter_receives_min_instances():
             shim_pb2.SessionContext(
                 session_id="session",
                 application=shim_pb2.ApplicationContext(name="app"),
-                min_instances=4,
+                batch_size=4,
             ),
             None,
         )

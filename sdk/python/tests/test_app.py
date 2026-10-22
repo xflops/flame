@@ -455,12 +455,12 @@ def test_module_facade_supports_cross_module_service_declarations(monkeypatch):
         (
             "cross_package.services",
             "fn_a",
-            {"autoscale": None, "warmup": 0, "resreq": "cpu=1"},
+            {"autoscale": None, "warmup": 0, "resreq": "cpu=1", "batch_size": 1},
         ),
         (
             "cross_package.services",
             "fn_b",
-            {"autoscale": None, "warmup": 0, "resreq": None},
+            {"autoscale": None, "warmup": 0, "resreq": None, "batch_size": 1},
         ),
     ]
 
@@ -481,7 +481,7 @@ def test_module_service_decorator_is_supported_after_init(monkeypatch):
         return value * 2
 
     assert calculate(3) == 6
-    runtime.service.assert_called_once_with(autoscale=None, warmup=0, resreq=None)
+    runtime.service.assert_called_once_with(autoscale=None, warmup=0, resreq=None, batch_size=1)
 
 
 def test_decorated_function_runs_locally_until_remote_is_called(monkeypatch):
@@ -824,6 +824,7 @@ def test_recursive_service_declaration_prefers_invocation_context(monkeypatch):
         {"autoscale": True},
         {"warmup": 1},
         {"resreq": "cpu=1"},
+        {"batch_size": 2},
     ],
 )
 def test_recursive_service_declaration_rejects_session_options(monkeypatch, options):
@@ -845,6 +846,29 @@ def test_recursive_service_declaration_rejects_session_options(monkeypatch, opti
                 return None
 
     open_session.assert_not_called()
+
+
+def test_public_service_forwards_batch_size(monkeypatch):
+    import flamepy.app as app
+    from flamepy.app.client import ServiceDefinition, _restore_service_definition
+
+    calls = []
+
+    class FakeRuntime:
+        def service(self, **kwargs):
+            calls.append(kwargs)
+            return lambda execution_object: execution_object
+
+    monkeypatch.setattr(app_client, "_runtime", FakeRuntime())
+
+    @app.service(autoscale=False, warmup=2, batch_size=3)
+    def gang_member():
+        return None
+
+    assert calls == [{"autoscale": False, "warmup": 2, "resreq": None, "batch_size": 3}]
+
+    definition = ServiceDefinition("app", gang_member, autoscale=None, warmup=0, resreq=None, batch_size=3)
+    assert _restore_service_definition(*definition.__reduce__()[1])._batch_size == 3
 
 
 def test_recursive_service_declaration_requires_existing_session(monkeypatch):
@@ -1619,6 +1643,7 @@ def test_app_service_passes_public_options(monkeypatch):
             resreq=None,
             constructor_args=None,
             constructor_kwargs=None,
+            batch_size=1,
         ):
             calls.append(
                 (
@@ -1629,6 +1654,7 @@ def test_app_service_passes_public_options(monkeypatch):
                     resreq,
                     constructor_args,
                     constructor_kwargs,
+                    batch_size,
                 )
             )
 
@@ -1644,7 +1670,7 @@ def test_app_service_passes_public_options(monkeypatch):
 
     monkeypatch.setattr("flamepy.app.client.ServiceInstance", FakeServiceInstance)
 
-    decorator = app.service(autoscale=False, warmup=2, resreq=resreq)
+    decorator = app.service(autoscale=False, warmup=2, resreq=resreq, batch_size=2)
     decorated = decorator(sample_func)
 
     assert decorated() == "ok"
@@ -1660,6 +1686,7 @@ def test_app_service_passes_public_options(monkeypatch):
             resreq,
             None,
             None,
+            2,
         )
     ]
 

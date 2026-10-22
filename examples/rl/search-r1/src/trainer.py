@@ -18,7 +18,7 @@ from runtime import CHECKPOINT_PREFIX_APP, TRAINERS, app
 SHARD_BYTES = 512 * 1024 * 1024
 
 
-@app.service(resreq="cpu=16,mem=128g,gpu=1", autoscale=False, warmup=TRAINERS)
+@app.service(resreq="cpu=16,mem=128g,gpu=1", batch_size=TRAINERS)
 class Trainer:
     def __init__(self, model: str, lr: float = 1e-6, kl_coef: float = 0.001, micro_tokens: int = 16384, run: str = "run"):
         import torch
@@ -82,9 +82,10 @@ class Trainer:
     def join(self, members: dict, count: int, port: int) -> dict:
         """Form the NCCL group of `count` executors. The driver sends this call `count` times at once.
 
-        The service is declared with `autoscale=False, warmup=N`, so `min_instances` is N and
-        gang scheduling binds all N executors or none: every one of the N calls gets an executor,
-        and none waits for a member that never starts.
+        The service is declared with `batch_size=N` and no warmup: while calls wait, the gang
+        binds all N executors or none, so every one of the N calls gets an executor and none
+        waits for a member that never starts. Idle executors are shared with the rollout
+        service in the same app.
 
         Each call blocks until every member has joined, so no executor takes two of them and
         calls need no per-executor addressing. Members register in a shared cache object;

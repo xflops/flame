@@ -1254,6 +1254,7 @@ mod tests {
 
     fn create_test_session_attr(id: &str) -> SessionAttributes {
         SessionAttributes {
+            batch_size: 1,
             id: id.to_string(),
             application: "test-app".to_string(),
             common_data: None,

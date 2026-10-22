@@ -77,6 +77,7 @@ async fn test_create_session() -> Result<(), FlameError> {
     let conn = get_connection().await?;
 
     let ssn_attr = SessionAttributes {
+        batch_size: 1,
         id: String::from("ssn-1-test-create-session"),
         application: FLAME_DEFAULT_APP.to_string(),
         common_data: None,
@@ -103,6 +104,7 @@ async fn test_create_multiple_sessions() -> Result<(), FlameError> {
 
     for i in 0..ssn_num {
         let ssn_attr = SessionAttributes {
+            batch_size: 1,
             id: format!("ssn-1-test-create-multiple-sessions-{}", i),
             application: FLAME_DEFAULT_APP.to_string(),
             common_data: None,
@@ -127,6 +129,7 @@ async fn test_create_session_with_tasks() -> Result<(), FlameError> {
     let conn = get_connection().await?;
 
     let ssn_attr = SessionAttributes {
+        batch_size: 1,
         id: String::from("ssn-1-test-create-session-with-tasks"),
         application: FLAME_DEFAULT_APP.to_string(),
         common_data: None,
@@ -189,6 +192,7 @@ async fn test_create_multiple_sessions_with_tasks() -> Result<(), FlameError> {
     let conn = get_connection().await?;
 
     let ssn_1_attr = SessionAttributes {
+        batch_size: 1,
         id: String::from("ssn-1-test-create-multiple-sessions-with-tasks"),
         application: FLAME_DEFAULT_APP.to_string(),
         common_data: None,
@@ -202,6 +206,7 @@ async fn test_create_multiple_sessions_with_tasks() -> Result<(), FlameError> {
     assert_eq!(ssn_1.state, SessionState::Open);
 
     let ssn_2_attr = SessionAttributes {
+        batch_size: 1,
         id: String::from("ssn-2-test-create-multiple-sessions-with-tasks"),
         application: FLAME_DEFAULT_APP.to_string(),
         common_data: None,
