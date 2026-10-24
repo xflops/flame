@@ -87,6 +87,28 @@ def test_sync_frontend_api_parity(frontend_server):
         connection.close()
 
 
+def test_suspend_and_resume_session(frontend_server):
+    endpoint, service, _ = frontend_server
+    connection = client.connect(endpoint)
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        suspended = session.suspend()
+        assert suspended.state == SessionState.SUSPENDING and session.state == SessionState.SUSPENDING
+        assert connection.suspend_session(session.id).id == session.id
+        assert [r.session_id for r in service.requests if r.DESCRIPTOR.name == "SuspendSessionRequest"] == [session.id, session.id]
+        assert session.resume().state == SessionState.OPEN and session.state == SessionState.OPEN
+        assert connection.resume_session(session.id).id == session.id
+        assert [r.session_id for r in service.requests if r.DESCRIPTOR.name == "ResumeSessionRequest"] == [session.id, session.id]
+        service.reject_suspend = True
+        with pytest.raises(FlameError, match="suspend rejected"):
+            session.suspend()
+        service.reject_resume = True
+        with pytest.raises(FlameError, match="resume rejected"):
+            session.resume()
+    finally:
+        connection.close()
+
+
 def test_failed_close_can_be_retried(frontend_server):
     endpoint, service, _ = frontend_server
     connection = client.connect(endpoint)
@@ -582,6 +604,9 @@ def test_module_connection_resets_lock_and_handle_after_fork(monkeypatch):
 def test_enums_and_flame_error():
     # Enums should be int-like and have expected values
     assert int(SessionState.OPEN) == 0
+    assert int(SessionState.CLOSED) == 1
+    assert int(SessionState.SUSPENDING) == 2
+    assert int(SessionState.SUSPENDED) == 3
     assert int(TaskState.PENDING) == 0
     assert int(ApplicationState.ENABLED) == 0
     assert int(Shim.HOST) == 0

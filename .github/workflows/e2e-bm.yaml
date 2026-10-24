@@ -124,7 +124,7 @@ jobs:
           export PYTHONPATH="$(pwd)/testing/e2e/src:$PYTHONPATH"
           export FLAME_LOG=DEBUG
           cd testing/e2e
-          pytest -vv --durations=0 tests/test_app.py tests/test_flmexec.py
+          pytest -vv --durations=0 tests/test_app.py tests/test_flmexec.py tests/test_sandbox.py
 
       - name: Show service logs on failure
         if: failure() || cancelled()

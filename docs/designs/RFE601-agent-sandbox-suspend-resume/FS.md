@@ -35,7 +35,9 @@ interrupted, released or its node fails.
    on its executor, so the agent's state survives if the session is rebound to that executor, and
    otherwise the session restarts from its last committed snapshot, or fresh if there is none
    (4.5, 5).
-4. Suspend is rejected while a task is running.
+4. Suspend never terminates or rejects work: a running task finishes normally and only new launches
+   stop. Clients can still submit tasks to a suspending or suspended session; they stay pending until
+   the resume.
 5. Suspend is supported only for applications on the host shim that opt in with `suspendable`, and
    only when the cluster configures a checkpoint store (`storage.checkpoint`, 4.7). Other shims,
    including CRI, reject it. The sandbox itself is run by the application (`flmbox`, 4.6).
@@ -48,7 +50,12 @@ interrupted, released or its node fails.
 resume of one sandbox session, a durable snapshot in S3 or a local directory, and the Python
 `Sandbox` class. Everything that only makes it faster, cheaper or safer to operate is listed in
 section 9 and is not part of the first release: data-aware placement of resumed sessions, a local
-snapshot cache, the extra limits and TTL, the orphan sweep, GCS, `flmctl` and the Rust SDK.
+snapshot cache, the extra limits and TTL, the orphan sweep and GCS.
+
+The work is delivered in sub-tasks: #603 session suspend and resume (the session states, the controller
+and scheduler behavior, the API, `flmctl` and the SDK calls), #604 the executor resource group, and
+#605 `flamepy.agent.Sandbox` and `flmbox`. The snapshot and checkpoint parts of this design follow the
+session-level step. Where a section below describes a later sub-task it says so.
 
 **Non-goals**
 
@@ -98,7 +105,7 @@ snapshot cache, the extra limits and TTL, the orphan sweep, GCS, `flmctl` and th
 | State | Meaning |
 | ----- | ------- |
 | `Open` | Schedulable. Unchanged. |
-| `Suspending` | Transient. A suspend was accepted; the executor is unbinding and checkpointing. The session records the suspend `attempt` id (4.4). It must be persisted, because a session manager restart in the middle of a suspend has to be recoverable. |
+| `Suspending` | Transient. A suspend was accepted: no new task is launched, running tasks finish, and the executor unbinds (and, in the checkpoint step, checkpoints). With a snapshot the session also records the suspend `attempt` id (4.4). It is persisted; a restart keeps it and the next scheduler cycle completes it (4.5 step 7). |
 | `Suspended` | No executor. The snapshot record of `session.version` (4.4) holds a complete snapshot, or none if the session has never been suspended with an executor. |
 | `Closed` | Terminal. Reachable from every state; releases the snapshot. |
 
@@ -109,18 +116,19 @@ Rejected transitions: `suspend` on anything but `Open`; `resume` on anything but
 is not `Suspending`, or whose attempt id is not the current one, is discarded and its object is
 deleted at once.
 
-`suspend` is the one transition that depends on running work, so the admission check and the move
-to `Suspending` happen under the session lock (the cached `SessionPtr` mutex that `close` uses),
-which also serialises it with `launch_task`.
+`suspend` does not depend on running work. The admission check and the move to `Suspending` still
+happen under the session lock (the cached `SessionPtr` mutex that `close` uses), which serialises it
+with `wait_for_task`.
 
 #### Admission
 
 `suspend` fails with `InvalidState` or `InvalidConfig` unless all of these hold:
 
 1. The session is `Open`.
-2. No task of the session is `Running`. The check and the transition are atomic under the session
-   lock, so a task cannot start between them. Pending tasks do not block suspend; they stay queued
-   (see 4.3).
+2. A running task does not block suspend. It finishes normally, and the executor then unbinds because
+   `wait_for_task` returns `None` for a session that is not `Open`. Pending tasks stay queued (see
+   4.3). An executor that is still `Binding` is not special: it finishes or fails its bind, and then
+   unbinds in the same way.
 3. The application is suspendable (4.2): its shim is `Host`, it has opted in, and the cluster has `storage.checkpoint` set.
 
 ### 4.2 Application and session configuration
@@ -196,9 +204,34 @@ also depends on the image and the sandbox user, so it is an explicit opt-in per 
   absent from it (`shuffle.rs` calls `get_session` on every bound executor). The implementation
   must keep that order. The memory and startup cost of suspended sessions stays, and
   keeping their tasks out of memory until resume is deferred (section 9).
-- Tasks created on a `Suspended` session are rejected in this version (`InvalidState`). Automatic
-  resume on a new task is deferred (section 9). Tasks already `Pending` remain queued and run after
-  resume.
+- Tasks can be created on a `Suspending` or `Suspended` session (only `Closed` rejects them). They are
+  stored `Pending` and run after the resume. The running tasks of a `Suspending` session complete
+  normally: `update_task_state` and `update_task_result` accept every state but `Closed`.
+  `create_task` and both updates check the session state before the engine write, so a rejected call
+  writes nothing (today they write the engine and then check the cache). `close_session` is unchanged:
+  it still refuses a session with a running task. Automatic resume on a new task is deferred
+  (section 9).
+- **Completion (session level).** `SuspendSession` calls `Controller::signal_session(id, Signal::Suspend)`, which
+  only starts the suspend asynchronously: it moves the session to `Suspending`;
+  the controller checks the current state and persists the new one through the single
+  `Storage::update_session_state(id, state)`, which refuses only a `Closed` session;
+  it removes the session's task notifier (waking the executors blocked in `wait_for_task`, as
+  `close_session` does) and returns the session, always `Suspending`. The
+  scheduler's shuffle action completes it: each cycle, a `Suspending` session that no executor in its
+  view references goes to `Suspended` through `Controller::suspend_session`. The scheduler
+  has already verified that no executor serves the session, so the controller does not look at the
+  executors again; it only moves a session that is still `Suspending`, so a session resumed or closed
+  since the check is left alone. No bind gate is needed: binds (`Controller::bind_session`) and the
+  completion run in the same scheduler loop, so the view cannot miss a bind, and a stale view can
+  only over-count executors, which delays the completion. Nothing notifies the scheduler when an
+  executor stops serving a session (`unbind_executor_completed`, a failed bind, unregister, node
+  loss): it notices in its next cycle, and the completion is level-triggered, so a restart cannot
+  leave the session in `Suspending`. `Suspended` is committed only after the executor's session
+  is cleared and persisted, because the scheduler view drops `Suspended` sessions and `shuffle.rs`
+  looks up the session of every bound
+  executor. There is no deadline in this step: a suspend that waits behind a long task, or for an
+  executor that never unbinds, stays `Suspending`. The session-level step has no attempt id; the
+  checkpoint step adds one (4.4) for the executor's completion report.
 
 ### 4.4 Session version, snapshot record and session context
 
@@ -279,13 +312,13 @@ Void -> Idle -> Binding -> Bound -> Unbinding -> Idle   (warm for delay_release,
 #### Suspend
 
 1. `SuspendSession(id)` runs the admission checks (4.1), moves the session to `Suspending` under the
-   session lock with a new attempt id (4.4), and persists it. Under the same lock `wait_for_task` stops handing out tasks
-   (`!is_open`), so no task starts after the check. A task taken from the queue but not yet `Running`
-   counts as running; the implementation must verify the exact point where a popped task changes
-   state.
+   session lock with a new attempt id (4.4, from the checkpoint step), and persists it. Under the same
+   lock `wait_for_task` stops handing out tasks (`!is_open`), so no new task starts after the check. A
+   task that is already running is left alone; its executor unbinds when it finishes.
 2. If the session has no executor, there is nothing to checkpoint: the controller moves the session
    to `Suspended` and leaves its version and snapshot record as they are. If its executor is
-   `Binding` or `Unbinding`, suspend fails with `InvalidState` and can be retried.
+   `Binding` or `Unbinding`, the suspend still proceeds: the session stays `Suspending` until that
+   executor stops serving it.
 3. Otherwise suspending wakes the `LaunchTask` long poll, `wait_for_task` returns `None`, and the
    executor goes `Bound` to `Unbinding` as today. `UnbindExecutor` returns the `suspend` target (4.4,
    4.8); the executor manager then writes the `suspend` marker into `checkpoint_path`.
@@ -313,16 +346,14 @@ Void -> Idle -> Binding -> Bound -> Unbinding -> Idle   (warm for delay_release,
      released first (`delay_release`), the sandbox is gone and the session restarts from its last
      committed snapshot, or fresh. The executor manager deletes the `suspend` marker, the checkpoint
      directory and the failed attempt's object.
-6. **Deadline:** a cluster setting bounds `Suspending`. When it passes the session manager treats it
-   as a failure (as above). The first executor may still be unbinding at that point, and the
-   scheduler can allocate a second one for the reopened session, so the implementation must check
-   whether an `Unbinding` executor counts toward the session's executors. The completion of that attempt arrives later with an attempt id that is no
-   longer current and is discarded, and its object deleted.
+6. **Deadline:** the session-level step has none (4.3). The checkpoint step bounds the checkpoint and
+   upload; a failed or timed-out upload takes the failure path above, and a late completion carries an
+   attempt id that is no longer current and is discarded, and its object deleted.
 7. **Restart recovery:** an executor manager or `flmbox` restart is treated as the loss of the
    executor, not resumed mid-suspend: `flmbox` keeps its configuration in memory, and the executor's
    resource group is killed at start (4.6). The attempt then fails as in the "Executor or node dies"
-   row of section 5. A restarted session manager keeps the persisted `Suspending` and attempt id and
-   waits for the completion or the deadline.
+   row of section 5. A restarted session manager loads a persisted `Suspending` session as it is; the shuffle
+   action completes it in the next cycle once no executor serves it.
 
 #### Resume
 
@@ -498,7 +529,7 @@ with that node, which would defeat resume after a failure.
   `SessionContext` gains `snapshot` and the `suspend` target (4.4). `SandboxConfig` is a new message
   carried in the common data of suspendable applications; the Rust and Python SDK contexts expose
   `resumed`. `ExecutorState` is unchanged.
-- `frontend.proto`: `SuspendSession` and `ResumeSession`. `OpenSession` keeps its get-or-create
+- `frontend.proto`: `SuspendSession` and `ResumeSession` (only `session_id` in the session-level step; `fresh` arrives with the snapshot). `OpenSession` keeps its get-or-create
   meaning and does not resume.
 - `backend.proto`: no new RPC, but two messages change. `UnbindExecutor` returns today only `Result`;
   it returns a new `UnbindExecutorResponse` with the `Result` and an optional `suspend` target.
@@ -508,8 +539,12 @@ with that node, which would defeat resume after a failure.
 - `flame.yaml`: `storage.checkpoint` (URL plus optional endpoint, region and path-style settings),
   `storage` accepting a map form (4.7), `sandbox.images`, `sandbox.network` and `sandbox.egress`.
 - SDKs: the Python `flamepy.agent.Sandbox` class (4.10) and the Python session calls it wraps,
-  `suspend()` and `resume()`, plus `SessionContext.resumed`. `flmctl` and the Rust SDK are deferred.
-- Storage migration: sqlite adds a version column and a snapshot table, and a new state value; the
+  `suspend()` and `resume()`, plus `SessionContext.resumed`. The session-level step (#603) also adds
+  `flmctl suspend <session>` and `flmctl resume <session>` and the Rust SDK `suspend_session` and
+  `resume_session` on the connection and `suspend` and `resume` on the session.
+- Storage migration: the new state values need no schema or format change (the state is the integer
+  already stored), so the session-level step has no migration. The snapshot step adds to sqlite a
+  version column and a snapshot table; the
   filesystem engine persists them next to the session record; `none` keeps them in memory. Existing stores contain
   only `Open` and `Closed` and decode unchanged. An older client that lists a suspended session
   sees an unknown numeric state, which proto3 preserves.
@@ -633,12 +668,14 @@ so the sandbox application can re-establish anything that cannot be checkpointed
 | ------- | -------- |
 | Admission check fails | Error to the caller, no state change. |
 | Checkpoint or upload fails or times out | Retried a bounded number of times, then reported. The sandbox is kept running, the session returns to `Open`, and the failed attempt's object is deleted. If the scheduler binds the same executor again the agent reattaches with its state (4.5). If the executor is released first, the session restarts from its last committed snapshot, or fresh, and state since is lost. |
-| Session manager restarts in `Suspending` | Recovery keeps `Suspending` and the attempt id, and waits for `UnbindExecutorCompleted` or the deadline. A completion that already arrived is applied; if the executor is gone with no completion, it is a failure. |
+| Session manager restarts in `Suspending` | The session stays `Suspending` when it is loaded, and the next scheduler cycle completes it once no executor serves it. |
+| A task runs for a long time, or an executor never unbinds | The session stays `Suspending` until the executor stops serving it; new tasks still queue (4.3). |
+| Tasks are submitted to a suspending or suspended session | Accepted and `Pending`; they run after the resume. |
 | Executor manager or `flmbox` restarts during suspend | Treated as executor loss (next row). |
-| Suspend exceeds its deadline | The session manager fails the suspend as above. A late completion has a stale attempt id and is discarded, and its object deleted. |
+| Checkpoint exceeds its time limit (checkpoint step) | The session manager fails the suspend as above. A late completion has a stale attempt id and is discarded, and its object deleted. |
 | Retry races a late completion | They carry different attempt ids and different object keys. Only the current attempt commits (4.4). |
 | Close while `Suspending` | The close wins. The completion that arrives later is discarded and its object deleted (4.1). |
-| Executor or node dies during suspend | The sandbox is lost and the suspend failed. The session returns to `Open` and restarts from its last committed snapshot, or fresh if there is none. |
+| Executor or node dies during suspend | At session level the executor no longer serves the session, and the suspend completes if it was the last one. With a checkpoint (later step) the sandbox is lost and the suspend failed: the session returns to `Open` and restarts from its last committed snapshot, or fresh if there is none. |
 | Snapshot store unreachable on suspend | Same as a failed upload. |
 | A suspended session is never resumed | It stays suspended and keeps its snapshot until closed. It counts in `limits.max_sessions` and is never evicted. |
 | Session created with a disallowed image, or with `snapshot_path` or `checkpoint_path` set | Rejected with `InvalidConfig` (4.2). |
@@ -649,9 +686,12 @@ so the sandbox application can re-establish anything that cannot be checkpointed
 
 ## 6. Verification
 
-- Controller and storage: transitions and rejected transitions; suspend rejected with a running
-  task, for a non-host application, without `storage.checkpoint`, and for a non-suspendable one; close and delete while
-  suspending or suspended; recovery in `Suspending`; migration of existing sessions.
+- Controller and storage: transitions and rejected transitions; suspend with a running task lets it
+  finish and then unbinds; tasks can be submitted and completed in every state but `Closed`; suspend
+  rejected for a non-host application, without `storage.checkpoint`, and for a non-suspendable one
+  (checkpoint step); close and delete while suspending or suspended; recovery in `Suspending` (stays
+  `Suspending`) and `Suspended`; no executor references a session missing from the scheduler view; a long-running
+  task keeps the session `Suspending` until it finishes; migration of existing sessions (checkpoint step).
 - Security: a session whose common data sets `snapshot_path` or `checkpoint_path`, or whose image is
   not in the allowlist, is rejected; the executor manager overwrites both paths in the copy it
   passes; `flmbox` refuses an image over `sandbox.max_image_size`; a sandbox cannot reach the
@@ -695,7 +735,7 @@ so the sandbox application can re-establish anything that cannot be checkpointed
 ## 7. Open questions
 
 1. Should a task created on a `Suspended` session resume it automatically, controlled per session?
-2. Should pending tasks also block suspend?
+2. Should `watch_task` keep working across a suspend? It does while the session is not closed.
 3. How does `flmbox` pull and unpack an image (a Rust registry client, or `skopeo` and `umoci` on
    the node), and is `runsc` provisioned on every node? The spike answers this.
 4. Client-side snapshot encryption and per-session access control, beyond bucket policy and
@@ -715,16 +755,18 @@ so the sandbox application can re-establish anything that cannot be checkpointed
     a sudo-capable user) without weakening isolation?
 11. Is a delegated cgroup v2 subtree available on the target nodes, and is Linux 5.14 or later
     (for `cgroup.kill`) a safe minimum?
+12. Should a suspend have a deadline that returns the session to `Open`? The session-level step has
+    none: a suspend that cannot complete stays `Suspending` (the shuffle action completes it each cycle).
 
 ## 8. Rollout and rollback
 
 - Everything is opt-in through `suspendable`. Without it no new code path runs, and the new
   proto fields and enum values are unused.
-- Land in order: (1) spike, (2) session state, version, attempt and snapshot record, session
-  context, API, controller and scheduler with a fake sandbox, (3) `SnapshotStore` with the `s3://`
-  and `file://` backends, (4) `storage.checkpoint`, the snapshot and checkpoint directories and
-  `flmbox`, (5) the built-in sandbox application and the Python `flamepy.agent.Sandbox`, (6)
-  end-to-end tests.
+- Land in order: (1) session suspend and resume (#603: states, storage, controller, API, `flmctl`, SDK
+  calls), (2) spike, (3) the snapshot record, version, attempt and session context with a fake sandbox, (4) `SnapshotStore` with the `s3://`
+  and `file://` backends, (5) `storage.checkpoint`, the snapshot and checkpoint directories and
+  `flmbox` (with #604 the executor resource group), (6) the built-in sandbox application and the Python
+  `flamepy.agent.Sandbox`, (7) end-to-end tests.
 - The `UnbindExecutor` response type changes (4.8), so the session manager and all executor managers
   are upgraded together.
 - Rollback: stop registering suspendable applications and resume or close the suspended sessions.
@@ -750,10 +792,10 @@ Each item is independent and can follow once the MVP works.
   today: `GrpcShim` awaits the call with no deadline, and the only timeouts on that path are 30
   seconds for the service socket and for the connection. A stalled pull, restore or checkpoint
   would keep the executor in `Binding` or `Unbinding` for ever. This predates suspend and affects
-  every application. The MVP relies on the suspend deadline of 4.5 only. A fix would add
+  every application. The MVP adds no deadline for them. A fix would add
   per-application deadlines in the executor manager and make `flmbox` stop its work when the request
   is cancelled.
-- **GCS backend**, and `flmctl suspend` and `resume`, and the Rust SDK.
+- **GCS backend.**
 - **Smaller snapshots.** Splitting the filesystem delta out of the checkpoint, once the sizes from
   the spike justify it.
 - **Automatic resume** of a suspended session by a new task, and **automatic suspend** on idle.

@@ -11,7 +11,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::cmp::Ordering;
 use std::error::Error;
 
 use comfy_table::presets::NOTHING;
@@ -103,16 +102,17 @@ async fn list_sessions(conn: Connection, output_format: &str) -> Result<(), Box<
         "Created",
     ]);
 
-    ssn_list.sort_by(|l, r| {
-        if l.state == r.state {
-            let lid: u32 = l.id.trim().parse().unwrap_or(0);
-            let rid: u32 = r.id.trim().parse().unwrap_or(0);
-            lid.cmp(&rid)
-        } else if l.state == SessionState::Open {
-            Ordering::Less
+    ssn_list.sort_by_key(|ssn| {
+        let rank = if ssn.state == SessionState::Open {
+            0
         } else {
-            Ordering::Greater
-        }
+            1
+        };
+        (
+            rank,
+            ssn.state as i32,
+            ssn.id.trim().parse::<u32>().unwrap_or(0),
+        )
     });
 
     for ssn in &ssn_list {

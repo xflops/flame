@@ -53,6 +53,22 @@ mod tests {
     }
 
     #[test]
+    fn test_session_state_rpc_round_trip() {
+        use rpc::flame::v1 as rpc;
+        for (state, wire) in [
+            (SessionState::Open, 0),
+            (SessionState::Closed, 1),
+            (SessionState::Suspending, 2),
+            (SessionState::Suspended, 3),
+        ] {
+            assert_eq!(i32::from(state), wire);
+            assert_eq!(rpc::SessionState::from(state) as i32, wire);
+            assert_eq!(SessionState::try_from(wire).unwrap(), state);
+        }
+        assert!(SessionState::try_from(99).is_err());
+    }
+
+    #[test]
     fn test_shim_default() {
         let shim = Shim::default();
         assert_eq!(shim, Shim::Host);

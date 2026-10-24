@@ -42,7 +42,7 @@ use std::fs;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock};
-use stdng::{async_rw_ptr, read_async, write_async, AsyncRWPtr};
+use stdng::{async_rw_ptr, ensure, read_async, write_async, AsyncRWPtr};
 use tokio::sync::OwnedRwLockWriteGuard;
 
 use async_trait::async_trait;
@@ -425,6 +425,17 @@ impl FilesystemEngine {
         fs::rename(&tmp_path, &path)
             .map_err(|e| FlameError::Storage(format!("Failed to rename session metadata: {e}")))?;
 
+        Ok(())
+    }
+
+    /// Persist `metadata` and make it the entry's current one.
+    fn commit_session_metadata(
+        &self,
+        entry: &mut SessionEntry,
+        metadata: SessionMetadata,
+    ) -> Result<(), FlameError> {
+        self.write_session_metadata(&metadata.id, &metadata)?;
+        entry.metadata = metadata;
         Ok(())
     }
 
@@ -1085,12 +1096,12 @@ impl Engine for FilesystemEngine {
             )));
         }
 
-        let filter = SessionFilter {
-            application: Some(name.clone()),
-            state: Some(SessionState::Open),
-            ..SessionFilter::default()
-        };
-        if !self._list_sessions_metadata(Some(&filter))?.is_empty() {
+        let filter = SessionFilter::by_application(name.clone());
+        let live = self
+            ._list_sessions_metadata(Some(&filter))?
+            .iter()
+            .any(|(_, session)| session.state != SessionState::Closed as i32);
+        if live {
             return Err(FlameError::Storage(format!(
                 "Cannot update application '{}': has open sessions",
                 name
@@ -1272,7 +1283,7 @@ impl Engine for FilesystemEngine {
         let shared = self.session_entry(&id)?;
         let mut entry = write_async!(shared);
         validate_entry(&self.sessions, &id, &shared)?;
-        if entry.metadata.state == SessionState::Closed as i32 {
+        if entry.is_closed() {
             entry.release_files();
             return self.session_from_metadata(&entry.metadata);
         }
@@ -1300,9 +1311,30 @@ impl Engine for FilesystemEngine {
         metadata.state = SessionState::Closed as i32;
         metadata.completion_time = Some(Utc::now().timestamp());
         metadata.version += 1;
-        self.write_session_metadata(&id, &metadata)?;
-        entry.metadata = metadata;
+        self.commit_session_metadata(&mut entry, metadata)?;
         entry.release_files();
+        self.session_from_metadata(&entry.metadata)
+    }
+
+    async fn update_session_state(
+        &self,
+        id: SessionID,
+        state: SessionState,
+    ) -> Result<Session, FlameError> {
+        let shared = self.session_entry(&id)?;
+        let mut entry = write_async!(shared);
+        validate_entry(&self.sessions, &id, &shared)?;
+        ensure!(
+            !entry.is_closed(),
+            FlameError::InvalidState(format!("Session {id} is closed"))
+        )?;
+
+        let mut metadata = entry.metadata.clone();
+        metadata.state = state as i32;
+        self.commit_session_metadata(&mut entry, metadata)?;
+        if state == SessionState::Suspended {
+            entry.release_files();
+        }
         self.session_from_metadata(&entry.metadata)
     }
 
@@ -1310,7 +1342,7 @@ impl Engine for FilesystemEngine {
         let shared = self.session_entry(&id)?;
         let entry = write_async!(shared);
         validate_entry(&self.sessions, &id, &shared)?;
-        if entry.metadata.state != SessionState::Closed as i32 {
+        if !entry.is_closed() {
             return Err(FlameError::Storage(
                 "Cannot delete open session".to_string(),
             ));
@@ -1355,7 +1387,11 @@ impl Engine for FilesystemEngine {
     ) -> Result<Task, FlameError> {
         lock_ssn!(self, &ssn_id, entry);
 
-        entry.ensure_open()?;
+        // A suspending or suspended session still accepts tasks and task updates.
+        ensure!(
+            !entry.is_closed(),
+            FlameError::InvalidState(format!("Session {} is closed", entry.metadata.id))
+        )?;
 
         // Stage the immutable payloads first. Their ranges are reserved
         // atomically, so neither the writes nor their syncs hold a gate, and an
@@ -1415,7 +1451,10 @@ impl Engine for FilesystemEngine {
 
     async fn retry_task(&self, gid: TaskGID) -> Result<Task, FlameError> {
         lock_ssn!(self, &gid.ssn_id, entry);
-        entry.ensure_open()?;
+        ensure!(
+            entry.is_open(),
+            FlameError::InvalidState(format!("Session {} is not open", entry.metadata.id))
+        )?;
 
         let meta = entry.with_task(gid.task_id, || {
             self.update_task(&entry, gid.task_id, |meta| {
@@ -1432,7 +1471,11 @@ impl Engine for FilesystemEngine {
         _message: Option<String>,
     ) -> Result<Task, FlameError> {
         lock_ssn!(self, &gid.ssn_id, entry);
-        entry.ensure_open()?;
+        // A suspending or suspended session still accepts tasks and task updates.
+        ensure!(
+            !entry.is_closed(),
+            FlameError::InvalidState(format!("Session {} is closed", entry.metadata.id))
+        )?;
 
         let meta = entry.with_task(gid.task_id, || {
             self._update_task_state(&entry, gid.task_id, task_state)
@@ -1446,7 +1489,11 @@ impl Engine for FilesystemEngine {
         task_result: TaskResult,
     ) -> Result<Task, FlameError> {
         lock_ssn!(self, &gid.ssn_id, entry);
-        entry.ensure_open()?;
+        // A suspending or suspended session still accepts tasks and task updates.
+        ensure!(
+            !entry.is_closed(),
+            FlameError::InvalidState(format!("Session {} is closed", entry.metadata.id))
+        )?;
 
         // Stage the output before taking the task gate. If the update is later
         // rejected or fails, the range stays unreferenced.

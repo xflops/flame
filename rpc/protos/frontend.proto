@@ -29,6 +29,8 @@ service Frontend {
 
   rpc OpenSession (OpenSessionRequest) returns (Session) {}
   rpc CloseSession (CloseSessionRequest) returns (Session) {}
+  rpc SuspendSession (SuspendSessionRequest) returns (Session) {}
+  rpc ResumeSession (ResumeSessionRequest) returns (Session) {}
 
   rpc GetSession(GetSessionRequest) returns (Session) {}
   rpc ListSessions (ListSessionsRequest) returns (SessionList) {}
@@ -98,6 +100,15 @@ message OpenSessionRequest {
 message CloseSessionRequest {
   string session_id = 1;
 }
+
+message SuspendSessionRequest {
+  string session_id = 1;
+}
+
+message ResumeSessionRequest {
+  string session_id = 1;
+}
+
 message GetSessionRequest {
   string session_id = 1;
 }

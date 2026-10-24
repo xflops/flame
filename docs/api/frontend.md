@@ -25,6 +25,8 @@ service Frontend {
   rpc DeleteSession(DeleteSessionRequest) returns (Session) {}
   rpc OpenSession(OpenSessionRequest) returns (Session) {}
   rpc CloseSession(CloseSessionRequest) returns (Session) {}
+  rpc SuspendSession(SuspendSessionRequest) returns (Session) {}
+  rpc ResumeSession(ResumeSessionRequest) returns (Session) {}
   rpc GetSession(GetSessionRequest) returns (Session) {}
   rpc ListSessions(ListSessionsRequest) returns (SessionList) {}
 
@@ -173,6 +175,38 @@ session and task events; events are retained while the session remains open.
 | Field | Type | Description |
 |-------|------|-------------|
 | `session_id` | string | Session ID to close |
+
+**Response:** [Session](types.md#session)
+
+### SuspendSession
+
+Suspends an `Open` session. The session moves to `Suspending`: no new task is
+launched, running tasks finish normally, and the session's executors unbind, after
+which the session becomes `Suspended` (the scheduler completes it in its next cycle).
+The returned session is always `Suspending`. Tasks can still be submitted
+to a suspending or suspended session; they stay `Pending` until the session is
+resumed. Suspending a session that is already `Suspending` or `Suspended`, or a
+`Closed` session, fails with `INVALID_ARGUMENT`.
+
+**Request:** `SuspendSessionRequest`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | string | Session ID to suspend |
+
+**Response:** [Session](types.md#session)
+
+### ResumeSession
+
+Resumes a `Suspended` session, moving it back to `Open` so that pending tasks are
+scheduled again. Resuming an `Open` session is a no-op that succeeds. Other states
+(`Suspending`, `Closed`) fail with `INVALID_ARGUMENT`.
+
+**Request:** `ResumeSessionRequest`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | string | Session ID to resume |
 
 **Response:** [Session](types.md#session)
 

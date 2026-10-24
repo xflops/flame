@@ -84,11 +84,14 @@ impl ApplicationManager {
             }
         }
 
-        let open_filter =
-            SessionFilter::by_application_state(application.name.clone(), SessionState::Open)
-                .with_limit(1);
-        let has_open_sessions = !self.storage.list_sessions(Some(&open_filter))?.is_empty();
-        if has_open_sessions {
+        // Suspending and suspended sessions are live too: they resume into the application.
+        let live_filter = SessionFilter::by_application(application.name.clone());
+        let has_live_sessions = self
+            .storage
+            .list_sessions(Some(&live_filter))?
+            .iter()
+            .any(|session| !session.is_closed());
+        if has_live_sessions {
             return Ok(());
         }
 

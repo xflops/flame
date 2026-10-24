@@ -252,14 +252,12 @@ impl SessionEntry {
         }
     }
 
-    pub(super) fn ensure_open(&self) -> Result<(), FlameError> {
-        if self.metadata.state != SessionState::Open as i32 {
-            return Err(FlameError::InvalidState(format!(
-                "Session {} is closed",
-                self.metadata.id
-            )));
-        }
-        Ok(())
+    pub(super) fn is_open(&self) -> bool {
+        self.metadata.state == SessionState::Open as i32
+    }
+
+    pub(super) fn is_closed(&self) -> bool {
+        self.metadata.state == SessionState::Closed as i32
     }
 
     /// The lock of one task, created on first use and kept for the life of the
@@ -287,7 +285,7 @@ impl SessionEntry {
     /// The shared handle for one file, opened on first use.
     pub(super) fn part(&self, part: Part) -> Result<Arc<PayloadFile>, FlameError> {
         let path = self.dir.join(part.file_name());
-        if self.metadata.state == SessionState::Closed as i32 {
+        if self.is_closed() {
             // Closed sessions stay readable but must not retain descriptors.
             return Ok(Arc::new(PayloadFile::open(&path, false)?));
         }

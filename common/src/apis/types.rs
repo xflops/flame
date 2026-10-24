@@ -241,6 +241,8 @@ pub enum SessionState {
     #[default]
     Open = 0,
     Closed = 1,
+    Suspending = 2,
+    Suspended = 3,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -355,7 +357,10 @@ impl Task {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
+    /// Ask an executor to leave its session after the task in flight.
     Interrupt,
+    /// Ask a session to suspend: no new task is launched and its executors unbind.
+    Suspend,
 }
 
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq, Hash, strum_macros::Display)]

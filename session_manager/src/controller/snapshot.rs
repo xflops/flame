@@ -142,6 +142,10 @@ pub struct SessionInfo {
 }
 
 impl SessionInfo {
+    pub fn is_open(&self) -> bool {
+        self.state == SessionState::Open
+    }
+
     pub fn is_ready(&self, retry_limits: u32) -> bool {
         self.retry_count < retry_limits
     }
@@ -1008,6 +1012,26 @@ mod tests {
 
         assert_eq!(ready_ssns.len(), 1);
         assert!(ready_ssns.contains_key("ssn-ready"));
+    }
+
+    #[test]
+    fn test_snapshot_suspending_and_suspended_sessions_are_not_ready() {
+        let ss = SnapShot::new();
+        for (id, state) in [
+            ("ssn-open", SessionState::Open),
+            ("ssn-suspending", SessionState::Suspending),
+            ("ssn-suspended", SessionState::Suspended),
+        ] {
+            ss.add_session(create_test_session(id, Some(slots_rr(2)), state))
+                .unwrap();
+        }
+
+        // Dispatch and Allocate read READY_SESSION, DRF reads OPEN_SESSION.
+        for filter in [READY_SESSION, OPEN_SESSION] {
+            let found = ss.find_sessions(filter).unwrap();
+            assert_eq!(found.len(), 1);
+            assert!(found.contains_key("ssn-open"));
+        }
     }
 
     /// Test that update_executor_state correctly updates the exec_index.

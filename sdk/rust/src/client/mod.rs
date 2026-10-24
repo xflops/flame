@@ -35,8 +35,8 @@ use self::rpc::{
     DeleteSessionRequest, Environment, GetApplicationRequest, GetNodeRequest, GetSessionRequest,
     GetTaskRequest, ListApplicationsRequest, ListExecutorsRequest, ListNodesRequest,
     ListSessionsRequest, ListTasksRequest, OpenSessionRequest, RegisterApplicationRequest,
-    SessionSpec, TaskSpec, UnregisterApplicationRequest, UpdateApplicationRequest,
-    WatchTaskRequest,
+    ResumeSessionRequest, SessionSpec, SuspendSessionRequest, TaskSpec,
+    UnregisterApplicationRequest, UpdateApplicationRequest, WatchTaskRequest,
 };
 use crate::apis::flame::v1 as rpc;
 use crate::apis::FlameClientTls;
@@ -987,6 +987,32 @@ impl Connection {
         Ok(())
     }
 
+    /// Suspend an open session. Running tasks finish, executors unbind, and
+    /// the session ends up `Suspended`. Pending tasks stay queued, so the shared
+    /// watch manager is left open.
+    pub async fn suspend_session(&self, id: &str) -> Result<Session, FlameError> {
+        let mut client = FlameClient::new(self.channel.clone());
+        let ssn = client
+            .suspend_session(SuspendSessionRequest {
+                session_id: id.to_string(),
+            })
+            .await?
+            .into_inner();
+        self.attach_session(&ssn, client)
+    }
+
+    /// Resume a suspended session (resuming an open session is a no-op).
+    pub async fn resume_session(&self, id: &str) -> Result<Session, FlameError> {
+        let mut client = FlameClient::new(self.channel.clone());
+        let ssn = client
+            .resume_session(ResumeSessionRequest {
+                session_id: id.to_string(),
+            })
+            .await?
+            .into_inner();
+        self.attach_session(&ssn, client)
+    }
+
     pub async fn register_application(
         &self,
         name: String,
@@ -1369,6 +1395,26 @@ impl Session {
             .as_ref()
             .ok_or_else(|| FlameError::Internal("no flame connection".to_string()))?
             .close_session(&self.id)
+            .await
+    }
+
+    /// Suspend this session and return its updated snapshot.
+    pub async fn suspend(&self) -> Result<Session, FlameError> {
+        trace_fn!("Session::suspend");
+        self.connection
+            .as_ref()
+            .ok_or_else(|| FlameError::Internal("no flame connection".to_string()))?
+            .suspend_session(&self.id)
+            .await
+    }
+
+    /// Resume this session and return its updated snapshot.
+    pub async fn resume(&self) -> Result<Session, FlameError> {
+        trace_fn!("Session::resume");
+        self.connection
+            .as_ref()
+            .ok_or_else(|| FlameError::Internal("no flame connection".to_string()))?
+            .resume_session(&self.id)
             .await
     }
 }
@@ -2224,6 +2270,59 @@ mod tests {
         let state = manager.state.lock().await;
         assert!(state.stream.is_none());
         assert!(state.task_watcher.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_suspend_and_resume_keep_shared_watch_open() {
+        let channel = Endpoint::from_static("http://127.0.0.1:0").connect_lazy();
+        let connection = Connection {
+            channel: channel.clone(),
+            watch_managers: Arc::default(),
+        };
+        let manager = connection.watch_manager(&"ssn-1".to_string());
+        let timeout = std::time::Duration::from_secs(3);
+        assert!(
+            tokio::time::timeout(timeout, connection.suspend_session("ssn-1"))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(timeout, connection.resume_session("ssn-1"))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(lock_ptr!(connection.watch_managers)
+            .unwrap()
+            .contains_key("ssn-1"));
+        assert!(Arc::ptr_eq(
+            &manager,
+            &connection.watch_manager(&"ssn-1".to_string())
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_suspend_without_connection_is_an_error() {
+        let session = Session {
+            client: None,
+            connection: None,
+            id: "ssn-1".to_string(),
+            application: "test-app".to_string(),
+            common_data: None,
+            creation_time: Utc::now(),
+            state: SessionState::Open,
+            pending: 0,
+            running: 0,
+            succeed: 0,
+            failed: 0,
+            events: Vec::new(),
+            tasks: None,
+            priority: 0,
+            resreq: None,
+        };
+        assert!(session.suspend().await.is_err());
+        assert!(session.resume().await.is_err());
     }
 
     #[tokio::test]

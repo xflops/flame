@@ -146,6 +146,8 @@ message SessionStatus {
 enum SessionState {
   Open = 0;
   Closed = 1;
+  Suspending = 2;
+  Suspended = 3;
 }
 ```
 
@@ -153,6 +155,8 @@ enum SessionState {
 |-------|-------------|
 | `Open` | Session is accepting new tasks |
 | `Closed` | Session is closed, no new tasks accepted |
+| `Suspending` | A suspend was accepted: no new task is launched, running tasks finish and executors unbind. Becomes `Suspended` when done |
+| `Suspended` | Session holds no executor. Submitted tasks stay `Pending` until `ResumeSession` returns it to `Open` |
 
 ### SessionList
 

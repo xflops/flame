@@ -109,9 +109,35 @@ macro_rules! write_async {
     };
 }
 
+/// Evaluates to `Ok(())` if `cond` holds, else to `Err(err)`; `err` is only evaluated
+/// on failure. The caller adds `?`.
+#[macro_export]
+macro_rules! ensure {
+    ($cond:expr, $err:expr $(,)?) => {
+        if $cond { Ok(()) } else { Err($err) }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_is_ok_when_true_and_skips_the_error() {
+        let evaluated = std::cell::Cell::new(false);
+        let result: Result<(), String> = ensure!(true, {
+            evaluated.set(true);
+            "unused".to_string()
+        });
+        assert_eq!(result, Ok(()));
+        assert!(!evaluated.get());
+    }
+
+    #[test]
+    fn ensure_is_the_given_error_when_false() {
+        let result: Result<(), String> = ensure!(1 > 2, "boom".to_string());
+        assert_eq!(result, Err("boom".to_string()));
+    }
 
     #[test]
     fn mutex_ptr_locks_and_shares() {

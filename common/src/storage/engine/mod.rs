@@ -17,8 +17,8 @@ use async_trait::async_trait;
 
 use crate::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationState, ExecutorID, ExecutorState,
-    Node, Session, SessionAttributes, SessionID, Task, TaskGID, TaskInput, TaskOptions, TaskResult,
-    TaskState,
+    Node, Session, SessionAttributes, SessionID, SessionState, Task, TaskGID, TaskInput,
+    TaskOptions, TaskResult, TaskState,
 };
 use crate::apis::{ApplicationFilter, Executor};
 use crate::FlameError;
@@ -65,7 +65,15 @@ pub trait Engine: Send + Sync + 'static {
         id: SessionID,
         spec: Option<SessionAttributes>,
     ) -> Result<Session, FlameError>;
+    /// Close a session in any non-closed state.
     async fn close_session(&self, id: SessionID) -> Result<Session, FlameError>;
+    /// Set the state of an existing session. `NotFound` if it does not exist;
+    /// `InvalidState` (nothing written) if it is `Closed`, which is terminal.
+    async fn update_session_state(
+        &self,
+        id: SessionID,
+        state: SessionState,
+    ) -> Result<Session, FlameError>;
     async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError>;
     async fn find_sessions(&self) -> Result<Vec<Session>, FlameError>;
 

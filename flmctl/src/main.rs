@@ -26,6 +26,8 @@ mod helper;
 mod list;
 mod migrate;
 mod register;
+mod resume;
+mod suspend;
 mod unregister;
 mod update;
 mod utils;
@@ -97,6 +99,16 @@ enum Commands {
     Close {
         /// The id of session
         #[arg(short, long)]
+        session: String,
+    },
+    /// Suspend an open session: running tasks finish, executors unbind, then the session is suspended
+    Suspend {
+        /// The id of the session
+        session: String,
+    },
+    /// Resume a suspended session (an open session is left as is)
+    Resume {
+        /// The id of the session
         session: String,
     },
     /// Delete closed sessions in Flame; a session must be closed first
@@ -177,6 +189,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Some(Commands::Close { session }) => close::run(&ctx, session).await?,
         Some(Commands::Delete { session }) => delete::run(&ctx, session.as_deref()).await?,
+        Some(Commands::Suspend { session }) => suspend::run(&ctx, session).await?,
+        Some(Commands::Resume { session }) => resume::run(&ctx, session).await?,
         Some(Commands::Create {
             app,
             priority,

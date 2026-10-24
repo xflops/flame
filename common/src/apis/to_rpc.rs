@@ -298,6 +298,8 @@ impl From<SessionState> for rpc::SessionState {
         match state {
             SessionState::Open => rpc::SessionState::Open,
             SessionState::Closed => rpc::SessionState::Closed,
+            SessionState::Suspending => rpc::SessionState::Suspending,
+            SessionState::Suspended => rpc::SessionState::Suspended,
         }
     }
 }

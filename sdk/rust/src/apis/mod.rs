@@ -125,6 +125,8 @@ impl From<FromEnvError> for FlameError {
 pub enum SessionState {
     Open = 0,
     Closed = 1,
+    Suspending = 2,
+    Suspended = 3,
 }
 
 #[derive(

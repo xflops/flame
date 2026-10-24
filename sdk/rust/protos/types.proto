@@ -12,6 +12,8 @@ message Metadata {
 enum SessionState {
   Open = 0;
   Closed = 1;
+  Suspending = 2;
+  Suspended = 3;
 }
 
 message SessionStatus {

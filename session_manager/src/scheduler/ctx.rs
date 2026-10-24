@@ -163,6 +163,12 @@ impl Context {
         Ok(())
     }
 
+    /// Finishes the suspend of a session the snapshot shows no executor serving. The controller only
+    /// moves a session that is still `Suspending`.
+    pub async fn suspend_session(&self, ssn: &SessionInfoPtr) -> Result<(), FlameError> {
+        self.controller.suspend_session(ssn.id.clone()).await
+    }
+
     pub async fn release_executor(&self, exec: &ExecutorInfoPtr) -> Result<(), FlameError> {
         self.controller.release_executor(exec.id.clone()).await?;
 

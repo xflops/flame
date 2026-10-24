@@ -41,6 +41,8 @@ from flamepy.proto.frontend_pb2 import (
     ListTasksRequest,
     OpenSessionRequest,
     RegisterApplicationRequest,
+    ResumeSessionRequest,
+    SuspendSessionRequest,
     UnregisterApplicationRequest,
     WatchTaskRequest,
 )
@@ -353,6 +355,16 @@ class Connection:
             session_watch.close(FlameError(FlameErrorCode.INTERNAL, "session deleted during task watch"))
         return _session_from_proto(self, response)
 
+    async def suspend_session(self, session_id: SessionID) -> "Session":
+        """Suspend an open session; pending tasks stay queued, so task watches are kept."""
+        response = await self._rpc("SuspendSession", SuspendSessionRequest(session_id=session_id), "failed to suspend session")
+        return _session_from_proto(self, response)
+
+    async def resume_session(self, session_id: SessionID) -> "Session":
+        """Resume a suspended session (resuming an open session is a no-op)."""
+        response = await self._rpc("ResumeSession", ResumeSessionRequest(session_id=session_id), "failed to resume session")
+        return _session_from_proto(self, response)
+
     def _watch_task(self, session_id: SessionID, task_id: TaskID, timeout: Optional[float]) -> "TaskWatcher":
         self._check_loop()
         session_watch = self._session_watches.get(session_id)
@@ -506,6 +518,19 @@ class Session:
 
     async def close(self) -> None:
         await self.connection.close_session(self.id)
+
+    def _refresh(self, other: "Session") -> "Session":
+        for name in ("state", "pending", "running", "succeed", "failed", "completion_time", "events"):
+            setattr(self, name, getattr(other, name))
+        return other
+
+    async def suspend(self) -> "Session":
+        """Suspend this session and refresh its local state from the response."""
+        return self._refresh(await self.connection.suspend_session(self.id))
+
+    async def resume(self) -> "Session":
+        """Resume this session and refresh its local state from the response."""
+        return self._refresh(await self.connection.resume_session(self.id))
 
 
 class _SessionWatch:

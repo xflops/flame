@@ -11,16 +11,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use stdng::{logs::TraceFn, trace_fn};
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::model::{ExecutorInfo, SnapShot, BOUND_EXECUTOR, IDLE_EXECUTOR};
+use crate::model::{
+    ExecutorInfo, SessionFilter, SnapShot, ALL_EXECUTOR, BOUND_EXECUTOR, IDLE_EXECUTOR,
+};
 use crate::scheduler::actions::{Action, ActionPtr};
 use crate::scheduler::ctx::Context;
 
+use common::apis::SessionState;
 use common::FlameError;
 
 pub struct ShuffleAction {}
@@ -46,6 +50,29 @@ impl Action for ShuffleAction {
     async fn execute(&self, ctx: &mut Context) -> Result<(), FlameError> {
         trace_fn!("ShuffleAction::execute");
         let ss = ctx.snapshot.clone();
+
+        // Complete the suspends: a Suspending session no executor serves becomes Suspended. Binds run
+        // in this same loop, so the snapshot cannot miss one; a stale snapshot only over-counts executors.
+        let suspending =
+            ss.find_sessions(Some(SessionFilter::by_state(SessionState::Suspending)))?;
+        if !suspending.is_empty() {
+            let serving: HashSet<_> = ss
+                .find_executors(ALL_EXECUTOR)?
+                .values()
+                .filter_map(|executor| executor.ssn_id.clone())
+                .collect();
+            for session in suspending.values() {
+                if serving.contains(&session.id) {
+                    continue;
+                }
+                if let Err(e) = ctx.suspend_session(session).await {
+                    tracing::warn!(
+                        "Failed to complete suspend of session <{}>: {e}",
+                        session.id
+                    );
+                }
+            }
+        }
 
         // Reclaim surplus bindings even when no recipient currently needs them.
         // Interrupt requests take effect after any in-flight task completes.
@@ -217,6 +244,229 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn shuffle_completes_a_suspend_no_executor_serves() {
+        let (controller, ids) = bound_executors(0, 0).await;
+        assert!(ids.is_empty());
+        controller
+            .signal_session("session".into(), Signal::Suspend)
+            .await
+            .unwrap();
+
+        let mut context = shuffle_context(controller.clone());
+        ShuffleAction {}.execute(&mut context).await.unwrap();
+
+        assert!(controller
+            .get_session("session".into())
+            .unwrap()
+            .is_suspended());
+    }
+
+    /// One scheduler cycle: a fresh snapshot, then the shuffle action.
+    async fn cycle(controller: &crate::controller::ControllerPtr) {
+        let mut context = shuffle_context(controller.clone());
+        ShuffleAction {}.execute(&mut context).await.unwrap();
+    }
+
+    fn state_of(controller: &crate::controller::ControllerPtr) -> SessionState {
+        controller
+            .get_session("session".into())
+            .unwrap()
+            .status
+            .state
+    }
+
+    fn succeed() -> common::apis::TaskResult {
+        common::apis::TaskResult {
+            state: common::apis::TaskState::Succeed,
+            output: None,
+            message: None,
+        }
+    }
+
+    async fn unbind(controller: &crate::controller::ControllerPtr, id: &str) {
+        controller.unbind_executor(id.to_string()).await.unwrap();
+        controller
+            .unbind_executor_completed(id.to_string())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shuffle_completes_a_suspend_once_the_executor_unbinds() {
+        let (controller, ids) = bound_executors(1, 0).await;
+        controller
+            .signal_session("session".into(), Signal::Suspend)
+            .await
+            .unwrap();
+        cycle(&controller).await;
+        assert_eq!(state_of(&controller), SessionState::Suspending);
+
+        // Unbinding still references the session.
+        controller.unbind_executor(ids[0].clone()).await.unwrap();
+        cycle(&controller).await;
+        assert_eq!(state_of(&controller), SessionState::Suspending);
+
+        controller
+            .unbind_executor_completed(ids[0].clone())
+            .await
+            .unwrap();
+        cycle(&controller).await;
+        assert_eq!(state_of(&controller), SessionState::Suspended);
+    }
+
+    #[tokio::test]
+    async fn shuffle_completes_a_suspend_after_a_failed_bind() {
+        let (controller, _) = bound_executors(0, 0).await;
+        let id = new_executor(&controller, false).await;
+        controller
+            .signal_session("session".into(), Signal::Suspend)
+            .await
+            .unwrap();
+        cycle(&controller).await;
+        assert_eq!(state_of(&controller), SessionState::Suspending);
+
+        controller
+            .bind_session_completed(
+                id.clone(),
+                Some(FlameResult {
+                    return_code: common::apis::BIND_RESULT_UNKNOWN_FAILED,
+                    message: Some("boom".to_string()),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            controller.get_executor(id).unwrap().state,
+            ExecutorState::Unbinding
+        );
+        cycle(&controller).await;
+        assert_eq!(state_of(&controller), SessionState::Suspended);
+    }
+
+    #[tokio::test]
+    async fn shuffle_completes_a_suspend_after_the_executor_unregisters() {
+        let (controller, ids) = bound_executors(1, 0).await;
+        controller
+            .signal_session("session".into(), Signal::Suspend)
+            .await
+            .unwrap();
+
+        // Orphan cleanup moves the executor to Releasing, then the executor manager unregisters it.
+        let mut executor = controller.get_executor(ids[0].clone()).unwrap();
+        executor.state = ExecutorState::Releasing;
+        controller
+            .storage()
+            .update_executor(&executor)
+            .await
+            .unwrap();
+        cycle(&controller).await;
+        assert_eq!(state_of(&controller), SessionState::Suspending);
+
+        controller
+            .unregister_executor(ids[0].clone())
+            .await
+            .unwrap();
+        cycle(&controller).await;
+        assert_eq!(state_of(&controller), SessionState::Suspended);
+    }
+
+    #[tokio::test]
+    async fn shuffle_completes_a_suspend_after_node_loss() {
+        let (controller, _) = bound_executors(1, 0).await;
+        controller
+            .signal_session("session".into(), Signal::Suspend)
+            .await
+            .unwrap();
+        cycle(&controller).await;
+        assert_eq!(state_of(&controller), SessionState::Suspending);
+
+        // What the node shutdown does: delete the node's executors.
+        let executors = controller.list_executors().unwrap();
+        controller
+            .storage()
+            .delete_executors(&executors)
+            .await
+            .unwrap();
+        cycle(&controller).await;
+        assert_eq!(state_of(&controller), SessionState::Suspended);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shuffle_keeps_suspending_behind_a_long_task_until_it_unbinds() {
+        let (controller, ids) = bound_executors(1, 0).await;
+        let task = controller
+            .create_task("session".into(), None, None)
+            .await
+            .unwrap();
+        controller.launch_task(ids[0].clone()).await.unwrap();
+        controller
+            .signal_session("session".into(), Signal::Suspend)
+            .await
+            .unwrap();
+
+        // Far beyond the former 10 minute deadline: nothing aborts the suspend.
+        tokio::time::advance(std::time::Duration::from_secs(24 * 60 * 60)).await;
+        cycle(&controller).await;
+        assert_eq!(state_of(&controller), SessionState::Suspending);
+        assert_eq!(
+            controller
+                .get_task("session".into(), task.id)
+                .unwrap()
+                .state,
+            common::apis::TaskState::Running
+        );
+
+        controller
+            .complete_task(ids[0].clone(), succeed(), None)
+            .await
+            .unwrap();
+        cycle(&controller).await;
+        assert_eq!(state_of(&controller), SessionState::Suspending);
+
+        unbind(&controller, &ids[0]).await;
+        cycle(&controller).await;
+        assert_eq!(state_of(&controller), SessionState::Suspended);
+    }
+
+    #[tokio::test]
+    async fn shuffle_leaves_a_session_closed_meanwhile_closed() {
+        let (controller, _) = bound_executors(1, 0).await;
+        controller
+            .signal_session("session".into(), Signal::Suspend)
+            .await
+            .unwrap();
+        controller.close_session("session".into()).await.unwrap();
+        cycle(&controller).await;
+        assert_eq!(state_of(&controller), SessionState::Closed);
+
+        // Closed between the snapshot and the completion.
+        let (controller, _) = bound_executors(0, 0).await;
+        controller
+            .signal_session("session".into(), Signal::Suspend)
+            .await
+            .unwrap();
+        let mut context = shuffle_context(controller.clone());
+        controller.close_session("session".into()).await.unwrap();
+        ShuffleAction {}.execute(&mut context).await.unwrap();
+        assert_eq!(state_of(&controller), SessionState::Closed);
+    }
+
+    #[tokio::test]
+    async fn shuffle_leaves_a_resumed_session_open() {
+        let (controller, _) = bound_executors(0, 0).await;
+        controller
+            .signal_session("session".into(), Signal::Suspend)
+            .await
+            .unwrap();
+        cycle(&controller).await;
+        assert_eq!(state_of(&controller), SessionState::Suspended);
+
+        controller.resume_session("session".into()).await.unwrap();
+        cycle(&controller).await;
+        assert_eq!(state_of(&controller), SessionState::Open);
+    }
+
     fn shuffle_context(controller: crate::controller::ControllerPtr) -> Context {
         Context::new(
             controller,
@@ -226,6 +476,26 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// Assigns a new executor to the session; `bound` also completes the bind.
+    async fn new_executor(controller: &crate::controller::ControllerPtr, bound: bool) -> String {
+        let executor = controller
+            .create_executor("node".into(), "session".into())
+            .await
+            .unwrap();
+        controller.register_executor(&executor).await.unwrap();
+        controller
+            .bind_session(executor.id.clone(), "session".into())
+            .await
+            .unwrap();
+        if bound {
+            controller
+                .bind_executor_completed(executor.id.clone(), None, None)
+                .await
+                .unwrap();
+        }
+        executor.id
     }
 
     async fn bound_executors(
@@ -265,20 +535,7 @@ mod tests {
             .unwrap();
         let mut ids = Vec::new();
         for _ in 0..count {
-            let executor = controller
-                .create_executor("node".into(), "session".into())
-                .await
-                .unwrap();
-            controller.register_executor(&executor).await.unwrap();
-            controller
-                .bind_session(executor.id.clone(), "session".into())
-                .await
-                .unwrap();
-            controller
-                .bind_executor_completed(executor.id.clone(), None, None)
-                .await
-                .unwrap();
-            ids.push(executor.id);
+            ids.push(new_executor(&controller, true).await);
         }
         (controller, ids)
     }

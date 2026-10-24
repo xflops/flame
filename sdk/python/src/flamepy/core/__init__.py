@@ -47,6 +47,8 @@ from .client import (
     list_sessions,
     open_session,
     register_application,
+    resume_session,
+    suspend_session,
     unregister_application,
 )
 
@@ -158,6 +160,8 @@ __all__ = [
     "get_session",
     "close_session",
     "delete_session",
+    "resume_session",
+    "suspend_session",
     # Client classes
     "ConnectionInstance",
     "Connection",

@@ -98,6 +98,16 @@ class FrontendStub(object):
                 request_serializer=frontend__pb2.CloseSessionRequest.SerializeToString,
                 response_deserializer=types__pb2.Session.FromString,
                 _registered_method=True)
+        self.SuspendSession = channel.unary_unary(
+                '/flame.v1.Frontend/SuspendSession',
+                request_serializer=frontend__pb2.SuspendSessionRequest.SerializeToString,
+                response_deserializer=types__pb2.Session.FromString,
+                _registered_method=True)
+        self.ResumeSession = channel.unary_unary(
+                '/flame.v1.Frontend/ResumeSession',
+                request_serializer=frontend__pb2.ResumeSessionRequest.SerializeToString,
+                response_deserializer=types__pb2.Session.FromString,
+                _registered_method=True)
         self.GetSession = channel.unary_unary(
                 '/flame.v1.Frontend/GetSession',
                 request_serializer=frontend__pb2.GetSessionRequest.SerializeToString,
@@ -209,6 +219,18 @@ class FrontendServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SuspendSession(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ResumeSession(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def GetSession(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -306,6 +328,16 @@ def add_FrontendServicer_to_server(servicer, server):
             'CloseSession': grpc.unary_unary_rpc_method_handler(
                     servicer.CloseSession,
                     request_deserializer=frontend__pb2.CloseSessionRequest.FromString,
+                    response_serializer=types__pb2.Session.SerializeToString,
+            ),
+            'SuspendSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.SuspendSession,
+                    request_deserializer=frontend__pb2.SuspendSessionRequest.FromString,
+                    response_serializer=types__pb2.Session.SerializeToString,
+            ),
+            'ResumeSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.ResumeSession,
+                    request_deserializer=frontend__pb2.ResumeSessionRequest.FromString,
                     response_serializer=types__pb2.Session.SerializeToString,
             ),
             'GetSession': grpc.unary_unary_rpc_method_handler(
@@ -665,6 +697,60 @@ class Frontend(object):
             target,
             '/flame.v1.Frontend/CloseSession',
             frontend__pb2.CloseSessionRequest.SerializeToString,
+            types__pb2.Session.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SuspendSession(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/flame.v1.Frontend/SuspendSession',
+            frontend__pb2.SuspendSessionRequest.SerializeToString,
+            types__pb2.Session.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ResumeSession(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/flame.v1.Frontend/ResumeSession',
+            frontend__pb2.ResumeSessionRequest.SerializeToString,
             types__pb2.Session.FromString,
             options,
             channel_credentials,

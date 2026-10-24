@@ -15,7 +15,7 @@ use std::path::Path;
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use common::apis::{ApplicationAttributes, SessionAttributes};
+use common::apis::{ApplicationAttributes, SessionAttributes, Signal};
 use futures::Stream;
 use serde_json::Value;
 use stdng::trace_fn;
@@ -29,8 +29,8 @@ use self::rpc::{
     DeleteSessionRequest, ExecutorList, GetApplicationRequest, GetNodeRequest, GetNodeResponse,
     GetSessionRequest, GetTaskRequest, ListApplicationsRequest, ListExecutorsRequest,
     ListNodesRequest, ListSessionsRequest, ListTasksRequest, NodeList, OpenSessionRequest,
-    RegisterApplicationRequest, Session, SessionList, Task, UnregisterApplicationRequest,
-    UpdateApplicationRequest, WatchTaskRequest,
+    RegisterApplicationRequest, ResumeSessionRequest, Session, SessionList, SuspendSessionRequest,
+    Task, UnregisterApplicationRequest, UpdateApplicationRequest, WatchTaskRequest,
 };
 
 use rpc::flame::v1 as rpc;
@@ -546,6 +546,48 @@ impl Frontend for Flame {
         Ok(Response::new(ssn))
     }
 
+    async fn suspend_session(
+        &self,
+        req: Request<SuspendSessionRequest>,
+    ) -> Result<Response<rpc::Session>, Status> {
+        trace_fn!("Frontend::suspend_session");
+        let ssn_id = req
+            .into_inner()
+            .session_id
+            .parse::<apis::SessionID>()
+            .map_err(|_| Status::invalid_argument("invalid session id"))?;
+
+        let ssn = self
+            .controller
+            .signal_session(ssn_id, Signal::Suspend)
+            .await
+            .map(rpc::Session::from)
+            .map_err(Status::from)?;
+
+        Ok(Response::new(ssn))
+    }
+
+    async fn resume_session(
+        &self,
+        req: Request<ResumeSessionRequest>,
+    ) -> Result<Response<rpc::Session>, Status> {
+        trace_fn!("Frontend::resume_session");
+        let ssn_id = req
+            .into_inner()
+            .session_id
+            .parse::<apis::SessionID>()
+            .map_err(|_| Status::invalid_argument("invalid session id"))?;
+
+        let ssn = self
+            .controller
+            .resume_session(ssn_id)
+            .await
+            .map(rpc::Session::from)
+            .map_err(Status::from)?;
+
+        Ok(Response::new(ssn))
+    }
+
     async fn close_session(
         &self,
         req: Request<CloseSessionRequest>,
@@ -861,6 +903,71 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let result = watch_task_stream(controller, ReceiverStream::new(requests_rx), tx).await;
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+
+    fn test_flame(controller: crate::controller::ControllerPtr) -> Flame {
+        Flame {
+            controller,
+            cluster_default_resreq: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn suspend_and_resume_session_round_trip() {
+        let flame = test_flame(watch_test_controller().await);
+        let session_id = "watch-test-session".to_string();
+
+        let suspended = flame
+            .suspend_session(Request::new(SuspendSessionRequest {
+                session_id: session_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            suspended.status.unwrap().state,
+            rpc::SessionState::Suspending as i32
+        );
+        // No executor serves the session, so the scheduler completes the suspend.
+        flame
+            .controller
+            .suspend_session(session_id.clone())
+            .await
+            .unwrap();
+
+        let resumed = flame
+            .resume_session(Request::new(ResumeSessionRequest { session_id }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            resumed.status.unwrap().state,
+            rpc::SessionState::Open as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn suspend_session_maps_errors() {
+        let flame = test_flame(watch_test_controller().await);
+        let session_id = "watch-test-session".to_string();
+
+        let status = flame
+            .suspend_session(Request::new(SuspendSessionRequest {
+                session_id: "missing".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound);
+
+        flame
+            .controller
+            .close_session(session_id.clone())
+            .await
+            .unwrap();
+        assert!(flame
+            .suspend_session(Request::new(SuspendSessionRequest { session_id }))
+            .await
+            .is_err());
     }
 
     #[tokio::test]

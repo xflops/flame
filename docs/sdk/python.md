@@ -79,6 +79,12 @@ outputs = [future.result() for future in futures]
 session.close()
 ```
 
+A session can be suspended and resumed with `session.suspend()` / `session.resume()`
+(or `connection.suspend_session(id)` / `connection.resume_session(id)`). Both return
+the updated session; `suspend()` reports `SessionState.SUSPENDING` until the
+executors unbind and `SessionState.SUSPENDED` afterwards. Pending tasks stay queued
+and task watches stay open while suspended.
+
 `submit()` returns a `TaskFuture` before the `CreateTask` RPC replies, so
 tasks can be submitted concurrently; submission and execution errors surface
 through `future.result()`. `run()` blocks until task completion and returns its
@@ -426,7 +432,7 @@ The repository-level check validates the `flmrun` template, App package upload/i
 | Area | Python API |
 |------|------------|
 | Connect | `flamepy.connect()` |
-| Sessions | `create_session()`, `open_session()`, `get_session()`, `list_sessions(state=, ids=, application=)`, `close_session()`, `delete_session()` |
+| Sessions | `create_session()`, `open_session()`, `get_session()`, `list_sessions(state=, ids=, application=)`, `close_session()`, `suspend_session()`, `resume_session()`, `delete_session()` |
 | Tasks | `Session.run()`, `Session.submit()`, `Session.create_task()`, `Session.watch_task()` |
 | Applications | `register_application()`, `unregister_application()`, `get_application()`, `list_applications()` |
 | Services | `FlameService`, `flamepy.run()`, `flamepy.serving.Instance`, `flamepy.serving.open_session()` |

@@ -96,6 +96,14 @@ def delete_session(session_id: SessionID) -> "Session":
     return ConnectionInstance.instance().delete_session(session_id)
 
 
+def suspend_session(session_id: SessionID) -> "Session":
+    return ConnectionInstance.instance().suspend_session(session_id)
+
+
+def resume_session(session_id: SessionID) -> "Session":
+    return ConnectionInstance.instance().resume_session(session_id)
+
+
 class ConnectionInstance:
     """Lazily initialized process-wide connection for module-level helpers."""
 
@@ -273,6 +281,12 @@ class Connection:
     def delete_session(self, session_id: SessionID) -> "Session":
         return self._session(self._call(self._aio.delete_session(session_id)))
 
+    def suspend_session(self, session_id: SessionID) -> "Session":
+        return self._session(self._call(self._aio.suspend_session(session_id)))
+
+    def resume_session(self, session_id: SessionID) -> "Session":
+        return self._session(self._call(self._aio.resume_session(session_id)))
+
 
 class Session:
     """Blocking facade for one aio session handle."""
@@ -396,6 +410,20 @@ class Session:
 
     def close(self) -> None:
         self.connection.close_session(self.id)
+
+    def _refresh(self, other: "Session") -> "Session":
+        with self.mutex:
+            for name in ("state", "pending", "running", "succeed", "failed", "completion_time", "events"):
+                setattr(self, name, getattr(other, name))
+        return other
+
+    def suspend(self) -> "Session":
+        """Suspend this session and refresh its local state from the response."""
+        return self._refresh(self.connection.suspend_session(self.id))
+
+    def resume(self) -> "Session":
+        """Resume this session and refresh its local state from the response."""
+        return self._refresh(self.connection.resume_session(self.id))
 
 
 class _AsyncIteratorFacade:

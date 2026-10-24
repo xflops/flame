@@ -21,6 +21,18 @@ impl Session {
         self.status.state == SessionState::Closed
     }
 
+    pub fn is_open(&self) -> bool {
+        self.status.state == SessionState::Open
+    }
+
+    pub fn is_suspending(&self) -> bool {
+        self.status.state == SessionState::Suspending
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.status.state == SessionState::Suspended
+    }
+
     pub fn is_ready(&self, retry_limits: u32) -> bool {
         self.retry_count < retry_limits
     }
@@ -137,6 +149,25 @@ impl Session {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn state_helpers_match_exactly_one_state() {
+        for (state, open, suspending, suspended, closed) in [
+            (SessionState::Open, true, false, false, false),
+            (SessionState::Suspending, false, true, false, false),
+            (SessionState::Suspended, false, false, true, false),
+            (SessionState::Closed, false, false, false, true),
+        ] {
+            let ssn = Session {
+                status: SessionStatus { state },
+                ..Default::default()
+            };
+            assert_eq!(ssn.is_open(), open, "{state}");
+            assert_eq!(ssn.is_suspending(), suspending, "{state}");
+            assert_eq!(ssn.is_suspended(), suspended, "{state}");
+            assert_eq!(ssn.is_closed(), closed, "{state}");
+        }
+    }
 
     #[test]
     fn is_ready_uses_transient_retry_count() {

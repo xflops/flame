@@ -97,6 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+`Session::suspend()` and `Session::resume()` (or `Connection::suspend_session(id)` and `Connection::resume_session(id)`) return the updated `Session`. A suspend reports `SessionState::Suspending` until the executors unbind and `SessionState::Suspended` afterwards. Pending tasks stay queued and task watches stay open while the session is suspended.
+
 For bulk submission, `Session::run()` returns a `TaskFuture<O>`. Awaiting it returns `Result<TaskResult<O>, FlameError>`: `Ok` contains task ID, session ID, terminal state, decoded output, and task-level error details, while `Err` reports SDK-level failures such as watch or decode errors. `Session::invoke()` converts that result into a simpler handle that resolves to successful output or `FlameError`.
 
 ## Write A Service

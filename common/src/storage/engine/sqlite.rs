@@ -149,6 +149,28 @@ impl SqliteEngine {
         Ok(ssn)
     }
 
+    /// Sessions of an application that are not closed.
+    async fn _count_live_sessions(
+        tx: &mut SqliteConnection,
+        application: &str,
+    ) -> Result<i64, FlameError> {
+        sqlx::query_scalar("SELECT count(*) FROM sessions WHERE application=? AND state!=?")
+            .bind(application)
+            .bind(SessionState::Closed as i32)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| FlameError::Storage(format!("failed to count sessions: {e}")))
+    }
+
+    /// The error for a rejected transition: the session is unknown or in another state.
+    async fn _not_in_state(tx: &mut SqliteConnection, id: &str, expected: &str) -> FlameError {
+        match Self::_get_session(tx, id.to_string()).await {
+            Ok(Some(_)) => FlameError::InvalidState(format!("session <{id}> is not {expected}")),
+            Ok(None) => FlameError::NotFound(format!("session <{id}> not found")),
+            Err(e) => e,
+        }
+    }
+
     async fn _count_sessions(
         &self,
         tx: &mut SqliteConnection,
@@ -391,8 +413,7 @@ impl Engine for SqliteEngine {
             )));
         }
 
-        let filter = SessionFilter::by_application_state(name.clone(), SessionState::Open);
-        let count = self._count_sessions(&mut tx, &filter).await?;
+        let count = Self::_count_live_sessions(&mut tx, &name).await?;
         if count > 0 {
             return Err(FlameError::Storage(format!(
                 "{count} open sessions in the application"
@@ -753,6 +774,36 @@ impl Engine for SqliteEngine {
         ssn.try_into()
     }
 
+    async fn update_session_state(
+        &self,
+        id: SessionID,
+        state: SessionState,
+    ) -> Result<Session, FlameError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| FlameError::Storage(e.to_string()))?;
+
+        let ssn: Option<SessionDao> =
+            sqlx::query_as("UPDATE sessions SET state=? WHERE id=? AND state<>? RETURNING *")
+                .bind(state as i32)
+                .bind(&id)
+                .bind(SessionState::Closed as i32)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| FlameError::Storage(e.to_string()))?;
+        let Some(ssn) = ssn else {
+            return Err(Self::_not_in_state(&mut tx, &id, "updatable").await);
+        };
+
+        tx.commit()
+            .await
+            .map_err(|e| FlameError::Storage(e.to_string()))?;
+
+        ssn.try_into()
+    }
+
     async fn find_sessions(&self) -> Result<Vec<Session>, FlameError> {
         let mut tx = self
             .pool
@@ -801,7 +852,7 @@ impl Engine for SqliteEngine {
         let sql = r#"INSERT INTO tasks (id, ssn_id, input, affinity, creation_time, state)
             VALUES (
                 COALESCE((SELECT MAX(id)+1 FROM tasks WHERE ssn_id=?), 1),
-                (SELECT id FROM sessions WHERE id=? AND state=?),
+                (SELECT id FROM sessions WHERE id=? AND state<>?),
                 ?,
                 ?,
                 ?,
@@ -810,7 +861,7 @@ impl Engine for SqliteEngine {
         let task: TaskDao = sqlx::query_as(sql)
             .bind(ssn_id.clone())
             .bind(ssn_id)
-            .bind(SessionState::Open as i32)
+            .bind(SessionState::Closed as i32)
             .bind(input)
             .bind(affinity)
             .bind(Utc::now().timestamp())

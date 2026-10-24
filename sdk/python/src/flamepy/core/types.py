@@ -44,6 +44,8 @@ class SessionState(IntEnum):
 
     OPEN = 0
     CLOSED = 1
+    SUSPENDING = 2
+    SUSPENDED = 3
 
 
 class TaskState(IntEnum):

@@ -128,14 +128,10 @@ impl Plugin for MinMaxPlugin {
         let executors = self.session_executors.get(&ssn.id).copied().unwrap_or(0);
         let interrupted = self.session_interrupted.get(&ssn.id).copied().unwrap_or(0);
         let effective = executors.saturating_sub(interrupted);
-        let demand = if ssn.state == SessionState::Closed {
-            0
-        } else {
-            executor_limit(ssn.max_instances, self.limits.session.max_executors)
-                .map_or(compute_demand(ssn), |maximum| {
-                    compute_demand(ssn).min(maximum)
-                })
-        };
+        let demand = executor_limit(ssn.max_instances, self.limits.session.max_executors)
+            .map_or(compute_demand(ssn), |maximum| {
+                compute_demand(ssn).min(maximum)
+            });
         (effective > demand as usize).then_some(true)
     }
 
@@ -258,7 +254,11 @@ fn gang_size(ssn: &SessionInfo) -> u32 {
 }
 
 /// Bounded executor demand: task demand, gang size, minimum warmup and maximum instances.
+/// Only an open session demands executors.
 fn compute_demand(ssn: &SessionInfo) -> u32 {
+    if !ssn.is_open() {
+        return 0;
+    }
     let task_count = [TaskState::Pending, TaskState::Running]
         .iter()
         .filter_map(|state| ssn.tasks_status.get(state))
@@ -332,6 +332,34 @@ mod tests {
         assert_eq!(compute_demand(&gang(0, 4, 0)), 0);
         assert_eq!(compute_demand(&gang(2, 4, 0)), 2);
         assert_eq!(compute_demand(&gang(0, 1, 3)), 3);
+    }
+
+    #[test]
+    fn only_open_sessions_demand_executors() {
+        let snapshot = SnapShot::new();
+        let mut plugin = plugin(&snapshot);
+        let open = Arc::new(SessionInfo {
+            min_instances: 1,
+            ..limited_session(None).as_ref().clone()
+        });
+        assert_eq!(compute_demand(&open), 10);
+        assert_eq!(plugin.is_underused(&open), Some(true));
+
+        for state in [
+            SessionState::Closed,
+            SessionState::Suspending,
+            SessionState::Suspended,
+        ] {
+            let ssn = Arc::new(SessionInfo {
+                state,
+                ..open.as_ref().clone()
+            });
+            assert_eq!(compute_demand(&ssn), 0, "{state}");
+            assert_eq!(plugin.is_underused(&ssn), None, "{state}");
+            plugin.on_session_bind(executor("one", "node", ExecutorState::Bound), ssn.clone());
+            assert_eq!(plugin.is_overused(&ssn), Some(true), "{state}");
+            plugin.on_session_unbind(executor("one", "node", ExecutorState::Bound), ssn);
+        }
     }
 
     #[test]

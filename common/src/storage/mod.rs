@@ -27,7 +27,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use stdng::{lock_ptr, trace_fn, MutexPtr};
+use stdng::{ensure, lock_ptr, trace_fn, MutexPtr};
 
 use crate::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationPtr, ApplicationState, Event,
@@ -108,10 +108,14 @@ impl Storage {
             .values()
             .map(|ptr| Ok((*lock_ptr!(ptr)?).clone()))
             .collect::<Result<Vec<_>, FlameError>>()?;
-        let sessions = lock_ptr!(self.sessions)?
-            .values()
-            .map(|ptr| Ok((*lock_ptr!(ptr)?).clone()))
-            .collect::<Result<Vec<_>, FlameError>>()?;
+        // A suspended session holds no executor and has no demand.
+        let mut sessions = Vec::new();
+        for ptr in lock_ptr!(self.sessions)?.values() {
+            let ssn = lock_ptr!(ptr)?;
+            if !ssn.is_suspended() {
+                sessions.push(ssn.clone());
+            }
+        }
         let executors = lock_ptr!(self.executors)?
             .values()
             .map(|ptr| Ok((*lock_ptr!(ptr)?).clone()))
@@ -475,6 +479,7 @@ impl Storage {
         Ok(ssn)
     }
 
+    /// Close a session in any non-closed state.
     pub async fn close_session(&self, id: SessionID) -> Result<Session, FlameError> {
         trace_fn!("Storage::close_session");
 
@@ -553,6 +558,48 @@ impl Storage {
         Ok(result_ssn)
     }
 
+    /// Sets the state of a session that is not `Closed` (`InvalidState` otherwise). It does
+    /// not check which transition is legal; the caller decides that from the state it read.
+    ///
+    /// Running tasks of a `Suspending` session keep running and finish normally; only new
+    /// launches stop, because `wait_for_task` hands out tasks to open sessions only.
+    /// Pending tasks wait for the resume.
+    pub async fn update_session_state(
+        &self,
+        id: SessionID,
+        state: SessionState,
+    ) -> Result<Session, FlameError> {
+        trace_fn!("Storage::update_session_state");
+
+        let ssn_ptr = self.get_session_ptr(id.clone())?;
+
+        // Admission and the cached flip happen in one lock section.
+        let previous = {
+            let mut ssn = lock_ptr!(ssn_ptr)?;
+            ensure!(
+                !ssn.is_closed(),
+                FlameError::InvalidState(format!("Session <{id}> is closed"))
+            )?;
+            std::mem::replace(&mut ssn.status.state, state)
+        };
+
+        match self.engine.update_session_state(id, state).await {
+            Ok(_) | Err(FlameError::NotFound(_)) => {}
+            Err(e) => {
+                let mut ssn = lock_ptr!(ssn_ptr)?;
+                // A close that won the race stays closed.
+                if ssn.status.state == state {
+                    ssn.status.state = previous;
+                }
+                return Err(e);
+            }
+        }
+
+        // A close that won the race already published Closed; it is returned as is.
+        let ssn = lock_ptr!(ssn_ptr)?;
+        Ok(ssn.clone())
+    }
+
     pub fn get_session(&self, id: SessionID) -> Result<Session, FlameError> {
         let ssn_ptr = self.get_session_ptr(id)?;
         let ssn = lock_ptr!(ssn_ptr)?;
@@ -588,6 +635,12 @@ impl Storage {
             let ssn_map = lock_ptr!(self.sessions)?;
             if let Some(ssn_ptr) = ssn_map.get(&id) {
                 let ssn = lock_ptr!(ssn_ptr)?;
+                // A suspended session is resumed, never reopened or replaced.
+                if ssn.is_suspending() || ssn.is_suspended() {
+                    return Err(FlameError::InvalidState(format!(
+                        "Session <{id}> is suspended"
+                    )));
+                }
                 // Verify the session is still open before returning cached version
                 if ssn.status.state == SessionState::Open {
                     // If spec provided, validate it matches the existing session
@@ -780,17 +833,28 @@ impl Storage {
         options: Option<TaskOptions>,
     ) -> Result<Task, FlameError> {
         trace_fn!("Storage::create_task");
+        let ssn = self.get_session_ptr(ssn_id.clone())?;
+        // Check before the engine writes, so a rejected task leaves nothing behind. A
+        // suspending or suspended session accepts tasks; they run after the resume.
+        {
+            let ssn = lock_ptr!(ssn)?;
+            if ssn.is_closed() {
+                return Err(FlameError::InvalidState(format!(
+                    "Session <{}> is closed",
+                    ssn.id
+                )));
+            }
+        }
         let task = self
             .engine
             .create_task(ssn_id.clone(), task_input, options)
             .await?;
 
-        let ssn = self.get_session_ptr(ssn_id.clone())?;
         {
             let mut ssn = lock_ptr!(ssn)?;
-            if ssn.status.state != SessionState::Open {
+            if ssn.is_closed() {
                 return Err(FlameError::InvalidState(format!(
-                    "Session <{}> is not open",
+                    "Session <{}> is closed",
                     ssn.id
                 )));
             }
@@ -952,6 +1016,18 @@ impl Storage {
             },
         };
 
+        // Check before the engine writes, so a rejected update leaves nothing behind.
+        // A suspending session lets its running tasks finish; only a closed one rejects.
+        {
+            let ssn_ptr = lock_ptr!(ssn)?;
+            if ssn_ptr.is_closed() {
+                return Err(FlameError::InvalidState(format!(
+                    "Session <{}> is closed",
+                    ssn_ptr.id
+                )));
+            }
+        }
+
         let updated_task = match self
             .engine
             .update_task_state(gid.clone(), task_state, message)
@@ -977,9 +1053,9 @@ impl Storage {
 
         {
             let mut ssn_ptr = lock_ptr!(ssn)?;
-            if ssn_ptr.status.state != SessionState::Open {
+            if ssn_ptr.is_closed() {
                 return Err(FlameError::InvalidState(format!(
-                    "Session <{}> is not open",
+                    "Session <{}> is closed",
                     ssn_ptr.id
                 )));
             }
@@ -1021,6 +1097,18 @@ impl Storage {
         let task_message = task_result.message.clone();
         let task_output = task_result.output.clone();
 
+        // Check before the engine writes, so a rejected update leaves nothing behind.
+        // A suspending session lets its running tasks finish; only a closed one rejects.
+        {
+            let ssn_ptr = lock_ptr!(ssn)?;
+            if ssn_ptr.is_closed() {
+                return Err(FlameError::InvalidState(format!(
+                    "Session <{}> is closed",
+                    ssn_ptr.id
+                )));
+            }
+        }
+
         let updated_task = match self
             .engine
             .update_task_result(gid.clone(), task_result)
@@ -1048,9 +1136,9 @@ impl Storage {
 
         {
             let mut ssn_ptr = lock_ptr!(ssn)?;
-            if ssn_ptr.status.state != SessionState::Open {
+            if ssn_ptr.is_closed() {
                 return Err(FlameError::InvalidState(format!(
-                    "Session <{}> is not open",
+                    "Session <{}> is closed",
                     ssn_ptr.id
                 )));
             }
@@ -1210,6 +1298,9 @@ mod executor_tests;
 
 #[cfg(test)]
 mod session_tests;
+
+#[cfg(test)]
+mod suspend_tests;
 
 #[cfg(test)]
 mod task_tests;

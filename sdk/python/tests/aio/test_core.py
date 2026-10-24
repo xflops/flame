@@ -7,7 +7,7 @@ import pytest
 from flamepy.core import aio
 from flamepy.core import client as sync_client
 from flamepy.core._bridge import LoopThread
-from flamepy.core.types import ApplicationAttributes, FlameError, SessionAttributes, TaskState
+from flamepy.core.types import ApplicationAttributes, FlameError, SessionAttributes, SessionState, TaskState
 
 
 def test_aio_frontend_api_parity(frontend_server):
@@ -38,6 +38,16 @@ def test_aio_frontend_api_parity(frontend_server):
             assert isinstance(submitted, asyncio.Task)
             assert await submitted == b"done"
             assert await session.run(b"input") == b"done"
+            suspended = await session.suspend()
+            assert suspended.state == SessionState.SUSPENDING and session.state == SessionState.SUSPENDING
+            assert (await connection.suspend_session(session.id)).id == session.id
+            assert (await session.resume()).state == SessionState.OPEN and session.state == SessionState.OPEN
+            assert (await connection.resume_session(session.id)).id == session.id
+            names = [request.DESCRIPTOR.name for request in service.requests]
+            assert names.count("SuspendSessionRequest") == 2 and names.count("ResumeSessionRequest") == 2
+            service.reject_suspend = True
+            with pytest.raises(FlameError, match="suspend rejected"):
+                await session.suspend()
             await session.close()
 
     asyncio.run(exercise())

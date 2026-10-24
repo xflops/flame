@@ -33,7 +33,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 
-use stdng::{lock_ptr, MutexPtr};
+use stdng::{ensure, lock_ptr, MutexPtr};
 
 use crate::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationState, ExecutorID, ExecutorState,
@@ -279,14 +279,33 @@ impl Engine for NoneEngine {
     }
 
     async fn close_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        if let Some(session) = lock_ptr!(self.sessions)?.get_mut(&id) {
-            if session.status.state == SessionState::Open {
-                session.status.state = SessionState::Closed;
-                session.completion_time = Some(Utc::now());
-                session.version += 1;
-            }
+        let mut sessions = lock_ptr!(self.sessions)?;
+        let session = sessions
+            .get_mut(&id)
+            .ok_or_else(|| FlameError::NotFound(format!("session <{id}>")))?;
+        if session.status.state != SessionState::Closed {
+            session.status.state = SessionState::Closed;
+            session.completion_time = Some(Utc::now());
+            session.version += 1;
         }
-        Err(FlameError::NotFound(format!("session <{id}>")))
+        Ok(session.clone())
+    }
+
+    async fn update_session_state(
+        &self,
+        id: SessionID,
+        state: SessionState,
+    ) -> Result<Session, FlameError> {
+        let mut sessions = lock_ptr!(self.sessions)?;
+        let session = sessions
+            .get_mut(&id)
+            .ok_or_else(|| FlameError::NotFound(format!("session <{id}>")))?;
+        ensure!(
+            !session.is_closed(),
+            FlameError::InvalidState(format!("session <{id}> is closed"))
+        )?;
+        session.status.state = state;
+        Ok(session.clone())
     }
 
     async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError> {

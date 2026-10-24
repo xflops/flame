@@ -22,6 +22,8 @@ class FrontendFixture(FrontendServicer):
         self.release = asyncio.Event()
         self.requests = []
         self.reject_close = False
+        self.reject_suspend = False
+        self.reject_resume = False
         self.reject_create_task = False
         self.create_task_gate = None
         self.create_task_started = threading.Event()
@@ -84,6 +86,20 @@ class FrontendFixture(FrontendServicer):
     async def CloseSession(self, request, context):
         if self.reject_close:
             await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "close rejected")
+        return self._session(request.session_id)
+
+    async def SuspendSession(self, request, context):
+        self.requests.append(request)
+        if self.reject_suspend:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "suspend rejected")
+        session = self._session(request.session_id)
+        session.status.state = SessionState.SUSPENDING
+        return session
+
+    async def ResumeSession(self, request, context):
+        self.requests.append(request)
+        if self.reject_resume:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "resume rejected")
         return self._session(request.session_id)
 
     async def CreateTask(self, request, context):
