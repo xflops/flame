@@ -140,7 +140,7 @@ sudo flmadm uninstall --backup-dir /backups/flame-backup-2026-01-28
 - `--prefix <PATH>`: Target installation directory (default: `/usr/local/flame`)
 - `--all`: Explicitly install all components (control plane + worker + cache + client)
 - `--control-plane`: Install control plane components only (flame-session-manager, flmctl, flmadm)
-- `--worker`: Install worker components only (flame-executor-manager, flmping-service, flmexec-service, flamepy)
+- `--worker`: Install worker components only (flame-executor-manager, flmping-service, flmexec-service, flmbox-service, flamepy)
 - `--cache`: Install cache component only (flame-object-cache)
 - `--client`: Install client components only (flmping, flmexec, flamepy)
 - `--with-examples`: Install all supported example binaries and Python sources under `${PREFIX}/examples`, including vLLM
@@ -175,6 +175,7 @@ Installs components required for executing workloads:
 - `flame-executor-manager`: Worker node service
 - `flmping-service`: Health check service
 - `flmexec-service`: Execution service
+- `flmbox-service`: Sandbox service (gVisor `runsc`, `nft` and `ip` must be installed on the worker)
 - `flamepy`: Python SDK
 
 **Use case:** Deploy on worker nodes that execute user workloads.
@@ -263,6 +264,7 @@ ${PREFIX}/
 ├── conf/                   # Configuration
 │   ├── flame-cluster.yaml
 │   └── applications/       # Applications registered when session manager starts
+│       ├── flmbox.yaml
 │       ├── flmexec.yaml
 │       ├── flmping.yaml
 │       └── flmrun.yaml

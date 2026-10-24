@@ -51,6 +51,8 @@ def test_agent_public_exports():
     import flamepy.agent as agent
 
     assert agent.__all__ == [
+        "CommandResult",
+        "Sandbox",
         "Session",
         "SessionOutput",
         "open_session",

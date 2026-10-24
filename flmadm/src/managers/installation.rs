@@ -189,6 +189,11 @@ impl InstallationManager {
                 &artifacts.flmexec_service,
                 paths.bin.join("flmexec-service"),
             ),
+            (
+                "flmbox-service",
+                &artifacts.flmbox_service,
+                paths.bin.join("flmbox-service"),
+            ),
         ];
 
         for (name, src, dst) in all_binaries {

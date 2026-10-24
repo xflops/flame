@@ -1,0 +1,34 @@
+[package]
+name = "flmbox"
+version = "0.6.0"
+edition = "2021"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+flame-rs = { path = "../sdk/rust", features = ["macros"] }
+
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_derive = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+reqwest = { version = "0.12", features = ["rustls-tls", "stream"], default-features = false }
+futures-util = "0.3"
+sha2 = "0.10"
+tar = "0.4"
+flate2 = "1"
+zstd = "0.13"
+oci-spec = { version = "0.10", default-features = false, features = ["runtime", "image"] }
+
+[lib]
+name = "flmbox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flmbox-service"
+path = "src/main.rs"

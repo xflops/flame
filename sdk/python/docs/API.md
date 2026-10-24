@@ -275,6 +275,31 @@ Key classes and methods:
 
 Creation options are ignored when `ssn_id` is provided. `ssn.attr` is a read-only view of the effective creation settings; its type is intentionally not exported. `language` and `runtime` are create-time only. `close()` destroys the session. Reopen works only while the session is still open. `ResourceRequirement` and `FlameError` are imported from `flamepy`.
 
+## Sandbox API
+
+`flamepy.agent.Sandbox` runs commands and scripts inside a container sandbox served by the built-in `flmbox` application.
+
+```python
+from flamepy.agent import Sandbox
+
+with Sandbox.create(image="ubuntu:26.04") as box:
+    result = box.run("echo hello", cwd="/tmp", envs={"A": "1"}, timeout=30)
+    print(result.exit_code, result.stdout_text())
+    print(box.run_code("print(1 + 2)", language="python").stdout_text())
+```
+
+- `Sandbox.create(*, image=None, resreq=None)` creates a sandbox (one instance). A missing `image` uses the service default. `resreq` is the session resource requirement only; it is not part of the sandbox configuration.
+- `Sandbox.connect(sandbox_id)` attaches to an existing sandbox; a session of another application raises `INVALID_ARGUMENT`.
+- `box.id`, `box.state` (a fresh query returning `"open"`, `"suspending"`, `"suspended"` or `"closed"`)
+- `box.run(cmd, *, cwd=None, envs=None, timeout=None) -> CommandResult` and `box.submit(...) -> Future[CommandResult]`
+- `box.run_code(code, *, language="python", input=None, timeout=None) -> CommandResult` and `box.submit_code(...)`; `language` is `"python"` or `"shell"`, `input` is bytes for stdin.
+- `box.suspend(*, timeout=60.0)` requests suspension and polls until the state is `suspended`. The signal is asynchronous; `INTERNAL` is raised on timeout.
+- `box.resume()` returns when the sandbox is `open` again. Phase 1 does NOT preserve process or filesystem state: a resumed sandbox starts fresh.
+- `box.close()` is idempotent; the context manager closes on exit.
+- `CommandResult.exit_code`, `.stdout`, `.stderr` (bytes), `.stdout_text()`, `.stderr_text()`, `.ok`. A nonzero exit code is a normal result, not an error.
+
+Errors are `FlameError`: `INVALID_ARGUMENT` for bad arguments, `INVALID_STATE` when the sandbox is closed, suspending or suspended (tasks are never queued for a suspended sandbox), and `INTERNAL` for a malformed service response or a suspend timeout.
+
 ## Enums
 
 - `SessionState.OPEN`, `SessionState.CLOSED`

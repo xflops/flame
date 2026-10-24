@@ -19,18 +19,41 @@ This module tests:
 - Rejected transitions (suspend a non-open session, resume a closed session)
 - Closing a suspended session
 - The flmctl suspend/resume commands
+- The flmbox sandbox application through flamepy.agent.Sandbox (#605): commands,
+  code, files, network isolation, suspend/resume and close. These classes are
+  skipped when flmbox is not registered or runsc is not installed, unless CI asks
+  for them (see the environment variables below).
+
+Environment variables for the sandbox classes:
+- FLAME_E2E_REQUIRE_SANDBOX=1: a missing prerequisite fails instead of skipping.
+  CI sets it, so the runtime tests run or fail and never skip silently.
+- FLAME_E2E_REMOTE_RUNSC=1: runsc runs inside the executor manager (Kubernetes),
+  not on the machine running pytest, so the local runsc check is not made.
+- FLAME_E2E_CONTROL_PLANE=host:port[,host:port...]: the control plane addresses the
+  sandbox must not reach, as seen from the node. Defaults to FLAME_ENDPOINT, which
+  is only right when the test process uses the same endpoint as the services
+  (the host-shim job); Kubernetes sets the in-cluster service and node addresses.
 
 suspend_session only signals: the session is returned in SUSPENDING and the
 scheduler moves it to SUSPENDED in a later cycle, so the tests poll for states.
 """
 
+import os
+import shlex
 import shutil
+import socket
 import subprocess
 import time
+from urllib.parse import urlparse
 
 import flamepy
 import pytest
 from flamepy import FlameError, FlameErrorCode, SessionState, TaskState
+
+try:
+    from flamepy.agent import Sandbox
+except ImportError:  # An SDK without flamepy.agent.Sandbox: the sandbox classes skip.
+    Sandbox = None
 
 from e2e.api import TestRequest
 from e2e.helpers import deserialize_response, invoke_task, serialize_request
@@ -313,3 +336,246 @@ class TestFlmctl:
 
         result = self._flmctl("suspend", f"no-such-session-{random_string(8)}")
         assert result.returncode != 0
+
+
+# --- flmbox sandboxes (#605) ---------------------------------------------------
+
+FIRST_COMMAND_TIMEOUT = 180.0  # The first command of a node pulls the image.
+COMMAND_TIMEOUT = 60.0
+AFTER_RESUME_TIMEOUT = 90.0
+
+
+def _env_flag(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def _control_plane_addresses():
+    """(host, port) pairs of the control plane that sandboxes must not reach."""
+    configured = os.environ.get("FLAME_E2E_CONTROL_PLANE", "").strip()
+    if configured:
+        pairs = []
+        for item in configured.split(","):
+            host, _, port = item.strip().rpartition(":")
+            if host and port.isdigit():
+                pairs.append((host.strip("[]"), int(port)))
+        if pairs:
+            return pairs
+    endpoint = urlparse(os.environ.get("FLAME_ENDPOINT", "http://127.0.0.1:8080"))
+    return [(endpoint.hostname or "127.0.0.1", endpoint.port or 8080)]
+
+
+@pytest.fixture(scope="module")
+def flmbox_env():
+    """Skip the sandbox tests unless flmbox is registered and runsc is available.
+
+    With FLAME_E2E_REQUIRE_SANDBOX=1 a missing prerequisite fails instead. With
+    FLAME_E2E_REMOTE_RUNSC=1 runsc is not looked up locally: it lives in the
+    executor manager (Kubernetes), and a missing runsc shows up as a failed command.
+    """
+    required = _env_flag("FLAME_E2E_REQUIRE_SANDBOX")
+
+    def unavailable(reason):
+        (pytest.fail if required else pytest.skip)(reason)
+
+    if Sandbox is None:
+        unavailable("flamepy.agent.Sandbox is not available")
+    try:
+        app = flamepy.get_application("flmbox")
+    except Exception:
+        app = None
+    if app is None:
+        unavailable("flmbox application is not registered")
+    if not _env_flag("FLAME_E2E_REMOTE_RUNSC") and shutil.which("runsc") is None:
+        unavailable("runsc is not on PATH")
+
+
+@pytest.fixture
+def make_sandbox(flmbox_env):
+    """Factory of sandboxes with the default image; all are closed after the test.
+
+    The sandbox is warmed up with a first command, which may pull the image.
+    """
+    created = []
+
+    def make():
+        sandbox = Sandbox.create()
+        created.append(sandbox)
+        result = _run(sandbox, "echo ready", wait=FIRST_COMMAND_TIMEOUT)
+        assert result.exit_code == 0, result.stderr_text()
+        return sandbox
+
+    yield make
+
+    for sandbox in created:
+        try:
+            sandbox.close()
+        except Exception:
+            pass
+
+
+@pytest.fixture
+def sandbox(make_sandbox):
+    return make_sandbox()
+
+
+def _run(sandbox, cmd, wait=COMMAND_TIMEOUT, **kwargs):
+    return sandbox.submit(cmd, **kwargs).result(timeout=wait)
+
+
+def _run_code(sandbox, code, wait=COMMAND_TIMEOUT, **kwargs):
+    return sandbox.submit_code(code, **kwargs).result(timeout=wait)
+
+
+def _tcp_probe(host, port):
+    """A command that exits nonzero when host:port cannot be reached within 3 seconds."""
+    inner = f"</dev/tcp/{host}/{port}"
+    return f"bash -c {shlex.quote(f'timeout 3 bash -c {shlex.quote(inner)}')}"
+
+
+def _assert_unreachable(sandbox, host, port):
+    started = time.monotonic()
+    result = _run(sandbox, _tcp_probe(host, port))
+    elapsed = time.monotonic() - started
+    assert result.exit_code != 0, f"{host}:{port} is reachable from the sandbox"
+    assert b"not found" not in result.stderr, result.stderr_text()
+    assert elapsed < 20, f"probe of {host}:{port} took {elapsed:.1f}s"
+
+
+class TestSandboxCommands:
+    """Commands and code run inside a sandbox."""
+
+    def test_run_echo(self, sandbox):
+        result = _run(sandbox, "echo hello")
+        assert result.exit_code == 0
+        assert result.stdout_text() == "hello\n"
+        assert result.stderr == b""
+
+    def test_nonzero_exit_is_a_normal_result(self, sandbox):
+        result = _run(sandbox, "sh -c 'echo err >&2; exit 3'")
+        assert result.exit_code == 3
+        assert result.stderr_text() == "err\n"
+        assert result.stdout == b""
+
+    def test_run_code_shell(self, sandbox):
+        result = _run_code(sandbox, "echo $((6 * 7))", language="shell")
+        assert result.exit_code == 0
+        assert result.stdout_text().strip() == "42"
+
+    def test_run_code_python(self, sandbox):
+        if _run(sandbox, "command -v python3").exit_code != 0:
+            pytest.skip("the sandbox image has no python3")
+        result = _run_code(sandbox, "print(6 * 7)", language="python")
+        assert result.exit_code == 0
+        assert result.stdout_text().strip() == "42"
+
+    def test_stdin_input(self, sandbox):
+        result = _run_code(sandbox, "cat", language="shell", input=b"from stdin")
+        assert result.exit_code == 0
+        assert result.stdout == b"from stdin"
+
+    def test_cwd_and_envs(self, sandbox):
+        result = _run(sandbox, "pwd; echo $FLM_E2E_VALUE", cwd="/tmp", envs={"FLM_E2E_VALUE": "abc"})
+        assert result.exit_code == 0
+        assert result.stdout_text().split() == ["/tmp", "abc"]
+
+    def test_timeout_exit_code(self, sandbox):
+        started = time.monotonic()
+        result = _run(sandbox, "sleep 30", timeout=2)
+        assert result.exit_code == 124
+        assert time.monotonic() - started < 25
+
+    def test_submit_future(self, sandbox):
+        future = sandbox.submit("echo from-future")
+        result = future.result(timeout=COMMAND_TIMEOUT)
+        assert result.exit_code == 0
+        assert result.stdout_text() == "from-future\n"
+
+
+class TestSandboxFilesystem:
+    """The filesystem belongs to one sandbox."""
+
+    def test_file_persists_between_runs_of_one_sandbox(self, sandbox):
+        assert _run(sandbox, "echo data > /tmp/flm-e2e-file").exit_code == 0
+        result = _run(sandbox, "cat /tmp/flm-e2e-file")
+        assert result.exit_code == 0
+        assert result.stdout_text() == "data\n"
+
+    def test_file_is_not_visible_in_another_sandbox(self, make_sandbox):
+        first = make_sandbox()
+        second = make_sandbox()
+        assert _run(first, "echo data > /tmp/flm-e2e-private").exit_code == 0
+
+        assert _run(second, "test -e /tmp/flm-e2e-private").exit_code != 0
+        assert _run(first, "test -e /tmp/flm-e2e-private").exit_code == 0
+
+    def test_dns_configuration(self, sandbox):
+        result = _run(sandbox, "cat /etc/resolv.conf")
+        assert result.exit_code == 0
+        assert "nameserver" in result.stdout_text()
+        assert _run(sandbox, "grep -q localhost /etc/hosts").exit_code == 0
+
+
+class TestSandboxNetwork:
+    """Sandboxes cannot reach the Flame control plane, the node or the metadata service."""
+
+    def test_metadata_address_is_unreachable(self, sandbox):
+        _assert_unreachable(sandbox, "169.254.169.254", 80)
+
+    def test_flame_endpoint_is_unreachable(self, sandbox):
+        addresses = _control_plane_addresses()
+        for host, port in addresses:
+            _assert_unreachable(sandbox, host, port)
+
+        # The node's own address on the same port is the control plane as well.
+        # This probe finds the node's address only when pytest runs on the node.
+        if _env_flag("FLAME_E2E_REMOTE_RUNSC"):
+            return
+        host, port = addresses[0]
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.connect(("192.0.2.1", 9))  # No packet is sent for a UDP connect.
+            node_ip = probe.getsockname()[0]
+            probe.close()
+        except OSError:
+            return
+        if node_ip != host:
+            _assert_unreachable(sandbox, node_ip, port)
+
+    def test_node_loopback_is_unreachable(self, sandbox):
+        # 127.0.0.1 inside the sandbox is the sandbox's own loopback, not the node's.
+        _assert_unreachable(sandbox, "127.0.0.1", _control_plane_addresses()[0][1])
+        _assert_unreachable(sandbox, "127.0.0.1", 22)
+
+
+class TestSandboxLifecycle:
+    """Suspend, resume and close."""
+
+    def test_suspend_and_resume(self, sandbox):
+        assert sandbox.state == "open"
+        assert _run(sandbox, "echo data > /tmp/flm-e2e-before-suspend").exit_code == 0
+
+        sandbox.suspend()
+        assert sandbox.state == "suspended"
+
+        with pytest.raises(FlameError) as excinfo:
+            sandbox.run("echo nope")
+        assert excinfo.value.code == FlameErrorCode.INVALID_STATE
+
+        sandbox.resume()
+        assert sandbox.state == "open"
+
+        result = _run(sandbox, "echo after-resume", wait=AFTER_RESUME_TIMEOUT)
+        assert result.exit_code == 0
+        assert result.stdout_text() == "after-resume\n"
+
+        # Phase 1 keeps no state across a suspend: the resumed sandbox starts fresh.
+        # This assertion changes when checkpoint/restore persistence lands (#605).
+        assert _run(sandbox, "test -e /tmp/flm-e2e-before-suspend").exit_code != 0
+
+    def test_close(self, sandbox):
+        sandbox_id = sandbox.id
+        sandbox.close()
+        assert flamepy.get_session(sandbox_id).state == SessionState.CLOSED
+
+        with pytest.raises(FlameError):
+            sandbox.run("echo nope")

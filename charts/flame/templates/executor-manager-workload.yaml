@@ -69,6 +69,9 @@ spec:
               mountPath: /tmp/flame
             - name: var-flame
               mountPath: /var/flame
+            # State of the flmbox sandbox application (images, network slots).
+            - name: flmbox-state
+              mountPath: /usr/local/flame/data/flmbox
             {{- if .Values.tls.enabled }}
             - name: cluster-tls
               mountPath: {{ include "flame.tlsClusterPath" . }}
@@ -187,6 +190,9 @@ spec:
           emptyDir:
             {{- include "flame.runtimeEmptyDir" .Values.executorManager.runtimeStorage | nindent 12 }}
         - name: var-flame
+          emptyDir:
+            {{- include "flame.runtimeEmptyDir" .Values.executorManager.runtimeStorage | nindent 12 }}
+        - name: flmbox-state
           emptyDir:
             {{- include "flame.runtimeEmptyDir" .Values.executorManager.runtimeStorage | nindent 12 }}
         {{- if .Values.tls.enabled }}

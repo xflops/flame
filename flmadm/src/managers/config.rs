@@ -233,6 +233,17 @@ mod tests {
             })
         );
 
+        let flmbox = load("flmbox");
+        assert_eq!(flmbox.shim, Shim::Host);
+        assert_eq!(
+            flmbox.command.as_deref(),
+            Some("${FLAME_HOME}/bin/flmbox-service")
+        );
+        let schema = flmbox.schema.unwrap();
+        for text in [schema.input.as_deref(), schema.output.as_deref()] {
+            serde_json::from_str::<serde_json::Value>(text.unwrap()).unwrap();
+        }
+
         let flmping = load("flmping");
         assert_eq!(flmping.shim, Shim::Host);
         assert_eq!(

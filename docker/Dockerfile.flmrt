@@ -21,8 +21,20 @@ RUN ./target/release/flmadm install \
 
 FROM ubuntu:24.04
 
+# The runtime also hosts the `flmbox` sandbox application, which drives gVisor `runsc` and
+# sets up a per-sandbox network namespace: runsc comes from the gVisor apt repository (the
+# same source the CRI e2e uses), iproute2 and nftables provide `ip` and `nft`, util-linux
+# provides `mount`. curl and gnupg are only needed to add the repository.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates python3 \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg iproute2 nftables python3 util-linux \
+    && curl -fsSL https://gvisor.dev/archive.key \
+        | gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+        > /etc/apt/sources.list.d/gvisor.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends runsc \
+    && apt-get purge -y --auto-remove curl gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/flame /usr/local/flame

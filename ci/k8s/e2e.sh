@@ -466,17 +466,66 @@ run_smoke_tests() {
     popd >/dev/null
 }
 
+# Control plane addresses a sandbox must not reach: the session manager service
+# (cluster IP) and the session NodePort on every worker node. The tests run on the
+# VM, which reaches the cluster through 127.0.0.1:${SESSION_NODE_PORT} instead, and
+# kubectl may not be configured in the step that runs them, so fall back to the kind
+# node IPs (read from Docker) plus the NodePort. An empty result is fine: the tests
+# then probe the endpoint from FLAME_ENDPOINT only.
+sandbox_control_plane() {
+    local session_service="" cluster_ip="" frontend_port="" node_ip=""
+    local -a addresses=()
+
+    if kubectl -n "$NAMESPACE" get service >/dev/null 2>&1; then
+        session_service="$(kubectl -n "$NAMESPACE" get service \
+            -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=session-manager" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+        if [[ -n "$session_service" ]]; then
+            cluster_ip="$(kubectl -n "$NAMESPACE" get service "$session_service" \
+                -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
+            frontend_port="$(kubectl -n "$NAMESPACE" get service "$session_service" \
+                -o jsonpath='{.spec.ports[?(@.name=="frontend")].port}' 2>/dev/null || true)"
+            if [[ -n "$cluster_ip" && -n "$frontend_port" ]]; then
+                addresses+=("${cluster_ip}:${frontend_port}")
+            fi
+        fi
+    fi
+    if command -v docker >/dev/null 2>&1; then
+        while read -r node_ip; do
+            if [[ -n "$node_ip" ]]; then
+                addresses+=("${node_ip}:${SESSION_NODE_PORT}")
+            fi
+        done < <(docker ps -q --filter "label=io.x-k8s.kind.cluster" 2>/dev/null \
+            | xargs -r docker inspect \
+                -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' 2>/dev/null \
+            | sort -u || true)
+    fi
+    if ((${#addresses[@]} > 0)); then
+        (IFS=,; printf '%s' "${addresses[*]}")
+    fi
+}
+
 run_e2e_tests() {
+    local control_plane=""
+
     log "Running E2E tests directly from the VM"
+    control_plane="$(sandbox_control_plane || true)"
+    log "Sandbox control plane addresses: ${control_plane:-<none, using FLAME_ENDPOINT>}"
     pushd "${ROOT_DIR}/testing/e2e" >/dev/null
+    # flmbox runs inside the executor manager pods (runsc is in that image, not on
+    # the VM), and the sandbox tests must run or fail here, never skip.
     PYTHONPATH="${ROOT_DIR}/testing/e2e/src:${PYTHONPATH}" \
         FLAME_LOG=DEBUG \
+        FLAME_E2E_REQUIRE_SANDBOX=1 \
+        FLAME_E2E_REMOTE_RUNSC=1 \
+        FLAME_E2E_CONTROL_PLANE="$control_plane" \
         uv run --no-project \
         --with pytest \
         --with pytest-timeout \
         python -m pytest -vv --durations=0 \
         tests/test_app.py \
-        tests/test_flmexec.py
+        tests/test_flmexec.py \
+        tests/test_sandbox.py
     popd >/dev/null
 }
 
@@ -504,7 +553,7 @@ Commands:
   install-flame           Lint, render, and install Flame; accepts Helm arguments.
   configure-access        Configure session and cache access from the VM.
   run-smoke-tests         Run lightweight Flame client tests from the VM.
-  run-e2e-tests           Run the App and flmexec E2E cases from the VM.
+  run-e2e-tests           Run the App, flmexec, and sandbox E2E cases from the VM.
   diagnostics             Print Kubernetes and component diagnostics.
   all                     Run every phase; accepts Helm arguments (default).
 EOF

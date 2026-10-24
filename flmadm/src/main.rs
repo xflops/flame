@@ -48,7 +48,7 @@ enum Commands {
         #[arg(long)]
         control_plane: bool,
 
-        /// Install worker components (flame-executor-manager, flmping-service, flmexec-service, flamepy)
+        /// Install worker components (flame-executor-manager, flmping-service, flmexec-service, flmbox-service, flamepy)
         #[arg(long)]
         worker: bool,
 

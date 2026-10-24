@@ -11,9 +11,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from .sandbox import CommandResult, Sandbox
 from .session import Session, SessionOutput, open_session
 
 __all__ = [
+    "CommandResult",
+    "Sandbox",
     "Session",
     "SessionOutput",
     "open_session",
