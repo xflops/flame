@@ -118,11 +118,25 @@ jobs:
           echo "=== Verify object cache is accessible ==="
           curl -s http://127.0.0.1:9090/ || echo "Note: Object cache gRPC endpoint (expected no HTTP response)"
 
+      - name: Install flmbox dependencies (gVisor runsc)
+        run: |
+          curl -fsSL https://gvisor.dev/archive.key \
+            | sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+            | sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y runsc
+          runsc --version
+          # The services run as root under systemd; make the flmbox state directories exist.
+          sudo install -d -m 0755 /var/lib/flmbox "$INSTALL_PREFIX/data/flmbox"
+
       - name: Run Python E2E tests
         timeout-minutes: 20
         run: |
           export PYTHONPATH="$(pwd)/testing/e2e/src:$PYTHONPATH"
           export FLAME_LOG=DEBUG
+          # runsc is installed above: the sandbox tests must run, not skip.
+          export FLAME_E2E_REQUIRE_SANDBOX=1
           cd testing/e2e
           pytest -vv --durations=0 tests/test_app.py tests/test_flmexec.py tests/test_sandbox.py
 

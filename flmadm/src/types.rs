@@ -18,6 +18,7 @@ impl InstallProfile {
                 "flame-executor-manager",
                 "flmping-service",
                 "flmexec-service",
+                "flmbox",
                 "flamepy",
             ],
             InstallProfile::Client => &["flmctl", "flmping", "flmexec", "flmbench", "flamepy"],
@@ -226,6 +227,7 @@ pub struct BuildArtifacts {
     pub flmexec: PathBuf,
     pub flmexec_service: PathBuf,
     pub flmbench: PathBuf,
+    pub flmbox: PathBuf,
 }
 
 impl BuildArtifacts {
@@ -261,10 +263,11 @@ impl BuildArtifacts {
             flmexec: target_dir.join("flmexec"),
             flmexec_service: target_dir.join("flmexec-service"),
             flmbench: target_dir.join("flmbench"),
+            flmbox: target_dir.join("flmbox"),
         }
     }
 
-    fn entries(&self) -> [(&'static str, &Path); 10] {
+    fn entries(&self) -> [(&'static str, &Path); 11] {
         [
             ("flame-session-manager", &self.session_manager),
             ("flame-executor-manager", &self.executor_manager),
@@ -276,6 +279,7 @@ impl BuildArtifacts {
             ("flmexec", &self.flmexec),
             ("flmexec-service", &self.flmexec_service),
             ("flmbench", &self.flmbench),
+            ("flmbox", &self.flmbox),
         ]
     }
 
@@ -337,6 +341,7 @@ mod tests {
             assert!(components.contains(&"flame-executor-manager"));
             assert!(components.contains(&"flmping-service"));
             assert!(components.contains(&"flmexec-service"));
+            assert!(components.contains(&"flmbox"));
             assert!(components.contains(&"flamepy"));
         }
 
@@ -356,6 +361,7 @@ mod tests {
             assert!(InstallProfile::ControlPlane.includes_component("flmctl"));
             assert!(InstallProfile::Worker.includes_component("flamepy"));
             assert!(InstallProfile::Client.includes_component("flmexec"));
+            assert!(InstallProfile::Worker.includes_component("flmbox"));
         }
 
         #[test]

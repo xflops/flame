@@ -1,0 +1,12 @@
+[project]
+name = "sandbox-example"
+version = "0.1.0"
+description = "Run commands and code in a gVisor sandbox with flamepy.agent.Sandbox"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "flamepy",
+]
+
+[tool.uv.sources]
+flamepy = { path = "/usr/local/flame/sdk/python" }

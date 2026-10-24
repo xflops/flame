@@ -469,14 +469,19 @@ run_smoke_tests() {
 run_e2e_tests() {
     log "Running E2E tests directly from the VM"
     pushd "${ROOT_DIR}/testing/e2e" >/dev/null
+    # flmbox runs inside the executor manager pods (runsc is in that image, not on
+    # the VM), and the sandbox tests must run or fail here, never skip.
     PYTHONPATH="${ROOT_DIR}/testing/e2e/src:${PYTHONPATH}" \
         FLAME_LOG=DEBUG \
+        FLAME_E2E_REQUIRE_SANDBOX=1 \
+        FLAME_E2E_REMOTE_RUNSC=1 \
         uv run --no-project \
         --with pytest \
         --with pytest-timeout \
         python -m pytest -vv --durations=0 \
         tests/test_app.py \
-        tests/test_flmexec.py
+        tests/test_flmexec.py \
+        tests/test_sandbox.py
     popd >/dev/null
 }
 
@@ -504,7 +509,7 @@ Commands:
   install-flame           Lint, render, and install Flame; accepts Helm arguments.
   configure-access        Configure session and cache access from the VM.
   run-smoke-tests         Run lightweight Flame client tests from the VM.
-  run-e2e-tests           Run the App and flmexec E2E cases from the VM.
+  run-e2e-tests           Run the App, flmexec, and sandbox E2E cases from the VM.
   diagnostics             Print Kubernetes and component diagnostics.
   all                     Run every phase; accepts Helm arguments (default).
 EOF

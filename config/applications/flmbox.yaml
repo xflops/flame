@@ -1,0 +1,13 @@
+metadata:
+  name: flmbox
+spec:
+  shim: host
+  description: The Flame Sandbox application, which runs commands and code in isolated sandboxes.
+  command: ${FLAME_HOME}/bin/flmbox
+  arguments:
+    - -d
+  schema:
+    input: >-
+      {"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"code":{"type":"string","description":"The shell command line or source code to run, e.g. echo hello"},"language":{"type":"string","description":"The language of the code: shell (default) or python"},"cwd":{"type":"string","description":"The working directory inside the sandbox"},"envs":{"type":"object","additionalProperties":{"type":"string"},"description":"Extra environment variables"},"input":{"type":"array","items":{"type":"integer"},"description":"Standard input in bytes, e.g. [0x1, 0x2]"},"timeout":{"type":"number","description":"Timeout in seconds"}},"required":["code"]}
+    output: >-
+      {"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"exit_code":{"type":"integer","description":"The exit code of the process"},"stdout":{"type":"array","items":{"type":"integer"},"description":"Captured standard output in bytes"},"stderr":{"type":"array","items":{"type":"integer"},"description":"Captured standard error in bytes"}},"required":["exit_code","stdout","stderr"]}

@@ -12,6 +12,7 @@
 !examples/
 !flmadm/
 !flmbench/
+!flmbox/
 !flmctl/
 !flmexec/
 !flmping/

@@ -31,10 +31,12 @@ def test_register_application():
 
 def test_list_application():
     apps = [app for app in flamepy.list_applications() if app.state == flamepy.ApplicationState.ENABLED]
-    assert len(apps) == 3
+    names = {app.name for app in apps}
+    assert {"flmexec", "flmping", "flmrun"} <= names
 
     for app in apps:
-        assert app.name in ["flmexec", "flmping", "flmrun"]
+        # flmbox is registered only where the flmbox manifest is installed.
+        assert app.name in ["flmbox", "flmexec", "flmping", "flmrun"]
         assert app.state == flamepy.ApplicationState.ENABLED
 
 

@@ -429,7 +429,7 @@ it creates, not in the service. Its inputs are untrusted: the image is checked a
 allowlist, the paths in `SandboxConfig` come only from the executor manager (4.4), and commands
 and code reach only `runsc exec`. Its sandboxes run inside the executor's resource group below.
 
-**Network.** Whether a sandbox can reach other hosts decides whether it can attack the cluster, so
+**Network** (target design; the first delivery has no network, see "Phase 1 implementation" below). Whether a sandbox can reach other hosts decides whether it can attack the cluster, so
 `flmbox` sets the network up itself in `on_session_enter`, before it runs or restores the sandbox,
 and does not rely on the node operator's firewall:
 
@@ -459,6 +459,43 @@ rules and the restore with a rebuilt network (4.9).
 The instance socket and the task input are the service's own concern now: the sandbox is entered
 with `runsc exec`, so no socket is mounted into the sandbox and there is no mount to recreate on
 restore beyond what the bundle already declares.
+
+**Phase 1 implementation.** The first delivery (#605) runs sandboxes without the checkpoint flow. The OCI runtime
+spec and the image manifest, index and config types come from the `oci-spec` crate:
+
+- **Image acquisition.** `flmbox` pulls with the `oci-client` crate (anonymous token auth; the image index is resolved
+  to the `linux/<arch>` manifest; manifest and blob digests are verified) and adds a size and layer cap, a hardened untar (path confinement, whiteouts applied while
+  unpacking) and a node-local cache keyed by the manifest digest, with a per-digest file lock, so that the executors of a node pull an image once. This follows the
+  `atelet` imagecache of Google's Agent Substrate, but flattened per image: there is no per-layer pool and no host
+  overlayfs mount, the rootfs is read-only and `runsc --overlay2=root:memory` provides the writable layer. Phase 1 has no
+  image allowlist: `flmbox` pulls any valid reference (limited by the image size cap), and the allowlist of 4.2 is
+  deferred with the session-manager validation.
+- **Binary and CLI.** The binary is `flmbox`. `flmbox -d` runs the Flame service instance (the application manifest
+  starts it with that argument), and `flmbox pull|images|ps|run|exec|kill` drive the same lifecycle from a shell: `pull`
+  downloads an image into the node cache, `images` lists the cache, `ps` lists the sandboxes with their images, `run`
+  creates and starts a sandbox and prints its id, `exec` runs a command in it and exits with the command's exit code,
+  and `kill` removes it. The sandboxes live in `runsc`'s state directory,
+  so the CLI and the service reach them from separate processes. The lifecycle (`sandbox` module) is keyed by sandbox
+  id and holds no state; the service only binds one id to the session.
+- **Configuration.** `flmbox` reads a `sandbox:` section of a YAML file into `FlameSandbox`, the way the cluster
+  file becomes `FlameCluster`: `state_dir`, `runtime` (`type: runsc`, `path`, `platform`, `overlay`) and `images`
+  (`max_size`). Every key is optional. The file is `--config`, `$FLMBOX_CONF`, `$FLAME_HOME/conf/flame-sandbox.yaml` or
+  `~/.flame/flame-sandbox.yaml` (the last two only when present). The `FLMBOX_*` variables override the file, and the file
+  overrides the defaults. The runtime `type` selects the `Runtime` implementation below.
+- **Runtime trait.** `Sandbox` talks to a `Runtime` trait (`start`, `exec`, `kill`, `list`; `runtime/mod.rs`), not
+  to `runsc`. gVisor (`runtime/runsc`, which also writes its own OCI bundle) is the only implementation; another runtime such
+  as Firecracker implements the trait and is selected in `runtime_for`.
+- **No network.** Phase 1 is lifecycle only. Sandboxes run with `runsc --network=none` and an empty network namespace,
+  so they cannot reach the control plane, the node or the internet. The network design above (per-sandbox namespace,
+  deny rules, egress allowlist, fixed in-sandbox address) is deferred to its own change, together with the checkpoint
+  and restore flow that needs it. The bundle carries a minimal `hosts` file, bind-mounted read-only.
+- **No resource limits in `flmbox`.** The bundle has no `linux.resources`; limits belong to the host shim (#604).
+- **No state persistence.** Suspend releases the executor and removes the sandbox; a resumed sandbox starts fresh.
+- **Kubernetes.** `flmbox` is a host-shim application, so it runs inside the executor manager pod. The pod must be
+  privileged (the chart default) so that `runsc` works; the executor manager
+  image (`docker/Dockerfile.fem`) carries `runsc`, and the chart mounts an
+  `emptyDir` at `${FLAME_HOME}/data/flmbox` for the state directory. The manifest comes from `config/applications`,
+  installed by `flmadm` into the session manager image. The Kubernetes e2e runs the sandbox tests against this.
 
 ### 4.7 Snapshot persistence
 
@@ -600,7 +637,7 @@ class Sandbox:
 
     def run(self, cmd: str, *, cwd: str | None = None, envs: dict[str, str] | None = None,
             timeout: float | None = None) -> CommandResult: ...
-    def submit_run(self, cmd: str, *, cwd: str | None = None, envs: dict[str, str] | None = None,
+    def submit(self, cmd: str, *, cwd: str | None = None, envs: dict[str, str] | None = None,
                    timeout: float | None = None) -> Future[CommandResult]: ...
     def run_code(self, code: str, *, language: str = "python", input: bytes | None = None,
                  timeout: float | None = None) -> CommandResult: ...
@@ -629,7 +666,7 @@ snapshot (4.4). There are no file transfer calls in this version.
 | ------------ | ------ |
 | `Sandbox.create(...)` | Creates a session on the built-in sandbox application with `min = max = batch_size = 1`. |
 | `Sandbox.connect(id)` | Reopens it (`OpenSession`); a suspended sandbox opens as `suspended` and is not resumed implicitly. |
-| `run` / `submit_run` | A `run` task: `flmbox` executes the shell command in the sandbox with `runsc exec`. |
+| `run` / `submit` | A `run` task: `flmbox` executes the shell command in the sandbox with `runsc exec`. |
 | `run_code` / `submit_code` | A `run_code` task on the session, with the call's `language`. |
 | `suspend` / `resume` | `SuspendSession` / `ResumeSession`; `resume(fresh=True)` discards the snapshot. |
 | `close` | `CloseSession`, which releases the snapshot (4.7). |
@@ -641,7 +678,7 @@ rejected tasks of 4.3. Errors use `FlameError`, as in `Session`.
 
 **Backing application.** A built-in application (for example `flmbox`, registered like
 `flmexec`) with `shim = Host`, `suspendable = true` and a longer `delay_release` (4.2), written with the Rust SDK. Its service runs `runsc` and
-handles the `run` and `run_code` task kinds inside the sandbox. It is separate from
+handles one task type, a script in `shell` (the default) or `python` with optional `cwd`, `envs` and stdin, which `run` and `run_code` both send. It is separate from
 `flmexec`, which is stateless and has no sandbox.
 
 **`run`.** Runs a shell command in the sandbox, as `commands.run` does in E2B. It returns a
@@ -661,6 +698,13 @@ informs.
 
 **Resumed signal.** `SessionContext.resumed` (4.5) is available to the service inside the sandbox,
 so the sandbox application can re-establish anything that cannot be checkpointed.
+
+**As implemented in phase 1.** `Sandbox.state` is read from the server and is one of `"open"`, `"suspending"`,
+`"suspended"` or `"closed"`. `suspend()` and `resume()` signal the session and then poll (every 0.2 s, default
+timeout 60 s) until it is `suspended` or `open`; a timeout raises `FlameError(INTERNAL)` and a closed sandbox
+raises `FlameError(INVALID_STATE)`. `run`, `run_code` and their `submit_` forms raise `FlameError(INVALID_STATE)`
+unless the sandbox is `"open"`, and after `close()`. `resume(fresh=...)` is not implemented because there is no
+snapshot to discard yet, and a resumed sandbox starts fresh.
 
 ## 5. Failure handling
 
@@ -725,7 +769,7 @@ so the sandbox application can re-establish anything that cannot be checkpointed
 - Persistence: version and pointer ordering, deletion of the old, failed and discarded objects, SHA-256 mismatch,
   store errors on put, get and delete, and the `file://` backend. The S3 backend runs against a
   local S3-compatible server in CI.
-- SDK: `Sandbox.create`, `Sandbox.connect`, `run`, `submit_run`, `run_code`, `suspend`, `resume`, `close` against a fake
+- SDK: `Sandbox.create`, `Sandbox.connect`, `run`, `submit`, `run_code`, `suspend`, `resume`, `close` against a fake
   session API (unit), and the error for calls on a suspended sandbox.
 - End to end: an agent runs `run("apt-get install -y ...")`, writes a file, suspends, resumes and
   then runs code that uses the package and reads the file back with `run_code`, including
