@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Union
 from urllib.parse import urlparse
 
 import grpc
@@ -30,6 +30,7 @@ from flamepy.proto.frontend_pb2 import (
     CloseSessionRequest,
     CreateSessionRequest,
     CreateTaskRequest,
+    DeleteSessionRequest,
     GetApplicationRequest,
     GetSessionRequest,
     GetTaskRequest,
@@ -311,8 +312,23 @@ class Connection:
         response = await self._rpc("CreateSession", CreateSessionRequest(session_id=attrs.id or short_name(attrs.application), session=_session_spec(attrs)), "failed to create session")
         return _session_from_proto(self, response)
 
-    async def list_sessions(self) -> List["Session"]:
-        response = await self._rpc("ListSessions", ListSessionsRequest(), "failed to list sessions")
+    async def list_sessions(
+        self,
+        *,
+        state: Optional[SessionState] = None,
+        ids: Optional[Iterable[SessionID]] = None,
+        application: Optional[str] = None,
+    ) -> List["Session"]:
+        """List sessions; the server applies the filters, so only matches are returned.
+
+        ``ids`` limits the result to those sessions (an empty ``ids`` means no filter on ids).
+        """
+        request = ListSessionsRequest(
+            application=application,
+            state=int(state) if state is not None else None,
+            ids=list(ids) if ids is not None else [],
+        )
+        response = await self._rpc("ListSessions", request, "failed to list sessions")
         return [_session_from_proto(self, item) for item in response.sessions]
 
     async def open_session(self, session_id: SessionID, spec: Optional[SessionAttributes] = None) -> "Session":
@@ -328,6 +344,13 @@ class Connection:
         session_watch = self._session_watches.get(session_id)
         if session_watch is not None:
             session_watch.close(FlameError(FlameErrorCode.INTERNAL, "session closed during task watch"))
+        return _session_from_proto(self, response)
+
+    async def delete_session(self, session_id: SessionID) -> "Session":
+        response = await self._rpc("DeleteSession", DeleteSessionRequest(session_id=session_id), "failed to delete session")
+        session_watch = self._session_watches.get(session_id)
+        if session_watch is not None:
+            session_watch.close(FlameError(FlameErrorCode.INTERNAL, "session deleted during task watch"))
         return _session_from_proto(self, response)
 
     def _watch_task(self, session_id: SessionID, task_id: TaskID, timeout: Optional[float]) -> "TaskWatcher":

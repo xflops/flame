@@ -778,11 +778,28 @@ mod tests {
         let filter = SessionFilter::try_from(rpc::ListSessionsRequest {
             application: Some("test-app".to_string()),
             state: Some(rpc::SessionState::Open as i32),
+            ids: vec![],
         })
         .unwrap();
 
         assert_eq!(filter.application.as_deref(), Some("test-app"));
         assert_eq!(filter.state, Some(SessionState::Open));
+        assert_eq!(filter.ids, None);
+    }
+
+    #[test]
+    fn session_filter_maps_rpc_ids() {
+        let filter = SessionFilter::try_from(rpc::ListSessionsRequest {
+            application: None,
+            state: None,
+            ids: vec!["ssn-1".to_string(), "ssn-2".to_string()],
+        })
+        .unwrap();
+
+        assert_eq!(
+            filter.ids,
+            Some(vec!["ssn-1".to_string(), "ssn-2".to_string()])
+        );
     }
 
     #[test]
@@ -790,6 +807,7 @@ mod tests {
         assert!(SessionFilter::try_from(rpc::ListSessionsRequest {
             application: None,
             state: Some(99),
+            ids: vec![],
         })
         .is_err());
     }

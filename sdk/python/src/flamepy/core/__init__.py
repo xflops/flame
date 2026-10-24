@@ -38,6 +38,7 @@ from .client import (
     close_session,
     connect,
     create_session,
+    delete_session,
     get_application,
     get_session,
     list_applications,
@@ -156,6 +157,7 @@ __all__ = [
     "list_sessions",
     "get_session",
     "close_session",
+    "delete_session",
     # Client classes
     "ConnectionInstance",
     "Connection",

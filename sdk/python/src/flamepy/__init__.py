@@ -79,6 +79,7 @@ from .core import (  # Type aliases; Constants; Enums; Exception classes; Data c
     TaskState,
     TaskWatcher,
     close_session,
+    delete_session,
     connect,
     create_session,
     get_application,
@@ -146,6 +147,7 @@ __all__ = [
     "list_sessions",
     "get_session",
     "close_session",
+    "delete_session",
     # Client classes
     "Connection",
     "Session",

@@ -31,11 +31,12 @@ use url::Url;
 
 use self::rpc::frontend_client::FrontendClient as FlameFrontendClient;
 use self::rpc::{
-    ApplicationSpec, CloseSessionRequest, CreateSessionRequest, CreateTaskRequest, Environment,
-    GetApplicationRequest, GetNodeRequest, GetSessionRequest, GetTaskRequest,
-    ListApplicationsRequest, ListExecutorsRequest, ListNodesRequest, ListSessionsRequest,
-    ListTasksRequest, OpenSessionRequest, RegisterApplicationRequest, SessionSpec, TaskSpec,
-    UnregisterApplicationRequest, UpdateApplicationRequest, WatchTaskRequest,
+    ApplicationSpec, CloseSessionRequest, CreateSessionRequest, CreateTaskRequest,
+    DeleteSessionRequest, Environment, GetApplicationRequest, GetNodeRequest, GetSessionRequest,
+    GetTaskRequest, ListApplicationsRequest, ListExecutorsRequest, ListNodesRequest,
+    ListSessionsRequest, ListTasksRequest, OpenSessionRequest, RegisterApplicationRequest,
+    SessionSpec, TaskSpec, UnregisterApplicationRequest, UpdateApplicationRequest,
+    WatchTaskRequest,
 };
 use crate::apis::flame::v1 as rpc;
 use crate::apis::FlameClientTls;
@@ -115,6 +116,27 @@ pub struct Event {
     pub message: Option<String>,
     #[serde(with = "serde_utc")]
     pub creation_time: DateTime<Utc>,
+}
+
+/// Narrows `Connection::list_sessions_with`. Unset fields match every session.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionFilter {
+    /// Only sessions of this application.
+    pub application: Option<ApplicationID>,
+    /// Only sessions in this state.
+    pub state: Option<SessionState>,
+    /// Only these sessions; empty means no filter on ids.
+    pub ids: Vec<SessionID>,
+}
+
+impl SessionFilter {
+    fn to_request(&self) -> ListSessionsRequest {
+        ListSessionsRequest {
+            application: self.application.clone(),
+            state: self.state.map(|state| state as i32),
+            ids: self.ids.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -845,14 +867,20 @@ impl Connection {
         self.attach_session(&inner_ssn, client)
     }
 
+    /// Lists every session. Use [`Connection::list_sessions_with`] to let the
+    /// server narrow the list.
     pub async fn list_sessions(&self) -> Result<Vec<Session>, FlameError> {
+        self.list_sessions_with(&SessionFilter::default()).await
+    }
+
+    /// Lists the sessions that match `filter`; the server applies it, so only
+    /// matching sessions cross the wire.
+    pub async fn list_sessions_with(
+        &self,
+        filter: &SessionFilter,
+    ) -> Result<Vec<Session>, FlameError> {
         let mut client = FlameClient::new(self.channel.clone());
-        let ssn_list = client
-            .list_sessions(ListSessionsRequest {
-                application: None,
-                state: None,
-            })
-            .await?;
+        let ssn_list = client.list_sessions(filter.to_request()).await?;
 
         let inner = ssn_list.into_inner();
         inner
@@ -927,6 +955,24 @@ impl Connection {
         let mut client = FlameClient::new(self.channel.clone());
         client
             .close_session(CloseSessionRequest {
+                session_id: id.to_string(),
+            })
+            .await?;
+
+        let manager = lock_ptr!(self.watch_managers)
+            .expect("watch manager lock poisoned")
+            .remove(id);
+        if let Some(manager) = manager {
+            manager.close().await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn delete_session(&self, id: &str) -> Result<(), FlameError> {
+        let mut client = FlameClient::new(self.channel.clone());
+        client
+            .delete_session(DeleteSessionRequest {
                 session_id: id.to_string(),
             })
             .await?;
@@ -1740,6 +1786,32 @@ mod serde_message {
     {
         let data: String = String::deserialize(deserializer)?;
         Ok(Some(Bytes::from(data.encode_to_vec())))
+    }
+}
+
+#[cfg(test)]
+mod session_filter_tests {
+    use super::*;
+
+    #[test]
+    fn default_filter_requests_every_session() {
+        let request = SessionFilter::default().to_request();
+        assert_eq!(request.application, None);
+        assert_eq!(request.state, None);
+        assert!(request.ids.is_empty());
+    }
+
+    #[test]
+    fn filter_maps_state_application_and_ids() {
+        let request = SessionFilter {
+            application: Some("app".to_string()),
+            state: Some(SessionState::Closed),
+            ids: vec!["a".to_string(), "b".to_string()],
+        }
+        .to_request();
+        assert_eq!(request.application.as_deref(), Some("app"));
+        assert_eq!(request.state, Some(SessionState::Closed as i32));
+        assert_eq!(request.ids, vec!["a".to_string(), "b".to_string()]);
     }
 }
 

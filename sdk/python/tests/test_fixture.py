@@ -78,6 +78,7 @@ class FrontendFixture(FrontendServicer):
         return self._session(request.session_id)
 
     async def ListSessions(self, request, context):
+        self.requests.append(request)
         return pb.SessionList(sessions=[self._session()])
 
     async def CloseSession(self, request, context):

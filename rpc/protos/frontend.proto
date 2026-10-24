@@ -105,6 +105,8 @@ message GetSessionRequest {
 message ListSessionsRequest {
   optional string application = 1;
   optional SessionState state = 2;
+  // Only these sessions; an empty list means no filter on ids.
+  repeated string ids = 3;
 }
 
 message CreateTaskRequest {

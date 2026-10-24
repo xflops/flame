@@ -426,7 +426,7 @@ The repository-level check validates the `flmrun` template, App package upload/i
 | Area | Python API |
 |------|------------|
 | Connect | `flamepy.connect()` |
-| Sessions | `create_session()`, `open_session()`, `get_session()`, `list_sessions()`, `close_session()` |
+| Sessions | `create_session()`, `open_session()`, `get_session()`, `list_sessions(state=, ids=, application=)`, `close_session()`, `delete_session()` |
 | Tasks | `Session.run()`, `Session.submit()`, `Session.create_task()`, `Session.watch_task()` |
 | Applications | `register_application()`, `unregister_application()`, `get_application()`, `list_applications()` |
 | Services | `FlameService`, `flamepy.run()`, `flamepy.serving.Instance`, `flamepy.serving.open_session()` |

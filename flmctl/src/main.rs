@@ -20,6 +20,7 @@ use flame_rs::apis::FlameContext;
 
 mod close;
 mod create;
+mod delete;
 mod deploy;
 mod helper;
 mod list;
@@ -98,6 +99,12 @@ enum Commands {
         #[arg(short, long)]
         session: String,
     },
+    /// Delete closed sessions in Flame; a session must be closed first
+    Delete {
+        /// Comma-separated session ids; with no value, every closed session
+        #[arg(short, long, num_args = 0.., value_delimiter = ',')]
+        session: Option<Vec<String>>,
+    },
     /// Create a session in Flame
     Create {
         /// The name of Application
@@ -169,6 +176,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await?
         }
         Some(Commands::Close { session }) => close::run(&ctx, session).await?,
+        Some(Commands::Delete { session }) => delete::run(&ctx, session.as_deref()).await?,
         Some(Commands::Create {
             app,
             priority,

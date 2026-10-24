@@ -69,6 +69,11 @@ def test_sync_frontend_api_parity(frontend_server):
         assert connection.open_session("sess-1").id == session.id
         assert connection.get_session("sess-1").id == session.id
         assert len(connection.list_sessions()) == 1
+        connection.list_sessions(state=SessionState.CLOSED, ids=["a", "b"], application="app")
+        listed = [req for req in service.requests if req.DESCRIPTOR.name == "ListSessionsRequest"]
+        assert not listed[0].HasField("state") and not listed[0].ids
+        assert listed[1].state == SessionState.CLOSED
+        assert list(listed[1].ids) == ["a", "b"] and listed[1].application == "app"
         task = session.create_task(b"input")
         assert task.id == "task-1"
         assert session.get_task(task.id).input == b""

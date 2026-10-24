@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 from flamepy.core._bridge import LoopThread
 from flamepy.core.aio import client as aio_client
@@ -19,6 +19,7 @@ from flamepy.core.types import (
     ResourceRequirement,
     SessionAttributes,
     SessionID,
+    SessionState,
     Task,
     TaskID,
     TaskOptions,
@@ -74,8 +75,13 @@ def list_nodes() -> List[Any]:
     return ConnectionInstance.instance().list_nodes()
 
 
-def list_sessions() -> List["Session"]:
-    return ConnectionInstance.instance().list_sessions()
+def list_sessions(
+    *,
+    state: Optional[SessionState] = None,
+    ids: Optional[Iterable[SessionID]] = None,
+    application: Optional[str] = None,
+) -> List["Session"]:
+    return ConnectionInstance.instance().list_sessions(state=state, ids=ids, application=application)
 
 
 def get_session(session_id: SessionID) -> "Session":
@@ -84,6 +90,10 @@ def get_session(session_id: SessionID) -> "Session":
 
 def close_session(session_id: SessionID) -> "Session":
     return ConnectionInstance.instance().close_session(session_id)
+
+
+def delete_session(session_id: SessionID) -> "Session":
+    return ConnectionInstance.instance().delete_session(session_id)
 
 
 class ConnectionInstance:
@@ -242,8 +252,14 @@ class Connection:
     def create_session(self, attrs: SessionAttributes) -> "Session":
         return self._session(self._call(self._aio.create_session(attrs)))
 
-    def list_sessions(self) -> List["Session"]:
-        return [self._session(session) for session in self._call(self._aio.list_sessions())]
+    def list_sessions(
+        self,
+        *,
+        state: Optional[SessionState] = None,
+        ids: Optional[Iterable[SessionID]] = None,
+        application: Optional[str] = None,
+    ) -> List["Session"]:
+        return [self._session(session) for session in self._call(self._aio.list_sessions(state=state, ids=ids, application=application))]
 
     def open_session(self, session_id: SessionID, spec: Optional[SessionAttributes] = None) -> "Session":
         return self._session(self._call(self._aio.open_session(session_id, spec)))
@@ -253,6 +269,9 @@ class Connection:
 
     def close_session(self, session_id: SessionID) -> "Session":
         return self._session(self._call(self._aio.close_session(session_id)))
+
+    def delete_session(self, session_id: SessionID) -> "Session":
+        return self._session(self._call(self._aio.delete_session(session_id)))
 
 
 class Session:

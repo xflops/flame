@@ -166,7 +166,7 @@ impl TryFrom<rpc::ListSessionsRequest> for SessionFilter {
         Ok(Self {
             application: request.application,
             state: request.state.map(SessionState::try_from).transpose()?,
-            ids: None,
+            ids: (!request.ids.is_empty()).then_some(request.ids),
             predicate: None,
             limit: None,
         })
