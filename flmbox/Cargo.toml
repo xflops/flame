@@ -1,6 +1,6 @@
 [package]
 name = "flmbox"
-version = "0.6.0"
+version = "0.7.0-rc1"
 edition = "2021"
 description = "flmbox: run commands and code in isolated sandboxes, from the command line or as a Flame service"
 readme = "README.md"

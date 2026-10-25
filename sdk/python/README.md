@@ -133,7 +133,7 @@ python3 -m pip install -e . --user --no-build-isolation
 
 # Or build and install the wheel
 python3 -m build --wheel --no-isolation
-python3 -m pip install dist/flamepy-0.6.0-py3-none-any.whl --user
+python3 -m pip install dist/flamepy-0.7.0rc1-py3-none-any.whl --user
 
 # Install development dependencies
 pip install -e .[dev]
