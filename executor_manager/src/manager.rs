@@ -129,6 +129,16 @@ impl ExecutorManager {
 }
 
 pub async fn run(ctx: &FlameClusterContext) -> Result<(), FlameError> {
+    // A previous run may have left resource groups (and their processes); this
+    // manager has no executors yet, so every group under `flame/` is stale.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = crate::cgroup::CgroupRoot::system()
+        .cleanup_stale(&std::collections::HashSet::new())
+        .await
+    {
+        tracing::warn!("failed to clean up stale executor cgroups: {e}");
+    }
+
     let mut manager = ExecutorManager::new(ctx).await?;
     manager.run().await?;
 

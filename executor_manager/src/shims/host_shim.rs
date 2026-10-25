@@ -29,6 +29,7 @@ use nix::unistd::Pid;
 use stdng::{async_ptr, logs::TraceFn, trace_fn};
 
 use crate::appmgr::ApplicationManager;
+use crate::cgroup::{Cgroup, CgroupRoot};
 use crate::executor::Executor;
 use crate::shims::grpc_shim::GrpcShim;
 use crate::shims::{ExecutorWorkDir, Shim, ShimPtr};
@@ -140,6 +141,9 @@ pub struct HostShim {
     instance: Option<HostInstance>,
     instance_client: Option<GrpcShim>,
     work_dir: Option<ExecutorWorkDir>,
+    /// The resource group of the executor: its limits bind the service and
+    /// everything it starts, and removing it kills them all.
+    cgroup: Option<Cgroup>,
 }
 
 const RUST_LOG: &str = "RUST_LOG";
@@ -154,7 +158,35 @@ impl HostShim {
             instance: None,
             instance_client: None,
             work_dir: None,
+            cgroup: None,
         })
+    }
+
+    /// Creates the executor's resource group, with the limits of its resource
+    /// requirement (Linux, cgroup v2). Where that is not possible the executor
+    /// runs without a group and the reason is logged: other nodes and
+    /// containers have no writable cgroup v2.
+    fn create_cgroup(&self) -> Option<Cgroup> {
+        if !cfg!(target_os = "linux") {
+            return None;
+        }
+        match CgroupRoot::system().create(&self.executor.id, &self.executor.resreq) {
+            Ok(group) => {
+                tracing::debug!(
+                    "executor <{}> runs in cgroup {}",
+                    self.executor.id,
+                    group.path().display()
+                );
+                Some(group)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "executor <{}> runs without a resource group: {e}",
+                    self.executor.id
+                );
+                None
+            }
+        }
     }
 
     fn create_dir(path: &Path, name: &str) -> Result<(), FlameError> {
@@ -212,6 +244,7 @@ impl HostShim {
         executor: &Executor,
         work_dir: &ExecutorWorkDir,
         install_env_vars: &HashMap<String, String>,
+        cgroup: Option<&Cgroup>,
     ) -> Result<HostInstance, FlameError> {
         trace_fn!("HostShim::launch_instance");
 
@@ -308,7 +341,7 @@ impl HostShim {
             .map_err(|e| FlameError::Internal(format!("failed to open stderr log file: {e}")))?;
 
         #[cfg(unix)]
-        let child = cmd
+        let mut child = cmd
             .envs(envs)
             .args(args)
             .current_dir(process_work_dir)
@@ -335,6 +368,18 @@ impl HostShim {
                     "failed to start service by command <{command}>: {e}"
                 ))
             })?;
+
+        // The service starts in its own group so the limits bind it from the
+        // beginning; a child it forked before this line is moved with it.
+        #[cfg(unix)]
+        if let (Some(group), Some(pid)) = (cgroup, child.id()) {
+            if let Err(e) = group.add_process_tree(pid, Path::new("/proc")) {
+                let _ = child.start_kill();
+                return Err(e);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = cgroup;
 
         Ok(HostInstance::new(child))
     }
@@ -433,6 +478,9 @@ impl Drop for HostShim {
         if let Some(instance) = self.instance.as_mut() {
             instance.kill_process();
         }
+        if let Some(group) = &self.cgroup {
+            group.kill();
+        }
     }
 }
 
@@ -454,8 +502,23 @@ impl Shim for HostShim {
             .extend(Self::base_runtime_environment(&self.app, &flame_home));
         let work_dir = ExecutorWorkDir::new(&self.app, &self.executor.id)?;
         let mut instance_client = GrpcShim::new(&work_dir)?;
-        let mut instance =
-            Self::launch_instance(&self.app, &self.executor, &work_dir, &installation.env_vars)?;
+        let cgroup = self.create_cgroup();
+        let mut instance = match Self::launch_instance(
+            &self.app,
+            &self.executor,
+            &work_dir,
+            &installation.env_vars,
+            cgroup.as_ref(),
+        ) {
+            Ok(instance) => instance,
+            Err(error) => {
+                if let Some(group) = &cgroup {
+                    let _ = group.remove().await;
+                }
+                return Err(error);
+            }
+        };
+        self.cgroup = cgroup;
         if let Err(error) = instance_client.connect().await {
             // Retain ownership if cleanup fails so the GPU assignment stays leased.
             self.work_dir = Some(work_dir);
@@ -514,6 +577,12 @@ impl Shim for HostShim {
         if let Some(instance) = self.instance.as_mut() {
             instance.stop().await?;
         }
+        // Also kills what left the service's process group or session, such as
+        // the `runsc` sandboxes of `flmbox`. Kept when it fails, to retry.
+        if let Some(group) = &self.cgroup {
+            group.remove().await?;
+        }
+        self.cgroup = None;
         self.instance = None;
         self.work_dir = None;
         Ok(())
@@ -578,6 +647,97 @@ mod tests {
         );
     }
 
+    /// A fake cgroup v2 root with the control files the kernel would create.
+    fn fake_cgroup_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("cgroup.controllers"), "cpu memory").unwrap();
+        fs::write(root.path().join("cgroup.subtree_control"), "").unwrap();
+        fs::create_dir(root.path().join("flame")).unwrap();
+        fs::write(root.path().join("flame/cgroup.subtree_control"), "").unwrap();
+        root
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launched_service_runs_in_the_executor_cgroup_with_its_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let cgroups = fake_cgroup_root();
+        let mut executor = test_executor();
+        executor.resreq = ResourceRequirement {
+            cpu: 2,
+            memory: 1 << 30,
+            gpu: 0,
+        };
+        let group = CgroupRoot::new(cgroups.path())
+            .create(&executor.id, &executor.resreq)
+            .unwrap();
+        let app = ApplicationContext {
+            name: "test-app".to_string(),
+            shim: ShimType::Host,
+            image: None,
+            command: Some("sh".to_string()),
+            arguments: vec!["-c".to_string(), "printf ok".to_string()],
+            working_directory: None,
+            environments: HashMap::new(),
+            url: None,
+            installer: None,
+        };
+        let work_dir = ExecutorWorkDir {
+            top_dir: temp.path().to_path_buf(),
+            app_dir: temp.path().join("app"),
+            socket: temp.path().join("instance.sock"),
+            auto_dir: false,
+        };
+
+        let mut instance =
+            HostShim::launch_instance(&app, &executor, &work_dir, &HashMap::new(), Some(&group))
+                .unwrap();
+        let pid = instance.child.id().unwrap();
+        instance.child.wait().await.unwrap();
+
+        let read = |file: &str| fs::read_to_string(group.path().join(file)).unwrap();
+        assert_eq!(read("cgroup.procs"), pid.to_string());
+        assert_eq!(read("memory.max"), (1u64 << 30).to_string());
+        assert_eq!(read("memory.swap.max"), "0");
+        assert_eq!(read("cpu.max"), "200000 100000");
+        assert_eq!(group.path(), cgroups.path().join("flame/executor-1"));
+        instance.stop().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_service_that_cannot_join_its_cgroup_is_not_left_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let cgroups = fake_cgroup_root();
+        let executor = test_executor();
+        let group = CgroupRoot::new(cgroups.path())
+            .create(&executor.id, &executor.resreq)
+            .unwrap();
+        // Joining writes cgroup.procs; a directory in its place makes that fail.
+        fs::create_dir(group.path().join("cgroup.procs")).unwrap();
+        let app = ApplicationContext {
+            name: "test-app".to_string(),
+            shim: ShimType::Host,
+            image: None,
+            command: Some("sleep".to_string()),
+            arguments: vec!["30".to_string()],
+            working_directory: None,
+            environments: HashMap::new(),
+            url: None,
+            installer: None,
+        };
+        let work_dir = ExecutorWorkDir {
+            top_dir: temp.path().to_path_buf(),
+            app_dir: temp.path().join("app"),
+            socket: temp.path().join("instance.sock"),
+            auto_dir: false,
+        };
+
+        let result =
+            HostShim::launch_instance(&app, &executor, &work_dir, &HashMap::new(), Some(&group));
+        assert!(result.is_err());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn launched_process_receives_assignment_instead_of_app_or_install_override() {
@@ -629,7 +789,8 @@ mod tests {
             "install-override".to_string(),
         )]);
         let mut instance =
-            HostShim::launch_instance(&app, &executor, &work_dir, &install_environment).unwrap();
+            HostShim::launch_instance(&app, &executor, &work_dir, &install_environment, None)
+                .unwrap();
         instance.child.wait().await.unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join("executor-1.out")).unwrap(),
@@ -880,6 +1041,7 @@ mod tests {
             instance: None,
             instance_client: None,
             work_dir: None,
+            cgroup: None,
         };
 
         let error = shim

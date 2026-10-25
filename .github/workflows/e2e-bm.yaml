@@ -137,8 +137,10 @@ jobs:
           export FLAME_LOG=DEBUG
           # runsc is installed above: the sandbox tests must run, not skip.
           export FLAME_E2E_REQUIRE_SANDBOX=1
+          # The services run as root on this VM (cgroup v2): check the executor cgroups.
+          export FLAME_E2E_CGROUP=1
           cd testing/e2e
-          pytest -vv --durations=0 tests/test_app.py tests/test_flmexec.py tests/test_sandbox.py
+          pytest -vv --durations=0 tests/test_app.py tests/test_flmexec.py tests/test_sandbox.py tests/test_cgroup.py
 
       - name: Show service logs on failure
         if: failure() || cancelled()

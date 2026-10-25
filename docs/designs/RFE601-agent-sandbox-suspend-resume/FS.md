@@ -395,30 +395,34 @@ transfer to and from the snapshot store.
 | `on_session_leave`, `suspend` marker in `checkpoint_path` | `runsc checkpoint --leave-running --image-path <checkpoint_path>`, plus a small metadata file with the base digest and the `runsc` version. The sandbox keeps running. |
 | `on_session_leave`, no marker | `runsc kill` and `runsc delete`, and tear down the sandbox network, so the retained service holds no sandbox. This is the only call of an ordinary unbind. A suspend calls it a second time after the upload succeeds (4.5); a failed suspend never makes the second call, so the sandbox stays. |
 
-**Executor resource group.** The host shim gains an optional per-executor resource group, used for
-suspendable applications in the MVP. It fixes three problems: the sandbox needs resource limits, a
+**Executor resource group.** The host shim runs the service of every executor in a per-executor
+resource group (cgroup v2, Linux). It fixes three problems: the sandbox needs resource limits, a
 sandbox must not outlive its executor, and `flmbox` processes of different executors share a node.
+It is predefined, not configurable: the root is `/sys/fs/cgroup` and the groups are
+`/sys/fs/cgroup/flame/<executor-id>`.
 
-- `create_instance` creates a cgroup v2 directory `<cgroup_root>/flame/<executor-id>`, sets
-  `memory.max` (and `memory.swap.max = 0`) and `cpu.max` from the executor's resource requirement,
-  converting from the scheduler's CPU unit, and starts the service inside it. The requirement is the
-  executor's reservation, and it equals the requirement of every session the executor serves
-  (`is_available` in `scheduler/ctx.rs` matches them), so it is also the right limit for the sandbox.
-  The session context needs no resource field.
-- `flmbox` puts each sandbox in a child group of the executor's group (`linux.cgroupsPath` in the
-  OCI bundle), so the limits apply to the sandbox through the hierarchy and a sandbox can never use
-  more than the executor reserved.
+- `create_instance` creates the group, sets `memory.max` (and `memory.swap.max = 0`) and `cpu.max`
+  from the executor's resource requirement (CPU is whole cores, a quota of `cores * 100000` per
+  100000 microseconds; zero means no limit), and moves the service into it right after the spawn,
+  with any child it already forked. The requirement is the executor's reservation, and it equals the
+  requirement of every session the executor serves (`is_available` in `scheduler/ctx.rs` matches
+  them), so it is also the right limit for the sandbox. The session context needs no resource field.
+- The limits bind everything the service starts, including `runsc` and its sandboxes and any group
+  they create below, because cgroup limits are hierarchical. (Putting each sandbox in its own child
+  group through `linux.cgroupsPath` in the OCI bundle is a refinement for later.)
 - `destroy_instance` kills the group (`cgroup.kill`, Linux 5.14 or later; otherwise it kills every
-  pid in `cgroup.procs` until the group is empty), waits for it to be empty and removes it. This
-  also kills `runsc` sandboxes, which the existing process group does not reach because `runsc` starts
-  its sandbox in its own session. So a released executor, a SIGKILLed service or a failed-suspend
-  sandbox never leaves a live sandbox behind.
-- At start the executor manager kills and removes every group under `<cgroup_root>/flame/` that
-  does not belong to one of its live executors. Group names carry the executor id, so a service
-  never touches another executor's sandboxes.
-- It requires cgroup v2 and a delegated subtree: the executor manager needs write access to
-  `<cgroup_root>` (for example systemd `Delegate=yes`). Without that, the executor manager refuses to
-  start an executor of a suspendable application and the bind fails with a clear error.
+  pid in `cgroup.procs` of the group and the groups below it until it is empty), waits for it to be
+  empty and removes it. This also kills `runsc` sandboxes, which the existing process group does not
+  reach because `runsc` starts its sandbox in its own session. So a released executor, a SIGKILLed
+  service or a failed-suspend sandbox never leaves a live sandbox behind. A group that cannot be
+  removed makes `destroy_instance` fail and is kept for a retry.
+- When the executor manager starts it kills and removes every group under `/sys/fs/cgroup/flame/`
+  that does not belong to one of its live executors; at start it has none, so all of them are stale.
+  Group names carry the executor id, so one executor's cleanup never touches another's group.
+- It needs cgroup v2 with the `cpu` and `memory` controllers and a writable subtree (the executor
+  manager runs as root, or with a delegated `/sys/fs/cgroup`). Where that is missing (macOS, a
+  container with a read-only cgroup file system, cgroup v1) the executor still starts, without a
+  group, and the reason is logged as a warning. Nothing changes for those nodes.
 
 The base rootfs is unpacked once per node and shared read-only. Credentials for the snapshot store stay in the executor manager and never reach the
 service or the sandbox.

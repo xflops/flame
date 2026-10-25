@@ -17,6 +17,7 @@ use common::ctx::FlameClusterContext;
 use common::FlameError;
 
 mod appmgr;
+mod cgroup;
 mod client;
 mod devices;
 mod executor;
