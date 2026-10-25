@@ -140,7 +140,7 @@ jobs:
           # The services run as root on this VM (cgroup v2): check the executor cgroups.
           export FLAME_E2E_CGROUP=1
           cd testing/e2e
-          pytest -vv --durations=0 tests/test_app.py tests/test_flmexec.py tests/test_sandbox.py tests/test_cgroup.py
+          pytest -vv --durations=0 tests/test_app.py tests/test_flmexec.py tests/test_sandbox.py tests/test_agent.py tests/test_cgroup.py
 
       - name: Show service logs on failure
         if: failure() || cancelled()
@@ -228,8 +228,7 @@ jobs:
           cd testing/e2e
           pytest -vv --durations=0 \
             tests/test_app.py \
-            tests/test_flmexec.py \
-            tests/test_agent.py
+            tests/test_flmexec.py
 
       - name: Verify Flame-owned CRI workloads
         run: ci/cri/e2e.sh verify-workloads

@@ -4,15 +4,16 @@ from flamepy import agent
 
 
 def main():
-    with agent.open_session(language="python") as session:
-        output = session.run_code("print(sum(range(1, 101)))")
-        print(f"Python> {output.text().strip()}")
+    with agent.open_session(image="python:3.12-slim") as session:
+        output = session.run_code("print(sum(range(1, 101)))", language="python")
+        print(f"Python> {output.stdout_text().strip()}")
 
-    with agent.open_session(language="shell", runtime="bash") as session:
+    with agent.open_session() as session:
         output = session.run_code(
-            'total=0; for ((i=1; i<=100; i++)); do ((total+=i)); done; echo "$total"'
+            'total=0; i=1; while [ "$i" -le 100 ]; do '
+            "total=$((total + i)); i=$((i + 1)); done; echo $total"
         )
-        print(f"Shell> {output.text().strip()}")
+        print(f"Shell> {output.stdout_text().strip()}")
 
 
 if __name__ == "__main__":

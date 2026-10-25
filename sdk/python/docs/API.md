@@ -252,28 +252,28 @@ Key classes and helpers:
 
 ## Agent Session API
 
-The agent `Session` lives under `flamepy.agent`. It runs remote Python or shell scripts through the built-in `flmexec` application without exposing the core `Session` or task JSON.
+The agent `Session` lives under `flamepy.agent`. It runs remote Python or shell scripts in sandboxed containers through the built-in `flmbox` application, the same backend as `Sandbox`, without exposing the core `Session` or task JSON.
 
 ```python
 from flamepy.agent import open_session
 from flamepy import ResourceRequirement, FlameError
 
 with open_session() as ssn:
-    print(ssn.run_code("print(1 + 2)").text())
+    print(ssn.run_code("echo hello").stdout_text())
 ```
 
 Key classes and methods:
 
-- `open_session(*, ssn_id=None, language="python", runtime=None, min_instances=0, max_instances=None, resreq=None)`
-- `open_session()` creates a Python session using the server-default runtime
+- `open_session(*, ssn_id=None, image=None, min_instances=0, max_instances=None, resreq=None)`
+- `open_session()` creates a session in the `flmbox` service's default image; pass `image` to choose the sandbox container image. To run Python, the image must provide it (for example `python:3.12-slim`)
 - `open_session(ssn_id="...")` reopens a session by ID
-- `Session.run_code(code, input=None) -> SessionOutput` blocks for output
-- `Session.submit_code(code, input=None) -> Future[SessionOutput]` returns immediately
+- `Session.run_code(code, *, language="shell", cwd=None, envs=None, input=None, timeout=None) -> CommandResult` blocks for the result; `language` is `"shell"` (default) or `"python"`
+- `Session.submit_code(code, *, language="shell", cwd=None, envs=None, input=None, timeout=None) -> Future[CommandResult]` returns immediately
 - `Session.close()`
 - `ssn.id`, `ssn.attr`
-- `SessionOutput.data`, `SessionOutput.text()`
+- `CommandResult.exit_code`, `.stdout`, `.stderr`, `.ok`, `.stdout_text()`, `.stderr_text()`. A nonzero exit is a normal result, not an exception.
 
-Creation options are ignored when `ssn_id` is provided. `ssn.attr` is a read-only view of the effective creation settings; its type is intentionally not exported. `language` and `runtime` are create-time only. `close()` destroys the session. Reopen works only while the session is still open. `ResourceRequirement` and `FlameError` are imported from `flamepy`.
+Creation options are ignored when `ssn_id` is provided. `ssn.attr` is a read-only view of the effective creation settings; its type is intentionally not exported. `image` is create-time only. `close()` destroys the session. Reopen works only while the session is still open. `ResourceRequirement` and `FlameError` are imported from `flamepy`.
 
 ## Sandbox API
 

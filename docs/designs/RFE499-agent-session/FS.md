@@ -1,5 +1,34 @@
 # RFE499: Add Session API to flamepy
 
+> **Update: Agent Session runs on `flmbox`.** `flamepy.agent.Session` now uses the
+> `flmbox` application, so each script runs in a sandboxed container, the same
+> backend as `flamepy.agent.Sandbox`. This supersedes the `flmexec` backend described
+> below wherever the two differ:
+>
+> - **Application:** `flmbox`. A Session creates it with `min_instances=0` and
+>   `max_instances` unset by default, so it scales like any other Flame session and
+>   is not pinned to one instance the way a `Sandbox` is.
+> - **`image` replaces `runtime`:** `flmbox` has no interpreter selector; the
+>   interpreter comes from the sandbox image. `open_session(image=...,
+>   min_instances=..., max_instances=..., resreq=...)`: `image` is the sandbox
+>   container image (the `flmbox` service default when omitted) and is stored with
+>   the session settings; `runtime` is removed.
+> - **`language` is per call:** `run_code` and `submit_code` take
+>   `language` (`"shell"` by default, or `"python"`), like `Sandbox`, and also `cwd`,
+>   `envs`, `input` and `timeout`. `open_session` no longer takes `language`.
+> - **Output:** `run_code` and `submit_code` return `flamepy.agent.CommandResult`,
+>   the `flmbox` result struct (`exit_code`, `stdout`, `stderr`, plus `ok`,
+>   `stdout_text()` and `stderr_text()`). `SessionOutput` is removed. A nonzero exit
+>   is a normal result, not an exception, exactly as in `Sandbox.run`.
+> - **Request:** the `flmbox` `CommandRequest` (`code`, `language`, `cwd`, `envs`,
+>   `input`, `timeout`), built from the `run_code` arguments.
+> - **`common_data`:** `Session` still stores its settings there for reopening.
+>   `flmbox` ignores unknown fields and reads the sandbox image from the `image` key.
+> - **Isolation:** scripts run in a container, so the trust-model remark below that
+>   Session "does not add isolation" no longer holds. The prerequisites are those of
+>   `flmbox` (a registered `flmbox` application and `runsc` on the executor).
+
+
 GitHub issue: https://github.com/xflops/flame/issues/499
 
 ## 1. Motivation

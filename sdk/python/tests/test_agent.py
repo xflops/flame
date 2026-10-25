@@ -10,21 +10,22 @@ from unittest.mock import patch
 import pytest
 
 from flamepy import FlameError, FlameErrorCode, ResourceRequirement
-from flamepy.agent import Session, SessionOutput, open_session
-from flamepy.agent.session import _decode_output, _encode_options, _encode_script, _SessionOptions
+from flamepy.agent import CommandResult, Session, open_session
+from flamepy.agent.sandbox import _decode_result, _encode_request
+from flamepy.agent.session import _encode_options, _SessionOptions
 from flamepy.core import TaskFuture
 from flamepy.core import client as core_client
 from flamepy.core.types import SessionAttributes
 
 
 class FakeSession:
-    def __init__(self, session_id="ssn-1", application="flmexec", common_data=None):
+    def __init__(self, session_id="ssn-1", application="flmbox", common_data=None):
         self.id = session_id
         self.application = application
         self._common_data = common_data
         self.closed = False
         self.invoked = []
-        self.invoke_result = json.dumps({"data": list(b"ok\n")}).encode("utf-8")
+        self.invoke_result = json.dumps({"exit_code": 0, "stdout": list(b"ok\n"), "stderr": []}).encode("utf-8")
 
     def common_data(self):
         return self._common_data
@@ -54,7 +55,6 @@ def test_agent_public_exports():
         "CommandResult",
         "Sandbox",
         "Session",
-        "SessionOutput",
         "open_session",
     ]
     assert agent.Session is Session
@@ -66,15 +66,16 @@ def test_agent_public_exports():
     assert not hasattr(agent, "FlameError")
     assert not hasattr(agent, "Script")
     assert not hasattr(agent, "flmexec")
+    assert not hasattr(agent, "SessionOutput")
 
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module("flamepy.tools")
 
 
 def test_private_session_options_are_frozen():
-    options = _SessionOptions(language="python")
+    options = _SessionOptions(image="a")
     with pytest.raises(FrozenInstanceError):
-        options.language = "shell"
+        options.image = "b"
 
 
 def test_open_without_id_creates_normalized_session():
@@ -89,23 +90,66 @@ def test_open_without_id_creates_normalized_session():
         return FakeSession(common_data=common_data)
 
     with patch("flamepy.agent.session._create_core_session", fake_create_session):
-        agent_session = open_session(language="Python", min_instances=1)
+        agent_session = open_session(min_instances=1)
 
-    assert created["application"] == "flmexec"
+    assert created["application"] == "flmbox"
+    assert created["max_instances"] is None
     assert created["min_instances"] == 1
-    assert agent_session.attr.language == "python"
+    assert agent_session.attr.image is None
     assert agent_session.id == "ssn-1"
     stored = json.loads(created["common_data"].decode("utf-8"))
-    assert stored["language"] == "python"
-    assert stored["runtime"] is None
+    assert "language" not in stored
+    assert "runtime" not in stored
     assert stored["min_instances"] == 1
     assert stored["resreq"] is None
 
 
-def test_open_rejects_unsupported_language():
+def test_open_stores_image_for_flmbox_and_restores_it():
+    created = {}
+
+    def fake_create_session(application, common_data=None, **kwargs):
+        created["common_data"] = common_data
+        return FakeSession(common_data=common_data)
+
+    with patch("flamepy.agent.session._create_core_session", fake_create_session):
+        agent_session = open_session(image="python:3.12-slim")
+
+    assert agent_session.attr.image == "python:3.12-slim"
+    # flmbox reads the sandbox image from the session common_data "image" key.
+    assert json.loads(created["common_data"].decode("utf-8"))["image"] == "python:3.12-slim"
+
+    reopened = FakeSession(common_data=created["common_data"])
+    with patch("flamepy.agent.session._open_core_session", return_value=reopened):
+        assert open_session(ssn_id="ssn-1").attr.image == "python:3.12-slim"
+
+
+def test_open_without_image_uses_the_service_default():
+    created = {}
+
+    def fake_create_session(application, common_data=None, **kwargs):
+        created["common_data"] = common_data
+        return FakeSession(common_data=common_data)
+
+    with patch("flamepy.agent.session._create_core_session", fake_create_session):
+        assert open_session().attr.image is None
+    assert json.loads(created["common_data"].decode("utf-8"))["image"] is None
+
+
+@pytest.mark.parametrize("image", ["", "  ", 5])
+def test_open_rejects_invalid_image(image):
     with pytest.raises(FlameError) as exc:
-        open_session(language="javascript")
+        open_session(image=image)
     assert exc.value.code == FlameErrorCode.INVALID_ARGUMENT
+
+
+def test_run_code_rejects_unsupported_language():
+    with patch("flamepy.agent.session._create_core_session", create_from_options):
+        agent_session = open_session()
+        for call in (agent_session.run_code, agent_session.submit_code):
+            with pytest.raises(FlameError) as exc:
+                call("1", language="javascript")
+            assert exc.value.code == FlameErrorCode.INVALID_ARGUMENT
+    assert agent_session._session.invoked == []
 
 
 def test_open_copies_resreq():
@@ -117,7 +161,7 @@ def test_open_copies_resreq():
         return FakeSession(common_data=common_data)
 
     with patch("flamepy.agent.session._create_core_session", fake_create_session):
-        agent_session = open_session(language="python", resreq=resreq)
+        agent_session = open_session(resreq=resreq)
 
     resreq.cpu = 99
     assert agent_session.attr.resreq.cpu == 2
@@ -125,31 +169,57 @@ def test_open_copies_resreq():
     assert created["resreq"] is not resreq
 
 
-def test_run_code_encodes_session_language_and_runtime():
+def test_run_code_encodes_flmbox_request():
     with patch("flamepy.agent.session._create_core_session", create_from_options):
-        agent_session = open_session(language="shell", runtime="bash")
-        output = agent_session.run_code("echo hello", input=b"in")
+        agent_session = open_session()
+        result = agent_session.run_code("echo hello", input=b"in")
 
-    assert output.text() == "ok\n"
+    assert result == CommandResult(exit_code=0, stdout=b"ok\n", stderr=b"")
     kind, payload = agent_session._session.invoked[0]
     assert kind == "run"
     request = json.loads(payload.decode("utf-8"))
-    assert request == {"language": "shell", "runtime": "bash", "code": "echo hello", "input": [105, 110]}
+    assert request == {"code": "echo hello", "language": "shell", "cwd": None, "envs": None, "input": [105, 110], "timeout": None}
 
 
-def test_run_code_omits_runtime_when_unset():
+def test_run_and_submit_code_pass_per_call_options_to_flmbox():
+    with patch("flamepy.agent.session._create_core_session", create_from_options):
+        agent_session = open_session()
+        agent_session.run_code("echo hi", cwd="/tmp", envs={"A": "1"}, timeout=5)
+        agent_session.submit_code("print(1)", language="python", cwd="/work", timeout=2.5).result()
+
+    run_request = json.loads(agent_session._session.invoked[0][1].decode("utf-8"))
+    assert run_request == {"code": "echo hi", "language": "shell", "cwd": "/tmp", "envs": {"A": "1"}, "input": None, "timeout": 5}
+    submit_request = json.loads(agent_session._session.invoked[1][1].decode("utf-8"))
+    assert submit_request["language"] == "python"
+    assert submit_request["cwd"] == "/work"
+    assert submit_request["timeout"] == 2.5
+
+
+def test_run_code_without_input():
     with patch("flamepy.agent.session._create_core_session", create_from_options):
         agent_session = open_session()
         agent_session.run_code("print(1)")
 
     request = json.loads(agent_session._session.invoked[0][1].decode("utf-8"))
-    assert "runtime" not in request
+    assert request["language"] == "shell"
     assert request["input"] is None
+
+
+def test_run_code_returns_a_failing_script_as_a_result():
+    core_session = FakeSession()
+    core_session.invoke_result = json.dumps({"exit_code": 3, "stdout": list(b"partial"), "stderr": list(b"boom")}).encode("utf-8")
+    with patch("flamepy.agent.session._create_core_session", return_value=core_session):
+        result = open_session().run_code("raise SystemExit(3)")
+
+    assert result.exit_code == 3
+    assert not result.ok
+    assert result.stdout_text() == "partial"
+    assert result.stderr_text() == "boom"
 
 
 def test_run_code_rejects_non_bytes_input():
     with patch("flamepy.agent.session._create_core_session", create_from_options):
-        agent_session = open_session(language="python")
+        agent_session = open_session()
         with pytest.raises(FlameError) as exc:
             agent_session.run_code("print(1)", input="not-bytes")
     assert exc.value.code == FlameErrorCode.INVALID_ARGUMENT
@@ -157,19 +227,19 @@ def test_run_code_rejects_non_bytes_input():
 
 def test_submit_code_decodes_future():
     with patch("flamepy.agent.session._create_core_session", create_from_options):
-        agent_session = open_session(language="python")
+        agent_session = open_session()
         future = agent_session.submit_code("print(1)")
 
     result = future.result()
-    assert isinstance(result, SessionOutput)
-    assert result.text() == "ok\n"
+    assert isinstance(result, CommandResult)
+    assert result.stdout_text() == "ok\n"
     assert agent_session._session.invoked[0][0] == "submit"
 
 
 def test_submit_code_completion_is_not_blocked_by_user_callbacks(frontend_server):
     endpoint, _, _ = frontend_server
     connection = core_client.connect(endpoint)
-    core_session = connection.create_session(SessionAttributes(application="flmexec"))
+    core_session = connection.create_session(SessionAttributes(application="flmbox"))
     release_callbacks = threading.Event()
     all_callbacks_started = threading.Event()
     started = 0
@@ -196,40 +266,38 @@ def test_submit_code_completion_is_not_blocked_by_user_callbacks(frontend_server
         assert all_callbacks_started.wait(timeout=2)
 
         core_session = PendingSession()
-        agent_session = Session(core_session, _SessionOptions(language="python"))
+        agent_session = Session(core_session, _SessionOptions())
         mapped = agent_session.submit_code("print(1)")
         core_session.raw_future.set_result(core_session.invoke_result)
-        assert mapped.result(timeout=2).text() == "ok\n"
+        assert mapped.result(timeout=2).stdout_text() == "ok\n"
     finally:
         release_callbacks.set()
         connection.close()
 
 
 def test_open_restores_options():
-    options = _SessionOptions(language="python", runtime="3.12", min_instances=1)
+    options = _SessionOptions(min_instances=1)
     session = FakeSession(session_id="ssn-open", common_data=_encode_options(options))
 
     with patch("flamepy.agent.session._open_core_session", return_value=session):
         agent_session = open_session(ssn_id="ssn-open")
 
     assert agent_session.id == "ssn-open"
-    assert agent_session.attr.language == "python"
-    assert agent_session.attr.runtime == "3.12"
     assert agent_session.attr.min_instances == 1
 
 
 def test_open_by_id_ignores_creation_options():
-    options = _SessionOptions(language="shell", runtime="bash")
+    options = _SessionOptions(image="img")
     core_session = FakeSession(common_data=_encode_options(options))
 
     with patch("flamepy.agent.session._open_core_session", return_value=core_session) as core_open:
-        agent_session = open_session(ssn_id="ssn-1", language="unsupported", runtime="ignored")
+        agent_session = open_session(ssn_id="ssn-1", image="ignored")
 
     core_open.assert_called_once_with("ssn-1")
     assert agent_session.attr == options
 
 
-def test_open_rejects_non_flmexec_session():
+def test_open_rejects_non_flmbox_session():
     session = FakeSession(application="flmping")
 
     with patch("flamepy.agent.session._open_core_session", return_value=session):
@@ -257,7 +325,7 @@ def test_close_destroys_session_and_is_idempotent():
     core_session = FakeSession()
 
     with patch("flamepy.agent.session._create_core_session", return_value=core_session):
-        agent_session = open_session(language="python")
+        agent_session = open_session()
         agent_session.close()
         agent_session.close()
 
@@ -271,7 +339,7 @@ def test_context_manager_closes_session():
     core_session = FakeSession()
 
     with patch("flamepy.agent.session._create_core_session", return_value=core_session):
-        with open_session(language="python") as agent_session:
+        with open_session() as agent_session:
             assert agent_session.id == "ssn-1"
         with pytest.raises(FlameError) as exc:
             agent_session.run_code("print(1)")
@@ -279,16 +347,15 @@ def test_context_manager_closes_session():
     assert exc.value.code == FlameErrorCode.INVALID_STATE
 
 
-def test_session_output_empty_and_invalid():
-    assert _decode_output(None).data == b""
+def test_decode_result_rejects_invalid_output():
     with pytest.raises(FlameError) as exc:
-        _decode_output(b"not-json")
+        _decode_result(b"not-json")
     assert exc.value.code == FlameErrorCode.INTERNAL
 
 
-def test_encode_script_matches_flmexec_contract():
-    payload = json.loads(_encode_script("python", None, "print(1)", None).decode("utf-8"))
-    assert payload == {"language": "python", "code": "print(1)", "input": None}
+def test_encode_request_matches_flmbox_contract():
+    payload = json.loads(_encode_request("print(1)", "python", None, None, None, None).decode("utf-8"))
+    assert payload == {"code": "print(1)", "language": "python", "cwd": None, "envs": None, "input": None, "timeout": None}
 
-    payload = json.loads(_encode_script("shell", "zsh", "echo ok", b"ab").decode("utf-8"))
-    assert payload == {"language": "shell", "runtime": "zsh", "code": "echo ok", "input": [97, 98]}
+    payload = json.loads(_encode_request("echo ok", "shell", None, None, b"ab", None).decode("utf-8"))
+    assert payload["input"] == [97, 98]
