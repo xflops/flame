@@ -36,6 +36,39 @@ mod minmax;
 mod priority;
 mod shim;
 
+/// Executors a session needs together before it can run: its `batch_size` while it is a gang
+/// (more than one) with pending tasks, otherwise 0 (nothing waits on a gang). `min_instances` is
+/// not a gang: it only keeps instances alive.
+fn batch_size(ssn: &SessionInfo) -> u32 {
+    let pending = ssn
+        .tasks_status
+        .get(&TaskState::Pending)
+        .copied()
+        .unwrap_or(0);
+    if pending > 0 && ssn.batch_size > 1 {
+        ssn.batch_size
+    } else {
+        0
+    }
+}
+
+/// Bounded executor demand shared by scheduling plugins: task demand, gang size,
+/// minimum warmup and maximum instances. Only an open session demands executors.
+pub(super) fn compute_demand(ssn: &SessionInfo) -> u32 {
+    if !ssn.is_open() {
+        return 0;
+    }
+    let task_count = [TaskState::Pending, TaskState::Running]
+        .iter()
+        .filter_map(|state| ssn.tasks_status.get(state))
+        .fold(0u32, |count, tasks| {
+            count.saturating_add((*tasks).max(0) as u32)
+        });
+    let demand = task_count.max(ssn.min_instances).max(batch_size(ssn));
+    ssn.max_instances
+        .map_or(demand, |maximum| demand.min(maximum))
+}
+
 #[derive(Clone, Debug)]
 pub struct PluginsOptions {
     pub policies: Vec<String>,

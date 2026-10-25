@@ -4,12 +4,13 @@ env:
   CLICOLOR_FORCE: 1
 jobs:
   ci:
-    name: Python System Test
+    name: Python System Test (${{ matrix.policy }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
+        policy: [priority, drf]
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -26,7 +27,7 @@ jobs:
 
       - name: Start Flame
         run: |
-          cp ci/docker/flame-cluster-e2e.yaml ci/docker/flame-cluster.yaml
+          cp ci/docker/flame-cluster-${{ matrix.policy }}.yaml ci/docker/flame-cluster.yaml
           docker compose up --build --force-recreate -d
 
       - name: Wait for services to be ready

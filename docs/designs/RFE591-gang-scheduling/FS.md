@@ -27,7 +27,7 @@ When the cluster can supply only part of the minimum, the session keeps what it 
 1. While a session has pending tasks, it is bound to executors only when it holds `batch_size`
    after the bind, decided in one scheduling step; if the Idle executors cannot cover the gang,
    nothing is bound.
-2. The same flow serves every session, as in kube-batch: a `batch_size` of 1 (the default) needs
+2. The same flow serves every session: a `batch_size` of 1 (the default) needs
    no gang, so those sessions behave as before.
 3. The change is confined to `DispatchAction`, the plugin hook that asks "is the minimum
    held" and a small `Statement` type. Allocate and Shuffle are unchanged.
@@ -68,8 +68,8 @@ no inverse, which is why only binds are staged.
 
 ## 4. Design
 
-Dispatch follows the kube-batch allocate loop: stage the decisions in a `Statement`, then
-commit if the session satisfies its gang, otherwise discard.
+Dispatch stages the decisions in a `Statement`, then
+commits them if the session satisfies its gang and discards them otherwise.
 
 ### 4.1 `Statement`
 
@@ -90,7 +90,7 @@ error. The next cycle sees the remaining shortfall and completes the gang.
 
 ### 4.2 `is_satisfied`
 
-A new plugin hook, the equivalent of kube-batch `JobReady`:
+A new plugin hook:
 
 ```
 fn is_satisfied(&self, ssn) -> Option<bool>       // Plugin

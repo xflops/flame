@@ -15,15 +15,14 @@ limitations under the License.
 
 use std::collections::HashMap;
 
-use common::apis::{ExecutorState, ResourceRequirement, SessionState, TaskState};
+use common::apis::{ExecutorState, ResourceRequirement, SessionState};
 use common::ctx::FlameLimits;
 use common::FlameError;
 
 use crate::model::{
-    ExecutorInfoPtr, NodeInfoPtr, SessionInfo, SessionInfoPtr, SnapShot, ALL_APPLICATION,
-    ALL_EXECUTOR,
+    ExecutorInfoPtr, NodeInfoPtr, SessionInfoPtr, SnapShot, ALL_APPLICATION, ALL_EXECUTOR,
 };
-use crate::scheduler::plugins::{Plugin, PluginPtr, PluginsOptions};
+use crate::scheduler::plugins::{batch_size, compute_demand, Plugin, PluginPtr, PluginsOptions};
 
 #[derive(Default)]
 pub struct MinMaxPlugin {
@@ -107,7 +106,7 @@ impl Plugin for MinMaxPlugin {
             return Some(true);
         }
         // Below the retained minimum, or while a gang is still short of its size.
-        if instances < ssn.min_instances.max(gang_size(ssn)) as usize {
+        if instances < ssn.min_instances.max(batch_size(ssn)) as usize {
             return Some(false);
         }
         // Count existing and pipelined reservations before another allocation.
@@ -117,7 +116,7 @@ impl Plugin for MinMaxPlugin {
 
     fn is_satisfied(&self, ssn: &SessionInfoPtr) -> Option<bool> {
         // The gang cannot exceed what the session limit allows.
-        let gang = gang_size(ssn);
+        let gang = batch_size(ssn);
         let minimum = executor_limit(Some(gang), self.limits.session.max_executors)
             .map_or(gang, |limit| limit.min(gang));
         let instances = self.session_executors.get(&ssn.id).copied().unwrap_or(0);
@@ -235,39 +234,6 @@ impl MinMaxPlugin {
             .entry(executor.application.clone())
             .or_default() += 1;
     }
-}
-
-/// Executors a session needs together before it can run: its `batch_size` while it is a gang
-/// (more than one) with pending tasks, otherwise 0 (nothing waits on a gang). `min_instances` is
-/// not a gang: it only keeps instances alive.
-fn gang_size(ssn: &SessionInfo) -> u32 {
-    let pending = ssn
-        .tasks_status
-        .get(&TaskState::Pending)
-        .copied()
-        .unwrap_or(0);
-    if pending > 0 && ssn.batch_size > 1 {
-        ssn.batch_size
-    } else {
-        0
-    }
-}
-
-/// Bounded executor demand: task demand, gang size, minimum warmup and maximum instances.
-/// Only an open session demands executors.
-fn compute_demand(ssn: &SessionInfo) -> u32 {
-    if !ssn.is_open() {
-        return 0;
-    }
-    let task_count = [TaskState::Pending, TaskState::Running]
-        .iter()
-        .filter_map(|state| ssn.tasks_status.get(state))
-        .fold(0u32, |count, tasks| {
-            count.saturating_add((*tasks).max(0) as u32)
-        });
-    let demand = task_count.max(ssn.min_instances).max(gang_size(ssn));
-    ssn.max_instances
-        .map_or(demand, |maximum| demand.min(maximum))
 }
 
 fn executor_limit(entity: Option<u32>, cluster: Option<u32>) -> Option<u32> {

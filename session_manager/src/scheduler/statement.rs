@@ -18,8 +18,7 @@ use crate::scheduler::Context;
 use common::apis::ExecutorState;
 use common::FlameError;
 
-/// A batch of Dispatch decisions that takes effect all at once, like the
-/// kube-batch `Statement`.
+/// A batch of Dispatch decisions that takes effect all at once.
 ///
 /// `bind` stages a decision: the plugins and the cycle's snapshot see it at
 /// once, so later decisions in the same cycle account for it, but the

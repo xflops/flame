@@ -35,6 +35,7 @@ INSTALL_PREFIX ?= /tmp/flame-dev
 FLAME_ENDPOINT ?= http://127.0.0.1:8080
 FLAME_ROOT := $(CURDIR)
 E2E_SYSTEM_PROFILE ?= all
+FLAME_E2E_POLICY ?= priority
 E2E_SYSTEM_PYTEST_ARGS ?=
 
 # Default target
@@ -132,7 +133,7 @@ e2e-py: ## Run Python E2E tests (use e2e-py-docker for docker compose or e2e-py-
 	@echo "Use 'make e2e-py-docker' for docker compose tests or 'make e2e-py-local' for local cluster tests"
 
 e2e-py-docker: ## Run Python E2E tests with docker compose
-	$(CONTAINER_CLI) compose exec -w /opt/e2e flame-console bash -c "source /usr/local/flame/sbin/flmenv.sh && PYTHONPATH=/opt/e2e/src:\$$PYTHONPATH python3 -m pytest -vv --durations=0 ."
+	$(CONTAINER_CLI) compose exec -e FLAME_E2E_POLICY=$(FLAME_E2E_POLICY) -w /opt/e2e flame-console bash -c "source /usr/local/flame/sbin/flmenv.sh && PYTHONPATH=/opt/e2e/src:\$$PYTHONPATH python3 -m pytest -vv --durations=0 ."
 
 e2e-py-local: ## Run Python E2E tests against local cluster (requires flamepy installed via pip)
 	cd testing/e2e && PYTHONPATH="$(CURDIR)/testing/e2e/src:$$PYTHONPATH" FLAME_ENDPOINT=$(FLAME_ENDPOINT) pytest -vv --durations=0 .

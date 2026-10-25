@@ -7,6 +7,32 @@
 
 ---
 
+## DRF plugin update
+
+The `drf` plugin orders sessions by dominant share (the largest of allocated CPU,
+memory and GPU over cluster capacity) and re-balances sessions toward a
+desired share. The earlier "1 / session count" ceiling is removed.
+
+- **Ordering:** sessions with the smaller dominant share are served first.
+- **Desired share:** each session's demand (pending plus running tasks,
+  `min_instances`, gang size, capped by `max_instances`, from the shared MinMax
+  calculation) expressed as a dominant share, capped by a max-min fair split of
+  the cluster among the sessions that want capacity. Desired shares are
+  calculated once per scheduling cycle; allocated shares are refreshed whenever
+  an earlier action allocates, binds, interrupts or unbinds an executor.
+- **Re-balance (`is_overused`):** a session is overused when it would still hold
+  its desired share after releasing one executor, so it never drops below its
+  desired share or its `min_instances`. The rule looks only at the session's own
+  desired and allocated shares. Sessions whose executors request no resources
+  DRF can divide are left to MinMax. Interrupted executors are excluded from the
+  allocated share, so they are not released twice.
+- **No opinion on `is_underused` / `is_ready`:** MinMax owns demand and instance
+  bounds, so a session may take free capacity beyond its desired share and is
+  trimmed back only by re-balancing.
+- **Physical safety:** node reservations still count every non-released
+  executor, including idle, starting and departing ones, and gate
+  `is_allocatable`. Pipelining does not change the allocated share.
+
 ## 1. Motivation
 
 ### Background

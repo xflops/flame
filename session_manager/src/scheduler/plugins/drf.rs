@@ -18,18 +18,27 @@ use crate::model::{
     ExecutorInfoPtr, NodeInfoPtr, SessionInfo, SessionInfoPtr, SnapShot, ALL_EXECUTOR, ALL_NODE,
     OPEN_SESSION,
 };
-use crate::scheduler::plugins::{Plugin, PluginPtr};
-use common::apis::{ResourceRequirement, SessionID, TaskState};
+use crate::scheduler::plugins::{compute_demand, Plugin, PluginPtr};
+use common::apis::{ResourceRequirement, SessionID};
 use common::FlameError;
 
+/// Dominant Resource Fairness: sessions are ordered by their
+/// dominant share, and a session holding more than its desired share is
+/// re-balanced one executor at a time. Demand and instance bounds belong to MinMax.
 #[derive(Default, Clone)]
 struct DRFSessionInfo {
-    pub id: SessionID,
+    pub unit: ResourceRequirement,
+    pub demand: u32,
+    pub min_instances: u32,
     pub allocated: ResourceRequirement,
     pub pipelined: ResourceRequirement,
-    pub dominant_share: f64,
+    pub dominant: f64,
+    /// Dominant share this session is entitled to: its demand, capped by a
+    /// max-min fair split of the cluster among the sessions that want capacity.
+    pub desired: f64,
 }
 
+#[derive(Default)]
 pub struct DRFPlugin {
     total: ResourceRequirement,
     ssn_map: HashMap<SessionID, DRFSessionInfo>,
@@ -38,34 +47,70 @@ pub struct DRFPlugin {
 
 impl DRFPlugin {
     pub fn new_ptr() -> PluginPtr {
-        Box::new(DRFPlugin {
-            total: ResourceRequirement::default(),
-            ssn_map: HashMap::new(),
-            node_allocations: HashMap::new(),
-        })
+        Box::new(DRFPlugin::default())
     }
 
     fn calculate_dominant_share(&self, allocated: &ResourceRequirement) -> f64 {
         let mut dominant = 0.0_f64;
-
-        if self.total.cpu > 0 {
-            let share = allocated.cpu as f64 / self.total.cpu as f64;
-            dominant = dominant.max(share);
+        for (used, total) in [
+            (allocated.cpu as f64, self.total.cpu as f64),
+            (allocated.memory as f64, self.total.memory as f64),
+            (allocated.gpu.max(0) as f64, self.total.gpu.max(0) as f64),
+        ] {
+            if total > 0.0 {
+                dominant = dominant.max(used / total);
+            } else if used > 0.0 {
+                dominant = f64::MAX;
+            }
         }
-
-        if self.total.memory > 0 {
-            let share = allocated.memory as f64 / self.total.memory as f64;
-            dominant = dominant.max(share);
-        }
-
-        if self.total.gpu > 0 {
-            let share = allocated.gpu as f64 / self.total.gpu as f64;
-            dominant = dominant.max(share);
-        } else if allocated.gpu > 0 {
-            dominant = f64::MAX;
-        }
-
         dominant
+    }
+
+    fn update_share(&mut self, session_id: &SessionID) {
+        let Some(allocated) = self.ssn_map.get(session_id).map(|i| i.allocated.clone()) else {
+            return;
+        };
+        let share = self.calculate_dominant_share(&allocated);
+        if let Some(info) = self.ssn_map.get_mut(session_id) {
+            info.dominant = share;
+        }
+    }
+
+    /// Dominant share of the session's whole demand; zero when the session
+    /// requests no resource the cluster has, which DRF cannot divide.
+    fn desire(&self, info: &DRFSessionInfo) -> f64 {
+        let unit = self.calculate_dominant_share(&info.unit);
+        if unit > 0.0 && unit < f64::MAX {
+            unit * info.demand as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Max-min fair division of the cluster's dominant share, capped by each
+    /// session's demand. Demand is fixed for the cycle, so this runs at setup.
+    fn update_desired(&mut self) {
+        let mut wants = self
+            .ssn_map
+            .iter()
+            .map(|(id, info)| (id.clone(), self.desire(info)))
+            .collect::<Vec<_>>();
+        wants.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let mut remaining = 1.0;
+        let mut left = wants.iter().filter(|(_, want)| *want > 0.0).count();
+        for (id, want) in wants {
+            let desired = if want > 0.0 {
+                let desired = want.min(remaining / left as f64);
+                remaining -= desired;
+                left -= 1;
+                desired
+            } else {
+                0.0
+            };
+            if let Some(info) = self.ssn_map.get_mut(&id) {
+                info.desired = desired;
+            }
+        }
     }
 
     /// After the slots-cleanup refactor, every session's `resreq` is populated
@@ -75,6 +120,12 @@ impl DRFPlugin {
         ssn.resreq
             .clone()
             .expect("SessionInfo.resreq must be populated by resolve_session_resreq")
+    }
+
+    fn release(allocated: &mut ResourceRequirement, unit: &ResourceRequirement) {
+        allocated.cpu = allocated.cpu.saturating_sub(unit.cpu);
+        allocated.memory = allocated.memory.saturating_sub(unit.memory);
+        allocated.gpu = allocated.gpu.saturating_sub(unit.gpu);
     }
 }
 
@@ -97,14 +148,8 @@ impl Plugin for DRFPlugin {
                 .insert(node.name.clone(), ResourceRequirement::default());
         }
 
-        tracing::debug!(
-            "[DRF] Total cluster resources: cpu={}, memory={}, gpu={}",
-            self.total.cpu,
-            self.total.memory,
-            self.total.gpu
-        );
-
         let executors = ss.find_executors(ALL_EXECUTOR)?;
+        let mut allocated: HashMap<SessionID, ResourceRequirement> = HashMap::new();
         for exec in executors.values() {
             // Creation reserves node capacity, including executors still starting
             // or departing. Pipelining existing capacity must not reserve it again.
@@ -117,102 +162,58 @@ impl Plugin for DRFPlugin {
             let Some(ssn_id) = &exec.ssn_id else {
                 continue;
             };
-            if !exec.is_binding(ssn_id) || exec.is_interrupted() {
-                continue;
+            if exec.is_binding(ssn_id) && !exec.is_interrupted() {
+                allocated
+                    .entry(ssn_id.clone())
+                    .or_default()
+                    .add(&exec.resreq);
             }
-            let entry = self
-                .ssn_map
-                .entry(ssn_id.clone())
-                .or_insert_with(|| DRFSessionInfo {
-                    id: ssn_id.clone(),
-                    ..Default::default()
-                });
-            entry.allocated.cpu += exec.resreq.cpu;
-            entry.allocated.memory += exec.resreq.memory;
-            entry.allocated.gpu += exec.resreq.gpu;
         }
 
-        let sessions = ss.find_sessions(OPEN_SESSION)?;
-        self.ssn_map.retain(|id, _| sessions.contains_key(id));
-        for ssn in sessions.values() {
-            let ssn_id = ssn.id.clone();
-            let _ = self
-                .ssn_map
-                .entry(ssn_id.clone())
-                .or_insert_with(|| DRFSessionInfo {
-                    id: ssn.id.clone(),
+        for ssn in ss.find_sessions(OPEN_SESSION)?.values() {
+            self.ssn_map.insert(
+                ssn.id.clone(),
+                DRFSessionInfo {
+                    unit: self.get_session_resreq(ssn),
+                    demand: compute_demand(ssn),
+                    min_instances: ssn.min_instances,
+                    allocated: allocated.remove(&ssn.id).unwrap_or_default(),
                     ..Default::default()
-                });
-            let allocated_clone = self
-                .ssn_map
-                .get(&ssn_id)
-                .map(|e| e.allocated.clone())
-                .unwrap_or_default();
-            let dominant_share = self.calculate_dominant_share(&allocated_clone);
-            if let Some(entry) = self.ssn_map.get_mut(&ssn_id) {
-                entry.dominant_share = dominant_share;
-            }
-
-            tracing::debug!(
-                "[DRF] Session <{}>: allocated=({},{},{}), dominant_share={:.4}",
-                ssn.id,
-                allocated_clone.cpu,
-                allocated_clone.memory,
-                allocated_clone.gpu,
-                dominant_share
+                },
             );
+            self.update_share(&ssn.id);
         }
+        self.update_desired();
 
         Ok(())
     }
 
     fn ssn_order_fn(&self, s1: &SessionInfo, s2: &SessionInfo) -> Option<Ordering> {
-        let ds1 = self
-            .ssn_map
-            .get(&s1.id)
-            .map(|s| s.dominant_share)
-            .unwrap_or(0.0);
-        let ds2 = self
-            .ssn_map
-            .get(&s2.id)
-            .map(|s| s.dominant_share)
-            .unwrap_or(0.0);
-
-        ds1.partial_cmp(&ds2)
+        let share = |ssn: &SessionInfo| self.ssn_map.get(&ssn.id).map_or(0.0, |i| i.dominant);
+        // The scheduler's session queue is a max-heap on this order, so the
+        // session with the smaller share must compare greater to be served first.
+        share(s2).partial_cmp(&share(s1))
     }
 
-    fn is_underused(&self, ssn: &SessionInfoPtr) -> Option<bool> {
-        let pending = ssn
-            .tasks_status
-            .get(&TaskState::Pending)
-            .copied()
-            .unwrap_or(0);
-
-        if pending == 0 {
-            return Some(false);
-        }
-
-        let ssn_info = self.ssn_map.get(&ssn.id)?;
-        let num_sessions = self.ssn_map.len().max(1) as f64;
-        let fair_share = 1.0 / num_sessions;
-
-        Some(ssn_info.dominant_share < fair_share)
-    }
-
-    fn is_ready(&self, ssn: &SessionInfoPtr) -> Option<bool> {
-        let ssn_info = self.ssn_map.get(&ssn.id)?;
-        let mut supplied = ssn_info.allocated.clone();
-        supplied.add(&ssn_info.pipelined);
-        let num_sessions = self.ssn_map.len().max(1) as f64;
-        Some(self.calculate_dominant_share(&supplied) >= 1.0 / num_sessions)
-    }
-
+    /// A session is overused when it would still hold its desired share after
+    /// releasing one executor, so it never drops below what it is entitled to
+    /// or below its `min_instances`.
     fn is_overused(&self, ssn: &SessionInfoPtr) -> Option<bool> {
         let info = self.ssn_map.get(&ssn.id)?;
-        let minimum = self.get_session_resreq(ssn).mul(ssn.min_instances);
-        let minimum_share = self.calculate_dominant_share(&minimum);
-        let fair_share = 1.0 / self.ssn_map.len().max(1) as f64;
-        (info.dominant_share > fair_share.max(minimum_share)).then_some(true)
+        if info.demand > 0 && self.desire(info) == 0.0 {
+            // Requests nothing DRF can divide; MinMax's demand rule applies.
+            return None;
+        }
+        if info.dominant == 0.0 {
+            return None;
+        }
+        let mut remaining = info.allocated.clone();
+        Self::release(&mut remaining, &info.unit);
+        let kept = self.calculate_dominant_share(&remaining);
+        let floor = info
+            .desired
+            .max(self.calculate_dominant_share(&info.unit.mul(info.min_instances)));
+        (kept >= floor || (kept - floor).abs() <= 1e-9 * kept.max(floor)).then_some(true)
     }
 
     fn is_allocatable(&self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Option<bool> {
@@ -237,65 +238,36 @@ impl Plugin for DRFPlugin {
         if let Some(node_alloc) = self.node_allocations.get_mut(&exec.node) {
             node_alloc.add(&exec.resreq);
         }
-        if let Some(entry) = self.ssn_map.get(&ssn.id) {
-            let share = self.calculate_dominant_share(&entry.allocated);
-            if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
-                entry.dominant_share = share;
-            }
-        }
+        self.update_share(&ssn.id);
     }
 
     fn on_executor_pipeline(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
-        // Reserve a future share while waiting for existing capacity to be released.
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
             entry.pipelined.add(&exec.resreq);
         }
     }
 
     fn on_session_bind(&mut self, _exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
-        let ssn_resreq = self.get_session_resreq(&ssn);
-
+        let unit = self.get_session_resreq(&ssn);
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
-            entry.allocated.cpu += ssn_resreq.cpu;
-            entry.allocated.memory += ssn_resreq.memory;
-            entry.allocated.gpu += ssn_resreq.gpu;
+            entry.allocated.add(&unit);
         }
-        if let Some(entry) = self.ssn_map.get(&ssn.id) {
-            let ds = self.calculate_dominant_share(&entry.allocated);
-            if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
-                entry.dominant_share = ds;
-            }
-        }
+        self.update_share(&ssn.id);
     }
 
     fn on_executor_interrupt(&mut self, exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
-            entry.allocated.cpu = entry.allocated.cpu.saturating_sub(exec.resreq.cpu);
-            entry.allocated.memory = entry.allocated.memory.saturating_sub(exec.resreq.memory);
-            entry.allocated.gpu = entry.allocated.gpu.saturating_sub(exec.resreq.gpu);
+            Self::release(&mut entry.allocated, &exec.resreq);
         }
-        if let Some(entry) = self.ssn_map.get(&ssn.id) {
-            let share = self.calculate_dominant_share(&entry.allocated);
-            if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
-                entry.dominant_share = share;
-            }
-        }
+        self.update_share(&ssn.id);
     }
 
     fn on_session_unbind(&mut self, _exec: ExecutorInfoPtr, ssn: SessionInfoPtr) {
-        let ssn_resreq = self.get_session_resreq(&ssn);
-
+        let unit = self.get_session_resreq(&ssn);
         if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
-            entry.allocated.cpu = entry.allocated.cpu.saturating_sub(ssn_resreq.cpu);
-            entry.allocated.memory = entry.allocated.memory.saturating_sub(ssn_resreq.memory);
-            entry.allocated.gpu = entry.allocated.gpu.saturating_sub(ssn_resreq.gpu);
+            Self::release(&mut entry.allocated, &unit);
         }
-        if let Some(entry) = self.ssn_map.get(&ssn.id) {
-            let ds = self.calculate_dominant_share(&entry.allocated);
-            if let Some(entry) = self.ssn_map.get_mut(&ssn.id) {
-                entry.dominant_share = ds;
-            }
-        }
+        self.update_share(&ssn.id);
     }
 }
 
@@ -303,9 +275,8 @@ impl Plugin for DRFPlugin {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use common::apis::{ExecutorState, SessionState, Shim, TaskState};
     use std::sync::Arc;
-
-    use common::apis::{ExecutorState, SessionState, Shim};
 
     fn rr(cpu: u64) -> ResourceRequirement {
         ResourceRequirement {
@@ -350,76 +321,29 @@ mod tests {
         })
     }
 
-    #[test]
-    fn overuse_balances_each_dominant_resource_and_preserves_minimum() {
-        for resource in [
-            ResourceRequirement {
-                cpu: 1,
-                ..Default::default()
-            },
-            ResourceRequirement {
-                memory: 1,
-                ..Default::default()
-            },
-            ResourceRequirement {
-                gpu: 1,
-                ..Default::default()
-            },
-        ] {
-            let ssn = Arc::new(SessionInfo {
-                min_instances: 2,
-                tasks_status: [(TaskState::Pending, 10)].into_iter().collect(),
-                resreq: Some(resource.clone()),
-                ..session().as_ref().clone()
-            });
-            let mut total = resource.clone();
-            total.add(&resource);
-            total.add(&resource);
-            total.add(&resource);
-            let mut allocated = resource.clone();
-            allocated.add(&resource);
-            allocated.add(&resource);
-            let mut plugin = DRFPlugin {
-                total,
-                ssn_map: HashMap::from([
-                    (
-                        ssn.id.clone(),
-                        DRFSessionInfo {
-                            allocated,
-                            ..Default::default()
-                        },
-                    ),
-                    ("other".into(), DRFSessionInfo::default()),
-                ]),
-                node_allocations: HashMap::new(),
-            };
-            plugin.ssn_map.get_mut(&ssn.id).unwrap().dominant_share = 0.75;
-            assert_eq!(plugin.is_overused(&ssn), Some(true));
-            let interrupted = Arc::new(crate::model::ExecutorInfo {
-                resreq: resource.clone(),
-                ..void_executor("interrupted").as_ref().clone()
-            });
-            plugin.on_executor_interrupt(interrupted.clone(), ssn.clone());
-            assert_eq!(plugin.is_overused(&ssn), None);
-            plugin.on_session_bind(interrupted, ssn.clone());
-            assert_eq!(plugin.is_overused(&ssn), Some(true));
-            plugin.on_session_unbind(void_executor("one"), ssn.clone());
-            assert_eq!(plugin.is_overused(&ssn), None);
-            let minimum = Arc::new(SessionInfo {
-                min_instances: 3,
-                ..ssn.as_ref().clone()
-            });
-            plugin.on_session_bind(void_executor("one"), ssn.clone());
-            assert_eq!(plugin.is_overused(&minimum), None);
-            plugin.ssn_map.remove("other");
-            assert_eq!(plugin.is_overused(&ssn), None);
-        }
+    fn requested(id: &str, demand: i32, unit: ResourceRequirement) -> SessionInfoPtr {
+        Arc::new(SessionInfo {
+            id: id.into(),
+            tasks_status: [(TaskState::Pending, demand)].into_iter().collect(),
+            resreq: Some(unit),
+            ..session().as_ref().clone()
+        })
     }
 
-    #[test]
-    fn overuse_excludes_departures_and_closed_sessions_after_refresh() {
-        use crate::scheduler::plugins::{PluginManager, PluginsOptions};
+    fn idle_session(id: &str) -> SessionInfoPtr {
+        requested(id, 0, rr(1))
+    }
 
+    fn bound(id: &str, ssn: &SessionInfoPtr) -> ExecutorInfoPtr {
+        Arc::new(crate::model::ExecutorInfo {
+            state: ExecutorState::Bound,
+            ssn_id: Some(ssn.id.clone()),
+            ..void_executor(id).as_ref().clone()
+        })
+    }
+
+    /// A 4-slot node, the sessions, and `held` executors bound to each.
+    fn cluster(sessions: &[(SessionInfoPtr, usize)]) -> DRFPlugin {
         let snapshot = SnapShot::new();
         snapshot
             .add_node(Arc::new(crate::model::NodeInfo {
@@ -428,68 +352,191 @@ mod tests {
                 state: common::apis::NodeState::Ready,
             }))
             .unwrap();
-        let ssn = Arc::new(SessionInfo {
-            tasks_status: [(TaskState::Pending, 10)].into_iter().collect(),
-            ..session().as_ref().clone()
+        for (ssn, held) in sessions {
+            snapshot.add_session(ssn.clone()).unwrap();
+            for i in 0..*held {
+                snapshot
+                    .add_executor(bound(&format!("{}-{i}", ssn.id), ssn))
+                    .unwrap();
+            }
+        }
+        let mut plugin = DRFPlugin::default();
+        plugin.setup(&snapshot).unwrap();
+        plugin
+    }
+
+    #[test]
+    fn sessions_are_ordered_by_dominant_share() {
+        let (a, b) = (requested("a", 4, rr(1)), requested("b", 4, rr(1)));
+        let plugin = cluster(&[(a.clone(), 3), (b.clone(), 1)]);
+        assert_eq!(plugin.ssn_order_fn(&b, &a), Some(Ordering::Greater));
+        assert_eq!(plugin.ssn_order_fn(&a, &a), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn dominant_share_uses_the_largest_resource_ratio() {
+        let ssn = requested(
+            "a",
+            1,
+            ResourceRequirement {
+                cpu: 1,
+                memory: 3,
+                gpu: 0,
+            },
+        );
+        let mut plugin = cluster(&[(ssn.clone(), 0)]);
+        plugin.total = ResourceRequirement {
+            cpu: 4,
+            memory: 4,
+            gpu: 0,
+        };
+        assert_share(
+            plugin.calculate_dominant_share(&ssn.resreq.clone().unwrap()),
+            0.75,
+        );
+        let gpu = ResourceRequirement {
+            cpu: 0,
+            memory: 0,
+            gpu: 1,
+        };
+        assert_eq!(plugin.calculate_dominant_share(&gpu), f64::MAX);
+    }
+
+    fn assert_share(actual: f64, expected: f64) {
+        assert!((actual - expected).abs() <= 1e-8, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn surplus_is_rebalanced_to_a_session_that_wants_capacity() {
+        let (a, b) = (requested("a", 8, rr(1)), requested("b", 8, rr(1)));
+        let plugin = cluster(&[(a.clone(), 4), (b.clone(), 0)]);
+        assert_eq!(plugin.is_overused(&a), Some(true));
+        assert_eq!(plugin.is_overused(&b), None);
+    }
+
+    #[test]
+    fn rebalance_stops_at_an_equal_split() {
+        let (a, b) = (requested("a", 8, rr(1)), requested("b", 8, rr(1)));
+        assert_eq!(
+            cluster(&[(a.clone(), 3), (b.clone(), 1)]).is_overused(&a),
+            Some(true)
+        );
+        let plugin = cluster(&[(a.clone(), 2), (b.clone(), 2)]);
+        assert_eq!(plugin.is_overused(&a), None);
+        assert_eq!(plugin.is_overused(&b), None);
+    }
+
+    #[test]
+    fn nothing_is_rebalanced_without_a_contender() {
+        let (a, idle) = (requested("a", 8, rr(1)), idle_session("idle"));
+        assert_eq!(cluster(&[(a.clone(), 4), (idle, 0)]).is_overused(&a), None);
+        assert_eq!(cluster(&[(a.clone(), 4)]).is_overused(&a), None);
+    }
+
+    #[test]
+    fn a_session_at_its_demand_is_not_a_contender() {
+        let a = requested("a", 8, rr(1));
+        let capped = Arc::new(SessionInfo {
+            max_instances: Some(1),
+            ..requested("capped", 8, rr(1)).as_ref().clone()
         });
-        snapshot.add_session(ssn.clone()).unwrap();
+        assert_eq!(
+            cluster(&[(a.clone(), 3), (capped, 1)]).is_overused(&a),
+            None
+        );
+    }
+
+    #[test]
+    fn resource_free_sessions_do_not_rebalance() {
+        let a = requested("a", 8, rr(1));
+        let free = requested("free", 8, rr(0));
+        assert_eq!(cluster(&[(a.clone(), 4), (free, 0)]).is_overused(&a), None);
+    }
+
+    #[test]
+    fn minimum_instances_are_kept() {
+        let warm = Arc::new(SessionInfo {
+            min_instances: 3,
+            ..requested("warm", 0, rr(1)).as_ref().clone()
+        });
+        let busy = requested("busy", 8, rr(1));
+        assert_eq!(
+            cluster(&[(warm.clone(), 3), (busy.clone(), 1)]).is_overused(&warm),
+            None
+        );
+        assert_eq!(
+            cluster(&[(warm.clone(), 4), (busy, 0)]).is_overused(&warm),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn interrupted_executors_are_not_rebalanced_again() {
+        let (a, b) = (requested("a", 8, rr(1)), requested("b", 8, rr(1)));
+        let mut plugin = cluster(&[(a.clone(), 3), (b, 1)]);
+        assert_eq!(plugin.is_overused(&a), Some(true));
+        plugin.on_executor_interrupt(bound("a-0", &a), a.clone());
+        assert_eq!(plugin.is_overused(&a), None);
+    }
+
+    #[test]
+    fn dispatch_pops_the_session_with_the_smallest_share_first() {
+        use crate::scheduler::plugins::{PluginManager, PluginsOptions};
+        use stdng::collections::{BinaryHeap, Cmp};
+
+        struct ByPlugins(Arc<PluginManager>);
+        impl Cmp<SessionInfoPtr> for ByPlugins {
+            fn cmp(&self, a: &SessionInfoPtr, b: &SessionInfoPtr) -> Ordering {
+                self.0.ssn_order_fn(a, b)
+            }
+        }
+
+        let (full, empty) = (requested("full", 8, rr(1)), requested("empty", 8, rr(1)));
+        let snapshot = SnapShot::new();
         snapshot
-            .add_session(Arc::new(SessionInfo {
-                id: "other".into(),
-                ..ssn.as_ref().clone()
+            .add_node(Arc::new(crate::model::NodeInfo {
+                name: "node-1".into(),
+                allocatable: rr(4),
+                state: common::apis::NodeState::Ready,
             }))
             .unwrap();
-        snapshot
-            .add_session(Arc::new(SessionInfo {
-                id: "closed".into(),
-                state: SessionState::Closed,
-                ..ssn.as_ref().clone()
-            }))
-            .unwrap();
-        for (id, owner, state) in [
-            ("one", ssn.id.as_str(), ExecutorState::Bound),
-            ("two", ssn.id.as_str(), ExecutorState::Bound),
-            ("three", ssn.id.as_str(), ExecutorState::Binding),
-            ("departing", ssn.id.as_str(), ExecutorState::Unbinding),
-            ("closed-executor", "closed", ExecutorState::Bound),
-        ] {
+        for ssn in [&full, &empty] {
+            snapshot.add_session(ssn.clone()).unwrap();
+        }
+        for i in 0..3 {
             snapshot
-                .add_executor(Arc::new(crate::model::ExecutorInfo {
-                    ssn_id: Some(owner.into()),
-                    state,
-                    ..void_executor(id).as_ref().clone()
-                }))
+                .add_executor(bound(&format!("f-{i}"), &full))
                 .unwrap();
         }
-        let options = PluginsOptions {
-            policies: vec!["drf".into()],
-            ..Default::default()
-        };
-        let manager = PluginManager::setup(&snapshot, &options).unwrap();
-        // MinMax abstains because demand exceeds three active bindings; DRF approves.
-        assert!(manager.is_overused(&ssn).unwrap());
-        let departing = snapshot.find_executors(ALL_EXECUTOR).unwrap()["one"].clone();
-        manager
-            .on_executor_interrupt(departing.clone(), ssn.clone())
-            .unwrap();
-        assert!(!manager.is_overused(&ssn).unwrap());
-        snapshot
-            .update_executor_state(departing, ExecutorState::Unbinding)
-            .unwrap();
-        let refreshed = PluginManager::setup(&snapshot, &options).unwrap();
-        assert!(!refreshed.is_overused(&ssn).unwrap());
-        // A deferred interrupt must exclude the same allocation before the
-        // worker has transitioned its lifecycle state to Unbinding.
-        let original = snapshot.find_executors(ALL_EXECUTOR).unwrap()["one"].clone();
-        snapshot
-            .update_executor(Arc::new(crate::model::ExecutorInfo {
-                state: ExecutorState::Bound,
-                signal: Some(common::apis::Signal::Interrupt),
-                ..original.as_ref().clone()
-            }))
-            .unwrap();
-        let interrupted = PluginManager::setup(&snapshot, &options).unwrap();
-        assert!(!interrupted.is_overused(&ssn).unwrap());
+        let manager = PluginManager::setup(
+            &snapshot,
+            &PluginsOptions {
+                policies: vec!["drf".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut heap = BinaryHeap::new(ByPlugins(manager));
+        heap.push(full.clone());
+        heap.push(empty.clone());
+        assert_eq!(heap.pop().unwrap().id, empty.id);
+        assert_eq!(heap.pop().unwrap().id, full.id);
+    }
+
+    #[test]
+    fn allocation_events_refresh_the_actual_share() {
+        let ssn = requested("events", 4, rr(1));
+        let mut plugin = cluster(&[(ssn.clone(), 0)]);
+        plugin.on_executor_create(void_executor("created"), ssn.clone());
+        assert_share(plugin.ssn_map[&ssn.id].dominant, 0.25);
+        plugin.on_session_bind(void_executor("retained"), ssn.clone());
+        assert_share(plugin.ssn_map[&ssn.id].dominant, 0.5);
+        plugin.on_executor_pipeline(void_executor("pipelined"), ssn.clone());
+        assert_share(plugin.ssn_map[&ssn.id].dominant, 0.5);
+        plugin.on_session_unbind(void_executor("retained"), ssn.clone());
+        assert_share(plugin.ssn_map[&ssn.id].dominant, 0.25);
+        plugin.on_executor_interrupt(void_executor("created"), ssn.clone());
+        assert_share(plugin.ssn_map[&ssn.id].dominant, 0.0);
     }
 
     #[test]
@@ -511,39 +558,12 @@ mod tests {
                 ..void_executor("interrupted").as_ref().clone()
             }))
             .unwrap();
-        let mut plugin = DRFPlugin {
-            total: rr(0),
-            ssn_map: HashMap::new(),
-            node_allocations: HashMap::new(),
-        };
+        let mut plugin = DRFPlugin::default();
         plugin.setup(&snapshot).unwrap();
         assert_eq!(snapshot.find_executors(ALL_EXECUTOR).unwrap().len(), 1);
         assert_eq!(plugin.node_allocations[&node.name], rr(1));
         assert_eq!(plugin.ssn_map[&ssn.id].allocated, rr(0));
         assert_eq!(plugin.is_allocatable(&node, &ssn), Some(false));
-    }
-
-    #[test]
-    fn readiness_preserves_fair_share_ceiling_when_demand_is_larger() {
-        let session = Arc::new(SessionInfo {
-            tasks_status: [(TaskState::Pending, 10)].into_iter().collect(),
-            ..session().as_ref().clone()
-        });
-        let plugin = DRFPlugin {
-            total: rr(4),
-            ssn_map: HashMap::from([
-                (
-                    session.id.clone(),
-                    DRFSessionInfo {
-                        allocated: rr(2),
-                        ..Default::default()
-                    },
-                ),
-                ("other-session".into(), DRFSessionInfo::default()),
-            ]),
-            node_allocations: HashMap::new(),
-        };
-        assert_eq!(plugin.is_ready(&session), Some(true));
     }
 
     #[test]
@@ -560,10 +580,8 @@ mod tests {
         let info = &plugin.ssn_map[&ssn.id];
         assert_eq!(info.allocated, rr(4));
         assert_eq!(info.pipelined, rr(0));
-        assert_eq!(info.dominant_share, 1.0);
+        assert_eq!(info.dominant, 1.0);
         assert_eq!(plugin.node_allocations["node-1"], rr(4));
-        assert_eq!(plugin.is_underused(&ssn), Some(false));
-        assert_eq!(plugin.is_ready(&ssn), Some(true));
     }
 
     #[test]
@@ -587,11 +605,7 @@ mod tests {
             snapshot.add_executor(exec.clone()).unwrap();
             departing.push(exec);
         }
-        let mut plugin = DRFPlugin {
-            total: rr(0),
-            ssn_map: HashMap::new(),
-            node_allocations: HashMap::new(),
-        };
+        let mut plugin = DRFPlugin::default();
         plugin.setup(&snapshot).unwrap();
         assert_eq!(plugin.node_allocations["node-1"], rr(4));
         for exec in departing {
@@ -600,10 +614,8 @@ mod tests {
         let info = &plugin.ssn_map[&ssn.id];
         assert_eq!(info.allocated, rr(0));
         assert_eq!(info.pipelined, rr(4));
-        assert_eq!(info.dominant_share, 0.0);
+        assert_eq!(info.dominant, 0.0);
         assert_eq!(plugin.node_allocations["node-1"], rr(4));
-        assert_eq!(plugin.is_underused(&ssn), Some(true));
-        assert_eq!(plugin.is_ready(&ssn), Some(true));
     }
 
     #[test]
@@ -636,11 +648,7 @@ mod tests {
         });
         snapshot.add_session(pending.clone()).unwrap();
 
-        let mut plugin = DRFPlugin {
-            total: ResourceRequirement::default(),
-            ssn_map: HashMap::new(),
-            node_allocations: HashMap::new(),
-        };
+        let mut plugin = DRFPlugin::default();
         plugin.setup(&snapshot).unwrap();
 
         assert_eq!(plugin.node_allocations.get(&node.name), Some(&rr(1)));
@@ -670,11 +678,7 @@ mod tests {
 
         let pending = session();
         snapshot.add_session(pending.clone()).unwrap();
-        let mut plugin = DRFPlugin {
-            total: ResourceRequirement::default(),
-            ssn_map: HashMap::new(),
-            node_allocations: HashMap::new(),
-        };
+        let mut plugin = DRFPlugin::default();
         plugin.setup(&snapshot).unwrap();
         assert_eq!(plugin.node_allocations.get(&node.name), Some(&rr(1)));
 

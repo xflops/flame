@@ -80,7 +80,7 @@ impl Action for DispatchAction {
                 &ssn.id
             );
 
-            // Like a kube-batch gang, every session binds through a Statement:
+            // Every session binds through a Statement:
             // stage binds until the session holds its gang (`batch_size`, 1 is
             // met by the first bind), then commit. A session that cannot
             // reach its gang from the Idle executors is discarded,

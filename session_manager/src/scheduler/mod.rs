@@ -752,6 +752,161 @@ mod tests {
         Ok(())
     }
 
+    fn competing_gangs(
+        policies: &[&str],
+        size: u32,
+        cycles: usize,
+    ) -> Result<Vec<usize>, FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        let mut node = new_test_node("node_1".to_string());
+        node.capacity = ResourceRequirement {
+            cpu: 6,
+            memory: 6 * 1024,
+            gpu: 0,
+        };
+        node.allocatable = node.capacity.clone();
+        tokio_test::block_on(controller.storage().register_node(&node))?;
+        let mut sessions = vec![];
+        for _ in 0..2 {
+            let session =
+                tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+                    id: format!("gang-{}", Uuid::new_v4()),
+                    application: "flmtest".to_string(),
+                    batch_size: size,
+                    min_instances: size,
+                    resreq: Some(ResourceRequirement {
+                        cpu: 1,
+                        memory: 1024,
+                        gpu: 0,
+                    }),
+                    ..Default::default()
+                }))?;
+            tokio_test::block_on(controller.create_task(session.id.clone(), None, None))?;
+            sessions.push(session);
+        }
+        let options = PluginsOptions {
+            policies: policies.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        };
+        for _ in 0..cycles {
+            let mut ctx = Context::new(controller.clone(), &options)?;
+            tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
+            tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
+            for executor in controller.list_executors()? {
+                if executor.state == common::apis::ExecutorState::Void {
+                    tokio_test::block_on(controller.register_executor(&executor))?;
+                }
+            }
+        }
+        sessions
+            .iter()
+            .map(|session| {
+                controller.list_executors().map(|all| {
+                    all.iter()
+                        .filter(|e| e.ssn_id.as_ref() == Some(&session.id))
+                        .count()
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_competing_gangs_never_hold_a_partial_set() -> Result<(), FlameError> {
+        for policies in [["priority", "das"], ["drf", "das"]] {
+            let held = competing_gangs(&policies, 4, 12)?;
+            assert!(
+                held.iter().all(|count| *count == 0 || *count == 4),
+                "{policies:?}: {held:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_drf_rebalances_a_session_holding_the_whole_cluster() -> Result<(), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        let mut node = new_test_node("node_1".to_string());
+        node.capacity = ResourceRequirement {
+            cpu: 6,
+            memory: 6 * 1024,
+            gpu: 0,
+        };
+        node.allocatable = node.capacity.clone();
+        tokio_test::block_on(controller.storage().register_node(&node))?;
+        let mut sessions = vec![];
+        for _ in 0..2 {
+            sessions.push(tokio_test::block_on(controller.create_session(
+                common::apis::SessionAttributes {
+                    id: format!("fair-{}", Uuid::new_v4()),
+                    application: "flmtest".to_string(),
+                    resreq: Some(ResourceRequirement {
+                        cpu: 1,
+                        memory: 1024,
+                        gpu: 0,
+                    }),
+                    ..Default::default()
+                },
+            ))?);
+        }
+        let options = PluginsOptions {
+            policies: vec!["drf".to_string(), "das".to_string()],
+            ..Default::default()
+        };
+        let cycle = |controller: &ControllerPtr| -> Result<(), FlameError> {
+            let mut ctx = Context::new(controller.clone(), &options)?;
+            for action in ctx.actions.clone() {
+                tokio_test::block_on(action.execute(&mut ctx))?;
+            }
+            for executor in controller.list_executors()? {
+                match executor.state {
+                    common::apis::ExecutorState::Void => {
+                        tokio_test::block_on(controller.register_executor(&executor))?
+                    }
+                    common::apis::ExecutorState::Binding => tokio_test::block_on(
+                        controller.bind_session_completed(executor.id.clone(), None),
+                    )?,
+                    _ => {}
+                }
+            }
+            Ok(())
+        };
+        for _ in 0..12 {
+            tokio_test::block_on(controller.create_task(sessions[0].id.clone(), None, None))?;
+        }
+        for _ in 0..20 {
+            cycle(&controller)?;
+        }
+        let held = |ssn: &str| -> Result<usize, FlameError> {
+            Ok(controller
+                .list_executors()?
+                .iter()
+                .filter(|e| e.ssn_id.as_deref() == Some(ssn))
+                .count())
+        };
+        assert_eq!(held(&sessions[0].id)?, 6);
+        for _ in 0..12 {
+            tokio_test::block_on(controller.create_task(sessions[1].id.clone(), None, None))?;
+        }
+        for _ in 0..3 {
+            cycle(&controller)?;
+        }
+        let interrupted = controller
+            .list_executors()?
+            .iter()
+            .filter(|e| e.signal == Some(common::apis::Signal::Interrupt))
+            .count();
+        assert_eq!(interrupted, 3, "re-balancing must stop at an equal split");
+        Ok(())
+    }
+
     fn instance_limit_env(
         application_max: u32,
         session_max: Option<u32>,
