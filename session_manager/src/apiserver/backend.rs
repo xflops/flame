@@ -30,7 +30,7 @@ use ::rpc::flame::v1 as rpc;
 
 use crate::apiserver::Flame;
 use crate::controller::ControllerPtr;
-use crate::model::Executor;
+use crate::model::{Executor, NodeConnectionReceiver, NodeConnectionSender};
 use common::apis::{ExecutorState, FlameResult, Node, Shim, TaskResult};
 use common::FlameError;
 
@@ -122,6 +122,54 @@ fn build_node_from_heartbeat(
 // ============================================================================
 // Backend trait implementation
 // ============================================================================
+
+/// Forwards the executor notifications queued for `node` to one watch stream.
+///
+/// The queue belongs to the node's connection and outlives the stream: when the executor
+/// manager reconnects, the next stream reads the same queue. The consumer of a dead stream
+/// must therefore stop as soon as its stream closes. If it stayed parked in `recv`, it would
+/// keep the queue's lock, take the next notification and fail to deliver it, and the executor
+/// that notification announces would stay `Void` forever.
+async fn forward_executors(
+    node: String,
+    sender: NodeConnectionSender,
+    receiver: NodeConnectionReceiver,
+    tx: mpsc::Sender<Result<WatchNodeResponse, Status>>,
+) {
+    loop {
+        // `biased`: a closed stream wins over a ready notification, which then stays queued
+        // for the next stream. Dropping the pending `recv` releases the queue's lock.
+        let executor = tokio::select! {
+            biased;
+            _ = tx.closed() => {
+                tracing::info!("Watch stream of node <{node}> closed, stopping its executor forwarder");
+                return;
+            }
+            executor = receiver.recv() => match executor {
+                Some(executor) => executor,
+                None => return,
+            },
+        };
+
+        let response = WatchNodeResponse {
+            response: Some(rpc::watch_node_response::Response::Executor(
+                rpc::Executor::from(&executor),
+            )),
+        };
+        if tx.send(Ok(response)).await.is_err() {
+            // The stream died after the executor was taken from the queue: queue it again
+            // for the next stream of the node instead of dropping it.
+            tracing::warn!(
+                "Watch stream of node <{node}> closed while sending executor <{}>, queueing it again",
+                executor.id
+            );
+            if let Err(e) = sender.send(executor).await {
+                tracing::warn!("Failed to queue the executor of node <{node}> again: {e}");
+            }
+            return;
+        }
+    }
+}
 
 #[async_trait]
 impl Backend for Flame {
@@ -241,30 +289,16 @@ impl Backend for Flame {
 
                     // Get the channel (already created by register_node)
                     match controller.get_node_channel(&name) {
-                        Ok(Some((_sender, receiver))) => {
+                        Ok(Some((sender, receiver))) => {
                             node_name = Some(name.clone());
 
                             // Spawn a task to receive from connection and send to client
-                            let tx_clone = tx_for_queue.clone();
-                            let name_clone = name.clone();
-                            tokio::spawn(async move {
-                                while let Some(executor) = receiver.recv().await {
-                                    let response = WatchNodeResponse {
-                                        response: Some(
-                                            rpc::watch_node_response::Response::Executor(
-                                                rpc::Executor::from(&executor),
-                                            ),
-                                        ),
-                                    };
-                                    if tx_clone.send(Ok(response)).await.is_err() {
-                                        tracing::debug!(
-                                            "Client <{}> disconnected, stopping receiver",
-                                            name_clone
-                                        );
-                                        break;
-                                    }
-                                }
-                            });
+                            tokio::spawn(forward_executors(
+                                name.clone(),
+                                sender,
+                                receiver,
+                                tx_for_queue.clone(),
+                            ));
                         }
                         Ok(None) => {
                             tracing::error!(
@@ -485,5 +519,124 @@ impl Backend for Flame {
             .await?;
 
         Ok(Response::new(rpc::Result::default()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use common::apis::ResourceRequirement;
+    use tokio::task::JoinHandle;
+    use tokio::time::sleep;
+
+    use super::*;
+    use crate::model::NodeConnection;
+
+    type Stream = (
+        mpsc::Sender<Result<WatchNodeResponse, Status>>,
+        mpsc::Receiver<Result<WatchNodeResponse, Status>>,
+    );
+
+    fn executor(id: &str) -> Executor {
+        Executor {
+            id: id.to_string(),
+            node: "node-1".to_string(),
+            resreq: ResourceRequirement::default(),
+            shim: Shim::Host,
+            application: String::new(),
+            task_id: None,
+            ssn_id: None,
+            attributes: Default::default(),
+            creation_time: Utc::now(),
+            latest_updated_timestamp: Utc::now(),
+            state: ExecutorState::Void,
+            signal: None,
+        }
+    }
+
+    fn forwarder(
+        connection: &NodeConnection,
+        tx: &mpsc::Sender<Result<WatchNodeResponse, Status>>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(forward_executors(
+            "node-1".to_string(),
+            connection.sender(),
+            connection.receiver(),
+            tx.clone(),
+        ))
+    }
+
+    async fn next_executor(rx: &mut mpsc::Receiver<Result<WatchNodeResponse, Status>>) -> String {
+        let response = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the notification reaches the new stream")
+            .expect("the stream is open")
+            .expect("a response, not an error");
+        match response.response {
+            Some(rpc::watch_node_response::Response::Executor(executor)) => {
+                executor.metadata.expect("metadata").id
+            }
+            other => panic!("expected an executor, got {other:?}"),
+        }
+    }
+
+    /// Issue #615: the consumer of the old stream must not take, and lose, the first
+    /// notification sent after the executor manager reconnects.
+    #[tokio::test]
+    async fn notification_after_a_reconnect_reaches_the_new_stream() {
+        let connection = NodeConnection::new("node-1".to_string());
+
+        // The first stream: its consumer parks waiting for a notification.
+        let (old_tx, old_rx): Stream = mpsc::channel(32);
+        let old = forwarder(&connection, &old_tx);
+        sleep(Duration::from_millis(50)).await;
+        // The executor manager goes away and comes back with a second stream.
+        drop(old_rx);
+        let (new_tx, mut new_rx): Stream = mpsc::channel(32);
+        let _new = forwarder(&connection, &new_tx);
+
+        connection.sender().send(executor("e1")).await.unwrap();
+
+        assert_eq!(next_executor(&mut new_rx).await, "e1");
+        timeout(Duration::from_secs(2), old)
+            .await
+            .expect("the consumer of the closed stream stops")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_stream_leaves_queued_notifications_for_the_next_one() {
+        let connection = NodeConnection::new("node-1".to_string());
+        connection.sender().send(executor("e1")).await.unwrap();
+
+        // A consumer that starts on an already closed stream must not take the notification.
+        let (dead_tx, dead_rx): Stream = mpsc::channel(32);
+        drop(dead_rx);
+        timeout(Duration::from_secs(2), forwarder(&connection, &dead_tx))
+            .await
+            .expect("the consumer of the closed stream stops")
+            .unwrap();
+
+        let (tx, mut rx): Stream = mpsc::channel(32);
+        let _live = forwarder(&connection, &tx);
+        assert_eq!(next_executor(&mut rx).await, "e1");
+    }
+
+    #[tokio::test]
+    async fn executor_taken_just_before_the_stream_dies_is_queued_again() {
+        let connection = NodeConnection::new("node-1".to_string());
+
+        // A stream whose buffer is full: the forwarder takes the executor, then waits to send it.
+        let (tx, rx): Stream = mpsc::channel(1);
+        tx.send(Ok(WatchNodeResponse::default())).await.unwrap();
+        let _old = forwarder(&connection, &tx);
+        connection.sender().send(executor("e1")).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        drop(rx);
+
+        let (new_tx, mut new_rx): Stream = mpsc::channel(32);
+        let _new = forwarder(&connection, &new_tx);
+        assert_eq!(next_executor(&mut new_rx).await, "e1");
     }
 }

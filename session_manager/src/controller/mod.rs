@@ -594,7 +594,7 @@ impl Controller {
             .notify_executor(&node_name, &executor)
             .await
         {
-            tracing::debug!(
+            tracing::warn!(
                 "Failed to notify node <{}> about executor creation: {}",
                 node_name,
                 e
@@ -638,7 +638,7 @@ impl Controller {
             .notify_executor(&executor.node, &executor)
             .await
         {
-            tracing::debug!(
+            tracing::warn!(
                 "Failed to notify node <{}> about executor registration: {}",
                 e.node,
                 err
@@ -777,7 +777,7 @@ impl Controller {
             .notify_executor(&executor.node, &executor)
             .await
         {
-            tracing::debug!(
+            tracing::warn!(
                 "Failed to notify node <{}> about executor binding: {}",
                 executor.node,
                 e
@@ -810,7 +810,7 @@ impl Controller {
             .notify_executor(&executor.node, &executor)
             .await
         {
-            tracing::debug!(
+            tracing::warn!(
                 "Failed to notify node <{}> about bind completion: {}",
                 executor.node,
                 e
@@ -1015,7 +1015,7 @@ impl Controller {
             .notify_executor(&executor.node, &executor)
             .await
         {
-            tracing::debug!(
+            tracing::warn!(
                 "Failed to notify node <{}> about task completion: {}",
                 executor.node,
                 e
@@ -1055,7 +1055,7 @@ impl Controller {
             .notify_executor(&executor.node, &executor)
             .await
         {
-            tracing::debug!(
+            tracing::warn!(
                 "Failed to notify node <{}> about executor unbinding: {}",
                 executor.node,
                 e
@@ -1083,7 +1083,7 @@ impl Controller {
             .notify_executor(&executor.node, &executor)
             .await
         {
-            tracing::debug!(
+            tracing::warn!(
                 "Failed to notify node <{}> about unbind completion: {}",
                 executor.node,
                 e
@@ -1112,7 +1112,7 @@ impl Controller {
             .notify_executor(&executor.node, &executor)
             .await
         {
-            tracing::debug!(
+            tracing::warn!(
                 "Failed to notify node <{}> about executor release: {}",
                 executor.node,
                 e
@@ -1180,7 +1180,7 @@ impl Controller {
             .notify_executor(&released_executor.node, &released_executor)
             .await
         {
-            tracing::debug!(
+            tracing::warn!(
                 "Failed to notify node <{}> about executor unregistration: {}",
                 executor.node,
                 e
