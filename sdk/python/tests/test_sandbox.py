@@ -114,6 +114,19 @@ def test_create_without_image_and_resreq_not_in_common_data(core):
     assert kw["resreq"].cpu == 2
 
 
+def test_create_uses_the_given_sandbox_id(core):
+    Sandbox.create(sandbox_id="my-box", image="alpine:3")
+    assert core.create_kwargs["session_id"] == "my-box"
+
+
+@pytest.mark.parametrize("sandbox_id", ["", "   ", 5])
+def test_create_rejects_bad_sandbox_id(core, sandbox_id):
+    with pytest.raises(FlameError) as exc:
+        Sandbox.create(sandbox_id=sandbox_id)
+    assert exc.value.code == FlameErrorCode.INVALID_ARGUMENT
+    assert core.create_kwargs is None
+
+
 def test_create_rejects_bad_image(core):
     with pytest.raises(FlameError) as exc:
         Sandbox.create(image="")
