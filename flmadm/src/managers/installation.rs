@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct InstallationManager;
 
@@ -297,6 +297,11 @@ impl InstallationManager {
         fs::create_dir_all(&paths.lib).context("Failed to create lib directory")?;
 
         println!("  📦 Building Python wheel...");
+        // Start from an empty wheels directory: earlier installs left their wheels here, and the
+        // one built now must be the only one.
+        if paths.wheels.exists() {
+            fs::remove_dir_all(&paths.wheels).context("Failed to clear the wheels directory")?;
+        }
         fs::create_dir_all(&paths.wheels).context("Failed to create wheels directory")?;
 
         let build_output = std::process::Command::new(&uv_path)
@@ -312,7 +317,8 @@ impl InstallationManager {
             let stderr = String::from_utf8_lossy(&build_output.stderr);
             anyhow::bail!("Failed to build wheel: {}", stderr);
         }
-        println!("  ✓ Built wheel to: {}", paths.wheels.display());
+        let wheel = built_wheel(&paths.wheels)?;
+        println!("  ✓ Built wheel: {}", wheel.display());
 
         let uv_cache_dir = paths.cache.join("uv");
         fs::create_dir_all(&uv_cache_dir).context("Failed to create cache directory")?;
@@ -328,9 +334,10 @@ impl InstallationManager {
                 .arg(format!("python{}", python_version))
                 .arg("--prefix")
                 .arg(&paths.prefix)
-                .arg("--find-links")
-                .arg(&paths.wheels)
-                .arg("flamepy")
+                // Install the wheel that was just built, not "flamepy" by name: a pre-release
+                // version (a release candidate) would be skipped in favor of the latest stable
+                // release on PyPI, which lacks the modules of this source tree.
+                .arg(&wheel)
                 .env("UV_CACHE_DIR", &uv_cache_dir)
                 .output()
                 .context("Failed to execute uv pip install")?;
@@ -702,10 +709,58 @@ fi
     }
 }
 
+/// The wheel `uv build` wrote to `dir`, which was empty before the build.
+fn built_wheel(dir: &Path) -> Result<PathBuf> {
+    let mut wheels = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("Failed to read {}", dir.display()))? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "whl") {
+            wheels.push(path);
+        }
+    }
+    match wheels.len() {
+        1 => Ok(wheels.remove(0)),
+        0 => anyhow::bail!("uv build wrote no wheel to {}", dir.display()),
+        n => anyhow::bail!("expected one wheel in {}, found {n}", dir.display()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    mod built_wheel {
+        use super::*;
+        use std::fs::File;
+
+        fn touch(dir: &Path, name: &str) -> PathBuf {
+            let path = dir.join(name);
+            File::create(&path).unwrap();
+            path
+        }
+
+        #[test]
+        fn is_the_only_wheel_in_the_directory() {
+            let dir = tempdir().unwrap();
+            let wheel = touch(dir.path(), "flamepy-0.7.0rc2-py3-none-any.whl");
+            touch(dir.path(), "notes.txt");
+
+            assert_eq!(built_wheel(dir.path()).unwrap(), wheel);
+        }
+
+        #[test]
+        fn no_wheel_or_several_wheels_is_an_error() {
+            let dir = tempdir().unwrap();
+            let err = built_wheel(dir.path()).unwrap_err();
+            assert!(err.to_string().contains("no wheel"), "{err}");
+
+            touch(dir.path(), "flamepy-0.7.0rc1-py3-none-any.whl");
+            touch(dir.path(), "flamepy-0.7.0rc2-py3-none-any.whl");
+            let err = built_wheel(dir.path()).unwrap_err();
+            assert!(err.to_string().contains("found 2"), "{err}");
+        }
+    }
 
     mod get_components_to_install {
         use super::*;
