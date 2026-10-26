@@ -92,6 +92,15 @@ impl Context {
         if exec.application != ssn.application {
             return Ok(false);
         }
+        // An executor on a node that is not ready cannot be started or told to bind: the node would
+        // never get the notification.
+        if !self
+            .snapshot
+            .get_node(&exec.node)?
+            .is_some_and(|node| node.is_ready())
+        {
+            return Ok(false);
+        }
         if ssn
             .resreq
             .as_ref()
@@ -205,6 +214,68 @@ mod tests {
     use std::collections::HashSet;
 
     #[tokio::test]
+    async fn executors_on_nodes_that_are_not_ready_are_not_available() {
+        use common::apis::NodeState;
+
+        let resreq = ResourceRequirement {
+            cpu: 1,
+            memory: 1024,
+            gpu: 0,
+        };
+        let source = Session {
+            id: "session".to_string(),
+            application: "test-app".to_string(),
+            resreq: Some(resreq.clone()),
+            ..Default::default()
+        };
+        let session = Arc::new(SessionInfo::try_from(&source).unwrap());
+        let snapshot = crate::model::SnapShot::new();
+        for (name, state) in [
+            ("ready", NodeState::Ready),
+            ("draining", NodeState::Unknown),
+            ("dead", NodeState::NotReady),
+        ] {
+            snapshot
+                .add_node(Arc::new(crate::model::NodeInfo {
+                    name: name.to_string(),
+                    state,
+                    ..Default::default()
+                }))
+                .unwrap();
+        }
+        let plugins = PluginManager::setup(&snapshot, &PluginsOptions::default()).unwrap();
+        let config = FlameClusterContext {
+            cluster: FlameCluster {
+                storage: "none".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let storage = crate::storage::new_ptr(&config).await.unwrap();
+        let context = Context {
+            snapshot: Arc::new(snapshot),
+            controller: crate::controller::new_ptr(storage),
+            actions: vec![],
+            plugins,
+        };
+        let on = |node: &str| {
+            Arc::new(ExecutorInfo {
+                id: format!("on-{node}"),
+                node: node.to_string(),
+                state: ExecutorState::Idle,
+                application: "test-app".to_string(),
+                resreq: resreq.clone(),
+                ..Default::default()
+            })
+        };
+
+        assert!(context.is_available(&on("ready"), &session).unwrap());
+        assert!(!context.is_available(&on("draining"), &session).unwrap());
+        assert!(!context.is_available(&on("dead"), &session).unwrap());
+        assert!(!context.is_available(&on("unknown-node"), &session).unwrap());
+    }
+
+    #[tokio::test]
     async fn select_executor_uses_context_plugins() {
         let resreq = ResourceRequirement {
             cpu: 1,
@@ -229,6 +300,14 @@ mod tests {
         let session = Arc::new(SessionInfo::try_from(&source).unwrap());
         let snapshot = crate::model::SnapShot::new();
         snapshot.add_session(session.clone()).unwrap();
+        // The executors below keep the default (empty) node name; their node is ready.
+        snapshot
+            .add_node(Arc::new(crate::model::NodeInfo {
+                name: String::new(),
+                state: common::apis::NodeState::Ready,
+                ..Default::default()
+            }))
+            .unwrap();
         let options = PluginsOptions {
             policies: vec!["das".to_string()],
             ..Default::default()

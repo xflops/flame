@@ -907,6 +907,121 @@ mod tests {
         Ok(())
     }
 
+    fn node_named(name: &str, state: NodeState) -> Node {
+        let mut node = new_test_node(name.to_string());
+        node.state = state;
+        node
+    }
+
+    fn cycle(controller: &ControllerPtr, options: &PluginsOptions) -> Result<(), FlameError> {
+        let mut ctx = Context::new(controller.clone(), options)?;
+        tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
+        tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
+        for executor in controller.list_executors()? {
+            if executor.state == common::apis::ExecutorState::Void {
+                tokio_test::block_on(controller.register_executor(&executor))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn session_with_task(controller: &ControllerPtr) -> Result<common::apis::Session, FlameError> {
+        let session =
+            tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+                id: format!("ready-nodes-{}", Uuid::new_v4()),
+                application: "flmtest".to_string(),
+                resreq: Some(ResourceRequirement {
+                    cpu: 1,
+                    memory: 1024,
+                    gpu: 0,
+                }),
+                ..Default::default()
+            }))?;
+        tokio_test::block_on(controller.create_task(session.id.clone(), None, None))?;
+        Ok(session)
+    }
+
+    /// An executor created for a node whose executor manager is not connected is never started
+    /// and stays `Void`, so the session waits forever.
+    #[test]
+    fn test_no_executor_is_allocated_on_a_node_that_is_not_ready() -> Result<(), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        tokio_test::block_on(
+            controller
+                .storage()
+                .register_node(&node_named("node_dead", NodeState::NotReady)),
+        )?;
+        session_with_task(&controller)?;
+        let options = PluginsOptions::default();
+
+        for _ in 0..5 {
+            cycle(&controller, &options)?;
+        }
+        assert!(
+            controller.list_executors()?.is_empty(),
+            "an executor was created on a node that is not ready"
+        );
+
+        // The node comes back: the executor is allocated there.
+        tokio_test::block_on(
+            controller
+                .storage()
+                .register_node(&node_named("node_dead", NodeState::Ready)),
+        )?;
+        for _ in 0..5 {
+            cycle(&controller, &options)?;
+        }
+        let executors = controller.list_executors()?;
+        assert_eq!(executors.len(), 1);
+        assert_eq!(executors[0].node, "node_dead");
+        Ok(())
+    }
+
+    #[test]
+    fn test_void_executor_on_a_node_that_is_not_ready_is_not_reused() -> Result<(), FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        for node in [
+            node_named("node_dead", NodeState::NotReady),
+            node_named("node_ok", NodeState::Ready),
+        ] {
+            tokio_test::block_on(controller.storage().register_node(&node))?;
+        }
+        let session = session_with_task(&controller)?;
+        // An executor left behind on the dead node, as the incident did.
+        let stranded = tokio_test::block_on(
+            controller.create_executor("node_dead".to_string(), session.id.clone()),
+        )?;
+        let options = PluginsOptions::default();
+
+        for _ in 0..8 {
+            cycle(&controller, &options)?;
+        }
+        let on_ok = controller
+            .list_executors()?
+            .into_iter()
+            .filter(|e| e.node == "node_ok" && e.ssn_id.as_ref() == Some(&session.id))
+            .count();
+        assert_eq!(
+            on_ok, 1,
+            "the session did not get an executor on the ready node"
+        );
+        let stranded = controller
+            .list_executors()?
+            .into_iter()
+            .find(|e| e.id == stranded.id)
+            .unwrap();
+        assert_eq!(stranded.node, "node_dead");
+        Ok(())
+    }
+
     fn instance_limit_env(
         application_max: u32,
         session_max: Option<u32>,

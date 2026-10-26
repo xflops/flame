@@ -16,7 +16,7 @@ use std::sync::Arc;
 use stdng::collections::{BinaryHeap, Cmp};
 use stdng::{logs::TraceFn, trace_fn};
 
-use crate::model::{ALL_NODE, READY_SESSION, UNBINDING_EXECUTOR, VOID_EXECUTOR};
+use crate::model::{READY_NODE, READY_SESSION, UNBINDING_EXECUTOR, VOID_EXECUTOR};
 use crate::scheduler::actions::{Action, ActionPtr};
 use crate::scheduler::plugins::ssn_order_fn;
 use crate::scheduler::Context;
@@ -46,7 +46,9 @@ impl Action for AllocateAction {
         }
 
         let mut nodes = vec![];
-        let node_list = ss.find_nodes(ALL_NODE)?;
+        // Only a node whose executor manager is connected can start an executor: a notification to
+        // any other node is lost and its executor stays `Void`.
+        let node_list = ss.find_nodes(READY_NODE)?;
         for node in node_list.values() {
             nodes.push(node.clone());
         }
