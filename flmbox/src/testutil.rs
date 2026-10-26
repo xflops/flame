@@ -29,7 +29,12 @@ use crate::runtime::{CommandOutput, Runtime};
 /// A `runsc` runtime whose commands go to `runner`.
 pub fn runsc_runtime(cfg: &FlameSandbox, runner: Arc<FakeRunner>) -> Arc<dyn Runtime> {
     let FlameRuntime::Runsc(runsc) = &cfg.runtime;
-    Arc::new(Runsc::with_runner(runsc, &cfg.state_dir, runner))
+    Arc::new(Runsc::with_runner(
+        runsc,
+        &cfg.state_dir,
+        cfg.network,
+        runner,
+    ))
 }
 
 /// Builds a command output.

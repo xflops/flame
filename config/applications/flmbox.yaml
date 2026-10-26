@@ -6,6 +6,10 @@ spec:
   command: ${FLAME_HOME}/bin/flmbox
   arguments:
     - -d
+    # Sandboxes use the network of the executor manager, so they have full egress (and
+    # reach the control plane and the node too). Remove this argument to run them without
+    # a network (the flmbox default); see flmbox/README.md.
+    - --network=host
   schema:
     input: >-
       {"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"code":{"type":"string","description":"The shell command line or source code to run, e.g. echo hello"},"language":{"type":"string","description":"The language of the code: shell (default) or python"},"cwd":{"type":"string","description":"The working directory inside the sandbox"},"envs":{"type":"object","additionalProperties":{"type":"string"},"description":"Extra environment variables"},"input":{"type":"array","items":{"type":"integer"},"description":"Standard input in bytes, e.g. [0x1, 0x2]"},"timeout":{"type":"number","description":"Timeout in seconds"}},"required":["code"]}

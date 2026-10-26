@@ -24,7 +24,7 @@ use async_trait::async_trait;
 mod bundle;
 pub mod runner;
 
-use crate::config::FlameRunsc;
+use crate::config::{FlameNetwork, FlameRunsc};
 use crate::runtime::CommandOutput;
 use crate::runtime::{ExecOptions, Runtime, SandboxInfo, SandboxSpec};
 use bundle::write_bundle;
@@ -55,23 +55,31 @@ pub struct Runsc {
     pub platform: Option<String>,
     /// `--overlay2` value, e.g. `root:memory`.
     pub overlay: String,
+    /// `--network`: no interface, or the network of this process.
+    pub network: FlameNetwork,
     /// Runs the commands.
     pub runner: Arc<dyn CommandRunner>,
 }
 
 impl Runsc {
     /// The `runsc` of a configuration.
-    pub fn new(cfg: &FlameRunsc, state_dir: &Path) -> Self {
-        Self::with_runner(cfg, state_dir, Arc::new(TokioRunner))
+    pub fn new(cfg: &FlameRunsc, state_dir: &Path, network: FlameNetwork) -> Self {
+        Self::with_runner(cfg, state_dir, network, Arc::new(TokioRunner))
     }
 
     /// Like [`new`](Self::new) with another process runner, so tests can use a fake.
-    pub fn with_runner(cfg: &FlameRunsc, state_dir: &Path, runner: Arc<dyn CommandRunner>) -> Self {
+    pub fn with_runner(
+        cfg: &FlameRunsc,
+        state_dir: &Path,
+        network: FlameNetwork,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Self {
         Self {
             bin: cfg.path.clone(),
             root: state_dir.join("runsc"),
             platform: cfg.platform.clone(),
             overlay: cfg.overlay.clone(),
+            network,
             runner,
         }
     }
@@ -81,7 +89,11 @@ impl Runsc {
         let mut args = vec![
             "--root".to_string(),
             self.root.display().to_string(),
-            "--network=none".to_string(),
+            match self.network {
+                FlameNetwork::None => "--network=none",
+                FlameNetwork::Host => "--network=host",
+            }
+            .to_string(),
         ];
         if let Some(platform) = &self.platform {
             args.push(format!("--platform={platform}"));
@@ -196,7 +208,13 @@ impl Runtime for Runsc {
     /// Writes the OCI bundle under `<dir>/bundle`, then `runsc create` and `start`.
     async fn start(&self, spec: &SandboxSpec<'_>) -> Result<(), FlameError> {
         let bundle = spec.dir.join("bundle");
-        write_bundle(&bundle, &spec.image.rootfs, &spec.image.config, spec.id)?;
+        write_bundle(
+            &bundle,
+            &spec.image.rootfs,
+            &spec.image.config,
+            spec.id,
+            self.network,
+        )?;
         self.create(spec.id, &bundle).await?;
         Runsc::start(self, spec.id).await
     }
@@ -288,6 +306,7 @@ mod tests {
             root: PathBuf::from("/state/runsc"),
             platform: None,
             overlay: "root:memory".to_string(),
+            network: FlameNetwork::None,
             runner: runner.clone(),
         }
     }
@@ -325,6 +344,20 @@ mod tests {
             vec![
                 "/usr/bin/runsc --root /state/runsc --network=none --platform=kvm \
                  --overlay2=all:dir=/var/tmp start x"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn host_network_is_a_global_flag() {
+        let fake = Arc::new(FakeRunner::default());
+        let mut r = runsc(&fake);
+        r.network = FlameNetwork::Host;
+        r.start("x").await.unwrap();
+        assert_eq!(
+            fake.lines(),
+            vec![
+                "/usr/bin/runsc --root /state/runsc --network=host --overlay2=root:memory start x"
             ]
         );
     }

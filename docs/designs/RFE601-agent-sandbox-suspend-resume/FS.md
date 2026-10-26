@@ -489,8 +489,10 @@ spec and the image manifest, index and config types come from the `oci-spec` cra
 - **Runtime trait.** `Sandbox` talks to a `Runtime` trait (`start`, `exec`, `kill`, `list`; `runtime/mod.rs`), not
   to `runsc`. gVisor (`runtime/runsc`, which also writes its own OCI bundle) is the only implementation; another runtime such
   as Firecracker implements the trait and is selected in `runtime_for`.
-- **No network.** Phase 1 is lifecycle only. Sandboxes run with `runsc --network=none` and an empty network namespace,
-  so they cannot reach the control plane, the node or the internet. The network design above (per-sandbox namespace,
+- **No network by default.** Phase 1 is lifecycle only. Sandboxes run with `runsc --network=none` and an empty network namespace,
+  so they cannot reach the control plane, the node or the internet. An opt-in `sandbox.network: host` (or `FLMBOX_NETWORK=host`, or `flmbox --network=host`, which
+  the built-in `flmbox` application passes in its `arguments`) runs them with `runsc --network=host` instead: they get every egress of the `flmbox` process, which this design rules out
+  as a default, so it is for clusters that trust the code sandboxes run. The network design above (per-sandbox namespace,
   deny rules, egress allowlist, fixed in-sandbox address) is deferred to its own change, together with the checkpoint
   and restore flow that needs it. The bundle carries a minimal `hosts` file, bind-mounted read-only.
 - **No resource limits in `flmbox`.** The bundle has no `linux.resources`; limits belong to the host shim (#604).

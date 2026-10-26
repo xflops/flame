@@ -19,6 +19,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use flame_rs::apis::FlameError;
 
+use crate::config::FlameNetwork;
 use crate::sandbox::{self, Sandbox};
 
 mod exec;
@@ -45,6 +46,12 @@ pub struct Cli {
     /// or ~/.flame/flame-sandbox.yaml when present)
     #[arg(long, global = true, value_name = "FILE")]
     pub config: Option<std::path::PathBuf>,
+
+    /// Network of the sandboxes: none (the default) or host. `host` gives them every egress
+    /// of this process, including the control plane and the node. Overrides $FLMBOX_NETWORK
+    /// and `sandbox.network` of the configuration file
+    #[arg(long, global = true, value_name = "MODE")]
+    pub network: Option<FlameNetwork>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -137,6 +144,17 @@ mod tests {
         );
         let cli = Cli::try_parse_from(["flmbox", "kill", "x", "--config", "/etc/s.yaml"]).unwrap();
         assert!(cli.config.is_some());
+    }
+
+    #[test]
+    fn network_is_a_global_option() {
+        let cli = Cli::try_parse_from(["flmbox", "-d", "--network=host"]).unwrap();
+        assert_eq!(cli.network, Some(FlameNetwork::Host));
+        let cli = Cli::try_parse_from(["flmbox", "run", "img", "--network", "NONE"]).unwrap();
+        assert_eq!(cli.network, Some(FlameNetwork::None));
+        let cli = Cli::try_parse_from(["flmbox", "-d"]).unwrap();
+        assert_eq!(cli.network, None);
+        assert!(Cli::try_parse_from(["flmbox", "-d", "--network=bridge"]).is_err());
     }
 
     #[test]
