@@ -35,6 +35,7 @@ use oci_spec::runtime::{
     Spec, SpecBuilder, UserBuilder,
 };
 
+use crate::config::FlameNetwork;
 use crate::images::ImageConfig;
 
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -61,14 +62,18 @@ const CAPABILITIES: [Capability; 14] = [
 ];
 
 /// Writes `<dir>/config.json` (OCI runtime spec 1.0.2) for a sandbox whose
-/// root filesystem is `rootfs`, mounted read-only. The sandbox has its own,
-/// empty network namespace. Also writes `<dir>/hosts`, bind-mounted read-only
+/// root filesystem is `rootfs`, mounted read-only. With [`FlameNetwork::None`]
+/// the sandbox has its own, empty network namespace; with [`FlameNetwork::Host`]
+/// the spec names no network namespace, so the sandbox uses the network of the
+/// process that runs `runsc`, and the host's `/etc/resolv.conf` is bind-mounted
+/// read-only so names resolve. Also writes `<dir>/hosts`, bind-mounted read-only
 /// at `/etc/hosts`.
 pub fn write_bundle(
     dir: &Path,
     rootfs: &Path,
     image: &ImageConfig,
     id: &str,
+    network: FlameNetwork,
 ) -> Result<(), FlameError> {
     let rootfs = std::path::absolute(rootfs)
         .map_err(|e| internal(format!("rootfs path {}: {e}", rootfs.display())))?;
@@ -85,7 +90,7 @@ pub fn write_bundle(
         .as_deref()
         .filter(|d| d.starts_with('/'))
         .unwrap_or("/");
-    let mounts = vec![
+    let mut mounts = vec![
         mount("/proc", "proc", "proc", &["nosuid", "noexec", "nodev"])?,
         mount(
             "/sys",
@@ -102,6 +107,19 @@ pub fn write_bundle(
         mount("/run", "tmpfs", "tmpfs", &["nosuid", "nodev", "mode=755"])?,
         mount("/etc/hosts", "bind", hosts_path, &["ro", "rbind"])?,
     ];
+    if network == FlameNetwork::Host {
+        // The sandbox shares the host's network; give it the host's resolver
+        // when it has one (a missing file leaves the image's own).
+        if let Ok(resolv) = fs::read("/etc/resolv.conf") {
+            let resolv_path = write_file(dir, "resolv.conf", &resolv)?;
+            mounts.push(mount(
+                "/etc/resolv.conf",
+                "bind",
+                resolv_path,
+                &["ro", "rbind"],
+            )?);
+        }
+    }
     let mut namespaces = [
         LinuxNamespaceType::Pid,
         LinuxNamespaceType::Ipc,
@@ -111,7 +129,9 @@ pub fn write_bundle(
     .map(namespace)
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
-    namespaces.push(namespace(LinuxNamespaceType::Network)?);
+    if network == FlameNetwork::None {
+        namespaces.push(namespace(LinuxNamespaceType::Network)?);
+    }
 
     let spec = minimal_spec(
         &rootfs,
@@ -295,7 +315,14 @@ mod tests {
     fn written(image: &ImageConfig, id: &str) -> Value {
         let dir = tempfile::tempdir().unwrap();
         let bundle = dir.path().join("bundle");
-        write_bundle(&bundle, Path::new("/images/rootfs"), image, id).unwrap();
+        write_bundle(
+            &bundle,
+            Path::new("/images/rootfs"),
+            image,
+            id,
+            FlameNetwork::None,
+        )
+        .unwrap();
         serde_json::from_slice(&fs::read(bundle.join("config.json")).unwrap()).unwrap()
     }
 
@@ -326,6 +353,7 @@ mod tests {
             Path::new("/images/rootfs"),
             &ImageConfig::default(),
             "id",
+            FlameNetwork::None,
         )
         .unwrap();
         let spec = Spec::load(dir.path().join("config.json")).unwrap();
@@ -510,6 +538,7 @@ mod tests {
             Path::new("/images/rootfs"),
             &ImageConfig::default(),
             "flmbox-e.0123456789abcdef",
+            FlameNetwork::None,
         )
         .unwrap();
         let v: Value =
@@ -559,10 +588,76 @@ mod tests {
             Path::new("rel/rootfs"),
             &ImageConfig::default(),
             "id",
+            FlameNetwork::None,
         )
         .unwrap();
         let v: Value =
             serde_json::from_slice(&fs::read(dir.path().join("config.json")).unwrap()).unwrap();
         assert!(Path::new(v["root"]["path"].as_str().unwrap()).is_absolute());
+    }
+
+    #[test]
+    fn host_network_has_no_network_namespace_and_mounts_the_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bundle(
+            dir.path(),
+            Path::new("/images/rootfs"),
+            &ImageConfig::default(),
+            "id",
+            FlameNetwork::Host,
+        )
+        .unwrap();
+        let v: Value =
+            serde_json::from_slice(&fs::read(dir.path().join("config.json")).unwrap()).unwrap();
+        let types: Vec<_> = v["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, vec!["pid", "ipc", "uts", "mount"]);
+        if Path::new("/etc/resolv.conf").is_file() {
+            let resolv = v["mounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["destination"] == "/etc/resolv.conf")
+                .expect("resolv.conf is mounted");
+            assert_eq!(
+                resolv["source"],
+                dir.path().join("resolv.conf").to_str().unwrap()
+            );
+            assert_eq!(resolv["options"], json!(["ro", "rbind"]));
+            assert_eq!(
+                fs::read(dir.path().join("resolv.conf")).unwrap(),
+                fs::read("/etc/resolv.conf").unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn no_network_keeps_its_own_namespace_and_no_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bundle(
+            dir.path(),
+            Path::new("/images/rootfs"),
+            &ImageConfig::default(),
+            "id",
+            FlameNetwork::None,
+        )
+        .unwrap();
+        let v: Value =
+            serde_json::from_slice(&fs::read(dir.path().join("config.json")).unwrap()).unwrap();
+        assert!(v["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["type"] == "network"));
+        assert!(!v["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["destination"] == "/etc/resolv.conf"));
+        assert!(!dir.path().join("resolv.conf").exists());
     }
 }

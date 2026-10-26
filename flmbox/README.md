@@ -9,8 +9,9 @@
 The first runtime is [gVisor](https://gvisor.dev) (`runsc`). The runtime is a trait, so others, such as Firecracker, can follow.
 The design is in `docs/designs/RFE601-agent-sandbox-suspend-resume/FS.md`.
 
-This release covers the sandbox lifecycle only. Sandboxes have **no network** (`runsc --network=none`), and nothing
-survives a suspend: the sandbox is removed when its session leaves.
+This release covers the sandbox lifecycle only. By default sandboxes have **no network** (`runsc --network=none`; set
+`sandbox.network: host` to give them the host's, see [Network](#network)), and nothing survives a suspend: the sandbox
+is removed when its session leaves.
 
 ## Requirements
 
@@ -63,6 +64,7 @@ sandbox:
     path: runsc
     platform: kvm               # optional, runsc --platform
     overlay: root:memory        # runsc --overlay2: writes stay in sandbox memory
+  network: none                 # none (default) or host, see Network
   images:
     max_size: 4G                # largest image, packed and unpacked
 ```
@@ -77,7 +79,27 @@ file overrides the defaults:
 | `FLMBOX_RUNSC` | `sandbox.runtime.path` |
 | `FLMBOX_PLATFORM` | `sandbox.runtime.platform` |
 | `FLMBOX_OVERLAY` | `sandbox.runtime.overlay` |
+| `FLMBOX_NETWORK` | `sandbox.network` (the `--network` option overrides both) |
 | `FLMBOX_MAX_IMAGE_BYTES` | `sandbox.images.max_size` |
+
+## Network
+
+`sandbox.network` selects the network of every sandbox:
+
+- `none` (the default): the sandbox has its own, empty network namespace (`runsc --network=none`). It cannot reach the
+  Flame control plane, the node or the internet.
+- `host`: the sandbox uses the network of the process that runs `flmbox` (`runsc --network=host`, no network namespace
+  in the sandbox spec), and the host's `/etc/resolv.conf` is mounted read-only so names resolve. The sandbox then has
+  **every egress that process has**: the internet, but also the Flame control plane, the node's own services, other
+  pods and the cloud metadata address. Use it only where the code that sandboxes run is trusted, such as a development
+  cluster.
+
+The mode comes from, in order of precedence, `--network <none|host>`, `$FLMBOX_NETWORK`, and `sandbox.network`. The
+built-in `flmbox` application (`config/applications/flmbox.yaml`) starts the service as `flmbox -d --network=host`, so
+its sandboxes run with the host's network; because the flag wins over the environment and the file, `sandbox.network`
+in `flame-sandbox.yaml` does not change it. To run them without a network, remove the argument from the application.
+Running `flmbox` yourself, without the application, still defaults to `none`. The network is chosen by the operator
+only: a client cannot request it for its own sandbox. A per-sandbox network with egress rules is tracked in #612.
 
 ## Images and state
 

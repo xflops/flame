@@ -22,6 +22,8 @@ limitations under the License.
 //!     path: runsc
 //!     platform: kvm               # optional, runsc --platform
 //!     overlay: root:memory        # runsc --overlay2
+//!   network: none                # none (default) or host, see `FlameNetwork`;
+//!                                #   `--network` and $FLMBOX_NETWORK override it
 //!   images:
 //!     max_size: 4G                # largest image, packed and unpacked
 //! ```
@@ -46,6 +48,8 @@ pub const ENV_RUNSC: &str = "FLMBOX_RUNSC";
 pub const ENV_OVERLAY: &str = "FLMBOX_OVERLAY";
 /// `runsc --platform` value, unset by default.
 pub const ENV_PLATFORM: &str = "FLMBOX_PLATFORM";
+/// Sandbox network mode: `none` (default) or `host`.
+pub const ENV_NETWORK: &str = "FLMBOX_NETWORK";
 /// Maximum size of an image in bytes.
 pub const ENV_MAX_IMAGE_BYTES: &str = "FLMBOX_MAX_IMAGE_BYTES";
 /// Flame home directory, used for the default state directory and file.
@@ -77,6 +81,7 @@ struct FlameSandboxContextYaml {
 struct FlameSandboxYaml {
     state_dir: Option<String>,
     runtime: Option<FlameRuntimeYaml>,
+    network: Option<String>,
     images: Option<FlameImagesYaml>,
 }
 
@@ -109,8 +114,46 @@ pub struct FlameSandbox {
     pub state_dir: PathBuf,
     /// The sandbox runtime and its settings.
     pub runtime: FlameRuntime,
+    /// The network of the sandboxes.
+    pub network: FlameNetwork,
     /// Image limits.
     pub images: FlameImages,
+}
+
+/// The network of a sandbox.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FlameNetwork {
+    /// No interface: the sandbox cannot reach the control plane, the node or the
+    /// internet. The default.
+    #[default]
+    None,
+    /// The sandbox uses the network of the process that runs `flmbox`, so it has
+    /// every egress that process has: the internet, but also the Flame control plane,
+    /// the node's own services, other pods and the cloud metadata address. Use it only
+    /// on clusters where the code that sandboxes run is trusted.
+    Host,
+}
+
+impl std::str::FromStr for FlameNetwork {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "host" => Ok(Self::Host),
+            other => Err(format!(
+                "'{other}' is not a known network mode (use none or host)"
+            )),
+        }
+    }
+}
+
+impl FlameNetwork {
+    fn parse(key: &str, value: &str) -> Result<Self, FlameError> {
+        value
+            .parse()
+            .map_err(|why| invalid(format!("{key}: {why}")))
+    }
 }
 
 /// The sandbox runtime. Another runtime, such as Firecracker, is another variant.
@@ -150,6 +193,7 @@ impl FlameSandbox {
             ENV_RUNSC,
             ENV_OVERLAY,
             ENV_PLATFORM,
+            ENV_NETWORK,
             ENV_MAX_IMAGE_BYTES,
             ENV_FLAME_HOME,
             ENV_HOME,
@@ -259,9 +303,17 @@ impl FlameSandbox {
                 None => DEFAULT_MAX_IMAGE_BYTES,
             };
 
+        let network = match (get(ENV_NETWORK).map(|v| (ENV_NETWORK, v.to_string())))
+            .or(filled(yaml.network).map(|v| ("sandbox.network", v)))
+        {
+            Some((key, v)) => FlameNetwork::parse(key, &v)?,
+            None => FlameNetwork::None,
+        };
+
         Ok(Self {
             state_dir,
             runtime,
+            network,
             images: FlameImages { max_bytes },
         })
     }
@@ -314,6 +366,37 @@ mod tests {
     fn runsc(c: &FlameSandbox) -> &FlameRunsc {
         let FlameRuntime::Runsc(r) = &c.runtime;
         r
+    }
+
+    #[test]
+    fn network_defaults_to_none_and_follows_the_file_and_the_environment() {
+        let c = FlameSandbox::from_map(&HashMap::new()).unwrap();
+        assert_eq!(c.network, FlameNetwork::None);
+
+        let vars = HashMap::new();
+        let c = FlameSandbox::from_yaml("sandbox:\n  network: host\n", &vars).unwrap();
+        assert_eq!(c.network, FlameNetwork::Host);
+        let c = FlameSandbox::from_yaml("sandbox:\n  network: None\n", &vars).unwrap();
+        assert_eq!(c.network, FlameNetwork::None);
+
+        // The environment wins over the file.
+        let c = FlameSandbox::from_yaml(
+            "sandbox:\n  network: host\n",
+            &map(&[(ENV_NETWORK, "none")]),
+        )
+        .unwrap();
+        assert_eq!(c.network, FlameNetwork::None);
+        let c = FlameSandbox::from_map(&map(&[(ENV_NETWORK, " HOST ")])).unwrap();
+        assert_eq!(c.network, FlameNetwork::Host);
+    }
+
+    #[test]
+    fn unknown_network_mode_is_rejected() {
+        let err = FlameSandbox::from_map(&map(&[(ENV_NETWORK, "bridge")])).unwrap_err();
+        assert!(err.to_string().contains("FLMBOX_NETWORK"), "{err}");
+        let err =
+            FlameSandbox::from_yaml("sandbox:\n  network: sandbox\n", &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("sandbox.network"), "{err}");
     }
 
     #[test]

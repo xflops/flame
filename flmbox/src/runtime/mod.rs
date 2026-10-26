@@ -109,6 +109,8 @@ pub trait Runtime: Send + Sync {
 /// The runtime named by the configuration.
 pub fn runtime_for(cfg: &FlameSandbox) -> Arc<dyn Runtime> {
     match &cfg.runtime {
-        FlameRuntime::Runsc(runsc) => Arc::new(runsc::Runsc::new(runsc, &cfg.state_dir)),
+        FlameRuntime::Runsc(runsc) => {
+            Arc::new(runsc::Runsc::new(runsc, &cfg.state_dir, cfg.network))
+        }
     }
 }

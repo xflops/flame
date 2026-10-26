@@ -58,7 +58,10 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     cli.check()?;
-    let cfg = FlameSandbox::load(cli.config.as_deref())?;
+    let mut cfg = FlameSandbox::load(cli.config.as_deref())?;
+    if let Some(network) = cli.network {
+        cfg.network = network;
+    }
     let mut images = ImageStore::new(&cfg);
     if !cli.daemon {
         images = images.with_progress();
