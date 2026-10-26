@@ -288,7 +288,7 @@ with Sandbox.create(image="ubuntu:26.04") as box:
     print(box.run_code("print(1 + 2)", language="python").stdout_text())
 ```
 
-- `Sandbox.create(*, image=None, resreq=None)` creates a sandbox (one instance). A missing `image` uses the service default. `resreq` is the session resource requirement only; it is not part of the sandbox configuration.
+- `Sandbox.create(*, sandbox_id=None, image=None, resreq=None)` creates a sandbox (one instance). A missing `sandbox_id` generates a `sandbox-<random>` id; an id that already exists is an error (use `Sandbox.connect`). A missing `image` uses the service default. `resreq` is the session resource requirement only; it is not part of the sandbox configuration.
 - `Sandbox.connect(sandbox_id)` attaches to an existing sandbox; a session of another application raises `INVALID_ARGUMENT`.
 - `box.id`, `box.state` (a fresh query returning `"open"`, `"suspending"`, `"suspended"` or `"closed"`)
 - `box.run(cmd, *, cwd=None, envs=None, timeout=None) -> CommandResult` and `box.submit(...) -> Future[CommandResult]`

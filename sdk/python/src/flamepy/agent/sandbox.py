@@ -132,15 +132,28 @@ class Sandbox:
         self._closed = False
 
     @classmethod
-    def create(cls, *, image: Optional[str] = None, resreq: Optional[ResourceRequirement] = None) -> "Sandbox":
-        """Create a new sandbox. ``image`` defaults to the service default image."""
+    def create(
+        cls,
+        *,
+        sandbox_id: Optional[str] = None,
+        image: Optional[str] = None,
+        resreq: Optional[ResourceRequirement] = None,
+    ) -> "Sandbox":
+        """Create a new sandbox.
+
+        ``sandbox_id`` names the sandbox; a ``sandbox-<random>`` id is generated when it is ``None``. Creating a
+        sandbox whose id already exists fails; use :meth:`connect` to attach to an existing one. ``image`` defaults
+        to the service default image.
+        """
+        if sandbox_id is not None and (not isinstance(sandbox_id, str) or not sandbox_id.strip()):
+            raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "sandbox_id must be a non-empty string or None")
         if image is not None and (not isinstance(image, str) or not image):
             raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "image must be a non-empty string or None")
         common_data = json.dumps({"image": image}).encode("utf-8")
         session = _create_core_session(
             _FLMBOX_APP,
             common_data=common_data,
-            session_id=_generate_id(),
+            session_id=sandbox_id if sandbox_id is not None else _generate_id(),
             min_instances=1,
             max_instances=1,
             batch_size=1,
