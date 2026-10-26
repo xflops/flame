@@ -263,14 +263,11 @@ class Sandbox:
         if self._closed or self._session is None:
             raise FlameError(FlameErrorCode.INVALID_STATE, "sandbox is closed")
 
-    def _ensure_open(self) -> None:
-        self._ensure_not_closed()
-        state = self.state
-        if state != "open":
-            raise FlameError(FlameErrorCode.INVALID_STATE, f"sandbox {self._id!r} is {state}, not open")
-
     def _submit(self, payload: bytes) -> "Future[CommandResult]":
-        self._ensure_open()
+        # The command goes straight to the server, with no state request first: the server rejects a
+        # command for a closed sandbox ("Session <id> is closed"), and queues one for a suspending or
+        # suspended sandbox until it is resumed.
+        self._ensure_not_closed()
         raw_future = self._session.submit(payload)
         mapped: Future = Future()
 

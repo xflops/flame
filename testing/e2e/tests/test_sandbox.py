@@ -38,6 +38,7 @@ import os
 import shutil
 import subprocess
 import time
+from concurrent.futures import TimeoutError as FutureTimeout
 
 import flamepy
 import pytest
@@ -482,12 +483,14 @@ class TestSandboxLifecycle:
         sandbox.suspend()
         assert sandbox.state == "suspended"
 
-        with pytest.raises(FlameError) as excinfo:
-            sandbox.run("echo nope")
-        assert excinfo.value.code == FlameErrorCode.INVALID_STATE
+        # The server accepts a command for a suspended sandbox and runs it after the resume.
+        queued = sandbox.submit("echo queued")
+        with pytest.raises(FutureTimeout):
+            queued.result(timeout=3)
 
         sandbox.resume()
         assert sandbox.state == "open"
+        assert queued.result(timeout=AFTER_RESUME_TIMEOUT).stdout_text() == "queued\n"
 
         result = _run(sandbox, "echo after-resume", wait=AFTER_RESUME_TIMEOUT)
         assert result.exit_code == 0

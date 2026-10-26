@@ -296,9 +296,10 @@ with Sandbox.create(image="ubuntu:26.04") as box:
 - `box.suspend(*, timeout=60.0)` requests suspension and polls until the state is `suspended`. The signal is asynchronous; `INTERNAL` is raised on timeout.
 - `box.resume()` returns when the sandbox is `open` again. Phase 1 does NOT preserve process or filesystem state: a resumed sandbox starts fresh.
 - `box.close()` is idempotent; the context manager closes on exit.
+- A command is sent without asking the server for the state first. The server queues a command for a suspending or suspended sandbox and runs it after the resume, so `run` blocks (and `submit` stays pending) until then; check `box.state` first if that matters.
 - `CommandResult.exit_code`, `.stdout`, `.stderr` (bytes), `.stdout_text()`, `.stderr_text()`, `.ok`. A nonzero exit code is a normal result, not an error.
 
-Errors are `FlameError`: `INVALID_ARGUMENT` for bad arguments, `INVALID_STATE` when the sandbox is closed, suspending or suspended (tasks are never queued for a suspended sandbox), and `INTERNAL` for a malformed service response or a suspend timeout.
+Errors are `FlameError`: `INVALID_ARGUMENT` for bad arguments, `INVALID_STATE` when this handle is closed (after `close()`); a command for a sandbox closed through another handle is rejected by the server with a `FlameError` saying the session is closed, and `INTERNAL` for a malformed service response or a suspend timeout.
 
 ## Enums
 

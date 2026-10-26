@@ -708,8 +708,9 @@ so the sandbox application can re-establish anything that cannot be checkpointed
 **As implemented in phase 1.** `Sandbox.state` is read from the server and is one of `"open"`, `"suspending"`,
 `"suspended"` or `"closed"`. `suspend()` and `resume()` signal the session and then poll (every 0.2 s, default
 timeout 60 s) until it is `suspended` or `open`; a timeout raises `FlameError(INTERNAL)` and a closed sandbox
-raises `FlameError(INVALID_STATE)`. `run`, `run_code` and their `submit_` forms raise `FlameError(INVALID_STATE)`
-unless the sandbox is `"open"`, and after `close()`. `resume(fresh=...)` is not implemented because there is no
+raises `FlameError(INVALID_STATE)`. `run`, `run_code` and their `submit_` forms send the command without asking for the state: the
+server rejects it with a `FlameError` ("Session <id> is closed") for a sandbox closed elsewhere and queues it for a
+suspending or suspended one until the resume (the call waits), and a handle raises `FlameError(INVALID_STATE)` after `close()`. `resume(fresh=...)` is not implemented because there is no
 snapshot to discard yet, and a resumed sandbox starts fresh.
 
 ## 5. Failure handling

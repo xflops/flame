@@ -52,6 +52,7 @@ class FakeCore:
         self.after_suspend = [SessionState.SUSPENDING, SessionState.SUSPENDED]
         self.after_resume = [SessionState.SUSPENDED, SessionState.OPEN]
         self.queue = []
+        self.get_calls = 0
 
     def create(self, application, **kwargs):
         self.create_app = application
@@ -63,6 +64,7 @@ class FakeCore:
         return self.session
 
     def get(self, sid):
+        self.get_calls += 1
         if self.queue:
             self.state = self.queue.pop(0)
         return SimpleNamespace(id=sid, state=self.state)
@@ -196,15 +198,27 @@ def test_submit_propagates_errors(core):
     assert exc.value.message == "boom"
 
 
-@pytest.mark.parametrize("state", [SessionState.SUSPENDED, SessionState.SUSPENDING, SessionState.CLOSED])
-def test_not_open_rejects_tasks(core, state):
+@pytest.mark.parametrize("state", [SessionState.OPEN, SessionState.SUSPENDING, SessionState.SUSPENDED, SessionState.CLOSED])
+def test_commands_are_sent_without_asking_for_the_state(core, state):
     box = Sandbox.create()
     core.state = state
-    for call in (lambda: box.run("ls"), lambda: box.submit("ls"), lambda: box.run_code("1"), lambda: box.submit_code("1")):
-        with pytest.raises(FlameError) as exc:
-            call()
-        assert exc.value.code == FlameErrorCode.INVALID_STATE
-    assert core.session.submitted == []
+    for call in (lambda: box.run("ls"), lambda: box.submit("ls").result(), lambda: box.run_code("1"), lambda: box.submit_code("1").result()):
+        assert call().ok
+    # The server decides: it queues a command for a suspending or suspended sandbox until the resume.
+    assert len(core.session.submitted) == 4
+    assert core.get_calls == 0
+
+
+def test_server_rejection_of_a_closed_sandbox_is_propagated(core):
+    box = Sandbox.create()
+    core.session.error = FlameError(FlameErrorCode.INVALID_ARGUMENT, "failed to create task: Session <sandbox-1> is closed")
+    with pytest.raises(FlameError) as exc:
+        box.run("ls")
+    assert "is closed" in str(exc.value)
+    future = box.submit("ls")
+    with pytest.raises(FlameError) as exc:
+        future.result()
+    assert "is closed" in str(exc.value)
 
 
 def test_state_mapping(core):
