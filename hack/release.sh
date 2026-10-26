@@ -26,7 +26,7 @@ validate_metadata() {
         <<<"${cargo_metadata}")"
     rust_macros_version="$(jq -er '.packages[] | select(.name == "flame-rs") | .dependencies[] | select(.name == "flame-rs-macros") | .req' \
         <<<"${cargo_metadata}")"
-    python_version="$(cd sdk/python && uv version --short)"
+    python_version="$(cd sdk/python && uv --color never version --short)"
     flamepy_version="$(shell_string_value sdk/python/src/flamepy/__init__.py __version__)"
 
     [[ "${flamepy_version}" == "${python_version}" ]] || {
