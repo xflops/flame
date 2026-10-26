@@ -189,6 +189,13 @@ pub struct NodeInfo {
     pub state: NodeState,
 }
 
+impl NodeInfo {
+    /// Whether the node's executor manager is connected and can start executors.
+    pub fn is_ready(&self) -> bool {
+        self.state == NodeState::Ready
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AppInfo {
     pub name: String,
@@ -341,8 +348,17 @@ impl Default for NodeFilter {
 }
 
 pub const ALL_NODE: Option<NodeFilter> = None;
+/// Nodes whose executor manager is connected. Executors can only be created on, or
+/// started by, such nodes.
+pub const READY_NODE: Option<NodeFilter> = Some(NodeFilter::by_state(NodeState::Ready));
 
 impl SnapShot {
+    /// The node of that name, or `None` when the snapshot does not know it.
+    pub fn get_node(&self, node_name: &str) -> Result<Option<NodeInfoPtr>, FlameError> {
+        let nodes = lock_ptr!(self.nodes)?;
+        Ok(nodes.get(node_name).cloned())
+    }
+
     pub fn find_nodes(
         &self,
         filter: Option<NodeFilter>,
@@ -1012,6 +1028,28 @@ mod tests {
 
         assert_eq!(ready_ssns.len(), 1);
         assert!(ready_ssns.contains_key("ssn-ready"));
+    }
+
+    #[test]
+    fn test_snapshot_node_is_ready_only_when_its_state_is_ready() {
+        let ss = SnapShot::new();
+        for (name, state) in [
+            ("ready", NodeState::Ready),
+            ("draining", NodeState::Unknown),
+            ("dead", NodeState::NotReady),
+        ] {
+            ss.add_node(Arc::new(NodeInfo {
+                name: name.to_string(),
+                state,
+                ..Default::default()
+            }))
+            .unwrap();
+        }
+
+        assert!(ss.get_node("ready").unwrap().unwrap().is_ready());
+        assert!(!ss.get_node("draining").unwrap().unwrap().is_ready());
+        assert!(!ss.get_node("dead").unwrap().unwrap().is_ready());
+        assert!(ss.get_node("unknown").unwrap().is_none());
     }
 
     #[test]
