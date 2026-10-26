@@ -693,13 +693,34 @@ def _executors_bound_to(session_id):
     return [executor for executor in flamepy.list_executors() if executor.status.session_id == session_id]
 
 
+def _describe_cluster():
+    """The nodes, executors and sessions as text, for the output of a failed wait."""
+    lines = []
+    for node in flamepy.list_nodes():
+        lines.append(f"node {node.metadata.name}: {NodeState.Name(node.status.state)} allocatable cpu={node.status.allocatable.cpu}")
+    for executor in flamepy.list_executors():
+        resreq = executor.spec.resreq
+        lines.append(
+            f"executor {executor.metadata.id}: node={executor.spec.node} app={executor.spec.application} "
+            f"cpu={resreq.cpu} memory={resreq.memory} state={executor.status.state} session={executor.status.session_id or '-'}"
+        )
+    for session in flamepy.list_sessions():
+        lines.append(f"session {session.id}: {session.state} pending={session.pending} running={session.running}")
+    return "\n".join(lines)
+
+
 def _wait_for_no_executors(timeout_seconds=30):
-    """Let executors retained by earlier tests go away so capacity is known."""
+    """Let executors retained by earlier tests go away so capacity is known.
+
+    Executors are retained for twice the application's delay_release, which is longer than the
+    wait, so this often times out; the executors left are printed to explain a later failure.
+    """
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if not flamepy.list_executors():
             return
         time.sleep(0.5)
+    print(f"Executors left after {timeout_seconds}s:\n{_describe_cluster()}")
 
 
 def _gang_capacity():
@@ -738,7 +759,7 @@ def _wait_until(predicate, what, timeout_seconds=60):
         if predicate():
             return
         time.sleep(0.2)
-    pytest.fail(f"Timed out waiting for {what}")
+    pytest.fail(f"Timed out waiting for {what}\n{_describe_cluster()}")
 
 
 def _assert_all_or_nothing(sessions, sizes, seconds):
