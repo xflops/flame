@@ -160,6 +160,10 @@ Service contexts expose bytes-oriented APIs:
 - `TaskContext.task_id`
 - `TaskContext.session_id`
 - `TaskContext.input`
+- `FlameService.publish(keys)` and `retract(keys)` publish and withdraw data-aware scheduling keys
+  for the next response; a `flamepy.serving.Instance` has them too.
+- On the client, `flamepy.serving.Session.run(req, option=None)` and `submit(req, option=None)` accept
+  `TaskOptions(affinity={key})` to prefer an executor that published `key`.
 
 ## App API
 

@@ -20,7 +20,7 @@ import cloudpickle
 
 from flamepy.core import ObjectRef, get_object, put_object
 from flamepy.core.client import Session as CoreSession, create_session, open_session as open_core_session
-from flamepy.core.types import ResourceRequirement, short_name
+from flamepy.core.types import ResourceRequirement, TaskOptions, short_name
 
 
 class Session:
@@ -101,7 +101,7 @@ class Session:
                 resreq=resreq,
             )
 
-    def run(self, req: Any) -> Any:
+    def run(self, req: Any, option: Optional[TaskOptions] = None) -> Any:
         """Run a request and return its result when the task completes.
 
         The request and response objects should exactly match the service entrypoint
@@ -109,6 +109,8 @@ class Session:
 
         Args:
             req: The request object matching the service entrypoint signature
+            option: Task options, such as ``TaskOptions(affinity={key})`` to prefer an executor
+                that published ``key`` with ``Instance.publish``
 
         Returns:
             The response object matching the service entrypoint signature
@@ -116,15 +118,15 @@ class Session:
         Example:
             >>> resp = session.run(req)
         """
-        return self.submit(req).result()
+        return self.submit(req, option).result()
 
-    def submit(self, req: Any) -> Future:
+    def submit(self, req: Any, option: Optional[TaskOptions] = None) -> Future:
         """Submit a request and return a future for its deserialized result."""
         if self._session is None:
             raise RuntimeError("Service session is not initialized")
 
         input_bytes = cloudpickle.dumps(req, protocol=cloudpickle.DEFAULT_PROTOCOL)
-        raw_future = self._session.submit(input_bytes)
+        raw_future = self._session.submit(input_bytes, option)
         result: Future = Future()
 
         def complete(done: Future) -> None:
