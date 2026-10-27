@@ -163,7 +163,7 @@ async def test_runpy_binds_session_context_and_publishes_invocation_attributes()
     session = SessionContext(None, "session", ApplicationContext("app"))
 
     await svc.on_session_enter(session)
-    assert list(svc._take_attributes().attr) == []
+    assert list(svc._take_attributes().publish) == []
 
     request = ServiceRequest(method="run")
     object_ref = SimpleNamespace(encode=lambda: b"result-ref")
@@ -172,7 +172,36 @@ async def test_runpy_binds_session_context_and_publishes_invocation_attributes()
 
     assert cloudpickle.loads(result) == ServiceResponse(ValueRef("session"))
     put.assert_not_called()
-    assert set(svc._take_attributes().attr) == {b"b", b"c"}
+    assert set(svc._take_attributes().publish) == {b"b", b"c"}
+
+
+@pytest.mark.asyncio
+async def test_runpy_retract_is_invocation_scoped_and_last_operation_wins():
+    import flamepy.app as app
+    from flamepy.core.service import ApplicationContext, SessionContext, TaskContext
+
+    class Worker:
+        def evict(self):
+            app.publish_attributes({b"x", b"y"})
+            app.retract_attributes({b"x", b"absent"})
+            app.publish_attributes({b"absent"})
+            return None
+
+    with pytest.raises(RuntimeError, match="not running in a Flame invocation"):
+        app.retract_attributes({b"outside"})
+
+    svc = FlameRunpyService()
+    svc._load_app_context = lambda context: _context(ServiceContext(Worker, constructor_args=()))
+    await svc.on_session_enter(SessionContext(None, "session", ApplicationContext("app")))
+
+    request = TaskContext("task", "session", cloudpickle.dumps(ServiceRequest(method="evict")))
+    with patch("flamepy.core.aio.put_object", new=AsyncMock(return_value=SimpleNamespace(encode=lambda: b"r"))):
+        await svc.on_task_invoke(request)
+    attributes = svc._take_attributes()
+    assert set(attributes.publish) == {b"y", b"absent"}
+    assert set(attributes.retract) == {b"x"}
+    drained = svc._take_attributes()
+    assert list(drained.publish) == [] and list(drained.retract) == []
 
 
 @pytest.mark.asyncio
@@ -200,7 +229,7 @@ async def test_runpy_handles_async_method_and_sync_method_returning_awaitable():
         request = TaskContext("task", "session", cloudpickle.dumps(ServiceRequest(method=method)))
         output = await service.on_task_invoke(request)
         assert cloudpickle.loads(output) == ServiceResponse(ValueRef("session"))
-        assert list(service._take_attributes().attr) == [attribute]
+        assert list(service._take_attributes().publish) == [attribute]
 
 
 @pytest.mark.asyncio
@@ -354,11 +383,11 @@ async def test_app_runtime_helpers_are_invocation_scoped():
     with patch("flamepy.core.aio.put_object", new=AsyncMock(return_value=result_ref)):
         result = await svc.on_task_invoke(TaskContext("task", "session", cloudpickle.dumps(ServiceRequest(method="run"))))
     assert cloudpickle.loads(result) == ServiceResponse(ValueRef("session"))
-    assert set(svc._take_attributes().attr) == {b"initial", b"next"}
+    assert set(svc._take_attributes().publish) == {b"initial", b"next"}
 
     with pytest.raises(TypeError, match="must contain bytes"):
         await svc.on_task_invoke(TaskContext("task", "session", cloudpickle.dumps(ServiceRequest(method="invalid"))))
-    assert list(svc._take_attributes().attr) == []
+    assert list(svc._take_attributes().publish) == []
 
 
 @pytest.mark.asyncio
@@ -436,16 +465,16 @@ async def test_runpy_reuses_class_execution_object_between_sessions():
 
     await svc.on_session_enter(session)
     assert Worker.init_count == 1
-    assert list(svc._take_attributes().attr) == []
+    assert list(svc._take_attributes().publish) == []
 
     request = ServiceRequest(method="fail")
     with pytest.raises(RuntimeError, match="failed"):
         await svc.on_task_invoke(TaskContext("task", "session", cloudpickle.dumps(request)))
-    assert set(svc._take_attributes().attr) == {b"failed"}
+    assert set(svc._take_attributes().publish) == {b"failed"}
 
     with pytest.raises(ValueError, match="Task input is None"):
         await svc.on_task_invoke(TaskContext("invalid-task", "session", None))
-    assert list(svc._take_attributes().attr) == []
+    assert list(svc._take_attributes().publish) == []
 
     original = svc._execution_object
     await svc.on_session_leave()
@@ -457,7 +486,7 @@ async def test_runpy_reuses_class_execution_object_between_sessions():
     await svc.on_session_enter(rebound)
     assert svc._execution_object is original
     assert Worker.init_count == 1
-    assert list(svc._take_attributes().attr) == []
+    assert list(svc._take_attributes().publish) == []
 
     result_ref = SimpleNamespace(encode=lambda: b"result-ref")
     with patch("flamepy.core.aio.put_object", new=AsyncMock(return_value=result_ref)):
@@ -475,7 +504,7 @@ async def test_runpy_reuses_class_execution_object_between_sessions():
     await svc.on_session_enter(other)
     assert svc._execution_object is not previous
     assert isinstance(svc._execution_object, OtherWorker)
-    assert list(svc._take_attributes().attr) == []
+    assert list(svc._take_attributes().publish) == []
 
 
 @pytest.mark.asyncio

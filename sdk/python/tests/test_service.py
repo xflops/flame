@@ -85,16 +85,16 @@ def test_publish_calls_are_unioned_and_sent_once():
     publisher.publish([])
 
     attributes = publisher._take_attributes()
-    assert set(attributes.attr) == {b"kv-cache-key", b"prefix-key", b"block-key"}
-    assert list(publisher._take_attributes().attr) == []
+    assert set(attributes.publish) == {b"kv-cache-key", b"prefix-key", b"block-key"}
+    assert list(publisher._take_attributes().publish) == []
 
     publisher.publish([])
     republished = publisher._take_attributes()
-    assert list(republished.attr) == []
+    assert list(republished.publish) == []
 
     instance = Instance()
     instance.publish({b"instance-key"})
-    assert instance._take_attributes().attr == [b"instance-key"]
+    assert instance._take_attributes().publish == [b"instance-key"]
 
 
 def test_publish_racing_response_delivers_one_complete_snapshot():
@@ -111,7 +111,7 @@ def test_publish_racing_response_delivers_one_complete_snapshot():
     raced = publisher.take()
     thread.join()
     after_race = publisher.take()
-    nonempty = [set(attributes.attr) for attributes in (raced, after_race) if attributes.attr]
+    nonempty = [set(attributes.publish) for attributes in (raced, after_race) if attributes.publish]
 
     assert nonempty == [{b"race-a", b"race-b"}]
 
@@ -151,8 +151,8 @@ def test_concurrent_servicers_publish_to_their_own_instance():
     for thread in threads:
         thread.join()
 
-    assert set(responses[0].attributes.attr) == {b"instance-a"}
-    assert set(responses[1].attributes.attr) == {b"instance-b"}
+    assert set(responses[0].attributes.publish) == {b"instance-a"}
+    assert set(responses[1].attributes.publish) == {b"instance-b"}
 
 
 def test_direct_servicer_uses_one_loop_for_concurrent_calls():
@@ -212,22 +212,22 @@ def test_servicer_wraps_enter_and_task_publication():
     task_request = shim_pb2.TaskContext(task_id="task-1", session_id="session-2")
 
     enter_response = servicer.OnSessionEnter(enter_request, DummyContext())
-    assert set(enter_response.attributes.attr) == {b"entered", b"prefix", b"block"}
+    assert set(enter_response.attributes.publish) == {b"entered", b"prefix", b"block"}
 
     servicer.OnSessionLeave(None, DummyContext())
     task_response = servicer.OnTaskInvoke(task_request, DummyContext())
-    assert list(task_response.attributes.attr) == []
+    assert list(task_response.attributes.publish) == []
 
     next_response = servicer.OnTaskInvoke(task_request, DummyContext())
     assert next_response.HasField("attributes")
-    assert list(next_response.attributes.attr) == []
+    assert list(next_response.attributes.publish) == []
 
     failed_response = servicer.OnTaskInvoke(
         shim_pb2.TaskContext(task_id="task-error", session_id="session-2"),
         DummyContext(),
     )
     assert failed_response.task_result.return_code == -1
-    assert set(failed_response.attributes.attr) == {b"error-key"}
+    assert set(failed_response.attributes.publish) == {b"error-key"}
 
 
 def test_failed_session_enter_does_not_leak_publication():
@@ -257,11 +257,11 @@ def test_failed_session_enter_does_not_leak_publication():
 
     succeeded = servicer.OnSessionEnter(request("next-session"), DummyContext())
     assert succeeded.result.return_code == 0
-    assert list(succeeded.attributes.attr) == []
+    assert list(succeeded.attributes.publish) == []
 
     empty = servicer.OnSessionEnter(request("empty-session"), DummyContext())
     assert empty.HasField("attributes")
-    assert list(empty.attributes.attr) == []
+    assert list(empty.attributes.publish) == []
 
 
 @pytest.mark.parametrize(
@@ -286,8 +286,54 @@ def test_publish_rejects_cumulative_limit_without_partial_update():
     publisher.publish(first)
     with pytest.raises(ValueError):
         publisher.publish(overflow)
-    assert len(publisher._take_attributes().attr) == 600
-    assert list(publisher._take_attributes().attr) == []
+    assert len(publisher._take_attributes().publish) == 600
+    assert list(publisher._take_attributes().publish) == []
+
+
+def test_retract_records_retractions_with_last_operation_winning():
+    publisher = _NoopService()
+    publisher.publish([b"x", b"y"])
+    publisher.retract([b"x", b"absent"])
+
+    attributes = publisher._take_attributes()
+    assert set(attributes.publish) == {b"y"}
+    assert set(attributes.retract) == {b"x", b"absent"}
+    drained = publisher._take_attributes()
+    assert list(drained.publish) == [] and list(drained.retract) == []
+
+    # A later operation on the same key replaces the earlier one.
+    publisher.retract([b"x"])
+    publisher.publish([b"x"])
+    publisher.publish([b"y"])
+    publisher.retract([b"y"])
+    attributes = publisher._take_attributes()
+    assert list(attributes.publish) == [b"x"]
+    assert list(attributes.retract) == [b"y"]
+
+
+def test_retract_validates_limits_without_partial_update():
+    publisher = _NoopService()
+    publisher.publish([b"kept"])
+    for invalid, error in (
+        (["not-bytes"], TypeError),
+        ([b""], ValueError),
+        ([b"x" * 257], ValueError),
+        ([index.to_bytes(2, "big") for index in range(1_025)], ValueError),
+    ):
+        with pytest.raises(error):
+            publisher.retract(invalid)
+
+    first = [index.to_bytes(2, "big") for index in range(600)]
+    overflow = [index.to_bytes(2, "big") for index in range(600, 1_100)]
+    publisher.retract(first)
+    with pytest.raises(ValueError):
+        publisher.retract(overflow)
+    # Each direction is bounded on its own, so publishing still fits.
+    publisher.publish([b"still-fits"])
+
+    attributes = publisher._take_attributes()
+    assert set(attributes.publish) == {b"kept", b"still-fits"}
+    assert len(attributes.retract) == 600
 
 
 def test_publish_byte_limit_resets_after_take():
@@ -298,10 +344,10 @@ def test_publish_byte_limit_resets_after_take():
     publisher.publish(boundary)
     with pytest.raises(ValueError):
         publisher.publish([b"overflow"])
-    assert len(publisher._take_attributes().attr) == 256
+    assert len(publisher._take_attributes().publish) == 256
 
     publisher.publish(boundary)
-    assert len(publisher._take_attributes().attr) == 256
+    assert len(publisher._take_attributes().publish) == 256
 
 
 def test_flame_service_abstract_minimal_implementation():

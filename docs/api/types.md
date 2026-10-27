@@ -407,18 +407,29 @@ message ExecutorSpec {
 
 ### ExecutorAttributes
 
-Opaque locality keys published by a service instance.
+Opaque locality keys published, or retracted, by a service instance.
 
 ```protobuf
 message ExecutorAttributes {
-  repeated bytes attr = 1;
+  repeated bytes publish = 1;
+  repeated bytes retract = 2;
 }
 ```
 
-Session Manager extends the executor's existing attribute set with every
-transported value. Keys remain until the executor is removed. Keys must be
-nonempty and no larger than 256 bytes; one publication may contain at most
-1,024 distinct keys and 64 KiB after deduplication.
+Session Manager adds every `publish` key to the executor's attribute set and
+removes every `retract` key from it. Keys not retracted remain until the
+executor is removed, including across unbind and rebind. Retracting an absent
+key is harmless, and a later publication can add it again. An update with both
+lists empty changes nothing.
+
+Keys must be nonempty and no larger than 256 bytes; each list may contain at
+most 1,024 distinct keys and 64 KiB after deduplication. Session Manager
+validates the whole update first and rejects it, leaving the attribute set
+unchanged, if either list is invalid or exceeds its limit, or if a key appears
+in both lists.
+
+Publisher and Session Manager must be upgraded together: a Session Manager
+that predates `retract` ignores the field instead of removing the keys.
 
 ### ExecutorStatus
 

@@ -7,7 +7,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from flamepy.app._context import _bind_invocation_context
+from flamepy.app._context import _bind_invocation_context, _stage_response_attributes
 from flamepy.app.runpy import FlameRunpyService
 from flamepy.app.types import ServiceContext
 from flamepy.core.service import ApplicationContext, SessionContext
@@ -80,15 +80,14 @@ class VllmEngineTest(unittest.TestCase):
         with _bind_invocation_context(session) as invocation_context:
             first = execution_object.generate("first")
             second = execution_object.generate("second")
-        service.publish(invocation_context.attributes)
+        _stage_response_attributes(invocation_context.attributes)
 
         self.assertEqual(FakeLLM.creations, 1)
         self.assertEqual(first.cached_tokens, 0)
         self.assertEqual(second.cached_tokens, 0)
-        self.assertEqual(
-            set(service._take_attributes().attr),
-            {kv_key(MODEL, "first"), kv_key(MODEL, "second")},
-        )
+        attributes = service._take_attributes()
+        self.assertEqual(set(attributes.publish), {kv_key(MODEL, "first"), kv_key(MODEL, "second")})
+        self.assertEqual(list(attributes.retract), [])
 
     def test_rebinding_reuses_cached_prompt(self) -> None:
         service = FlameRunpyService()
@@ -98,7 +97,7 @@ class VllmEngineTest(unittest.TestCase):
         session = SessionContext(None, "session", ApplicationContext("vllm-das"))
         with _bind_invocation_context(session) as invocation_context:
             first = first_execution_object.generate("same prompt")
-        service.publish(invocation_context.attributes)
+        _stage_response_attributes(invocation_context.attributes)
         service._take_attributes()
 
         asyncio.run(service.on_session_leave())
@@ -106,16 +105,15 @@ class VllmEngineTest(unittest.TestCase):
         second_execution_object = service._execution_object
         with _bind_invocation_context(session) as invocation_context:
             second = second_execution_object.generate("same prompt")
-        service.publish(invocation_context.attributes)
+        _stage_response_attributes(invocation_context.attributes)
 
         self.assertEqual(first.cached_tokens, 0)
         self.assertGreater(second.cached_tokens, 0)
         self.assertEqual(FakeLLM.creations, 1)
         self.assertIs(second_execution_object, first_execution_object)
-        self.assertEqual(
-            set(service._take_attributes().attr),
-            {kv_key(MODEL, "same prompt")},
-        )
+        attributes = service._take_attributes()
+        self.assertEqual(set(attributes.publish), {kv_key(MODEL, "same prompt")})
+        self.assertEqual(list(attributes.retract), [])
 
 
 if __name__ == "__main__":

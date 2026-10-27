@@ -12,7 +12,6 @@ limitations under the License.
 */
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use stdng::{lock_ptr, MutexPtr};
 
@@ -51,14 +50,47 @@ const MAX_EXECUTOR_ATTRIBUTES: usize = 1_024;
 const MAX_EXECUTOR_ATTRIBUTE_BYTES: usize = 256;
 const MAX_EXECUTOR_ATTRIBUTES_BYTES: usize = 64 * 1_024;
 
+/// Attribute changes recorded since the last response. A key is in at most one
+/// set, so the last operation on it wins.
+#[derive(Debug, Default)]
+struct PendingAttributes {
+    publish: HashSet<Vec<u8>>,
+    retract: HashSet<Vec<u8>>,
+}
+
+#[derive(Clone, Copy)]
+enum AttributeOp {
+    Publish,
+    Retract,
+}
+
+fn attribute_bytes(keys: &HashSet<Vec<u8>>) -> usize {
+    keys.iter().map(Vec::len).sum()
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Publisher {
-    attributes: MutexPtr<HashSet<Vec<u8>>>,
-    attributes_bytes: Arc<AtomicUsize>,
+    pending: MutexPtr<PendingAttributes>,
 }
 
 impl Publisher {
     fn publish<I, B>(&self, attributes: I) -> Result<(), FlameError>
+    where
+        I: IntoIterator<Item = B>,
+        B: Into<Vec<u8>>,
+    {
+        self.record(attributes, AttributeOp::Publish)
+    }
+
+    fn retract<I, B>(&self, attributes: I) -> Result<(), FlameError>
+    where
+        I: IntoIterator<Item = B>,
+        B: Into<Vec<u8>>,
+    {
+        self.record(attributes, AttributeOp::Retract)
+    }
+
+    fn record<I, B>(&self, attributes: I, op: AttributeOp) -> Result<(), FlameError>
     where
         I: IntoIterator<Item = B>,
         B: Into<Vec<u8>>,
@@ -78,38 +110,42 @@ impl Publisher {
                     || snapshot_bytes > MAX_EXECUTOR_ATTRIBUTES_BYTES
                 {
                     return Err(FlameError::InvalidConfig(
-                        "executor attribute publication exceeds configured limits".to_string(),
+                        "executor attribute update exceeds configured limits".to_string(),
                     ));
                 }
             }
         }
 
-        let mut current = lock_ptr!(self.attributes)?;
-        let current_bytes = self.attributes_bytes.load(Ordering::Relaxed);
+        let mut pending = lock_ptr!(self.pending)?;
+        let PendingAttributes { publish, retract } = &mut *pending;
+        let (target, opposite) = match op {
+            AttributeOp::Publish => (publish, retract),
+            AttributeOp::Retract => (retract, publish),
+        };
         let (added_count, added_bytes) = snapshot
-            .difference(&current)
+            .difference(target)
             .fold((0, 0), |(count, bytes), value| {
                 (count + 1, bytes + value.len())
             });
-        if current.len() + added_count > MAX_EXECUTOR_ATTRIBUTES
-            || current_bytes + added_bytes > MAX_EXECUTOR_ATTRIBUTES_BYTES
+        if target.len() + added_count > MAX_EXECUTOR_ATTRIBUTES
+            || attribute_bytes(target) + added_bytes > MAX_EXECUTOR_ATTRIBUTES_BYTES
         {
             return Err(FlameError::InvalidConfig(
-                "executor attribute publication exceeds configured limits".to_string(),
+                "executor attribute update exceeds configured limits".to_string(),
             ));
         }
-        current.extend(snapshot);
-        self.attributes_bytes
-            .fetch_add(added_bytes, Ordering::Relaxed);
+        opposite.retain(|value| !snapshot.contains(value));
+        target.extend(snapshot);
         Ok(())
     }
 
     #[doc(hidden)]
     pub fn take(&self) -> rpc::ExecutorAttributes {
-        let mut attributes = lock_ptr!(self.attributes).expect("publisher mutex poisoned");
-        self.attributes_bytes.store(0, Ordering::Relaxed);
+        let mut pending = lock_ptr!(self.pending).expect("publisher mutex poisoned");
+        let PendingAttributes { publish, retract } = std::mem::take(&mut *pending);
         rpc::ExecutorAttributes {
-            attr: std::mem::take(&mut *attributes).into_iter().collect(),
+            publish: publish.into_iter().collect(),
+            retract: retract.into_iter().collect(),
         }
     }
 }
@@ -196,6 +232,20 @@ impl FlameInstance {
         self.publisher.publish(attributes)
     }
 
+    /// Withdraw keys that are no longer valid, e.g. after a cache eviction.
+    pub fn retract<I, B>(&self, attributes: I) -> Result<(), FlameError>
+    where
+        I: IntoIterator<Item = B>,
+        B: Into<Vec<u8>>,
+    {
+        if !self.publisher_attached {
+            return Err(FlameError::InvalidConfig(
+                "flame instance is not attached to a service".to_string(),
+            ));
+        }
+        self.publisher.retract(attributes)
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session.session_id
     }
@@ -227,6 +277,16 @@ pub trait FlameService: Send + Sync + 'static {
         B: Into<Vec<u8>>,
     {
         self.publisher().publish(attributes)
+    }
+
+    /// Withdraw keys that are no longer valid, e.g. after a cache eviction.
+    fn retract<I, B>(&self, attributes: I) -> Result<(), FlameError>
+    where
+        Self: Sized,
+        I: IntoIterator<Item = B>,
+        B: Into<Vec<u8>>,
+    {
+        self.publisher().retract(attributes)
     }
 
     async fn on_session_enter(&self, _: SessionContext) -> Result<(), FlameError>;
@@ -563,11 +623,11 @@ mod tests {
         );
 
         assert_eq!(
-            response_a.unwrap().into_inner().attributes.unwrap().attr,
+            response_a.unwrap().into_inner().attributes.unwrap().publish,
             vec![b"instance-a".to_vec()]
         );
         assert_eq!(
-            response_b.unwrap().into_inner().attributes.unwrap().attr,
+            response_b.unwrap().into_inner().attributes.unwrap().publish,
             vec![b"instance-b".to_vec()]
         );
     }
@@ -594,7 +654,7 @@ mod tests {
         publisher
             .publish(vec![b"deduplicated".to_vec(); 1_025])
             .unwrap();
-        assert_eq!(publisher.take().attr.len(), 1);
+        assert_eq!(publisher.take().publish.len(), 1);
         let instance = FlameInstance::with_publisher(
             SessionContext::new(
                 "ssn-handle".to_string(),
@@ -608,7 +668,7 @@ mod tests {
             publisher.clone(),
         );
         instance.publish([b"instance-key".to_vec()]).unwrap();
-        assert_eq!(publisher.take().attr, vec![b"instance-key".to_vec()]);
+        assert_eq!(publisher.take().publish, vec![b"instance-key".to_vec()]);
         assert!(publisher.publish([vec![b'x'; 257]]).is_err());
         let too_many = (0_u16..1_025).map(|value| value.to_be_bytes().to_vec());
         assert!(publisher.publish(too_many).is_err());
@@ -631,8 +691,9 @@ mod tests {
         .into_inner();
         assert_eq!(failed_enter.result.unwrap().return_code, -1);
         assert!(failed_enter.attributes.is_none());
-        assert!(lock_ptr!(publisher.attributes)
+        assert!(lock_ptr!(publisher.pending)
             .unwrap()
+            .publish
             .contains(b"failed-enter-key".as_slice()));
 
         let enter = Instance::on_session_enter(
@@ -655,7 +716,7 @@ mod tests {
             enter
                 .attributes
                 .unwrap()
-                .attr
+                .publish
                 .into_iter()
                 .collect::<HashSet<_>>(),
             HashSet::from([b"failed-enter-key".to_vec()])
@@ -676,7 +737,7 @@ mod tests {
             invoke
                 .attributes
                 .unwrap()
-                .attr
+                .publish
                 .into_iter()
                 .collect::<HashSet<_>>(),
             HashSet::from([b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
@@ -693,7 +754,7 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(next_invoke.attributes.unwrap().attr.is_empty());
+        assert!(next_invoke.attributes.unwrap().publish.is_empty());
 
         let republished = Instance::on_task_invoke(
             &shim,
@@ -706,15 +767,16 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(republished.attributes.unwrap().attr.is_empty());
+        assert!(republished.attributes.unwrap().publish.is_empty());
 
         assert!(publisher.publish([Vec::new()]).is_err());
         publisher.publish([b"retained-key".to_vec()]).unwrap();
         Instance::on_session_leave(&shim, Request::new(rpc::EmptyRequest {}))
             .await
             .unwrap();
-        assert!(lock_ptr!(publisher.attributes)
+        assert!(lock_ptr!(publisher.pending)
             .unwrap()
+            .publish
             .contains(b"retained-key".as_slice()));
 
         let reenter = Instance::on_session_enter(
@@ -738,12 +800,12 @@ mod tests {
             reenter
                 .attributes
                 .unwrap()
-                .attr
+                .publish
                 .into_iter()
                 .collect::<HashSet<_>>(),
             expected
         );
-        assert!(publisher.take().attr.is_empty());
+        assert!(publisher.take().publish.is_empty());
 
         let empty_enter = Instance::on_session_enter(
             &shim,
@@ -761,7 +823,7 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(empty_enter.attributes.unwrap().attr.is_empty());
+        assert!(empty_enter.attributes.unwrap().publish.is_empty());
 
         let failed = Instance::on_task_invoke(
             &shim,
@@ -775,7 +837,10 @@ mod tests {
         .unwrap()
         .into_inner();
         assert_eq!(failed.task_result.unwrap().return_code, -1);
-        assert_eq!(failed.attributes.unwrap().attr, vec![b"error-key".to_vec()]);
+        assert_eq!(
+            failed.attributes.unwrap().publish,
+            vec![b"error-key".to_vec()]
+        );
 
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let publish_barrier = barrier.clone();
@@ -793,8 +858,8 @@ mod tests {
         let expected = HashSet::from([b"race-a".to_vec(), b"race-b".to_vec()]);
         let nonempty = [raced, after_race]
             .into_iter()
-            .filter(|attributes| !attributes.attr.is_empty())
-            .map(|attributes| attributes.attr.into_iter().collect::<HashSet<_>>())
+            .filter(|attributes| !attributes.publish.is_empty())
+            .map(|attributes| attributes.publish.into_iter().collect::<HashSet<_>>())
             .collect::<Vec<_>>();
         assert_eq!(nonempty, vec![expected]);
 
@@ -808,7 +873,7 @@ mod tests {
             )
             .unwrap();
         assert!(publisher.publish([b"one-key-too-many".to_vec()]).is_err());
-        assert_eq!(publisher.take().attr.len(), MAX_EXECUTOR_ATTRIBUTES);
+        assert_eq!(publisher.take().publish.len(), MAX_EXECUTOR_ATTRIBUTES);
 
         let byte_boundary = (0_u16..256)
             .map(|index| {
@@ -820,13 +885,61 @@ mod tests {
         publisher.publish(byte_boundary.clone()).unwrap();
         publisher.publish(byte_boundary.clone()).unwrap();
         assert!(publisher.publish([b"overflow".to_vec()]).is_err());
-        assert_eq!(publisher.take().attr.len(), byte_boundary.len());
+        assert_eq!(publisher.take().publish.len(), byte_boundary.len());
 
         publisher.publish(byte_boundary.clone()).unwrap();
-        assert_eq!(publisher.take().attr.len(), byte_boundary.len());
-        assert!(publisher.take().attr.is_empty());
+        assert_eq!(publisher.take().publish.len(), byte_boundary.len());
+        assert!(publisher.take().publish.is_empty());
 
         drop(shim);
         drop(publisher);
+    }
+
+    #[test]
+    fn publisher_records_retractions_with_last_operation_winning() {
+        let publisher = Publisher::default();
+        let set = |keys: Vec<Vec<u8>>| keys.into_iter().collect::<HashSet<_>>();
+
+        publisher.publish([b"x".to_vec(), b"y".to_vec()]).unwrap();
+        publisher
+            .retract([b"x".to_vec(), b"absent".to_vec()])
+            .unwrap();
+        let taken = publisher.take();
+        assert_eq!(set(taken.publish), set(vec![b"y".to_vec()]));
+        assert_eq!(
+            set(taken.retract),
+            set(vec![b"x".to_vec(), b"absent".to_vec()])
+        );
+        let drained = publisher.take();
+        assert!(drained.publish.is_empty() && drained.retract.is_empty());
+
+        // A later publication re-adds a retracted key, and vice versa.
+        publisher.retract([b"x".to_vec()]).unwrap();
+        publisher.publish([b"x".to_vec()]).unwrap();
+        publisher.publish([b"y".to_vec()]).unwrap();
+        publisher.retract([b"y".to_vec()]).unwrap();
+        let taken = publisher.take();
+        assert_eq!(taken.publish, vec![b"x".to_vec()]);
+        assert_eq!(taken.retract, vec![b"y".to_vec()]);
+
+        // Invalid or oversized updates leave the pending state unchanged.
+        publisher.publish([b"kept".to_vec()]).unwrap();
+        assert!(publisher.retract([b"z".to_vec(), Vec::new()]).is_err());
+        assert!(publisher.retract([vec![b'x'; 257]]).is_err());
+        let too_many = (0_u16..1_025).map(|value| value.to_be_bytes().to_vec());
+        assert!(publisher.retract(too_many).is_err());
+        let taken = publisher.take();
+        assert_eq!(taken.publish, vec![b"kept".to_vec()]);
+        assert!(taken.retract.is_empty());
+
+        // Each direction is bounded independently.
+        publisher
+            .retract((0..MAX_EXECUTOR_ATTRIBUTES).map(|index| format!("k-{index}").into_bytes()))
+            .unwrap();
+        assert!(publisher.retract([b"one-too-many".to_vec()]).is_err());
+        publisher.publish([b"still-fits".to_vec()]).unwrap();
+        let taken = publisher.take();
+        assert_eq!(taken.retract.len(), MAX_EXECUTOR_ATTRIBUTES);
+        assert_eq!(taken.publish, vec![b"still-fits".to_vec()]);
     }
 }

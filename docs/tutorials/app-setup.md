@@ -351,10 +351,13 @@ print(result.get())
 app.destroy()
 ```
 
-App publishes accumulated keys after every task invocation, including a failed
-task. Session Manager retains previously accepted keys, and publishing nothing
-is a no-op. Keys must be nonempty and at most 256 bytes. One publication
-round supports at most 1,024 distinct keys and 64 KiB after deduplication.
+App sends the accumulated changes after every task invocation, including a
+failed task. Session Manager retains previously accepted keys, and publishing
+nothing is a no-op. When the cache drops an entry, call
+`app.retract_attributes({key})` so the executor stops advertising it; keys
+that are not retracted stay advertised across rebinding. Keys must be nonempty
+and at most 256 bytes. One round supports at most 1,024 distinct keys and
+64 KiB after deduplication, separately for published and retracted keys.
 
 App constructs class execution objects from the supplied constructor arguments
 in each executor process. It retains an object by its handle's service ID when

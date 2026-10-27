@@ -206,8 +206,11 @@ Key classes and helpers:
   members have joined, such as a collective `init_process_group`, can use it as
   the world size. It raises `RuntimeError` outside an invocation.
 - `app.publish_attributes(attrs)` adds opaque `bytes` locality keys to the
-  current App response; repeated calls in the response accumulate. Session
-  Manager unions every response into the executor's retained set.
+  current App response; repeated calls in the response accumulate.
+- `app.retract_attributes(attrs)` retracts keys that are no longer valid,
+  such as an evicted cache entry. The last call on a key within a response wins.
+  Session Manager adds published keys to the executor's retained set and
+  removes retracted ones; retracting an absent key is harmless.
 - `init(name, fail_if_exists=False, dependencies=None, python_version=None)`
   packages and initializes the application and returns its runtime handle.
   Repeating it for the same name returns the same handle. `dependencies`

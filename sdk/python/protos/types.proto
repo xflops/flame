@@ -76,9 +76,11 @@ message TaskSpec {
 }
 
 // Volatile, executor-local data advertised by a service for affinity routing.
-// A publication extends the executor's retained attribute set.
+// An update adds `publish` keys to, and removes `retract` keys from, the
+// executor's retained attribute set. A key must not appear in both lists.
 message ExecutorAttributes {
-  repeated bytes attr = 1;
+  repeated bytes publish = 1;
+  repeated bytes retract = 2;
 }
 
 message Task {

@@ -2178,7 +2178,7 @@ async def test_runpy_binds_session_context_and_publishes_invocation_attributes()
     session = SessionContext(None, "session", ApplicationContext("app"))
 
     await svc.on_session_enter(session)
-    assert list(svc._take_attributes().attr) == []
+    assert list(svc._take_attributes().publish) == []
 
     request = ServiceRequest(method="run")
     object_ref = SimpleNamespace(encode=lambda: b"result-ref")
@@ -2187,7 +2187,7 @@ async def test_runpy_binds_session_context_and_publishes_invocation_attributes()
 
     assert cloudpickle.loads(result) == ServiceResponse(ValueRef("session"))
     put.assert_not_called()
-    assert set(svc._take_attributes().attr) == {b"b", b"c"}
+    assert set(svc._take_attributes().publish) == {b"b", b"c"}
 
 
 @pytest.mark.asyncio
@@ -2230,7 +2230,7 @@ async def test_runpy_keeps_concurrent_invocation_attributes_with_their_response(
     with patch("flamepy.app.runpy.aio_core.put_object", return_value=result_ref):
         responses = await asyncio.wait_for(asyncio.gather(invoke(0), invoke(1)), timeout=10)
 
-    assert [set(response.attributes.attr) for response in responses] == [
+    assert [set(response.attributes.publish) for response in responses] == [
         {b"invocation-0"},
         {b"invocation-1"},
     ]
@@ -2371,11 +2371,11 @@ async def test_app_runtime_helpers_are_invocation_scoped():
     with patch("flamepy.app.runpy.aio_core.put_object", return_value=result_ref):
         result = await svc.on_task_invoke(TaskContext("task", "session", cloudpickle.dumps(ServiceRequest(method="run"))))
     assert cloudpickle.loads(result) == ServiceResponse(ValueRef("session"))
-    assert set(svc._take_attributes().attr) == {b"initial", b"next"}
+    assert set(svc._take_attributes().publish) == {b"initial", b"next"}
 
     with pytest.raises(TypeError, match="must contain bytes"):
         await svc.on_task_invoke(TaskContext("task", "session", cloudpickle.dumps(ServiceRequest(method="invalid"))))
-    assert list(svc._take_attributes().attr) == []
+    assert list(svc._take_attributes().publish) == []
 
 
 def test_app_service_validates_combined_publication_limit():
@@ -2391,7 +2391,7 @@ def test_app_service_validates_combined_publication_limit():
         with pytest.raises(ValueError, match="exceeds configured limits"):
             app.publish_attributes({b"overflow"})
 
-    assert invocation_context.attributes == attributes
+    assert invocation_context.attributes.publish == attributes
 
 
 def test_app_get_resolves_futures():

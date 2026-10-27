@@ -392,10 +392,12 @@ API names such as `close`.
 
 During an App invocation, `app.session_context()` returns the active session
 context, while `app.publish_attributes(attrs)` adds opaque `bytes` keys to the
-current response. Repeated calls in one response accumulate; App publishes and
-drains the set at the response boundary. Session Manager unions every response
-into the executor's retained attribute set. Task calls can request a matching
-instance with `TaskOptions(affinity={key})`.
+current response, and `app.retract_attributes(attrs)` retracts keys that are
+no longer valid, such as a cache entry that was evicted. Repeated calls in one
+response accumulate, with the last call on a key winning; App sends and drains
+the changes at the response boundary. Session Manager adds the published keys
+to the executor's retained attribute set and removes the retracted ones. Task
+calls can request a matching instance with `TaskOptions(affinity={key})`.
 
 The returned service-side context is the core `flamepy.SessionContext`. An inner
 `@app.service()` declaration made during a service invocation can call
@@ -437,7 +439,7 @@ The repository-level check validates the `flmrun` template, App package upload/i
 | Applications | `register_application()`, `unregister_application()`, `get_application()`, `list_applications()` |
 | Services | `FlameService`, `flamepy.run()`, `flamepy.serving.Instance`, `flamepy.serving.open_session()` |
 | Objects | `put_object()`, `get_object()`, `patch_object()`, `delete_objects()`, `upload_package()`, `download_package()` |
-| App | `flamepy.app.init()`, `flamepy.app.service()`, `flamepy.app.destroy()`, `flamepy.app.session_context()`, `flamepy.app.publish_attributes()`, `ServiceInstance`, `ObjectFuture` |
+| App | `flamepy.app.init()`, `flamepy.app.service()`, `flamepy.app.destroy()`, `flamepy.app.session_context()`, `flamepy.app.publish_attributes()`, `flamepy.app.retract_attributes()`, `ServiceInstance`, `ObjectFuture` |
 
 See also:
 
