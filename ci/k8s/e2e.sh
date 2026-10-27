@@ -44,6 +44,8 @@ CACHE_CLIENT_TLS_SECRET="${RELEASE}-cache-client-tls"
 EXTERNAL_ACCESS_TEMPLATE="${ROOT_DIR}/ci/k8s/external-access.yaml"
 VM_CLIENT_CONFIG_TEMPLATE="${ROOT_DIR}/ci/k8s/flame-vm.yaml"
 RENDERED_EXTERNAL_ACCESS="${TMPDIR:-/tmp}/flame-k8s-e2e-external-access.yaml"
+CLIENT_POLICY_TEMPLATE="${ROOT_DIR}/ci/k8s/external-access-client-policy.yaml"
+RENDERED_CLIENT_POLICY="${TMPDIR:-/tmp}/flame-k8s-e2e-client-policy.yaml"
 
 CLIENT_ROOT=""
 CLIENT_CONTAINER=""
@@ -102,7 +104,7 @@ cleanup() {
     if [[ -n "$CLIENT_ROOT" && -d "$CLIENT_ROOT" ]]; then
         rm -rf -- "$CLIENT_ROOT"
     fi
-    rm -f -- "$RENDERED_EXTERNAL_ACCESS"
+    rm -f -- "$RENDERED_EXTERNAL_ACCESS" "$RENDERED_CLIENT_POLICY"
 }
 
 finish() {
@@ -318,6 +320,12 @@ create_external_access() {
         --from-file=ca.crt="$client_ca_file" --dry-run=client -o yaml \
         | kubectl apply -f -
     rm -f -- "$client_ca_file"
+
+    # Create the policy only now: Envoy Gateway marks a policy whose trust secret does not exist yet
+    # as Invalid and has not re-evaluated it when the secret appears.
+    envsubst '${NAMESPACE} ${GATEWAY} ${CACHE_CLIENT_POLICY} ${CACHE_CLIENT_TRUST_SECRET}' \
+        <"$CLIENT_POLICY_TEMPLATE" >"$RENDERED_CLIENT_POLICY"
+    kubectl apply -f "$RENDERED_CLIENT_POLICY"
 
     kubectl -n "$NAMESPACE" wait \
         --for=condition=Ready "certificate/${RELEASE}-cache-server" \
