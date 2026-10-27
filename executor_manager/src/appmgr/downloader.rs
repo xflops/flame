@@ -218,11 +218,7 @@ where
     let temp_path = dest_path.with_extension("tmp");
     let encoded_path = dest_path.with_extension("zstd.tmp");
     let result = async {
-        let write_path = if compressed {
-            &encoded_path
-        } else {
-            &temp_path
-        };
+        let write_path = if compressed { &encoded_path } else { &temp_path };
         let mut file = tokio::fs::File::create(write_path)
             .await
             .map_err(|e| FlameError::Internal(format!("failed to create temp file: {}", e)))?;

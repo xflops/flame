@@ -192,11 +192,7 @@ impl SqliteEngine {
             has_condition = true;
         }
         if let Some(state) = filter.state {
-            query.push(if has_condition {
-                " AND state="
-            } else {
-                " WHERE state="
-            });
+            query.push(if has_condition { " AND state=" } else { " WHERE state=" });
             query.push_bind(state as i32);
             has_condition = true;
         }

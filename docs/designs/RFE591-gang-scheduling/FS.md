@@ -33,7 +33,11 @@ When the cluster can supply only part of the minimum, the session keeps what it 
    held" and a small `Statement` type. Allocate and Shuffle are unchanged.
 4. A gang member can read the session id, the task id and `batch_size` at run time.
 5. `min_instances` keeps its own meaning: long-lived instances that are warmed up and never
-   trimmed. It is not a gang and does not take part in the all-or-nothing bind.
+   trimmed. On a session that is not a gang it is not part of the all-or-nothing bind. A gang
+   is the whole session: its `min_instances` is 0 or `batch_size` and its `max_instances` is
+   unset or `batch_size`, and a session that sets anything else is rejected when it is created.
+   A gang with `min_instances` equal to `batch_size` is kept warm, and is formed all at once like
+   any other, even before its first task exists.
 
 **Non-goals**
 
@@ -188,7 +192,9 @@ only gang knob:
 - SQLite: a new migration adds `sessions.batch_size` back (the earlier migration that dropped
   it is unchanged). The filesystem engine reads sessions written without the field as 1.
 - `min_instances` goes back to its meaning before #593: warm-up and the floor that Shuffle and
-  the MinMax plugin keep. It no longer takes part in `is_satisfied`.
+  the MinMax plugin keep. On a session that is not a gang it no longer takes part in
+  `is_satisfied`. A gang's `min_instances` is 0 or `batch_size`; with `batch_size` the gang is
+  kept warm, and MinMax's `is_satisfied` counts it as a gang whether or not a task is pending.
 
 The reserved executor column `batch_index` is not part of this change.
 
@@ -203,9 +209,11 @@ The reserved executor column `batch_index` is not part of this change.
 
 | Case | Behavior |
 | ---- | -------- |
-| `batch_size > max_instances` | The gang size is capped at the limit (4.2). |
-| Gang larger than the session limit | The gang size is capped at the limit (4.2). |
-| Gang session with no pending task | Not a gang: it needs and holds only what `min_instances` and its running tasks need. |
+| A gang whose `min_instances` is not 0 or `batch_size`, or whose `max_instances` is not unset or `batch_size` | Rejected when the session is created, as an invalid argument. |
+| `batch_size` above the application's `max_instances` | Rejected when the session is created. |
+| Gang larger than a cluster-wide session limit | The gang size is capped at the limit (4.2). |
+| Gang session with no pending task and `min_instances` 0 | Not a gang yet: it needs and holds only what its running tasks need. |
+| Gang kept warm (`min_instances` = `batch_size`) with no pending task | Formed all at once like any gang, and held. |
 | Gang larger than the cluster | Never satisfied; Dispatch discards each cycle and logs a debug line. |
 | Executor of a gang session released or interrupted | Count drops below the minimum; Dispatch binds a replacement only when the whole shortfall can be bound. Running tasks are not stopped by the scheduler. |
 | Two gangs competing for Idle executors | Sessions are processed in plugin order. The first stages and commits; the second finds too few Idle executors and discards. |
@@ -257,7 +265,7 @@ to `batch_size`, together with `app.context()`.
 
 ## 9. Open questions
 
-1. Resolved: a session opts in with `batch_size >= 2`; `min_instances` never makes a gang.
+1. Resolved: a session opts in with `batch_size >= 2`; `min_instances` never makes a gang on its own, but a gang's `min_instances` may be its size, to keep it warm.
 2. Report a gang that cannot start (a session event or condition) so users see why it is pending.
 3. Stage Allocate's pipeline and creation in the `Statement` too, so a gang assembles in one
    cycle and Idle executors it waits on are counted (4.3)? It needs inverse plugin hooks for pipeline and create and deferred executor creation.

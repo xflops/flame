@@ -826,6 +826,98 @@ mod tests {
         Ok(())
     }
 
+    /// A cluster of one node with `slots` executors of cpu 1, and a session of `batch_size` and
+    /// `min_instances` with `tasks` pending tasks that runs `cycles` scheduling cycles. Returns the
+    /// number of executors the session holds.
+    fn executors_held(
+        policies: &[&str],
+        slots: u32,
+        batch_size: u32,
+        min_instances: u32,
+        tasks: u32,
+        cycles: usize,
+    ) -> Result<usize, FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        let mut node = new_test_node("node_1".to_string());
+        node.capacity = ResourceRequirement {
+            cpu: slots as u64,
+            memory: slots as u64 * 1024,
+            gpu: 0,
+        };
+        node.allocatable = node.capacity.clone();
+        tokio_test::block_on(controller.storage().register_node(&node))?;
+        let session =
+            tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+                id: format!("kept-warm-{}", Uuid::new_v4()),
+                application: "flmtest".to_string(),
+                batch_size,
+                min_instances,
+                resreq: Some(ResourceRequirement {
+                    cpu: 1,
+                    memory: 1024,
+                    gpu: 0,
+                }),
+                ..Default::default()
+            }))?;
+        for _ in 0..tasks {
+            tokio_test::block_on(controller.create_task(session.id.clone(), None, None))?;
+        }
+        let options = PluginsOptions {
+            policies: policies.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        };
+        for _ in 0..cycles {
+            cycle(&controller, &options)?;
+        }
+        Ok(controller
+            .list_executors()?
+            .iter()
+            .filter(|e| e.ssn_id.as_deref() == Some(session.id.as_str()))
+            .count())
+    }
+
+    /// A gang is created with `min_instances` equal to its size so its executors stay, and the
+    /// session exists before its first task. Idle executors must not be bound to it one by one in
+    /// between: the gang is formed all at once, or not at all.
+    #[test]
+    fn test_gang_kept_warm_binds_all_at_once_even_without_a_task() -> Result<(), FlameError> {
+        for policies in [["priority", "das"], ["drf", "das"]] {
+            // Larger than the cluster: nothing is bound, with a task or without.
+            assert_eq!(
+                executors_held(&policies, 6, 7, 7, 0, 12)?,
+                0,
+                "{policies:?}"
+            );
+            assert_eq!(
+                executors_held(&policies, 6, 7, 7, 7, 12)?,
+                0,
+                "{policies:?}"
+            );
+            // It fits: all of it is bound, with a task or without.
+            assert_eq!(
+                executors_held(&policies, 7, 7, 7, 0, 12)?,
+                7,
+                "{policies:?}"
+            );
+            assert_eq!(
+                executors_held(&policies, 7, 7, 7, 7, 12)?,
+                7,
+                "{policies:?}"
+            );
+            // Not kept warm: it waits for its tasks.
+            assert_eq!(
+                executors_held(&policies, 7, 7, 0, 0, 12)?,
+                0,
+                "{policies:?}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_drf_rebalances_a_session_holding_the_whole_cluster() -> Result<(), FlameError> {
         let env = TestEnv::new()?;

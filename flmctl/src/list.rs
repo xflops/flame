@@ -103,11 +103,7 @@ async fn list_sessions(conn: Connection, output_format: &str) -> Result<(), Box<
     ]);
 
     ssn_list.sort_by_key(|ssn| {
-        let rank = if ssn.state == SessionState::Open {
-            0
-        } else {
-            1
-        };
+        let rank = if ssn.state == SessionState::Open { 0 } else { 1 };
         (
             rank,
             ssn.state as i32,
