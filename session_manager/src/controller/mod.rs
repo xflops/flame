@@ -94,6 +94,13 @@ impl ConnectionCallbacks for NodeCallbacks {
     }
 }
 
+/// A validated executor attribute update: keys to add and keys to remove.
+#[derive(Default)]
+struct ExecutorAttributeUpdate {
+    publish: HashSet<bytes::Bytes>,
+    retract: HashSet<bytes::Bytes>,
+}
+
 pub struct Controller {
     storage: StoragePtr,
     connection_manager: ConnectionManager<NodeCallbacks>,
@@ -135,37 +142,48 @@ impl Controller {
         self.notifier.scheduler.notify();
     }
 
-    fn validate_executor_attributes(
-        attributes: rpc::ExecutorAttributes,
-    ) -> Result<HashSet<bytes::Bytes>, FlameError> {
-        let mut attr = HashSet::with_capacity(attributes.attr.len());
+    fn validate_attribute_keys(keys: Vec<Vec<u8>>) -> Result<HashSet<bytes::Bytes>, FlameError> {
+        let mut set = HashSet::with_capacity(keys.len());
         let mut total_bytes = 0usize;
-        for value in attributes.attr {
+        for value in keys {
             let value_len = value.len();
             if value.is_empty() || value_len > Self::MAX_EXECUTOR_ATTRIBUTE_BYTES {
                 return Err(FlameError::InvalidConfig(
                     "executor attributes must be nonempty and at most 256 bytes".to_string(),
                 ));
             }
-            if attr.insert(bytes::Bytes::from(value)) {
+            if set.insert(bytes::Bytes::from(value)) {
                 total_bytes += value_len;
             }
         }
-        if attr.len() > Self::MAX_EXECUTOR_ATTRIBUTES
+        if set.len() > Self::MAX_EXECUTOR_ATTRIBUTES
             || total_bytes > Self::MAX_EXECUTOR_ATTRIBUTES_BYTES
         {
             return Err(FlameError::InvalidConfig(
-                "executor attribute publication exceeds configured limits".to_string(),
+                "executor attribute update exceeds configured limits".to_string(),
             ));
         }
+        Ok(set)
+    }
 
-        Ok(attr)
+    /// Validates the whole update before any of it is applied.
+    fn validate_executor_attributes(
+        attributes: rpc::ExecutorAttributes,
+    ) -> Result<ExecutorAttributeUpdate, FlameError> {
+        let publish = Self::validate_attribute_keys(attributes.publish)?;
+        let retract = Self::validate_attribute_keys(attributes.retract)?;
+        if !publish.is_disjoint(&retract) {
+            return Err(FlameError::InvalidConfig(
+                "executor attributes must not be published and retracted in one update".to_string(),
+            ));
+        }
+        Ok(ExecutorAttributeUpdate { publish, retract })
     }
 
     fn update_executor_attributes(
         &self,
         id: &ExecutorID,
-        attributes: HashSet<bytes::Bytes>,
+        update: ExecutorAttributeUpdate,
     ) -> Result<(), FlameError> {
         let executor = self.storage.get_executor_ptr(id.clone())?;
         let mut executor = lock_ptr!(executor)?;
@@ -179,7 +197,10 @@ impl Controller {
                 "executor <{id}> must have a session before publishing attributes"
             ))
         })?;
-        executor.attributes.extend(attributes);
+        executor
+            .attributes
+            .retain(|key| !update.retract.contains(key));
+        executor.attributes.extend(update.publish);
         Ok(())
     }
 
@@ -1224,25 +1245,29 @@ mod tests {
     fn executor_attributes_reject_invalid_keys_before_indexing() {
         assert!(
             Controller::validate_executor_attributes(rpc::ExecutorAttributes {
-                attr: vec![vec![]],
+                publish: vec![vec![]],
+                ..Default::default()
             })
             .is_err()
         );
         assert!(
             Controller::validate_executor_attributes(rpc::ExecutorAttributes {
-                attr: vec![vec![0; 257]],
+                publish: vec![vec![0; 257]],
+                ..Default::default()
             })
             .is_err()
         );
 
         let attributes = Controller::validate_executor_attributes(rpc::ExecutorAttributes {
-            attr: vec![b"kv-cache-key".to_vec(), b"kv-cache-key".to_vec()],
+            publish: vec![b"kv-cache-key".to_vec(), b"kv-cache-key".to_vec()],
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(
-            attributes,
+            attributes.publish,
             HashSet::from([bytes::Bytes::from_static(b"kv-cache-key")])
         );
+        assert!(attributes.retract.is_empty());
 
         let byte_boundary = (0_u16..256)
             .map(|index| {
@@ -1253,7 +1278,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(
             Controller::validate_executor_attributes(rpc::ExecutorAttributes {
-                attr: byte_boundary.clone(),
+                publish: byte_boundary.clone(),
+                ..Default::default()
             })
             .is_ok()
         );
@@ -1262,10 +1288,54 @@ mod tests {
         over_byte_limit.push(b"overflow".to_vec());
         assert!(
             Controller::validate_executor_attributes(rpc::ExecutorAttributes {
-                attr: over_byte_limit,
+                publish: over_byte_limit,
+                ..Default::default()
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn executor_attribute_retractions_are_validated_with_the_whole_update() {
+        assert!(
+            Controller::validate_executor_attributes(rpc::ExecutorAttributes {
+                retract: vec![vec![]],
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            Controller::validate_executor_attributes(rpc::ExecutorAttributes {
+                retract: vec![vec![0; 257]],
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            Controller::validate_executor_attributes(rpc::ExecutorAttributes {
+                publish: vec![b"x".to_vec()],
+                retract: vec![b"x".to_vec()],
+            })
+            .is_err()
+        );
+        let too_many = (0..=Controller::MAX_EXECUTOR_ATTRIBUTES)
+            .map(|index| format!("key-{index}").into_bytes())
+            .collect::<Vec<_>>();
+        assert!(
+            Controller::validate_executor_attributes(rpc::ExecutorAttributes {
+                publish: vec![b"ok".to_vec()],
+                retract: too_many,
+            })
+            .is_err()
+        );
+
+        let update = Controller::validate_executor_attributes(rpc::ExecutorAttributes {
+            publish: vec![b"x".to_vec()],
+            retract: vec![b"y".to_vec(), b"y".to_vec()],
+        })
+        .unwrap();
+        assert_eq!(update.publish.len(), 1);
+        assert_eq!(update.retract.len(), 1);
     }
 
     /// Creates a test storage with a unique SQLite database.
@@ -1743,7 +1813,8 @@ mod tests {
                     message: None,
                 },
                 Some(rpc::ExecutorAttributes {
-                    attr: vec![b"completed-key".to_vec()],
+                    publish: vec![b"completed-key".to_vec()],
+                    ..Default::default()
                 }),
             )
             .await
@@ -1791,7 +1862,8 @@ mod tests {
                     message: None,
                 }),
                 Some(rpc::ExecutorAttributes {
-                    attr: vec![b"kv-cache-key".to_vec()],
+                    publish: vec![b"kv-cache-key".to_vec()],
+                    ..Default::default()
                 }),
             )
             .await
@@ -1804,7 +1876,7 @@ mod tests {
         );
 
         controller
-            .update_executor_attributes(&executor_id, HashSet::new())
+            .update_executor_attributes(&executor_id, ExecutorAttributeUpdate::default())
             .unwrap();
         assert_eq!(
             controller
@@ -1831,7 +1903,8 @@ mod tests {
                     output: None,
                 },
                 Some(rpc::ExecutorAttributes {
-                    attr: vec![b"second-key".to_vec()],
+                    publish: vec![b"second-key".to_vec()],
+                    ..Default::default()
                 }),
             )
             .await
@@ -1880,6 +1953,122 @@ mod tests {
             .await
             .unwrap();
         assert!(controller.get_executor(executor_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn executor_retracts_attributes_and_keeps_the_rest_on_unbind() {
+        let storage = create_test_storage().await;
+        let controller = new_ptr(storage);
+        let ssn_id = "executor-attributes-retract".to_string();
+        let executor_id = create_binding_executor(&controller, &ssn_id).await;
+        let key = |value: &'static [u8]| bytes::Bytes::from_static(value);
+
+        controller
+            .bind_executor_completed(
+                executor_id.clone(),
+                Some(FlameResult {
+                    return_code: BIND_RESULT_OK,
+                    message: None,
+                }),
+                Some(rpc::ExecutorAttributes {
+                    publish: vec![b"x".to_vec(), b"y".to_vec()],
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        // An invalid update leaves the previous state unchanged.
+        controller
+            .create_task(ssn_id.clone(), None, None)
+            .await
+            .unwrap();
+        controller
+            .launch_task(executor_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let succeed = || TaskResult {
+            state: TaskState::Succeed,
+            message: None,
+            output: None,
+        };
+        assert!(controller
+            .complete_task(
+                executor_id.clone(),
+                succeed(),
+                Some(rpc::ExecutorAttributes {
+                    publish: vec![b"z".to_vec()],
+                    retract: vec![b"x".to_vec(), vec![]],
+                }),
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            controller
+                .get_executor(executor_id.clone())
+                .unwrap()
+                .attributes,
+            HashSet::from([key(b"x"), key(b"y")])
+        );
+
+        // Retracting X (and an absent key) keeps Y; an empty update is a no-op.
+        controller
+            .complete_task(
+                executor_id.clone(),
+                succeed(),
+                Some(rpc::ExecutorAttributes {
+                    retract: vec![b"x".to_vec(), b"absent".to_vec()],
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            controller
+                .get_executor(executor_id.clone())
+                .unwrap()
+                .attributes,
+            HashSet::from([key(b"y")])
+        );
+        controller
+            .update_executor_attributes(&executor_id, ExecutorAttributeUpdate::default())
+            .unwrap();
+
+        // The retraction survives an ordinary unbind.
+        controller
+            .unbind_executor(executor_id.clone())
+            .await
+            .unwrap();
+        controller
+            .unbind_executor_completed(executor_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            controller
+                .get_executor(executor_id.clone())
+                .unwrap()
+                .attributes,
+            HashSet::from([key(b"y")])
+        );
+
+        // A replacement executor starts without the retired executor's keys.
+        let replacement_ssn = "executor-attributes-replacement";
+        controller
+            .create_session(create_test_session_attr(replacement_ssn))
+            .await
+            .unwrap();
+        let replacement = controller
+            .create_executor("bind-node".to_string(), replacement_ssn.to_string())
+            .await
+            .unwrap();
+        controller.register_executor(&replacement).await.unwrap();
+        assert_ne!(replacement.id, executor_id);
+        assert!(controller
+            .get_executor(replacement.id)
+            .unwrap()
+            .attributes
+            .is_empty());
     }
 
     #[tokio::test]

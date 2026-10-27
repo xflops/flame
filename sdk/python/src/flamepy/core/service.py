@@ -18,6 +18,7 @@ import threading
 from abc import abstractmethod
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Dict, FrozenSet, Iterable, Optional
 
 # Handle typing.override compatibility for Python < 3.12
@@ -46,29 +47,61 @@ _MAX_ATTRIBUTE_BYTES = 256
 _MAX_ATTRIBUTES_BYTES = 64 * 1_024
 
 
+class _AttributeOp(Enum):
+    """How a set of keys changes the executor's advertised attributes."""
+
+    PUBLISH = "publish"
+    RETRACT = "retract"
+
+
+class _AttributeDelta:
+    """Attribute changes recorded since the last response.
+
+    A key is in at most one set, so the last operation on it wins. Callers
+    serialize access.
+    """
+
+    def __init__(self) -> None:
+        self.publish: set[bytes] = set()
+        self.retract: set[bytes] = set()
+
+    def record(self, keys: FrozenSet[bytes], op: _AttributeOp) -> None:
+        """Record ``keys`` as published or retracted; unchanged on a limit error."""
+        if op is _AttributeOp.PUBLISH:
+            target, opposite = self.publish, self.retract
+        else:
+            target, opposite = self.retract, self.publish
+        added = keys.difference(target)
+        if len(target) + len(added) > _MAX_ATTRIBUTE_COUNT or sum(map(len, target)) + sum(map(len, added)) > _MAX_ATTRIBUTES_BYTES:
+            raise ValueError("executor attribute update exceeds configured limits")
+        opposite.difference_update(keys)
+        target.update(added)
+
+    def take(self) -> ExecutorAttributes:
+        attributes = ExecutorAttributes(publish=list(self.publish), retract=list(self.retract))
+        self.publish = set()
+        self.retract = set()
+        return attributes
+
+
 class _Publisher:
     """Attributes accumulated for the next shim response."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._attributes: set[bytes] = set()
-        self._attribute_bytes = 0
+        self._delta = _AttributeDelta()
 
     def publish(self, attributes: FrozenSet[bytes]) -> None:
         with self._lock:
-            added = attributes.difference(self._attributes)
-            added_bytes = sum(map(len, added))
-            if len(self._attributes) + len(added) > _MAX_ATTRIBUTE_COUNT or self._attribute_bytes + added_bytes > _MAX_ATTRIBUTES_BYTES:
-                raise ValueError("executor attribute publication exceeds configured limits")
-            self._attributes.update(added)
-            self._attribute_bytes += added_bytes
+            self._delta.record(attributes, _AttributeOp.PUBLISH)
+
+    def retract(self, attributes: FrozenSet[bytes]) -> None:
+        with self._lock:
+            self._delta.record(attributes, _AttributeOp.RETRACT)
 
     def take(self) -> ExecutorAttributes:
         with self._lock:
-            attributes = self._attributes
-            self._attributes = set()
-            self._attribute_bytes = 0
-            return ExecutorAttributes(attr=list(attributes))
+            return self._delta.take()
 
 
 _active_response_publisher: ContextVar[Optional[_Publisher]] = ContextVar("flamepy_active_response_publisher", default=None)
@@ -85,7 +118,7 @@ def _validate_attributes(attributes: Iterable[bytes]) -> FrozenSet[bytes]:
     if any(not key or len(key) > _MAX_ATTRIBUTE_BYTES for key in snapshot):
         raise ValueError("executor attributes must be nonempty and at most 256 bytes")
     if len(snapshot) > _MAX_ATTRIBUTE_COUNT or sum(map(len, snapshot)) > _MAX_ATTRIBUTES_BYTES:
-        raise ValueError("executor attribute publication exceeds configured limits")
+        raise ValueError("executor attribute update exceeds configured limits")
     return snapshot
 
 
@@ -151,6 +184,10 @@ class FlameService:
     def publish(self, attributes: Iterable[bytes]) -> None:
         """Add locality keys to this instance's next response."""
         self._publisher().publish(_validate_attributes(attributes))
+
+    def retract(self, attributes: Iterable[bytes]) -> None:
+        """Withdraw locality keys that are no longer valid, e.g. after a cache eviction."""
+        self._publisher().retract(_validate_attributes(attributes))
 
     def _take_attributes(self) -> ExecutorAttributes:
         return self._publisher().take()

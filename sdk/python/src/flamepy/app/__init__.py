@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from flamepy.app._context import InstanceContext, context, publish_attributes, session_context
+from flamepy.app._context import InstanceContext, context, publish_attributes, retract_attributes, session_context
 from flamepy.app.types import ServiceContext, ServiceRequest, ServiceResponse
 from flamepy.core import Ref, ValueRef
 
@@ -53,6 +53,7 @@ __all__ = [
     "publish_attributes",
     "ref",
     "remote",
+    "retract_attributes",
     "select",
     "service",
     "session_context",

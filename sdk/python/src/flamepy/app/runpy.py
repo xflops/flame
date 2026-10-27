@@ -58,7 +58,7 @@ class FlameRunpyService(AioFlameService):
         """Take attributes belonging to the invocation assembling this response."""
         attributes = _take_response_attributes()
         if attributes is not None:
-            return ExecutorAttributes(attr=list(attributes))
+            return attributes
         return super()._take_attributes()
 
     def _set_execution_from_context(self, service_context: ServiceContext) -> None:

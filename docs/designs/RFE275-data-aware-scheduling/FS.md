@@ -184,7 +184,9 @@ is not overloaded:
 
 ```protobuf
 message ExecutorAttributes {
-  repeated bytes attr = 1;
+  repeated bytes publish = 1;
+  // Added by #632: keys to remove from the retained set.
+  repeated bytes retract = 2;
 }
 
 message OnTaskInvokeResponse {

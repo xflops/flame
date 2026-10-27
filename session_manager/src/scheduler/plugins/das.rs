@@ -154,6 +154,28 @@ mod tests {
     }
 
     #[test]
+    fn retracted_key_gives_no_affinity_advantage() {
+        let session = session("session", vec![task("session", 1, &[b"x"])]);
+        let plugin = setup(&session);
+        let advertising = executor("a", &[b"x", b"y"]);
+        let retracted = executor("b", &[b"y"]);
+        assert_eq!(plugin.score(&advertising, &session), 1);
+        assert_eq!(plugin.score(&retracted, &session), 0);
+        assert_eq!(
+            plugin.executor_order_fn(&session, &advertising, &retracted),
+            Some(Ordering::Greater)
+        );
+
+        // With X retracted from A, the smaller id wins instead of stale residency.
+        let evicted = executor("a", &[b"y"]);
+        let other = executor("b", &[b"y"]);
+        assert_eq!(
+            plugin.score(&evicted, &session),
+            plugin.score(&other, &session)
+        );
+    }
+
+    #[test]
     fn setup_rebuilds_affinity_without_stale_keys() {
         let first = session("session", vec![task("session", 1, &[b"old"])]);
         let mut plugin = setup(&first);

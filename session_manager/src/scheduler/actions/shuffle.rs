@@ -232,7 +232,8 @@ mod tests {
                     message: None,
                 },
                 Some(rpc::flame::v1::ExecutorAttributes {
-                    attr: vec![b"task-completed".to_vec()],
+                    publish: vec![b"task-completed".to_vec()],
+                    ..Default::default()
                 }),
             )
             .await

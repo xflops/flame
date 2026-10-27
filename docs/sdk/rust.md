@@ -213,11 +213,14 @@ impl FlameService for RawService {
 
 `self.publish()` and the runtime-provided `FlameInstance::publish()` add opaque
 locality keys to the next successful session-enter response or the next task
-response, including a failed task. Calls in one round are unioned, and the
-transported set extends the executor's retained attributes. Keys must be
-nonempty and at most 256 bytes; a round supports at most 1,024 distinct keys and
-64 KiB after deduplication. A manually constructed `FlameInstance` is not
-attached to a service publisher, so its `publish()` method returns an error.
+response, including a failed task. `retract()` withdraws keys, for example
+after a cache eviction. Calls in one round are merged with the last operation on
+a key winning, and the transported changes update the executor's retained
+attributes. Keys must be nonempty and at most 256 bytes; a round supports at
+most 1,024 distinct keys and 64 KiB after deduplication, separately for
+published and retracted keys. A manually constructed `FlameInstance` is not
+attached to a service publisher, so its `publish()` and `retract()` methods
+return an error.
 
 ## Use Object Cache
 

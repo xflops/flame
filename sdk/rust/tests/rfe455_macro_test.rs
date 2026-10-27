@@ -137,8 +137,11 @@ async fn instance_entrypoint_can_use_typed_common_data() {
         .on_session_enter(session_context(Some(common_data)))
         .await
         .unwrap();
-    assert_eq!(service.publisher().take().attr, vec![b"entered".to_vec()]);
-    assert!(service.publisher().take().attr.is_empty());
+    assert_eq!(
+        service.publisher().take().publish,
+        vec![b"entered".to_vec()]
+    );
+    assert!(service.publisher().take().publish.is_empty());
 
     let input = Number { value: 7 }.encode().unwrap();
     let output = service

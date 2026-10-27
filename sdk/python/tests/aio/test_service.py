@@ -59,7 +59,7 @@ def test_aio_shim_handles_concurrent_hooks_and_isolates_attributes(monkeypatch):
                 for i, response in enumerate(responses):
                     assert response.task_result.return_code == 0
                     assert response.task_result.output == b"payload"
-                    assert set(response.attributes.attr) == {str(i).encode()}
+                    assert set(response.attributes.publish) == {str(i).encode()}
                 leave = await stub.OnSessionLeave(types_pb2.EmptyRequest())
                 assert leave.return_code == 0
         finally:
@@ -69,6 +69,44 @@ def test_aio_shim_handles_concurrent_hooks_and_isolates_attributes(monkeypatch):
         endpoint = str(Path(directory) / "shim.sock")
         monkeypatch.setenv(aio_service.FLAME_INSTANCE_ENDPOINT, endpoint)
         asyncio.run(exercise())
+
+
+def test_aio_shim_isolates_retractions_per_hook_including_failures():
+    class Service(aio_service.FlameService):
+        async def on_session_enter(self, context):
+            pass
+
+        async def on_task_invoke(self, context):
+            self.publish({b"shared", context.task_id.encode()})
+            await asyncio.sleep(0.01)
+            self.retract({b"shared"} if context.task_id != "bad" else {b"bad-evicted"})
+            if context.task_id == "bad":
+                raise RuntimeError("boom")
+            return context.input
+
+        async def on_session_leave(self):
+            pass
+
+    async def exercise():
+        servicer = aio_service.FlameInstanceServicer(Service())
+        try:
+            request = lambda task_id: shim_pb2.TaskContext(task_id=task_id, session_id="session", input=b"")  # noqa: E731
+            good_a, good_b, bad = await asyncio.gather(
+                servicer.OnTaskInvoke(request("a"), None),
+                servicer.OnTaskInvoke(request("b"), None),
+                servicer.OnTaskInvoke(request("bad"), None),
+            )
+            for response, key in ((good_a, b"a"), (good_b, b"b")):
+                assert response.task_result.return_code == 0
+                assert set(response.attributes.publish) == {key}
+                assert set(response.attributes.retract) == {b"shared"}
+            assert bad.task_result.return_code != 0
+            assert set(bad.attributes.publish) == {b"shared", b"bad"}
+            assert set(bad.attributes.retract) == {b"bad-evicted"}
+        finally:
+            await servicer.close()
+
+    asyncio.run(exercise())
 
 
 def test_aio_shim_moves_synchronous_hooks_off_event_loop():
@@ -88,7 +126,7 @@ def test_aio_shim_moves_synchronous_hooks_off_event_loop():
         try:
             response = await servicer.OnTaskInvoke(shim_pb2.TaskContext(task_id="task", session_id="session", input=b""), None)
             assert response.task_result.output.startswith(b"flame-shim")
-            assert set(response.attributes.attr) == {b"sync"}
+            assert set(response.attributes.publish) == {b"sync"}
         finally:
             await servicer.close()
 
@@ -394,7 +432,7 @@ def test_aio_app_worker_isolates_invocation_attributes(monkeypatch):
                     cloudpickle.dumps(ServiceRequest(args=(value,))),
                 )
             )
-            return set(service._take_attributes().attr)
+            return set(service._take_attributes().publish)
 
         assert await asyncio.gather(invoke(1), invoke(2)) == [{b"1"}, {b"2"}]
 
