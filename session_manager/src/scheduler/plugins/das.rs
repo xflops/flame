@@ -25,6 +25,11 @@ use common::apis::SessionID;
 use common::FlameError;
 
 /// Orders eligible Idle executors by coverage of a session's Pending affinity.
+///
+/// Equal scores, including no match at all, prefer the executor that publishes fewer attributes: the
+/// attributes are the keys an executor holds, so that is the emptier cache, and work without a
+/// match lands where it evicts the least. Equal counts prefer the executor that has been Idle the
+/// longest (it was used least recently), and equal times fall back to the executor ID.
 #[derive(Default)]
 pub struct DasPlugin {
     affinity: HashMap<SessionID, HashSet<Bytes>>,
@@ -76,7 +81,14 @@ impl Plugin for DasPlugin {
         Some(
             self.score(e1, session)
                 .cmp(&self.score(e2, session))
-                // A smaller ID wins equal scores.
+                // Equal scores: fewer attributes, an emptier cache, wins ...
+                .then_with(|| e2.attributes.len().cmp(&e1.attributes.len()))
+                // ... then the executor Idle the longest, which was updated least recently ...
+                .then_with(|| {
+                    e2.latest_updated_timestamp
+                        .cmp(&e1.latest_updated_timestamp)
+                })
+                // ... and then a smaller ID, so the order is deterministic.
                 .then_with(|| e2.id.cmp(&e1.id)),
         )
     }
@@ -127,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn orders_by_unique_coverage_then_smaller_id() {
+    fn orders_by_unique_coverage_then_attributes_then_idle_time_then_smaller_id() {
         let session = session(
             "session",
             vec![
@@ -227,16 +239,87 @@ mod tests {
     }
 
     #[test]
-    fn zero_score_prefers_smaller_id() {
+    fn zero_score_prefers_fewer_attributes() {
         let session = session("session", vec![task("session", 1, &[b"wanted"])]);
         let plugin = setup(&session);
+        // No match on either: the emptier executor wins whatever the IDs are.
+        let fuller_smaller_id = executor("a", &[b"other"]);
+        let emptier_larger_id = executor("z", &[]);
+        assert_eq!(plugin.score(&fuller_smaller_id, &session), 0);
+        assert_eq!(plugin.score(&emptier_larger_id, &session), 0);
+        assert_eq!(
+            plugin.executor_order_fn(&session, &emptier_larger_id, &fuller_smaller_id),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            plugin.executor_order_fn(&session, &fuller_smaller_id, &emptier_larger_id),
+            Some(Ordering::Less)
+        );
+
+        // The same number of attributes and idle time: the smaller ID wins.
         let smaller = executor("a", &[b"other"]);
-        let larger = executor("z", &[]);
-        assert_eq!(plugin.score(&smaller, &session), 0);
-        assert_eq!(plugin.score(&larger, &session), 0);
+        let larger = executor("z", &[b"another"]);
         assert_eq!(
             plugin.executor_order_fn(&session, &smaller, &larger),
             Some(Ordering::Greater)
         );
+    }
+
+    #[test]
+    fn equal_attributes_prefer_the_executor_idle_the_longest() {
+        let session = session("session", vec![task("session", 1, &[b"wanted"])]);
+        let plugin = setup(&session);
+        let now = chrono::Utc::now();
+        let recently_used = ExecutorInfo {
+            latest_updated_timestamp: now,
+            ..executor("a", &[b"other"])
+        };
+        let idle_longer = ExecutorInfo {
+            latest_updated_timestamp: now - chrono::Duration::minutes(10),
+            ..executor("z", &[b"another"])
+        };
+        // The longer idle time beats the smaller ID.
+        assert_eq!(
+            plugin.executor_order_fn(&session, &idle_longer, &recently_used),
+            Some(Ordering::Greater)
+        );
+
+        // Fewer attributes still beat a longer idle time.
+        let sparse_but_recent = ExecutorInfo {
+            latest_updated_timestamp: now,
+            ..executor("m", &[])
+        };
+        assert_eq!(
+            plugin.executor_order_fn(&session, &sparse_but_recent, &idle_longer),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn equal_match_prefers_the_executor_with_fewer_other_attributes() {
+        let session = session("session", vec![task("session", 1, &[b"wanted"])]);
+        let plugin = setup(&session);
+        let crowded = executor("a", &[b"wanted", b"x", b"y", b"z"]);
+        let sparse = executor("z", &[b"wanted"]);
+        assert_eq!(plugin.score(&crowded, &session), 1);
+        assert_eq!(plugin.score(&sparse, &session), 1);
+        assert_eq!(
+            plugin.executor_order_fn(&session, &sparse, &crowded),
+            Some(Ordering::Greater)
+        );
+
+        // A better match still beats a sparser executor.
+        let two_keys = session_with_keys(&[b"p", b"q"]);
+        let plugin = setup(&two_keys);
+        let full = executor("z", &[b"p", b"q", b"x", b"y"]);
+        let partial = executor("a", &[b"p"]);
+        assert_eq!(
+            plugin.executor_order_fn(&two_keys, &full, &partial),
+            Some(Ordering::Greater)
+        );
+    }
+
+    fn session_with_keys(keys: &[&'static [u8]]) -> SessionInfo {
+        session("session", vec![task("session", 1, keys)])
     }
 }

@@ -260,8 +260,11 @@ coverage, not request frequency.
 
 Existing scheduler checks determine which Idle executors are eligible for the
 session. A new executor has an empty attribute set. Equal scores, including
-all-zero and empty affinity, fall back to executor ID for deterministic
-behavior.
+all-zero and empty affinity, prefer the executor that publishes fewer attributes:
+the attributes are the keys an executor holds, so that is the emptier cache, and
+work without a match lands where it evicts the least. Equal counts prefer the
+executor that has been Idle the longest (the least recently updated), and equal
+times fall back to executor ID for deterministic behavior.
 
 ### DAS scheduler plugin
 
@@ -302,8 +305,9 @@ fn executor_order_fn(
 ```
 
 `PluginManager` applies the existing first-non-equal composition rule.
-`DasPlugin` orders larger scores first and, for equal scores, lexicographically
-smaller executor IDs first. `Context::select_executor` collects eligible
+`DasPlugin` orders larger scores first and, for equal scores, executors with fewer
+attributes first, then the executor that has been Idle the longest, then
+lexicographically smaller executor IDs first. `Context::select_executor` collects eligible
 executors into an array, sorts greatest-first with the plugin-manager
 comparator, and takes the first entry. The stable sort preserves the first
 eligible candidate when every plugin returns equal. Removing `das` from

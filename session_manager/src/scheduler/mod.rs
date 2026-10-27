@@ -485,6 +485,152 @@ mod tests {
         Ok(())
     }
 
+    /// Two Idle executors and a session whose pending task asks for `wanted`. The executor with the
+    /// smaller ID publishes three attributes and the other none, and `both_hold_wanted` adds `wanted`
+    /// to both. Returns whether Dispatch bound the executor with fewer attributes.
+    fn dispatch_binds_the_emptier_executor(both_hold_wanted: bool) -> Result<bool, FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        tokio_test::block_on(
+            controller
+                .storage()
+                .register_node(&new_test_node("node_1".to_string())),
+        )?;
+        let session =
+            tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+                id: "das-empty-cache".to_string(),
+                application: "flmtest".to_string(),
+                resreq: Some(ResourceRequirement {
+                    cpu: 1,
+                    memory: 1024,
+                    gpu: 0,
+                }),
+                ..Default::default()
+            }))?;
+
+        let mut executor_ids = Vec::new();
+        for _ in 0..2 {
+            let executor = tokio_test::block_on(
+                controller.create_executor("node_1".to_string(), session.id.clone()),
+            )?;
+            tokio_test::block_on(controller.register_executor(&executor))?;
+            executor_ids.push(executor.id);
+        }
+        executor_ids.sort();
+        let (smaller_id, larger_id) = (executor_ids[0].clone(), executor_ids[1].clone());
+        for (id, extra) in [(&smaller_id, 3), (&larger_id, 0)] {
+            let executor = controller.storage().get_executor_ptr(id.clone())?;
+            let mut executor = stdng::lock_ptr!(executor)?;
+            for index in 0..extra {
+                executor
+                    .attributes
+                    .insert(Bytes::from(format!("held-{index}")));
+            }
+            if both_hold_wanted {
+                executor.attributes.insert(Bytes::from_static(b"wanted"));
+            }
+        }
+
+        tokio_test::block_on(controller.create_task(
+            session.id.clone(),
+            None,
+            Some(TaskOptions {
+                affinity: [Bytes::from_static(b"wanted")].into_iter().collect(),
+            }),
+        ))?;
+        let options = PluginsOptions {
+            policies: vec!["priority".to_string(), "drf".to_string(), "das".to_string()],
+            ..Default::default()
+        };
+        let mut ctx = Context::new(controller.clone(), &options)?;
+        tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
+
+        let bound = controller.get_executor(larger_id)?.ssn_id.as_ref() == Some(&session.id);
+        let other = controller.get_executor(smaller_id)?.ssn_id.as_ref() == Some(&session.id);
+        assert_ne!(bound, other, "exactly one executor is bound");
+        Ok(bound)
+    }
+
+    /// Two Idle executors with no attributes and a session whose pending task asks for a key nobody
+    /// holds. The executor with the smaller ID was updated just now and the other ten minutes ago.
+    /// Returns whether Dispatch bound the executor that has been Idle longer.
+    fn dispatch_binds_the_executor_idle_longest() -> Result<bool, FlameError> {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        tokio_test::block_on(
+            controller
+                .storage()
+                .register_node(&new_test_node("node_1".to_string())),
+        )?;
+        let session =
+            tokio_test::block_on(controller.create_session(common::apis::SessionAttributes {
+                id: "das-idle-longest".to_string(),
+                application: "flmtest".to_string(),
+                resreq: Some(ResourceRequirement {
+                    cpu: 1,
+                    memory: 1024,
+                    gpu: 0,
+                }),
+                ..Default::default()
+            }))?;
+        let mut executor_ids = Vec::new();
+        for _ in 0..2 {
+            let executor = tokio_test::block_on(
+                controller.create_executor("node_1".to_string(), session.id.clone()),
+            )?;
+            tokio_test::block_on(controller.register_executor(&executor))?;
+            executor_ids.push(executor.id);
+        }
+        executor_ids.sort();
+        let (smaller_id, larger_id) = (executor_ids[0].clone(), executor_ids[1].clone());
+        for (id, idle_minutes) in [(&smaller_id, 0), (&larger_id, 10)] {
+            let executor = controller.storage().get_executor_ptr(id.clone())?;
+            let mut executor = stdng::lock_ptr!(executor)?;
+            executor.latest_updated_timestamp =
+                chrono::Utc::now() - chrono::Duration::minutes(idle_minutes);
+        }
+
+        tokio_test::block_on(controller.create_task(
+            session.id.clone(),
+            None,
+            Some(TaskOptions {
+                affinity: [Bytes::from_static(b"wanted")].into_iter().collect(),
+            }),
+        ))?;
+        let options = PluginsOptions {
+            policies: vec!["priority".to_string(), "drf".to_string(), "das".to_string()],
+            ..Default::default()
+        };
+        let mut ctx = Context::new(controller.clone(), &options)?;
+        tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
+        Ok(controller.get_executor(larger_id)?.ssn_id.as_ref() == Some(&session.id))
+    }
+
+    /// With equal scores and equal attribute counts, the session goes to the executor that has been
+    /// Idle the longest, not to the smaller executor ID.
+    #[test]
+    fn test_dispatch_with_equal_das_scores_and_attributes_prefers_the_executor_idle_longest(
+    ) -> Result<(), FlameError> {
+        assert!(dispatch_binds_the_executor_idle_longest()?);
+        Ok(())
+    }
+
+    /// With no executor holding the key, or with both holding it, the session goes to the executor
+    /// that publishes fewer attributes, not to the smaller executor ID.
+    #[test]
+    fn test_dispatch_with_equal_das_scores_prefers_the_emptier_executor() -> Result<(), FlameError>
+    {
+        assert!(dispatch_binds_the_emptier_executor(false)?, "no match");
+        assert!(dispatch_binds_the_emptier_executor(true)?, "equal match");
+        Ok(())
+    }
+
     /// Runs one Dispatch over `idle` retained Idle executors and a session of
     /// `batch_size` with one pending task; returns the executors bound to it.
     fn gang_dispatch(batch_size: u32, idle: usize) -> Result<usize, FlameError> {
