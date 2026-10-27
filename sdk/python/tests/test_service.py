@@ -13,7 +13,7 @@ import pytest
 import flamepy.core.service as service
 import flamepy.serving.client as serving_client
 from flamepy.core.service import ApplicationContext, SessionContext, TaskContext
-from flamepy.core.types import TaskOutput
+from flamepy.core.types import TaskOptions, TaskOutput
 from flamepy.proto import shim_pb2
 from flamepy.proto.types_pb2 import Result as ResultProto
 from flamepy.serving import Instance, open_session
@@ -614,7 +614,7 @@ class FakeSession:
         self.application = "myapp"
         self.id = "sess-1"
 
-    def submit(self, input_bytes):
+    def submit(self, input_bytes, option=None):
         self.input_bytes = input_bytes
         future = Future()
         future.set_result(cloudpickle.dumps("OK"))
@@ -702,7 +702,7 @@ class TestSessionOperations:
 
     def test_session_run_returns_none_for_none_output(self, monkeypatch):
         class NoneOutputSession(FakeSession):
-            def submit(self, input_bytes):
+            def submit(self, input_bytes, option=None):
                 future = Future()
                 future.set_result(None)
                 return future
@@ -714,7 +714,7 @@ class TestSessionOperations:
 
     def test_session_submit_deserializes_result(self, monkeypatch):
         class PendingSession(FakeSession):
-            def submit(self, input_bytes):
+            def submit(self, input_bytes, option=None):
                 self.input_bytes = input_bytes
                 self.future = Future()
                 return self.future
@@ -731,9 +731,27 @@ class TestSessionOperations:
         assert future.result() == {"answer": 6}
         assert cloudpickle.loads(fake_session.input_bytes) == {"value": 3}
 
+    def test_session_run_passes_task_options_to_the_session(self, monkeypatch):
+        class RecordingSession(FakeSession):
+            def submit(self, input_bytes, option=None):
+                self.option = option
+                future = Future()
+                future.set_result(cloudpickle.dumps("ok"))
+                return future
+
+        fake_session = RecordingSession()
+        monkeypatch.setattr(serving_client, "create_session", lambda **kwargs: fake_session)
+        session = open_session(name="myapp")
+        option = TaskOptions(affinity={b"prefix-key"})
+
+        assert session.run("test", option) == "ok"
+        assert fake_session.option is option
+        assert session.submit("test").result() == "ok"
+        assert fake_session.option is None
+
     def test_session_submit_propagates_task_failure(self, monkeypatch):
         class FailedSession(FakeSession):
-            def submit(self, input_bytes):
+            def submit(self, input_bytes, option=None):
                 future = Future()
                 future.set_exception(ValueError("task failed"))
                 return future
@@ -745,7 +763,7 @@ class TestSessionOperations:
 
     def test_session_submit_cancellation_cancels_task(self, monkeypatch):
         class PendingSession(FakeSession):
-            def submit(self, input_bytes):
+            def submit(self, input_bytes, option=None):
                 self.future = Future()
                 return self.future
 
@@ -938,6 +956,37 @@ def test_on_task_invoke_calls_entrypoint(instance, monkeypatch):
     assert len(received_input) == 1
     assert received_input[0] == {"key": "value"}
     assert isinstance(result, TaskOutput)
+
+
+def test_entrypoint_publishes_attributes_for_data_aware_scheduling(instance):
+    """An entrypoint publishes locality keys with `Instance.publish`, sync or async, and the
+    response carries them (the shim runs the hook with a response publisher)."""
+
+    @instance.entrypoint
+    def handler(data):
+        instance.publish({b"prefix-" + data})
+        return data
+
+    @instance.entrypoint
+    async def async_handler(data):
+        instance.publish({b"async-" + data})
+        retracted = b"stale-" + data
+        instance.retract({retracted})
+        return data
+
+    for handler_under_test, published, retracted in (
+        (handler, b"prefix-a", None),
+        (async_handler, b"async-b", b"stale-b"),
+    ):
+        instance.entrypoint(handler_under_test)
+        token = service._active_response_publisher.set(service._Publisher())
+        try:
+            instance.on_task_invoke(TaskContext(task_id="t", session_id="s", input=cloudpickle.dumps(published.split(b"-")[1])))
+            attributes = instance._take_attributes()
+        finally:
+            service._active_response_publisher.reset(token)
+        assert set(attributes.publish) == {published}
+        assert set(attributes.retract) == ({retracted} if retracted else set())
 
 
 def test_on_task_invoke_with_none_input(instance, monkeypatch):

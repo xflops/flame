@@ -280,6 +280,29 @@ future. Use this helper when request, response, or session context objects are
 easier to model as Python objects than raw bytes. Use the core `FlameService`
 API when you need explicit byte-level protocol control.
 
+### Data-aware scheduling with the serving helper
+
+A serving instance is a `FlameService`, so an entrypoint publishes the locality keys it holds with
+`instance.publish(keys)` (and withdraws stale ones with `instance.retract(keys)`), as in the
+data-aware scheduling section above. The client then prefers an executor that holds a key by
+passing `TaskOptions(affinity={key})` to `run()` or `submit()`:
+
+```python
+from flamepy import TaskOptions
+
+@instance.entrypoint
+def generate(request: dict) -> dict:
+    result = engine.generate(request["prompt"])
+    instance.publish({prefix_key(request["prompt"])})  # this executor now holds the prefix cache
+    return result
+
+with open_session("llm-app") as session:
+    session.run(request, TaskOptions(affinity={prefix_key(request["prompt"])}))
+```
+
+Attributes are scoped to the session, like the other data-aware scheduling attributes, and the
+match is a preference: when no executor holds the key, or it is busy, the task runs on another one.
+
 ## Use Object Cache
 
 Top-level helpers store Python objects in Flame object cache:
