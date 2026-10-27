@@ -101,6 +101,52 @@ struct ExecutorAttributeUpdate {
     retract: HashSet<bytes::Bytes>,
 }
 
+/// A gang (`batch_size` above 1) is bound all at once and is the whole session: `min_instances`
+/// keeps it warm and `max_instances` limits it, so each is the gang's size or not set. Any other
+/// value would have the scheduler bind a part of the gang, or more executors than it. The
+/// application's `max_instances` must hold the gang too. A session without a gang only needs a
+/// maximum that holds its minimum.
+fn validate_instance_limits(
+    attr: &SessionAttributes,
+    application: &Application,
+) -> Result<(), FlameError> {
+    let batch_size = attr.batch_size.max(1);
+    if batch_size > 1 {
+        ensure!(
+            attr.min_instances == 0 || attr.min_instances == batch_size,
+            FlameError::InvalidConfig(format!(
+                "session <{}> min_instances ({}) must be 0 or batch_size ({batch_size})",
+                attr.id, attr.min_instances
+            ))
+        )?;
+        ensure!(
+            attr.max_instances
+                .is_none_or(|maximum| maximum == batch_size),
+            FlameError::InvalidConfig(format!(
+                "session <{}> max_instances ({:?}) must be unset or batch_size ({batch_size})",
+                attr.id, attr.max_instances
+            ))
+        )?;
+        ensure!(
+            application.max_instances >= batch_size,
+            FlameError::InvalidConfig(format!(
+                "session <{}> batch_size ({batch_size}) is more than max_instances ({}) of application <{}>",
+                attr.id, application.max_instances, application.name
+            ))
+        )?;
+    }
+    if let Some(maximum) = attr.max_instances {
+        ensure!(
+            maximum >= attr.min_instances,
+            FlameError::InvalidConfig(format!(
+                "session <{}> max_instances ({maximum}) is less than min_instances ({})",
+                attr.id, attr.min_instances
+            ))
+        )?;
+    }
+    Ok(())
+}
+
 pub struct Controller {
     storage: StoragePtr,
     connection_manager: ConnectionManager<NodeCallbacks>,
@@ -418,7 +464,8 @@ impl Controller {
 
     pub async fn create_session(&self, attr: SessionAttributes) -> Result<Session, FlameError> {
         trace_fn!("Controller::create_session");
-        self.application_enabled(&attr.application).await?;
+        let application = self.application_enabled(&attr.application).await?;
+        validate_instance_limits(&attr, &application)?;
         self.storage.create_session(attr).await
     }
 
@@ -432,18 +479,21 @@ impl Controller {
             Some(attr) => attr.application.clone(),
             None => self.storage.session_application(id.clone()).await?,
         };
-        self.application_enabled(&application).await?;
+        let application = self.application_enabled(&application).await?;
+        if let Some(attr) = spec.as_ref() {
+            validate_instance_limits(attr, &application)?;
+        }
         self.storage.open_session(id, spec).await
     }
 
-    async fn application_enabled(&self, name: &str) -> Result<(), FlameError> {
+    async fn application_enabled(&self, name: &str) -> Result<Application, FlameError> {
         let application = self.storage.get_application(name.to_string()).await?;
         if application.state != ApplicationState::Enabled {
             return Err(FlameError::InvalidState(format!(
                 "application <{name}> is disabled"
             )));
         }
-        Ok(())
+        Ok(application)
     }
 
     pub async fn close_session(&self, id: SessionID) -> Result<Session, FlameError> {
@@ -2121,6 +2171,68 @@ mod tests {
                 .state,
             ApplicationState::Disabled
         );
+    }
+
+    #[tokio::test]
+    async fn gang_min_and_max_instances_are_its_size_or_not_set() {
+        let controller = new_ptr(create_test_storage().await);
+        controller
+            .register_application(
+                "limited-app".to_string(),
+                ApplicationAttributes {
+                    max_instances: 4,
+                    ..ApplicationAttributes::default()
+                },
+            )
+            .await
+            .unwrap();
+        let session = |id: &str, batch_size, min_instances, max_instances| SessionAttributes {
+            id: id.to_string(),
+            application: "limited-app".to_string(),
+            batch_size,
+            min_instances,
+            max_instances,
+            ..SessionAttributes::default()
+        };
+
+        for attributes in [
+            session("min-below-batch", 3, 2, None),
+            session("min-above-batch", 3, 4, None),
+            session("max-below-batch", 3, 0, Some(2)),
+            session("max-above-batch", 3, 0, Some(4)),
+            session("zero-max-gang", 3, 0, Some(0)),
+            session("app-max-below-batch", 5, 0, None),
+            session("max-below-min", 1, 3, Some(2)),
+        ] {
+            let id = attributes.id.clone();
+            assert!(
+                matches!(
+                    controller.create_session(attributes.clone()).await,
+                    Err(FlameError::InvalidConfig(_))
+                ),
+                "{id} must be rejected by create_session"
+            );
+            assert!(
+                matches!(
+                    controller.open_session(id.clone(), Some(attributes)).await,
+                    Err(FlameError::InvalidConfig(_))
+                ),
+                "{id} must be rejected by open_session"
+            );
+        }
+
+        // A gang is its size, or not kept or limited at all; a session without a gang is free.
+        for attributes in [
+            session("gang-only", 3, 0, None),
+            session("gang-warm", 3, 3, None),
+            session("gang-exact", 4, 4, Some(4)),
+            session("gang-limited", 3, 0, Some(3)),
+            session("default-batch", 0, 0, None),
+            session("min-and-max", 1, 2, Some(5)),
+            session("zero-max", 1, 0, Some(0)),
+        ] {
+            controller.create_session(attributes).await.unwrap();
+        }
     }
 
     #[tokio::test]

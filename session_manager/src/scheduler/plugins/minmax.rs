@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn gang_is_the_batch_size_while_tasks_are_pending_and_not_min_instances() {
+    fn gang_is_the_batch_size_while_tasks_are_pending_or_it_is_kept_warm() {
         let snapshot = SnapShot::new();
         let mut plugin = plugin(&snapshot);
         let gang = |min_instances, batch_size, pending| {
@@ -293,11 +293,33 @@ mod tests {
         plugin.on_session_bind(executor("c", "node", ExecutorState::Bound), batch.clone());
         assert_eq!(plugin.is_satisfied(&batch), Some(true));
 
-        // ... and demands them, but only while tasks wait.
+        // ... and demands them while tasks wait or it is kept warm (a gang's `min_instances` is its
+        // size), and nothing otherwise.
         assert_eq!(compute_demand(&gang(0, 4, 1)), 4);
         assert_eq!(compute_demand(&gang(0, 4, 0)), 0);
-        assert_eq!(compute_demand(&gang(2, 4, 0)), 2);
+        assert_eq!(compute_demand(&gang(4, 4, 0)), 4);
         assert_eq!(compute_demand(&gang(0, 1, 3)), 3);
+        assert_eq!(compute_demand(&gang(3, 1, 0)), 3);
+    }
+
+    #[test]
+    fn gang_kept_warm_is_formed_all_at_once_before_its_first_task() {
+        let snapshot = SnapShot::new();
+        let mut plugin = plugin(&snapshot);
+        let warm = Arc::new(SessionInfo {
+            min_instances: 3,
+            batch_size: 3,
+            ..limited_session(None).as_ref().clone()
+        });
+        assert_eq!(plugin.is_satisfied(&warm), Some(false));
+        plugin.on_session_bind(executor("a", "node", ExecutorState::Bound), warm.clone());
+        assert_eq!(plugin.is_satisfied(&warm), Some(false));
+        plugin.on_session_bind(executor("b", "node", ExecutorState::Bound), warm.clone());
+        plugin.on_session_bind(executor("c", "node", ExecutorState::Bound), warm.clone());
+        assert_eq!(plugin.is_satisfied(&warm), Some(true));
+        // Shuffle only reclaims bindings above demand, and a gang kept warm demands its whole
+        // size with no task pending, so none of its executors is reclaimed.
+        assert_eq!(plugin.is_overused(&warm), None);
     }
 
     #[test]
