@@ -1,0 +1,16 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: ${CACHE_CLIENT_POLICY}
+  namespace: ${NAMESPACE}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: ${GATEWAY}
+  tls:
+    clientValidation:
+      caCertificateRefs:
+        - group: ""
+          kind: Secret
+          name: ${CACHE_CLIENT_TRUST_SECRET}
