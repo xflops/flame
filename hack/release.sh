@@ -168,7 +168,10 @@ verify_installed_python_package() {
         echo "installed flamepy runtime version ${runtime_version} does not match ${expected_version}" >&2
         return 1
     }
-    PYTHONPATH="${root}" "$(command -v python3)" -c 'import flamepy.app' >/dev/null
+    # The package is not always directly under ${root}: a virtual environment keeps it in
+    # lib/pythonX.Y/site-packages, a `pip install --target` directory holds it at the top.
+    PYTHONPATH="$(dirname "$(dirname "${init_file}")")" \
+        "$(command -v python3)" -c 'import flamepy.app' >/dev/null
     echo "verified flamepy ${expected_version} under ${root}"
 }
 
