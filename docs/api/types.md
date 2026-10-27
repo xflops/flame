@@ -104,8 +104,8 @@ message SessionSpec {
 |-------|------|-------------|
 | `application` | string | Name of the application to run |
 | `common_data` | bytes | Data shared across all tasks (optional) |
-| `min_instances` | uint32 | Long-lived instances to keep: warmed up and never trimmed below this count (default: 0). Not a gang |
-| `max_instances` | uint32 | Maximum executor instances, including in-flight bindings and reservations (optional, unlimited if not set; `0` prevents allocation and binding) |
+| `min_instances` | uint32 | Long-lived instances to keep: warmed up and never trimmed below this count (default: 0). For a gang (`batch_size` above 1) it must be 0 or `batch_size`, and a gang that is kept warm is bound together even before its first task |
+| `max_instances` | uint32 | Maximum executor instances, including in-flight bindings and reservations (optional, unlimited if not set; `0` prevents allocation and binding). For a gang it must be unset or `batch_size`, and the application's `max_instances` must be at least `batch_size` |
 | `batch_size` | uint32 | Gang size: while the session has pending tasks, executors are bound to it only once `batch_size` of them can be bound together (default and `0`: `1`, not a gang) |
 | `priority` | uint32 | Session priority; higher = more important (default: 0) |
 | `resreq` | ResourceRequirement | Per-task resource request (optional); when absent, the server applies `cluster.resreq`, with a hardcoded `cpu=1,mem=1g,gpu=0` fallback. |

@@ -233,7 +233,10 @@ Key classes and helpers:
   executor.
 - `warmup` keeps that many instances alive (`min_instances`); it does not make
   them a gang. `batch_size` is the gang size: use `batch_size=N` for work that
-  blocks until N members are present, together with `warmup=N` to keep them.
+  blocks until N members are present, together with `warmup=N` to keep them. For
+  a gang `warmup` must be 0 or N, and `autoscale=False` with `warmup=N` also fixes
+  the maximum at N; any other `min_instances` or `max_instances` is rejected
+  when the session is created.
 - Public class methods must not collide with `ServiceInstance` API names such
   as `close`; handle construction rejects such definitions.
 - The handle returned by `app.init()` also exposes `service(...)` when direct
