@@ -1,6 +1,6 @@
 [package]
 name = "flame-rs"
-version = "0.7.0-rc1"
+version = "0.7.0-rc2"
 edition = "2021"
 build = "build.rs"
 
@@ -11,7 +11,7 @@ readme = "README.md"
 
 [dependencies]
 stdng = { path = "../../stdng", version = "0.1.9" }
-flame-rs-macros = { path = "macros", version = "0.7.0-rc1", optional = true }
+flame-rs-macros = { path = "macros", version = "0.7.0-rc2", optional = true }
 
 tower = { workspace = true }
 prost = { workspace = true, features = ["derive"] }
