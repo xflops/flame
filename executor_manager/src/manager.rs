@@ -83,8 +83,8 @@ impl ExecutorManager {
         });
 
         tracing::info!(
-            "Starting executor manager in streaming mode with shim <{:?}>",
-            self.ctx.cluster.executors.shim
+            "Starting executor manager in streaming mode with shims <{:?}>",
+            self.ctx.cluster.executors.shims
         );
 
         while let Some(ExecutorMessage::Update(executor)) = executor_rx.recv().await {
@@ -118,7 +118,21 @@ impl ExecutorManager {
         executor.app_mgr = Some(self.app_mgr.clone());
         executor.dev_mgr = Some(self.dev_mgr.clone());
         executor.context = Some(self.ctx.clone());
-        executor.shim = self.ctx.cluster.executors.shim;
+        // The session manager gives an executor the shim of its application. Keep it when
+        // this manager runs that shim; otherwise use the default one, whose executor the
+        // application is then not matched with.
+        let executors = &self.ctx.cluster.executors;
+        let shim = executors.shim_for(executor.shim);
+        if shim != executor.shim {
+            tracing::warn!(
+                "Executor <{}> asks for the {:?} shim, which this executor manager does not run (it runs {:?}); using {:?}",
+                executor.id,
+                executor.shim,
+                executors.shims,
+                shim
+            );
+            executor.shim = shim;
+        }
         executor.assignments = self.dev_mgr.allocate(&executor)?;
         let pointer = new_ptr(executor);
         lock_ptr!(self.executors)?.insert(executor_id, pointer.clone());

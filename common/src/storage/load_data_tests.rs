@@ -36,10 +36,7 @@ mod tests {
                 resreq: None,
                 policies: vec!["priority".to_string(), "drf".to_string()],
                 schedule_interval: 1000,
-                executors: FlameExecutors {
-                    shim: Shim::default(),
-                    ..Default::default()
-                },
+                executors: FlameExecutors::default(),
                 tls: None,
                 limits: FlameLimits {
                     max_sessions: None,

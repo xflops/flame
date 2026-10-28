@@ -8,7 +8,7 @@ cluster:
   storage: none
   schedule_interval: 100
   executors:
-    shim: host
+    shims: [host]
   limits:
     max_sessions: 1000
     node:

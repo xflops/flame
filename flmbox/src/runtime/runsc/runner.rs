@@ -49,6 +49,16 @@ pub struct CommandSpec {
     pub timeout: Option<Duration>,
     /// Maximum number of bytes kept per output stream.
     pub max_output: usize,
+    /// Appends stdout and stderr to this file instead of reading them through
+    /// pipes, and gives the process no input. Only what this command appended is
+    /// returned, as `stderr`, for the diagnostics of a failure.
+    ///
+    /// A command that creates a long-lived process (`runsc create` hands its
+    /// stdio to the container's init process) must not own pipes: they stay open
+    /// as long as that process lives, so their end never comes. With a file there
+    /// is no stream to wait for, and the caller keeps the file as the log of that
+    /// process.
+    pub log: Option<PathBuf>,
 }
 
 /// Runs commands.
@@ -108,13 +118,35 @@ fn exit_code(status: ExitStatus) -> i32 {
     -1
 }
 
-async fn drain(mut handle: tokio::task::JoinHandle<()>) {
-    if tokio::time::timeout(DRAIN_GRACE, &mut handle)
-        .await
-        .is_err()
-    {
-        handle.abort();
+/// Waits for the readers to reach the end of their streams, at most `grace` in
+/// total; a reader that is still going is aborted, which closes its pipe.
+async fn drain(handles: Vec<tokio::task::JoinHandle<()>>, grace: Duration) {
+    let deadline = tokio::time::Instant::now() + grace;
+    for mut handle in handles {
+        if tokio::time::timeout_at(deadline, &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+        }
     }
+}
+
+/// Up to `max` bytes of the file from `start`, without touching its offset (the
+/// child shares it).
+fn read_capture(file: &std::fs::File, start: u64, max: usize) -> (Vec<u8>, bool) {
+    use std::os::unix::fs::FileExt;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let available = len.saturating_sub(start);
+    let keep = usize::try_from(available).unwrap_or(usize::MAX).min(max);
+    let mut buf = vec![0u8; keep];
+    let read = file.read_at(&mut buf, start).unwrap_or(0);
+    buf.truncate(read);
+    (buf, (keep as u64) < available)
+}
+
+fn capture_error(e: std::io::Error) -> FlameError {
+    FlameError::Internal(format!("failed to create a capture file: {e}"))
 }
 
 #[async_trait]
@@ -123,14 +155,29 @@ impl CommandRunner for TokioRunner {
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args)
             .envs(spec.envs.iter().map(|(k, v)| (k, v)))
-            .stdin(if spec.stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .kill_on_drop(true);
+        let capture: Option<(std::fs::File, u64)> = if let Some(path) = &spec.log {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(path)
+                .map_err(capture_error)?;
+            let start = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let out_end = file.try_clone().map_err(capture_error)?;
+            let err_end = file.try_clone().map_err(capture_error)?;
+            cmd.stdout(Stdio::from(out_end))
+                .stderr(Stdio::from(err_end));
+            Some((file, start))
+        } else {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            None
+        };
+        cmd.stdin(if spec.stdin.is_some() && capture.is_none() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         if let Some(cwd) = &spec.cwd {
             cmd.current_dir(cwd);
         }
@@ -175,17 +222,29 @@ impl CommandRunner for TokioRunner {
         if let Some(task) = stdin_task {
             task.abort();
         }
-        for task in [out_task, err_task].into_iter().flatten() {
-            drain(task).await;
-        }
+        drain(
+            [out_task, err_task].into_iter().flatten().collect(),
+            DRAIN_GRACE,
+        )
+        .await;
+
+        let mut truncated =
+            out.truncated.load(Ordering::Relaxed) || err.truncated.load(Ordering::Relaxed);
+        let stderr = match &capture {
+            Some((file, start)) => {
+                let (bytes, cut) = read_capture(file, *start, spec.max_output);
+                truncated |= cut;
+                bytes
+            }
+            None => err.take(),
+        };
 
         Ok(CommandOutput {
             exit_code: exit_code(status),
             stdout: out.take(),
-            stderr: err.take(),
+            stderr,
             timed_out,
-            truncated: out.truncated.load(Ordering::Relaxed)
-                || err.truncated.load(Ordering::Relaxed),
+            truncated,
         })
     }
 }
@@ -287,6 +346,77 @@ mod tests {
         assert!(out.timed_out);
         assert_eq!(out.stdout, b"partial\n");
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    fn logged(script: &str, path: &std::path::Path) -> CommandSpec {
+        CommandSpec {
+            log: Some(path.to_path_buf()),
+            max_output: 1000,
+            ..sh(script)
+        }
+    }
+
+    #[tokio::test]
+    async fn log_does_not_wait_for_a_process_that_keeps_the_stdio() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("sandbox.log");
+        // The shell exits at once; its background child keeps stdout and stderr open.
+        let started = std::time::Instant::now();
+        let out = TokioRunner
+            .run(logged("echo out; echo err >&2; sleep 30 &", &log))
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert!(out.stdout.is_empty());
+        assert_eq!(out.stderr, b"out\nerr\n");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(std::fs::read(&log).unwrap(), b"out\nerr\n");
+    }
+
+    #[tokio::test]
+    async fn log_appends_and_returns_only_the_new_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("sandbox.log");
+        TokioRunner.run(logged("echo first", &log)).await.unwrap();
+        let out = TokioRunner
+            .run(logged("echo bad >&2; exit 7", &log))
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 7);
+        assert_eq!(out.stderr, b"bad\n");
+        assert_eq!(std::fs::read(&log).unwrap(), b"first\nbad\n");
+    }
+
+    #[tokio::test]
+    async fn log_output_is_capped_but_the_file_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("sandbox.log");
+        let mut spec = logged("head -c 5000 /dev/zero | tr '\\0' e >&2", &log);
+        spec.max_output = 100;
+        let out = TokioRunner.run(spec).await.unwrap();
+        assert_eq!(out.stderr.len(), 100);
+        assert!(out.truncated);
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 5000);
+    }
+
+    #[tokio::test]
+    async fn log_gives_no_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("sandbox.log");
+        let out = TokioRunner
+            .run(logged("cat; echo done", &log))
+            .await
+            .unwrap();
+        assert_eq!(out.stderr, b"done\n");
+    }
+
+    #[tokio::test]
+    async fn readers_share_one_drain_deadline() {
+        let never = || tokio::spawn(std::future::pending::<()>());
+        let started = std::time::Instant::now();
+        drain(vec![never(), never()], Duration::from_millis(300)).await;
+        // Two readers that never finish take one grace together, not two.
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[tokio::test]

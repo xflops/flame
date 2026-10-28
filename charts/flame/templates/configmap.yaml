@@ -19,7 +19,7 @@ data:
       storage: {{ .Values.cluster.storage | quote }}
       schedule_interval: {{ .Values.cluster.scheduleInterval }}
       executors:
-        shim: {{ .Values.cluster.executors.shim | quote }}
+        shims: {{ .Values.cluster.executors.shims | toJson }}
         devices: {{ .Values.cluster.executors.devices | toJson }}
       limits:
         max_sessions: {{ .Values.cluster.limits.maxSessions }}

@@ -16,7 +16,8 @@ cluster:
   scheduleInterval: 100
   storage: "fs:///var/lib/flame/session"
   executors:
-    shim: host
+    # Shims the executor manager runs; Kubernetes executor managers run the host shim.
+    shims: [host]
     # Optional device managers loaded by FEM; CPU and memory are always loaded.
     devices: [gpu]
   limits:

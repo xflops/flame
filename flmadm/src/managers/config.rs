@@ -108,7 +108,7 @@ cluster:
     - das
   storage: "fs://{prefix}/data"
   executors:
-    shim: host
+    shims: [host]
   limits:
     max_executors: 128
 cache:

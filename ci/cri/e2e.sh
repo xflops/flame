@@ -52,6 +52,9 @@ install_flame() {
     sudo install -d "$INSTALL_PREFIX/conf/applications"
     sudo install -m 0644 ci/cri/applications/*.yaml \
         "$INSTALL_PREFIX/conf/applications/"
+    # flmbox (a host shim application) runs sandboxes with runsc, which the dependencies
+    # install; the services run as root under systemd, so make its state directories exist.
+    sudo install -d -m 0755 /var/lib/flmbox "$INSTALL_PREFIX/data/flmbox"
     mkdir -p "$HOME/.flame"
     install -m 0644 ci/cri/flame.yaml "$HOME/.flame/flame.yaml"
 

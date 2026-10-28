@@ -17,6 +17,12 @@
         "executors": {
           "type": "object",
           "properties": {
+            "shims": {
+              "type": "array",
+              "items": { "type": "string" },
+              "uniqueItems": true,
+              "minItems": 1
+            },
             "devices": {
               "type": "array",
               "items": { "type": "string" },

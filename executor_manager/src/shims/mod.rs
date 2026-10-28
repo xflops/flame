@@ -203,7 +203,7 @@ impl Drop for ExecutorWorkDir {
     }
 }
 
-/// Create a shim from the executor-manager's configured runtime.
+/// Create the shim of the executor.
 ///
 /// A normal application-scoped shim requires `Some(app)`. `None` requests a
 /// cleanup-only shim for a runtime that can outlive executor-manager; currently
@@ -212,15 +212,12 @@ pub fn new_ptr(
     executor: &Executor,
     app: Option<&ApplicationContext>,
 ) -> Result<ShimPtr, FlameError> {
-    // Get shim type from executor's cluster context configuration
-    let shim_type = executor
-        .context
-        .as_ref()
-        .map(|ctx| ctx.cluster.executors.shim)
-        .unwrap_or(ShimType::Host);
+    // The executor's own shim: the executor manager sets it from the application's, among the
+    // shims it is configured to run.
+    let shim_type = executor.shim;
 
     tracing::info!(
-        "Creating shim for executor <{}> with type: {:?} (from executor-manager config)",
+        "Creating shim for executor <{}> with type: {:?}",
         executor.id,
         shim_type
     );
@@ -275,7 +272,7 @@ mod tests {
 
     fn create_test_executor(shim: ShimType) -> Executor {
         let mut context = FlameClusterContext::default();
-        context.cluster.executors.shim = shim;
+        context.cluster.executors.shims = vec![shim];
         Executor {
             id: "executor-1".to_string(),
             application: "test-app".to_string(),
@@ -291,6 +288,24 @@ mod tests {
             shim_instance: None,
             state: ExecutorState::Idle,
         }
+    }
+
+    #[test]
+    fn the_shim_follows_the_executor_and_not_the_cluster_context() {
+        // A cluster that runs both shims: the executor decides.
+        let mut cri = create_test_executor(ShimType::Cri);
+        cri.context.as_mut().unwrap().cluster.executors.shims = vec![ShimType::Host];
+        assert!(
+            new_ptr(&cri, None).is_ok(),
+            "a CRI executor can be cleaned up"
+        );
+
+        let mut host = create_test_executor(ShimType::Host);
+        host.context.as_mut().unwrap().cluster.executors.shims = vec![ShimType::Cri];
+        assert!(
+            new_ptr(&host, None).is_err(),
+            "a host executor needs an application, whatever the cluster default is"
+        );
     }
 
     #[test]

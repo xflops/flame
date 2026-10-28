@@ -101,8 +101,8 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if hasKey .Values.cluster.limits "maxExecutors" -}}
 {{- fail "cluster.limits.maxExecutors has moved to cluster.limits.node.maxExecutors; update your Helm values" -}}
 {{- end -}}
-{{- if ne .Values.cluster.executors.shim "host" -}}
-{{- fail "Kubernetes executor managers require cluster.executors.shim=host" -}}
+{{- if ne (toJson .Values.cluster.executors.shims) "[\"host\"]" -}}
+{{- fail "Kubernetes executor managers require cluster.executors.shims=[host]" -}}
 {{- end -}}
 {{- if .Values.tls.enabled -}}
 {{- if not .Values.tls.cluster.secretName -}}

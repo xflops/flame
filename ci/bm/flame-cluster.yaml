@@ -9,7 +9,7 @@ cluster:
   storage: fs://data/
   schedule_interval: 100           # Scheduler loop interval in milliseconds (default: 100)
   executors:
-    shim: host
+    shims: [host]
   limits:
     node:
       max_executors: 10

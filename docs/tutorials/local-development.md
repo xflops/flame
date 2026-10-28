@@ -164,7 +164,7 @@ cluster:
     - das
   storage: "fs:///tmp/flame-dev/data"
   executors:
-    shim: host
+    shims: [host]
   limits:
     application: {}
     session: {}

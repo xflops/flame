@@ -23,7 +23,7 @@ For example:
 ```yaml
 cluster:
   executors:
-    shim: host
+    shims: [host]
     devices: [gpu]
 executorManager:
   hostNetwork: true

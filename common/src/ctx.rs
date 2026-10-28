@@ -86,7 +86,7 @@ struct FlameSessionRecoveryYaml {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FlameExecutorsYaml {
-    pub shim: Option<String>,
+    pub shims: Option<Vec<String>>,
     pub devices: Option<Vec<String>>,
 }
 
@@ -188,7 +188,10 @@ pub struct FlameCluster {
 
 #[derive(Debug, Clone)]
 pub struct FlameExecutors {
-    pub shim: Shim,
+    /// Every shim this executor manager can run. An executor keeps the shim of its
+    /// application when it is listed here; the first one is the default, for an
+    /// executor that asks for a shim that is not.
+    pub shims: Vec<Shim>,
     /// Optional device managers loaded by FEM; CPU and memory are always loaded.
     pub devices: Vec<String>,
 }
@@ -560,17 +563,58 @@ impl TryFrom<FlameExecutorsYaml> for FlameExecutors {
                 )));
             }
         }
-        Ok(FlameExecutors {
-            shim: Shim::try_from(executors.shim.unwrap_or(DEFAULT_SHIM.to_string()))?,
-            devices,
-        })
+        let shims = match executors.shims {
+            Some(names) => {
+                if names.is_empty() {
+                    return Err(FlameError::InvalidConfig(
+                        "cluster.executors.shims must list at least one shim".to_string(),
+                    ));
+                }
+                let shims = names
+                    .into_iter()
+                    .map(Shim::try_from)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut seen = HashSet::new();
+                if let Some(duplicate) = shims.iter().find(|shim| !seen.insert(**shim)) {
+                    return Err(FlameError::InvalidConfig(format!(
+                        "duplicate shim <{:?}> in cluster.executors.shims",
+                        duplicate
+                    )));
+                }
+                shims
+            }
+            None => vec![Shim::try_from(DEFAULT_SHIM.to_string())?],
+        };
+        Ok(FlameExecutors { shims, devices })
+    }
+}
+
+impl FlameExecutors {
+    /// Whether this executor manager can run executors of `shim`.
+    pub fn supports(&self, shim: Shim) -> bool {
+        self.shims.contains(&shim)
+    }
+
+    /// The default shim: the first one listed.
+    pub fn default_shim(&self) -> Shim {
+        self.shims[0]
+    }
+
+    /// The shim of an executor that asks for `requested`: that one when it is
+    /// supported, the default one otherwise.
+    pub fn shim_for(&self, requested: Shim) -> Shim {
+        if self.supports(requested) {
+            requested
+        } else {
+            self.default_shim()
+        }
     }
 }
 
 impl Default for FlameExecutors {
     fn default() -> Self {
         Self {
-            shim: Shim::default(),
+            shims: vec![Shim::default()],
             devices: vec!["gpu".to_string()],
         }
     }
@@ -746,9 +790,55 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn executors(yaml: &str) -> Result<FlameExecutors, FlameError> {
+        FlameExecutors::try_from(serde_yaml::from_str::<FlameExecutorsYaml>(yaml).unwrap())
+    }
+
+    #[test]
+    fn executor_shims_default_to_the_host_shim() {
+        let executors = executors("devices: []").unwrap();
+        assert_eq!(executors.shims, [Shim::Host]);
+        assert_eq!(executors.default_shim(), Shim::Host);
+        assert_eq!(FlameExecutors::default().shims, [Shim::default()]);
+    }
+
+    #[test]
+    fn executor_shims_with_one_shim_support_only_that_shim() {
+        let executors = executors("shims: [cri]").unwrap();
+        assert_eq!(executors.default_shim(), Shim::Cri);
+        assert!(executors.supports(Shim::Cri));
+        assert!(!executors.supports(Shim::Host));
+    }
+
+    #[test]
+    fn executor_shims_list_every_supported_shim_and_the_first_is_the_default() {
+        let executors = executors("shims: [cri, host]").unwrap();
+        assert_eq!(executors.shims, [Shim::Cri, Shim::Host]);
+        assert_eq!(executors.default_shim(), Shim::Cri);
+        assert!(executors.supports(Shim::Host) && executors.supports(Shim::Cri));
+    }
+
+    #[test]
+    fn executor_keeps_a_supported_shim_and_falls_back_to_the_default() {
+        let both = executors("shims: [cri, host]").unwrap();
+        assert_eq!(both.shim_for(Shim::Host), Shim::Host);
+        assert_eq!(both.shim_for(Shim::Cri), Shim::Cri);
+
+        let cri = executors("shims: [cri]").unwrap();
+        assert_eq!(cri.shim_for(Shim::Host), Shim::Cri);
+        assert_eq!(cri.shim_for(Shim::Cri), Shim::Cri);
+    }
+
+    #[test]
+    fn executor_shims_reject_bad_lists() {
+        assert!(executors("shims: []").is_err());
+        assert!(executors("shims: [host, host]").is_err());
+        assert!(executors("shims: [nope]").is_err());
+    }
+
     #[test]
     fn executor_devices_default_to_gpu() {
-        let yaml: FlameExecutorsYaml = serde_yaml::from_str("shim: host").unwrap();
+        let yaml: FlameExecutorsYaml = serde_yaml::from_str("shims: [host]").unwrap();
         let executors = FlameExecutors::try_from(yaml).unwrap();
         assert_eq!(executors.devices, ["gpu"]);
         assert_eq!(FlameExecutors::default().devices, ["gpu"]);
@@ -837,7 +927,7 @@ cluster:
     - drf
   storage: sqlite://flame.db
   executors:
-    shim: host
+    shims: [host]
   limits:
     node:
       max_executors: 10
@@ -858,7 +948,7 @@ cluster:
         );
         assert_eq!(ctx.cluster.policies, vec!["priority", "drf"]);
         assert_eq!(ctx.cluster.storage, "sqlite://flame.db");
-        assert_eq!(ctx.cluster.executors.shim, Shim::Host);
+        assert_eq!(ctx.cluster.executors.shims, [Shim::Host]);
         assert_eq!(ctx.cluster.limits.node.max_executors, 10);
 
         Ok(())
@@ -894,7 +984,7 @@ cluster:
   name: flame
   endpoint: "http://flame-session-manager:8080"
   executors:
-    shim: host
+    shims: [host]
 cache:
   endpoint: "grpc://127.0.0.1:9090"
   storage: "/var/lib/flame/cache"
@@ -972,7 +1062,7 @@ cluster:
   name: flame
   endpoint: "http://flame-session-manager:8080"
   executors:
-    shim: host
+    shims: [host]
 cache:
   endpoint: "grpc://127.0.0.1:9090"
   eviction:
@@ -1004,7 +1094,7 @@ cluster:
   name: flame
   endpoint: "http://flame-session-manager:8080"
   executors:
-    shim: host
+    shims: [host]
 cache:
   endpoint: "grpc://127.0.0.1:9090"
         "#;
@@ -1285,7 +1375,7 @@ cluster:
   name: flame
   endpoint: "http://flame-session-manager:8080"
   executors:
-    shim: host
+    shims: [host]
 cache:
   endpoint: "grpc://127.0.0.1:9090"
   eviction:
@@ -1313,7 +1403,7 @@ cluster:
   name: flame
   endpoint: "http://flame-session-manager:8080"
   executors:
-    shim: host
+    shims: [host]
 cache:
   endpoint: "grpc://127.0.0.1:9090"
   eviction:
@@ -1341,7 +1431,7 @@ cluster:
   name: flame
   endpoint: "http://flame-session-manager:8080"
   executors:
-    shim: host
+    shims: [host]
 cache:
   endpoint: "grpc://127.0.0.1:9090"
   eviction:
@@ -1370,7 +1460,7 @@ cluster:
   name: flame
   endpoint: "http://flame-session-manager:8080"
   executors:
-    shim: host
+    shims: [host]
 cache:
   endpoint: "grpc://127.0.0.1:9090"
   eviction:
@@ -1400,7 +1490,7 @@ cluster:
   endpoint: "http://flame-session-manager:8080"
   resreq: "cpu=2,mem=4g,gpu=1"
   executors:
-    shim: host
+    shims: [host]
         "#;
 
         let tmp_dir = TempDir::new().unwrap();
@@ -1424,7 +1514,7 @@ cluster:
   name: flame
   endpoint: "http://flame-session-manager:8080"
   executors:
-    shim: host
+    shims: [host]
         "#;
 
         let tmp_dir = TempDir::new().unwrap();
@@ -1446,7 +1536,7 @@ cluster:
   endpoint: "http://flame-session-manager:8080"
   resreq: "cpu=two,mem=4g"
   executors:
-    shim: host
+    shims: [host]
         "#;
 
         let tmp_dir = TempDir::new().unwrap();
@@ -1465,7 +1555,7 @@ cluster:
   name: flame
   endpoint: "http://flame-session-manager:8080"
   executors:
-    shim: host
+    shims: [host]
 cache:
   endpoint: "grpc://127.0.0.1:9090"
   eviction:

@@ -8,7 +8,8 @@ cluster:
   storage: none
   schedule_interval: 100
   executors:
-    shim: cri
+    # flmbox is a host shim application: this manager runs both shims; the first is the default.
+    shims: [cri, host]
   limits:
     max_sessions: 1000
     node:

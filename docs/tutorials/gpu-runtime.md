@@ -14,7 +14,7 @@ when `devices` is omitted):
 ```yaml
 cluster:
   executors:
-    shim: host
+    shims: [host]
     devices: [gpu]
 ```
 

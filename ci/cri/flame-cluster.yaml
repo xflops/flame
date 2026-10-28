@@ -9,7 +9,7 @@ cluster:
     - das
   storage: "fs:///opt/flame-test/data/session"
   executors:
-    shim: cri
+    shims: [cri]
   limits:
     node:
       max_executors: 16

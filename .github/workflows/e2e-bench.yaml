@@ -130,6 +130,19 @@ jobs:
           cd testing/system/perf
           python3 app.py | tee -a "$GITHUB_STEP_SUMMARY"
 
+      - name: Run flamepy.agent benchmark
+        timeout-minutes: 20
+        env:
+          # Small cases: each sandbox is an executor (the cluster allows 4), and the cluster
+          # has no session storage, so the suspend case is skipped.
+          FLAME_AGENT_BENCHMARK_SAMPLES: 3
+          FLAME_AGENT_BENCHMARK_PARALLEL: 2
+          FLAME_AGENT_BENCHMARK_SUSPEND: 0
+        run: |
+          bash testing/system/perf/wait_for_idle.sh
+          cd testing/system/perf
+          python3 agent.py | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Print CRI and Flame diagnostics
         if: always()
         run: ci/cri/e2e.sh diagnostics

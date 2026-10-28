@@ -115,7 +115,15 @@ impl Runsc {
     }
 
     async fn control(&self, what: &str, sub: Vec<String>) -> Result<CommandOutput, FlameError> {
-        let out = self.runner.run(self.spec(sub)).await?;
+        self.control_with(what, self.spec(sub)).await
+    }
+
+    async fn control_with(
+        &self,
+        what: &str,
+        spec: CommandSpec,
+    ) -> Result<CommandOutput, FlameError> {
+        let out = self.runner.run(spec).await?;
         if out.timed_out {
             return Err(FlameError::Internal(format!("runsc {what} timed out")));
         }
@@ -125,15 +133,22 @@ impl Runsc {
         Ok(out)
     }
 
-    /// `runsc create --bundle <dir> <id>`.
-    pub async fn create(&self, id: &str, bundle: &Path) -> Result<(), FlameError> {
+    /// `runsc create --bundle <dir> <id>`, with its stdout and stderr appended to
+    /// `log`. The container's init process inherits them and keeps them for as
+    /// long as the sandbox lives, so they are a file and not pipes, which would
+    /// never reach their end; the file is the log of the sandbox.
+    pub async fn create(&self, id: &str, bundle: &Path, log: &Path) -> Result<(), FlameError> {
         let sub = vec![
             "create".to_string(),
             "--bundle".to_string(),
             bundle.display().to_string(),
             id.to_string(),
         ];
-        self.control("create", sub).await.map(|_| ())
+        let spec = CommandSpec {
+            log: Some(log.to_path_buf()),
+            ..self.spec(sub)
+        };
+        self.control_with("create", spec).await.map(|_| ())
     }
 
     /// `runsc start <id>`.
@@ -215,7 +230,8 @@ impl Runtime for Runsc {
             spec.id,
             self.network,
         )?;
-        self.create(spec.id, &bundle).await?;
+        self.create(spec.id, &bundle, &spec.dir.join(crate::runtime::LOG_FILE))
+            .await?;
         Runsc::start(self, spec.id).await
     }
 
@@ -314,10 +330,37 @@ mod tests {
     const G: &str = "--root /state/runsc --network=none --overlay2=root:memory";
 
     #[tokio::test]
+    async fn only_create_writes_to_the_log_file() {
+        let fake = Arc::new(FakeRunner::default());
+        let r = runsc(&fake);
+        r.create("sb1", Path::new("/b/bundle"), Path::new("/b/sandbox.log"))
+            .await
+            .unwrap();
+        r.start("sb1").await.unwrap();
+        r.kill("sb1", "SIGKILL").await.unwrap();
+        r.delete("sb1").await.unwrap();
+        r.list().await.unwrap();
+        let logs: Vec<Option<std::path::PathBuf>> =
+            fake.specs().iter().map(|s| s.log.clone()).collect();
+        assert_eq!(
+            logs,
+            vec![
+                Some(Path::new("/b/sandbox.log").to_path_buf()),
+                None,
+                None,
+                None,
+                None
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn create_start_kill_delete_arguments() {
         let fake = Arc::new(FakeRunner::default());
         let r = runsc(&fake);
-        r.create("sb1", Path::new("/b/bundle")).await.unwrap();
+        r.create("sb1", Path::new("/b/bundle"), Path::new("/b/sandbox.log"))
+            .await
+            .unwrap();
         r.start("sb1").await.unwrap();
         r.kill("sb1", "SIGKILL").await.unwrap();
         r.delete("sb1").await.unwrap();
@@ -414,7 +457,10 @@ mod tests {
         let fake = Arc::new(FakeRunner::default());
         fake.respond(|_| Ok(out(1, "", "boom: bad bundle\n")));
         let r = runsc(&fake);
-        let err = r.create("sb1", Path::new("/b")).await.unwrap_err();
+        let err = r
+            .create("sb1", Path::new("/b"), Path::new("/b/sandbox.log"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, FlameError::Internal(_)));
         assert!(err.to_string().contains("boom: bad bundle"), "{err}");
         assert!(r.start("sb1").await.is_err());

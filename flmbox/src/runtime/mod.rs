@@ -20,6 +20,10 @@ limitations under the License.
 
 pub mod runsc;
 
+/// File name of a sandbox's log, in the sandbox directory: where the stdout and
+/// stderr of its init process go.
+pub const LOG_FILE: &str = "sandbox.log";
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;

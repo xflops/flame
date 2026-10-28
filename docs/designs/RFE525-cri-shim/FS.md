@@ -9,7 +9,7 @@ Status: **Implemented.**
 The implementation follows these reviewed decisions:
 
 1. **Explicit CRI shim.** Add `Shim::Cri` and select it only through
-   `cluster.executors.shim: cri`. Applications intended for container execution
+   `cluster.executors.shims: [cri]`. Applications intended for container execution
    also declare `shim: cri`, preserving the existing exact-match scheduler and
    executor binding contract.
 2. **Containerd owns runtime policy.** Flame has no `executors.cri` block. It
@@ -92,14 +92,31 @@ manager both select it:
 ```yaml
 cluster:
   executors:
-    shim: cri
+    shims: [cri]
 
 # Application specification
 shim: cri
 image: registry.example.com/flame/runner:latest
 ```
 
-`host` remains the default. `cri` uses `/run/containerd/containerd.sock` and
+`executors.shims` lists the shims an executor manager runs, and the first one is
+the default. A manager can run more than one:
+
+```yaml
+cluster:
+  executors:
+    shims: [cri, host]
+```
+
+The session manager creates an executor with the shim of its application, and the
+executor manager keeps it when it is listed; otherwise it uses the default shim,
+and the application is not matched with that executor (the scheduler matches an
+application only with executors of its own shim). The session manager does not
+yet know which shims a node runs, so Allocate can still ask a node for an
+executor that its executor manager cannot start; use the same `shims` on every
+node that serves an application of that shim.
+
+`host` remains the default when `shims` is not set. `cri` uses `/run/containerd/containerd.sock` and
 sends an empty `runtime_handler`, selecting containerd's configured default.
 Flame does not configure or override the runtime handler, CNI, DNS, cgroup
 driver, registry credentials, or gVisor flags. Those are node prerequisites
