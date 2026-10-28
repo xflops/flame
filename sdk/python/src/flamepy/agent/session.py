@@ -22,7 +22,7 @@ from typing import Dict, Optional
 from flamepy.agent.sandbox import CommandResult, _decode_result, _encode_request
 from flamepy.core.client import create_session as _create_core_session
 from flamepy.core.client import open_session as _open_core_session
-from flamepy.core.types import FlameError, FlameErrorCode, ResourceRequirement
+from flamepy.core.types import FlameError, FlameErrorCode, ResourceRequirement, SessionAttributes
 
 logger = logging.getLogger(__name__)
 
@@ -193,38 +193,51 @@ def open_session(
     max_instances: Optional[int] = None,
     resreq: Optional[ResourceRequirement] = None,
 ) -> Session:
-    """Create an agent session, or reopen one when ``ssn_id`` is provided.
+    """Create an agent session, or open or create the one named ``ssn_id``.
 
+    With ``ssn_id`` an existing session is reopened and a missing one is created with that id. The
+    creation options only apply when the session is created; an existing session keeps its own.
     ``image`` is the sandbox container image; the ``flmbox`` service default applies when it is ``None``.
     """
-    if ssn_id is None:
-        normalized_options = _normalize_options(
-            _SessionOptions(
-                image=image,
-                min_instances=min_instances,
-                max_instances=max_instances,
-                resreq=resreq,
-            )
+    if ssn_id is not None and (not isinstance(ssn_id, str) or not ssn_id):
+        raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "ssn_id must be a non-empty string")
+    normalized_options = _normalize_options(
+        _SessionOptions(
+            image=image,
+            min_instances=min_instances,
+            max_instances=max_instances,
+            resreq=resreq,
         )
+    )
+    common_data = _encode_options(normalized_options)
+    if ssn_id is None:
         logger.debug("Creating agent session image=%s", normalized_options.image)
         core_session = _create_core_session(
             _FLMBOX_APP,
-            common_data=_encode_options(normalized_options),
+            common_data=common_data,
             min_instances=normalized_options.min_instances,
             max_instances=normalized_options.max_instances,
             resreq=normalized_options.resreq,
         )
     else:
-        if not isinstance(ssn_id, str) or not ssn_id:
-            raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "ssn_id must be a non-empty string")
-        core_session = _open_core_session(ssn_id)
-        normalized_options = None
+        core_session = _open_core_session(
+            ssn_id,
+            SessionAttributes(
+                application=_FLMBOX_APP,
+                id=ssn_id,
+                common_data=common_data,
+                min_instances=normalized_options.min_instances,
+                max_instances=normalized_options.max_instances,
+                resreq=normalized_options.resreq,
+            ),
+        )
 
     if core_session.application != _FLMBOX_APP:
         raise FlameError(
             FlameErrorCode.INVALID_ARGUMENT,
             f"session {core_session.id!r} is not an agent session",
         )
-    if normalized_options is None:
+    if ssn_id is not None:
+        # The session may have existed already, with its own options.
         normalized_options = _decode_options(core_session.common_data())
     return Session(core_session, normalized_options)

@@ -276,14 +276,14 @@ Key classes and methods:
 
 - `open_session(*, ssn_id=None, image=None, min_instances=0, max_instances=None, resreq=None)`
 - `open_session()` creates a session in the `flmbox` service's default image; pass `image` to choose the sandbox container image. To run Python, the image must provide it (for example `python:3.12-slim`)
-- `open_session(ssn_id="...")` reopens a session by ID
+- `open_session(ssn_id="...")` reopens the session with that ID, or creates it with the given options when it does not exist
 - `Session.run_code(code, *, language="shell", cwd=None, envs=None, input=None, timeout=None) -> CommandResult` blocks for the result; `language` is `"shell"` (default) or `"python"`
 - `Session.submit_code(code, *, language="shell", cwd=None, envs=None, input=None, timeout=None) -> Future[CommandResult]` returns immediately
 - `Session.close()`
 - `ssn.id`, `ssn.attr`
 - `CommandResult.exit_code`, `.stdout`, `.stderr`, `.ok`, `.stdout_text()`, `.stderr_text()`. A nonzero exit is a normal result, not an exception.
 
-Creation options are ignored when `ssn_id` is provided. `ssn.attr` is a read-only view of the effective creation settings; its type is intentionally not exported. `image` is create-time only. `close()` destroys the session. Reopen works only while the session is still open. `ResourceRequirement` and `FlameError` are imported from `flamepy`.
+Creation options apply only when the session is created: an existing session keeps its own, so they are ignored when `ssn_id` names one that exists. `ssn.attr` is a read-only view of the effective creation settings; its type is intentionally not exported. `image` is create-time only. `close()` destroys the session. Reopen works only while the session is still open. `ResourceRequirement` and `FlameError` are imported from `flamepy`.
 
 ## Sandbox API
 
