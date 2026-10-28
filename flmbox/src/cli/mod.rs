@@ -174,6 +174,13 @@ mod tests {
             Command::Pull(_)
         ));
         assert!(matches!(
+            parse(&["flmbox", "pull", "ubuntu:26.04", "--policy", "ifnotpresent"]),
+            Command::Pull(_)
+        ));
+        assert!(
+            Cli::try_parse_from(["flmbox", "pull", "ubuntu:26.04", "--policy", "never"]).is_err()
+        );
+        assert!(matches!(
             parse(&["flmbox", "kill", "dev"]),
             Command::Kill(_)
         ));

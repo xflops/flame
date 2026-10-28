@@ -21,7 +21,7 @@ use flame_rs::apis::FlameError;
 
 use crate::config::{FlameRuntime, FlameSandbox};
 use crate::images::Images;
-use crate::images::{ImageConfig, ImageInfo, ImageRoot};
+use crate::images::{ImageConfig, ImageInfo, ImageRoot, PullPolicy};
 use crate::runtime::runsc::runner::{CommandRunner, CommandSpec};
 use crate::runtime::runsc::Runsc;
 use crate::runtime::{CommandOutput, Runtime};
@@ -172,7 +172,11 @@ impl FakeImages {
 
 #[async_trait]
 impl Images for FakeImages {
-    async fn pull_image(&self, reference: &str) -> Result<ImageRoot, FlameError> {
+    async fn pull_image(
+        &self,
+        reference: &str,
+        _policy: PullPolicy,
+    ) -> Result<ImageRoot, FlameError> {
         self.calls
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

@@ -28,7 +28,7 @@ use flame_rs::apis::FlameError;
 use crate::api::{CommandRequest, CommandResult};
 
 use crate::config::FlameSandbox;
-use crate::images::{parse_reference, ImageInfo, ImageRoot, Images};
+use crate::images::{parse_reference, ImageInfo, ImageRoot, Images, PullPolicy};
 use crate::runtime::{runtime_for, ExecOptions, Runtime, SandboxInfo, SandboxSpec};
 
 /// Image used when none is named.
@@ -91,9 +91,9 @@ impl Sandbox {
     }
 
     /// Downloads and unpacks an image into the node-local cache.
-    pub async fn pull(&self, reference: &str) -> Result<ImageRoot, FlameError> {
+    pub async fn pull(&self, reference: &str, policy: PullPolicy) -> Result<ImageRoot, FlameError> {
         parse_reference(reference)?;
-        self.images.pull_image(reference).await
+        self.images.pull_image(reference, policy).await
     }
 
     /// Pulls the image, then creates and starts sandbox `id` on it. Nothing is
@@ -116,7 +116,10 @@ impl Sandbox {
     }
 
     async fn start(&self, id: &str, reference: &str) -> Result<(), FlameError> {
-        let image = self.images.pull_image(reference).await?;
+        let image = self
+            .images
+            .pull_image(reference, PullPolicy::IfNotPresent)
+            .await?;
         let dir = self.sandboxes_dir().join(id);
         fs::create_dir_all(&dir)
             .map_err(|e| FlameError::Internal(format!("create {}: {e}", dir.display())))?;
@@ -445,7 +448,7 @@ mod tests {
             Err(FlameError::InvalidConfig(_))
         ));
         assert!(matches!(
-            f.sb.pull("not a ref!").await,
+            f.sb.pull("not a ref!", PullPolicy::Always).await,
             Err(FlameError::InvalidConfig(_))
         ));
         assert!(matches!(
@@ -464,7 +467,7 @@ mod tests {
     #[tokio::test]
     async fn pull_only_fetches_the_image() {
         let f = fixture();
-        let root = f.sb.pull("alpine:3").await.unwrap();
+        let root = f.sb.pull("alpine:3", PullPolicy::Always).await.unwrap();
         assert_eq!(root.digest, "sha256:fake");
         assert_eq!(f.images.calls(), vec!["alpine:3"]);
         assert!(f.runner.specs().is_empty());
@@ -568,7 +571,7 @@ mod tests {
     #[tokio::test]
     async fn images_come_from_the_image_cache() {
         let f = fixture();
-        f.sb.pull("alpine:3").await.unwrap();
+        f.sb.pull("alpine:3", PullPolicy::Always).await.unwrap();
         let images = f.sb.images().await.unwrap();
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].reference.as_deref(), Some("alpine:3"));

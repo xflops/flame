@@ -22,13 +22,18 @@ mod store;
 mod unpack;
 
 pub use progress::human_bytes;
-pub use store::{parse_reference, ImageConfig, ImageInfo, ImageRoot, ImageStore};
+pub use store::{parse_reference, ImageConfig, ImageInfo, ImageRoot, ImageStore, PullPolicy};
 
 /// Provides unpacked images.
 #[async_trait]
 pub trait Images: Send + Sync {
-    /// Makes sure the image is available locally and returns it.
-    async fn pull_image(&self, reference: &str) -> Result<ImageRoot, FlameError>;
+    /// Makes sure the image is available locally and returns it. `policy` says whether a cached
+    /// image is used as it is or a tag is resolved with the registry again.
+    async fn pull_image(
+        &self,
+        reference: &str,
+        policy: PullPolicy,
+    ) -> Result<ImageRoot, FlameError>;
 
     /// The images in the local cache, newest first.
     async fn list_images(&self) -> Result<Vec<ImageInfo>, FlameError>;
@@ -36,8 +41,12 @@ pub trait Images: Send + Sync {
 
 #[async_trait]
 impl Images for ImageStore {
-    async fn pull_image(&self, reference: &str) -> Result<ImageRoot, FlameError> {
-        ImageStore::pull_image(self, reference).await
+    async fn pull_image(
+        &self,
+        reference: &str,
+        policy: PullPolicy,
+    ) -> Result<ImageRoot, FlameError> {
+        ImageStore::pull_image(self, reference, policy).await
     }
 
     async fn list_images(&self) -> Result<Vec<ImageInfo>, FlameError> {

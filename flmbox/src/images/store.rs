@@ -69,6 +69,17 @@ pub struct ImageConfig {
     pub user: Option<String>,
 }
 
+/// When to ask the registry for an image that is already in the cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum PullPolicy {
+    /// Use the cached image; the registry is asked only when there is none.
+    #[default]
+    #[value(name = "ifnotpresent")]
+    IfNotPresent,
+    /// Resolve a tag with the registry again, so that a tag that moved is followed.
+    Always,
+}
+
 /// An unpacked image in the cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageRoot {
@@ -283,14 +294,24 @@ impl ImageStore {
         }
     }
 
-    /// Makes sure the image is in the cache and returns it. A tag costs the
-    /// manifest requests to resolve the digest; a cached digest reference costs none.
-    pub async fn pull_image(&self, reference: &str) -> Result<ImageRoot, FlameError> {
+    /// Makes sure the image is in the cache and returns it. With `IfNotPresent` a cached image
+    /// costs no registry request, also when it is named by a tag: the digest a tag resolved to is
+    /// remembered, and a tag that moved in the registry is not followed. With `Always` a tag is
+    /// resolved with the registry again (a digest names its content, so it never is).
+    pub async fn pull_image(
+        &self,
+        reference: &str,
+        policy: PullPolicy,
+    ) -> Result<ImageRoot, FlameError> {
         let reference = parse_reference(reference)?;
-        if let Some(requested) = reference.digest() {
-            let digest = self
-                .alias(requested)
-                .unwrap_or_else(|| requested.to_string());
+        // The alias of a digest names its content and never changes: only a tag is resolved again.
+        let alias = if policy == PullPolicy::Always && reference.digest().is_none() {
+            None
+        } else {
+            self.alias(&reference)
+        };
+        let known = alias.or_else(|| reference.digest().map(str::to_string));
+        if let Some(digest) = known {
             if let Some(root) = self.cached(&digest)? {
                 self.record_reference(&digest, &reference);
                 self.emit(PullEvent::Cached { digest });
@@ -304,10 +325,9 @@ impl ImageStore {
             .await
             .map_err(|e| registry_error(&format!("pull {reference}"), &e))?;
         sha256_hex(&digest)?;
-        if let Some(requested) = reference.digest() {
-            if requested != digest {
-                self.record_alias(requested, &digest);
-            }
+        // A tag, or the digest of an index: the digest of the platform manifest keys the cache.
+        if reference.digest() != Some(digest.as_str()) {
+            self.record_alias(&reference, &digest);
         }
 
         // Held until the end of the pull: other executors of the node wait here.
@@ -344,29 +364,43 @@ impl ImageStore {
         self.pull(&reference, digest, manifest, total).await
     }
 
-    /// The cache is keyed by the digest of the platform manifest, which is not the digest of a
-    /// multi-platform index. An alias maps the one to the other, so that a digest reference to
-    /// an index finds its cached image without the registry.
-    fn alias_path(&self, requested: &str) -> Result<PathBuf, FlameError> {
-        Ok(self.images_dir.join("aliases").join(sha256_hex(requested)?))
+    /// The cache is keyed by the digest of the platform manifest, which is not what a tag or the
+    /// digest of a multi-platform index names. An alias maps such a reference to the platform
+    /// digest, so that it finds its cached image without the registry. It is the file
+    /// `refs/<registry>/<repository>/<name>`, with the name `:<tag>` or `@sha256-<hex>`: no
+    /// component of a repository starts with `:` or `@`, so a name never clashes with a
+    /// repository below this one.
+    fn alias_path(&self, reference: &Reference) -> Result<PathBuf, FlameError> {
+        let name = match reference.digest() {
+            Some(digest) => format!("@sha256-{}", sha256_hex(digest)?),
+            None => format!(":{}", reference.tag().unwrap_or("latest")),
+        };
+        Ok(self
+            .images_dir
+            .join("refs")
+            .join(reference.registry())
+            .join(reference.repository())
+            .join(name))
     }
 
-    /// The platform digest an earlier pull of the digest `requested` resolved to. It is only a
-    /// hint: `cached` says whether that image is still there.
-    fn alias(&self, requested: &str) -> Option<String> {
-        let digest = fs::read_to_string(self.alias_path(requested).ok()?).ok()?;
+    /// The platform digest an earlier pull of `reference` resolved to. It is only a hint:
+    /// `cached` says whether that image is still there.
+    fn alias(&self, reference: &Reference) -> Option<String> {
+        let digest = fs::read_to_string(self.alias_path(reference).ok()?).ok()?;
         sha256_hex(&digest).is_ok().then_some(digest)
     }
 
     /// Best effort: without an alias the next pull asks the registry again.
-    fn record_alias(&self, requested: &str, digest: &str) {
-        let Ok(path) = self.alias_path(requested) else {
+    fn record_alias(&self, reference: &Reference, digest: &str) {
+        let Ok(path) = self.alias_path(reference) else {
             return;
         };
-        let written = fs::create_dir_all(self.images_dir.join("aliases"))
+        let written = path
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
             .and_then(|()| fs::write(&path, digest));
         if let Err(e) = written {
-            tracing::debug!("could not record the alias of {requested}: {e}");
+            tracing::debug!("could not record the alias of {reference}: {e}");
         }
     }
 
@@ -1032,7 +1066,10 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let store = store(state.path(), None);
 
-        let root = store.pull_image(&mock.reference(":v1")).await.unwrap();
+        let root = store
+            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
+            .await
+            .unwrap();
         let fs = &root.rootfs;
 
         assert_eq!(root.digest, manifest);
@@ -1099,14 +1136,27 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let store = store(state.path(), None);
 
-        let first = store.pull_image(&mock.reference(":v1")).await.unwrap();
+        let first = store
+            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
+            .await
+            .unwrap();
         let blobs = mock.requests("/blobs/");
         assert_eq!(blobs, 3);
         let manifests = mock.requests("/manifests/");
 
-        // A tag costs the manifest requests (index and platform manifest) only, never a blob.
-        let second = store.pull_image(&mock.reference(":v1")).await.unwrap();
+        // A cached tag costs no registry request, and `Always` the manifest requests (index
+        // and platform manifest) only, never a blob.
+        let second = store
+            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
+            .await
+            .unwrap();
         assert_eq!(first, second);
+        assert_eq!(mock.requests("/manifests/"), manifests);
+        let always = store
+            .pull_image(&mock.reference(":v1"), PullPolicy::Always)
+            .await
+            .unwrap();
+        assert_eq!(first, always);
         assert_eq!(mock.requests("/blobs/"), blobs);
         assert_eq!(mock.requests("/manifests/"), manifests + 2);
 
@@ -1118,7 +1168,10 @@ mod tests {
         // A cached digest costs nothing.
         let before = mock.total();
         let third = store
-            .pull_image(&format!("{}@{manifest}", mock.reference("")))
+            .pull_image(
+                &format!("{}@{manifest}", mock.reference("")),
+                PullPolicy::IfNotPresent,
+            )
             .await
             .unwrap();
         assert_eq!(first, third);
@@ -1139,12 +1192,27 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let (first_store, other_store) = (store(state.path(), None), store(state.path(), None));
 
-        let first = first_store.pull_image(&by_index).await.unwrap();
+        let first = first_store
+            .pull_image(&by_index, PullPolicy::IfNotPresent)
+            .await
+            .unwrap();
 
         let before = mock.total();
-        assert_eq!(first_store.pull_image(&by_index).await.unwrap(), first);
+        assert_eq!(
+            first_store
+                .pull_image(&by_index, PullPolicy::IfNotPresent)
+                .await
+                .unwrap(),
+            first
+        );
         // The alias is on disk: another store (another process) does not ask either.
-        assert_eq!(other_store.pull_image(&by_index).await.unwrap(), first);
+        assert_eq!(
+            other_store
+                .pull_image(&by_index, PullPolicy::IfNotPresent)
+                .await
+                .unwrap(),
+            first
+        );
         assert_eq!(mock.total(), before);
     }
 
@@ -1157,14 +1225,29 @@ mod tests {
         let by_index = format!("{}@{index}", mock.reference(""));
         let state = tempfile::tempdir().unwrap();
         let store = store(state.path(), None);
-        let first = store.pull_image(&by_index).await.unwrap();
+        let first = store
+            .pull_image(&by_index, PullPolicy::IfNotPresent)
+            .await
+            .unwrap();
         let blobs = mock.requests("/blobs/");
 
         let not_cached = format!("sha256:{}", "d".repeat(64));
         for bad in [not_cached.as_str(), "../../etc"] {
-            fs::write(store.alias_path(&index).unwrap(), bad).unwrap();
+            fs::write(
+                store
+                    .alias_path(&parse_reference(&by_index).unwrap())
+                    .unwrap(),
+                bad,
+            )
+            .unwrap();
             let before = mock.total();
-            assert_eq!(store.pull_image(&by_index).await.unwrap(), first);
+            assert_eq!(
+                store
+                    .pull_image(&by_index, PullPolicy::IfNotPresent)
+                    .await
+                    .unwrap(),
+                first
+            );
             assert!(mock.total() > before, "{bad}: it did not ask the registry");
             assert_eq!(
                 mock.requests("/blobs/"),
@@ -1174,8 +1257,104 @@ mod tests {
         }
 
         let before = mock.total();
-        assert_eq!(store.pull_image(&by_index).await.unwrap(), first);
+        assert_eq!(
+            store
+                .pull_image(&by_index, PullPolicy::IfNotPresent)
+                .await
+                .unwrap(),
+            first
+        );
         assert_eq!(mock.total(), before, "the alias was not corrected");
+    }
+
+    /// With `IfNotPresent` a cached tag is used as it is; `Always` follows a tag that moved.
+    #[tokio::test]
+    async fn a_moved_tag_is_followed_by_the_always_policy_only() {
+        let mock = Mock::start(Duration::ZERO).await;
+        let old = add_image(&mock, &base_layers());
+        add_index(&mock, "v1", &old);
+        let state = tempfile::tempdir().unwrap();
+        let store = store(state.path(), None);
+        let first = store
+            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
+            .await
+            .unwrap();
+
+        let new = add_image(
+            &mock,
+            &[layer(&[Ent::File("etc/os-release", b"ID=v2\n", 0o644)])],
+        );
+        assert_ne!(old, new);
+        add_index(&mock, "v1", &new);
+
+        let before = mock.total();
+        assert_eq!(
+            store
+                .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(mock.total(), before, "a cached tag asked the registry");
+
+        let moved = store
+            .pull_image(&mock.reference(":v1"), PullPolicy::Always)
+            .await
+            .unwrap();
+        assert_ne!(moved, first);
+        // The tag is what it resolved to now.
+        assert_eq!(
+            store
+                .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
+                .await
+                .unwrap(),
+            moved
+        );
+
+        // Another tag of the same repository has its own alias, and a digest is not resolved again.
+        add_index(&mock, "v2", &old);
+        assert_eq!(
+            store
+                .pull_image(&mock.reference(":v2"), PullPolicy::IfNotPresent)
+                .await
+                .unwrap(),
+            first
+        );
+        let by_digest = format!("{}@{old}", mock.reference(""));
+        let before = mock.total();
+        assert_eq!(
+            store
+                .pull_image(&by_digest, PullPolicy::Always)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(mock.total(), before);
+    }
+
+    /// Aliases are nested by image, and a tag never clashes with a repository below it.
+    #[test]
+    fn aliases_are_nested_by_image() {
+        let state = tempfile::tempdir().unwrap();
+        let store = store(state.path(), None);
+        let (one, two) = (
+            parse_reference("example.com/a/b:c").unwrap(),
+            parse_reference("example.com/a/b/c:d").unwrap(),
+        );
+        let digest = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+        store.record_alias(&one, &digest('1'));
+        store.record_alias(&two, &digest('2'));
+
+        assert_eq!(store.alias(&one), Some(digest('1')));
+        assert_eq!(store.alias(&two), Some(digest('2')));
+        let refs = state.path().join("images/refs/example.com/a/b");
+        assert!(refs.join(":c").is_file());
+        assert!(refs.join("c/:d").is_file());
+
+        let by_digest = parse_reference(&format!("example.com/a/b@{}", digest('3'))).unwrap();
+        store.record_alias(&by_digest, &digest('4'));
+        assert!(refs.join(format!("@sha256-{}", "3".repeat(64))).is_file());
+        assert_eq!(store.alias(&by_digest), Some(digest('4')));
     }
 
     #[tokio::test]
@@ -1188,10 +1367,10 @@ mod tests {
         let r = mock.reference(":v1");
 
         let (a, b, c, d) = tokio::join!(
-            store.pull_image(&r),
-            store.pull_image(&r),
-            store.pull_image(&r),
-            store.pull_image(&r)
+            store.pull_image(&r, PullPolicy::IfNotPresent),
+            store.pull_image(&r, PullPolicy::IfNotPresent),
+            store.pull_image(&r, PullPolicy::IfNotPresent),
+            store.pull_image(&r, PullPolicy::IfNotPresent)
         );
         for result in [a, b, c, d] {
             assert_eq!(result.unwrap().digest, manifest);
@@ -1210,7 +1389,10 @@ mod tests {
         let (a, b) = (store(state.path(), None), store(state.path(), None));
         let r = mock.reference(":v1");
 
-        let (x, y) = tokio::join!(a.pull_image(&r), b.pull_image(&r));
+        let (x, y) = tokio::join!(
+            a.pull_image(&r, PullPolicy::IfNotPresent),
+            b.pull_image(&r, PullPolicy::IfNotPresent)
+        );
         assert_eq!(x.unwrap(), y.unwrap());
         assert_eq!(mock.requests("/blobs/"), 3);
         assert_eq!(a.list().unwrap().len(), 1);
@@ -1224,7 +1406,10 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let store = store(state.path(), Some("100"));
 
-        let err = store.pull_image(&mock.reference(":v1")).await.unwrap_err();
+        let err = store
+            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
+            .await
+            .unwrap_err();
         assert!(matches!(err, FlameError::InvalidConfig(_)), "{err}");
         assert_eq!(mock.requests("/blobs/"), 0);
         assert_clean(state.path());
@@ -1240,7 +1425,10 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let store = store(state.path(), Some("16K"));
 
-        let err = store.pull_image(&mock.reference(":v1")).await.unwrap_err();
+        let err = store
+            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("limit"), "{err}");
         assert_clean(state.path());
     }
@@ -1286,7 +1474,9 @@ mod tests {
             let state = tempfile::tempdir().unwrap();
             let store = store(state.path(), None);
 
-            let result = store.pull_image(&mock.reference(":v1")).await;
+            let result = store
+                .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
+                .await;
             assert!(result.is_err(), "{name} must be rejected");
             assert_clean(state.path());
             assert!(!state.path().join("escape").exists(), "{name}");
@@ -1307,7 +1497,10 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let store = store(state.path(), None);
 
-        let err = store.pull_image(&mock.reference(":v1")).await.unwrap_err();
+        let err = store
+            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
+            .await
+            .unwrap_err();
         assert!(matches!(err, FlameError::Network(_)), "{err}");
         assert!(err.to_string().contains("404"), "{err}");
         assert_clean(state.path());
@@ -1339,7 +1532,10 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let store = store(state.path(), None);
 
-        let root = store.pull_image(&mock.reference(":v1")).await.unwrap();
+        let root = store
+            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(root.rootfs.join("one")).unwrap(), b"1");
         assert_eq!(std::fs::read(root.rootfs.join("two")).unwrap(), b"2");
     }

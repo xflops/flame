@@ -15,17 +15,22 @@ limitations under the License.
 
 use flame_rs::apis::FlameError;
 
+use crate::images::PullPolicy;
 use crate::sandbox::Sandbox;
 
 #[derive(clap::Args)]
 pub struct Args {
     /// Image reference, e.g. ubuntu:26.04 or ghcr.io/org/img@sha256:...
     image: String,
+
+    /// When to ask the registry for an image that is already cached
+    #[arg(long, value_enum, default_value_t = PullPolicy::Always)]
+    policy: PullPolicy,
 }
 
 /// Prints the digest of the pulled image; the progress goes to stderr.
 pub async fn run(sandbox: &Sandbox, args: Args) -> Result<(), FlameError> {
-    let root = sandbox.pull(&args.image).await?;
+    let root = sandbox.pull(&args.image, args.policy).await?;
     println!("{}", root.digest);
     Ok(())
 }
