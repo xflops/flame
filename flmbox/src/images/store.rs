@@ -287,12 +287,13 @@ impl ImageStore {
     /// manifest requests to resolve the digest; a cached digest reference costs none.
     pub async fn pull_image(&self, reference: &str) -> Result<ImageRoot, FlameError> {
         let reference = parse_reference(reference)?;
-        if let Some(digest) = reference.digest() {
-            if let Some(root) = self.cached(digest)? {
-                self.record_reference(digest, &reference);
-                self.emit(PullEvent::Cached {
-                    digest: digest.to_string(),
-                });
+        if let Some(requested) = reference.digest() {
+            let digest = self
+                .alias(requested)
+                .unwrap_or_else(|| requested.to_string());
+            if let Some(root) = self.cached(&digest)? {
+                self.record_reference(&digest, &reference);
+                self.emit(PullEvent::Cached { digest });
                 return Ok(root);
             }
         }
@@ -303,6 +304,11 @@ impl ImageStore {
             .await
             .map_err(|e| registry_error(&format!("pull {reference}"), &e))?;
         sha256_hex(&digest)?;
+        if let Some(requested) = reference.digest() {
+            if requested != digest {
+                self.record_alias(requested, &digest);
+            }
+        }
 
         // Held until the end of the pull: other executors of the node wait here.
         let _lock = self.lock(&digest).await?;
@@ -336,6 +342,32 @@ impl ImageStore {
             )));
         }
         self.pull(&reference, digest, manifest, total).await
+    }
+
+    /// The cache is keyed by the digest of the platform manifest, which is not the digest of a
+    /// multi-platform index. An alias maps the one to the other, so that a digest reference to
+    /// an index finds its cached image without the registry.
+    fn alias_path(&self, requested: &str) -> Result<PathBuf, FlameError> {
+        Ok(self.images_dir.join("aliases").join(sha256_hex(requested)?))
+    }
+
+    /// The platform digest an earlier pull of the digest `requested` resolved to. It is only a
+    /// hint: `cached` says whether that image is still there.
+    fn alias(&self, requested: &str) -> Option<String> {
+        let digest = fs::read_to_string(self.alias_path(requested).ok()?).ok()?;
+        sha256_hex(&digest).is_ok().then_some(digest)
+    }
+
+    /// Best effort: without an alias the next pull asks the registry again.
+    fn record_alias(&self, requested: &str, digest: &str) {
+        let Ok(path) = self.alias_path(requested) else {
+            return;
+        };
+        let written = fs::create_dir_all(self.images_dir.join("aliases"))
+            .and_then(|()| fs::write(&path, digest));
+        if let Err(e) = written {
+            tracing::debug!("could not record the alias of {requested}: {e}");
+        }
     }
 
     /// Records `reference` for a cached image that has none, for `list`. Best effort.
@@ -898,8 +930,9 @@ mod tests {
         d
     }
 
-    /// Registers an index under `tag` that selects `manifest` for the host arch.
-    fn add_index(mock: &Mock, tag: &str, manifest: &str) {
+    /// Registers an index under `tag` and under its digest, which it returns, that selects
+    /// `manifest` for the host arch.
+    fn add_index(mock: &Mock, tag: &str, manifest: &str) -> String {
         let host = match std::env::consts::ARCH {
             "x86_64" => "amd64",
             "aarch64" => "arm64",
@@ -913,11 +946,15 @@ mod tests {
             {{"mediaType":"{OCI_MANIFEST}","digest":"{missing}","size":1,"platform":{{"architecture":"{host}","os":"windows"}}}},
             {{"mediaType":"{OCI_MANIFEST}","digest":"{manifest}","size":1,"platform":{{"architecture":"{host}","os":"linux"}}}}]}}"#
         );
+        let index = index.into_bytes();
+        let index_digest = digest(&index);
         mock.put(
-            &format!("/v2/{REPO}/manifests/{tag}"),
+            &format!("/v2/{REPO}/manifests/{index_digest}"),
             OCI_INDEX,
-            index.into_bytes(),
+            index.clone(),
         );
+        mock.put(&format!("/v2/{REPO}/manifests/{tag}"), OCI_INDEX, index);
+        index_digest
     }
 
     fn base_layers() -> Vec<Vec<u8>> {
@@ -1086,6 +1123,59 @@ mod tests {
             .unwrap();
         assert_eq!(first, third);
         assert_eq!(mock.total(), before);
+    }
+
+    /// A cached image pulled by the digest of a multi-platform index costs no registry request,
+    /// though the cache is keyed by the digest of the platform manifest.
+    #[tokio::test]
+    async fn an_index_digest_costs_no_registry_request_once_cached() {
+        let mock = Mock::start(Duration::ZERO).await;
+        let manifest = add_image(&mock, &base_layers());
+        let by_index = format!(
+            "{}@{}",
+            mock.reference(""),
+            add_index(&mock, "v1", &manifest)
+        );
+        let state = tempfile::tempdir().unwrap();
+        let (first_store, other_store) = (store(state.path(), None), store(state.path(), None));
+
+        let first = first_store.pull_image(&by_index).await.unwrap();
+
+        let before = mock.total();
+        assert_eq!(first_store.pull_image(&by_index).await.unwrap(), first);
+        // The alias is on disk: another store (another process) does not ask either.
+        assert_eq!(other_store.pull_image(&by_index).await.unwrap(), first);
+        assert_eq!(mock.total(), before);
+    }
+
+    /// An alias is a hint: a wrong or damaged one falls back to the registry, which corrects it.
+    #[tokio::test]
+    async fn a_bad_alias_falls_back_to_the_registry_and_is_corrected() {
+        let mock = Mock::start(Duration::ZERO).await;
+        let manifest = add_image(&mock, &base_layers());
+        let index = add_index(&mock, "v1", &manifest);
+        let by_index = format!("{}@{index}", mock.reference(""));
+        let state = tempfile::tempdir().unwrap();
+        let store = store(state.path(), None);
+        let first = store.pull_image(&by_index).await.unwrap();
+        let blobs = mock.requests("/blobs/");
+
+        let not_cached = format!("sha256:{}", "d".repeat(64));
+        for bad in [not_cached.as_str(), "../../etc"] {
+            fs::write(store.alias_path(&index).unwrap(), bad).unwrap();
+            let before = mock.total();
+            assert_eq!(store.pull_image(&by_index).await.unwrap(), first);
+            assert!(mock.total() > before, "{bad}: it did not ask the registry");
+            assert_eq!(
+                mock.requests("/blobs/"),
+                blobs,
+                "{bad}: the image was pulled again"
+            );
+        }
+
+        let before = mock.total();
+        assert_eq!(store.pull_image(&by_index).await.unwrap(), first);
+        assert_eq!(mock.total(), before, "the alias was not corrected");
     }
 
     #[tokio::test]
