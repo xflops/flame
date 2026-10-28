@@ -98,7 +98,7 @@ from .core import (  # Type aliases; Constants; Enums; Exception classes; Data c
     unregister_application,
 )
 
-__version__ = "0.7.0rc3"
+__version__ = "0.7.0"
 
 __all__ = [
     # Type aliases
