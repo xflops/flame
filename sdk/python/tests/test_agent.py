@@ -286,15 +286,36 @@ def test_open_restores_options():
     assert agent_session.attr.min_instances == 1
 
 
-def test_open_by_id_ignores_creation_options():
-    options = _SessionOptions(image="img")
-    core_session = FakeSession(common_data=_encode_options(options))
+def test_open_by_id_passes_creation_options_as_spec():
+    spec = {}
 
-    with patch("flamepy.agent.session._open_core_session", return_value=core_session) as core_open:
+    def fake_open(session_id, attrs=None):
+        spec["id"], spec["attrs"] = session_id, attrs
+        return FakeSession(session_id=session_id, common_data=attrs.common_data)
+
+    resreq = ResourceRequirement(cpu=1)
+    with patch("flamepy.agent.session._open_core_session", fake_open):
+        agent_session = open_session(ssn_id="named", image="img", min_instances=1, max_instances=2, resreq=resreq)
+
+    attrs = spec["attrs"]
+    assert spec["id"] == "named"
+    assert attrs.id == "named"
+    assert attrs.application == "flmbox"
+    assert attrs.min_instances == 1
+    assert attrs.max_instances == 2
+    assert attrs.resreq == resreq
+    assert json.loads(attrs.common_data.decode("utf-8"))["image"] == "img"
+    assert agent_session.id == "named"
+    assert agent_session.attr.image == "img"
+
+
+def test_open_existing_session_keeps_its_own_options():
+    existing = FakeSession(common_data=_encode_options(_SessionOptions(image="img")))
+
+    with patch("flamepy.agent.session._open_core_session", return_value=existing):
         agent_session = open_session(ssn_id="ssn-1", image="ignored")
 
-    core_open.assert_called_once_with("ssn-1")
-    assert agent_session.attr == options
+    assert agent_session.attr.image == "img"
 
 
 def test_open_rejects_non_flmbox_session():
