@@ -590,11 +590,6 @@ impl TryFrom<FlameExecutorsYaml> for FlameExecutors {
 }
 
 impl FlameExecutors {
-    /// Whether this executor manager can run executors of `shim`.
-    pub fn supports(&self, shim: Shim) -> bool {
-        self.shims.contains(&shim)
-    }
-
     /// The default shim: the first one listed.
     pub fn default_shim(&self) -> Shim {
         self.shims[0]
@@ -603,7 +598,7 @@ impl FlameExecutors {
     /// The shim of an executor that asks for `requested`: that one when it is
     /// supported, the default one otherwise.
     pub fn shim_for(&self, requested: Shim) -> Shim {
-        if self.supports(requested) {
+        if self.shims.contains(&requested) {
             requested
         } else {
             self.default_shim()
@@ -803,11 +798,10 @@ mod tests {
     }
 
     #[test]
-    fn executor_shims_with_one_shim_support_only_that_shim() {
+    fn executor_shims_with_one_shim_run_only_that_shim() {
         let executors = executors("shims: [cri]").unwrap();
+        assert_eq!(executors.shims, [Shim::Cri]);
         assert_eq!(executors.default_shim(), Shim::Cri);
-        assert!(executors.supports(Shim::Cri));
-        assert!(!executors.supports(Shim::Host));
     }
 
     #[test]
@@ -815,7 +809,6 @@ mod tests {
         let executors = executors("shims: [cri, host]").unwrap();
         assert_eq!(executors.shims, [Shim::Cri, Shim::Host]);
         assert_eq!(executors.default_shim(), Shim::Cri);
-        assert!(executors.supports(Shim::Host) && executors.supports(Shim::Cri));
     }
 
     #[test]

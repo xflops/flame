@@ -82,6 +82,28 @@ impl Plugin for ShimPlugin {
         Ok(())
     }
 
+    /// Check if a node can be asked for an executor for a session: the node's executor
+    /// manager has to run the shim of the session's application. A node that reported no
+    /// shims runs none.
+    ///
+    /// Returns `None` if the session is not found.
+    fn is_allocatable(&self, node: &NodeInfoPtr, ssn: &SessionInfoPtr) -> Option<bool> {
+        let required_shim = self.ssn_shim_map.get(&ssn.id)?;
+        let is_compatible = node.shims.contains(required_shim);
+
+        if !is_compatible {
+            tracing::debug!(
+                "ShimPlugin: Node <{}> (shims={:?}) NOT compatible with session <{}> (requires {:?})",
+                node.name,
+                node.shims,
+                ssn.id,
+                required_shim
+            );
+        }
+
+        Some(is_compatible)
+    }
+
     /// Check if an executor is available for a session based on shim compatibility.
     ///
     /// Returns `Some(true)` if the executor's shim matches the session's required shim,
@@ -111,7 +133,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use crate::model::{AppInfo, ExecutorInfo, SessionInfo};
+    use crate::model::{AppInfo, ExecutorInfo, NodeInfo, SessionInfo};
     use chrono::Duration;
     use common::apis::{
         ApplicationState, ExecutorState, ResourceRequirement, SessionState, Shim, TaskState,
@@ -251,5 +273,71 @@ mod tests {
 
         // Should NOT be available (Wasm executor for Host app)
         assert_eq!(plugin.is_available(&exec, &ssn), Some(false));
+    }
+    fn create_node_info(name: &str, shims: Vec<Shim>) -> NodeInfoPtr {
+        Arc::new(NodeInfo {
+            name: name.to_string(),
+            shims,
+            ..Default::default()
+        })
+    }
+
+    fn setup_plugin(app_shim: Shim) -> (PluginPtr, SessionInfoPtr) {
+        let ss = create_test_snapshot();
+        ss.add_application(create_app_info("app", app_shim))
+            .unwrap();
+        let ssn = create_session_info("ssn-1", "app");
+        ss.add_session(ssn.clone()).unwrap();
+        let mut plugin = ShimPlugin::new_ptr();
+        plugin.setup(&ss).unwrap();
+        (plugin, ssn)
+    }
+
+    #[test]
+    fn test_node_that_runs_the_shim_is_allocatable() {
+        let (plugin, ssn) = setup_plugin(Shim::Host);
+        assert_eq!(
+            plugin.is_allocatable(&create_node_info("n", vec![Shim::Host]), &ssn),
+            Some(true)
+        );
+        // One of several.
+        assert_eq!(
+            plugin.is_allocatable(&create_node_info("n", vec![Shim::Cri, Shim::Host]), &ssn),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_node_that_does_not_run_the_shim_is_not_allocatable() {
+        let (plugin, ssn) = setup_plugin(Shim::Host);
+        assert_eq!(
+            plugin.is_allocatable(&create_node_info("n", vec![Shim::Cri]), &ssn),
+            Some(false)
+        );
+
+        let (plugin, ssn) = setup_plugin(Shim::Cri);
+        assert_eq!(
+            plugin.is_allocatable(&create_node_info("n", vec![Shim::Host, Shim::Wasm]), &ssn),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_node_that_reported_no_shims_is_not_allocatable() {
+        let (plugin, ssn) = setup_plugin(Shim::Host);
+        assert_eq!(
+            plugin.is_allocatable(&create_node_info("n", vec![]), &ssn),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_unknown_session_does_not_decide_node_allocation() {
+        let (plugin, _) = setup_plugin(Shim::Host);
+        let other = create_session_info("other", "app");
+        assert_eq!(
+            plugin.is_allocatable(&create_node_info("n", vec![Shim::Host]), &other),
+            None
+        );
     }
 }

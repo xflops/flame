@@ -514,6 +514,7 @@ Node specification.
 ```protobuf
 message NodeSpec {
   string hostname = 1;
+  repeated Shim shims = 2;  // Shims the node's executor manager runs
 }
 ```
 

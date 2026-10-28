@@ -9,37 +9,61 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark flamepy.agent: Sandbox and Session, both backed by the flmbox application.
+"""Benchmark flamepy.agent (Sandbox and Session) with the case matrix of core.py and app.py.
 
 Run from the benchmarks directory with a configured Flame client, on a cluster whose
-executor managers can run flmbox sandboxes (runsc and the sandbox image):
+executors run the host shim and can start flmbox sandboxes (runsc and the sandbox image):
     python3 agent.py
 
-Environment:
-    FLAME_AGENT_BENCHMARK_IMAGE     sandbox image (default: the flmbox default image)
-    FLAME_AGENT_BENCHMARK_SAMPLES   samples per case (default: 5)
-    FLAME_AGENT_BENCHMARK_PARALLEL  sandboxes or sessions in the scale-out case (default: 4)
-    FLAME_AGENT_BENCHMARK_SUSPEND   set to 0 to skip the Sandbox suspend/resume case
+Both APIs run on the flmbox application. Each task is `echo ok` run in a sandbox with
+`runsc exec`, far slower than the flmping or echo task of the other suites, so the
+1000-task cases of core.py and app.py use FLAME_AGENT_BENCHMARK_HEAVY_TASKS tasks
+(default 100). The other case sizes are the same. Each timed sample creates and closes
+its sandboxes or sessions, so the first task of a sample includes binding an executor
+and starting the sandbox (`runsc create`). Incorrect results fail the benchmark.
 
-Every sample creates and closes its own sandbox or session, so the first command of a
-sample pays for binding an executor and for starting the sandbox (`runsc create`, which
-is what the sandbox startup work changes). Commands are shell `echo`, so the image needs
-no Python. An incorrect result fails the benchmark.
+Environment:
+    FLAME_AGENT_BENCHMARK_HEAVY_TASKS  tasks per session in the large cases (default: 100)
 """
 
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 from flamepy import agent
 
-IMAGE = os.environ.get("FLAME_AGENT_BENCHMARK_IMAGE") or None
-SAMPLES = int(os.environ.get("FLAME_AGENT_BENCHMARK_SAMPLES", "5"))
-PARALLEL = int(os.environ.get("FLAME_AGENT_BENCHMARK_PARALLEL", "4"))
-SUSPEND = os.environ.get("FLAME_AGENT_BENCHMARK_SUSPEND", "1") != "0"
-STEADY_COMMANDS = 20
-EXPECTED = b"ok\n"
+# The linux/amd64 manifest of ubuntu:26.04. The image is pinned by digest because every creation
+# resolves a tag with the registry, the benchmark creates more than 200 sandboxes, and Docker Hub
+# answers an unauthenticated address with "reached your unauthenticated pull rate limit" after 100
+# pulls; a digest costs no registry request once the image is cached. Use the digest of your
+# platform on another architecture.
+IMAGE = "docker.io/library/ubuntu@sha256:157dc3d6e4a3e4f2c68d12df9df9ed6e808b59af6d4c3757b432b4f519916725"
+HEAVY_TASKS = int(os.environ.get("FLAME_AGENT_BENCHMARK_HEAVY_TASKS", "100"))
 COMMAND = "echo ok"
+EXPECTED = b"ok\n"
+# A task that does not finish (a sandbox that cannot start never fails its tasks) fails the
+# benchmark here, instead of at the timeout of the job.
+TASK_TIMEOUT = 300
+
+
+@dataclass(frozen=True)
+class Case:
+    phase: str
+    sessions: int
+    tasks_per_session: int
+    repetitions: int
+
+
+COLD_CASE = Case("cold-start", 1, 1, 1)
+SCALE_OUT_CASE = Case("scale-out", 10, 1, 1)
+WARMUP_CASE = Case("warm-up", 4, HEAVY_TASKS, 1)
+STEADY_CASES = (
+    Case("steady-state", 1, 1, 5),
+    Case("steady-state", 1, HEAVY_TASKS, 3),
+    Case("steady-state", 10, 1, 5),
+    Case("steady-state", 10, HEAVY_TASKS, 3),
+)
 
 
 def check(result: "agent.CommandResult") -> None:
@@ -47,167 +71,69 @@ def check(result: "agent.CommandResult") -> None:
         raise RuntimeError(f"unexpected command result: exit={result.exit_code} stdout={result.stdout!r} stderr={result.stderr!r}")
 
 
-def timed(fn, *args) -> float:
-    """Seconds taken by fn(*args)."""
-    started = time.perf_counter()
-    fn(*args)
-    return time.perf_counter() - started
+def run_sandbox(tasks: int) -> None:
+    sandbox = agent.Sandbox.create(image=IMAGE)
+    try:
+        futures = [sandbox.submit(COMMAND) for _ in range(tasks)]
+        for future in futures:
+            check(future.result(timeout=TASK_TIMEOUT))
+    finally:
+        sandbox.close()
 
 
-def timed_run(run, command: str) -> float:
-    """Seconds taken by run(command), whose result is checked."""
+def run_session(tasks: int) -> None:
+    session = agent.open_session(image=IMAGE)
+    try:
+        futures = [session.submit_code(COMMAND) for _ in range(tasks)]
+        for future in futures:
+            check(future.result(timeout=TASK_TIMEOUT))
+    finally:
+        session.close()
+
+
+def run_sample(pool: ThreadPoolExecutor, run_one, case: Case) -> float:
     started = time.perf_counter()
-    result = run(command)
+    sessions = [pool.submit(run_one, case.tasks_per_session) for _ in range(case.sessions)]
+    for session in sessions:
+        session.result()
     elapsed = time.perf_counter() - started
-    check(result)
+    if elapsed >= 600:
+        raise RuntimeError(f"{case.sessions} x {case.tasks_per_session} exceeded 10 minutes")
     return elapsed
 
 
-# ----------------------------------------------------------------------------- sandbox
+def format_row(case: Case, samples: list[float]) -> str:
+    durations = sorted(samples)
+    total_tasks = case.sessions * case.tasks_per_session
+    throughputs = sorted(total_tasks / duration for duration in samples)
+    middle = len(samples) // 2
+    wall_time = "/".join(f"{value * 1000:.2f}" for value in (durations[0], durations[middle], durations[-1]))
+    throughput = "/".join(f"{value:.2f}" for value in (throughputs[0], throughputs[middle], throughputs[-1]))
+    return f"| {case.phase} | {case.sessions} | {case.tasks_per_session} | {len(samples)} | {wall_time} | {throughput} |"
 
 
-def sandbox_create_first_second() -> list[list[float]]:
-    columns: list[list[float]] = [[], [], []]
-    for _ in range(SAMPLES):
-        started = time.perf_counter()
-        box = agent.Sandbox.create(image=IMAGE)
-        created = time.perf_counter() - started
-        try:
-            first = timed_run(box.run, COMMAND)
-            second = timed_run(box.run, COMMAND)
-        finally:
-            box.close()
-        for column, value in zip(columns, (created, first, second)):
-            column.append(value)
-    return columns
-
-
-def sandbox_steady() -> list[float]:
-    """One sandbox, commands back to back after a warm-up command."""
-    samples: list[float] = []
-    box = agent.Sandbox.create(image=IMAGE)
-    try:
-        check(box.run(COMMAND))
-        for _ in range(STEADY_COMMANDS):
-            samples.append(timed_run(box.run, COMMAND))
-    finally:
-        box.close()
-    return samples
-
-
-def sandbox_suspend_resume() -> list[list[float]]:
-    columns: list[list[float]] = [[], []]
-    for _ in range(SAMPLES):
-        box = agent.Sandbox.create(image=IMAGE)
-        try:
-            check(box.run(COMMAND))
-            columns[0].append(timed(box.suspend))
-            columns[1].append(timed(box.resume))
-            # The resumed sandbox starts fresh (no state is preserved yet), but must work.
-            check(box.run(COMMAND))
-        finally:
-            box.close()
-    return columns
-
-
-def sandbox_one_scale_out() -> float:
-    def one() -> None:
-        box = agent.Sandbox.create(image=IMAGE)
-        try:
-            check(box.run(COMMAND))
-        finally:
-            box.close()
-
-    with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
-        started = time.perf_counter()
-        for future in [pool.submit(one) for _ in range(PARALLEL)]:
-            future.result()
-        return time.perf_counter() - started
-
-
-# ----------------------------------------------------------------------------- session
-
-
-def session_open_first_second() -> list[list[float]]:
-    columns: list[list[float]] = [[], [], []]
-    for _ in range(SAMPLES):
-        started = time.perf_counter()
-        session = agent.open_session(image=IMAGE)
-        opened = time.perf_counter() - started
-        try:
-            first = timed_run(session.run_code, COMMAND)
-            second = timed_run(session.run_code, COMMAND)
-        finally:
-            session.close()
-        for column, value in zip(columns, (opened, first, second)):
-            column.append(value)
-    return columns
-
-
-def session_steady() -> list[float]:
-    samples: list[float] = []
-    session = agent.open_session(image=IMAGE)
-    try:
-        check(session.run_code(COMMAND))
-        for _ in range(STEADY_COMMANDS):
-            samples.append(timed_run(session.run_code, COMMAND))
-    finally:
-        session.close()
-    return samples
-
-
-def session_one_scale_out() -> float:
-    def one() -> None:
-        session = agent.open_session(image=IMAGE)
-        try:
-            check(session.run_code(COMMAND))
-        finally:
-            session.close()
-
-    with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
-        started = time.perf_counter()
-        for future in [pool.submit(one) for _ in range(PARALLEL)]:
-            future.result()
-        return time.perf_counter() - started
-
-
-# ----------------------------------------------------------------------------- report
-
-
-def row(name: str, samples: list[float], note: str = "") -> str:
-    ordered = sorted(samples)
-    middle = len(ordered) // 2
-    values = "/".join(f"{value * 1000:.2f}" for value in (ordered[0], ordered[middle], ordered[-1]))
-    return f"| {name} | {len(samples)} | {values} | {note} |"
+def run_suite(run_one) -> list[tuple[Case, list[float]]]:
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        results = [
+            (COLD_CASE, [run_sample(pool, run_one, COLD_CASE)]),
+            (SCALE_OUT_CASE, [run_sample(pool, run_one, SCALE_OUT_CASE)]),
+        ]
+        run_sample(pool, run_one, WARMUP_CASE)
+        for case in STEADY_CASES:
+            results.append((case, [run_sample(pool, run_one, case) for _ in range(case.repetitions)]))
+    return results
 
 
 def main() -> None:
-    rows: list[str] = []
-
-    created, first, second = sandbox_create_first_second()
-    rows.append(row("Sandbox.create", created, "creates the session; the sandbox starts on the first command"))
-    rows.append(row("Sandbox first command", first, "executor bind and sandbox start"))
-    rows.append(row("Sandbox second command", second, "warm"))
-    rows.append(row("Sandbox steady command", sandbox_steady(), f"{STEADY_COMMANDS} commands on one sandbox"))
-    if SUSPEND:
-        suspend, resume = sandbox_suspend_resume()
-        rows.append(row("Sandbox.suspend", suspend, "session suspend; the sandbox is not preserved"))
-        rows.append(row("Sandbox.resume", resume, "back to open"))
-    rows.append(row(f"Sandbox scale-out x{PARALLEL}", [sandbox_one_scale_out() for _ in range(SAMPLES)], "create, one command and close, in parallel"))
-
-    opened, first, second = session_open_first_second()
-    rows.append(row("agent.open_session", opened, "creates the session"))
-    rows.append(row("Session first command", first, "executor bind and sandbox start"))
-    rows.append(row("Session second command", second, "warm"))
-    rows.append(row("Session steady command", session_steady(), f"{STEADY_COMMANDS} commands on one session"))
-    rows.append(row(f"Session scale-out x{PARALLEL}", [session_one_scale_out() for _ in range(SAMPLES)], "open, one command and close, in parallel"))
-
-    print("## flamepy.agent benchmark", flush=True)
-    print(f"Image: `{IMAGE or 'flmbox default'}`; command: `{COMMAND}`; each sample creates and closes its own sandbox or session.\n", flush=True)
-    print("| Case | Samples | Wall time ms (min/p50/max) | Note |", flush=True)
-    print("| --- | ---: | ---: | --- |", flush=True)
-    for line in rows:
-        print(line, flush=True)
+    for name, run_one in (("Sandbox", run_sandbox), ("Session", run_session)):
+        results = run_suite(run_one)
+        print(f"## flamepy.agent {name} benchmark", flush=True)
+        print(f"Worker: flmbox, image `{IMAGE}`; each task runs `{COMMAND}` in the sandbox; sandboxes are created and closed inside each sample; the large cases run {HEAVY_TASKS} tasks per session.\n", flush=True)
+        print("| Phase | Sessions | Tasks/session | Samples | Wall time ms (min/p50/max) | Tasks/sec (min/p50/max) |", flush=True)
+        print("| --- | ---: | ---: | ---: | ---: | ---: |", flush=True)
+        for case, samples in results:
+            print(format_row(case, samples), flush=True)
+        print(flush=True)
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@ mod tests {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
             },
+            shims: Vec::new(),
         };
 
         // Verify all fields are properly set
@@ -80,6 +81,7 @@ mod tests {
                 arch: "aarch64".to_string(),
                 os: "linux".to_string(),
             },
+            shims: Vec::new(),
         };
 
         // Simulate a heartbeat status update with updated allocatable but no info
@@ -98,6 +100,7 @@ mod tests {
             capacity: existing_node.capacity.clone(),
             allocatable: updated_allocatable,
             info: existing_node.info.clone(),
+            shims: Vec::new(),
         };
 
         // Verify the merge preserved existing info
@@ -137,6 +140,7 @@ mod tests {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
             },
+            shims: Vec::new(),
         };
 
         // Verify the new node was created correctly
@@ -171,6 +175,7 @@ mod tests {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
             },
+            shims: Vec::new(),
         };
 
         // Partial update: only state and allocatable changed
@@ -185,6 +190,7 @@ mod tests {
                 gpu: 0,
             },
             info: existing_node.info.clone(),
+            shims: Vec::new(),
         };
 
         // Verify partial update worked correctly
@@ -200,29 +206,39 @@ mod tests {
         assert_eq!(merged_node.info.os, "linux");
     }
 
-    /// Test node refresh functionality used in heartbeats.
-    /// This verifies that Node::refresh() properly updates resource information.
+    /// A new node has its identity info; capacity belongs to the FEM device managers.
     #[test]
-    fn test_node_refresh() {
-        let mut node = Node {
-            name: "refresh-test".to_string(),
-            state: NodeState::Ready,
-            capacity: ResourceRequirement {
-                gpu: 3,
-                ..Default::default()
-            },
-            allocatable: ResourceRequirement::default(),
-            info: NodeInfo::default(),
-        };
+    fn test_new_node_has_identity_info_and_no_capacity() {
+        let node = Node::new();
 
-        // Refresh updates identity info only; capacity belongs to FEM device managers.
-        node.refresh();
-        assert_eq!(node.capacity.gpu, 3);
-        assert_eq!(node.capacity.cpu, 0);
-
-        // Info should be populated
+        assert_eq!(node.capacity, ResourceRequirement::default());
         assert!(!node.info.arch.is_empty() || cfg!(not(target_os = "linux")));
         assert!(!node.info.os.is_empty() || cfg!(not(target_os = "linux")));
+        assert!(node.shims.is_empty());
+    }
+
+    /// The builders set the shims and the capacity of a node.
+    #[test]
+    fn test_node_builders_set_shims_and_capacity() {
+        let capacity = ResourceRequirement {
+            cpu: 4,
+            memory: 1024,
+            gpu: 2,
+        };
+
+        let mut node = Node::new();
+        node.with_shims(&[crate::apis::Shim::Cri, crate::apis::Shim::Host])
+            .with_capability(capacity.clone());
+
+        assert_eq!(
+            node.shims,
+            [crate::apis::Shim::Cri, crate::apis::Shim::Host]
+        );
+        assert_eq!(node.capacity, capacity);
+        assert_eq!(node.allocatable, capacity);
+        // Nothing else changes.
+        assert_eq!(node.info.arch, Node::new().info.arch);
+        assert_eq!(node.info.os, Node::new().info.os);
     }
 
     /// Test that NodeState conversions work correctly.

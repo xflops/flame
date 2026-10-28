@@ -96,6 +96,7 @@ mod tests {
             capacity: ResourceRequirement::default(),
             allocatable: ResourceRequirement::default(),
             info: NodeInfo::default(),
+            shims: vec![common::apis::Shim::Host],
         })
     }
 
@@ -224,6 +225,7 @@ mod tests {
                     gpu: 0,
                 },
                 info: NodeInfo::default(),
+                shims: vec![common::apis::Shim::Host],
             };
 
             let result = state.update_node(&updated_node).await;
@@ -325,6 +327,7 @@ mod tests {
                     arch: "x86_64".to_string(),
                     os: "linux".to_string(),
                 },
+                shims: vec![common::apis::Shim::Host],
             };
 
             let result = state.update_node(&updated_node).await;
@@ -417,6 +420,7 @@ mod tests {
                 capacity: ResourceRequirement::default(),
                 allocatable: ResourceRequirement::default(),
                 info: NodeInfo::default(),
+                shims: vec![common::apis::Shim::Host],
             };
 
             let result = state.update_node(&updated_node).await;

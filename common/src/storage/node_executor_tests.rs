@@ -51,6 +51,7 @@ mod tests {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
             },
+            shims: Vec::new(),
         };
 
         let created = tokio_test::block_on(storage.create_node(&node))?;
@@ -83,6 +84,7 @@ mod tests {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
             },
+            shims: Vec::new(),
         };
 
         let updated = tokio_test::block_on(storage.update_node(&updated_node))?;
@@ -127,6 +129,7 @@ mod tests {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
             },
+            shims: Vec::new(),
         };
         tokio_test::block_on(storage.create_node(&node))?;
 
@@ -212,6 +215,7 @@ mod tests {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
             },
+            shims: Vec::new(),
         };
         tokio_test::block_on(storage.create_node(&node))?;
 
@@ -273,6 +277,7 @@ mod tests {
                 gpu: 0,
             },
             info: NodeInfo::default(),
+            shims: Vec::new(),
         };
         tokio_test::block_on(storage.create_node(&node))?;
 

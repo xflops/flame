@@ -898,6 +898,8 @@ impl FilesystemEngine {
                 arch: meta.info_arch.clone(),
                 os: meta.info_os.clone(),
             },
+            // Reported by the executor manager each time the node registers.
+            shims: Vec::new(),
         }
     }
 
@@ -2472,6 +2474,7 @@ mod tests {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
             },
+            shims: Vec::new(),
         };
 
         let created = engine.create_node(&node).await.unwrap();
@@ -2517,6 +2520,7 @@ mod tests {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
             },
+            shims: Vec::new(),
         };
         engine.create_node(&node).await.unwrap();
 
@@ -2590,6 +2594,7 @@ mod tests {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
             },
+            shims: Vec::new(),
         };
         engine.create_node(&node).await.unwrap();
 
@@ -2678,6 +2683,7 @@ mod tests {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
             },
+            shims: Vec::new(),
         }
     }
 

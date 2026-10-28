@@ -53,6 +53,31 @@ mod tests {
     }
 
     #[test]
+    fn test_node_shims_rpc_round_trip() {
+        use rpc::flame::v1 as rpc;
+        let node = Node {
+            name: "node-1".to_string(),
+            shims: vec![Shim::Cri, Shim::Host],
+            ..Default::default()
+        };
+
+        let wire = rpc::Node::from(&node);
+        assert_eq!(
+            wire.spec.as_ref().unwrap().shims,
+            [rpc::Shim::Cri as i32, rpc::Shim::Host as i32]
+        );
+        assert_eq!(Node::from(wire).shims, [Shim::Cri, Shim::Host]);
+
+        // A node that reports none, and a value this version does not know.
+        assert!(Node::from(rpc::Node::from(&Node::default()))
+            .shims
+            .is_empty());
+        let mut wire = rpc::Node::from(&node);
+        wire.spec.as_mut().unwrap().shims.push(99);
+        assert_eq!(Node::from(wire).shims, [Shim::Cri, Shim::Host]);
+    }
+
+    #[test]
     fn test_session_state_rpc_round_trip() {
         use rpc::flame::v1 as rpc;
         for (state, wire) in [

@@ -27,22 +27,24 @@ The Host Shim job in `.github/workflows/e2e-bench.yaml` runs both Python
 benchmarks inside `flame-console`; the CRI Shim job runs them with the
 installed Python client. Both add the reports to the GitHub Actions summary.
 
-`agent.py` times `flamepy.agent`: `Sandbox` (create, first command, warm commands,
-suspend and resume, and parallel creation) and the agent `Session` (open, first
-command, warm commands, and parallel sessions). Both run on the `flmbox`
-application, so it needs a cluster whose executor managers can run `runsc` and
-pull the sandbox image; the first command of each sample includes binding an
-executor and starting the sandbox, which is what changes with the sandbox
-startup work. The case sizes and the image are set with the
-`FLAME_AGENT_BENCHMARK_*` variables listed in the script.
+`agent.py` times `flamepy.agent` with the same cold-start, scale-out, warm-up and
+steady-state cases and the same report as `core.py` and `app.py`, once for
+`Sandbox` and once for the agent `Session`. Both run on the `flmbox` application,
+so it needs a cluster whose executors run the host shim and can run `runsc` and
+pull the sandbox image. Each task is `echo ok` run with `runsc exec`, far slower
+than the `flmping` or echo task of the other suites, so the 1000-task cases use
+`FLAME_AGENT_BENCHMARK_HEAVY_TASKS` tasks (default 100). The first task of each
+sample includes binding an executor and starting the sandbox, which is what
+changes with the sandbox startup work.
 
 `.github/workflows/e2e-bench.yaml` runs it after the `app.py` step, in the CRI
 Shim job: that bare-metal cluster has `runsc`, and
 `ci/cri/applications/flmbox.yaml` registers `flmbox` there. `flmbox` runs on the
 host shim, so the benchmark cluster config lists both shims
-(`executors.shims: [cri, host]`) and its executor manager runs both. The cluster
-has no session storage, so the suspend case is skipped, and the report goes to
-the Actions summary.
+(`executors.shims: [cri, host]`) and its executor manager runs both. The report
+goes to the Actions summary. The script pins its image by digest (see `IMAGE`):
+each creation resolves a tag with the registry, the benchmark creates more than 200
+sandboxes, and Docker Hub rate limits an unauthenticated address to 100 pulls.
 
 ```sh
 python3 agent.py

@@ -31,12 +31,13 @@ pub enum ExecutorMessage {
     Update(Executor),
 }
 
+#[derive(Clone)]
 pub struct ExecutorManager {
-    ctx: FlameClusterContext,
-    executors: MutexPtr<HashMap<String, ExecutorPtr>>,
-    client: BackendClient,
+    pub(crate) ctx: FlameClusterContext,
+    pub(crate) executors: MutexPtr<HashMap<String, ExecutorPtr>>,
+    pub(crate) client: BackendClient,
     app_mgr: Arc<ApplicationManager>,
-    dev_mgr: Arc<DeviceManagers>,
+    pub(crate) dev_mgr: Arc<DeviceManagers>,
 }
 
 impl ExecutorManager {
@@ -70,14 +71,22 @@ impl ExecutorManager {
         })
     }
 
+    /// A manager with the given configuration and devices, and nothing to connect to.
+    #[cfg(test)]
+    pub(crate) fn for_test(ctx: FlameClusterContext, dev_mgr: Arc<DeviceManagers>) -> Self {
+        Self {
+            ctx,
+            executors: new_ptr(HashMap::new()),
+            client: BackendClient::default(),
+            app_mgr: Arc::new(ApplicationManager::new().unwrap()),
+            dev_mgr,
+        }
+    }
+
     pub async fn run(&mut self) -> Result<(), FlameError> {
         let (executor_tx, mut executor_rx) = mpsc::channel(32);
 
-        let client = self.client.clone();
-        let executors_for_handler = self.executors.clone();
-        let dev_mgr = self.dev_mgr.clone();
-
-        let mut handler = StreamHandler::new(client, executors_for_handler, dev_mgr)?;
+        let mut handler = StreamHandler::new(self.clone())?;
         let stream_handle = tokio::spawn(async move {
             handler.run(executor_tx).await;
         });

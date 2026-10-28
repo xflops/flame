@@ -187,6 +187,8 @@ pub struct NodeInfo {
     pub name: String,
     pub allocatable: ResourceRequirement,
     pub state: NodeState,
+    /// The shims the node's executor manager runs, as it reported them.
+    pub shims: Vec<Shim>,
 }
 
 impl NodeInfo {
@@ -217,6 +219,7 @@ impl From<&Node> for NodeInfo {
             name: node.name.clone(),
             allocatable: node.allocatable.clone(),
             state: node.state,
+            shims: node.shims.clone(),
         }
     }
 }

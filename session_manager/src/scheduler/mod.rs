@@ -129,6 +129,7 @@ mod tests {
                 os: "linux".to_string(),
             },
             state: NodeState::Ready,
+            shims: vec![common::apis::Shim::Host],
         }
     }
 
@@ -1216,6 +1217,45 @@ mod tests {
         let executors = controller.list_executors()?;
         assert_eq!(executors.len(), 1);
         assert_eq!(executors[0].node, "node_dead");
+        Ok(())
+    }
+
+    /// An executor created for a node whose executor manager does not run the shim of the
+    /// application cannot be started there, so no executor is allocated on that node.
+    #[test]
+    fn test_no_executor_is_allocated_on_a_node_that_does_not_run_the_shim() -> Result<(), FlameError>
+    {
+        let env = TestEnv::new()?;
+        let controller = env.controller.clone();
+        // The application of the test uses the default (host) shim.
+        tokio_test::block_on(
+            controller.register_application("flmtest".to_string(), new_test_application()),
+        )?;
+        let mut cri_node = node_named("node_cri", NodeState::Ready);
+        cri_node.shims = vec![common::apis::Shim::Cri];
+        tokio_test::block_on(controller.storage().register_node(&cri_node))?;
+        session_with_task(&controller)?;
+        let options = PluginsOptions::default();
+
+        for _ in 0..5 {
+            cycle(&controller, &options)?;
+        }
+        assert!(
+            controller.list_executors()?.is_empty(),
+            "an executor was created on a node that does not run the application's shim"
+        );
+
+        // A node that runs both shims takes it, though the CRI node is still there.
+        let mut both = node_named("node_both", NodeState::Ready);
+        both.shims = vec![common::apis::Shim::Cri, common::apis::Shim::Host];
+        tokio_test::block_on(controller.storage().register_node(&both))?;
+        for _ in 0..5 {
+            cycle(&controller, &options)?;
+        }
+        let executors = controller.list_executors()?;
+        assert_eq!(executors.len(), 1);
+        assert_eq!(executors[0].node, "node_both");
+        assert_eq!(executors[0].shim, common::apis::Shim::Host);
         Ok(())
     }
 

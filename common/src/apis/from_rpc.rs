@@ -62,12 +62,18 @@ impl From<rpc::Node> for Node {
     fn from(node: rpc::Node) -> Self {
         let status = node.status.unwrap_or_default();
         let metadata = node.metadata.unwrap_or_default();
+        let spec = node.spec.unwrap_or_default();
         Self {
             name: metadata.name,
             capacity: status.capacity.unwrap_or_default().into(),
             allocatable: status.allocatable.unwrap_or_default().into(),
             info: status.info.unwrap_or_default().into(),
             state: status.state.into(),
+            shims: spec
+                .shims
+                .into_iter()
+                .filter_map(|shim| Shim::try_from(shim).ok())
+                .collect(),
         }
     }
 }

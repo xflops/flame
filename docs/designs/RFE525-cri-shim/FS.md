@@ -111,10 +111,10 @@ cluster:
 The session manager creates an executor with the shim of its application, and the
 executor manager keeps it when it is listed; otherwise it uses the default shim,
 and the application is not matched with that executor (the scheduler matches an
-application only with executors of its own shim). The session manager does not
-yet know which shims a node runs, so Allocate can still ask a node for an
-executor that its executor manager cannot start; use the same `shims` on every
-node that serves an application of that shim.
+application only with executors of its own shim). The executor manager reports
+its `shims` in `NodeSpec` when the node registers, and the scheduler's shim plugin
+only allows Allocate to ask a node for an executor of a shim the node runs; a node
+that reported no shims runs none. So nodes of one cluster can run different shims.
 
 `host` remains the default when `shims` is not set. `cri` uses `/run/containerd/containerd.sock` and
 sends an empty `runtime_handler`, selecting containerd's configured default.

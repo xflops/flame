@@ -350,6 +350,7 @@ mod tests {
                 name: "node-1".into(),
                 allocatable: rr(4),
                 state: common::apis::NodeState::Ready,
+                shims: vec![common::apis::Shim::Host],
             }))
             .unwrap();
         for (ssn, held) in sessions {
@@ -498,6 +499,7 @@ mod tests {
                 name: "node-1".into(),
                 allocatable: rr(4),
                 state: common::apis::NodeState::Ready,
+                shims: vec![common::apis::Shim::Host],
             }))
             .unwrap();
         for ssn in [&full, &empty] {
@@ -546,6 +548,7 @@ mod tests {
             name: "node-1".into(),
             allocatable: rr(1),
             state: common::apis::NodeState::Ready,
+            shims: vec![common::apis::Shim::Host],
         });
         snapshot.add_node(node.clone()).unwrap();
         let ssn = session();
@@ -592,6 +595,7 @@ mod tests {
                 name: "node-1".into(),
                 allocatable: rr(4),
                 state: common::apis::NodeState::Ready,
+                shims: vec![common::apis::Shim::Host],
             }))
             .unwrap();
         let ssn = session();
@@ -625,6 +629,7 @@ mod tests {
             name: "node-1".to_string(),
             allocatable: rr(1),
             state: common::apis::NodeState::Ready,
+            shims: vec![common::apis::Shim::Host],
         });
         snapshot.add_node(node.clone()).unwrap();
 
@@ -663,6 +668,7 @@ mod tests {
             name: "node-1".to_string(),
             allocatable: rr(2),
             state: common::apis::NodeState::Ready,
+            shims: vec![common::apis::Shim::Host],
         });
         snapshot.add_node(node.clone()).unwrap();
 

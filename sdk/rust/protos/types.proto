@@ -202,6 +202,7 @@ message ResourceRequirement {
 // NodeSpec contains the static/desired attributes of a node.
 message NodeSpec {
   string hostname = 1;
+  repeated Shim shims = 2;  // Shims the node's executor manager runs
 }
 
 enum NodeState {

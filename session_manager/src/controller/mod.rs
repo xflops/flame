@@ -1449,6 +1449,7 @@ mod tests {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
             },
+            shims: vec![common::apis::Shim::Host],
         }
     }
 

@@ -336,6 +336,8 @@ impl TryFrom<&NodeDao> for Node {
                 arch: dao.info_arch.clone(),
                 os: dao.info_os.clone(),
             },
+            // Reported by the executor manager each time the node registers.
+            shims: Vec::new(),
         })
     }
 }

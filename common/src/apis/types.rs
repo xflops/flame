@@ -444,6 +444,10 @@ pub struct Node {
     pub allocatable: ResourceRequirement,
     pub info: NodeInfo,
     pub state: NodeState,
+    /// The shims the node's executor manager runs, reported when it registers. The scheduler
+    /// only asks the node for executors of one of them. It is not persisted: a node
+    /// registers again whenever it connects.
+    pub shims: Vec<Shim>,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -458,23 +462,29 @@ fn uname() -> String {
 
 impl Node {
     pub fn new() -> Self {
-        let name = uname();
-        let mut node = Node {
-            name,
+        Node {
+            name: uname(),
             state: NodeState::Ready,
+            info: NodeInfo {
+                arch: env::consts::ARCH.to_string(),
+                os: env::consts::OS.to_string(),
+            },
             ..Default::default()
-        };
-        node.refresh();
-        node
+        }
     }
 
-    /// Refreshes node identity info. Capacity comes from FEM device managers.
-    pub fn refresh(&mut self) {
-        let info = NodeInfo {
-            arch: env::consts::ARCH.to_string(),
-            os: env::consts::OS.to_string(),
-        };
-        self.info = info;
+    /// Sets the shims the node's executor manager runs.
+    pub fn with_shims(&mut self, shims: &[Shim]) -> &mut Self {
+        self.shims = shims.to_vec();
+        self
+    }
+
+    /// Sets the node's capacity, which is all of it allocatable. It comes from the FEM device
+    /// managers.
+    pub fn with_capability(&mut self, capacity: ResourceRequirement) -> &mut Self {
+        self.allocatable = capacity.clone();
+        self.capacity = capacity;
+        self
     }
 }
 

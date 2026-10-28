@@ -26,6 +26,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Streaming;
 
 use common::apis::Node;
+use common::ctx::FlameClusterContext;
 use common::FlameError;
 use rpc::flame::v1 as proto;
 use stdng::{lock_ptr, MutexPtr};
@@ -33,7 +34,7 @@ use stdng::{lock_ptr, MutexPtr};
 use crate::client::BackendClient;
 use crate::devices::DeviceManagers;
 use crate::executor::{Executor, ExecutorPtr};
-use crate::manager::ExecutorMessage;
+use crate::manager::{ExecutorManager, ExecutorMessage};
 
 /// Default interval between heartbeats in seconds.
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
@@ -57,11 +58,11 @@ const RESPONSE_TIMEOUT_SECS: u64 = 10;
 /// - Processing executor state notifications from the server
 /// - Forwarding executor updates to the manager for action derivation
 pub struct StreamHandler {
-    client: BackendClient,
+    /// A clone of the executor manager: its configuration (what the node reports about it, such
+    /// as the shims it runs), its backend client, its devices, and its executors, which are
+    /// shared with it for re-registration.
+    manager: ExecutorManager,
     node: MutexPtr<Node>,
-    dev_mgr: Arc<DeviceManagers>,
-    /// Reference to current executors (shared with manager) for re-registration
-    executors: MutexPtr<HashMap<String, ExecutorPtr>>,
     reconnect_interval: Duration,
     heartbeat_interval: Duration,
 }
@@ -71,33 +72,19 @@ impl StreamHandler {
     ///
     /// # Arguments
     ///
-    /// * `client` - The backend client for gRPC communication
-    /// * `executors` - Shared reference to current executors for re-registration on reconnect
-    /// * `dev_mgr` - Shared device inventory for registration and heartbeat capacity
-    pub fn new(
-        client: BackendClient,
-        executors: MutexPtr<HashMap<String, ExecutorPtr>>,
-        dev_mgr: Arc<DeviceManagers>,
-    ) -> Result<Self, FlameError> {
+    /// * `manager` - A clone of the executor manager, which shares its executors, devices
+    ///   and backend client with the handler
+    pub fn new(manager: ExecutorManager) -> Result<Self, FlameError> {
+        manager.dev_mgr.discover()?;
         let mut node = Node::new();
-        Self::refresh_node(&mut node, &dev_mgr)?;
+        node.with_shims(&manager.ctx.cluster.executors.shims)
+            .with_capability(manager.dev_mgr.capacity());
         Ok(StreamHandler {
-            client,
+            manager,
             node: stdng::new_ptr(node),
-            dev_mgr,
-            executors,
             reconnect_interval: Duration::from_secs(DEFAULT_RECONNECT_INTERVAL_SECS),
             heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS),
         })
-    }
-
-    fn refresh_node(node: &mut Node, dev_mgr: &DeviceManagers) -> Result<(), FlameError> {
-        dev_mgr.discover()?;
-        node.refresh();
-        // Capacity is owned by the device managers, so rebuild it on each refresh.
-        node.capacity = dev_mgr.capacity();
-        node.allocatable = node.capacity.clone();
-        Ok(())
     }
 
     /// Runs the stream handler, forwarding executor updates to the manager.
@@ -162,12 +149,14 @@ impl StreamHandler {
         // Get current node state
         let node = {
             let mut node = lock_ptr!(self.node)?;
-            Self::refresh_node(&mut node, &self.dev_mgr)?;
+            self.manager.dev_mgr.discover()?;
+            node.with_shims(&self.manager.ctx.cluster.executors.shims)
+                .with_capability(self.manager.dev_mgr.capacity());
             node.clone()
         };
 
         // Get current executors for state alignment during registration
-        let current_executors: Vec<Executor> = lock_ptr!(self.executors)?
+        let current_executors: Vec<Executor> = lock_ptr!(self.manager.executors)?
             .values()
             .filter_map(|ptr| lock_ptr!(ptr).ok().map(|e| (*e).clone()))
             .collect();
@@ -179,13 +168,17 @@ impl StreamHandler {
             node.name,
             current_executors.len()
         );
-        self.client.register_node(&node, &current_executors).await?;
+        self.manager
+            .client
+            .register_node(&node, &current_executors)
+            .await?;
 
         // Create channels for the bidirectional stream
         let (request_tx, request_rx) = mpsc::channel::<proto::WatchNodeRequest>(32);
 
         // Start the stream
         let response_stream = self
+            .manager
             .client
             .watch_node(ReceiverStream::new(request_rx))
             .await?;
@@ -214,7 +207,8 @@ impl StreamHandler {
         // Spawn heartbeat task for periodic heartbeats
         let heartbeat_tx = request_tx.clone();
         let node_ptr = self.node.clone();
-        let dev_mgr = self.dev_mgr.clone();
+        let dev_mgr = self.manager.dev_mgr.clone();
+        let shims = self.manager.ctx.cluster.executors.shims.clone();
         let heartbeat_interval = self.heartbeat_interval;
         let heartbeat_handle = tokio::spawn(async move {
             let mut ticker = interval(heartbeat_interval);
@@ -224,11 +218,12 @@ impl StreamHandler {
                 // Refresh and collect current node status
                 let (node_name, status) = match lock_ptr!(node_ptr) {
                     Ok(mut node) => {
-                        // Refresh node to get current resource status
-                        if let Err(error) = Self::refresh_node(&mut node, &dev_mgr) {
+                        // Discover again, and rebuild the node to get its current resource status
+                        if let Err(error) = dev_mgr.discover() {
                             tracing::warn!(%error, "Failed to discover devices for heartbeat");
                             continue;
                         }
+                        node.with_shims(&shims).with_capability(dev_mgr.capacity());
                         let status = proto::NodeStatus {
                             state: proto::NodeState::from(node.state) as i32,
                             capacity: Some(node.capacity.clone().into()),
@@ -335,6 +330,13 @@ impl StreamHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::apis::Shim;
+
+    fn context_with_shims(shims: Vec<Shim>) -> FlameClusterContext {
+        let mut ctx = FlameClusterContext::default();
+        ctx.cluster.executors.shims = shims;
+        ctx
+    }
 
     struct RefreshDevices {
         visible: std::sync::atomic::AtomicI32,
@@ -377,42 +379,47 @@ mod tests {
             crate::devices::GPU,
             devices.clone(),
         ));
-        let handler = StreamHandler::new(
-            BackendClient::default(),
-            stdng::new_ptr(HashMap::new()),
+        let manager = ExecutorManager::for_test(
+            context_with_shims(vec![Shim::Cri, Shim::Host]),
             dev_mgr.clone(),
-        )
-        .unwrap();
-        assert!(Arc::ptr_eq(&handler.dev_mgr, &dev_mgr));
-        let mut node = lock_ptr!(handler.node).unwrap();
+        );
+        let handler = StreamHandler::new(manager).unwrap();
+        assert!(Arc::ptr_eq(&handler.manager.dev_mgr, &dev_mgr));
+        let mut node = lock_ptr!(handler.node).unwrap().clone();
         assert_eq!(node.capacity.gpu, 2);
+        // The node carries the shims of the context.
+        assert_eq!(node.shims, [Shim::Cri, Shim::Host]);
+        let shims = handler.manager.ctx.cluster.executors.shims.clone();
         for visible in [3, 0, 1] {
             devices.visible.store(visible, SeqCst);
-            StreamHandler::refresh_node(&mut node, &handler.dev_mgr).unwrap();
+            handler.manager.dev_mgr.discover().unwrap();
+            node.with_shims(&shims)
+                .with_capability(handler.manager.dev_mgr.capacity());
+            assert_eq!(node.shims, [Shim::Cri, Shim::Host]);
             assert_eq!(node.capacity.gpu, visible);
             assert_eq!(node.capacity.cpu, 0);
             assert_eq!(node.capacity.memory, 0);
             assert_eq!(node.allocatable, node.capacity);
         }
-        let previous = node.clone();
         devices.visible.store(99, SeqCst);
         devices.fail.store(true, SeqCst);
-        assert!(StreamHandler::refresh_node(&mut node, &handler.dev_mgr).is_err());
-        assert_eq!(node.capacity, previous.capacity);
-        assert_eq!(node.allocatable, previous.allocatable);
-        assert!(StreamHandler::new(
-            BackendClient::default(),
-            stdng::new_ptr(HashMap::new()),
-            dev_mgr,
-        )
-        .is_err());
+        // A device manager that cannot discover fails before the node is rebuilt, so the node
+        // stays as it was.
+        assert!(handler.manager.dev_mgr.discover().is_err());
+        assert_eq!(node.capacity.gpu, 1);
+        let manager = ExecutorManager::for_test(context_with_shims(vec![Shim::Host]), dev_mgr);
+        assert!(StreamHandler::new(manager).is_err());
     }
 
     #[test]
     fn disabled_device_managers_clear_previous_device_capacity() {
         let mut node = Node::new();
         node.capacity.gpu = 99;
-        StreamHandler::refresh_node(&mut node, &DeviceManagers::default()).unwrap();
+        let dev_mgr = DeviceManagers::default();
+        dev_mgr.discover().unwrap();
+        node.with_shims(&[Shim::Host])
+            .with_capability(dev_mgr.capacity());
+        assert_eq!(node.shims, [Shim::Host]);
         assert_eq!(node.capacity, Default::default());
         assert_eq!(node.allocatable, node.capacity);
     }
@@ -439,6 +446,7 @@ mod tests {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
             },
+            shims: Vec::new(),
         };
 
         // Verify the node can be converted to proto NodeStatus
@@ -482,6 +490,7 @@ mod tests {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
             },
+            shims: Vec::new(),
         };
 
         // We can't fully test StreamHandler without a real client,

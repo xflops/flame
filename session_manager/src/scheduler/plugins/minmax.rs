@@ -459,6 +459,7 @@ mod tests {
                 name: "node".into(),
                 allocatable: request.clone(),
                 state: common::apis::NodeState::Ready,
+                shims: vec![common::apis::Shim::Host],
             });
             snapshot.add_node(node.clone()).unwrap();
             let retained = Arc::new(ExecutorInfo {
@@ -712,6 +713,7 @@ mod tests {
                         capacity: capacity.clone(),
                         allocatable: capacity,
                         state: NodeState::Ready,
+                        shims: vec![common::apis::Shim::Host],
                         ..Default::default()
                     })
                     .await

@@ -66,7 +66,8 @@ async fn handle_heartbeat(
 
     // Update node status if provided
     if let Some(status) = hb.status {
-        let node = build_node_from_heartbeat(controller, node_name, status);
+        let existing = controller.get_node(node_name).ok().flatten();
+        let node = build_node_from_heartbeat(existing, node_name, status);
         if let Err(e) = controller.update_node(&node).await {
             tracing::warn!("Failed to update node status for <{}>: {}", node_name, e);
         }
@@ -78,15 +79,13 @@ async fn handle_heartbeat(
 
 /// Builds a Node struct from heartbeat status, preserving existing node info.
 fn build_node_from_heartbeat(
-    controller: &ControllerPtr,
+    existing_node: Option<Node>,
     node_name: &str,
     status: rpc::NodeStatus,
 ) -> Node {
-    // Fetch existing node to preserve info (labels, taints, etc.)
-    let existing_node = controller.get_node(node_name);
-
+    // The existing node preserves what a heartbeat does not carry (info, shims, ...).
     match existing_node {
-        Ok(Some(existing)) => {
+        Some(existing) => {
             // Preserve existing node info, update status fields
             Node {
                 name: node_name.to_string(),
@@ -102,10 +101,12 @@ fn build_node_from_heartbeat(
                     .map(|r| r.into())
                     .unwrap_or(existing.allocatable),
                 info: status.info.map(|i| i.into()).unwrap_or(existing.info),
+                // Reported at registration, not in a heartbeat.
+                shims: existing.shims,
             }
         }
-        _ => {
-            // Node not found or error, create with status data
+        None => {
+            // Node not found, create with status data
             Node {
                 name: node_name.to_string(),
                 state: rpc::NodeState::try_from(status.state)
@@ -114,6 +115,7 @@ fn build_node_from_heartbeat(
                 capacity: status.capacity.map(|r| r.into()).unwrap_or_default(),
                 allocatable: status.allocatable.map(|r| r.into()).unwrap_or_default(),
                 info: status.info.map(|i| i.into()).unwrap_or_default(),
+                shims: Vec::new(),
             }
         }
     }
@@ -537,6 +539,43 @@ mod tests {
         mpsc::Sender<Result<WatchNodeResponse, Status>>,
         mpsc::Receiver<Result<WatchNodeResponse, Status>>,
     );
+
+    fn heartbeat_status() -> rpc::NodeStatus {
+        rpc::NodeStatus {
+            state: rpc::NodeState::Ready as i32,
+            capacity: Some(
+                ResourceRequirement {
+                    cpu: 8,
+                    memory: 1024,
+                    gpu: 1,
+                }
+                .into(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn heartbeat_keeps_the_shims_the_node_registered_with() {
+        let existing = Node {
+            name: "node-1".to_string(),
+            shims: vec![Shim::Cri, Shim::Host],
+            ..Default::default()
+        };
+
+        let node = build_node_from_heartbeat(Some(existing), "node-1", heartbeat_status());
+
+        assert_eq!(node.shims, [Shim::Cri, Shim::Host]);
+        // The heartbeat updates what it carries.
+        assert_eq!(node.capacity.cpu, 8);
+        assert_eq!(node.capacity.gpu, 1);
+    }
+
+    #[test]
+    fn heartbeat_of_an_unknown_node_has_no_shims() {
+        let node = build_node_from_heartbeat(None, "node-1", heartbeat_status());
+        assert!(node.shims.is_empty());
+    }
 
     fn executor(id: &str) -> Executor {
         Executor {

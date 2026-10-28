@@ -72,6 +72,7 @@ impl From<Node> for rpc::Node {
             }),
             spec: Some(rpc::NodeSpec {
                 hostname: node.name.clone(),
+                shims: node.shims.iter().map(|shim| i32::from(*shim)).collect(),
             }),
             status,
         }

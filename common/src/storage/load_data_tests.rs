@@ -70,6 +70,7 @@ mod tests {
                 gpu: 0,
             },
             info: NodeInfo::default(),
+            shims: Vec::new(),
         };
         tokio_test::block_on(engine.create_node(&node))?;
 
@@ -164,6 +165,7 @@ mod tests {
                 gpu: 0,
             },
             info: NodeInfo::default(),
+            shims: Vec::new(),
         };
         tokio_test::block_on(engine.create_node(&node))?;
 
