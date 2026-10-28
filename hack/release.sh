@@ -132,7 +132,9 @@ verify_pypi() {
     local target_dir="/tmp/flamepy-pypi-check"
     for attempt in $(seq 1 30); do
         rm -rf "${target_dir}"
-        if uv pip install --system --target "${target_dir}" \
+        # --refresh: the package index is cached by uv for several minutes, so without it every retry
+        # can reuse an answer that was fetched before the upload appeared.
+        if uv pip install --system --refresh --target "${target_dir}" \
             "flamepy==${python_version}" && \
             verify_installed_python_package "${target_dir}" "${python_version}"; then
             return 0
