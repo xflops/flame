@@ -3,8 +3,7 @@
 [![license](https://img.shields.io/github/license/xflops/flame)](http://github.com/xflops/flame)
 [![RepoSize](https://img.shields.io/github/repo-size/xflops/flame)](http://github.com/xflops/flame)
 [![Release](https://img.shields.io/github/release/xflops/flame)](https://github.com/xflops/flame/releases)
-[![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/7299/badge)](https://bestpractices.coreinfrastructure.org/projects/7299)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/xflops/flame)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/7299/badge)](https://www.bestpractices.dev/projects/7299)
 
 Flame is a distributed engine for elastic workloads, including AI agents, reinforcement learning, and quantitative computing. It provides a comprehensive suite of core mechanisms for running these workloads at scale. Built on over a decade and a half of experience running diverse high-performance workloads across multiple systems and platforms, Flame incorporates best-of-breed ideas and practices from the open source community.
 
@@ -165,6 +164,7 @@ For more details, see the [flmadm README](flmadm/README.md).
 * [Rust API Tutorial](docs/tutorials/rust-api.md)
 * [Local Development](docs/tutorials/local-development.md)
 * [App Setup Guide](docs/tutorials/app-setup.md)
+* [Security](docs/security.md)
 * [Release Process](docs/release-process.md)
 * [Design Documents](docs/designs/)
 
@@ -175,7 +175,7 @@ For more details, see the [flmadm README](flmadm/README.md).
 
 ## Contributing
 
-We welcome contributions through GitHub issues and pull requests.
+We welcome contributions through GitHub issues and pull requests; see [CONTRIBUTING.md](CONTRIBUTING.md) for the process, the coding standards and the test policy. To report a security vulnerability, see [SECURITY.md](SECURITY.md); [docs/security.md](docs/security.md) describes the security design and how to deploy Flame safely.
 
 ## License
 
