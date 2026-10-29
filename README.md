@@ -1,8 +1,10 @@
 # Flame: A Distributed Engine for Elastic Workloads
 
+[![E2E](https://github.com/xflops/flame/actions/workflows/e2e-py.yaml/badge.svg?branch=main)](https://github.com/xflops/flame/actions/workflows/e2e-py.yaml)
 [![license](https://img.shields.io/github/license/xflops/flame)](http://github.com/xflops/flame)
 [![RepoSize](https://img.shields.io/github/repo-size/xflops/flame)](http://github.com/xflops/flame)
 [![Release](https://img.shields.io/github/release/xflops/flame)](https://github.com/xflops/flame/releases)
+[![Rust](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fxflops%2Fflame%2Fmain%2Frust-toolchain.toml&query=%24.toolchain.channel&label=rust&logo=rust)](https://github.com/xflops/flame/blob/main/rust-toolchain.toml)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/7299/badge)](https://www.bestpractices.dev/projects/7299)
 
 Flame is a distributed engine for elastic workloads, including AI agents, reinforcement learning, and quantitative computing. It provides a comprehensive suite of core mechanisms for running these workloads at scale. Built on over a decade and a half of experience running diverse high-performance workloads across multiple systems and platforms, Flame incorporates best-of-breed ideas and practices from the open source community.
