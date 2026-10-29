@@ -36,7 +36,7 @@ use crate::shims::{ExecutorWorkDir, Shim, ShimPtr};
 use ::rpc::flame::v1 as rpc;
 use common::apis::{ApplicationContext, SessionContext, TaskContext, TaskOutput, TaskResult};
 use common::{
-    get_python_runtime, FlameError, FLAME_CACHE_ENDPOINT, FLAME_CA_FILE, FLAME_ENDPOINT,
+    get_python_runtime, perf_log, FlameError, FLAME_CACHE_ENDPOINT, FLAME_CA_FILE, FLAME_ENDPOINT,
     FLAME_INSTANCE_ENDPOINT, FLAME_LOG, FLAME_PYTHON_VERSION_ENV,
 };
 
@@ -494,11 +494,9 @@ impl Shim for HostShim {
             return Ok(());
         }
         let start = std::time::Instant::now();
-        tracing::debug!(target: "flame::timeline", phase = "create_instance_begin", executor = %self.executor.id);
+        perf_log!("create_instance_begin", executor = %self.executor.id);
         let mut installation = app_manager.install(&self.app).await?;
-        tracing::debug!(
-            target: "flame::timeline",
-            phase = "installed",
+        perf_log!("installed",
             executor = %self.executor.id,
             elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
         );
@@ -527,9 +525,7 @@ impl Shim for HostShim {
             }
         };
         self.cgroup = cgroup;
-        tracing::debug!(
-            target: "flame::timeline",
-            phase = "process_spawned",
+        perf_log!("process_spawned",
             executor = %self.executor.id,
             elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
         );
@@ -545,9 +541,7 @@ impl Shim for HostShim {
         self.work_dir = Some(work_dir);
         self.instance_client = Some(instance_client);
         self.instance = Some(instance);
-        tracing::debug!(
-            target: "flame::timeline",
-            phase = "create_instance_end",
+        perf_log!("create_instance_end",
             executor = %self.executor.id,
             elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
         );
@@ -561,16 +555,14 @@ impl Shim for HostShim {
         trace_fn!("HostShim::on_session_enter");
 
         let start = std::time::Instant::now();
-        tracing::debug!(target: "flame::timeline", phase = "session_enter_begin", executor = %self.executor.id);
+        perf_log!("session_enter_begin", executor = %self.executor.id);
         let response = self
             .instance_client
             .as_mut()
             .ok_or_else(|| FlameError::InvalidState("Host instance is not created".to_string()))?
             .on_session_enter(ctx)
             .await;
-        tracing::debug!(
-            target: "flame::timeline",
-            phase = "session_enter_end",
+        perf_log!("session_enter_end",
             executor = %self.executor.id,
             elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
         );
@@ -584,16 +576,14 @@ impl Shim for HostShim {
         trace_fn!("HostShim::on_task_invoke");
 
         let start = std::time::Instant::now();
-        tracing::debug!(target: "flame::timeline", phase = "task_invoke_begin", executor = %self.executor.id);
+        perf_log!("task_invoke_begin", executor = %self.executor.id);
         let response = self
             .instance_client
             .as_mut()
             .ok_or_else(|| FlameError::InvalidState("Host instance is not created".to_string()))?
             .on_task_invoke(ctx)
             .await;
-        tracing::debug!(
-            target: "flame::timeline",
-            phase = "task_invoke_end",
+        perf_log!("task_invoke_end",
             executor = %self.executor.id,
             elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
         );

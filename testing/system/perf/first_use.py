@@ -10,8 +10,8 @@ new executor and, as soon as that sandbox is closed, a second one on the retaine
 create call and the first Python command in each. The temporary application is removed at the end and the
 result is printed as JSON.
 
-The timeline points the executor manager and ``flmbox`` log under the ``flame::timeline`` target show where
-the time goes inside the first command. Enable them with ``RUST_LOG=flame::timeline=debug`` on the executor
+The timeline points the executor manager and ``flmbox`` log under the ``flame::perf`` target show where
+the time goes inside the first command. Enable them with ``RUST_LOG=flame::perf=debug`` on the executor
 manager, and put the same variable in the ``environments`` of the application for ``flmbox``, whose log is
 ``<executor-id>.err`` in the executor's work directory.
 """

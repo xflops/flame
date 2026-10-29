@@ -39,13 +39,26 @@ mod testutil;
 
 use crate::cli::Cli;
 use crate::config::FlameSandbox;
-use crate::images::ImageStore;
-use crate::sandbox::Sandbox;
+use crate::images::{parse_reference, ImageStore};
+use crate::sandbox::{Sandbox, DEFAULT_IMAGE};
 use crate::service::{executor_id_from_env, FlmboxService};
 use flame_rs as flame;
+use flame_rs::perf_log;
+
+/// Compiles the image-reference grammar on another thread.
+///
+/// The grammar is a large regular expression that the first parse in a process compiles, which takes
+/// tens of milliseconds. Left to the first sandbox, that delay lands on its creation; started here it
+/// overlaps the service's startup and the wait for the first session.
+fn warm_up_reference_parser() {
+    std::thread::spawn(|| {
+        let _ = parse_reference(DEFAULT_IMAGE);
+    });
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    warm_up_reference_parser();
     let cli = Cli::parse();
     match run(cli).await {
         Ok(code) => code,
@@ -57,12 +70,10 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    if cli.daemon {
-        // The service logs nothing unless RUST_LOG asks for it, e.g. RUST_LOG=flame::timeline=debug
-        // for the first-use timeline.
-        flame::apis::init_logger()?;
-    }
-    tracing::debug!(target: "flame::timeline", phase = "flmbox_started");
+    // Logs only errors unless RUST_LOG asks for more, e.g. RUST_LOG=flame::perf=debug for the
+    // performance timeline.
+    flame::apis::init_logger()?;
+    perf_log!("flmbox_started");
     cli.check()?;
     let mut cfg = FlameSandbox::load(cli.config.as_deref())?;
     if let Some(network) = cli.network {
@@ -78,7 +89,6 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         daemon(sandbox).await?;
         return Ok(ExitCode::SUCCESS);
     }
-    flame::apis::init_logger()?;
     match cli.command {
         Some(command) => Ok(command.run(&sandbox).await?),
         None => Ok(ExitCode::SUCCESS),
@@ -90,12 +100,11 @@ async fn daemon(sandbox: Sandbox) -> Result<(), Box<dyn std::error::Error>> {
     let service = FlmboxService::new(sandbox, &executor_id_from_env());
     let start = std::time::Instant::now();
     service.cleanup_stale().await;
-    tracing::debug!(
-        target: "flame::timeline",
-        phase = "flmbox_cleanup_stale",
+    perf_log!(
+        "flmbox_cleanup_stale",
         elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
     );
-    tracing::debug!(target: "flame::timeline", phase = "flmbox_serving");
+    perf_log!("flmbox_serving");
     flame::run(service).await?;
     tracing::debug!("flmbox service was stopped.");
     Ok(())

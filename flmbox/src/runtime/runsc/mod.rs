@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flame_rs::apis::FlameError;
+use flame_rs::perf_log;
 
 use async_trait::async_trait;
 
@@ -118,9 +119,8 @@ impl Runsc {
     async fn timed_run(&self, what: &str, spec: CommandSpec) -> Result<CommandOutput, FlameError> {
         let start = std::time::Instant::now();
         let out = self.runner.run(spec).await;
-        tracing::debug!(
-            target: "flame::timeline",
-            phase = "runsc",
+        perf_log!(
+            "runsc",
             command = what,
             elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
         );

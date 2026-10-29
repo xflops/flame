@@ -18,6 +18,7 @@ limitations under the License.
 //! yet.
 
 use flame_rs::apis::{FlameError, TaskOutput};
+use flame_rs::perf_log;
 use flame_rs::service::{async_trait, FlameService, Publisher, SessionContext, TaskContext};
 use flame_rs::FlameMessage;
 use sha2::{Digest, Sha256};
@@ -170,12 +171,10 @@ impl FlameService for FlmboxService {
 
     async fn on_session_enter(&self, ctx: SessionContext) -> Result<(), FlameError> {
         let start = std::time::Instant::now();
-        tracing::debug!(target: "flame::timeline", phase = "flmbox_session_enter_begin", executor = %self.executor_id);
+        perf_log!("flmbox_session_enter_begin", executor = %self.executor_id);
         let config = decode_config(ctx.common_data.as_deref())?;
         let result = self.enter(&ctx.session_id, config).await;
-        tracing::debug!(
-            target: "flame::timeline",
-            phase = "flmbox_session_enter_end",
+        perf_log!("flmbox_session_enter_end",
             executor = %self.executor_id,
             elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
         );
@@ -189,11 +188,9 @@ impl FlameService for FlmboxService {
         let request: CommandRequest = serde_json::from_slice(&input)
             .map_err(|e| FlameError::InvalidConfig(format!("invalid task input: {e}")))?;
         let start = std::time::Instant::now();
-        tracing::debug!(target: "flame::timeline", phase = "flmbox_task_invoke_begin", executor = %self.executor_id);
+        perf_log!("flmbox_task_invoke_begin", executor = %self.executor_id);
         let result = self.execute(request).await?;
-        tracing::debug!(
-            target: "flame::timeline",
-            phase = "flmbox_task_invoke_end",
+        perf_log!("flmbox_task_invoke_end",
             executor = %self.executor_id,
             elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
         );

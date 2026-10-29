@@ -1,0 +1,87 @@
+/*
+Copyright 2026 The Flame Authors.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+/// Logs a point on the performance timeline: a debug event on the `flame::perf` target with the
+/// `phase` field first, followed by any further `field = value` pairs, e.g.
+/// `perf_log!("session_enter_end", executor = %id, elapsed_ms = start.elapsed().as_secs_f64() * 1e3)`.
+///
+/// The points are off unless a log filter turns the target on, e.g. `RUST_LOG=flame::perf=debug`.
+#[macro_export]
+macro_rules! perf_log {
+    ($phase:expr $(, $($fields:tt)+)?) => {
+        $crate::__private::tracing::debug!(target: "flame::perf", phase = $phase $(, $($fields)+)?)
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::EnvFilter;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Capture {
+        type Writer = Capture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn captured(filter: &str) -> String {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_env_filter(EnvFilter::new(filter))
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            crate::perf_log!("session_enter_end", executor = %"e1", elapsed_ms = 1.5);
+            crate::perf_log!("process_spawned");
+        });
+        let bytes = capture.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn perf_log_is_a_debug_event_on_the_perf_target_with_the_phase() {
+        let out = captured("flame::perf=debug");
+
+        assert!(out.contains("flame::perf"), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+        assert!(out.contains("phase=\"session_enter_end\""), "{out}");
+        assert!(out.contains("executor=e1"), "{out}");
+        assert!(out.contains("elapsed_ms=1.5"), "{out}");
+        assert!(out.contains("phase=\"process_spawned\""), "{out}");
+    }
+
+    #[test]
+    fn perf_log_is_silent_unless_the_perf_target_is_enabled() {
+        assert_eq!(captured("info"), "");
+    }
+}

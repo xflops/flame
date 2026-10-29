@@ -16,6 +16,7 @@ pub mod application;
 pub mod ctx;
 pub mod events;
 pub mod net;
+pub mod perf;
 pub mod pprof;
 pub mod python;
 pub mod storage;
@@ -24,6 +25,11 @@ pub const FLAME_PYTHON_VERSION_ENV: &str = "FLAME_PYTHON_VERSION";
 pub const DEFAULT_PYTHON_VERSION: &str = "3.12";
 
 pub use python::{get_python_runtime, PythonRuntime};
+
+#[doc(hidden)]
+pub mod __private {
+    pub use tracing;
+}
 
 use std::string::FromUtf8Error;
 

@@ -31,11 +31,24 @@ pub use object::{
     ObjectFuture, ObjectKey, ObjectRef,
 };
 
+/// Logs a point on the performance timeline: a debug event on the `flame::perf` target with the
+/// `phase` field first, followed by any further `field = value` pairs, e.g.
+/// `perf_log!("task_invoke_end", executor = %id, elapsed_ms = start.elapsed().as_secs_f64() * 1e3)`.
+///
+/// The points are off unless a log filter turns the target on, e.g. `RUST_LOG=flame::perf=debug`.
+#[macro_export]
+macro_rules! perf_log {
+    ($phase:expr $(, $($fields:tt)+)?) => {
+        $crate::__private::tracing::debug!(target: "flame::perf", phase = $phase $(, $($fields)+)?)
+    };
+}
+
 #[doc(hidden)]
 pub mod __private {
     pub use bytes;
     pub use serde;
     pub use serde_json;
+    pub use tracing;
 }
 
 pub trait IntoFlameInstance {
@@ -98,4 +111,58 @@ pub async fn open_or_create_session(
         .await?
         .open_or_create_session_with(id, options)
         .await
+}
+
+#[cfg(test)]
+mod perf_log_tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::EnvFilter;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured(filter: &str) -> String {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_env_filter(EnvFilter::new(filter))
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            crate::perf_log!("task_invoke_end", executor = %"e1", elapsed_ms = 2.5);
+            crate::perf_log!("process_spawned");
+        });
+        let bytes = capture.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn perf_log_is_a_debug_event_on_the_perf_target_with_the_phase() {
+        let out = captured("flame::perf=debug");
+
+        assert!(out.contains("flame::perf"), "{out}");
+        assert!(out.contains("phase=\"task_invoke_end\""), "{out}");
+        assert!(out.contains("executor=e1"), "{out}");
+        assert!(out.contains("elapsed_ms=2.5"), "{out}");
+        assert!(out.contains("phase=\"process_spawned\""), "{out}");
+    }
+
+    #[test]
+    fn perf_log_is_silent_unless_the_perf_target_is_enabled() {
+        assert_eq!(captured("info"), "");
+    }
 }

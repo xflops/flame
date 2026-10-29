@@ -36,7 +36,7 @@ use rpc::{EmptyRequest, ExecutorAttributes};
 use crate::appmgr::ApplicationManager;
 use crate::shims::{ExecutorWorkDir, Shim};
 use common::apis::{SessionContext, TaskContext, TaskResult, TaskState};
-use common::FlameError;
+use common::{perf_log, FlameError};
 use stdng::{logs::TraceFn, new_ptr, trace_fn};
 
 /// Longest to wait for a service to report that it is listening, and then to connect to it.
@@ -86,9 +86,7 @@ impl GrpcShim {
 
         let start = std::time::Instant::now();
         self.wait_for_ready(SERVICE_WAIT_TIMEOUT).await?;
-        tracing::debug!(
-            target: "flame::timeline",
-            phase = "service_ready",
+        perf_log!("service_ready",
             endpoint = %self.endpoint,
             elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
         );
@@ -124,9 +122,7 @@ impl GrpcShim {
             })?;
 
         self.client = Some(InstanceClient::new(channel));
-        tracing::debug!(
-            target: "flame::timeline",
-            phase = "connected",
+        perf_log!("connected",
             endpoint = %self.endpoint,
             elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
         );
@@ -139,6 +135,18 @@ impl GrpcShim {
     /// starts before the first check so a file created in between is not missed.
     #[cfg(unix)]
     async fn wait_for_ready(&self, timeout: Duration) -> Result<(), FlameError> {
+        self.wait_for_ready_rechecking(timeout, READY_RECHECK_INTERVAL)
+            .await
+    }
+
+    /// [`wait_for_ready`](Self::wait_for_ready) with the interval of the periodic re-check as a
+    /// parameter, so a test can make it long enough that only a directory event can wake the wait.
+    #[cfg(unix)]
+    async fn wait_for_ready_rechecking(
+        &self,
+        timeout: Duration,
+        recheck: Duration,
+    ) -> Result<(), FlameError> {
         let ready = ready_file(Path::new(&self.endpoint));
         let deadline = tokio::time::Instant::now() + timeout;
         let (events, mut changed) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -155,7 +163,7 @@ impl GrpcShim {
                     self.endpoint
                 )));
             }
-            let wait = remaining.min(READY_RECHECK_INTERVAL);
+            let wait = remaining.min(recheck);
             // Woken by a directory event; otherwise re-check when the interval elapses. If the
             // watcher is gone the channel is closed, so wait out the interval instead.
             if let Ok(None) = tokio::time::timeout(wait, changed.recv()).await {
@@ -525,28 +533,20 @@ mod tests {
         let _listener = tokio::net::UnixListener::bind(&path).unwrap();
         let shim = GrpcShim::new_at(&path).unwrap();
 
-        let (created_tx, created_rx) = tokio::sync::oneshot::channel();
         let service = tokio::spawn({
             let ready = ready_file(&path);
             async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 std::fs::write(&ready, b"").unwrap();
-                created_tx.send(std::time::Instant::now()).unwrap();
             }
         });
 
-        shim.wait_for_ready(Duration::from_secs(5)).await.unwrap();
-        let seen = std::time::Instant::now();
-        let created = created_rx.await.unwrap();
+        // The periodic re-check is far longer than the timeout, so only the directory event can
+        // wake the wait in time; no timing bound on the event itself is needed.
+        shim.wait_for_ready_rechecking(Duration::from_secs(5), Duration::from_secs(60))
+            .await
+            .unwrap();
         service.await.unwrap();
-
-        // Found by the directory event, not by the periodic re-check, which would only look
-        // again READY_RECHECK_INTERVAL after the first check, long after the file appeared.
-        let delay = seen.duration_since(created);
-        assert!(
-            delay < READY_RECHECK_INTERVAL / 2,
-            "ready file noticed {delay:?} after it was created"
-        );
     }
 
     #[cfg(unix)]
