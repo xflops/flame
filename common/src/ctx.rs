@@ -257,6 +257,7 @@ impl FlameTls {
     /// Load server TLS config for tonic.
     /// Returns ServerTlsConfig with identity loaded from cert/key files.
     pub fn server_tls_config(&self) -> Result<ServerTlsConfig, FlameError> {
+        stdng::tls::install_crypto_provider();
         let cert = fs::read_to_string(&self.cert_file).map_err(|e| {
             FlameError::InvalidConfig(format!(
                 "failed to read cert_file <{}>: {}",
@@ -279,6 +280,7 @@ impl FlameTls {
     /// Load client TLS config for tonic.
     /// If ca_file is specified, use it; otherwise use system CA bundle.
     pub fn client_tls_config(&self) -> Result<ClientTlsConfig, FlameError> {
+        stdng::tls::install_crypto_provider();
         let mut config = ClientTlsConfig::new();
 
         if let Some(ca_file) = &self.ca_file {

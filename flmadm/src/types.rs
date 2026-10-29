@@ -32,7 +32,7 @@ impl InstallProfile {
     }
 }
 
-pub const DEFAULT_PYTHON_VERSIONS: &[&str] = &["3.11", "3.12"];
+pub const DEFAULT_PYTHON_VERSIONS: &[&str] = &["3.11", "3.12", "3.13", "3.14"];
 
 /// Configuration for the install command
 #[derive(Debug, Clone)]
@@ -378,7 +378,7 @@ mod tests {
         #[test]
         fn default_python_versions() {
             let config = InstallConfig::default();
-            assert_eq!(config.python_versions, vec!["3.11", "3.12"]);
+            assert_eq!(config.python_versions, vec!["3.11", "3.12", "3.13", "3.14"]);
         }
 
         #[test]
@@ -514,7 +514,7 @@ mod tests {
 
         #[test]
         fn default_python_versions_value() {
-            assert_eq!(DEFAULT_PYTHON_VERSIONS, &["3.11", "3.12"]);
+            assert_eq!(DEFAULT_PYTHON_VERSIONS, &["3.11", "3.12", "3.13", "3.14"]);
         }
 
         #[test]

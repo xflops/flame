@@ -1,15 +1,15 @@
 # Development dependencies
-pytest>=7.0.0
-pytest-asyncio>=0.21.0
-black>=22.0.0
-isort>=5.0.0
-mypy>=1.0.0
+pytest>=9.2.0
+pytest-asyncio>=1.4.1
+black>=26.10.1
+isort>=9.0.2
+mypy>=2.4.1
 
 # Runtime dependencies (for development)
-grpcio>=1.80
-grpcio-tools>=1.80
-protobuf>=4.21.0
-pydantic>=2.11
-fastapi>=0.115.0
-uvicorn>=0.35.0
-pyyaml>=6.0.0
+grpcio>=1.85.0
+grpcio-tools>=1.85.0
+protobuf>=7.36.2
+pydantic>=2.14.1
+fastapi>=0.162.0
+uvicorn>=0.54.0
+pyyaml>=6.0.3

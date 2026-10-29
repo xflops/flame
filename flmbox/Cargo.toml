@@ -21,11 +21,11 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 serde_yaml = { workspace = true }
 
-sha2 = "0.10"
+sha2 = "0.11"
 tar = "0.4"
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.14"
 oci-spec = { version = "0.10", default-features = false, features = ["runtime"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
-nix = { version = "0.30", default-features = false, features = ["fs"] }
+nix = { version = "0.31", default-features = false, features = ["fs"] }

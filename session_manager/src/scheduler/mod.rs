@@ -70,7 +70,7 @@ impl FlameThread for ScheduleRunner {
 
 #[cfg(test)]
 mod tests {
-    use rand::Rng;
+    use rand::RngExt;
 
     use crate::controller;
     use crate::model::{ALL_NODE, OPEN_SESSION};

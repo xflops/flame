@@ -360,7 +360,7 @@ async fn run_case(
 
 fn format_results(runtime: &str, results: &[BenchmarkStatistics]) -> String {
     let mut table = Table::new();
-    table.load_preset(ASCII_MARKDOWN).set_header([
+    table.load_style(ASCII_MARKDOWN).set_header([
         "Phase",
         "Sessions",
         "Tasks/session",

@@ -19,7 +19,7 @@ env:
 jobs:
   ci:
     name: Kubernetes E2E Test
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     steps:
       - name: Checkout

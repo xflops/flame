@@ -402,10 +402,11 @@ impl InstallationManager {
 #
 # Options:
 #   --python-version VERSION  Python version to use (e.g., 3.11, 3.12)
-#                             If not specified, uses the latest installed version
+#                             If not specified, uses the version of python3 on PATH when
+#                             installed, otherwise the latest installed version
 #
 # Examples:
-#   source {prefix}/sbin/flmenv.sh                       # Use latest installed Python version
+#   source {prefix}/sbin/flmenv.sh                       # Match python3 on PATH, else latest
 #   source {prefix}/sbin/flmenv.sh --python-version 3.11 # Use Python 3.11
 #   source {prefix}/sbin/flmenv.sh --python-version 3.12 # Use Python 3.12
 #
@@ -442,7 +443,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Find latest installed Python version if not specified
+# Prefer the version of the python3 on PATH when flamepy is installed for it: native
+# extensions such as grpc only load under the interpreter they were built for.
+if [ -z "$FLAME_PYTHON_VERSION" ]; then
+    FLAME_SYSTEM_PYTHON_VERSION=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)
+    if [ -n "$FLAME_SYSTEM_PYTHON_VERSION" ] && [ -d "$FLAME_HOME/lib/python$FLAME_SYSTEM_PYTHON_VERSION/site-packages" ]; then
+        FLAME_PYTHON_VERSION="$FLAME_SYSTEM_PYTHON_VERSION"
+    fi
+    unset FLAME_SYSTEM_PYTHON_VERSION
+fi
+
+# Otherwise use the latest installed Python version
 if [ -z "$FLAME_PYTHON_VERSION" ]; then
     FLAME_PYTHON_VERSION=$(ls -1d "$FLAME_HOME"/lib/python*/site-packages 2>/dev/null \
         | sed 's|.*/python\([0-9.]*\)/site-packages|\1|' \

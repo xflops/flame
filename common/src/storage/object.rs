@@ -17,10 +17,7 @@ use std::io::prelude::*;
 use std::io::SeekFrom;
 use std::path::PathBuf;
 
-use bincode::{
-    config::{BigEndian, Configuration, Fixint},
-    Decode, Encode,
-};
+use serde::de::DeserializeOwned;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
 use stdng::trace_fn;
@@ -55,7 +52,6 @@ pub struct ObjectStorage {
 
     data: File,
     data_file_path: PathBuf,
-    data_config: Configuration<BigEndian, Fixint>,
 }
 
 impl ObjectStorage {
@@ -88,11 +84,6 @@ impl ObjectStorage {
             .open(&metadata_file_path)?;
 
         let owners = HashMap::new();
-        let data_config = bincode::config::standard()
-            .with_no_limit()
-            .with_big_endian()
-            .with_fixed_int_encoding();
-
         let mut storage = ObjectStorage {
             metadata: Metadata { size: 0 },
             metadata_file,
@@ -102,7 +93,6 @@ impl ObjectStorage {
             owners_file_path,
             data,
             data_file_path,
-            data_config,
         };
 
         storage.reload()?;
@@ -110,14 +100,16 @@ impl ObjectStorage {
         Ok(storage)
     }
 
-    pub fn save<T: Object + Encode + Clone>(&mut self, object: &T) -> Result<T, FlameError> {
+    pub fn save<T: Object + serde::Serialize + Clone>(
+        &mut self,
+        object: &T,
+    ) -> Result<T, FlameError> {
         trace_fn!("ObjectStorage::save");
 
         let mut obj = object.clone();
         obj.set_id(self.next_id()?);
 
-        let data = bincode::encode_to_vec(&obj, self.data_config)
-            .map_err(|e| FlameError::Internal(e.to_string()))?;
+        let data = postcard::to_allocvec(&obj).map_err(|e| FlameError::Internal(e.to_string()))?;
 
         tracing::debug!("save data: {:?}", data);
 
@@ -136,10 +128,13 @@ impl ObjectStorage {
         Ok(obj)
     }
 
-    pub fn update<T: Object + Encode + Clone>(&mut self, object: &T) -> Result<T, FlameError> {
+    pub fn update<T: Object + serde::Serialize + Clone>(
+        &mut self,
+        object: &T,
+    ) -> Result<T, FlameError> {
         trace_fn!("ObjectStorage::update");
-        let data = bincode::encode_to_vec(object, self.data_config)
-            .map_err(|e| FlameError::Internal(e.to_string()))?;
+        let data =
+            postcard::to_allocvec(object).map_err(|e| FlameError::Internal(e.to_string()))?;
 
         tracing::debug!("update data: {:?}", data);
 
@@ -148,7 +143,7 @@ impl ObjectStorage {
         Ok(object.clone())
     }
 
-    pub fn load<T: Object + Decode<()>>(&mut self, id: ObjectId) -> Result<T, FlameError> {
+    pub fn load<T: Object + DeserializeOwned>(&mut self, id: ObjectId) -> Result<T, FlameError> {
         trace_fn!("ObjectStorage::load");
 
         self.seek(id)?;
@@ -158,13 +153,13 @@ impl ObjectStorage {
 
         tracing::debug!("load data: {:?}", object);
 
-        let (object, _) = bincode::decode_from_slice(&object, self.data_config)
-            .map_err(|e| FlameError::Internal(e.to_string()))?;
+        let (object, _) =
+            postcard::take_from_bytes(&object).map_err(|e| FlameError::Internal(e.to_string()))?;
 
         Ok(object)
     }
 
-    pub fn list<T: Object + Decode<()>>(
+    pub fn list<T: Object + DeserializeOwned>(
         &mut self,
         filter: Option<Filter>,
     ) -> Result<Vec<T>, FlameError> {
@@ -312,22 +307,27 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     struct TestObject {
-        id: Option<ObjectId>,
+        #[serde(with = "postcard::fixint::le")]
+        id: ObjectId,
+        #[serde(with = "postcard::fixint::le")]
         state: u64,
+        #[serde(with = "postcard::fixint::le")]
         created_at: u64,
+        #[serde(with = "postcard::fixint::le")]
         updated_at: u64,
+        #[serde(with = "postcard::fixint::le")]
         owner: ObjectId,
     }
 
     impl Object for TestObject {
         fn id(&self) -> ObjectId {
-            self.id.unwrap_or(0)
+            self.id
         }
 
         fn set_id(&mut self, id: ObjectId) {
-            self.id = Some(id);
+            self.id = id;
         }
 
         fn owner(&self) -> ObjectId {
@@ -344,7 +344,7 @@ mod tests {
         let now = Utc::now().timestamp() as u64;
 
         let object = TestObject {
-            id: None,
+            id: 0,
             state: 0,
             created_at: now,
             updated_at: 0,
@@ -382,7 +382,7 @@ mod tests {
         let now = Utc::now().timestamp() as u64;
         let updated_at = now + 1;
         let object = TestObject {
-            id: None,
+            id: 0,
             state: 0,
             created_at: now,
             updated_at: 0,
@@ -430,7 +430,7 @@ mod tests {
         let updated_at = now + 1;
 
         let object1 = TestObject {
-            id: None,
+            id: 0,
             state: 0,
             created_at: now,
             updated_at: 0,
@@ -444,7 +444,7 @@ mod tests {
         assert_eq!(obj1.owner, 1);
 
         let object2 = TestObject {
-            id: None,
+            id: 0,
             state: 1,
             created_at: now + 1,
             updated_at: 0,
@@ -458,7 +458,7 @@ mod tests {
         assert_eq!(obj2.owner, 1);
 
         let object3 = TestObject {
-            id: None,
+            id: 0,
             state: 2,
             created_at: now + 2,
             updated_at: 0,

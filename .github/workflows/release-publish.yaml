@@ -25,7 +25,7 @@ env:
 jobs:
   release-metadata:
     name: Release Metadata
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       cargo-version: ${{ steps.metadata.outputs.cargo-version }}
       docker-tag: ${{ steps.metadata.outputs.docker-tag }}
@@ -54,7 +54,7 @@ jobs:
 
   publish-python:
     name: Publish flamepy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs: release-metadata
     steps:
       - name: Checkout release tooling
@@ -101,7 +101,7 @@ jobs:
 
   publish-rust:
     name: Publish Rust crates
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs: release-metadata
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

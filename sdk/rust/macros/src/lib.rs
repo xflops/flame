@@ -565,7 +565,7 @@ fn analyze_signature(sig: &syn::Signature, expects_receiver: bool) -> Result<Han
     if expects_receiver {
         match args.next() {
             Some(FnArg::Receiver(receiver))
-                if receiver.reference.is_some() && receiver.mutability.is_none() => {}
+                if matches!(receiver.kind, syn::ReceiverKind::Reference(_, _, None)) => {}
             Some(arg) => {
                 return Err(Error::new_spanned(
                     arg,
@@ -647,7 +647,7 @@ fn analyze_enter_hook(method: &ImplItemFn) -> Result<EnterHook> {
     let mut args = method.sig.inputs.iter();
     match args.next() {
         Some(FnArg::Receiver(receiver))
-            if receiver.reference.is_some() && receiver.mutability.is_none() => {}
+            if matches!(receiver.kind, syn::ReceiverKind::Reference(_, _, None)) => {}
         Some(arg) => return Err(Error::new_spanned(arg, "flame enter hook must take &self")),
         None => {
             return Err(Error::new_spanned(
@@ -693,7 +693,7 @@ fn analyze_leave_hook(method: &ImplItemFn) -> Result<()> {
     let mut args = method.sig.inputs.iter();
     match args.next() {
         Some(FnArg::Receiver(receiver))
-            if receiver.reference.is_some() && receiver.mutability.is_none() => {}
+            if matches!(receiver.kind, syn::ReceiverKind::Reference(_, _, None)) => {}
         Some(arg) => return Err(Error::new_spanned(arg, "flame leave hook must take &self")),
         None => {
             return Err(Error::new_spanned(

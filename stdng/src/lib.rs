@@ -18,6 +18,7 @@ use thiserror::Error;
 pub mod collections;
 pub mod logs;
 pub mod rand;
+pub mod tls;
 
 #[derive(Error, Debug)]
 pub enum Error {

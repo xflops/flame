@@ -155,7 +155,7 @@ fn print_outputs(tasks: Vec<TaskResult<PingResponse>>) -> Result<(), Box<dyn Err
     let mut table = Table::new();
 
     table
-        .load_preset(NOTHING)
+        .load_style(NOTHING)
         .set_header(vec!["Session", "Task", "State", "Output"]);
 
     for task in tasks {

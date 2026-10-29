@@ -21,7 +21,7 @@ use std::{
     thread,
 };
 
-use rand::Rng;
+use rand::RngExt;
 
 use flame_rs::{apis::FlameError, FLAME_PYTHON_VERSION_ENV};
 use stdng::trace_fn;

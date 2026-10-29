@@ -1,4 +1,4 @@
-FROM rust:1.98.1 AS builder
+FROM rust:1.99.1 AS builder
 
 WORKDIR /usr/src/flame
 COPY . .
@@ -19,7 +19,7 @@ RUN ./target/release/flmadm install \
     --skip-build \
     --force
 
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 # The executor manager hosts host-shim applications, including the `flmbox` sandbox
 # application, which drives gVisor `runsc`: runsc comes from the gVisor apt repository (the

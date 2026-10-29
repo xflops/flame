@@ -9,7 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-26.04]
         policy: [priority, drf]
     steps:
       - name: Checkout

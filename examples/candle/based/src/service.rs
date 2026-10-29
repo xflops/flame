@@ -24,7 +24,8 @@ use candle_transformers::models::based::{Config, Model};
 use flame::apis::FlameError;
 use flame::service::FlameInstance;
 use flame_rs::{self as flame};
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::RepoTypeModel;
+use hf_hub::{HFClientSync, HFRepositorySync};
 use tokenizers::Tokenizer;
 
 use self::api::{
@@ -166,32 +167,55 @@ impl BasedService {
     }
 }
 
+fn model_repo(
+    api: &HFClientSync,
+    model_id: &str,
+) -> Result<HFRepositorySync<RepoTypeModel>, FlameError> {
+    let (owner, name) = model_id
+        .split_once('/')
+        .ok_or_else(|| FlameError::InvalidConfig(format!("invalid model id: {model_id}")))?;
+    Ok(api.model(owner, name))
+}
+
+fn download(
+    repo: &HFRepositorySync<RepoTypeModel>,
+    filename: &str,
+    revision: Option<String>,
+) -> Result<PathBuf, FlameError> {
+    repo.download_file()
+        .filename(filename)
+        .maybe_revision(revision)
+        .send()
+        .map_err(internal)
+}
+
 fn load_model(options: BasedModelOptions) -> Result<ModelBundle, FlameError> {
     let start = Instant::now();
-    let api = Api::new().map_err(internal)?;
+    let api = HFClientSync::new().map_err(internal)?;
     let model_id = options
         .model_id
         .clone()
         .unwrap_or_else(|| default_model_id(options.which).to_string());
-    let repo = api.repo(Repo::with_revision(
-        model_id.clone(),
-        RepoType::Model,
-        options.revision.clone(),
-    ));
+    let repo = model_repo(&api, &model_id)?;
+    let revision = options.revision.clone();
 
     let config_file = match options.config_file {
         Some(path) => PathBuf::from(path),
-        None => repo.get("config.json").map_err(internal)?,
+        None => download(&repo, "config.json", Some(revision.clone()))?,
     };
     let weight_files = match options.weight_files {
         Some(files) => files.into_iter().map(PathBuf::from).collect(),
-        None => vec![repo.get("model.safetensors").map_err(internal)?],
+        None => vec![download(
+            &repo,
+            "model.safetensors",
+            Some(revision.clone()),
+        )?],
     };
 
-    let tokenizer_repo = api.model(options.tokenizer_id.clone());
+    let tokenizer_repo = model_repo(&api, &options.tokenizer_id)?;
     let tokenizer_file = match options.tokenizer_file {
         Some(path) => PathBuf::from(path),
-        None => tokenizer_repo.get("tokenizer.json").map_err(internal)?,
+        None => download(&tokenizer_repo, "tokenizer.json", None)?,
     };
 
     let tokenizer = Tokenizer::from_file(tokenizer_file).map_err(internal)?;

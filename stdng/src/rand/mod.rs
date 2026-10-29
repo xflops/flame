@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use rand::{Rng, distr::Alphanumeric};
+use rand::{RngExt, distr::Alphanumeric};
 
 pub fn short_name() -> String {
     rand::rng()

@@ -858,7 +858,11 @@ mod tests {
     }
 
     fn digest(bytes: &[u8]) -> String {
-        format!("sha256:{:x}", Sha256::digest(bytes))
+        let digest: String = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!("sha256:{digest}")
     }
 
     fn config_json() -> Vec<u8> {

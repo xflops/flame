@@ -14,8 +14,8 @@ limitations under the License.
 use std::collections::HashMap;
 use std::fs;
 
-use bincode::{Decode, Encode};
 use chrono::{DateTime, Utc};
+use serde_derive::{Deserialize, Serialize};
 use stdng::{lock_ptr, new_ptr, MutexPtr};
 
 use crate::apis::{Event, EventOwner, SessionID, TaskID};
@@ -29,18 +29,22 @@ struct EventStorage {
     data_storage: DataStorage,
 }
 
-#[derive(Clone, Debug, Encode, Decode)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct EventDao {
-    id: Option<u64>,
+    #[serde(with = "postcard::fixint::le")]
+    id: ObjectId,
+    #[serde(with = "postcard::fixint::le")]
     owner: TaskID,
+    #[serde(with = "postcard::fixint::le")]
     code: i32,
     message: Index,
+    #[serde(with = "postcard::fixint::le")]
     creation_time: i64,
 }
 
 impl Object for EventDao {
     fn id(&self) -> ObjectId {
-        self.id.unwrap_or(0)
+        self.id
     }
 
     fn owner(&self) -> ObjectId {
@@ -48,7 +52,7 @@ impl Object for EventDao {
     }
 
     fn set_id(&mut self, id: ObjectId) {
-        self.id = Some(id);
+        self.id = id;
     }
 }
 
@@ -160,7 +164,7 @@ impl EventManager for FsEventManager {
         let msg_index = storage.data_storage.save(message.as_bytes())?;
 
         let event_dao = EventDao {
-            id: None,
+            id: 0,
             owner: owner.task_id,
             code: event.code,
             message: msg_index,

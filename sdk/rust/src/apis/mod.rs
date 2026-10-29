@@ -18,7 +18,6 @@ pub(crate) mod flame {
 }
 use flame::v1 as rpc;
 
-use bincode::{config, Decode, Encode};
 use bytes::Bytes;
 use prost::Enumeration;
 use serde_derive::{Deserialize, Serialize};
@@ -45,13 +44,13 @@ pub type TaskInput = Message;
 pub type TaskOutput = Message;
 pub type CommonData = Message;
 
-#[derive(Encode, Decode, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 pub enum DataSource {
     Local,
     Remote,
 }
 
-#[derive(Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 pub struct DataExpr {
     pub source: DataSource,
     pub endpoint: Option<String>,
@@ -61,8 +60,8 @@ pub struct DataExpr {
 impl DataExpr {
     pub fn encode(&self) -> Result<Bytes, FlameError> {
         if self.source == DataSource::Local {
-            let data = bincode::encode_to_vec(self, config::standard())
-                .map_err(|e| FlameError::Internal(e.to_string()))?;
+            let data =
+                postcard::to_allocvec(self).map_err(|e| FlameError::Internal(e.to_string()))?;
             return Ok(Bytes::from(data));
         }
 
@@ -71,8 +70,8 @@ impl DataExpr {
             endpoint: self.endpoint.clone(),
             data: None,
         };
-        let data = bincode::encode_to_vec(data_expr, config::standard())
-            .map_err(|e| FlameError::Internal(e.to_string()))?;
+        let data =
+            postcard::to_allocvec(&data_expr).map_err(|e| FlameError::Internal(e.to_string()))?;
 
         Ok(Bytes::from(data))
     }
@@ -80,8 +79,8 @@ impl DataExpr {
     pub fn decode(data: Bytes) -> Result<Self, FlameError> {
         let data = data.to_vec();
 
-        let (data, _): (Self, usize) = bincode::decode_from_slice(&data, config::standard())
-            .map_err(|e| FlameError::Internal(e.to_string()))?;
+        let data: Self =
+            postcard::from_bytes(&data).map_err(|e| FlameError::Internal(e.to_string()))?;
         Ok(data)
     }
 }

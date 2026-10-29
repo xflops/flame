@@ -16,13 +16,15 @@ use std::io::prelude::*;
 use std::io::SeekFrom;
 use std::path::PathBuf;
 
-use bincode::{Decode, Encode};
+use serde_derive::{Deserialize, Serialize};
 
 use crate::FlameError;
 
-#[derive(Clone, Debug, Encode, Decode)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Index {
+    #[serde(with = "postcard::fixint::le")]
     pub start: u64,
+    #[serde(with = "postcard::fixint::le")]
     pub end: u64,
 }
 

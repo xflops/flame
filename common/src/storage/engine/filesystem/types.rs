@@ -15,7 +15,6 @@ use super::payload::{Part, PayloadFile};
 use super::poisoned;
 use crate::apis::{Executor, Node, SessionState, TaskID};
 use crate::FlameError;
-use bincode::{Decode, Encode};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -26,33 +25,44 @@ use tokio::sync::Mutex;
 
 /// Task metadata stored in tasks.bin with fixed-size records.
 ///
-/// Uses `bincode` with `fixint` encoding to ensure constant serialized size.
+/// Uses `postcard` with fixed-width (`fixint`) integer fields to ensure constant serialized size.
 /// The checksum is calculated using `crc32fast` for data integrity.
-#[derive(Encode, Decode, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub(super) struct TaskMetadata {
     /// Task ID (index in file)
+    #[serde(with = "postcard::fixint::le")]
     pub(super) id: u64,
     /// Optimistic locking version
+    #[serde(with = "postcard::fixint::le")]
     pub(super) version: u32,
     /// CRC32 checksum of the record (excluding this field)
+    #[serde(with = "postcard::fixint::le")]
     pub(super) checksum: u32,
     /// Task state (TaskState enum as u8)
     pub(super) state: u8,
     /// Unix timestamp of creation
+    #[serde(with = "postcard::fixint::le")]
     pub(super) creation_time: i64,
     /// Unix timestamp of completion (0 if not completed)
+    #[serde(with = "postcard::fixint::le")]
     pub(super) completion_time: i64,
     /// Offset in inputs.bin where input data starts
+    #[serde(with = "postcard::fixint::le")]
     pub(super) input_offset: u64,
     /// Length of input data in bytes
+    #[serde(with = "postcard::fixint::le")]
     pub(super) input_len: u64,
     /// Offset in outputs.bin where output data starts
+    #[serde(with = "postcard::fixint::le")]
     pub(super) output_offset: u64,
     /// Length of output data in bytes
+    #[serde(with = "postcard::fixint::le")]
     pub(super) output_len: u64,
     /// Offset in affinity.bin where the encoded affinity vector starts
+    #[serde(with = "postcard::fixint::le")]
     pub(super) affinity_offset: u64,
     /// Length of the encoded affinity vector in bytes
+    #[serde(with = "postcard::fixint::le")]
     pub(super) affinity_len: u64,
 }
 
@@ -158,18 +168,11 @@ impl ExecutorMetadata {
     }
 }
 
-/// Bincode configuration for fixed-size encoding.
-pub(super) fn bincode_config() -> impl bincode::config::Config {
-    bincode::config::standard()
-        .with_fixed_int_encoding()
-        .with_little_endian()
-}
-
 /// Calculate the fixed record size for TaskMetadata.
 pub(super) fn task_record_size() -> usize {
     // Calculate the serialized size of a default TaskMetadata
     let meta = TaskMetadata::default();
-    bincode::encode_to_vec(&meta, bincode_config())
+    postcard::to_allocvec(&meta)
         .expect("Failed to calculate record size")
         .len()
 }
@@ -305,5 +308,33 @@ impl SessionEntry {
                 *slot = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod record_size_tests {
+    use super::*;
+
+    #[test]
+    fn task_record_size_is_constant_for_extreme_values() {
+        let max = TaskMetadata {
+            id: u64::MAX,
+            version: u32::MAX,
+            checksum: u32::MAX,
+            state: u8::MAX,
+            creation_time: i64::MIN,
+            completion_time: i64::MAX,
+            input_offset: u64::MAX,
+            input_len: u64::MAX,
+            output_offset: u64::MAX,
+            output_len: u64::MAX,
+            affinity_offset: u64::MAX,
+            affinity_len: u64::MAX,
+        };
+        let encoded = postcard::to_allocvec(&max).unwrap();
+        assert_eq!(encoded.len(), task_record_size());
+        let (decoded, _): (TaskMetadata, _) = postcard::take_from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.id, u64::MAX);
+        assert_eq!(decoded.creation_time, i64::MIN);
     }
 }

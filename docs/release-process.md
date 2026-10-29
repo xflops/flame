@@ -17,8 +17,8 @@ export DOCKER_TAG="${RELEASE_TAG}"
 export RELEASE_BRANCH=release-0.6
 export IMAGE_REGISTRY=docker.io/xflops
 export RELEASE_IMAGE_PLATFORMS=linux/amd64,linux/arm64
-export RUST_BUILDER_IMAGE=docker.io/library/rust:1.98.1
-export UBUNTU_BASE_IMAGE=docker.io/library/ubuntu:24.04
+export RUST_BUILDER_IMAGE=docker.io/library/rust:1.99.1
+export UBUNTU_BASE_IMAGE=docker.io/library/ubuntu:26.04
 # Optional override; Makefile auto-detects usable podman first, then docker.
 # export CONTAINER_CLI=podman
 export RELEASE_NOTES_FILE=/tmp/flame-${RELEASE_TAG}-notes.md
@@ -88,7 +88,7 @@ gh workflow run release-publish.yaml --ref main \
 ```
 
 Main and release image publishing use the shared `build-images.yaml` workflow.
-It builds amd64 on `ubuntu-24.04` and arm64 on `ubuntu-24.04-arm`, without QEMU.
+It builds amd64 on `ubuntu-26.04` and arm64 on `ubuntu-26.04-arm`, without QEMU.
 Each runner builds all five images with `ci/release/image-bake.hcl`, sharing the
 common Rust compilation stage. Build caches are scoped by image and architecture.
 Native binary and Python SDK smoke checks must pass before the image digests are

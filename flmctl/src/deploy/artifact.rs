@@ -515,7 +515,11 @@ fn sha256_file(path: &Path) -> Result<String, FlameError> {
         hasher.update(&buffer[..read]);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 #[cfg(test)]

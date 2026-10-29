@@ -5,7 +5,7 @@ import warnings
 
 import flamepy.proto.cache_pb2 as cache__pb2
 
-GRPC_GENERATED_VERSION = '1.80.0'
+GRPC_GENERATED_VERSION = '1.85.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -25,7 +25,7 @@ if _version_not_supported:
     )
 
 
-class ObjectCacheServiceStub(object):
+class ObjectCacheServiceStub:
     """The cache stores opaque bytes. Clients serialize and deserialize values,
     including Arrow values, before sending them over this service.
     """
@@ -68,7 +68,7 @@ class ObjectCacheServiceStub(object):
                 _registered_method=True)
 
 
-class ObjectCacheServiceServicer(object):
+class ObjectCacheServiceServicer:
     """The cache stores opaque bytes. Clients serialize and deserialize values,
     including Arrow values, before sending them over this service.
     """
@@ -150,7 +150,7 @@ def add_ObjectCacheServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class ObjectCacheService(object):
+class ObjectCacheService:
     """The cache stores opaque bytes. Clients serialize and deserialize values,
     including Arrow values, before sending them over this service.
     """

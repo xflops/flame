@@ -1,4 +1,4 @@
-FROM rust:1.98.1 AS builder
+FROM rust:1.99.1 AS builder
 
 WORKDIR /usr/src/flame
 COPY . .
@@ -16,10 +16,10 @@ RUN ./target/release/flmadm install \
     --no-systemd \
     --skip-build \
     --force \
-    --python-version 3.12 \
+    --python-version 3.14 \
     && rm -f /usr/local/flame/bin/flame-executor-manager
 
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 # The runtime also hosts the `flmbox` sandbox application, which drives gVisor `runsc`: runsc
 # comes from the gVisor apt repository (the same source the CRI e2e uses). curl and gnupg
@@ -40,7 +40,7 @@ COPY --from=builder /usr/local/flame /usr/local/flame
 
 ENV FLAME_HOME=/usr/local/flame
 ENV PATH=/usr/local/flame/bin:${PATH}
-ENV PYTHONPATH=/usr/local/flame/lib/python3.12/site-packages
+ENV PYTHONPATH=/usr/local/flame/lib/python3.14/site-packages
 # Device and driver injection is selected explicitly through CRI CDI requests.
 ENV NVIDIA_VISIBLE_DEVICES=void
 

@@ -7,7 +7,7 @@ name = "flamepy"
 version = "0.6.0"
 description = "Python SDK for Flame, a distributed system for Agentic AI"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 license-files = ["LICENSE"]
 authors = [
   {name = "XFLOPS Authors", email = "support@xflops.io"}
@@ -18,33 +18,32 @@ classifiers = [
   "Intended Audience :: Developers",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-  "grpcio>=1.80",
-  "grpcio-tools>=1.80",
-  "protobuf>=6.31.0",
-  "pydantic>=2.11.0",
-  "fastapi>=0.115.0",
-  "uvicorn>=0.35.0",
-  "pyyaml>=6.0.0",
-  "pymongo>=4",
-  "requests >= 2.32",
-  "httpx >= 0.28",
-  "cloudpickle >= 3.1",
-  "pathspec >= 0.12.1, < 2",
-  "pyarrow >= 18.1.0"
+  "grpcio>=1.85.0",
+  "grpcio-tools>=1.85.0",
+  "protobuf>=7.36.2",
+  "pydantic>=2.14.1",
+  "fastapi>=0.162.0",
+  "uvicorn>=0.54.0",
+  "pyyaml>=6.0.3",
+  "pymongo>=4.19.0",
+  "requests >= 2.34.2",
+  "httpx >= 0.28.1",
+  "cloudpickle >= 3.1.2",
+  "pathspec >= 1.1.1, < 2",
+  "pyarrow >= 26.0.0"
 ]
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=7.0.0",
-  "pytest-asyncio>=0.21.0",
-  "ruff>=0.1.0",
-  "mypy>=1.0.0",
+  "pytest>=9.2.0",
+  "pytest-asyncio>=1.4.1",
+  "ruff>=0.17.3",
+  "mypy>=2.4.1",
 ]
 
 [tool.setuptools.packages.find]
@@ -59,7 +58,7 @@ Issues = "https://github.com/xflops/flame/issues"
 
 [tool.ruff]
 line-length = 320
-target-version = "py39"
+target-version = "py311"
 exclude = [
     ".eggs",
     ".git",
@@ -84,7 +83,7 @@ ignore = []
 known-first-party = ["flamepy"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
@@ -108,5 +107,5 @@ ignore_missing_imports = true
 
 [dependency-groups]
 dev = [
-    "ruff>=0.1.0",
+    "ruff>=0.17.3",
 ]

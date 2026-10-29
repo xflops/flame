@@ -6,11 +6,11 @@ readme = "README.md"
 authors = [
     { name = "XFLOPS Authors", email = "support@xflops.io" }
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
-    "cloudpickle>=3.1",
-    "grpcio>=1.80",
-    "grpcio-tools>=1.80",
+    "cloudpickle>=3.1.2",
+    "grpcio>=1.85.0",
+    "grpcio-tools>=1.85.0",
 ]
 
 [project.scripts]
@@ -29,10 +29,10 @@ exclude = ["tests*"]
 [dependency-groups]
 dev = [
     "flamepy",
-    "pytest>=8.4.2",
-    "pytest-timeout>=2.3.1",
-    "black>=25.1.0",
-    "isort>=5.0.0",
+    "pytest>=9.2.0",
+    "pytest-timeout>=2.4.0",
+    "black>=26.10.1",
+    "isort>=9.0.2",
 ]
 
 [tool.pytest.ini_options]
@@ -51,9 +51,9 @@ markers = [
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=7.0.0",
-  "pytest-asyncio>=0.21.0",
-  "ruff>=0.1.0",
+  "pytest>=9.2.0",
+  "pytest-asyncio>=1.4.1",
+  "ruff>=0.17.3",
 ]
 
 [tool.ruff]

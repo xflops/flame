@@ -97,7 +97,7 @@ fn format_task_summary(pending: i32, running: i32, succeed: i32, failed: i32) ->
 
 fn view_session_table(session: &client::Session) -> Result<(), Box<dyn Error>> {
     let mut table = Table::new();
-    table.load_preset(NOTHING);
+    table.load_style(NOTHING);
 
     table.add_row(vec!["Session:", &session.id.to_string()]);
     table.add_row(vec!["Application:", &session.application.to_string()]);

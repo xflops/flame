@@ -60,7 +60,7 @@ async fn list_applications(conn: Connection, output_format: &str) -> Result<(), 
 
     let mut table = Table::new();
     table
-        .load_preset(NOTHING)
+        .load_style(NOTHING)
         .set_header(vec!["Name", "State", "Shim", "Tags", "Created", "Command"]);
 
     for app in &app_list {
@@ -89,7 +89,7 @@ async fn list_sessions(conn: Connection, output_format: &str) -> Result<(), Box<
         return Ok(());
     }
     let mut table = Table::new();
-    table.load_preset(NOTHING).set_header(vec![
+    table.load_style(NOTHING).set_header(vec![
         "ID",
         "State",
         "App",
@@ -147,7 +147,7 @@ async fn list_executors(conn: Connection, output_format: &str) -> Result<(), Box
 fn executor_table(executors: &[Executor]) -> Table {
     let mut table = Table::new();
     table
-        .load_preset(NOTHING)
+        .load_style(NOTHING)
         .set_header(vec!["ID", "State", "App", "Session", "Node"]);
 
     for executor in executors {
@@ -170,7 +170,7 @@ async fn list_nodes(conn: Connection, output_format: &str) -> Result<(), Box<dyn
         return Ok(());
     }
     let mut table = Table::new();
-    table.load_preset(NOTHING).set_header(vec![
+    table.load_style(NOTHING).set_header(vec![
         "NAME", "HOSTNAME", "STATUS", "CPU", "MEMORY", "GPU", "ARCH", "OS",
     ]);
 

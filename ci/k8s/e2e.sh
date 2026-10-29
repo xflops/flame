@@ -470,7 +470,7 @@ run_smoke_tests() {
     pushd "${FLAME_HOME}/examples/pi/python" >/dev/null
     PI_NUM_BATCHES="$PI_NUM_BATCHES" \
         PI_SAMPLES_PER_BATCH="$PI_SAMPLES_PER_BATCH" \
-        uv run main.py
+        uv run --python "${FLAME_PYTHON_VERSION}" main.py
     popd >/dev/null
 }
 
@@ -483,7 +483,7 @@ run_e2e_tests() {
         FLAME_LOG=DEBUG \
         FLAME_E2E_REQUIRE_SANDBOX=1 \
         FLAME_E2E_REMOTE_RUNSC=1 \
-        uv run --no-project \
+        uv run --python "${FLAME_PYTHON_VERSION}" --no-project \
         --with pytest \
         --with pytest-timeout \
         python -m pytest -vv --durations=0 \

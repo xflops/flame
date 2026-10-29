@@ -33,22 +33,22 @@ num_cpus = "1.17"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_derive = { workspace = true }
-sha2 = "0.10"
-toml = "0.9"
+sha2 = "0.11"
+toml = "1.1"
 
 bytes = { workspace = true }
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.14"
 tar = "0.4"
-zip = "2"
-reqwest = { version = "0.12", features = ["rustls-tls", "stream"], default-features = false }
+zip = "9"
+reqwest = { version = "0.13", features = ["rustls", "stream"], default-features = false }
 futures-util = "0.3"
-wasmtime = { version = "43", optional = true }
-wasmtime-wasi = { version = "43", optional = true }
+wasmtime = { version = "50", optional = true }
+wasmtime-wasi = { version = "50", optional = true }
 anyhow = "1"
 tokio-stream = { workspace = true }
 shellexpand = "3.1"
-nvml-wrapper = "0.10"
+nvml-wrapper = "0.13"
 
 [lints.rust]
 unused = "allow"

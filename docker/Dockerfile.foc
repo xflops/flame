@@ -1,4 +1,4 @@
-FROM rust:1.98.1 AS builder
+FROM rust:1.99.1 AS builder
 
 WORKDIR /usr/src/flame
 COPY . .
@@ -15,7 +15,7 @@ RUN ./target/release/flmadm install \
     --skip-build \
     --force
 
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 

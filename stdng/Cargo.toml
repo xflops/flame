@@ -12,4 +12,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
-parking_lot = { version = "0.12", features = ["arc_lock"] }
+parking_lot = { version = "0.13", features = ["arc_lock"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

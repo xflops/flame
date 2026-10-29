@@ -37,26 +37,26 @@ hyper-util = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 actix-rt = "2"
-nix = { version = "0.30", features = ["signal"] }
+nix = { version = "0.31", features = ["signal"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
 tracing-appender = "0.2"
 
-strum = { version = "0.27", features = ["derive"] }
-strum_macros = "0.27"
+strum = { version = "0.28", features = ["derive"] }
+strum_macros = "0.28"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-rand = { version = "0.9" }
+rand = { version = "0.10" }
 
-sqlx = { version = "0.8", features = [ "runtime-tokio", "tls-native-tls", "sqlite", "postgres", "macros" ] }
+sqlx = { version = "0.9", features = [ "runtime-tokio", "tls-native-tls", "sqlite", "postgres", "macros" ] }
 
 url = { version = "2", features = ["serde"] }
 
-bincode = { version = "2" }
-bson = "2"
+postcard = { version = "1", features = ["use-std"] }
+bson = "3"
 
 # Shared dependencies moved from sub-projects
 thiserror = "2"
@@ -65,18 +65,18 @@ serde_yaml = "0.9"
 humantime = "2"
 tokio-stream = "0.1"
 tempfile = "3"
-comfy-table = "7"
-jsonschema = "0.33"
+comfy-table = "8"
+jsonschema = "0.60"
 gethostname = "1"
 proc-macro2 = "1"
 proc-macro-crate = "3"
 quote = "1"
-syn = { version = "2", features = ["full"] }
+syn = { version = "3", features = ["full"] }
 
 # Arrow ecosystem (v58 for tonic 0.14 compatibility)
 
 # profiling and HTTP
 axum = "0.8"
-pprof = { version = "0.14", features = ["flamegraph", "prost-codec"] }
+pprof = { version = "0.15", features = ["flamegraph", "prost-codec"] }
 
 # parallelism

@@ -67,7 +67,7 @@ mod payload_tests;
 mod types;
 use payload::Part;
 use types::{
-    bincode_config, calculate_checksum, task_record_size, ApplicationEntry, ApplicationMetadata,
+    calculate_checksum, task_record_size, ApplicationEntry, ApplicationMetadata,
     ApplicationSchemaMetadata, ExecutorEntry, ExecutorMetadata, NodeEntry, NodeMetadata,
     SessionEntry, SessionMetadata, TaskMetadata,
 };
@@ -597,10 +597,9 @@ impl FilesystemEngine {
             .read_exact_at(&mut buffer, offset)
             .map_err(|e| FlameError::NotFound(format!("Task {task_id} not found: {e}")))?;
 
-        let (meta, _): (TaskMetadata, _) = bincode::decode_from_slice(&buffer, bincode_config())
-            .map_err(|e| {
-                FlameError::Storage(format!("Failed to deserialize task metadata: {e}"))
-            })?;
+        let (meta, _): (TaskMetadata, _) = postcard::take_from_bytes(&buffer).map_err(|e| {
+            FlameError::Storage(format!("Failed to deserialize task metadata: {e}"))
+        })?;
 
         let expected_checksum = calculate_checksum(&meta);
         if meta.checksum != expected_checksum {
@@ -620,7 +619,7 @@ impl FilesystemEngine {
     ) -> Result<(), FlameError> {
         let tasks = entry.part(Part::Tasks)?;
         let offset = (meta.id - 1) * self.record_size as u64;
-        let buffer = bincode::encode_to_vec(meta, bincode_config())
+        let buffer = postcard::to_allocvec(meta)
             .map_err(|e| FlameError::Storage(format!("Failed to serialize task metadata: {e}")))?;
 
         tasks
@@ -659,7 +658,7 @@ impl FilesystemEngine {
 
         meta.id = len / record_size + 1;
         meta.checksum = calculate_checksum(&meta);
-        let buffer = bincode::encode_to_vec(&meta, bincode_config())
+        let buffer = postcard::to_allocvec(&meta)
             .map_err(|e| FlameError::Storage(format!("Failed to serialize task metadata: {e}")))?;
 
         // Readers of the new ID (a scan up to the file length) wait for the write.
@@ -775,8 +774,8 @@ impl FilesystemEngine {
                 meta.affinity_offset,
                 meta.affinity_len,
             )?;
-            let (keys, _): (Vec<Vec<u8>>, _) = bincode::decode_from_slice(&data, bincode_config())
-                .map_err(|e| FlameError::Storage(e.to_string()))?;
+            let (keys, _): (Vec<Vec<u8>>, _) =
+                postcard::take_from_bytes(&data).map_err(|e| FlameError::Storage(e.to_string()))?;
             keys.into_iter().map(Bytes::from).collect()
         } else {
             Default::default()
@@ -1409,8 +1408,8 @@ impl Engine for FilesystemEngine {
             (0, 0)
         } else {
             let keys = affinity.iter().map(|key| key.to_vec()).collect::<Vec<_>>();
-            let encoded = bincode::encode_to_vec(keys, bincode_config())
-                .map_err(|e| FlameError::Storage(e.to_string()))?;
+            let encoded =
+                postcard::to_allocvec(&keys).map_err(|e| FlameError::Storage(e.to_string()))?;
             let offset = self.append_data(&entry, Part::Affinity, &encoded)?;
             (offset, encoded.len() as u64)
         };
@@ -1834,8 +1833,8 @@ mod tests {
             affinity_len: u64::MAX,
         };
 
-        let buf1 = bincode::encode_to_vec(&meta1, bincode_config()).unwrap();
-        let buf2 = bincode::encode_to_vec(&meta2, bincode_config()).unwrap();
+        let buf1 = postcard::to_allocvec(&meta1).unwrap();
+        let buf2 = postcard::to_allocvec(&meta2).unwrap();
 
         assert_eq!(buf1.len(), buf2.len());
     }

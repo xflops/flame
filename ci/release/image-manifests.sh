@@ -57,7 +57,7 @@ case "$mode" in
             case "$image" in
                 flame-executor-manager|flame-console|flame-test|flame-instance-runtime)
                     docker run --rm --platform "linux/${value}" --entrypoint /bin/bash "$ref" -lc \
-                        'source /usr/local/flame/sbin/flmenv.sh --python-version 3.12 && python3 -c "import flamepy"'
+                        'source /usr/local/flame/sbin/flmenv.sh --python-version 3.14 && python3 -c "import flamepy"'
                     ;;
             esac
         done

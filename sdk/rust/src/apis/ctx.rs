@@ -50,6 +50,7 @@ impl FlameClientTls {
     /// If ca_file is specified, use it; otherwise use system CA bundle.
     /// The domain parameter is used for server name verification.
     pub fn client_tls_config(&self, domain: &str) -> Result<ClientTlsConfig, FlameError> {
+        stdng::tls::install_crypto_provider();
         if self.cert_file.is_some() != self.key_file.is_some() {
             return Err(FlameError::InvalidConfig(
                 "client TLS requires both cert_file and key_file".to_string(),

@@ -153,7 +153,7 @@ fn number(value: f64) -> String {
 
 pub fn table(rounds: &[RoundReport]) -> String {
     let mut table = Table::new();
-    table.load_preset(ASCII_MARKDOWN).set_header(vec![
+    table.load_style(ASCII_MARKDOWN).set_header(vec![
         "Round",
         "Kind",
         "Succeeded",

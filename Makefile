@@ -27,8 +27,8 @@ CONSOLE_DOCKERFILE = docker/Dockerfile.console
 IMAGE_REGISTRY ?= docker.io/$(DOCKER_REGISTRY)
 DOCKER_TAG ?= $(RELEASE_TAG)
 RELEASE_IMAGE_PLATFORMS ?= linux/amd64,linux/arm64
-RUST_BUILDER_IMAGE ?= docker.io/library/rust:1.98.1
-UBUNTU_BASE_IMAGE ?= docker.io/library/ubuntu:24.04
+RUST_BUILDER_IMAGE ?= docker.io/library/rust:1.99.1
+UBUNTU_BASE_IMAGE ?= docker.io/library/ubuntu:26.04
 
 # Installation configuration
 INSTALL_PREFIX ?= /tmp/flame-dev
