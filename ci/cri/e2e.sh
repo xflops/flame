@@ -39,7 +39,7 @@ install_dependencies() {
 }
 
 install_flame() {
-    cargo build --release
+    # The workflow unpacks the release binaries built by the build-binaries job.
     sudo ./target/release/flmadm install \
         --all \
         --src-dir . \
@@ -73,8 +73,8 @@ install_flame() {
 
 publish_runtime_image() {
     docker run -d --name flame-cri-registry -p 5000:5000 registry:2
-    docker build -f docker/Dockerfile.flmrt \
-        -t "$FLAME_E2E_RUNTIME_IMAGE" .
+    # The workflow loads the runtime image built by the build-images job.
+    docker tag xflops/flmrt:ci "$FLAME_E2E_RUNTIME_IMAGE"
     docker push "$FLAME_E2E_RUNTIME_IMAGE"
 }
 

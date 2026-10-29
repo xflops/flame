@@ -1,0 +1,776 @@
+name: Flame E2E
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+concurrency:
+  group: flame-e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CLICOLOR_FORCE: 1
+  DOCKER_BUILDKIT: 1
+  # The Compose, Kubernetes and CRI jobs run the images built once by build-images, tagged ci.
+  FLAME_IMAGE_TAG: ci
+  CERT_SANS: flame-session-manager,flame-executor-manager,flame-object-cache,localhost,127.0.0.1
+# Stages, each starting only after the previous one passes, so a broken build does not spend
+# runner time on the slow jobs behind it:
+#   1. build:  build-images, build-binaries
+#   2. e2e:    rust-e2e, python-e2e, kubernetes-e2e, host-shim-e2e, cri-shim-e2e
+#   3. system: python-system
+#   4. bench:  host-shim-benchmark, cri-shim-benchmark
+jobs:
+  # Build the container images once; every job below that needs them loads this artifact
+  # instead of building its own.
+  build-images:
+    name: Build Images
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build images
+        uses: docker/bake-action@v7
+        with:
+          files: ci/k8s/docker-bake.hcl
+          targets: |
+            default
+            runtime
+          load: true
+          set: |
+            *.cache-from=type=gha,scope=ci-images
+            *.cache-to=type=gha,scope=ci-images,mode=max
+
+      - name: Save images
+        run: |
+          docker save \
+            xflops/flame-session-manager:ci \
+            xflops/flame-object-cache:ci \
+            xflops/flame-executor-manager:ci \
+            xflops/flame-console:ci \
+            | zstd -T0 -3 -o flame-images.tar.zst
+          docker save xflops/flmrt:ci | zstd -T0 -3 -o flmrt-image.tar.zst
+          ls -lh *.tar.zst
+
+      - name: Upload images
+        uses: actions/upload-artifact@v7
+        with:
+          name: flame-images
+          path: flame-images.tar.zst
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload runtime image
+        uses: actions/upload-artifact@v7
+        with:
+          name: flmrt-image
+          path: flmrt-image.tar.zst
+          retention-days: 1
+          compression-level: 0
+
+  # Build the release binaries once for the BareMetal jobs, which install them with flmadm.
+  build-binaries:
+    name: Build Binaries
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Build Flame
+        run: cargo build --release
+
+      - name: Package binaries
+        run: |
+          find target/release -maxdepth 1 -type f -perm -u+x -printf '%f\n' > binaries.txt
+          tar -C target/release -T binaries.txt -cf - | zstd -T0 -3 -o flame-binaries.tar.zst
+          ls -lh flame-binaries.tar.zst
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: flame-binaries
+          path: flame-binaries.tar.zst
+          retention-days: 1
+          compression-level: 0
+
+  rust-e2e:
+    name: Rust E2E Test (${{ matrix.policy }})
+    needs: build-images
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable]
+        os: [ubuntu-26.04]
+        policy: [priority, drf]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Docker Compose
+        uses: docker/setup-compose-action@v2
+        with:
+          version: latest
+      - name: Download images
+        uses: actions/download-artifact@v8
+        with:
+          name: flame-images
+      - name: Load images
+        run: zstd -dc flame-images.tar.zst | docker load
+      - name: Generate TLS certificates
+        run: |
+          chmod +x ci/docker/generate-certs.sh
+          ci/docker/generate-certs.sh -o ci/docker/certs -s "$CERT_SANS" -i "172.20.0.0/24"
+      - name: Start Flame
+        run: |
+          cp ci/docker/flame-cluster-${{ matrix.policy }}.yaml ci/docker/flame-cluster.yaml
+          docker compose up --no-build --force-recreate -d
+      - name: Install gRPC
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          profile: minimal
+      - name: Run Rust E2E Test
+        run: |
+          make e2e-rs
+
+  python-e2e:
+    name: Python E2E Test (${{ matrix.policy }})
+    needs: build-images
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04]
+        policy: [priority, drf]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Compose
+        uses: docker/setup-compose-action@v2
+        with:
+          version: latest
+
+      - name: Download images
+        uses: actions/download-artifact@v8
+        with:
+          name: flame-images
+
+      - name: Load images
+        run: zstd -dc flame-images.tar.zst | docker load
+
+      - name: Generate TLS certificates
+        run: |
+          chmod +x ci/docker/generate-certs.sh
+          ci/docker/generate-certs.sh -o ci/docker/certs -s "$CERT_SANS" -i "172.20.0.0/24"
+
+      - name: Start Flame
+        run: |
+          cp ci/docker/flame-cluster-${{ matrix.policy }}.yaml ci/docker/flame-cluster.yaml
+          docker compose up --no-build --force-recreate -d
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for services to be ready..."
+          sleep 10
+          docker compose ps
+
+      - name: Run Python E2E Test
+        timeout-minutes: 60
+        run: |
+          make e2e-py-docker FLAME_E2E_POLICY=${{ matrix.policy }}
+
+      - name: Print session-manager logs
+        if: always()
+        run: |
+          echo "=== Session Manager Logs ==="
+          docker compose logs flame-session-manager --tail=5000
+
+      - name: Print executor-manager logs
+        if: always()
+        run: |
+          echo "=== Executor Manager Logs ==="
+          docker compose logs flame-executor-manager --tail=500
+
+      - name: Print object-cache logs
+        if: always()
+        run: |
+          echo "=== Object Cache Logs ==="
+          docker compose logs flame-object-cache --tail=500
+
+  python-system:
+    name: Python System Test (${{ matrix.policy }})
+    needs: [rust-e2e, python-e2e, kubernetes-e2e, host-shim-e2e, cri-shim-e2e]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04]
+        policy: [priority, drf]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Compose
+        uses: docker/setup-compose-action@v2
+        with:
+          version: latest
+
+      - name: Download images
+        uses: actions/download-artifact@v8
+        with:
+          name: flame-images
+
+      - name: Load images
+        run: zstd -dc flame-images.tar.zst | docker load
+
+      - name: Generate TLS certificates
+        run: |
+          chmod +x ci/docker/generate-certs.sh
+          ci/docker/generate-certs.sh -o ci/docker/certs -s "$CERT_SANS" -i "172.20.0.0/24"
+
+      - name: Start Flame
+        run: |
+          cp ci/docker/flame-cluster-${{ matrix.policy }}.yaml ci/docker/flame-cluster.yaml
+          docker compose up --no-build --force-recreate -d
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for services to be ready..."
+          sleep 10
+          docker compose ps
+
+      - name: Run Python system tests
+        timeout-minutes: 120
+        run: |
+          make e2e-py-system-docker E2E_SYSTEM_PROFILE=all
+
+      - name: Print session-manager logs
+        if: always()
+        run: |
+          echo "=== Session Manager Logs ==="
+          docker compose logs flame-session-manager --tail=500
+
+      - name: Print executor-manager logs
+        if: always()
+        run: |
+          echo "=== Executor Manager Logs ==="
+          docker compose logs flame-executor-manager --tail=500
+
+      - name: Print object-cache logs
+        if: always()
+        run: |
+          echo "=== Object Cache Logs ==="
+          docker compose logs flame-object-cache --tail=500
+
+  host-shim-benchmark:
+    name: Host Shim Benchmark
+    needs: python-system
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Compose
+        uses: docker/setup-compose-action@v2
+        with:
+          version: latest
+
+      - name: Download images
+        uses: actions/download-artifact@v8
+        with:
+          name: flame-images
+
+      - name: Load images
+        run: zstd -dc flame-images.tar.zst | docker load
+
+      - name: Generate TLS certificates
+        run: |
+          chmod +x ci/docker/generate-certs.sh
+          ci/docker/generate-certs.sh -o ci/docker/certs -s "$CERT_SANS" -i "172.20.0.0/24"
+
+      - name: Start Flame with benchmark config
+        run: |
+          cp ci/docker/flame-cluster-benchmark.yaml ci/docker/flame-cluster.yaml
+          docker compose up --no-build --force-recreate -d --scale flame-executor-manager=1
+
+      - name: Install gRPC
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+
+      - name: Run Flame benchmark
+        env:
+          FLAME_ROOT: ${{ github.workspace }}
+          FLAME_BENCHMARK_ENDPOINT: https://127.0.0.1:8080
+          FLAME_BENCHMARK_RUNTIME: Host Shim
+          FLAME_BENCHMARK_EXECUTORS: 4
+        run: |
+          docker compose exec -T -w /opt/benchmarks flame-console bash -c \
+            'source /usr/local/flame/sbin/flmenv.sh && bash wait_for_idle.sh'
+          cargo test -p flame-rs --test benchmark_test -- --nocapture
+
+      - name: Run flamepy.core benchmark
+        timeout-minutes: 15
+        run: |
+          docker compose exec -T -w /opt/benchmarks flame-console bash -c \
+            'source /usr/local/flame/sbin/flmenv.sh && bash wait_for_idle.sh && python3 core.py' \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run flamepy.app benchmark
+        timeout-minutes: 20
+        run: |
+          docker compose exec -T -w /opt/benchmarks flame-console bash -c \
+            'source /usr/local/flame/sbin/flmenv.sh && bash wait_for_idle.sh && python3 app.py' \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          docker compose logs flame-session-manager
+          docker compose logs flame-executor-manager
+
+  kubernetes-e2e:
+    name: Kubernetes E2E Test
+    needs: build-images
+    env:
+      IMAGE_REGISTRY: xflops
+      IMAGE_TAG: ci
+      AUTO_DIAGNOSTICS: "false"
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: flame
+          config: ci/k8s/kind.yaml
+          wait: 120s
+
+      - name: Download images
+        uses: actions/download-artifact@v8
+        with:
+          name: flame-images
+
+      - name: Load images
+        run: zstd -dc flame-images.tar.zst | docker load
+
+      - name: Load images into Kind
+        run: |
+          kind load docker-image ${IMAGE_REGISTRY}/flame-session-manager:${IMAGE_TAG} --name flame
+          kind load docker-image ${IMAGE_REGISTRY}/flame-object-cache:${IMAGE_TAG} --name flame
+          kind load docker-image ${IMAGE_REGISTRY}/flame-executor-manager:${IMAGE_TAG} --name flame
+
+      - name: Install cert-manager and Envoy Gateway
+        run: ci/k8s/e2e.sh install-infrastructure
+
+      - name: Install Flame
+        run: ci/k8s/e2e.sh install-flame
+
+      - name: Configure external access
+        run: ci/k8s/e2e.sh configure-access
+
+      - name: Run smoke tests from VM
+        run: ci/k8s/e2e.sh run-smoke-tests
+
+      - name: Run E2E tests from VM
+        timeout-minutes: 20
+        run: ci/k8s/e2e.sh run-e2e-tests
+
+      - name: Print Kubernetes diagnostics
+        if: failure() || cancelled()
+        run: ci/k8s/e2e.sh diagnostics
+
+  host-shim-e2e:
+    name: Host Shim E2E
+    needs: build-binaries
+    env:
+      INSTALL_PREFIX: /opt/flame-test
+      FLAME_ENDPOINT: http://127.0.0.1:8080
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable]
+        os: [ubuntu-26.04]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+      
+      - name: Install Python and uv
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          # Install uv to /usr/bin for flmrun service
+          sudo cp $HOME/.local/bin/uv /usr/bin/uv
+          sudo chmod +x /usr/bin/uv
+          echo "✓ Installed uv to /usr/bin/uv for flmrun"
+      
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: flame-binaries
+
+      - name: Unpack binaries
+        run: |
+          mkdir -p target/release
+          zstd -dc flame-binaries.tar.zst | tar -C target/release -xf -
+
+      - name: Verify systemd availability
+        run: |
+          echo "=== Checking systemd ==="
+          systemctl --version
+          echo ""
+          echo "=== Systemd status ==="
+          systemctl status || echo "systemd status command returned non-zero"
+          echo ""
+          echo "=== Check if systemd is running as init ==="
+          ps -p 1 -o comm=
+          echo ""
+          echo "=== Current user ==="
+          whoami
+          echo ""
+          echo "=== Sudo privileges ==="
+          sudo -v && echo "✓ Sudo available"
+      
+      - name: Install Flame with flmadm and systemd
+        run: |
+          sudo ./target/release/flmadm install --all --src-dir . --skip-build --prefix $INSTALL_PREFIX --enable
+          echo "$INSTALL_PREFIX/bin" >> $GITHUB_PATH
+      
+      - name: Setup local configuration
+        run: |
+          echo "=== Copy local configuration ==="
+          mkdir -p ~/.flame
+          cp ci/bm/flame.yaml ~/.flame/flame.yaml
+          echo "✓ Copied ci/bm/flame.yaml to ~/.flame/flame.yaml"
+
+      - name: Setup Python environment
+        run: |
+          echo "=== Setting up Flame environment ==="
+          source $INSTALL_PREFIX/sbin/flmenv.sh
+          echo "PYTHONPATH=$PYTHONPATH" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "FLAME_HOME=$FLAME_HOME" >> $GITHUB_ENV
+          
+          pip3 install pytest pytest-timeout
+
+      - name: Verify flamepy installation
+        run: |
+          echo "=== Verify flamepy import ==="
+          python3 -c "import flamepy; print('✓ flamepy imported from:', flamepy.__file__)"
+          python3 -c "import flamepy.app as app; print('✓ app imported successfully')"
+
+      - name: Check service status
+        run: |
+          # Wait for services to be ready
+          sleep 5
+          
+          # Check service status
+          sudo systemctl status flame-session-manager || (echo "Session manager not running" && sudo journalctl -u flame-session-manager -n 50 && exit 1)
+          sudo systemctl status flame-executor-manager || (echo "Executor manager not running" && sudo journalctl -u flame-executor-manager -n 50 && exit 1)
+          sudo systemctl status flame-object-cache || (echo "Object cache not running" && sudo journalctl -u flame-object-cache -n 50 && exit 1)
+          
+          echo "✓ Services are running via systemd"
+
+      - name: Verify Flame cluster is ready
+        run: |
+          echo "=== Check flmctl connectivity ==="
+          flmctl list -a || echo "Warning: Could not list applications"
+          echo ""
+          echo "=== Flame nodes ==="
+          flmctl list -n || echo "Warning: Could not list nodes"
+          echo ""
+          echo "=== Flame node details ==="
+          for node in $(flmctl list -n 2>/dev/null | awk 'NR > 1 {print $1}'); do
+            echo "--- Node: $node ---"
+            flmctl view -n "$node" || echo "Warning: Could not view node $node"
+          done
+          echo ""
+          echo "=== Verify object cache is accessible ==="
+          curl -s http://127.0.0.1:9090/ || echo "Note: Object cache gRPC endpoint (expected no HTTP response)"
+
+      - name: Install flmbox dependencies (gVisor runsc)
+        run: |
+          curl -fsSL https://gvisor.dev/archive.key \
+            | sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+            | sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y runsc
+          runsc --version
+          # The services run as root under systemd; make the flmbox state directories exist.
+          sudo install -d -m 0755 /var/lib/flmbox "$INSTALL_PREFIX/data/flmbox"
+
+      - name: Run Python E2E tests
+        timeout-minutes: 20
+        run: |
+          export PYTHONPATH="$(pwd)/testing/e2e/src:$PYTHONPATH"
+          export FLAME_LOG=DEBUG
+          # runsc is installed above: the sandbox tests must run, not skip.
+          export FLAME_E2E_REQUIRE_SANDBOX=1
+          # The services run as root on this VM (cgroup v2): check the executor cgroups.
+          export FLAME_E2E_CGROUP=1
+          cd testing/e2e
+          pytest -vv --durations=0 tests/test_app.py tests/test_flmexec.py tests/test_sandbox.py tests/test_agent.py tests/test_cgroup.py
+
+      - name: Show service logs on failure
+        if: failure() || cancelled()
+        run: |
+          echo "=== Session Manager Logs (systemd) ==="
+          sudo journalctl -u flame-session-manager -n 500 || echo "No systemd logs found"
+          echo ""
+          echo "=== Session Manager Logs (file) ==="
+          sudo cat $INSTALL_PREFIX/logs/fsm.log || echo "No FSM log file found"
+          echo ""
+          echo "=== Executor Manager Logs (systemd) ==="
+          sudo journalctl -u flame-executor-manager -n 500 || echo "No systemd logs found"
+          echo ""
+          echo "=== Executor Manager Logs (file) ==="
+          sudo cat $INSTALL_PREFIX/logs/fem.log || echo "No FEM log file found"
+          echo ""
+          echo "=== Object Cache Logs (systemd) ==="
+          sudo journalctl -u flame-object-cache -n 500 || echo "No systemd logs found"
+          echo ""
+          echo "=== Object Cache Logs (file) ==="
+          sudo cat $INSTALL_PREFIX/logs/foc.log || echo "No FOC log file found"
+          echo ""
+          echo "=== Active processes ==="
+          ps aux | grep -E "(flame|python)" || true
+          echo ""
+          echo "=== Network connections ==="
+          netstat -tlnp 2>/dev/null || ss -tlnp || true
+      
+      - name: Stop Flame services
+        if: always()
+        run: |
+          # Stop services via systemd
+          sudo systemctl stop flame-executor-manager || true
+          sudo systemctl stop flame-object-cache || true
+          sudo systemctl stop flame-session-manager || true
+      
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo ./target/release/flmadm uninstall --prefix $INSTALL_PREFIX --no-backup --force || true
+
+  cri-shim-e2e:
+    name: CRI Shim E2E
+    needs: [build-binaries, build-images]
+    runs-on: ubuntu-26.04
+    env:
+      INSTALL_PREFIX: /opt/flame-test
+      FLAME_ENDPOINT: http://10.250.0.1:8080
+      FLAME_CACHE_ENDPOINT: grpc://10.250.0.1:9090
+      FLAME_E2E_RUNTIME_IMAGE: localhost:5000/xflops/flmrt:ci
+      FLAME_CRI_SANDBOX_IMAGE: registry.k8s.io/pause:3.10.2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install Python and uv
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: flame-binaries
+
+      - name: Unpack binaries
+        run: |
+          mkdir -p target/release
+          zstd -dc flame-binaries.tar.zst | tar -C target/release -xf -
+
+      - name: Download runtime image
+        uses: actions/download-artifact@v8
+        with:
+          name: flmrt-image
+
+      - name: Load runtime image
+        run: zstd -dc flmrt-image.tar.zst | docker load
+
+      - name: Install host and CRI dependencies
+        run: ci/cri/e2e.sh install-dependencies
+
+      - name: Install Flame
+        run: ci/cri/e2e.sh install-flame
+
+      - name: Publish flmrt to the local registry
+        run: ci/cri/e2e.sh publish-runtime-image
+
+      - name: Configure containerd, gVisor, and CNI
+        run: ci/cri/e2e.sh configure-runtime
+
+      - name: Start the BareMetal Flame cluster
+        run: ci/cri/e2e.sh start-cluster
+
+      - name: Run shared Python E2E cases through CRI
+        timeout-minutes: 90
+        run: |
+          export PYTHONPATH="$(pwd)/testing/e2e/src:$PYTHONPATH"
+          export FLAME_LOG=DEBUG
+          cd testing/e2e
+          pytest -vv --durations=0 \
+            tests/test_app.py \
+            tests/test_flmexec.py
+
+      - name: Verify Flame-owned CRI workloads
+        run: ci/cri/e2e.sh verify-workloads
+
+      - name: Print CRI and Flame diagnostics
+        if: always()
+        run: ci/cri/e2e.sh diagnostics
+
+      - name: Stop CRI E2E services
+        if: always()
+        run: ci/cri/e2e.sh stop-services
+
+      - name: Uninstall Flame
+        if: always()
+        run: ci/cri/e2e.sh uninstall-flame
+
+  cri-shim-benchmark:
+    name: CRI Shim Benchmark
+    needs: python-system
+    runs-on: ubuntu-26.04
+    env:
+      INSTALL_PREFIX: /opt/flame-test
+      FLAME_ENDPOINT: http://10.250.0.1:8080
+      FLAME_CACHE_ENDPOINT: grpc://10.250.0.1:9090
+      FLAME_E2E_RUNTIME_IMAGE: localhost:5000/xflops/flmrt:ci
+      FLAME_CRI_SANDBOX_IMAGE: registry.k8s.io/pause:3.10.2
+      FLAME_CLUSTER_CONFIG: ci/cri/flame-cluster-benchmark.yaml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: flame-binaries
+
+      - name: Unpack binaries
+        run: |
+          mkdir -p target/release
+          zstd -dc flame-binaries.tar.zst | tar -C target/release -xf -
+
+      - name: Download runtime image
+        uses: actions/download-artifact@v8
+        with:
+          name: flmrt-image
+
+      - name: Load runtime image
+        run: zstd -dc flmrt-image.tar.zst | docker load
+
+      - name: Install host and CRI dependencies
+        run: ci/cri/e2e.sh install-dependencies
+
+      - name: Install Flame
+        run: ci/cri/e2e.sh install-flame
+
+      - name: Publish flmrt to the local registry
+        run: ci/cri/e2e.sh publish-runtime-image
+
+      - name: Configure containerd, gVisor, and CNI
+        run: ci/cri/e2e.sh configure-runtime
+
+      - name: Cache the benchmark images
+        run: ci/cri/e2e.sh cache-runtime-image
+
+      - name: Start the BareMetal Flame cluster
+        run: ci/cri/e2e.sh start-cluster
+
+      - name: Run CRI shim benchmark
+        timeout-minutes: 15
+        env:
+          FLAME_BENCHMARK_ENDPOINT: http://10.250.0.1:8080
+          FLAME_BENCHMARK_RUNTIME: CRI Shim
+          FLAME_BENCHMARK_EXECUTORS: 4
+        run: |
+          bash testing/system/perf/wait_for_idle.sh
+          cargo test -p flame-rs --test benchmark_test -- --nocapture
+
+      - name: Verify Flame-owned CRI workloads
+        run: ci/cri/e2e.sh verify-workloads
+
+      - name: Run flamepy.core benchmark
+        timeout-minutes: 15
+        run: |
+          bash testing/system/perf/wait_for_idle.sh
+          python3 testing/system/perf/core.py | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run flamepy.app benchmark
+        timeout-minutes: 20
+        run: |
+          bash testing/system/perf/wait_for_idle.sh
+          cd testing/system/perf
+          python3 app.py | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run flamepy.agent benchmark
+        timeout-minutes: 20
+        run: |
+          bash testing/system/perf/wait_for_idle.sh
+          cd testing/system/perf
+          python3 agent.py | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Print CRI and Flame diagnostics
+        if: always()
+        run: ci/cri/e2e.sh diagnostics
+
+      - name: Stop CRI benchmark services
+        if: always()
+        run: ci/cri/e2e.sh stop-services
+
+      - name: Uninstall Flame
+        if: always()
+        run: ci/cri/e2e.sh uninstall-flame

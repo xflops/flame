@@ -23,7 +23,7 @@ already be installed in the client and worker environments. The worker builds
 and installs this project's source package on its first use; App registration
 happens before timed samples.
 
-The Host Shim job in `.github/workflows/e2e-bench.yaml` runs both Python
+The Host Shim job in `.github/workflows/e2e.yaml` runs both Python
 benchmarks inside `flame-console`; the CRI Shim job runs them with the
 installed Python client. Both add the reports to the GitHub Actions summary.
 
@@ -37,7 +37,7 @@ than the `flmping` or echo task of the other suites, so the 1000-task cases use
 sample includes binding an executor and starting the sandbox, which is what
 changes with the sandbox startup work.
 
-`.github/workflows/e2e-bench.yaml` runs it after the `app.py` step, in the CRI
+`.github/workflows/e2e.yaml` runs it after the `app.py` step, in the CRI
 Shim job: that bare-metal cluster has `runsc`, and
 `ci/cri/applications/flmbox.yaml` registers `flmbox` there. `flmbox` runs on the
 host shim, so the benchmark cluster config lists both shims

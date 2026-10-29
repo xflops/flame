@@ -1,6 +1,6 @@
 # Flame: A Distributed Engine for Elastic Workloads
 
-[![E2E](https://github.com/xflops/flame/actions/workflows/e2e-py.yaml/badge.svg?branch=main)](https://github.com/xflops/flame/actions/workflows/e2e-py.yaml)
+[![E2E](https://github.com/xflops/flame/actions/workflows/e2e.yaml/badge.svg?branch=main)](https://github.com/xflops/flame/actions/workflows/e2e.yaml)
 [![license](https://img.shields.io/github/license/xflops/flame)](http://github.com/xflops/flame)
 [![RepoSize](https://img.shields.io/github/repo-size/xflops/flame)](http://github.com/xflops/flame)
 [![Release](https://img.shields.io/github/release/xflops/flame)](https://github.com/xflops/flame/releases)

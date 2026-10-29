@@ -42,3 +42,10 @@ target "console" {
   dockerfile = "docker/Dockerfile.console"
   tags       = ["${IMAGE_REGISTRY}/flame-console:${IMAGE_TAG}"]
 }
+
+# The CRI shim E2E runtime image; not part of the default group.
+target "runtime" {
+  inherits   = ["image"]
+  dockerfile = "docker/Dockerfile.flmrt"
+  tags       = ["${IMAGE_REGISTRY}/flmrt:${IMAGE_TAG}"]
+}
