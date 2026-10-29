@@ -169,8 +169,17 @@ impl FlameService for FlmboxService {
     }
 
     async fn on_session_enter(&self, ctx: SessionContext) -> Result<(), FlameError> {
+        let start = std::time::Instant::now();
+        tracing::debug!(target: "flame::timeline", phase = "flmbox_session_enter_begin", executor = %self.executor_id);
         let config = decode_config(ctx.common_data.as_deref())?;
-        self.enter(&ctx.session_id, config).await
+        let result = self.enter(&ctx.session_id, config).await;
+        tracing::debug!(
+            target: "flame::timeline",
+            phase = "flmbox_session_enter_end",
+            executor = %self.executor_id,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
+        );
+        result
     }
 
     async fn on_task_invoke(&self, ctx: TaskContext) -> Result<Option<TaskOutput>, FlameError> {
@@ -179,7 +188,15 @@ impl FlameService for FlmboxService {
             .ok_or_else(|| FlameError::InvalidConfig("task has no input".to_string()))?;
         let request: CommandRequest = serde_json::from_slice(&input)
             .map_err(|e| FlameError::InvalidConfig(format!("invalid task input: {e}")))?;
+        let start = std::time::Instant::now();
+        tracing::debug!(target: "flame::timeline", phase = "flmbox_task_invoke_begin", executor = %self.executor_id);
         let result = self.execute(request).await?;
+        tracing::debug!(
+            target: "flame::timeline",
+            phase = "flmbox_task_invoke_end",
+            executor = %self.executor_id,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
+        );
         Ok(Some(result.encode()?))
     }
 

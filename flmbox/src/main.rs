@@ -57,6 +57,12 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    if cli.daemon {
+        // The service logs nothing unless RUST_LOG asks for it, e.g. RUST_LOG=flame::timeline=debug
+        // for the first-use timeline.
+        flame::apis::init_logger()?;
+    }
+    tracing::debug!(target: "flame::timeline", phase = "flmbox_started");
     cli.check()?;
     let mut cfg = FlameSandbox::load(cli.config.as_deref())?;
     if let Some(network) = cli.network {
@@ -82,7 +88,14 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
 /// The service: created once per executor and kept across session bindings.
 async fn daemon(sandbox: Sandbox) -> Result<(), Box<dyn std::error::Error>> {
     let service = FlmboxService::new(sandbox, &executor_id_from_env());
+    let start = std::time::Instant::now();
     service.cleanup_stale().await;
+    tracing::debug!(
+        target: "flame::timeline",
+        phase = "flmbox_cleanup_stale",
+        elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
+    );
+    tracing::debug!(target: "flame::timeline", phase = "flmbox_serving");
     flame::run(service).await?;
     tracing::debug!("flmbox service was stopped.");
     Ok(())

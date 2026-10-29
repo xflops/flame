@@ -16,6 +16,10 @@ python3 core.py
 python3 app.py
 ```
 
+`first_use.py` times the first command in a new sandbox on a new executor and on a retained one, for the
+latency of creating a sandbox with a cached image. See its docstring for the run, and for the
+`flame::timeline` log points that show where the first command spends its time.
+
 This is a separate Python project with no declared dependencies. The App
 benchmark packages this directory, so its cold-start result does not include
 installing the `e2e` project's test dependencies. The Flame Python SDK must

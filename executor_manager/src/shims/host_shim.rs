@@ -493,7 +493,15 @@ impl Shim for HostShim {
         if self.instance.is_some() {
             return Ok(());
         }
+        let start = std::time::Instant::now();
+        tracing::debug!(target: "flame::timeline", phase = "create_instance_begin", executor = %self.executor.id);
         let mut installation = app_manager.install(&self.app).await?;
+        tracing::debug!(
+            target: "flame::timeline",
+            phase = "installed",
+            executor = %self.executor.id,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
+        );
         let flame_home = env::var("FLAME_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/opt/flame"));
@@ -519,6 +527,12 @@ impl Shim for HostShim {
             }
         };
         self.cgroup = cgroup;
+        tracing::debug!(
+            target: "flame::timeline",
+            phase = "process_spawned",
+            executor = %self.executor.id,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
+        );
         if let Err(error) = instance_client.connect().await {
             // Retain ownership if cleanup fails so the GPU assignment stays leased.
             self.work_dir = Some(work_dir);
@@ -531,6 +545,12 @@ impl Shim for HostShim {
         self.work_dir = Some(work_dir);
         self.instance_client = Some(instance_client);
         self.instance = Some(instance);
+        tracing::debug!(
+            target: "flame::timeline",
+            phase = "create_instance_end",
+            executor = %self.executor.id,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
+        );
         Ok(())
     }
 
@@ -540,11 +560,21 @@ impl Shim for HostShim {
     ) -> Result<super::SessionEnterResponse, FlameError> {
         trace_fn!("HostShim::on_session_enter");
 
-        self.instance_client
+        let start = std::time::Instant::now();
+        tracing::debug!(target: "flame::timeline", phase = "session_enter_begin", executor = %self.executor.id);
+        let response = self
+            .instance_client
             .as_mut()
             .ok_or_else(|| FlameError::InvalidState("Host instance is not created".to_string()))?
             .on_session_enter(ctx)
-            .await
+            .await;
+        tracing::debug!(
+            target: "flame::timeline",
+            phase = "session_enter_end",
+            executor = %self.executor.id,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
+        );
+        response
     }
 
     async fn on_task_invoke(
@@ -553,11 +583,21 @@ impl Shim for HostShim {
     ) -> Result<super::TaskInvokeResponse, FlameError> {
         trace_fn!("HostShim::on_task_invoke");
 
-        self.instance_client
+        let start = std::time::Instant::now();
+        tracing::debug!(target: "flame::timeline", phase = "task_invoke_begin", executor = %self.executor.id);
+        let response = self
+            .instance_client
             .as_mut()
             .ok_or_else(|| FlameError::InvalidState("Host instance is not created".to_string()))?
             .on_task_invoke(ctx)
-            .await
+            .await;
+        tracing::debug!(
+            target: "flame::timeline",
+            phase = "task_invoke_end",
+            executor = %self.executor.id,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
+        );
+        response
     }
 
     async fn on_session_leave(&mut self) -> Result<(), FlameError> {

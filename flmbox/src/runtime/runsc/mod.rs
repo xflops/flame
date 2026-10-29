@@ -114,6 +114,19 @@ impl Runsc {
         }
     }
 
+    /// Runs a `runsc` command, logging how long it took on the first-use timeline.
+    async fn timed_run(&self, what: &str, spec: CommandSpec) -> Result<CommandOutput, FlameError> {
+        let start = std::time::Instant::now();
+        let out = self.runner.run(spec).await;
+        tracing::debug!(
+            target: "flame::timeline",
+            phase = "runsc",
+            command = what,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
+        );
+        out
+    }
+
     async fn control(&self, what: &str, sub: Vec<String>) -> Result<CommandOutput, FlameError> {
         self.control_with(what, self.spec(sub)).await
     }
@@ -123,7 +136,7 @@ impl Runsc {
         what: &str,
         spec: CommandSpec,
     ) -> Result<CommandOutput, FlameError> {
-        let out = self.runner.run(spec).await?;
+        let out = self.timed_run(what, spec).await?;
         if out.timed_out {
             return Err(FlameError::Internal(format!("runsc {what} timed out")));
         }
@@ -181,7 +194,7 @@ impl Runsc {
         spec.stdin = opts.stdin;
         spec.timeout = opts.timeout;
         spec.max_output = opts.max_output;
-        self.runner.run(spec).await
+        self.timed_run("exec", spec).await
     }
 
     /// `runsc kill <id> <signal>`; an unknown or stopped container is success.
@@ -197,7 +210,7 @@ impl Runsc {
     }
 
     async fn idempotent(&self, what: &str, sub: Vec<String>) -> Result<(), FlameError> {
-        let out = self.runner.run(self.spec(sub)).await?;
+        let out = self.timed_run(what, self.spec(sub)).await?;
         if out.timed_out {
             return Err(FlameError::Internal(format!("runsc {what} timed out")));
         }

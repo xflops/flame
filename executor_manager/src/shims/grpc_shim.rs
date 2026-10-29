@@ -84,7 +84,14 @@ impl GrpcShim {
     pub async fn connect(&mut self) -> Result<(), FlameError> {
         trace_fn!("GrpcShim::connect");
 
+        let start = std::time::Instant::now();
         self.wait_for_ready(SERVICE_WAIT_TIMEOUT).await?;
+        tracing::debug!(
+            target: "flame::timeline",
+            phase = "service_ready",
+            endpoint = %self.endpoint,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
+        );
         tracing::debug!("Try to connect to service at <{}>", self.endpoint);
 
         let endpoint = Endpoint::try_from("http://[::]:50051").unwrap();
@@ -117,6 +124,12 @@ impl GrpcShim {
             })?;
 
         self.client = Some(InstanceClient::new(channel));
+        tracing::debug!(
+            target: "flame::timeline",
+            phase = "connected",
+            endpoint = %self.endpoint,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1e3,
+        );
 
         Ok(())
     }
