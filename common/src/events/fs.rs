@@ -64,60 +64,19 @@ pub struct FsEventManager {
 }
 
 impl FsEventManager {
+    /// A manager under `path`. It manages the sessions that are set up through it and no others:
+    /// the directory can be shared with other managers (every `Storage` of one process uses
+    /// `events/`), and a manager that opened the sessions of the others would create files in
+    /// directories that they are removing. The events a previous run recorded for a session
+    /// are loaded when it is set up.
     pub fn new(path: &str) -> Result<Self, FlameError> {
         fs::create_dir_all(path)?;
 
-        let manager = Self {
+        Ok(Self {
             storage_path: path.to_string(),
             event_storage: new_ptr(HashMap::new()),
             events: new_ptr(HashMap::new()),
-        };
-
-        let sessions = manager.list_sessions()?;
-        for session_id in &sessions {
-            manager.setup_event_storage(session_id)?;
-        }
-
-        manager.load_events()?;
-
-        Ok(manager)
-    }
-
-    fn load_events(&self) -> Result<(), FlameError> {
-        let sessions = {
-            let registry = lock_ptr!(self.event_storage)?;
-            registry
-                .iter()
-                .map(|(id, entry)| (id.clone(), entry.clone()))
-                .collect::<Vec<_>>()
-        };
-
-        for (session_id, entry) in sessions {
-            let mut storage = lock_ptr!(entry)?;
-            let event_daos: Vec<EventDao> = storage.object_storage.list(None)?;
-
-            let mut events = lock_ptr!(self.events)?;
-            for event_dao in event_daos {
-                events
-                    .entry(session_id.clone())
-                    .or_default()
-                    .entry(event_dao.owner as TaskID)
-                    .or_default()
-                    .push(event_dao);
-            }
-        }
-        Ok(())
-    }
-
-    fn list_sessions(&self) -> Result<Vec<SessionID>, FlameError> {
-        let mut sessions = vec![];
-        let entries = fs::read_dir(&self.storage_path)?;
-        for entry in entries {
-            let file_name = entry?.file_name();
-            let session_id = file_name.to_string_lossy().to_string();
-            sessions.push(session_id);
-        }
-        Ok(sessions)
+        })
     }
 
     /// The session's entry; the registry lock is released before it is returned.
@@ -136,13 +95,26 @@ impl FsEventManager {
         // by Storage, so a concurrent duplicate open is not expected.
         let base_path = format!("{}/{}", self.storage_path, session_id);
         fs::create_dir_all(&base_path)?;
-        let storage = EventStorage {
+        let mut storage = EventStorage {
             object_storage: ObjectStorage::new(&base_path, "events")?,
             data_storage: DataStorage::new(&base_path, "event_messages")?,
         };
-        lock_ptr!(self.event_storage)?
-            .entry(session_id.clone())
-            .or_insert_with(|| new_ptr(storage));
+        let recorded: Vec<EventDao> = storage.object_storage.list(None)?;
+
+        let mut registry = lock_ptr!(self.event_storage)?;
+        if registry.contains_key(session_id) {
+            return Ok(());
+        }
+        let mut events = lock_ptr!(self.events)?;
+        for event_dao in recorded {
+            events
+                .entry(session_id.clone())
+                .or_default()
+                .entry(event_dao.owner as TaskID)
+                .or_default()
+                .push(event_dao);
+        }
+        registry.insert(session_id.clone(), new_ptr(storage));
         Ok(())
     }
 }
@@ -381,6 +353,38 @@ mod tests {
         assert_eq!(found[0].message.as_deref(), Some("after"));
     }
 
+    /// Managers share a directory (every `Storage` of a process uses `events/`). A manager that
+    /// is created while another one removes a session must not touch that session's directory:
+    /// it made `remove_events` fail with "Directory not empty", which left the events behind.
+    #[test]
+    fn a_new_manager_does_not_disturb_the_sessions_of_another() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let others = {
+            let (path, stop) = (path.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut failed = 0;
+                while !stop.load(Relaxed) {
+                    failed += usize::from(FsEventManager::new(&path).is_err());
+                }
+                failed
+            })
+        };
+
+        let manager = FsEventManager::new(&path).unwrap();
+        for i in 0..400 {
+            let id = format!("s{i}");
+            manager.setup_events(id.clone()).unwrap();
+            manager.record_event(owner(&id, 1), event("e")).unwrap();
+            manager.remove_events(id.clone()).unwrap();
+            assert!(manager.find_events(owner(&id, 1)).unwrap().is_empty());
+        }
+        stop.store(true, Relaxed);
+        assert_eq!(others.join().unwrap(), 0, "a manager could not be created");
+    }
+
     #[test]
     fn events_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -391,7 +395,9 @@ mod tests {
             manager.record_event(owner("s", 7), event("one")).unwrap();
             manager.record_event(owner("s", 7), event("two")).unwrap();
         }
+        // As `Storage::load_data` does for a session it finds.
         let reopened = FsEventManager::new(path).unwrap();
+        reopened.setup_events("s".to_string()).unwrap();
         let found = reopened.find_events(owner("s", 7)).unwrap();
         let messages: Vec<_> = found.iter().map(|e| e.message.clone().unwrap()).collect();
         assert_eq!(messages, vec!["one", "two"]);

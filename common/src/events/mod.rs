@@ -286,7 +286,9 @@ mod tests {
         }
 
         {
+            // As `Storage::load_data` does for a session it finds.
             let manager = FsEventManager::new(&path).unwrap();
+            manager.setup_events(owner.session_id.clone()).unwrap();
             let events = manager.find_events(owner).unwrap();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].code, 42);
