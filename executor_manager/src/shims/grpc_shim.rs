@@ -21,6 +21,8 @@ use std::os::unix::fs::FileTypeExt;
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
 #[cfg(unix)]
+use notify::{RecursiveMode, Watcher};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tonic::transport::Channel;
 use tonic::transport::{Endpoint, Uri};
@@ -36,6 +38,24 @@ use crate::shims::{ExecutorWorkDir, Shim};
 use common::apis::{SessionContext, TaskContext, TaskResult, TaskState};
 use common::FlameError;
 use stdng::{logs::TraceFn, new_ptr, trace_fn};
+
+/// Longest to wait for a service to report that it is listening, and then to connect to it.
+#[cfg(unix)]
+const SERVICE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Safety net for the watch on the ready file: it is re-checked at this interval in case a
+/// directory event was missed or the directory could not be watched.
+#[cfg(unix)]
+const READY_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The file a service creates, next to its socket, once it is listening on the socket.
+///
+/// A socket file appears when the service binds, which can be before it listens, so the
+/// executor manager waits for this file and not for the socket: it can then connect once.
+pub fn ready_file(socket: &Path) -> std::path::PathBuf {
+    let mut ready = socket.as_os_str().to_owned();
+    ready.push(".ready");
+    ready.into()
+}
 
 pub struct GrpcShim {
     client: Option<InstanceClient<Channel>>,
@@ -64,7 +84,7 @@ impl GrpcShim {
     pub async fn connect(&mut self) -> Result<(), FlameError> {
         trace_fn!("GrpcShim::connect");
 
-        self.wait_for_socket().await?;
+        self.wait_for_ready(SERVICE_WAIT_TIMEOUT).await?;
         tracing::debug!("Try to connect to service at <{}>", self.endpoint);
 
         let endpoint = Endpoint::try_from("http://[::]:50051").unwrap();
@@ -81,7 +101,7 @@ impl GrpcShim {
                 }
             })
         });
-        let channel = tokio::time::timeout(Duration::from_secs(30), connect)
+        let channel = tokio::time::timeout(SERVICE_WAIT_TIMEOUT, connect)
             .await
             .map_err(|_| {
                 FlameError::Network(format!(
@@ -101,34 +121,58 @@ impl GrpcShim {
         Ok(())
     }
 
+    /// Wait until the service reports that it is listening, by creating the ready file next to
+    /// its socket. A watch on that directory wakes this as soon as the file appears; the watch
+    /// starts before the first check so a file created in between is not missed.
     #[cfg(unix)]
-    async fn wait_for_socket(&self) -> Result<(), FlameError> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    async fn wait_for_ready(&self, timeout: Duration) -> Result<(), FlameError> {
+        let ready = ready_file(Path::new(&self.endpoint));
+        let deadline = tokio::time::Instant::now() + timeout;
+        let (events, mut changed) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let _watcher = watch_dir(ready.parent(), events);
+
         loop {
-            match std::fs::symlink_metadata(&self.endpoint) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(FlameError::InvalidState(format!(
-                        "instance endpoint <{}> must not be a symlink",
-                        self.endpoint
-                    )));
-                }
-                Ok(metadata) if metadata.file_type().is_socket() => return Ok(()),
-                Ok(_) => {
-                    return Err(FlameError::InvalidState(format!(
-                        "instance endpoint <{}> is not a Unix socket",
-                        self.endpoint
-                    )));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(FlameError::Storage(error.to_string())),
+            if ready.exists() {
+                return self.check_socket();
             }
-            if tokio::time::Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
                 return Err(FlameError::Network(format!(
-                    "timed out waiting for service socket <{}>",
+                    "timed out waiting for service at <{}> to report ready",
                     self.endpoint
                 )));
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let wait = remaining.min(READY_RECHECK_INTERVAL);
+            // Woken by a directory event; otherwise re-check when the interval elapses. If the
+            // watcher is gone the channel is closed, so wait out the interval instead.
+            if let Ok(None) = tokio::time::timeout(wait, changed.recv()).await {
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+
+    /// The service reported ready, so the endpoint must be its Unix socket.
+    #[cfg(unix)]
+    fn check_socket(&self) -> Result<(), FlameError> {
+        match std::fs::symlink_metadata(&self.endpoint) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(FlameError::InvalidState(format!(
+                    "instance endpoint <{}> must not be a symlink",
+                    self.endpoint
+                )))
+            }
+            Ok(metadata) if metadata.file_type().is_socket() => Ok(()),
+            Ok(_) => Err(FlameError::InvalidState(format!(
+                "instance endpoint <{}> is not a Unix socket",
+                self.endpoint
+            ))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(FlameError::InvalidState(format!(
+                    "service reported ready but its socket <{}> does not exist",
+                    self.endpoint
+                )))
+            }
+            Err(error) => Err(FlameError::Storage(error.to_string())),
         }
     }
 
@@ -142,6 +186,35 @@ impl GrpcShim {
     pub fn close(&mut self) {
         if self.client.take().is_some() {
             tracing::debug!("Closed gRPC connection to service at <{}>", self.endpoint);
+        }
+    }
+}
+
+/// Watch `dir`, signalling `events` on every change. Returns `None` when there is no directory
+/// or it cannot be watched; the periodic re-check still finds the ready file.
+#[cfg(unix)]
+fn watch_dir(
+    dir: Option<&Path>,
+    events: tokio::sync::mpsc::UnboundedSender<()>,
+) -> Option<notify::RecommendedWatcher> {
+    let dir = dir?;
+    let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        if event.is_ok() {
+            let _ = events.send(());
+        }
+    })
+    .and_then(|mut watcher| {
+        watcher.watch(dir, RecursiveMode::NonRecursive)?;
+        Ok(watcher)
+    });
+    match watcher {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            tracing::debug!(
+                "Cannot watch <{}> for the ready file: {error}",
+                dir.display()
+            );
+            None
         }
     }
 }
@@ -392,5 +465,107 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("no connection to service"));
+    }
+
+    #[test]
+    fn test_ready_file_is_next_to_the_socket() {
+        assert_eq!(
+            ready_file(Path::new("/var/flame/shim/exec-1.sock")),
+            Path::new("/var/flame/shim/exec-1.sock.ready")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_wait_for_ready_returns_when_the_ready_file_exists() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("ready.sock");
+        let _listener = tokio::net::UnixListener::bind(&path).unwrap();
+        std::fs::write(ready_file(&path), b"").unwrap();
+        let shim = GrpcShim::new_at(&path).unwrap();
+
+        shim.wait_for_ready(Duration::from_secs(5)).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_wait_for_ready_ignores_a_socket_that_is_not_ready() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("bound.sock");
+        // Bound, but the service has not reported that it is listening.
+        let _listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let shim = GrpcShim::new_at(&path).unwrap();
+
+        let err = shim
+            .wait_for_ready(Duration::from_millis(300))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("to report ready"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_wait_for_ready_is_woken_by_the_ready_file_appearing() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("late.sock");
+        let _listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let shim = GrpcShim::new_at(&path).unwrap();
+
+        let (created_tx, created_rx) = tokio::sync::oneshot::channel();
+        let service = tokio::spawn({
+            let ready = ready_file(&path);
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                std::fs::write(&ready, b"").unwrap();
+                created_tx.send(std::time::Instant::now()).unwrap();
+            }
+        });
+
+        shim.wait_for_ready(Duration::from_secs(5)).await.unwrap();
+        let seen = std::time::Instant::now();
+        let created = created_rx.await.unwrap();
+        service.await.unwrap();
+
+        // Found by the directory event, not by the periodic re-check, which would only look
+        // again READY_RECHECK_INTERVAL after the first check, long after the file appeared.
+        let delay = seen.duration_since(created);
+        assert!(
+            delay < READY_RECHECK_INTERVAL / 2,
+            "ready file noticed {delay:?} after it was created"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_wait_for_ready_rejects_a_ready_service_without_a_socket() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("missing.sock");
+        std::fs::write(ready_file(&path), b"").unwrap();
+        let shim = GrpcShim::new_at(&path).unwrap();
+
+        let err = shim
+            .wait_for_ready(Duration::from_secs(5))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_wait_for_ready_rejects_a_regular_file_as_the_socket() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("not-a-socket");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::write(ready_file(&path), b"").unwrap();
+        let shim = GrpcShim::new_at(&path).unwrap();
+
+        let err = shim
+            .wait_for_ready(Duration::from_secs(5))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("not a Unix socket"), "{err}");
     }
 }

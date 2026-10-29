@@ -103,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Inside an executor, Flame sets `FLAME_INSTANCE_ENDPOINT`. The Rust SDK binds a Unix domain socket at that endpoint and receives session and task callbacks from the executor manager.
+Inside an executor, Flame sets `FLAME_INSTANCE_ENDPOINT`. The Rust SDK binds a Unix domain socket at that endpoint, creates `<endpoint>.ready` once it is listening, and receives session and task callbacks from the executor manager. The executor manager waits for the `.ready` file before it connects, so a service that implements the protocol without the SDK must create that file after it starts listening.
 
 ## Write The Client
 

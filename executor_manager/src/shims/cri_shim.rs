@@ -33,7 +33,7 @@ use uuid::Uuid;
 use crate::appmgr::{ApplicationInstallation, ApplicationManager, InstallationMountKind};
 use crate::devices::DeviceAssignments;
 use crate::executor::Executor;
-use crate::shims::grpc_shim::GrpcShim;
+use crate::shims::grpc_shim::{ready_file, GrpcShim};
 use crate::shims::{Shim, ShimPtr};
 use common::apis::{ApplicationContext, SessionContext, TaskContext};
 use common::ctx::FlameClusterContext;
@@ -148,6 +148,7 @@ impl CriShim {
         })?;
         let socket = work_dir.join(INSTANCE_SOCKET);
         remove_stale_socket(&socket)?;
+        remove_stale_socket(&ready_file(&socket))?;
 
         let log_level = std::env::var(RUST_LOG).unwrap_or_else(|_| DEFAULT_LOG_LEVEL.to_string());
         let mut env = build_environment(

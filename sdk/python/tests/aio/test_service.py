@@ -71,6 +71,33 @@ def test_aio_shim_handles_concurrent_hooks_and_isolates_attributes(monkeypatch):
         asyncio.run(exercise())
 
 
+def test_aio_shim_reports_ready_once_listening(monkeypatch):
+    class Service(aio_service.FlameService):
+        async def on_session_enter(self, context):
+            pass
+
+        async def on_task_invoke(self, context):
+            return context.input
+
+        async def on_session_leave(self):
+            pass
+
+    async def exercise(endpoint):
+        ready = Path(f"{endpoint}.ready")
+        server = aio_service.FlameInstanceServer(Service())
+        assert not ready.exists()
+        await server.start()
+        try:
+            assert ready.exists()
+        finally:
+            await server.stop()
+
+    with tempfile.TemporaryDirectory(prefix="flame-shim-", dir="/tmp") as directory:
+        endpoint = str(Path(directory) / "shim.sock")
+        monkeypatch.setenv(aio_service.FLAME_INSTANCE_ENDPOINT, endpoint)
+        asyncio.run(exercise(endpoint))
+
+
 def test_aio_shim_isolates_retractions_per_hook_including_failures():
     class Service(aio_service.FlameService):
         async def on_session_enter(self, context):

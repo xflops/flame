@@ -49,6 +49,7 @@ anyhow = "1"
 tokio-stream = { workspace = true }
 shellexpand = "3.1"
 nvml-wrapper = "0.13"
+notify = "8"
 
 [lints.rust]
 unused = "allow"

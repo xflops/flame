@@ -383,6 +383,13 @@ impl Instance for ShimService {
     }
 }
 
+/// Tell the executor manager the socket at `endpoint` is listening, by creating a file next to
+/// it. The socket file itself appears when the service binds, which can be before it listens.
+#[cfg(unix)]
+fn endpoint_ready(endpoint: &str) -> std::io::Result<()> {
+    std::fs::File::create(format!("{endpoint}.ready")).map(|_| ())
+}
+
 #[cfg(unix)]
 pub async fn run(service: impl FlameService) -> Result<(), Box<dyn std::error::Error>> {
     let shim_service = ShimService {
@@ -392,7 +399,9 @@ pub async fn run(service: impl FlameService) -> Result<(), Box<dyn std::error::E
     let endpoint = std::env::var(FLAME_INSTANCE_ENDPOINT)
         .map_err(|_| FlameError::InvalidConfig("FLAME_INSTANCE_ENDPOINT not found".to_string()))?;
 
-    let uds_stream = UnixListenerStream::new(UnixListener::bind(endpoint)?);
+    let uds_stream = UnixListenerStream::new(UnixListener::bind(&endpoint)?);
+    // Binding a tokio listener also listens, so the socket accepts connections from here on.
+    endpoint_ready(&endpoint)?;
 
     Server::builder()
         .add_service(InstanceServer::new(shim_service))
@@ -455,6 +464,19 @@ impl From<rpc::TaskContext> for TaskContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_ready_creates_the_file_next_to_the_socket() {
+        let dir = std::env::temp_dir().join(format!("flame-ready-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let endpoint = dir.join("svc.sock").to_string_lossy().to_string();
+
+        endpoint_ready(&endpoint).unwrap();
+
+        assert!(dir.join("svc.sock.ready").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn session_context_requires_application() {

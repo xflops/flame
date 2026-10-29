@@ -231,7 +231,7 @@ if __name__ == "__main__":
     flamepy.run(Echo())
 ```
 
-The service runtime provides `FLAME_INSTANCE_ENDPOINT` and calls the service through a Unix domain socket. Service methods should return bytes or `None`.
+The service runtime provides `FLAME_INSTANCE_ENDPOINT` and calls the service through a Unix domain socket. The SDK creates `<FLAME_INSTANCE_ENDPOINT>.ready` once the server is listening, and the runtime waits for that file before it connects. Service methods should return bytes or `None`.
 
 `self.publish()` adds opaque locality keys to the next successful session-enter
 response or the next task response, including a failed task. Calls within one

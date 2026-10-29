@@ -62,7 +62,7 @@ pub struct TaskInvokeResponse {
 /// Cleanup:
 ///   - top_dir: cleaned up only if auto-generated
 ///   - app_dir: always cleaned up
-///   - socket: always cleaned up
+///   - socket and its ready file: always cleaned up
 pub struct ExecutorWorkDir {
     /// Top-level working directory (process runs here).
     top_dir: PathBuf,
@@ -134,6 +134,18 @@ impl ExecutorWorkDir {
             ))
         })?;
 
+        // A ready file left by an earlier run must not make the new service look ready.
+        match fs::remove_file(grpc_shim::ready_file(&socket)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(FlameError::Internal(format!(
+                    "failed to remove stale ready file for {}: {e}",
+                    socket.display()
+                )));
+            }
+        }
+
         Ok(Self {
             top_dir,
             app_dir,
@@ -159,6 +171,14 @@ impl ExecutorWorkDir {
 
 impl Drop for ExecutorWorkDir {
     fn drop(&mut self) {
+        // Always cleanup the ready file the service created next to the socket
+        let ready = grpc_shim::ready_file(&self.socket);
+        if let Err(e) = fs::remove_file(&ready) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("Failed to remove ready file {}: {}", ready.display(), e);
+            }
+        }
+
         // Always cleanup socket file
         if self.socket.exists() {
             if let Err(e) = fs::remove_file(&self.socket) {

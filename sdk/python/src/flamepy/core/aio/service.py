@@ -16,6 +16,7 @@ import contextvars
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Optional
 
 import grpc
@@ -204,6 +205,14 @@ class FlameInstanceServicer(InstanceServicer):
             return Result(return_code=-1, message=str(exc))
 
 
+def endpoint_ready(endpoint: str) -> None:
+    """Tell the executor manager the socket at `endpoint` is listening, by creating a file next to it.
+
+    The socket file itself appears when the server binds, which is before it listens.
+    """
+    Path(f"{endpoint}.ready").touch()
+
+
 class FlameInstanceServer:
     """AsyncIO server for the executor's Unix socket."""
 
@@ -225,6 +234,7 @@ class FlameInstanceServer:
             if not port:
                 raise FlameError(FlameErrorCode.INTERNAL, f"Failed to bind shim socket: {endpoint}")
             await self._server.start()
+            endpoint_ready(endpoint)
         except Exception:
             self._closed = True
             await self._server.stop(grace=0)
