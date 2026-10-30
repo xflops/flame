@@ -12,7 +12,12 @@ impl SystemdManager {
     }
 
     /// Generate and install systemd service files
-    pub fn install_services(&self, prefix: &Path, profiles: &[InstallProfile]) -> Result<()> {
+    pub fn install_services(
+        &self,
+        prefix: &Path,
+        profiles: &[InstallProfile],
+        python_version: Option<&str>,
+    ) -> Result<()> {
         println!("⚙️  Installing systemd service files...");
 
         let prefix_str = prefix.to_str().unwrap();
@@ -33,7 +38,7 @@ impl SystemdManager {
         }
 
         if has_worker {
-            let fem_service = self.generate_executor_manager_service(prefix_str);
+            let fem_service = self.generate_executor_manager_service(prefix_str, python_version);
             let fem_path = PathBuf::from("/etc/systemd/system/flame-executor-manager.service");
             fs::write(&fem_path, fem_service)
                 .context("Failed to write flame-executor-manager.service")?;
@@ -299,7 +304,15 @@ WantedBy=multi-user.target
         )
     }
 
-    fn generate_executor_manager_service(&self, prefix: &str) -> String {
+    fn generate_executor_manager_service(
+        &self,
+        prefix: &str,
+        python_version: Option<&str>,
+    ) -> String {
+        // The Python the applications default to when they request none.
+        let python_env = python_version
+            .map(|version| format!("Environment=\"FLAME_PYTHON_VERSION={version}\"\n"))
+            .unwrap_or_default();
         format!(
             r#"[Unit]
 Description=Flame Executor Manager
@@ -312,7 +325,7 @@ Requires=flame-session-manager.service
 Type=simple
 Environment="RUST_LOG=info"
 Environment="FLAME_HOME={prefix}"
-WorkingDirectory={prefix}/work
+{python_env}WorkingDirectory={prefix}/work
 ExecStart={prefix}/bin/flame-executor-manager --config {prefix}/conf/flame-cluster.yaml
 StandardOutput=append:{prefix}/logs/fem.log
 StandardError=append:{prefix}/logs/fem.log
@@ -323,7 +336,8 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 "#,
-            prefix = prefix
+            prefix = prefix,
+            python_env = python_env
         )
     }
 
@@ -353,5 +367,23 @@ WantedBy=multi-user.target
 "#,
             prefix = prefix
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn executor_manager_unit_names_the_default_python_version() {
+        let manager = SystemdManager::new();
+
+        let unit = manager.generate_executor_manager_service("/opt/flame", Some("3.12"));
+        assert!(unit.contains(
+            "Environment=\"FLAME_PYTHON_VERSION=3.12\"\nWorkingDirectory=/opt/flame/work"
+        ));
+
+        let unit = manager.generate_executor_manager_service("/opt/flame", None);
+        assert!(!unit.contains("FLAME_PYTHON_VERSION"));
     }
 }

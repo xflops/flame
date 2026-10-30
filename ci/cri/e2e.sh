@@ -45,7 +45,7 @@ install_flame() {
         --src-dir . \
         --skip-build \
         --prefix "$INSTALL_PREFIX" \
-        --python-version 3.14 \
+        --python-version 3.12 \
         --force
     sudo install -m 0644 "$FLAME_CLUSTER_CONFIG" \
         "$INSTALL_PREFIX/conf/flame-cluster.yaml"

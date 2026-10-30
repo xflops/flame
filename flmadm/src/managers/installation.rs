@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub struct InstallationManager;
 
@@ -376,6 +377,32 @@ impl InstallationManager {
         Ok(installed_versions)
     }
 
+    /// The Python the services of this installation default to: the `python3` on this host when the
+    /// SDK is installed for it (native extensions load only under the interpreter they were built
+    /// for, and `flmenv.sh` makes the same choice), otherwise the newest installed version.
+    pub fn default_python_version(&self, paths: &InstallationPaths) -> Option<String> {
+        let installed = fs::read_dir(&paths.lib)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().join("site-packages").is_dir())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.strip_prefix("python").map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+
+        let host = Command::new("python3")
+            .args(["-c", "import sys; print('%d.%d' % sys.version_info[:2])"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|version| version.trim().to_string());
+
+        choose_default_python_version(host, installed)
+    }
+
     /// Generate flmenv.sh script for environment setup
     pub fn generate_env_script(
         &self,
@@ -736,10 +763,61 @@ fn built_wheel(dir: &Path) -> Result<PathBuf> {
     }
 }
 
+/// The host's version when the SDK is installed for it, else the newest installed version.
+fn choose_default_python_version(
+    host: Option<String>,
+    mut installed: Vec<String>,
+) -> Option<String> {
+    if let Some(host) = host.filter(|host| installed.contains(host)) {
+        return Some(host);
+    }
+    installed.sort_by_key(|version| {
+        version
+            .split('.')
+            .map(|part| part.parse::<u32>().unwrap_or(0))
+            .collect::<Vec<_>>()
+    });
+    installed.pop()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    mod default_python_version {
+        use super::*;
+
+        fn versions(list: &[&str]) -> Vec<String> {
+            list.iter().map(|version| version.to_string()).collect()
+        }
+
+        #[test]
+        fn prefers_the_host_python_when_the_sdk_is_installed_for_it() {
+            let installed = versions(&["3.11", "3.12", "3.14"]);
+
+            assert_eq!(
+                choose_default_python_version(Some("3.12".to_string()), installed),
+                Some("3.12".to_string())
+            );
+        }
+
+        #[test]
+        fn falls_back_to_the_newest_installed_version() {
+            let installed = versions(&["3.9", "3.12", "3.10"]);
+
+            // No host Python, or one the SDK is not installed for.
+            assert_eq!(
+                choose_default_python_version(None, installed.clone()),
+                Some("3.12".to_string())
+            );
+            assert_eq!(
+                choose_default_python_version(Some("3.13".to_string()), installed),
+                Some("3.12".to_string())
+            );
+            assert_eq!(choose_default_python_version(None, Vec::new()), None);
+        }
+    }
 
     mod built_wheel {
         use super::*;

@@ -14,7 +14,7 @@ limitations under the License.
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::DEFAULT_PYTHON_VERSION;
+use crate::{DEFAULT_PYTHON_VERSION, FLAME_PYTHON_VERSION_ENV};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PythonRuntime {
@@ -22,8 +22,14 @@ pub struct PythonRuntime {
     pub site_packages: Option<PathBuf>,
 }
 
+/// Resolve the Python of an application: the requested version, else the process's
+/// `FLAME_PYTHON_VERSION` (the installation sets it for the interpreter its services run), else
+/// the latest installed one.
 pub fn get_python_runtime(flame_home: &Path, requested: Option<&str>) -> PythonRuntime {
     let version = requested
+        .map(ToOwned::to_owned)
+        .or_else(|| std::env::var(FLAME_PYTHON_VERSION_ENV).ok())
+        .as_deref()
         .map(version_number)
         .filter(|version| !version.is_empty())
         .map(ToOwned::to_owned)
@@ -82,10 +88,21 @@ fn minor_version(version: &str) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    // `get_python_runtime` reads the process environment, so the tests that call it run one at a time.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn without_env() -> std::sync::MutexGuard<'static, ()> {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(FLAME_PYTHON_VERSION_ENV);
+        guard
+    }
 
     #[test]
     fn resolves_requested_version_even_when_not_installed() {
+        let _env = without_env();
         let temp = tempdir().unwrap();
 
         assert_eq!(
@@ -99,6 +116,7 @@ mod tests {
 
     #[test]
     fn resolves_latest_installed_version_when_unspecified() {
+        let _env = without_env();
         let temp = tempdir().unwrap();
         let site_packages = temp.path().join("lib/python3.12/site-packages");
         fs::create_dir_all(temp.path().join("lib/python3.11/site-packages")).unwrap();
@@ -114,7 +132,32 @@ mod tests {
     }
 
     #[test]
+    fn process_environment_names_the_version_when_none_is_requested() {
+        let _env = without_env();
+        let temp = tempdir().unwrap();
+        let site_packages = temp.path().join("lib/python3.12/site-packages");
+        fs::create_dir_all(&site_packages).unwrap();
+        fs::create_dir_all(temp.path().join("lib/python3.14/site-packages")).unwrap();
+        std::env::set_var(FLAME_PYTHON_VERSION_ENV, "3.12");
+
+        assert_eq!(
+            get_python_runtime(temp.path(), None),
+            PythonRuntime {
+                version: "3.12".to_string(),
+                site_packages: Some(site_packages),
+            }
+        );
+        // A requested version wins over the process environment.
+        assert_eq!(
+            get_python_runtime(temp.path(), Some("3.14")).version,
+            "3.14"
+        );
+        std::env::remove_var(FLAME_PYTHON_VERSION_ENV);
+    }
+
+    #[test]
     fn falls_back_to_default_when_nothing_installed() {
+        let _env = without_env();
         let temp = tempdir().unwrap();
 
         assert_eq!(

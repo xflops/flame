@@ -288,7 +288,8 @@ fn setup_systemd(paths: &InstallationPaths, config: &InstallConfig) -> Result<()
     let systemd_manager = SystemdManager::new();
 
     // Install service files
-    systemd_manager.install_services(&paths.prefix, &config.profiles)?;
+    let python_version = InstallationManager::new().default_python_version(paths);
+    systemd_manager.install_services(&paths.prefix, &config.profiles, python_version.as_deref())?;
 
     // Enable and start services if requested
     if config.enable {

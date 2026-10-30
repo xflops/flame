@@ -19,7 +19,7 @@ RUN ./target/release/flmadm install \
     --skip-build \
     --force
 
-FROM ubuntu:26.04
+FROM ubuntu:24.04
 
 # The executor manager hosts host-shim applications, including the `flmbox` sandbox
 # application, which drives gVisor `runsc`: runsc comes from the gVisor apt repository (the
@@ -42,5 +42,7 @@ WORKDIR /usr/local/flame/work
 COPY --from=builder /usr/local/flame /usr/local/flame
 
 ENV FLAME_HOME=/usr/local/flame
+# The Python of this image (Ubuntu 24.04's python3): the default of applications that name none.
+ENV FLAME_PYTHON_VERSION=3.12
 
 ENTRYPOINT ["/usr/bin/dumb-init", "--", "/usr/local/flame/bin/flame-executor-manager"]

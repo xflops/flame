@@ -16,10 +16,9 @@ RUN ./target/release/flmadm install \
     --no-systemd \
     --skip-build \
     --force \
-    --python-version 3.14 \
     && rm -f /usr/local/flame/bin/flame-executor-manager
 
-FROM ubuntu:26.04
+FROM ubuntu:24.04
 
 # The runtime also hosts the `flmbox` sandbox application, which drives gVisor `runsc`: runsc
 # comes from the gVisor apt repository (the same source the CRI e2e uses). curl and gnupg
@@ -39,8 +38,9 @@ RUN apt-get update \
 COPY --from=builder /usr/local/flame /usr/local/flame
 
 ENV FLAME_HOME=/usr/local/flame
+# The Python of this image (Ubuntu 24.04's python3): the default of applications that name none.
+ENV FLAME_PYTHON_VERSION=3.12
 ENV PATH=/usr/local/flame/bin:${PATH}
-ENV PYTHONPATH=/usr/local/flame/lib/python3.14/site-packages
 # Device and driver injection is selected explicitly through CRI CDI requests.
 ENV NVIDIA_VISIBLE_DEVICES=void
 

@@ -2855,3 +2855,15 @@ def test_runtime_close_serializes_with_service_creation(monkeypatch):
     runtime._application_owner.unregister.assert_called_once_with()
     assert runtime._services == []
     assert runtime._state is _RuntimeState.INACTIVE
+
+
+def test_executor_environments_default_to_the_client_python_version():
+    """The executor runs the client's Python unless the caller or template names one."""
+    from flamepy.app.client import _executor_environments
+
+    client = f"{sys.version_info.major}.{sys.version_info.minor}"
+
+    assert _executor_environments(None, None) == {"FLAME_PYTHON_VERSION": client}
+    assert _executor_environments({"A": "1"}, None) == {"A": "1", "FLAME_PYTHON_VERSION": client}
+    assert _executor_environments({"FLAME_PYTHON_VERSION": "3.12"}, None) == {"FLAME_PYTHON_VERSION": "3.12"}
+    assert _executor_environments({"FLAME_PYTHON_VERSION": "3.12"}, "3.13") == {"FLAME_PYTHON_VERSION": "3.13"}

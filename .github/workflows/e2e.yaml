@@ -429,7 +429,7 @@ jobs:
       - name: Install Python and uv
         uses: actions/setup-python@v7
         with:
-          python-version: '3.14'
+          python-version: '3.12'
       
       - name: Install uv
         run: |
@@ -614,7 +614,7 @@ jobs:
       - name: Install Python and uv
         uses: actions/setup-python@v7
         with:
-          python-version: "3.14"
+          python-version: "3.12"
 
       - name: Download binaries
         uses: actions/download-artifact@v8

@@ -372,7 +372,8 @@ disabled existing application is never reused and always produces an error.
 `dependencies` is used only to generate a `pyproject.toml` when the packaged
 project has no Python package metadata; otherwise, declare dependencies in the
 project's existing metadata. `python_version` selects the executor Python
-version through the application template. `app.service()` is the canonical
+version; when omitted, the template's `FLAME_PYTHON_VERSION` applies, else the executor runs the
+client's Python version, which a pickled task payload needs. `app.service()` is the canonical
 decorator and must run after initialization. Decorated functions and classes
 run locally when called directly. `fn.remote(*args, **kwargs)` submits a remote
 function call on a shared session and returns an `ObjectFuture`. Use

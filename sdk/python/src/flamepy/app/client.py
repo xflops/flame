@@ -118,6 +118,20 @@ def _validate_service_class(execution_class: type) -> None:
         raise TypeError(f"service class methods conflict with ServiceInstance API: {names}")
 
 
+def _executor_environments(template_environments, python_version: Optional[str]) -> dict:
+    """Environment of the registered application.
+
+    A task payload pickled by this client only loads under the same Python minor version, so the
+    executor runs the client's version unless the caller or the application template names one.
+    """
+    environments = dict(template_environments) if template_environments else {}
+    if python_version:
+        environments["FLAME_PYTHON_VERSION"] = python_version
+    else:
+        environments.setdefault("FLAME_PYTHON_VERSION", f"{sys.version_info.major}.{sys.version_info.minor}")
+    return environments
+
+
 class _ServiceState(Enum):
     OPEN = auto()
     CLOSING = auto()
@@ -761,7 +775,8 @@ class _Runtime:
             dependencies: List of pip dependencies (e.g., ["numpy", "pandas>=2.0"]).
                          If provided and no pyproject.toml exists, one will be auto-generated.
             python_version: Python version to use for execution.
-                           If omitted, the executor uses the latest installed Flame Python SDK.
+                           If omitted, the template's FLAME_PYTHON_VERSION applies, else the
+                           executor runs this client's Python version.
         """
         self._name = name
         self._services: List[ServiceInstance] = []
@@ -862,9 +877,7 @@ class _Runtime:
 
             logger.debug(f"Working directory: {working_directory}")
 
-            environments = dict(template_app.environments) if template_app.environments else {}
-            if self._python_version:
-                environments["FLAME_PYTHON_VERSION"] = self._python_version
+            environments = _executor_environments(template_app.environments, self._python_version)
 
             app_attrs = ApplicationAttributes(
                 shim=template_app.shim,
