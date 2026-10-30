@@ -824,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1816,7 +1816,7 @@ checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
 name = "flame-executor-manager"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "actix-rt",
  "anyhow",
@@ -1863,7 +1863,7 @@ dependencies = [
 
 [[package]]
 name = "flame-object-cache"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1892,7 +1892,7 @@ dependencies = [
 
 [[package]]
 name = "flame-rs"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bson",
  "bytes",
@@ -1926,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "flame-rs-macros"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1936,7 +1936,7 @@ dependencies = [
 
 [[package]]
 name = "flame-session-manager"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "flmbench"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "byte-unit",
  "clap",
@@ -2023,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "flmbox"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -2047,7 +2047,7 @@ dependencies = [
 
 [[package]]
 name = "flmctl"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "clap",
@@ -2077,7 +2077,7 @@ dependencies = [
 
 [[package]]
 name = "flmexec"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clap",
  "flame-rs",
@@ -2094,7 +2094,7 @@ dependencies = [
 
 [[package]]
 name = "flmping"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "byte-unit",
  "clap",
@@ -5068,7 +5068,7 @@ dependencies = [
 
 [[package]]
 name = "rpc"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "prost 0.14.4",
  "prost-build 0.14.4",
