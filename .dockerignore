@@ -1,16 +1,16 @@
 # The images build Flame from source. Keep the context to Cargo workspace
-# members and files used by flmadm install; runtime examples and E2E files are
+# members and files that build.sh packages; runtime examples and E2E files are
 # mounted by Compose instead of copied into the image.
 *
 !Cargo.toml
 !Cargo.lock
+!LICENSE
 !rust-toolchain.toml
 !common/
 !config/
 !cri/
 !executor_manager/
 !examples/
-!flmadm/
 !flmbench/
 !flmbox/
 !flmctl/
@@ -19,6 +19,7 @@
 !migrations/
 !object_cache/
 !rpc/
+!scripts/
 !sdk/
 !session_manager/
 !stdng/

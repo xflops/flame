@@ -4,7 +4,7 @@ This example uses `flamepy.agent.Sandbox` to run shell commands and Python code 
 
 ## Requirements
 
-- The `flmbox` application is registered. `flmadm install` registers it.
+- The `flmbox` application is registered. `setup.sh` registers it on the head node.
 - `runsc` is installed on the worker nodes, and `flmbox` runs as root.
 - The worker can reach the image registry. The default image is `ubuntu:26.04`.
 

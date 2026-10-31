@@ -134,6 +134,130 @@ jobs:
         working-directory: source
         run: ../hack/release.sh publish-rust "${CARGO_VERSION}" "${STDNG_VERSION}"
 
+  # The release assets, built on 24.04 runners so the binaries run on the oldest glibc we support:
+  # the package archive and the four client tools (see docs/designs/RFE683-script-install/FS.md).
+  publish-binaries:
+    name: Publish ${{ matrix.arch }} binaries
+    needs: release-metadata
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+
+      - name: Checkout release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-metadata.outputs.source-sha }}
+          path: source
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache-workspaces: source
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: 0.9.26
+
+      - name: Build the release assets
+        working-directory: source
+        run: scripts/build.sh --output "${RUNNER_TEMP}/dist" --tag "${RELEASE_TAG}"
+
+      # Install the way a user does: the checksums, then the hosted setup.sh piped to sh, installing the
+      # archive from a URL, then the package's own sdk.sh (the SDK install from PyPI is covered by tests,
+      # because this release's flamepy is published by a parallel job).
+      - name: Smoke test the release assets
+        working-directory: source
+        run: |
+          dist="${RUNNER_TEMP}/dist"
+          name="flame-${RELEASE_TAG}-linux-${{ matrix.arch }}"
+          (cd "${dist}" && sha256sum -c ./*.sha256)
+          scripts/inline.sh "${RUNNER_TEMP}/hosted"
+          (cd "${dist}" && python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          sleep 2
+          sh -s -- --package "http://127.0.0.1:8000/${name}.tar.gz" --prefix "${RUNNER_TEMP}/flame" --no-systemd \
+              < "${RUNNER_TEMP}/hosted/setup.sh"
+          sh -s -- --package "http://127.0.0.1:8000/${name}.tar.gz" --prefix "${RUNNER_TEMP}/flame" \
+              --join --python-version 3.12 --no-systemd \
+              < "${RUNNER_TEMP}/hosted/setup.sh"
+          "${RUNNER_TEMP}/dist/package/sbin/sdk.sh" --prefix "${RUNNER_TEMP}/client" --python-version 3.12
+          "${RUNNER_TEMP}/client/bin/flmctl" --version
+          "${RUNNER_TEMP}/flame/bin/flame-session-manager" --version
+          source "${RUNNER_TEMP}/client/sbin/flmenv.sh"
+          python3 -c "import flamepy"
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "${RUNNER_TEMP}/dist"
+          gh release upload "${RELEASE_TAG}" flame-*.tar.gz* flmctl-* flmping-* flmexec-* flmbench-* \
+            --repo "${GITHUB_REPOSITORY}" --clobber
+
+  # The install scripts of this release, with the release as their default version, to the xflops.io site
+  # (xflops/xflops.github.io): flame/<tag>/setup.sh and sdk.sh for every release, and flame/setup.sh and
+  # sdk.sh, which install the latest release, for a stable one (not a release candidate). Runs after the
+  # assets and flamepy are published, because the scripts install them.
+  publish-scripts:
+    name: Publish install scripts
+    needs: [release-metadata, publish-python, publish-binaries]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-metadata.outputs.source-sha }}
+
+      - name: Test the scripts
+        working-directory: scripts/tests
+        run: python3 -m unittest discover -s . -p 'test_*.py'
+
+      - name: Inline the shared code for this release
+        run: scripts/inline.sh --version "${RELEASE_TAG}" hosted
+
+      - name: Checkout the site
+        uses: actions/checkout@v7
+        with:
+          repository: xflops/xflops.github.io
+          token: ${{ secrets.XFLOPS_SITE_TOKEN }}
+          path: site
+
+      - name: Publish to the site
+        run: |
+          mkdir -p "site/flame/${RELEASE_TAG}"
+          cp hosted/setup.sh hosted/sdk.sh "site/flame/${RELEASE_TAG}/"
+          case "${RELEASE_TAG}" in
+            *-*) echo "${RELEASE_TAG} is a pre-release: the latest scripts are not updated" ;;
+            *) cp hosted/setup.sh hosted/sdk.sh site/flame/ ;;
+          esac
+          cd site
+          git config user.name "flame-release[bot]"
+          git config user.email "flame-release@users.noreply.github.com"
+          git add flame
+          if git diff --cached --quiet; then
+            echo "the site already has these scripts"
+          else
+            git commit -m "flame: install scripts for ${RELEASE_TAG}"
+            git push
+          fi
+
   publish-images:
     name: Publish native images
     needs: release-metadata

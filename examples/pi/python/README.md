@@ -71,7 +71,7 @@ dependencies provide NumPy; `flamepy` comes from the Flame installation through
 
 ```shell
 source /usr/local/flame/sbin/flmenv.sh --python-version 3.12
-cd /usr/local/flame/examples/pi/python
+cd examples/pi/python
 uv run main.py
 ```
 

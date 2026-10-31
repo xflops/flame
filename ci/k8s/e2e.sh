@@ -48,7 +48,6 @@ CLIENT_POLICY_TEMPLATE="${ROOT_DIR}/ci/k8s/external-access-client-policy.yaml"
 RENDERED_CLIENT_POLICY="${TMPDIR:-/tmp}/flame-k8s-e2e-client-policy.yaml"
 
 CLIENT_ROOT=""
-CLIENT_CONTAINER=""
 
 HELM_E2E_ARGS=(
     --set "global.imageRegistry=${IMAGE_REGISTRY}"
@@ -98,9 +97,6 @@ dump_debug() {
 }
 
 cleanup() {
-    if [[ -n "$CLIENT_CONTAINER" ]]; then
-        docker rm -f "$CLIENT_CONTAINER" >/dev/null 2>&1 || true
-    fi
     if [[ -n "$CLIENT_ROOT" && -d "$CLIENT_ROOT" ]]; then
         rm -rf -- "$CLIENT_ROOT"
     fi
@@ -378,19 +374,18 @@ configure_external_access() {
         "$cache_grpc_port"
 }
 
-extract_host_client() {
+# install_host_client installs the client with the sdk.sh of the package the workflow unpacked (the
+# package's own tools and flamepy, no download). FLAME_PACKAGE names another package directory.
+install_host_client() {
     CLIENT_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/flame-k8s-e2e.XXXXXX")"
-    CLIENT_CONTAINER="$(docker create "${IMAGE_REGISTRY}/flame-console:${IMAGE_TAG}")"
+    local package="${FLAME_PACKAGE:-${ROOT_DIR}/flame-package/package}"
 
-    log "Extracting Flame client from the console image"
-    docker cp "${CLIENT_CONTAINER}:/usr/local/flame" "$CLIENT_ROOT/"
-    docker rm -f "$CLIENT_CONTAINER" >/dev/null
-    CLIENT_CONTAINER=""
+    log "Installing the Flame client with sdk.sh from ${package}"
+    "${package}/sbin/sdk.sh" --prefix "${CLIENT_ROOT}/flame" --python-version 3.12
 
     export FLAME_HOME="${CLIENT_ROOT}/flame"
     export PYTHONPATH="${PYTHONPATH:-}"
     export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
-    sed -i "s|/usr/local/flame|${FLAME_HOME}|g" "${FLAME_HOME}/sbin/flmenv.sh"
     # shellcheck disable=SC1091
     source "${FLAME_HOME}/sbin/flmenv.sh"
 }
@@ -496,7 +491,7 @@ run_e2e_tests() {
 run_vm_tests() {
     local suite="$1"
 
-    extract_host_client
+    install_host_client
     configure_host_client
     case "$suite" in
         smoke) run_smoke_tests ;;

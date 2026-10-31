@@ -416,6 +416,31 @@ IMAGE_REGISTRY="${IMAGE_REGISTRY}" IMAGE_TAG="${DOCKER_TAG}" ci/k8s/e2e.sh
 Capture the `helm test`, `flmctl list`, `flmctl list -n`, `flmping`, and Python
 Pi example output when reporting the result.
 
+## Release Binaries And Install Scripts
+
+The release workflow's `publish-binaries` job builds, on `ubuntu-24.04` and `ubuntu-24.04-arm`
+runners (so the binaries run on the oldest glibc we support), these assets for `amd64` and `arm64`, each
+with a `.sha256` file, and uploads them to the GitHub release with `gh release upload --clobber`, so the
+release must exist first and a rerun replaces the assets:
+
+- `flame-<tag>-linux-<arch>.tar.gz`: every binary, `uv`, the Python SDK wheel, the migrations, the
+  application manifests, and `sbin/setup.sh` and `sbin/sdk.sh` that install it, and
+- `flmctl-<tag>-linux-<arch>`, `flmping-<tag>-linux-<arch>`, `flmexec-<tag>-linux-<arch>` and
+  `flmbench-<tag>-linux-<arch>`: the client tools, which `sdk.sh` downloads.
+
+`scripts/build.sh --output DIR --tag TAG` makes them (it builds everything). The job smoke-tests the
+assets the way a user installs them: the checksums, then the hosted `setup.sh` piped to `sh`
+installing the archive from a local URL (head, then `--join`), then the package's own `sdk.sh`, then
+`flmctl --version` and `import flamepy`. `flamepy` is published to PyPI by a parallel job, and
+`sdk.sh` installs `flamepy==<version>` from PyPI, so wait for the PyPI job before announcing a release.
+
+`setup.sh` and `sdk.sh` are not release assets: the `publish-scripts` job (after the assets and `flamepy`)
+tests them, inlines the shared code with this release as the default version
+(`scripts/inline.sh --version "$RELEASE_TAG"`), and pushes them to the `xflops/xflops.github.io`
+repository: `flame/<tag>/setup.sh` and `sdk.sh` for every release, and `flame/setup.sh` and `sdk.sh`
+(the latest) for a stable release, not a release candidate. It needs the `XFLOPS_SITE_TOKEN` secret, a
+token with write access to that repository.
+
 ## Git Tag And GitHub Release
 
 Tag only the final verified release commit:
@@ -448,6 +473,7 @@ Before declaring the release complete, record:
 - PyPI `flamepy` version URL and uploaded files.
 - crates.io URLs for `stdng`, `flame-rs-macros`, and `flame-rs`.
 - Docker Hub tag URLs and manifest digests for all five images.
+- The release assets: both architectures' package archives and client tools, with their `.sha256` files.
 - CI run URLs for the final release commit.
 - Helm/Kubernetes smoke-test output or the reason it was not run locally.
 

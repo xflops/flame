@@ -283,7 +283,7 @@ class CacheStorage(StorageBackend):
     """Storage backend using flame-object-cache directly or through a gRPC proxy."""
 
     def __init__(self, storage_base: str | None = None, app_name: str | None = None):
-        from flamepy.core.types import FlameClientCache, FlameContext
+        from flamepy.core.types import FlameClientCache, FlameContext, missing_config_message
 
         self._app_name = app_name
 
@@ -295,9 +295,14 @@ class CacheStorage(StorageBackend):
             self._host = parsed_url.hostname or "localhost"
             self._port = parsed_url.port or 9090
         else:
+            # There is no default cache: an unset endpoint is an error that says how to set it.
             context = FlameContext()
+            not_configured = FlameError(
+                FlameErrorCode.INVALID_CONFIG,
+                missing_config_message("cache", "cache.endpoint", "FLAME_CACHE_ENDPOINT"),
+            )
             if context.cache is None:
-                raise FlameError(FlameErrorCode.INVALID_CONFIG, "Cache not configured")
+                raise not_configured
 
             if isinstance(context.cache, FlameClientCache):
                 cache_endpoint = context.cache.endpoint
@@ -305,7 +310,7 @@ class CacheStorage(StorageBackend):
                 cache_endpoint = context.cache if isinstance(context.cache, str) else context.cache.get("endpoint")
 
             if not cache_endpoint:
-                raise FlameError(FlameErrorCode.INVALID_CONFIG, "Cache endpoint not configured")
+                raise not_configured
 
             parsed = urlparse(cache_endpoint)
             self._scheme = parsed.scheme

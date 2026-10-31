@@ -39,14 +39,14 @@ install_dependencies() {
 }
 
 install_flame() {
-    # The workflow unpacks the release binaries built by the build-binaries job.
-    sudo ./target/release/flmadm install \
-        --all \
-        --src-dir . \
-        --skip-build \
-        --prefix "$INSTALL_PREFIX" \
-        --python-version 3.12 \
-        --force
+    # The workflow unpacks the package built by the build-binaries job into ./flame-package. This node
+    # runs the head and a worker that joins it (the services start now, and start_cluster restarts
+    # them with the config below); the client goes to ~/.flame.
+    local package=flame-package/package
+    sudo "$package/sbin/setup.sh" --prefix "$INSTALL_PREFIX" --python-version 3.12 --force
+    sudo "$package/sbin/setup.sh" --prefix "$INSTALL_PREFIX" --python-version 3.12 \
+        --join --force
+    "$package/sbin/sdk.sh" --python-version 3.12 --prefix "$HOME/.flame"
     sudo install -m 0644 "$FLAME_CLUSTER_CONFIG" \
         "$INSTALL_PREFIX/conf/flame-cluster.yaml"
     sudo install -d "$INSTALL_PREFIX/conf/applications"
@@ -60,13 +60,14 @@ install_flame() {
 
     set +u
     # shellcheck source=/dev/null
-    source "$INSTALL_PREFIX/sbin/flmenv.sh"
+    source "$HOME/.flame/sbin/flmenv.sh"
     set -u
     {
-        echo "PATH=$INSTALL_PREFIX/bin:$PATH"
+        echo "PATH=$HOME/.flame/bin:$PATH"
         echo "PYTHONPATH=${PYTHONPATH:-}"
         echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
-        echo "FLAME_HOME=$FLAME_HOME"
+        # the cluster's prefix; flmenv.sh above is the client's
+        echo "FLAME_HOME=$INSTALL_PREFIX"
     } >> "$CI_ENV_FILE"
     python3 -m pip install pytest pytest-timeout
 }
@@ -169,9 +170,10 @@ EOF
 
 start_cluster() {
     sudo systemctl daemon-reload
-    sudo systemctl start flame-object-cache
-    sudo systemctl start flame-session-manager
-    sudo systemctl start flame-executor-manager
+    # restart: setup.sh started them with the generated config, which install_flame replaced
+    sudo systemctl restart flame-object-cache
+    sudo systemctl restart flame-session-manager
+    sudo systemctl restart flame-executor-manager
 
     local ready=false
     for _ in $(seq 1 60); do
@@ -234,11 +236,14 @@ stop_services() {
     docker stop flame-cri-registry || true
 }
 
+# Removing Flame is documented in scripts/README.md: stop and remove the units, then the directories.
 uninstall_flame() {
-    sudo ./target/release/flmadm uninstall \
-        --prefix "$INSTALL_PREFIX" \
-        --no-backup \
-        --force || true
+    sudo systemctl disable --now flame-executor-manager flame-object-cache flame-session-manager || true
+    sudo rm -f /etc/systemd/system/flame-executor-manager.service \
+        /etc/systemd/system/flame-object-cache.service \
+        /etc/systemd/system/flame-session-manager.service
+    sudo systemctl daemon-reload || true
+    sudo rm -rf "$INSTALL_PREFIX" "$HOME/.flame"
 }
 
 usage() {

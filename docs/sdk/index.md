@@ -46,7 +46,7 @@ in `x-flame-object-cache` metadata while TLS verifies the public proxy host.
 
 ## Typical Workflow
 
-1. Start a Flame cluster with Docker Compose or `flmadm`.
+1. Start a Flame cluster with Docker Compose or the install scripts (`scripts/README.md`).
 2. Deploy or register an application service.
 3. Create a session for that application from a client.
 4. Run tasks with `run()` or submit them with `submit()`.

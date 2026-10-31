@@ -298,7 +298,7 @@ pub async fn put_object<T>(key_prefix: impl AsRef<str>, object: &T) -> Result<Ob
 where
     T: FlameMessage,
 {
-    let context = FlameContext::from_file_with_env(None)?;
+    let context = FlameContext::load(None)?;
     let object_key = ObjectKey::from_prefix(key_prefix.as_ref())?;
     let cache = cache_from_context(&context)?;
     do_put_bytes(
@@ -350,7 +350,7 @@ where
 }
 
 pub async fn delete_objects(key_prefix: impl AsRef<str>) -> Result<(), FlameError> {
-    let context = FlameContext::from_file_with_env(None)?;
+    let context = FlameContext::load(None)?;
     delete_with_context(&context, key_prefix.as_ref()).await
 }
 
@@ -579,7 +579,7 @@ fn optional_context() -> Result<Option<FlameContext>, FlameError> {
             Ok(None)
         };
     }
-    FlameContext::from_file_with_env(Some(config_path.to_string_lossy().into_owned())).map(Some)
+    FlameContext::load(Some(config_path.to_string_lossy().into_owned())).map(Some)
 }
 
 async fn connect_cache(

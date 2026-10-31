@@ -96,14 +96,13 @@ flame-object-cache --config /etc/flame/flame-cluster.yaml
 flame-object-cache --config ./my-config.yaml
 ```
 
-### Using flmadm
+### Using the install script
+
+The object cache runs on each worker, so a worker install includes it:
 
 ```bash
-# Install cache component only
-sudo flmadm install --cache --enable
-
-# Install as part of full deployment
-sudo flmadm install --all --enable
+# A worker: the executor manager and the object cache, joined to the head
+curl -fsSL https://xflops.io/flame/setup.sh | sudo FLAME_ENDPOINT=http://HEAD:8080 sh -s -- --join
 ```
 
 ### Docker
@@ -319,7 +318,7 @@ Benefits of standalone architecture:
 
 ## Systemd Service
 
-When installed with `--cache --enable`, flmadm creates a systemd service:
+A worker install (`setup.sh --join`) creates a systemd service for the cache:
 
 ```bash
 # Check status
@@ -338,4 +337,4 @@ sudo systemctl restart flame-object-cache
 - Design Document: `docs/designs/RFE318-cache/FS.md`
 - Version Tracking: `docs/designs/RFE426-cache-versioning/FS.md`
 - Python SDK Cache Module: `sdk/python/src/flamepy/core/cache.py`
-- flmadm Documentation: `flmadm/README.md`
+- Install scripts: `scripts/README.md`

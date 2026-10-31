@@ -37,10 +37,8 @@ def __dir__():
 
 # Export all core classes/types at top level
 from .core import (  # Type aliases; Constants; Enums; Exception classes; Data classes; Context and utility classes; Client functions; Client classes; Service constants; Service context classes; Service base classes; Service functions
-    DEFAULT_FLAME_CACHE_ENDPOINT,
     DEFAULT_FLAME_APP_TEMPLATE,
     DEFAULT_FLAME_CONF,
-    DEFAULT_FLAME_ENDPOINT,
     FLAME_INSTANCE_ENDPOINT,
     Application,
     ApplicationAttributes,
@@ -111,8 +109,6 @@ __all__ = [
     "CommonData",
     # Constants
     "DEFAULT_FLAME_CONF",
-    "DEFAULT_FLAME_ENDPOINT",
-    "DEFAULT_FLAME_CACHE_ENDPOINT",
     "DEFAULT_FLAME_APP_TEMPLATE",
     # Enums
     "SessionState",

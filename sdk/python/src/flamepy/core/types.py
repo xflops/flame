@@ -34,9 +34,13 @@ CommonData = Message
 
 # Constants
 DEFAULT_FLAME_CONF = "flame.yaml"
-DEFAULT_FLAME_ENDPOINT = "http://127.0.0.1:8080"
-DEFAULT_FLAME_CACHE_ENDPOINT = "grpc://127.0.0.1:9090"
 DEFAULT_FLAME_APP_TEMPLATE = "flmrun"
+
+
+def missing_config_message(what: str, key: str, env: str) -> str:
+    """The error for a cluster setting that is configured nowhere: Flame never guesses an endpoint."""
+    path = Path.home() / ".flame" / DEFAULT_FLAME_CONF
+    return f'no Flame {what} configured: {key} is not set in {path} and {env} is not set.\nCreate {path}:\n  current-context: flame\n  contexts:\n    - name: flame\n      cluster:\n        endpoint: "http://<head>:8080"\n      cache:\n        endpoint: "grpc://<worker>:9090"\nor export {env}.'
 
 
 class SessionState(IntEnum):
@@ -543,8 +547,17 @@ class FlameContext:
 
     @property
     def endpoint(self) -> str:
-        """Get the Flame cluster endpoint."""
-        return self._endpoint if self._endpoint is not None else DEFAULT_FLAME_ENDPOINT
+        """Get the Flame cluster endpoint.
+
+        There is no default: an endpoint that is neither in ``flame.yaml`` nor in ``FLAME_ENDPOINT`` is an
+        error that says how to configure it.
+        """
+        if self._endpoint is None:
+            raise FlameError(
+                FlameErrorCode.INVALID_CONFIG,
+                missing_config_message("cluster", "cluster.endpoint", "FLAME_ENDPOINT"),
+            )
+        return self._endpoint
 
     @property
     def tls(self) -> Optional[FlameClientTls]:
@@ -558,17 +571,22 @@ class FlameContext:
 
     @property
     def cache(self) -> Optional[FlameClientCache]:
-        """Get the cache configuration."""
-        if self._cache is not None:
-            return self._cache
-        return FlameClientCache(endpoint=DEFAULT_FLAME_CACHE_ENDPOINT, tls=self._cache_tls)
+        """Get the cache configuration, or None when there is none (there is no default cache)."""
+        return self._cache
 
     @property
     def cache_endpoint(self) -> str:
-        """Get the cache endpoint (legacy property for backward compatibility)."""
-        if self._cache is not None and self._cache.endpoint is not None:
-            return self._cache.endpoint
-        return DEFAULT_FLAME_CACHE_ENDPOINT
+        """Get the cache endpoint (legacy property for backward compatibility).
+
+        There is no default: an endpoint that is neither in ``flame.yaml`` nor in
+        ``FLAME_CACHE_ENDPOINT`` is an error that says how to configure it.
+        """
+        if self._cache is None or self._cache.endpoint is None:
+            raise FlameError(
+                FlameErrorCode.INVALID_CONFIG,
+                missing_config_message("cache", "cache.endpoint", "FLAME_CACHE_ENDPOINT"),
+            )
+        return self._cache.endpoint
 
     @property
     def cache_tls(self) -> Optional[FlameClientTls]:

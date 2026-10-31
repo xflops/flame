@@ -86,7 +86,7 @@ From an installed Flame environment:
 source /usr/local/flame/sbin/flmenv.sh
 flmctl deploy \
   --name candle-based-example \
-  --application /usr/local/flame/examples/candle/based/candle-based-example-service
+  --application ./target/release/candle-based-example-service
 ```
 
 ## Run The Client
@@ -104,7 +104,7 @@ cargo run -p candle-based-example --bin candle-based-example --release -- \
 From an installed Flame environment:
 
 ```bash
-/usr/local/flame/examples/candle/based/candle-based-example \
+./target/release/candle-based-example \
   --app candle-based-example \
   --prompt "The future of distributed inference is" \
   --sample-len 64 \

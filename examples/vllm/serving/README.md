@@ -14,7 +14,7 @@ Load the installed Flame SDK environment, then deploy the worker package:
 
 ```bash
 source /usr/local/flame/sbin/flmenv.sh --python-version 3.12
-cd "$FLAME_HOME/examples/vllm/serving"
+cd examples/vllm/serving
 flmctl deploy --name vllm-serving --application . --max-instances 1 \
   --env VLLM_MODEL=facebook/opt-125m
 ```

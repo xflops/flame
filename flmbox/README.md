@@ -41,7 +41,7 @@ separate invocations (and the service) see the same ones.
 `flmbox -d` serves one Flame executor: it creates a sandbox when a session is bound and removes it when the session
 leaves. Tasks are JSON, `{"code": "...", "language": "shell|python", "cwd": ..., "envs": {...}, "input": [bytes],
 "timeout": secs}`, and the result is `{"exit_code", "stdout", "stderr"}`. The application manifest is
-`config/applications/flmbox.yaml`, and `flmadm install` registers it. From Python:
+`config/applications/flmbox.yaml`, and `setup.sh` registers it on the head node. From Python:
 
 ```python
 from flamepy.agent import Sandbox

@@ -10,11 +10,9 @@ From the Flame console with the Flame Python SDK environment loaded:
 
 ```bash
 source /usr/local/flame/sbin/flmenv.sh
-cd "$FLAME_HOME/examples/vllm/offline"
+cd examples/vllm/offline
 python3 main.py
 ```
-
-`flmadm install --client --with-examples` includes this example.
 
 The console needs only the Flame SDK. vLLM is imported on the executor, where
 Flame installs the pinned dependencies from `pyproject.toml` using Python 3.12.

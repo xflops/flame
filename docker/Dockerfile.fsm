@@ -6,14 +6,14 @@ COPY . .
 RUN apt-get update && apt-get install -y protobuf-compiler pkg-config libssl-dev
 RUN cargo build --release
 
-# Install using flmadm with control-plane profile
-RUN ./target/release/flmadm install \
-    --src-dir /usr/src/flame \
-    --prefix /usr/local/flame \
-    --control-plane \
-    --no-systemd \
-    --skip-build \
-    --force
+# uv builds the Python SDK wheel of the package
+COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /usr/bin/
+
+# Build the package (cargo reuses the build above), then install from it with the same scripts users run.
+RUN scripts/build.sh --output /tmp/dist
+
+# The head node: the session manager, its migrations and the application manifests
+RUN /tmp/dist/package/sbin/setup.sh --prefix /usr/local/flame --no-systemd --force
 
 FROM ubuntu:24.04
 
