@@ -88,7 +88,7 @@ pub async fn connect_with_context(
 }
 
 pub async fn connect_with_config(path: Option<String>) -> Result<Connection, apis::FlameError> {
-    let context = apis::FlameContext::from_file_with_env(path)?;
+    let context = apis::FlameContext::load(path)?;
     connect_with_context(context).await
 }
 

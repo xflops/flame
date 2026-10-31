@@ -1,0 +1,105 @@
+#!/bin/bash
+# Flame Environment Setup Script
+# Generated from flmenv.sh.in by Flame's setup.sh or sdk.sh; @PREFIX@ and @PYTHON_VERSIONS@ are the
+# placeholders they replace (with sed), so an image can render its own copy the same way.
+#
+# Usage:
+#   source @PREFIX@/sbin/flmenv.sh [OPTIONS]
+#
+# Options:
+#   --python-version VERSION  Python version to use (e.g., 3.11, 3.12)
+#                             If not specified, uses the version of python3 on PATH when
+#                             installed, otherwise the latest installed version
+#
+# Available Python versions: @PYTHON_VERSIONS@
+
+# Flame installation prefix
+export FLAME_HOME="@PREFIX@"
+
+# Add Flame binaries to PATH
+if [[ ":$PATH:" != *":@PREFIX@/bin:"* ]]; then
+    export PATH="@PREFIX@/bin:$PATH"
+fi
+
+# UV and pip cache directories (shared across containers)
+export UV_CACHE_DIR="$FLAME_HOME/data/cache/uv"
+export PIP_CACHE_DIR="$FLAME_HOME/data/cache/pip"
+export UV_LINK_MODE=copy
+
+# Create cache directories if they don't exist
+mkdir -p "$UV_CACHE_DIR" 2>/dev/null || true
+mkdir -p "$PIP_CACHE_DIR" 2>/dev/null || true
+
+# Parse arguments
+FLAME_PYTHON_VERSION=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --python-version)
+            FLAME_PYTHON_VERSION="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+# Prefer the version of the python3 on PATH when flamepy is installed for it: native
+# extensions such as grpc only load under the interpreter they were built for.
+if [ -z "$FLAME_PYTHON_VERSION" ]; then
+    FLAME_SYSTEM_PYTHON_VERSION=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)
+    if [ -n "$FLAME_SYSTEM_PYTHON_VERSION" ] && [ -d "$FLAME_HOME/lib/python$FLAME_SYSTEM_PYTHON_VERSION/site-packages" ]; then
+        FLAME_PYTHON_VERSION="$FLAME_SYSTEM_PYTHON_VERSION"
+    fi
+    unset FLAME_SYSTEM_PYTHON_VERSION
+fi
+
+# Otherwise use the latest installed Python version
+if [ -z "$FLAME_PYTHON_VERSION" ]; then
+    FLAME_PYTHON_VERSION=$(ls -1d "$FLAME_HOME"/lib/python*/site-packages 2>/dev/null \
+        | sed 's|.*/python\([0-9.]*\)/site-packages|\1|' \
+        | sort -V \
+        | tail -1)
+fi
+export FLAME_PYTHON_VERSION
+
+# Python environment for flamepy
+FLAME_LD_DIRS=""
+FLAME_MATCHED_SITE_PACKAGES=""
+if [ -n "$FLAME_PYTHON_VERSION" ]; then
+    FLAME_SITE_PACKAGES="@PREFIX@/lib/python$FLAME_PYTHON_VERSION/site-packages"
+    if [ -d "$FLAME_SITE_PACKAGES" ]; then
+        if [[ ":$PYTHONPATH:" != *":$FLAME_SITE_PACKAGES:"* ]]; then
+            export PYTHONPATH="$FLAME_SITE_PACKAGES:$PYTHONPATH"
+            FLAME_MATCHED_SITE_PACKAGES="$FLAME_SITE_PACKAGES"
+        fi
+
+        # Find all directories containing shared libraries for native extensions
+        while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+            abs_dir=$(cd "$dir" 2>/dev/null && pwd)
+            if [ -n "$abs_dir" ] && [[ ":$LD_LIBRARY_PATH:" != *":$abs_dir:"* ]]; then
+                export LD_LIBRARY_PATH="$abs_dir:$LD_LIBRARY_PATH"
+                FLAME_LD_DIRS="$FLAME_LD_DIRS $abs_dir"
+            fi
+        done < <(find "$FLAME_SITE_PACKAGES" \( -name "*.so" -o -name "*.dylib" \) -type f 2>/dev/null | xargs -r -n1 dirname 2>/dev/null | sort -u)
+    fi
+fi
+
+# Print environment info (only when sourced interactively)
+if [[ $- == *i* ]]; then
+    echo "Flame environment loaded:"
+    echo "  FLAME_HOME=$FLAME_HOME"
+    echo "  PATH includes: @PREFIX@/bin"
+    echo "  UV_CACHE_DIR=$UV_CACHE_DIR"
+    echo "  PIP_CACHE_DIR=$PIP_CACHE_DIR"
+    if [ -n "$FLAME_MATCHED_SITE_PACKAGES" ]; then
+        echo "  PYTHONPATH includes: $FLAME_MATCHED_SITE_PACKAGES (Python $FLAME_PYTHON_VERSION)"
+    elif [ -n "$FLAME_PYTHON_VERSION" ]; then
+        echo "  Warning: No flamepy installation found for Python $FLAME_PYTHON_VERSION"
+        echo "  Available versions: @PYTHON_VERSIONS@"
+    fi
+    if [ -n "$FLAME_LD_DIRS" ]; then
+        echo "  LD_LIBRARY_PATH includes: $FLAME_LD_DIRS"
+    fi
+fi

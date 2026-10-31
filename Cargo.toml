@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "common",
     "flmctl",
-    "flmadm",
     "flmping",
     "flmbench",
     "flmexec",

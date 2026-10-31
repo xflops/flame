@@ -25,6 +25,18 @@ jobs:
             jq -e --arg platform "linux/${arch}" '.target | length == 8 and all(.[]; .platforms == [$platform])' "bake-${arch}.json"
           done
 
+  scripts:
+    name: Scripts Verify
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install shellcheck and dash
+        run: sudo apt-get update && sudo apt-get install -y shellcheck dash
+      - name: Test build.sh, setup.sh and sdk.sh
+        working-directory: scripts/tests
+        run: python3 -m unittest discover -s . -p 'test_*.py' -v
+
   rust:
     name: Rust Code Verify
     runs-on: ubuntu-26.04

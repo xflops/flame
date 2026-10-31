@@ -71,7 +71,8 @@ jobs:
           retention-days: 1
           compression-level: 0
 
-  # Build the release binaries once for the BareMetal jobs, which install them with flmadm.
+  # Build the release package once (scripts/build.sh builds everything); the BareMetal and k8s jobs
+  # install from it with the package's own setup.sh and sdk.sh.
   build-binaries:
     name: Build Binaries
     runs-on: ubuntu-26.04
@@ -88,20 +89,22 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - name: Build Flame
-        run: cargo build --release
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
 
-      - name: Package binaries
+      - name: Build the Flame package
+        run: scripts/build.sh --output flame-package
+
+      - name: Archive the package
         run: |
-          find target/release -maxdepth 1 -type f -perm -u+x -printf '%f\n' > binaries.txt
-          tar -C target/release -T binaries.txt -cf - | zstd -T0 -3 -o flame-binaries.tar.zst
-          ls -lh flame-binaries.tar.zst
+          tar -cf - flame-package | zstd -T0 -3 -o flame-package.tar.zst
+          ls -lh flame-package.tar.zst
 
-      - name: Upload binaries
+      - name: Upload the package
         uses: actions/upload-artifact@v7
         with:
-          name: flame-binaries
-          path: flame-binaries.tar.zst
+          name: flame-package
+          path: flame-package.tar.zst
           retention-days: 1
           compression-level: 0
 
@@ -352,7 +355,7 @@ jobs:
 
   kubernetes-e2e:
     name: Kubernetes E2E Test
-    needs: build-images
+    needs: [build-images, build-binaries]
     env:
       IMAGE_REGISTRY: xflops
       IMAGE_TAG: ci
@@ -380,6 +383,21 @@ jobs:
 
       - name: Load images
         run: zstd -dc flame-images.tar.zst | docker load
+
+      # The client is installed from the package with its sdk.sh (ci/k8s/e2e.sh)
+      - name: Download the package
+        uses: actions/download-artifact@v8
+        with:
+          name: flame-package
+
+      - name: Unpack the package
+        run: zstd -dc flame-package.tar.zst | tar -xf -
+
+      # sdk.sh installs flamepy for the Python it is asked for (3.12); the runner's default is newer
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
 
       - name: Load images into Kind
         run: |
@@ -446,15 +464,13 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y protobuf-compiler
       
-      - name: Download binaries
+      - name: Download the package
         uses: actions/download-artifact@v8
         with:
-          name: flame-binaries
+          name: flame-package
 
-      - name: Unpack binaries
-        run: |
-          mkdir -p target/release
-          zstd -dc flame-binaries.tar.zst | tar -C target/release -xf -
+      - name: Unpack the package
+        run: zstd -dc flame-package.tar.zst | tar -xf -
 
       - name: Verify systemd availability
         run: |
@@ -473,10 +489,16 @@ jobs:
           echo "=== Sudo privileges ==="
           sudo -v && echo "✓ Sudo available"
       
-      - name: Install Flame with flmadm and systemd
+      # One machine runs the head, then a worker that joins it; the client goes to ~/.flame.
+      - name: Install Flame with setup.sh and systemd
         run: |
-          sudo ./target/release/flmadm install --all --src-dir . --skip-build --prefix $INSTALL_PREFIX --enable
-          echo "$INSTALL_PREFIX/bin" >> $GITHUB_PATH
+          sudo ./flame-package/package/sbin/setup.sh --prefix $INSTALL_PREFIX
+          sudo ./flame-package/package/sbin/setup.sh --prefix $INSTALL_PREFIX --join --force
+
+      - name: Install the client with sdk.sh
+        run: |
+          ./flame-package/package/sbin/sdk.sh --python-version 3.12
+          echo "$HOME/.flame/bin" >> $GITHUB_PATH
       
       - name: Setup local configuration
         run: |
@@ -488,10 +510,11 @@ jobs:
       - name: Setup Python environment
         run: |
           echo "=== Setting up Flame environment ==="
-          source $INSTALL_PREFIX/sbin/flmenv.sh
+          source $HOME/.flame/sbin/flmenv.sh
           echo "PYTHONPATH=$PYTHONPATH" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> $GITHUB_ENV
-          echo "FLAME_HOME=$FLAME_HOME" >> $GITHUB_ENV
+          # the cluster's prefix, which the tests inspect; flmenv.sh above is the client's
+          echo "FLAME_HOME=$INSTALL_PREFIX" >> $GITHUB_ENV
           
           pip3 install pytest pytest-timeout
 
@@ -592,7 +615,11 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          sudo ./target/release/flmadm uninstall --prefix $INSTALL_PREFIX --no-backup --force || true
+          sudo systemctl disable --now flame-executor-manager flame-object-cache flame-session-manager || true
+          sudo rm -f /etc/systemd/system/flame-executor-manager.service /etc/systemd/system/flame-object-cache.service /etc/systemd/system/flame-session-manager.service
+          sudo systemctl daemon-reload
+          # a gVisor netns mount under the prefix can be busy; the runner is discarded anyway
+          sudo rm -rf $INSTALL_PREFIX $HOME/.flame || true
 
   cri-shim-e2e:
     name: CRI Shim E2E
@@ -618,15 +645,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Download binaries
+      - name: Download the package
         uses: actions/download-artifact@v8
         with:
-          name: flame-binaries
+          name: flame-package
 
-      - name: Unpack binaries
-        run: |
-          mkdir -p target/release
-          zstd -dc flame-binaries.tar.zst | tar -C target/release -xf -
+      - name: Unpack the package
+        run: zstd -dc flame-package.tar.zst | tar -xf -
 
       - name: Download runtime image
         uses: actions/download-artifact@v8
@@ -696,15 +721,13 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Download binaries
+      - name: Download the package
         uses: actions/download-artifact@v8
         with:
-          name: flame-binaries
+          name: flame-package
 
-      - name: Unpack binaries
-        run: |
-          mkdir -p target/release
-          zstd -dc flame-binaries.tar.zst | tar -C target/release -xf -
+      - name: Unpack the package
+        run: zstd -dc flame-package.tar.zst | tar -xf -
 
       - name: Download runtime image
         uses: actions/download-artifact@v8

@@ -187,7 +187,7 @@ pub async fn open_or_create_session(
 ) -> Result<Session, FlameError>;
 ```
 
-`connect()` loads `FlameContext::from_file_with_env(None)`, reads the current context's cluster endpoint and TLS config, and delegates to the existing `client::connect_with_tls(...)`. This mirrors FlamePy's default connection behavior without introducing a global singleton in the MVP. Applications that need connection reuse can call `connect()` once and keep the returned `Connection`.
+`connect()` loads `FlameContext::from_file(None)?.with_env()` (through `FlameContext::load`, which also accepts `FLAME_ENDPOINT` alone, as an executor gives it), reads the current context's cluster endpoint and TLS config, and delegates to the existing `client::connect_with_tls(...)`. This mirrors FlamePy's default connection behavior without introducing a global singleton in the MVP. Applications that need connection reuse can call `connect()` once and keep the returned `Connection`.
 
 Connection-level mirrors avoid reconnecting in long-running clients:
 
@@ -1001,7 +1001,7 @@ The proc macro should use `proc_macro_crate` plus a `crate = "..."` override so 
 
 Default connection:
 
-1. Load `FlameContext::from_file_with_env(None)`.
+1. Load `FlameContext::from_file(None)?.with_env()` (through `FlameContext::load`, which also accepts `FLAME_ENDPOINT` alone, as an executor gives it).
 2. Read the current context's cluster endpoint and optional TLS config.
 3. Call existing `client::connect_with_tls(endpoint, tls.as_ref())`.
 4. Return the existing `Connection` type.

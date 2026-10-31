@@ -5,30 +5,23 @@ This guide sets up a single-node Flame cluster from the local source tree withou
 ## Prerequisites
 
 - Rust toolchain
-- Python 3.12, or another version passed with `flmadm install --python-version`
+- Python 3.12, or another version passed with `setup.sh --python-version`
 - `uv`
 - Git
 
 ## Install
 
-Build all release artifacts:
+Build the release package (`scripts/build.sh` builds everything), then install the head node and a worker that joins it into `/tmp/flame-dev`, and the client into `~/.flame` (`--force` replaces an earlier install, the config included; without it each script asks before overwriting, and stops when it cannot ask):
 
 ```bash
-cargo build --release
+scripts/build.sh --output /tmp/flame-package --force
+/tmp/flame-package/package/sbin/setup.sh --prefix /tmp/flame-dev --no-systemd --force
+/tmp/flame-package/package/sbin/setup.sh --prefix /tmp/flame-dev --join --no-systemd --force
+FLAME_ENDPOINT=http://127.0.0.1:8080 FLAME_CACHE_ENDPOINT=grpc://127.0.0.1:9090 /tmp/flame-package/package/sbin/sdk.sh --force
+source ~/.flame/sbin/flmenv.sh
 ```
 
-Install all Flame components into `/tmp/flame-dev`:
-
-```bash
-./target/release/flmadm install \
-    --all \
-    --src-dir . \
-    --skip-build \
-    --no-systemd \
-    --prefix /tmp/flame-dev
-```
-
-`flmadm` requires an explicit profile flag. For local development, `--all` installs the control plane, worker, object cache, client tools, and Python SDK.
+`setup.sh` without `--join` installs the head node (the session manager) and with `--join` a worker (the executor manager and the object cache). `setup.sh` generates `/tmp/flame-dev/conf/flame-cluster.yaml` from `FLAME_*` settings (see [Configuration](#configuration)); the defaults suit one machine. `sdk.sh` installs `flmctl`, `flmping`, `flmexec`, `flmbench` and the Python SDK; it writes `~/.flame/flame.yaml` from `FLAME_ENDPOINT` and `FLAME_CACHE_ENDPOINT` (the environment or `./.env`), which is why they are set above; without `FLAME_ENDPOINT` it writes none, and there is no default (see [the install scripts README](../../scripts/README.md)).
 
 ## Start Services
 
@@ -117,17 +110,12 @@ FLAME_ROOT="$PWD" cargo test --workspace --exclude cri-rs -- --nocapture
 
 ## Development Loop
 
-After changing Rust components:
+After changing Rust components, rebuild the package and install it over the old one (`--force` replaces what is already installed, the config included):
 
 ```bash
-cargo build --release
-./target/release/flmadm install \
-    --all \
-    --src-dir . \
-    --skip-build \
-    --no-systemd \
-    --prefix /tmp/flame-dev \
-    --clean
+scripts/build.sh --output /tmp/flame-package --force
+/tmp/flame-package/package/sbin/setup.sh --prefix /tmp/flame-dev --no-systemd --force
+/tmp/flame-package/package/sbin/setup.sh --prefix /tmp/flame-dev --join --no-systemd --force
 ```
 
 Then restart the three services.
@@ -150,7 +138,7 @@ tail -f /tmp/flame-dev/logs/fem.log
 
 ## Configuration
 
-`flmadm` generates `/tmp/flame-dev/conf/flame-cluster.yaml`:
+`setup.sh` generates `/tmp/flame-dev/conf/flame-cluster.yaml` from `FLAME_*` settings in the environment or `./.env` (defaults below; see [the install scripts README](../../scripts/README.md)); for example on one machine:
 
 ```yaml
 ---
@@ -196,17 +184,14 @@ If App fails to find the `flmrun` template, check that the session manager is ru
 
 ## Cleanup
 
-Stop the service processes, then uninstall:
+Stop the service processes, then remove the directory (see [Removing Flame](../../scripts/README.md#removing-flame)):
 
 ```bash
-./target/release/flmadm uninstall \
-    --prefix /tmp/flame-dev \
-    --no-backup \
-    --force
+rm -rf /tmp/flame-dev ~/.flame
 ```
 
 ## See Also
 
-- [flmadm README](../../flmadm/README.md)
+- [Install scripts README](../../scripts/README.md)
 - [App Setup Guide](app-setup.md)
-- [RFE333 Functional Specification](../designs/RFE333-flmadm/FS.md)
+- [RFE683 Functional Specification](../designs/RFE683-script-install/FS.md)

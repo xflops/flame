@@ -16,7 +16,7 @@ submit.
 flmbench -s 4 -t 10000 -n 3 -o result.json
 ```
 
-It is installed with the client profile (`flmadm install --client`), so it is
+It is installed with the client (`sdk.sh`), so it is
 included in the `flame-console` image. The client connects the same way as the other Flame tools (`~/.flame/flame.yaml`,
 or `FLAME_ENDPOINT`).
 

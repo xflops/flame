@@ -21,7 +21,7 @@ contexts:
       endpoint: "grpc://127.0.0.1:9090"
 ```
 
-If Flame was installed with `flmadm`, source the generated environment file before running the commands:
+If Flame was installed with `setup.sh` or `sdk.sh`, source the generated environment file before running the commands (`~/.flame/sbin/flmenv.sh` for a client installed with `sdk.sh`):
 
 ```bash
 source /usr/local/flame/sbin/flmenv.sh

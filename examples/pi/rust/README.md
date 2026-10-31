@@ -8,13 +8,13 @@ Deploy the service binary from the installed examples directory:
 source /usr/local/flame/sbin/flmenv.sh
 flmctl deploy \
   --name pi \
-  --application /usr/local/flame/examples/pi/rust/pi-service
+  --application ./target/release/pi-service
 ```
 
 Run the client with the same application name:
 
 ```bash
-/usr/local/flame/examples/pi/rust/pi --app pi
+./target/release/pi --app pi
 ```
 
 `flmctl deploy` uploads the service binary package to object cache and registers the `pi` application so executors download the package instead of relying on a local worker-image path. Use another `--name` value when deploying and pass the same value to `pi --app <name>` for a custom registration.

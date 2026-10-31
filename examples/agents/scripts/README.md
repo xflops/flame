@@ -11,7 +11,7 @@ With Flame running and the Python SDK installed, run in flame-console:
 
 ```bash
 source /usr/local/flame/sbin/flmenv.sh --python-version 3.12
-cd "$FLAME_HOME/examples/agents/scripts"
+cd examples/agents/scripts
 python3 main.py
 ```
 

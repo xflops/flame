@@ -241,22 +241,39 @@ impl FlameContext {
         })
     }
 
-    /// Load FlameContext from file, then apply environment variable overrides.
+    /// The context of a client: `from_file(fp)` with the environment applied (`with_env`). When there is no
+    /// file, `FLAME_ENDPOINT` alone names the cluster (`from_env`), which is how an application running in an
+    /// executor gets its cluster; with neither, the error is `from_file`'s: no default is assumed.
+    pub(crate) fn load(fp: Option<String>) -> Result<Self, FlameError> {
+        let path = Self::config_path(fp);
+        if !Path::new(&path).is_file() && env::var_os(FLAME_ENDPOINT).is_some() {
+            return Self::from_env();
+        }
+        Ok(Self::from_file(Some(path))?.with_env())
+    }
+
+    fn config_path(fp: Option<String>) -> String {
+        match fp {
+            None => env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".flame")
+                .join(DEFAULT_FLAME_CONF)
+                .to_string_lossy()
+                .into_owned(),
+            Some(path) => path,
+        }
+    }
+
+    /// Apply environment variable overrides to the current context; use it as `from_file(fp)?.with_env()`.
     ///
-    /// Environment variables take precedence over file configuration:
+    /// Environment variables take precedence over the file:
     /// - FLAME_ENDPOINT: Overrides cluster endpoint
     /// - FLAME_CACHE_ENDPOINT: Overrides cache endpoint
     /// - FLAME_CA_FILE: Sets CA file if not already configured
     /// - FLAME_CERT_FILE: Sets client certificate if not already configured
     /// - FLAME_KEY_FILE: Sets client private key if not already configured
-    pub fn from_file_with_env(fp: Option<String>) -> Result<Self, FlameError> {
-        let mut ctx = Self::from_file(fp)?;
-        ctx.apply_env_overrides();
-        Ok(ctx)
-    }
-
-    /// Apply environment variable overrides to the current context.
-    fn apply_env_overrides(&mut self) {
+    pub fn with_env(mut self) -> Self {
         if let Ok(current) = self.get_current_context_mut() {
             // Override endpoint if FLAME_ENDPOINT is set
             if let Ok(endpoint) = env::var(FLAME_ENDPOINT) {
@@ -294,6 +311,7 @@ impl FlameContext {
                 }
             }
         }
+        self
     }
 
     /// Get mutable reference to the current context entry.
@@ -309,30 +327,31 @@ impl FlameContext {
     }
 
     pub fn from_file(fp: Option<String>) -> Result<Self, FlameError> {
-        let fp = match fp {
-            None => env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".flame")
-                .join(DEFAULT_FLAME_CONF)
-                .to_string_lossy()
-                .into_owned(),
-            Some(path) => path,
-        };
+        let fp = Self::config_path(fp);
 
         if !Path::new(&fp).is_file() {
-            return Err(FlameError::InvalidConfig(format!("<{fp}> is not a file")));
+            return Err(FlameError::InvalidConfig(missing_config_message(&fp)));
         }
 
         let contents =
             fs::read_to_string(fp.clone()).map_err(|e| FlameError::Internal(e.to_string()))?;
-        let ctx: FlameContext =
-            serde_yaml::from_str(&contents).map_err(|e| FlameError::Internal(e.to_string()))?;
+        let ctx: FlameContext = serde_yaml::from_str(&contents).map_err(|e| {
+            FlameError::InvalidConfig(format!("<{fp}> is not a valid Flame configuration: {e}"))
+        })?;
 
         tracing::debug!("Load FlameContext from <{fp}>: {ctx}");
 
         Ok(ctx)
     }
+}
+
+/// The error for a cluster that is configured nowhere: Flame never guesses an endpoint.
+fn missing_config_message(path: &str) -> String {
+    format!(
+        "no Flame cluster configured: <{path}> does not exist.\n\
+         Create it:\n  current-context: flame\n  contexts:\n    - name: flame\n      cluster:\n        \
+         endpoint: \"http://<head>:8080\"\n      cache:\n        endpoint: \"grpc://<worker>:9090\""
+    )
 }
 
 impl Display for FlameContext {
@@ -349,6 +368,36 @@ impl Display for FlameContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_file_is_an_error_that_says_how_to_configure() {
+        let error =
+            FlameContext::from_file(Some("/nonexistent/flame.yaml".to_string())).unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("no Flame cluster configured"));
+        assert!(message.contains("/nonexistent/flame.yaml"));
+        assert!(message.contains("endpoint: \"http://<head>:8080\""));
+        // the file is the only user-facing configuration, so the hint names only the file
+        assert!(!message.contains("FLAME_ENDPOINT"));
+    }
+
+    #[test]
+    fn an_invalid_file_names_itself() {
+        let path = std::env::temp_dir().join(format!("flame-invalid-{}.yaml", std::process::id()));
+        std::fs::write(&path, "current-context: [").unwrap();
+
+        let error = FlameContext::from_file(Some(path.to_string_lossy().into_owned())).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(matches!(error, FlameError::InvalidConfig(_)));
+        assert!(error
+            .to_string()
+            .contains("is not a valid Flame configuration"));
+        assert!(error
+            .to_string()
+            .contains(&path.to_string_lossy().into_owned()));
+    }
 
     #[test]
     fn client_identity_requires_both_files() {
