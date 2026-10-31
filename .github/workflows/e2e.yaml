@@ -37,6 +37,8 @@ jobs:
           targets: |
             default
             runtime
+            executor-manager-devel
+            runtime-devel
           load: true
           set: |
             *.cache-from=type=gha,scope=ci-images

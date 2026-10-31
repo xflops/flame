@@ -215,6 +215,15 @@ release-images-build: require-release-image-tag ## Build local multi-arch releas
 			$(CONTAINER_CLI) build --platform "$$platform" --manifest "$(IMAGE_REGISTRY)/$$image:$(DOCKER_TAG)" -f "$$dockerfile" .; \
 		done; \
 	}; \
+	build_devel_image() { \
+		image="$$1"; \
+		dockerfile="$$2"; \
+		for platform in $$platforms; do \
+			echo "$(CONTAINER_CLI) build --platform $$platform --manifest $(IMAGE_REGISTRY)/$$image:$(DOCKER_TAG)-devel -f $$dockerfile"; \
+			$(CONTAINER_CLI) build --platform "$$platform" --manifest "$(IMAGE_REGISTRY)/$$image:$(DOCKER_TAG)-devel" -f "$$dockerfile" \
+				--build-context $$image="container-image://$(IMAGE_REGISTRY)/$$image:$(DOCKER_TAG)" .; \
+		done; \
+	}; \
 	build_test_image() { \
 		for platform in $$platforms; do \
 			echo "$(CONTAINER_CLI) build --platform $$platform --manifest $(IMAGE_REGISTRY)/flame-test:$(DOCKER_TAG) -f docker/Dockerfile.testing"; \
@@ -226,25 +235,31 @@ release-images-build: require-release-image-tag ## Build local multi-arch releas
 	build_image flame-session-manager docker/Dockerfile.fsm; \
 	build_image flame-object-cache docker/Dockerfile.foc; \
 	build_image flame-executor-manager docker/Dockerfile.fem; \
+	build_devel_image flame-executor-manager docker/Dockerfile.fem-devel; \
 	build_image flame-console docker/Dockerfile.console; \
 	build_test_image; \
-	build_image flame-instance-runtime docker/Dockerfile.flmrt
+	build_image flame-instance-runtime docker/Dockerfile.flmrt; \
+	build_devel_image flame-instance-runtime docker/Dockerfile.flmrt-devel
 
 release-images-inspect: require-release-image-tag ## Inspect local release image manifests
 	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-session-manager:$(DOCKER_TAG)"
 	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-object-cache:$(DOCKER_TAG)"
 	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)"
+	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)-devel"
 	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)"
 	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-test:$(DOCKER_TAG)"
 	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-instance-runtime:$(DOCKER_TAG)"
+	$(CONTAINER_CLI) manifest inspect "$(IMAGE_REGISTRY)/flame-instance-runtime:$(DOCKER_TAG)-devel"
 
 release-images-push: require-release-image-tag ## Push release manifest lists
 	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-session-manager:$(DOCKER_TAG)" "docker://$(IMAGE_REGISTRY)/flame-session-manager:$(DOCKER_TAG)"
 	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-object-cache:$(DOCKER_TAG)" "docker://$(IMAGE_REGISTRY)/flame-object-cache:$(DOCKER_TAG)"
 	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)" "docker://$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)"
+	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)-devel" "docker://$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)-devel"
 	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)" "docker://$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)"
 	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-test:$(DOCKER_TAG)" "docker://$(IMAGE_REGISTRY)/flame-test:$(DOCKER_TAG)"
 	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-instance-runtime:$(DOCKER_TAG)" "docker://$(IMAGE_REGISTRY)/flame-instance-runtime:$(DOCKER_TAG)"
+	$(CONTAINER_CLI) manifest push "$(IMAGE_REGISTRY)/flame-instance-runtime:$(DOCKER_TAG)-devel" "docker://$(IMAGE_REGISTRY)/flame-instance-runtime:$(DOCKER_TAG)-devel"
 
 release-images: require-release-image-tag ## Build, inspect, and push release image manifests
 	$(MAKE) release-images-build
@@ -262,9 +277,11 @@ release-images-verify: require-release-image-tag ## Verify remote release image 
 	check_image "$(IMAGE_REGISTRY)/flame-session-manager:$(DOCKER_TAG)"; \
 	check_image "$(IMAGE_REGISTRY)/flame-object-cache:$(DOCKER_TAG)"; \
 	check_image "$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)"; \
+	check_image "$(IMAGE_REGISTRY)/flame-executor-manager:$(DOCKER_TAG)-devel"; \
 	check_image "$(IMAGE_REGISTRY)/flame-console:$(DOCKER_TAG)"; \
 	check_image "$(IMAGE_REGISTRY)/flame-test:$(DOCKER_TAG)"; \
-	check_image "$(IMAGE_REGISTRY)/flame-instance-runtime:$(DOCKER_TAG)"
+	check_image "$(IMAGE_REGISTRY)/flame-instance-runtime:$(DOCKER_TAG)"; \
+	check_image "$(IMAGE_REGISTRY)/flame-instance-runtime:$(DOCKER_TAG)-devel"
 
 release-images-pull-bases: ## Pull release base images with the detected container CLI
 	@set -eu; \

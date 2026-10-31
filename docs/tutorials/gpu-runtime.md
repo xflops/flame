@@ -99,7 +99,10 @@ populate envs and CDI uniformly; each shim consumes the fields it supports.
 The existing `flame-instance-runtime` image is published for amd64 and arm64.
 Choose its tag with `--image`; the image and host driver must support the
 application's CUDA requirements. Driver injection belongs to the host runtime,
-so the image does not bundle a host NVIDIA driver.
+so the image does not bundle a host NVIDIA driver. Applications that use Triton
+(vLLM) compile a C helper at the first kernel launch and need a C compiler and
+Python headers: use the `-devel` tag (`xflops/flame-instance-runtime:<tag>-devel`),
+which adds them.
 
 Keep each FEM's GPU assignment directory private to that worker. Workers may
 share installed application packages, but must not share `workdir/gpu`: discovery

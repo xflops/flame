@@ -12,10 +12,12 @@ SCRIPT = Path(__file__).with_name("image-manifests.sh")
 IMAGES = [
     "flame-session-manager",
     "flame-object-cache",
-    "flame-executor-manager",
+    "flame-executor-manager-runtime",
+    "flame-executor-manager-devel",
     "flame-console",
     "flame-test",
     "flame-instance-runtime",
+    "flame-instance-runtime-devel",
 ]
 
 
@@ -71,10 +73,17 @@ class ImageManifestsTest(unittest.TestCase):
         calls = self.calls()
         self.assertEqual(len(calls), 2 * len(IMAGES))
         for image, command in zip(IMAGES, calls[: len(IMAGES)]):
+            # A flavor shares its stock image's repository: -devel is the -devel tag.
+            repository = {
+                "flame-executor-manager-runtime": "flame-executor-manager",
+                "flame-executor-manager-devel": "flame-executor-manager",
+                "flame-instance-runtime-devel": "flame-instance-runtime",
+            }.get(image, image)
+            tag = "sha-test-devel" if image.endswith("-devel") else "sha-test"
             self.assertEqual(command, [
-                "buildx", "imagetools", "create", "--tag", f"docker.io/xflops/{image}:sha-test",
-                f"docker.io/xflops/{image}@sha256:" + "a" * 64,
-                f"docker.io/xflops/{image}@sha256:" + "b" * 64,
+                "buildx", "imagetools", "create", "--tag", f"docker.io/xflops/{repository}:{tag}",
+                f"docker.io/xflops/{repository}@sha256:" + "a" * 64,
+                f"docker.io/xflops/{repository}@sha256:" + "b" * 64,
             ])
         self.assertTrue(all(command[:3] == ["buildx", "imagetools", "inspect"] for command in calls[len(IMAGES) :]))
 
@@ -105,9 +114,11 @@ class ImageManifestsTest(unittest.TestCase):
                 result = self.run_script("check", arch, self.root / f"digests-{arch}.json")
                 self.assertEqual(result.returncode, 0, result.stderr)
         runs = [command for command in self.calls() if command[0] == "run"]
-        self.assertEqual(len(runs), 20)
+        self.assertEqual(len(runs), 32)
         sdk = [command for command in runs if "import flamepy" in command[-1]]
-        self.assertEqual(len(sdk), 8)
+        self.assertEqual(len(sdk), 12)
+        toolchain = [command for command in runs if "Python.h" in command[-1]]
+        self.assertEqual(len(toolchain), 4)
 
     def test_wrong_native_architecture_fails_before_running_binary(self):
         self.env["TEST_ARCH"] = "arm64"

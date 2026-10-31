@@ -1,0 +1,17 @@
+# flame-executor-manager:<tag>-devel: the executor-manager image plus the C toolchain and Python
+# headers that GPU applications need.
+#
+# Triton (vLLM) compiles a small C helper (cuda_utils.c) with the system compiler on the first
+# kernel launch, and the stock executor image ships no compiler, libc headers or Python.h.
+#
+# It is built in the same invocation as flame-executor-manager (ci/release/image-bake.hcl),
+# which supplies the named context below. To build it alone:
+#   docker build -f docker/Dockerfile.fem-devel \
+#     --build-context flame-executor-manager=docker-image://xflops/flame-executor-manager:latest \
+#     -t xflops/flame-executor-manager:latest-devel .
+FROM flame-executor-manager
+
+# python3-dev follows the distribution's python3, the interpreter the executors run.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential python3-dev \
+    && rm -rf /var/lib/apt/lists/*

@@ -289,34 +289,52 @@ verify_images() {
     done
 }
 
+image_repository() {
+    case "$1" in
+        flame-executor-manager-runtime|flame-executor-manager-devel) printf 'flame-executor-manager' ;;
+        flame-instance-runtime-devel) printf 'flame-instance-runtime' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 promote_images() {
     local registry="$1"
     local source_sha="$2"
     local images=(
         flame-session-manager
         flame-object-cache
-        flame-executor-manager
+        flame-executor-manager-runtime
+        flame-executor-manager-devel
         flame-console
         flame-test
         flame-instance-runtime
+        flame-instance-runtime-devel
     )
-    local refs=() image repository source_ref latest_ref
+    local refs=() image repository suffix source_ref latest_ref
 
+    # A flavor image shares the repository of its stock image: the -devel images are
+    # <repository>:latest-devel, and flame-executor-manager-runtime is the stock flame-executor-manager:latest.
     for image in "${images[@]}"; do
-        refs+=("${registry}/${image}:sha-${source_sha}")
+        suffix=""
+        [[ "${image}" == *-devel ]] && suffix="-devel"
+        refs+=("${registry}/$(image_repository "${image}"):sha-${source_sha}${suffix}")
     done
     verify_images "${refs[@]}"
 
     for image in "${images[@]}"; do
-        repository="${registry}/${image}"
-        source_ref="${repository}:sha-${source_sha}"
-        latest_ref="${repository}:latest"
+        suffix=""
+        [[ "${image}" == *-devel ]] && suffix="-devel"
+        repository="${registry}/$(image_repository "${image}")"
+        source_ref="${repository}:sha-${source_sha}${suffix}"
+        latest_ref="${repository}:latest${suffix}"
         promote_image "${source_ref}" "${latest_ref}"
     done
 
     refs=()
     for image in "${images[@]}"; do
-        refs+=("${registry}/${image}:latest")
+        suffix=""
+        [[ "${image}" == *-devel ]] && suffix="-devel"
+        refs+=("${registry}/$(image_repository "${image}"):latest${suffix}")
     done
     verify_images "${refs[@]}"
 }

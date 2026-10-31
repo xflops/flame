@@ -1,0 +1,14 @@
+# flame-instance-runtime:<tag>-devel: the CRI application runtime image plus the C toolchain and
+# Python headers that GPU applications need (see Dockerfile.fem-devel).
+#
+# It is built in the same invocation as flame-instance-runtime (ci/release/image-bake.hcl), which
+# supplies the named context below. To build it alone:
+#   docker build -f docker/Dockerfile.flmrt-devel \
+#     --build-context flame-instance-runtime=docker-image://xflops/flame-instance-runtime:latest \
+#     -t xflops/flame-instance-runtime:latest-devel .
+FROM flame-instance-runtime
+
+# python3-dev follows the distribution's python3, the interpreter of this image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential python3-dev \
+    && rm -rf /var/lib/apt/lists/*

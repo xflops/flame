@@ -5,7 +5,7 @@ variable "SOURCE_CONTEXT" { default = "." }
 variable "SOURCE_SHA" { default = "" }
 
 group "default" {
-  targets = ["flame-session-manager", "flame-object-cache", "flame-executor-manager", "flame-console", "flame-test", "flame-instance-runtime"]
+  targets = ["flame-session-manager", "flame-object-cache", "flame-executor-manager-runtime", "flame-executor-manager-devel", "flame-console", "flame-test", "flame-instance-runtime", "flame-instance-runtime-devel"]
 }
 
 // Build all images in one invocation so their common Cargo stage is shared.
@@ -36,12 +36,27 @@ target "flame-object-cache" {
   cache-to = ["type=gha,mode=max,scope=flame-object-cache-${ARCH}"]
 }
 
-target "flame-executor-manager" {
+// flame-executor-manager-runtime is the stock executor manager, published as flame-executor-manager:<tag>.
+target "flame-executor-manager-runtime" {
   inherits = ["image"]
   dockerfile = "docker/Dockerfile.fem"
   tags = ["${IMAGE_REGISTRY}/flame-executor-manager:${IMAGE_TAG}-${ARCH}"]
   cache-from = ["type=gha,scope=flame-executor-manager-${ARCH}"]
   cache-to = ["type=gha,mode=max,scope=flame-executor-manager-${ARCH}"]
+}
+
+// flame-executor-manager-devel is the executor manager plus a C toolchain and Python headers for GPU
+// applications (Triton). It is published as the `-devel` tag of the flame-executor-manager
+// repository and is built from the runtime target of this same invocation.
+target "flame-executor-manager-devel" {
+  inherits = ["image"]
+  dockerfile = "docker/Dockerfile.fem-devel"
+  contexts = {
+    flame-executor-manager = "target:flame-executor-manager-runtime"
+  }
+  tags = ["${IMAGE_REGISTRY}/flame-executor-manager:${IMAGE_TAG}-devel-${ARCH}"]
+  cache-from = ["type=gha,scope=flame-executor-manager-devel-${ARCH}"]
+  cache-to = ["type=gha,mode=max,scope=flame-executor-manager-devel-${ARCH}"]
 }
 
 target "flame-console" {
@@ -72,4 +87,17 @@ target "flame-instance-runtime" {
   tags = ["${IMAGE_REGISTRY}/flame-instance-runtime:${IMAGE_TAG}-${ARCH}"]
   cache-from = ["type=gha,scope=flame-instance-runtime-${ARCH}"]
   cache-to = ["type=gha,mode=max,scope=flame-instance-runtime-${ARCH}"]
+}
+
+// flame-instance-runtime-devel is the CRI application runtime plus a C toolchain and Python headers
+// for GPU applications, published as the `-devel` tag of the flame-instance-runtime repository.
+target "flame-instance-runtime-devel" {
+  inherits = ["image"]
+  dockerfile = "docker/Dockerfile.flmrt-devel"
+  contexts = {
+    flame-instance-runtime = "target:flame-instance-runtime"
+  }
+  tags = ["${IMAGE_REGISTRY}/flame-instance-runtime:${IMAGE_TAG}-devel-${ARCH}"]
+  cache-from = ["type=gha,scope=flame-instance-runtime-devel-${ARCH}"]
+  cache-to = ["type=gha,mode=max,scope=flame-instance-runtime-devel-${ARCH}"]
 }

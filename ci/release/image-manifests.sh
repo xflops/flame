@@ -10,7 +10,20 @@ mode="$1"
 registry="$2"
 value="$3"
 metadata="$4"
-images=(flame-session-manager flame-object-cache flame-executor-manager flame-console flame-test flame-instance-runtime)
+images=(flame-session-manager flame-object-cache flame-executor-manager-runtime flame-executor-manager-devel flame-console flame-test flame-instance-runtime flame-instance-runtime-devel)
+
+# A flavor image shares the repository of its stock image, as in nvidia/cuda: the -devel images are
+# <repository>:<tag>-devel, and flame-executor-manager-runtime is the stock flame-executor-manager:<tag>.
+repository() {
+    case "$1" in
+        flame-executor-manager-runtime|flame-executor-manager-devel) printf 'flame-executor-manager' ;;
+        flame-instance-runtime-devel) printf 'flame-instance-runtime' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+variant_tag() {
+    if [[ "$1" == *-devel ]]; then printf '%s-devel' "$2"; else printf '%s' "$2"; fi
+}
 
 digest() {
     local image="$1" file="$2" result
@@ -30,7 +43,7 @@ case "$mode" in
         fi
         refs=()
         for image in "${images[@]}"; do
-            refs+=("${registry}/${image}@$(digest "$image" "$metadata")")
+            refs+=("${registry}/$(repository "$image")@$(digest "$image" "$metadata")")
         done
         for i in "${!images[@]}"; do
             image="${images[$i]}"
@@ -41,7 +54,7 @@ case "$mode" in
                 exit 1
             fi
             case "$image" in
-                flame-session-manager|flame-object-cache|flame-executor-manager)
+                flame-session-manager|flame-object-cache|flame-executor-manager-runtime|flame-executor-manager-devel)
                     docker run --rm --platform "linux/${value}" "$ref" --help
                     ;;
                 flame-console)
@@ -50,12 +63,19 @@ case "$mode" in
                 flame-test)
                     docker run --rm --platform "linux/${value}" "$ref" flame-test help
                     ;;
-                flame-instance-runtime)
+                flame-instance-runtime|flame-instance-runtime-devel)
                     docker run --rm --platform "linux/${value}" --entrypoint /usr/local/flame/bin/uv "$ref" --version
                     ;;
             esac
             case "$image" in
-                flame-executor-manager|flame-console|flame-test|flame-instance-runtime)
+                flame-executor-manager-devel|flame-instance-runtime-devel)
+                    # Triton compiles a C helper against libc and Python.h with the system compiler.
+                    docker run --rm --platform "linux/${value}" --entrypoint /bin/bash "$ref" -lc \
+                        'gcc --version >/dev/null && echo "#include <Python.h>" | gcc -E $(python3-config --includes) - >/dev/null'
+                    ;;
+            esac
+            case "$image" in
+                flame-executor-manager-runtime|flame-executor-manager-devel|flame-console|flame-test|flame-instance-runtime|flame-instance-runtime-devel)
                     docker run --rm --platform "linux/${value}" --entrypoint /bin/bash "$ref" -lc \
                         'source /usr/local/flame/sbin/flmenv.sh --python-version 3.14 && python3 -c "import flamepy"'
                     ;;
@@ -66,9 +86,9 @@ case "$mode" in
         # Validate every digest before writing any final tag.
         amd64=() arm64=() refs=()
         for image in "${images[@]}"; do
-            amd64+=("${registry}/${image}@$(digest "$image" "${metadata}/digests-amd64.json")")
-            arm64+=("${registry}/${image}@$(digest "$image" "${metadata}/digests-arm64.json")")
-            refs+=("${registry}/${image}:${value}")
+            amd64+=("${registry}/$(repository "$image")@$(digest "$image" "${metadata}/digests-amd64.json")")
+            arm64+=("${registry}/$(repository "$image")@$(digest "$image" "${metadata}/digests-arm64.json")")
+            refs+=("${registry}/$(repository "$image"):$(variant_tag "$image" "$value")")
         done
         for i in "${!images[@]}"; do
             docker buildx imagetools create --tag "${refs[$i]}" "${amd64[$i]}" "${arm64[$i]}"

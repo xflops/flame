@@ -278,8 +278,12 @@ Release Docker images as multi-arch manifest tags for `linux/amd64` and
 - `xflops/flame-session-manager`
 - `xflops/flame-object-cache`
 - `xflops/flame-executor-manager`
+- `xflops/flame-executor-manager:<tag>-devel` (the executor manager plus a C toolchain and Python
+  headers for GPU applications that use Triton, such as vLLM)
 - `xflops/flame-console`
 - `xflops/flame-instance-runtime` (CRI application runtime)
+- `xflops/flame-instance-runtime:<tag>-devel` (the runtime plus the same C toolchain and Python
+  headers)
 
 The release workflow publishes only the versioned release tag. Among automated
 workflows, only the main-branch image workflow moves the mutable `latest` tag.

@@ -75,11 +75,18 @@ executorManager:
     - name: LD_LIBRARY_PATH
       value: /run/nvidia/driver/usr/lib/x86_64-linux-gnu
     - name: PATH
-      value: /run/nvidia/driver/usr/bin:/usr/local/flame/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      value: /usr/local/flame/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/run/nvidia/driver/usr/bin
 ```
 
 These paths match x86_64 GPU Operator hosts; adapt them to the host driver
-installation. NVML provides GPU discovery, and Host services inherit the devices
+installation. Applications that use Triton (vLLM) compile a C helper at the first kernel
+launch, which needs a C compiler and Python headers that the stock image does not have.
+Use the `-devel` image of the release (`xflops/flame-executor-manager:<tag>-devel`, built from
+`docker/Dockerfile.fem-devel`): set `executorManager.image.tag` to `<tag>-devel`, and keep
+the driver `bin` directory last on `PATH`: the driver container's `gcc` cannot run from the
+image, so listing that directory first would shadow the image's compiler.
+
+NVML provides GPU discovery, and Host services inherit the devices
 and library paths. CPU workers in the same DaemonSet report zero GPUs.
 
 SRE must arrange a maintenance window and ensure workers have no tasks before
