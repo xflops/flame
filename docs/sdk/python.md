@@ -396,6 +396,14 @@ counter = Counter.remote(10)  # creates a proxy; flmrun constructs Counter(10)
 counter.increment()
 ```
 
+`app.service()` is an ordinary callable, so an existing function or class needs no
+decorator syntax. Call it inline with the options for that proxy:
+
+```python
+counter = app.service(warmup=1)(Counter).remote(10)    # class proxy
+sum_proxy = app.remote(app.service()(sum_fn))          # independent function proxy
+```
+
 Class-level calls such as `Counter.increment()` are not supported. Call methods
 on the remote proxy with `counter.increment()`. The decorator options configure
 the session created by each `.remote()` call. `app.destroy()` closes the
