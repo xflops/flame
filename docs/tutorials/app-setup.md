@@ -211,7 +211,9 @@ Top-level functions:
   `fn.remote(*args, **kwargs)` submits a remote call on a shared session.
   `app.remote(fn)` creates an independent function proxy. For classes,
   `Clazz.remote(*args, **kwargs)` or `app.remote(Clazz, *args, **kwargs)`
-  creates a proxy and passes constructor arguments to the executor.
+  creates a proxy and passes constructor arguments to the executor. Apply it
+  inline to a function or class defined elsewhere, such as
+  `app.service(warmup=1)(Clazz).remote(*args, **kwargs)`.
 - `get(futures)`: resolve multiple `ObjectFuture` values to concrete objects.
 - `ref(futures)`: return `Ref` values, either inline `ValueRef` or cache-backed `ObjectRef`.
 - `wait(futures)`: wait for multiple futures without fetching objects.
