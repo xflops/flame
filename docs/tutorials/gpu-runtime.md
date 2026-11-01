@@ -81,7 +81,7 @@ Deploy the vLLM serving example with an application image:
 
 ```bash
 source /usr/local/flame/sbin/flmenv.sh --python-version 3.12
-cd "$FLAME_HOME/examples/vllm/serving"
+cd examples/vllm/serving
 flmctl deploy --name vllm-serving --application . --shim Cri \
   --image xflops/flame-instance-runtime:latest --max-instances 1 \
   --env VLLM_MODEL=facebook/opt-125m

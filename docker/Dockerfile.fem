@@ -6,18 +6,15 @@ COPY . .
 RUN apt-get update && apt-get install -y protobuf-compiler pkg-config libssl-dev
 RUN cargo build --release
 
-# Copy uv before flmadm install (flmadm will detect and copy it to FLAME_HOME/bin)
+# uv builds the Python SDK wheel of the package and installs it
 COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /usr/bin/
 
-# Install using flmadm with worker profile
-# This builds wheel and installs flamepy to lib/ via --prefix
-RUN ./target/release/flmadm install \
-    --src-dir /usr/src/flame \
-    --prefix /usr/local/flame \
-    --worker \
-    --no-systemd \
-    --skip-build \
-    --force
+# Build the package (cargo reuses the build above), then install from it with the same scripts users run.
+RUN scripts/build.sh --output /tmp/dist
+
+# A worker install: the executor manager, its services and flamepy under lib/. The joined head and
+# the interface only name the default config, which the deployment replaces.
+RUN /tmp/dist/package/sbin/setup.sh --prefix /usr/local/flame --join --no-systemd --force
 
 FROM ubuntu:24.04
 

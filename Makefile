@@ -40,7 +40,7 @@ E2E_SYSTEM_PYTEST_ARGS ?=
 
 # Default target
 .PHONY: help build build-release init update_protos
-.PHONY: install install-dev uninstall uninstall-dev start-services stop-services
+.PHONY: package install install-dev uninstall uninstall-dev start-services stop-services
 .PHONY: sdk-python sdk-python-generate sdk-python-test sdk-python-clean
 .PHONY: format format-rust format-python format-e2e
 .PHONY: e2e e2e-local e2e-py e2e-py-docker e2e-py-local e2e-rs
@@ -68,12 +68,19 @@ build-release: update_protos ## Build the Rust project in release mode
 init: ## Install required tools
 	cargo install cargo-get --force
 
-# Installation targets using flmadm
-install: build-release ## Install Flame to system (requires sudo)
-	sudo ./target/release/flmadm install --all --src-dir . --skip-build --enable
+# Installation targets: build the release package, then install from it with its setup.sh
+PACKAGE_DIR ?= target/flame-package
 
-install-dev: build-release ## Install Flame to dev location (no sudo required)
-	./target/release/flmadm install --all --src-dir . --skip-build --no-systemd --prefix $(INSTALL_PREFIX)
+package: ## Build the release package (builds everything; see scripts/build.sh)
+	scripts/build.sh --output $(PACKAGE_DIR) --force
+
+install: package ## Install a single-node Flame to the system, replacing an installation (requires sudo)
+	sudo $(PACKAGE_DIR)/package/sbin/setup.sh --force
+	sudo $(PACKAGE_DIR)/package/sbin/setup.sh --join --force
+
+install-dev: package ## Install Flame to dev location (no sudo required)
+	$(PACKAGE_DIR)/package/sbin/setup.sh --prefix $(INSTALL_PREFIX) --no-systemd --force
+	$(PACKAGE_DIR)/package/sbin/setup.sh --prefix $(INSTALL_PREFIX) --join --no-systemd --force
 	@echo ""
 	@echo "Flame installed to: $(INSTALL_PREFIX)"
 	@echo "Add to PATH: export PATH=$(INSTALL_PREFIX)/bin:\$$PATH"
@@ -82,11 +89,14 @@ install-dev: build-release ## Install Flame to dev location (no sudo required)
 	@echo "  FLAME_HOME=$(INSTALL_PREFIX) $(INSTALL_PREFIX)/bin/flame-session-manager --config $(INSTALL_PREFIX)/conf/flame-cluster.yaml &"
 	@echo "  FLAME_HOME=$(INSTALL_PREFIX) $(INSTALL_PREFIX)/bin/flame-executor-manager --config $(INSTALL_PREFIX)/conf/flame-cluster.yaml &"
 
-uninstall: ## Uninstall Flame from system (requires sudo)
-	sudo ./target/release/flmadm uninstall --force
+uninstall: ## Remove a Flame install from the system: the units, then /usr/local/flame (requires sudo)
+	-sudo systemctl disable --now flame-executor-manager flame-object-cache flame-session-manager
+	sudo rm -f /etc/systemd/system/flame-executor-manager.service /etc/systemd/system/flame-object-cache.service /etc/systemd/system/flame-session-manager.service
+	-sudo systemctl daemon-reload
+	sudo rm -rf /usr/local/flame
 
-uninstall-dev: ## Uninstall Flame from dev location
-	./target/release/flmadm uninstall --prefix $(INSTALL_PREFIX) --no-backup --force
+uninstall-dev: ## Remove the dev install
+	rm -rf $(INSTALL_PREFIX)
 
 start-services: ## Start Flame services (systemd)
 	sudo systemctl start flame-session-manager flame-executor-manager

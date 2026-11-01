@@ -77,9 +77,7 @@ from .service import (
 # Type aliases
 from .types import (
     DEFAULT_FLAME_APP_TEMPLATE,
-    DEFAULT_FLAME_CACHE_ENDPOINT,
     DEFAULT_FLAME_CONF,
-    DEFAULT_FLAME_ENDPOINT,
     Application,
     ApplicationAttributes,
     ApplicationID,
@@ -119,8 +117,6 @@ __all__ = [
     "CommonData",
     # Constants
     "DEFAULT_FLAME_CONF",
-    "DEFAULT_FLAME_ENDPOINT",
-    "DEFAULT_FLAME_CACHE_ENDPOINT",
     "DEFAULT_FLAME_APP_TEMPLATE",
     # Enums
     "SessionState",

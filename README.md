@@ -82,23 +82,20 @@ After the Flame cluster is launched, use the following steps to log into the `fl
 $ docker compose exec flame-console /bin/bash
 ```
 
-### Option 2: Local Installation with flmadm (Faster for Development)
+### Option 2: Local Installation with the install scripts (Faster for Development)
 
-For development and testing, you can install Flame directly on your machine using `flmadm` (requires [Rust](https://rustup.rs/) and [uv](https://astral.sh/uv)):
+For development and testing, you can install Flame directly on your machine (building it needs [Rust](https://rustup.rs/) and [uv](https://astral.sh/uv)):
 
 ```shell
-# Build and install flmadm
-$ cargo build --release -p flmadm
-$ sudo install -m 755 target/release/flmadm /usr/local/bin/
+# Build the release package from local source, then install a single node from it and start the services
+$ make install
 
-# Install all components from local source and start services
-$ sudo flmadm install --all --src-dir . --enable
-
-# Add Flame binaries to PATH
-$ source /usr/local/flame/sbin/flmenv.sh
+# Install the client (the tools and the Python SDK) and put it on your environment
+$ target/flame-package/package/sbin/sdk.sh
+$ source ~/.flame/sbin/flmenv.sh
 ```
 
-For more details, see the [flmadm README](flmadm/README.md).
+For more details, see the [install scripts README](scripts/README.md).
 
 ### Verify the Installation
 
@@ -134,30 +131,24 @@ $ flmctl list -s
 
 ## CLI Tools
 
-Flame provides two separate command-line tools:
+**`flmctl`** is the command-line tool for submitting jobs, managing sessions, and querying cluster state.
 
-- **`flmctl`**: User-facing CLI for submitting jobs, managing sessions, and querying cluster state
-- **`flmadm`**: Administrator CLI for installing, configuring, and managing Flame clusters
+### Installing Flame with the install scripts
 
-### Installing Flame with flmadm
-
-For multi-node bare-metal or VM deployments, use `flmadm` to install Flame components on each node:
+For multi-node bare-metal or VM deployments, run `setup.sh` on each node and `sdk.sh` on each client:
 
 ```shell
-# On control plane node
-sudo flmadm install --control-plane --enable
+# On the head node
+curl -fsSL https://xflops.io/flame/setup.sh | sudo sh
 
-# On worker nodes
-sudo flmadm install --worker --enable
+# On each worker node (the executor manager and the object cache); FLAME_* settings generate conf/flame-cluster.yaml
+curl -fsSL https://xflops.io/flame/setup.sh | sudo FLAME_ENDPOINT=http://HEAD:8080 sh -s -- --join
 
-# On cache nodes (optional, can be co-located with workers)
-sudo flmadm install --cache --enable
-
-# Or deploy all components on a single node
-sudo flmadm install --all --enable
+# On a client machine (flmctl, flmping, flmexec, flmbench and the Python SDK); FLAME_ENDPOINT writes ~/.flame/flame.yaml
+curl -fsSL https://xflops.io/flame/sdk.sh | FLAME_ENDPOINT=http://HEAD:8080 sh
 ```
 
-For more details, see the [flmadm README](flmadm/README.md).
+For more details, see the [install scripts README](scripts/README.md).
 
 ## Documentation
 
