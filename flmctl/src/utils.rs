@@ -11,6 +11,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::error::Error;
+
 use chrono::Duration;
 use flame_rs::{
     apis::Shim as ClientShim,
@@ -19,6 +21,17 @@ use flame_rs::{
         ApplicationSchema as ClientApplicationSchema, ResourceRequirement,
     },
 };
+
+/// The trimmed session ids from a `-s` argument. An explicit blank id is a
+/// mistake, not a request for every session.
+pub fn trim_ids(sessions: &[String]) -> Result<Vec<&str>, Box<dyn Error>> {
+    let ids: Vec<&str> = sessions.iter().map(|id| id.trim()).collect();
+    if ids.iter().any(|id| id.is_empty()) {
+        return Err("session ids must not be empty".into());
+    }
+
+    Ok(ids)
+}
 
 pub fn client_application_attributes(
     attributes: common::apis::ApplicationAttributes,
@@ -122,6 +135,22 @@ pub fn format_optional_duration(duration: &Option<Duration>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn ids_are_trimmed() {
+        let a = args(&["id-1", " id-2 "]);
+        assert_eq!(trim_ids(&a).unwrap(), ["id-1", "id-2"]);
+    }
+
+    #[test]
+    fn blank_id_is_rejected() {
+        assert!(trim_ids(&args(&[""])).is_err());
+        assert!(trim_ids(&args(&["id-1", " "])).is_err());
+    }
 
     #[test]
     fn format_resreq_none_renders_dash() {

@@ -95,11 +95,11 @@ enum Commands {
         #[arg(short, long, default_value = "table", value_parser = ["table", "json"])]
         output_format: String,
     },
-    /// Close the session in Flame
+    /// Close sessions in Flame
     Close {
-        /// The id of session
-        #[arg(short, long)]
-        session: String,
+        /// Comma-separated session ids
+        #[arg(short, long, required = true, num_args = 1.., value_delimiter = ',')]
+        session: Vec<String>,
     },
     /// Suspend an open session: running tasks finish, executors unbind, then the session is suspended
     Suspend {
@@ -215,4 +215,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close_ids(args: &[&str]) -> Vec<String> {
+        let cli =
+            Cli::try_parse_from(std::iter::once("flmctl").chain(args.iter().copied())).unwrap();
+        match cli.command {
+            Some(Commands::Close { session }) => session,
+            _ => panic!("not a close command"),
+        }
+    }
+
+    #[test]
+    fn close_takes_ids_separated_by_commas_spaces_or_repeated_flags() {
+        let expected = ["a", "b", "c"];
+        assert_eq!(close_ids(&["close", "-s", "a,b,c"]), expected);
+        assert_eq!(close_ids(&["close", "-s", "a", "b", "c"]), expected);
+        assert_eq!(close_ids(&["close", "-s", "a", "-s", "b,c"]), expected);
+    }
+
+    #[test]
+    fn close_requires_a_session() {
+        assert!(Cli::try_parse_from(["flmctl", "close"]).is_err());
+        assert!(Cli::try_parse_from(["flmctl", "close", "-s"]).is_err());
+    }
 }

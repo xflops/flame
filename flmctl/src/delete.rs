@@ -17,6 +17,8 @@ use flame_rs as flame;
 use flame_rs::apis::{FlameContext, SessionState};
 use flame_rs::client::SessionFilter;
 
+use crate::utils::trim_ids;
+
 /// Which sessions a `delete -s` argument names.
 #[derive(Debug, PartialEq)]
 enum Selection<'a> {
@@ -33,13 +35,7 @@ fn parse_selection(sessions: Option<&[String]>) -> Result<Selection<'_>, Box<dyn
         return Ok(Selection::AllClosed);
     }
 
-    // An explicit blank id is a mistake, not a request for every session.
-    let ids: Vec<&str> = sessions.iter().map(|id| id.trim()).collect();
-    if ids.iter().any(|id| id.is_empty()) {
-        return Err("session ids must not be empty".into());
-    }
-
-    Ok(Selection::Ids(ids))
+    Ok(Selection::Ids(trim_ids(sessions)?))
 }
 
 pub async fn run(ctx: &FlameContext, sessions: Option<&[String]>) -> Result<(), Box<dyn Error>> {
