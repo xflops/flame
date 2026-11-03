@@ -95,6 +95,13 @@ class SetupTests(ScriptCase):
         self.assertIn("shims: [host, cri]", conf)
         self.assertIn("max_executors: 16", conf)
 
+    def test_system_resource_is_written_only_when_set(self):
+        self.ok(self.setup())
+        self.assertNotIn("system_resource", self.config())
+
+        self.ok(self.setup("--force", env={"FLAME_SYSTEM_RESOURCE": "cpu=2,mem=4g"}))
+        self.assertIn('    shims: [host]\n    system_resource: "cpu=2,mem=4g"\n  limits:', self.config())
+
     def test_dotenv_in_the_current_directory_is_read_and_the_environment_wins(self):
         (self.root / ".env").write_text(
             "# a comment\nFLAME_CLUSTER_NAME=\"from-dotenv\"\nexport FLAME_ENDPOINT=http://1.2.3.4:8080\n"

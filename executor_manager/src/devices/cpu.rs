@@ -39,6 +39,15 @@ impl CpuManager {
             ledger: stdng::new_ptr(Ledger::new(crate::devices::CPU, num_cpus::get() as u64)),
         }
     }
+
+    /// A manager that holds `reserved` back for system daemons.
+    pub fn with_reserved(reserved: u64) -> Result<Self, FlameError> {
+        Ok(Self {
+            ledger: stdng::new_ptr(
+                Ledger::new(crate::devices::CPU, num_cpus::get() as u64).reserve(reserved)?,
+            ),
+        })
+    }
 }
 
 impl DeviceManager for CpuManager {

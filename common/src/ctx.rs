@@ -88,6 +88,7 @@ struct FlameSessionRecoveryYaml {
 struct FlameExecutorsYaml {
     pub shims: Option<Vec<String>>,
     pub devices: Option<Vec<String>>,
+    pub system_resource: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +195,9 @@ pub struct FlameExecutors {
     pub shims: Vec<Shim>,
     /// Optional device managers loaded by FEM; CPU and memory are always loaded.
     pub devices: Vec<String>,
+    /// CPU and memory held back for system daemons, e.g. `cpu=2,mem=4g`. FEM does
+    /// not report it as capacity and never hands it to executors.
+    pub system_resource: ResourceRequirement,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -565,6 +569,14 @@ impl TryFrom<FlameExecutorsYaml> for FlameExecutors {
                 )));
             }
         }
+        let system_resource = match executors.system_resource {
+            Some(resources) => ResourceRequirement::parse(&resources).map_err(|e| {
+                FlameError::InvalidConfig(format!(
+                    "invalid cluster.executors.system_resource <{resources}>: {e}"
+                ))
+            })?,
+            None => ResourceRequirement::default(),
+        };
         let shims = match executors.shims {
             Some(names) => {
                 if names.is_empty() {
@@ -587,7 +599,11 @@ impl TryFrom<FlameExecutorsYaml> for FlameExecutors {
             }
             None => vec![Shim::try_from(DEFAULT_SHIM.to_string())?],
         };
-        Ok(FlameExecutors { shims, devices })
+        Ok(FlameExecutors {
+            shims,
+            devices,
+            system_resource,
+        })
     }
 }
 
@@ -613,6 +629,7 @@ impl Default for FlameExecutors {
         Self {
             shims: vec![Shim::default()],
             devices: vec!["gpu".to_string()],
+            system_resource: ResourceRequirement::default(),
         }
     }
 }
@@ -829,6 +846,20 @@ mod tests {
         assert!(executors("shims: []").is_err());
         assert!(executors("shims: [host, host]").is_err());
         assert!(executors("shims: [nope]").is_err());
+    }
+
+    #[test]
+    fn executor_system_resource_defaults_to_none_and_parses() {
+        assert_eq!(
+            executors("devices: []").unwrap().system_resource,
+            ResourceRequirement::default()
+        );
+        let configured = executors("system_resource: cpu=2,mem=4g").unwrap();
+        assert_eq!(
+            configured.system_resource,
+            ResourceRequirement::from("cpu=2,mem=4g")
+        );
+        assert!(executors("system_resource: foo=1").is_err());
     }
 
     #[test]

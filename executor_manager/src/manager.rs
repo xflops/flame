@@ -50,7 +50,10 @@ impl ExecutorManager {
             ))
         })?;
 
-        let dev_mgr = Arc::new(DeviceManagers::load(&ctx.cluster.executors.devices)?);
+        let dev_mgr = Arc::new(DeviceManagers::load(
+            &ctx.cluster.executors.devices,
+            &ctx.cluster.executors.system_resource,
+        )?);
         let client = BackendClient::new(ctx).await?;
 
         let cache_tls = match &ctx.cache {
