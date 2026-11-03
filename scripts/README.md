@@ -43,6 +43,7 @@ environment and from a `.env` file in the current directory (the environment win
 | `FLAME_STORAGE` | `fs://<prefix>/data` |
 | `FLAME_SHIMS` | `host` |
 | `FLAME_MAX_EXECUTORS` | `128` |
+| `FLAME_SYSTEM_RESOURCE` | unset; e.g. `cpu=2,mem=4g` holds that much back from executors for system daemons |
 | `FLAME_CACHE_ENDPOINT` | `grpc://127.0.0.1:9090` |
 | `FLAME_CACHE_ADVERTISE` | `lo` |
 | `FLAME_CACHE_STORAGE` | `<prefix>/data/cache` |

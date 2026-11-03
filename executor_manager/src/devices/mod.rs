@@ -93,7 +93,15 @@ pub struct DeviceManagers {
 }
 
 impl DeviceManagers {
-    pub fn load(names: &[String]) -> Result<Self, FlameError> {
+    /// Load the host managers plus `names`, holding `system` back for system
+    /// daemons: that much CPU and memory is neither reported as capacity nor
+    /// handed to executors.
+    pub fn load(names: &[String], system: &ResourceRequirement) -> Result<Self, FlameError> {
+        if system.gpu != 0 {
+            return Err(FlameError::InvalidConfig(
+                "system resource reserves cpu and memory only".to_string(),
+            ));
+        }
         let mut seen = HashSet::new();
         // Validate the entire configuration before discovering any hardware.
         for name in names {
@@ -115,8 +123,14 @@ impl DeviceManagers {
         }
         // CPU and memory are node capacity and always loaded; names select extras.
         let mut managers: Vec<(String, Arc<dyn DeviceManager>)> = vec![
-            (CPU.into(), Arc::new(cpu::CpuManager::new())),
-            (MEMORY.into(), Arc::new(memory::MemoryManager::new())),
+            (
+                CPU.into(),
+                Arc::new(cpu::CpuManager::with_reserved(system.cpu)?),
+            ),
+            (
+                MEMORY.into(),
+                Arc::new(memory::MemoryManager::with_reserved(system.memory)?),
+            ),
         ];
         for name in names {
             let manager: Box<dyn DeviceManager> = match name.as_str() {
@@ -222,7 +236,7 @@ mod tests {
 
     #[test]
     fn empty_config_loads_only_mandatory_host_managers() {
-        let managers = DeviceManagers::load(&[]).unwrap();
+        let managers = DeviceManagers::load(&[], &ResourceRequirement::default()).unwrap();
         let capacity = managers.capacity();
         assert!(capacity.cpu > 0);
         assert_eq!(capacity.gpu, 0);
@@ -230,6 +244,32 @@ mod tests {
         assert!(assignments.values().all(|a| a.devices().is_empty()));
         assert!(!assignments.contains_key(GPU));
         managers.release(&request()).unwrap();
+    }
+
+    #[test]
+    fn system_resource_is_held_back_from_capacity() {
+        let host = DeviceManagers::load(&[], &ResourceRequirement::default())
+            .unwrap()
+            .capacity();
+        let system = ResourceRequirement {
+            cpu: 1,
+            ..Default::default()
+        };
+        let managers = DeviceManagers::load(&[], &system).unwrap();
+        assert_eq!(managers.capacity().cpu, host.cpu - 1);
+        managers.discover().unwrap();
+        assert_eq!(managers.capacity().cpu, host.cpu - 1);
+
+        let too_much = ResourceRequirement {
+            cpu: host.cpu + 1,
+            ..Default::default()
+        };
+        assert!(DeviceManagers::load(&[], &too_much).is_err());
+        let gpu = ResourceRequirement {
+            gpu: 1,
+            ..Default::default()
+        };
+        assert!(DeviceManagers::load(&[], &gpu).is_err());
     }
 
     #[test]
@@ -243,6 +283,7 @@ mod tests {
         ] {
             assert!(DeviceManagers::load(
                 &names.into_iter().map(str::to_string).collect::<Vec<_>>(),
+                &ResourceRequirement::default(),
             )
             .is_err());
         }

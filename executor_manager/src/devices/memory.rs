@@ -49,6 +49,15 @@ impl MemoryManager {
             ledger: stdng::new_ptr(Ledger::new(crate::devices::MEMORY, total_memory())),
         }
     }
+
+    /// A manager that holds `reserved` back for system daemons.
+    pub fn with_reserved(reserved: u64) -> Result<Self, FlameError> {
+        Ok(Self {
+            ledger: stdng::new_ptr(
+                Ledger::new(crate::devices::MEMORY, total_memory()).reserve(reserved)?,
+            ),
+        })
+    }
 }
 
 impl DeviceManager for MemoryManager {

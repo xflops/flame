@@ -288,7 +288,8 @@ and from `./.env` (the environment wins; only `FLAME_*` keys are read, never exe
 that suit one machine: `FLAME_CLUSTER_NAME=flame`, `FLAME_ENDPOINT=http://127.0.0.1:8080`,
 `FLAME_RESREQ=cpu=1,mem=2g`, `FLAME_POLICIES=priority drf das`, `FLAME_STORAGE=fs://<prefix>/data`,
 `FLAME_SHIMS=host`, `FLAME_MAX_EXECUTORS=128`, `FLAME_CACHE_ENDPOINT=grpc://127.0.0.1:9090`,
-`FLAME_CACHE_ADVERTISE=lo`, `FLAME_CACHE_STORAGE=<prefix>/data/cache`. A value with a double quote or a
+`FLAME_CACHE_ADVERTISE=lo`, `FLAME_CACHE_STORAGE=<prefix>/data/cache`; `FLAME_SYSTEM_RESOURCE` (e.g. `cpu=2,mem=4g`,
+unset by default) becomes `cluster.executors.system_resource`. A value with a double quote or a
 newline is refused before anything is written. The file has many more possible settings, so the site
 administrator edits it for anything else; it is a target file like any other (the prompt, `--force`).
 Head and worker get the same file. Images carry the defaults; a deployment mounts its own. The server

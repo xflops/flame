@@ -166,6 +166,11 @@ cache:
 
 Restart the services after changing this file.
 
+`executors.system_resource` (for example `"cpu=2,mem=4g"`) holds CPU and memory
+back for system daemons on a node. The executor manager does not report it as
+capacity and never hands it to executors. It is empty by default, and a value
+larger than the host total stops the executor manager at startup.
+
 `limits.node.max_executors` caps active executors on each node. Set
 `limits.application.max_executors` or `limits.session.max_executors` to add hard
 ceilings per application or session. Each ceiling also applies when the

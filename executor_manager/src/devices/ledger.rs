@@ -23,6 +23,8 @@ use common::FlameError;
 pub(super) struct Ledger {
     resource: &'static str,
     total: u64,
+    /// Host capacity held back for system daemons; never handed to executors.
+    reserved: u64,
     claims: HashMap<String, u64>,
 }
 
@@ -33,16 +35,35 @@ impl Ledger {
         Self {
             resource,
             total,
+            reserved: 0,
             claims: HashMap::new(),
         }
+    }
+
+    /// Hold `reserved` back from the host total for system daemons.
+    pub(super) fn reserve(mut self, reserved: u64) -> Result<Self, FlameError> {
+        self.total = self.net(self.total, reserved)?;
+        self.reserved = reserved;
+        Ok(self)
+    }
+
+    fn net(&self, host: u64, reserved: u64) -> Result<u64, FlameError> {
+        host.checked_sub(reserved).ok_or_else(|| {
+            FlameError::InvalidConfig(format!(
+                "system reserved {} {reserved} exceeds the host total {host}",
+                self.resource
+            ))
+        })
     }
 
     pub(super) fn total(&self) -> u64 {
         self.total
     }
 
-    /// Update the host total; it may not drop below what is already reserved.
-    pub(super) fn refresh(&mut self, total: u64) -> Result<(), FlameError> {
+    /// Update the host total; the system reservation stays held back and the
+    /// result may not drop below what executors have already claimed.
+    pub(super) fn refresh(&mut self, host: u64) -> Result<(), FlameError> {
+        let total = self.net(host, self.reserved)?;
         let reserved: u64 = self.claims.values().sum();
         if total < reserved {
             return Err(FlameError::InvalidState(format!(
@@ -91,6 +112,17 @@ mod tests {
         ledger.release("a").unwrap();
         ledger.release("a").unwrap();
         ledger.allocate("c", 3).unwrap();
+    }
+
+    #[test]
+    fn system_reservation_is_held_back_across_refresh() {
+        let mut ledger = Ledger::new(crate::devices::CPU, 8).reserve(2).unwrap();
+        assert_eq!(ledger.total(), 6);
+        assert!(ledger.allocate("a", 7).is_err());
+        ledger.refresh(10).unwrap();
+        assert_eq!(ledger.total(), 8);
+        assert!(Ledger::new(crate::devices::CPU, 2).reserve(3).is_err());
+        assert!(ledger.refresh(1).is_err());
     }
 
     #[test]
