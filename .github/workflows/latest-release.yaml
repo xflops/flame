@@ -1,0 +1,138 @@
+name: Publish Latest Release
+
+# The install package and tools of the latest main, as the `latest` prerelease: one rolling release whose
+# assets and tag are replaced on every push, like the `latest` images. It is a prerelease and never GitHub's
+# "Latest" release, so setup.sh still installs the newest stable release by default; install this one with
+# `setup.sh --version latest`. It publishes nothing else: no PyPI, crates.io, images or site scripts.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Queue, never cancel: a cancelled run could leave the tag and the assets from different pushes.
+concurrency:
+  group: latest-release
+  cancel-in-progress: false
+
+env:
+  CLICOLOR_FORCE: 1
+  LATEST_TAG: latest
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} assets
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: 0.9.26
+
+      - name: Build the release assets
+        run: scripts/build.sh --output "${RUNNER_TEMP}/dist" --tag "${LATEST_TAG}"
+
+      # Install the way a user does: the checksums, then the package from a URL, as head and as worker.
+      - name: Smoke test the assets
+        run: |
+          dist="${RUNNER_TEMP}/dist"
+          name="flame-${LATEST_TAG}-linux-${{ matrix.arch }}"
+          (cd "${dist}" && sha256sum -c ./*.sha256)
+          scripts/inline.sh "${RUNNER_TEMP}/hosted"
+          (cd "${dist}" && python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          sleep 2
+          sh -s -- --package "http://127.0.0.1:8000/${name}.tar.gz" --prefix "${RUNNER_TEMP}/flame" --no-systemd \
+              < "${RUNNER_TEMP}/hosted/setup.sh"
+          sh -s -- --package "http://127.0.0.1:8000/${name}.tar.gz" --prefix "${RUNNER_TEMP}/flame" \
+              --join --python-version 3.12 --no-systemd --force < "${RUNNER_TEMP}/hosted/setup.sh"
+          "${RUNNER_TEMP}/flame/bin/flame-session-manager" --version
+
+      - name: Keep the assets for publishing
+        uses: actions/upload-artifact@v7
+        with:
+          name: latest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish the latest release
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # A slower, older run must not replace the assets of a newer push; the newer run publishes them.
+      - name: Skip when main has moved on
+        id: head
+        run: |
+          head="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
+          if [ "${head}" = "${GITHUB_SHA}" ]; then
+            echo "current=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "main is at ${head}, not ${GITHUB_SHA}; leaving the latest release to the newer run"
+            echo "current=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Download the assets
+        if: steps.head.outputs.current == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: latest-*
+          merge-multiple: true
+
+      - name: Point the latest tag at this commit
+        if: steps.head.outputs.current == 'true'
+        run: |
+          ref="repos/${GITHUB_REPOSITORY}/git/refs"
+          if gh api "${ref}/tags/${LATEST_TAG}" >/dev/null 2>&1; then
+            gh api -X PATCH "${ref}/tags/${LATEST_TAG}" -f sha="${GITHUB_SHA}" -F force=true >/dev/null
+          else
+            gh api -X POST "${ref}" -f ref="refs/tags/${LATEST_TAG}" -f sha="${GITHUB_SHA}" >/dev/null
+          fi
+
+      - name: Publish the release
+        if: steps.head.outputs.current == 'true'
+        run: |
+          notes="Latest build of main, replaced on every push: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}
+
+          Images: the \`latest\` tags, and \`sha-${GITHUB_SHA}\` for this commit, on Docker Hub (xflops/*).
+
+          Install: \`curl -fsSL https://xflops.io/flame/setup.sh | sudo sh -s -- --version ${LATEST_TAG}\`
+
+          This is not a stable release; use the newest versioned release for production."
+          if gh release view "${LATEST_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${LATEST_TAG}" --repo "${GITHUB_REPOSITORY}" --prerelease --latest=false \
+              --title "Latest (${GITHUB_SHA::7})" --notes "${notes}"
+          else
+            gh release create "${LATEST_TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag --prerelease --latest=false \
+              --title "Latest (${GITHUB_SHA::7})" --notes "${notes}"
+          fi
+          gh release upload "${LATEST_TAG}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber

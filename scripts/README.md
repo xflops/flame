@@ -125,6 +125,24 @@ dist/package/sbin/sdk.sh
 The release publishes `flame-<tag>-linux-<amd64|arm64>.tar.gz` and the four tools
 (`<tool>-<tag>-linux-<arch>`, also published on their own), each with a `.sha256`.
 
+## The latest build of main
+
+Every push to `main` replaces the `latest` prerelease (`.github/workflows/latest-release.yaml`) with the package
+and tools built from that commit, for the same two architectures and with the same checksums, next to the
+`latest` images built from the same push. It is a prerelease, not GitHub's "Latest" release, so the plain
+`setup.sh` still installs the newest stable release; ask for this one by name:
+
+```shell
+curl -fsSL https://xflops.io/flame/setup.sh | sudo sh -s -- --version latest
+```
+
+`FLAME_VERSION=latest` (upper case) in the environment or in `./.env` does the same, for `sdk.sh` too. `sudo` drops
+the environment, so pass it with `sudo -E` or `sudo FLAME_VERSION=latest sh`, and unset it afterwards: while it is
+set, every `setup.sh` and `sdk.sh` run installs this build.
+
+The release notes name the commit. The workflow publishes nothing else: PyPI, crates.io and the hosted scripts
+only change with a real release.
+
 ## Tests
 
 ```shell
