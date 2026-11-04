@@ -74,7 +74,12 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: latest-${{ matrix.arch }}
-          path: ${{ runner.temp }}/dist/*
+          path: |
+            ${{ runner.temp }}/dist/flame-*.tar.gz*
+            ${{ runner.temp }}/dist/flmctl-*
+            ${{ runner.temp }}/dist/flmping-*
+            ${{ runner.temp }}/dist/flmexec-*
+            ${{ runner.temp }}/dist/flmbench-*
           if-no-files-found: error
           retention-days: 1
 
@@ -135,4 +140,7 @@ jobs:
             gh release create "${LATEST_TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag --prerelease --latest=false \
               --title "Latest (${GITHUB_SHA::7})" --notes "${notes}"
           fi
-          gh release upload "${LATEST_TAG}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+          # the assets only: the build output also holds the unpacked package directory
+          cd dist
+          gh release upload "${LATEST_TAG}" flame-*.tar.gz* flmctl-* flmping-* flmexec-* flmbench-* \
+            --repo "${GITHUB_REPOSITORY}" --clobber
