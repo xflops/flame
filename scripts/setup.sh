@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install a Flame cluster node from a release package: the head node, or a worker that joins it.
+# Install a Flame cluster node and client tools from a release package: the head node, or a worker.
 #
 #   curl -fsSL https://xflops.io/flame/setup.sh | sh                              # the head node
 #   curl -fsSL https://xflops.io/flame/setup.sh | sh -s -- --join                 # a worker
@@ -25,6 +25,8 @@ usage: setup.sh [--join] [--prefix DIR] [--package DIR|FILE|URL] [--version TAG]
   --no-systemd         do not write unit files or start anything
   --force              replace an installation that is already there without asking (without it,
                        setup.sh asks, and with no terminal to ask on, stops)
+
+Both head and worker installs include flmctl (admin CLI), flmping, flmexec and flmbench.
 
 environment: FLAME_VERSION, FLAME_BASE_URL (release download base, for a mirror)
 
@@ -126,6 +128,9 @@ acquire_package() {
 # target_files lists the files this install writes, so an existing one is found before anything changes.
 target_files() {
     printf '%s\n' "$prefix/conf/flame-cluster.yaml"
+    for tool in flmctl flmping flmexec flmbench; do
+        printf '%s\n' "$prefix/bin/$tool"
+    done
     if [ "$join" -eq 0 ]; then
         printf '%s\n' "$prefix/bin/flame-session-manager"
         for manifest in "$pkg"/config/applications/*.yaml "$pkg"/config/applications/*.yml; do
@@ -352,6 +357,9 @@ install_node() {
     log "Installing to $prefix..."
     make_dirs
     write_config
+    for tool in flmctl flmping flmexec flmbench; do
+        install_bin "$tool"
+    done
     if [ "$join" -eq 0 ]; then
         install_bin flame-session-manager
         install_manifests_and_migrations
