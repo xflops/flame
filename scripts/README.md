@@ -7,7 +7,7 @@ release's and install it by default, and `https://xflops.io/flame/<tag>/setup.sh
 
 | Script | Use it to |
 |---|---|
-| `setup.sh` | install a cluster node: the head node, or a worker that joins it |
+| `setup.sh` | install a head or worker node, including `flmctl`, `flmping`, `flmexec` and `flmbench` |
 | `sdk.sh` | install the client: `flmctl`, `flmping`, `flmexec`, `flmbench` and the Python SDK `flamepy` |
 | `build.sh` | build the release package from a source tree |
 
@@ -128,7 +128,7 @@ The release publishes `flame-<tag>-linux-<amd64|arm64>.tar.gz` and the four tool
 ## The latest build of main
 
 Every push to `main` replaces the `latest` prerelease (`.github/workflows/latest-release.yaml`) with the package
-and tools built from that commit, for the same two architectures and with the same checksums, next to the
+and standalone `flmctl` admin binary built from that commit, for the same two architectures and with the same checksums, next to the
 `latest` images built from the same push. It is a prerelease, not GitHub's "Latest" release, so the plain
 `setup.sh` still installs the newest stable release; ask for this one by name:
 
@@ -142,6 +142,13 @@ set, every `setup.sh` and `sdk.sh` run installs this build.
 
 The release notes name the commit. The workflow publishes nothing else: PyPI, crates.io and the hosted scripts
 only change with a real release.
+
+The archive still contains every binary, including `flmping`, `flmexec`, and `flmbench`.
+`sdk.sh` installs these client tools and `flmctl` from the archive; it does not download
+standalone tool assets. `setup.sh` installs `flmctl`, `flmping`, `flmexec`, and `flmbench`
+on both head and worker nodes, alongside the node services from the same archive.
+Workers also receive `flmping-service` and `flmexec-service`. Standalone `flmctl` lets administrators
+download the admin CLI without installing the SDK or a cluster node.
 
 ## Tests
 

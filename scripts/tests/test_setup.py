@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from helpers import (
-    BINARIES, SCRIPTS, ReleaseServer, ScriptCase, make_archive, make_package, write_checksum,
+    BINARIES, SCRIPTS, TOOLS, ReleaseServer, ScriptCase, make_archive, make_package, write_checksum,
 )
 
 
@@ -30,10 +30,10 @@ class SetupTests(ScriptCase):
 
     # --- the head -------------------------------------------------------------------------------
 
-    def test_head_installs_only_the_session_manager(self):
+    def test_head_installs_the_session_manager_and_client_tools(self):
         self.ok(self.setup())
 
-        self.assertEqual(self.installed(), {"flame-session-manager"})
+        self.assertEqual(self.installed(), {"flame-session-manager", *TOOLS})
         self.assertTrue((self.prefix / "conf/flame-cluster.yaml").is_file())
         self.assertTrue((self.prefix / "migrations/sqlite/001.sql").is_file())
         self.assertTrue((self.prefix / "conf/applications/flmexec.yaml").is_file())
@@ -136,10 +136,11 @@ class SetupTests(ScriptCase):
 
         self.assertEqual(
             self.installed(),
-            {"flame-executor-manager", "flame-object-cache", "flmping-service", "flmexec-service", "flmbox", "uv"},
+            {"flame-executor-manager", "flame-object-cache", "flmping-service", "flmexec-service", "flmbox", "uv", *TOOLS},
         )
         self.assertFalse((self.prefix / "bin/flame-session-manager").exists())
-        self.assertFalse((self.prefix / "bin/flmctl").exists())
+        for tool in TOOLS:
+            self.assertTrue((self.prefix / "bin" / tool).stat().st_mode & 0o111)
         self.assertFalse((self.prefix / "migrations/sqlite/001.sql").exists())
         self.assertTrue((self.prefix / "conf/flame-cluster.yaml").is_file())
 
@@ -275,7 +276,7 @@ class SetupTests(ScriptCase):
         self.assertNotIn("[y/N]", result.stderr)
 
     def test_any_existing_target_is_refused(self):
-        for relative in ("bin/flame-session-manager", "conf/applications/flmexec.yaml", "migrations/sqlite/001.sql"):
+        for relative in ("bin/flame-session-manager", "conf/applications/flmexec.yaml", "migrations/sqlite/001.sql", *(f"bin/{tool}" for tool in TOOLS)):
             with self.subTest(relative=relative):
                 shutil.rmtree(self.prefix, ignore_errors=True)
                 (self.prefix / relative).parent.mkdir(parents=True)
@@ -286,6 +287,20 @@ class SetupTests(ScriptCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(relative, result.stderr)
                 self.assertEqual((self.prefix / relative).read_text(), "mine")
+
+    def test_worker_refuses_to_overwrite_existing_client_tools(self):
+        for tool in TOOLS:
+            with self.subTest(tool=tool):
+                shutil.rmtree(self.prefix, ignore_errors=True)
+                path = self.prefix / "bin" / tool
+                path.parent.mkdir(parents=True)
+                path.write_text("mine")
+
+                result = self.setup("--join", "--no-systemd")
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"bin/{tool}", result.stderr)
+                self.assertEqual(path.read_text(), "mine")
 
     def test_an_existing_unit_file_is_refused_without_force(self):
         self.unit_dir.mkdir()

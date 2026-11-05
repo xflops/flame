@@ -1,6 +1,6 @@
 name: Publish Latest Release
 
-# The install package and tools of the latest main, as the `latest` prerelease: one rolling release whose
+# The install package and flmctl of the latest main, as the `latest` prerelease: one rolling release whose
 # assets and tag are replaced on every push, like the `latest` images. It is a prerelease and never GitHub's
 # "Latest" release, so setup.sh still installs the newest stable release by default; install this one with
 # `setup.sh --version latest`. It publishes nothing else: no PyPI, crates.io, images or site scripts.
@@ -66,9 +66,16 @@ jobs:
           sleep 2
           sh -s -- --package "http://127.0.0.1:8000/${name}.tar.gz" --prefix "${RUNNER_TEMP}/flame" --no-systemd \
               < "${RUNNER_TEMP}/hosted/setup.sh"
+          for tool in flmctl flmping flmexec flmbench; do
+            test -x "${RUNNER_TEMP}/flame/bin/${tool}"
+          done
           sh -s -- --package "http://127.0.0.1:8000/${name}.tar.gz" --prefix "${RUNNER_TEMP}/flame" \
               --join --python-version 3.12 --no-systemd --force < "${RUNNER_TEMP}/hosted/setup.sh"
           "${RUNNER_TEMP}/flame/bin/flame-session-manager" --version
+          "${RUNNER_TEMP}/dist/package/sbin/sdk.sh" --prefix "${RUNNER_TEMP}/client" --python-version 3.12
+          for tool in flmctl flmping flmexec flmbench; do
+            test -x "${RUNNER_TEMP}/client/bin/${tool}"
+          done
 
       - name: Keep the assets for publishing
         uses: actions/upload-artifact@v7
@@ -77,9 +84,6 @@ jobs:
           path: |
             ${{ runner.temp }}/dist/flame-*.tar.gz*
             ${{ runner.temp }}/dist/flmctl-*
-            ${{ runner.temp }}/dist/flmping-*
-            ${{ runner.temp }}/dist/flmexec-*
-            ${{ runner.temp }}/dist/flmbench-*
           if-no-files-found: error
           retention-days: 1
 
@@ -142,5 +146,13 @@ jobs:
           fi
           # the assets only: the build output also holds the unpacked package directory
           cd dist
-          gh release upload "${LATEST_TAG}" flame-*.tar.gz* flmctl-* flmping-* flmexec-* flmbench-* \
+          gh release upload "${LATEST_TAG}" flame-*.tar.gz* flmctl-* \
             --repo "${GITHUB_REPOSITORY}" --clobber
+          # --clobber replaces matching names but leaves assets from earlier publication policies.
+          assets="$(gh release view "${LATEST_TAG}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')"
+          while IFS= read -r asset; do
+            case "${asset}" in
+              flame-*.tar.gz|flame-*.tar.gz.sha256|flmctl-*) ;;
+              *) gh release delete-asset "${LATEST_TAG}" "${asset}" --repo "${GITHUB_REPOSITORY}" --yes ;;
+            esac
+          done <<< "${assets}"
