@@ -51,8 +51,10 @@ flmctl deploy --application <path> [--name <application-name>]
 ```
 
 The current Flame context supplies the cache endpoint. It accepts `grpc://`,
-`grpcs://`, `grpc+tls://` (normalized to `grpcs://`), and `grpcs-proxy://`.
-The proxy scheme requires an explicit port; the other schemes default to 9090.
+`grpcs://`, `grpc+tls://` (normalized to `grpcs://`), `grpc-proxy://`, and
+`grpcs-proxy://`. Both proxy schemes require an explicit port; the other
+schemes default to 9090. `grpc-proxy://` uses plaintext HTTP/2 to the gateway;
+`grpcs-proxy://` uses TLS.
 Credentials, paths, queries, and fragments are not accepted. Other options from
 RFE458 remain available, including explicit `--command`, `--argument`,
 `--installer`, `--dry-run`, and `-o summary|yaml|json`. Explicit installer and

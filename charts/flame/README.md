@@ -204,7 +204,7 @@ names, or routes. A site administrator who wants external access must provide
 both external paths independently:
 
 - a frontend-only LoadBalancer for the session manager; and
-- a TLS-terminating gRPC proxy and LoadBalancer for the object cache.
+- a gRPC proxy and LoadBalancer for the object cache.
 
 The session-manager LoadBalancer must expose only the frontend port and route
 it to the Flame session-manager Service. The backend/executor-facing port must
@@ -212,25 +212,25 @@ remain internal.
 
 The object-cache proxy must:
 
-- accept HTTP/2 gRPC connections over TLS at its public address;
-- present a certificate valid for that address;
-- route initial operations carrying the public proxy authority to the Flame
+- accept plaintext HTTP/2 gRPC or gRPC over TLS at its public address,
+  matching the client endpoint scheme;
+- when using TLS, present a certificate valid for that address;
+- route initial operations without `x-flame-object-cache` to the Flame
   object-cache Service on `objectCache.service.port`; and
 - accept an owning cache endpoint from an object reference in the
   `x-flame-object-cache` gRPC metadata header and route it to that specific
-  cache replica, while keeping the public proxy name in the client request's
-  HTTP/2 `:authority` header.
+  cache replica.
 
 The gateway must restrict replica routing to endpoints belonging to the Flame
 object-cache Service; it must not act as an unrestricted dynamic forward proxy.
 The object-cache Service remains `ClusterIP`. The external LoadBalancer must
 not directly expose the executor-manager pods or the cache port on the nodes.
 
-The external cache endpoint is
-`grpcs-proxy://<address>:<proxy-port>`. Clients dial that proxy over TLS and
-send the owning cache replica endpoint as `x-flame-object-cache` metadata for
-operations on a returned object reference. The chart-managed client
+The external cache endpoint is `grpc-proxy://<address>:<proxy-port>` for
+plaintext HTTP/2 or `grpcs-proxy://<address>:<proxy-port>` for TLS. Both require
+an explicit port and an administrator-managed gateway listener matching the
+selected transport. Clients send the owning cache replica endpoint as
+`x-flame-object-cache` metadata for operations on a returned object reference. The chart-managed client
 configuration always uses the in-cluster Services. The site administrator
 creates a separate external configuration with the session-manager
-LoadBalancer endpoint
-and this `grpcs-proxy://` endpoint; both configurations use the same schema.
+LoadBalancer endpoint and the selected proxy endpoint; both configurations use the same schema.

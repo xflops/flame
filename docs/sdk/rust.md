@@ -42,8 +42,13 @@ contexts:
 Use `flame_rs::connect_with_config(Some(path))` or `flame_rs::connect_with_context(context)` when a process needs an explicit config source.
 For a client certificate, set both `cert_file` and `key_file` under the
 relevant `cluster.tls` or `cache.tls` section. An external cache proxy uses
-`grpcs-proxy://host:port`; reference requests send the owning cache address
-in `x-flame-object-cache` metadata while TLS verifies the public proxy host.
+`grpc-proxy://host:port` for plaintext HTTP/2 or `grpcs-proxy://host:port`
+for TLS. Both require an explicit port and send the owning cache address in
+`x-flame-object-cache` metadata for reference requests. Gateways route these
+requests to the owner named in the header and initial requests without the
+header to the cache Service. With TLS, certificate verification uses the public
+proxy host. The administrator must configure a gateway listener matching the
+selected transport.
 Rotated certificate and CA files are read when a new cache connection opens.
 
 ## Define Typed Messages

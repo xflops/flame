@@ -432,18 +432,19 @@ impl CacheEndpoint {
         let scheme = match parsed.scheme() {
             "grpc" => "grpc",
             "grpcs" | "grpc+tls" => "grpcs",
+            "grpc-proxy" => "grpc-proxy",
             "grpcs-proxy" => "grpcs-proxy",
             scheme => {
                 return Err(FlameError::InvalidConfig(format!(
-                    "unsupported cache endpoint scheme <{}>; expected grpc, grpcs, grpc+tls, or grpcs-proxy",
+                    "unsupported cache endpoint scheme <{}>; expected grpc, grpcs, grpc+tls, grpc-proxy, or grpcs-proxy",
                     scheme
                 )));
             }
         }
         .to_string();
-        if scheme == "grpcs-proxy" && parsed.port().is_none() {
+        if matches!(scheme.as_str(), "grpc-proxy" | "grpcs-proxy") && parsed.port().is_none() {
             return Err(FlameError::InvalidConfig(
-                "grpcs-proxy endpoint requires an explicit port".to_string(),
+                "cache proxy endpoint requires an explicit port".to_string(),
             ));
         }
         let host = parsed
@@ -551,7 +552,9 @@ fn endpoint_for_reference(reference_endpoint: &str) -> Result<CacheEndpoint, Fla
     let Some(configured_endpoint) = cache.endpoint.as_deref() else {
         return Ok(origin);
     };
-    if !configured_endpoint.starts_with("grpcs-proxy://") {
+    if !configured_endpoint.starts_with("grpc-proxy://")
+        && !configured_endpoint.starts_with("grpcs-proxy://")
+    {
         return Ok(origin);
     }
     let proxy = CacheEndpoint::parse(configured_endpoint)?;
@@ -924,33 +927,42 @@ mod tests {
     }
 
     #[test]
-    fn cache_endpoint_accepts_grpcs_proxy() {
-        let proxy = CacheEndpoint::parse("grpcs-proxy://gateway.example.com:9090").unwrap();
-        let origin = CacheEndpoint::parse("grpc://cache-0.cache:9090").unwrap();
-        let routed = proxy.clone().proxy_for(&origin);
-        assert_eq!(routed.scheme, "grpcs-proxy");
-        assert_eq!(routed.host, "gateway.example.com");
-        assert_eq!(routed.port, 9090);
-        assert_eq!(routed.target.as_deref(), Some("cache-0.cache:9090"));
-        let request = cache_request(&routed, CacheGetRequest::default()).unwrap();
-        assert_eq!(
-            request.metadata().get(CACHE_TARGET_HEADER).unwrap(),
-            "cache-0.cache:9090"
-        );
-        assert!(cache_request(&proxy, CacheGetRequest::default())
-            .unwrap()
-            .metadata()
-            .get(CACHE_TARGET_HEADER)
-            .is_none());
+    fn cache_endpoint_accepts_proxy_schemes() {
+        for scheme in ["grpc-proxy", "grpcs-proxy"] {
+            let proxy =
+                CacheEndpoint::parse(&format!("{scheme}://gateway.example.com:9090")).unwrap();
+            let origin = CacheEndpoint::parse("grpc://cache-0.cache:9090").unwrap();
+            let routed = proxy.clone().proxy_for(&origin);
+            assert_eq!(routed.scheme, scheme);
+            assert_eq!(routed.host, "gateway.example.com");
+            assert_eq!(routed.port, 9090);
+            assert_eq!(routed.target.as_deref(), Some("cache-0.cache:9090"));
+            let request = cache_request(&routed, CacheGetRequest::default()).unwrap();
+            assert_eq!(
+                request.metadata().get(CACHE_TARGET_HEADER).unwrap(),
+                "cache-0.cache:9090"
+            );
+            assert!(cache_request(&proxy, CacheGetRequest::default())
+                .unwrap()
+                .metadata()
+                .get(CACHE_TARGET_HEADER)
+                .is_none());
+        }
     }
 
     #[test]
     fn cache_endpoint_rejects_proxy_url_extras() {
-        assert!(CacheEndpoint::parse("grpc-proxy://gateway:9090").is_err());
-        assert!(CacheEndpoint::parse("grpcs-proxy://gateway:9090/path").is_err());
-        assert!(CacheEndpoint::parse("grpcs-proxy://gateway:9090?host=cache:9090").is_err());
-        assert!(CacheEndpoint::parse("grpcs-proxy://user@gateway:9090").is_err());
-        assert!(CacheEndpoint::parse("grpcs-proxy://gateway").is_err());
+        for scheme in ["grpc-proxy", "grpcs-proxy"] {
+            for authority in [
+                "gateway:9090/path",
+                "gateway:9090?host=cache:9090",
+                "gateway:9090#fragment",
+                "user@gateway:9090",
+                "gateway",
+            ] {
+                assert!(CacheEndpoint::parse(&format!("{scheme}://{authority}")).is_err());
+            }
+        }
     }
 
     #[test]
@@ -962,24 +974,26 @@ mod tests {
 
     #[test]
     fn env_only_context_routes_references() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("object::tests::env_only_context_child")
-            .env("FLAME_ENV_CONTEXT_CHILD", "1")
-            .env(
-                "HOME",
-                std::env::temp_dir().join("flame-env-only-no-config"),
-            )
-            .env("FLAME_ENDPOINT", "http://session.example.com:8080")
-            .env(
-                "FLAME_CACHE_ENDPOINT",
-                "grpcs-proxy://gateway.example.com:9443",
-            )
-            .env("FLAME_CERT_FILE", "client.crt")
-            .env("FLAME_KEY_FILE", "client.key")
-            .status()
-            .unwrap();
-        assert!(status.success());
+        for scheme in ["grpc-proxy", "grpcs-proxy"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("object::tests::env_only_context_child")
+                .env("FLAME_ENV_CONTEXT_CHILD", "1")
+                .env(
+                    "HOME",
+                    std::env::temp_dir().join("flame-env-only-no-config"),
+                )
+                .env("FLAME_ENDPOINT", "http://session.example.com:8080")
+                .env(
+                    "FLAME_CACHE_ENDPOINT",
+                    format!("{scheme}://gateway.example.com:9443"),
+                )
+                .env("FLAME_CERT_FILE", "client.crt")
+                .env("FLAME_KEY_FILE", "client.key")
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
     }
 
     #[test]
@@ -988,6 +1002,8 @@ mod tests {
             return;
         }
         let endpoint = endpoint_for_reference("grpc://cache-0.cache:9090").unwrap();
+        let configured = std::env::var("FLAME_CACHE_ENDPOINT").unwrap();
+        assert_eq!(endpoint.scheme, configured.split("://").next().unwrap());
         assert_eq!(endpoint.host, "gateway.example.com");
         assert_eq!(endpoint.target.as_deref(), Some("cache-0.cache:9090"));
         let tls = current_cache_tls().unwrap().unwrap();

@@ -102,10 +102,39 @@ class TestAioCache:
         with pytest.raises(ValueError, match="cert_file and key_file"):
             aio_cache._create_client("grpcs-proxy://gateway.example:443", FlameClientTls(key_file="key.pem"), None)
 
-    def test_plaintext_direct_cache_ignores_tls_identity(self, monkeypatch):
+    @pytest.mark.parametrize("scheme", ["grpc", "grpc-proxy"])
+    def test_plaintext_cache_ignores_tls_identity(self, monkeypatch, scheme):
         monkeypatch.setattr(aio_cache.grpc.aio, "insecure_channel", lambda target, options: object())
         monkeypatch.setattr(aio_cache.cache_pb2_grpc, "ObjectCacheServiceStub", lambda channel: channel)
-        aio_cache._create_client("grpc://cache:9090", FlameClientTls(cert_file="client.pem"), None)
+        aio_cache._create_client(f"{scheme}://cache:9090", FlameClientTls(cert_file="client.pem"), None)
+
+    def test_plaintext_proxy_initial_and_owner_routes(self, monkeypatch):
+        routes = []
+
+        class Service(cache_pb2_grpc.ObjectCacheServiceServicer):
+            async def GetMetadata(self, request, context):  # noqa: N802 - gRPC method name
+                routes.append(dict(context.invocation_metadata()).get("x-flame-object-cache"))
+                return cache_pb2.CacheObjectMetadata(key=request.key)
+
+        async def run():
+            server = grpc.aio.server()
+            cache_pb2_grpc.add_ObjectCacheServiceServicer_to_server(Service(), server)
+            port = server.add_insecure_port("127.0.0.1:0")
+            await server.start()
+            endpoint = f"grpc-proxy://127.0.0.1:{port}"
+            monkeypatch.setattr(cache_module, "_get_cached_context", lambda: SimpleNamespace(cache=cache_module.FlameClientCache(endpoint=endpoint)))
+            try:
+                for origin in (endpoint, "grpc://cache-0:9090", "grpcs://cache-1:9090"):
+                    response = await aio_cache._get_client(origin).GetMetadata(cache_pb2.CacheGetMetadataRequest(key="key"), timeout=5)
+                    assert response.key == "key"
+                assert routes == [None, "cache-0:9090", "cache-1:9090"]
+            finally:
+                clients = aio_cache._clients.pop(asyncio.get_running_loop(), {})
+                for channel, _ in clients.values():
+                    await channel.close()
+                await server.stop(0)
+
+        asyncio.run(run())
 
     def test_invalid_context_does_not_fall_back_to_direct_cache(self, monkeypatch):
         monkeypatch.setattr(cache_module, "_get_cached_context", lambda: (_ for _ in ()).throw(ValueError("bad TLS configuration")))
@@ -164,7 +193,7 @@ class TestAioCache:
         routes = []
         asyncio.run(run())
 
-    @pytest.mark.parametrize("endpoint", ["grpcs-proxy://gateway:443/path", "grpcs-proxy://gateway"])
+    @pytest.mark.parametrize("endpoint", [f"{scheme}://{address}" for scheme in ("grpc-proxy", "grpcs-proxy") for address in ("gateway:443/path", "gateway", "user@gateway:443", "gateway:443?route=other", "gateway:bad")])
     def test_invalid_proxy(self, endpoint):
         with pytest.raises(ValueError, match="proxy endpoint"):
             cache_module._resolve_cache_endpoint(endpoint)
