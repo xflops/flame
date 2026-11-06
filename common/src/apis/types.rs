@@ -257,7 +257,8 @@ pub struct Session {
     pub version: u32,
     pub common_data: Option<CommonData>,
     pub tokens: HashMap<String, String>,
-    pub tasks: HashMap<TaskID, TaskPtr>,
+    pub tasks: BTreeMap<TaskID, TaskPtr>,
+    pub task_counts: TaskCounts,
     pub tasks_index: HashMap<TaskState, BTreeMap<TaskID, TaskPtr>>,
     pub creation_time: DateTime<Utc>,
     pub completion_time: Option<DateTime<Utc>>,
@@ -290,6 +291,53 @@ pub enum TaskState {
     Succeed = 2,
     Failed = 3,
     Cancelled = 4,
+}
+
+/// Logical task counts, independent of pending dequeue and cache eviction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskCounts {
+    pub pending: u64,
+    pub running: u64,
+    pub succeed: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+}
+
+impl TaskCounts {
+    pub fn get(&self, state: TaskState) -> u64 {
+        match state {
+            TaskState::Pending => self.pending,
+            TaskState::Running => self.running,
+            TaskState::Succeed => self.succeed,
+            TaskState::Failed => self.failed,
+            TaskState::Cancelled => self.cancelled,
+        }
+    }
+
+    fn value_mut(&mut self, state: TaskState) -> &mut u64 {
+        match state {
+            TaskState::Pending => &mut self.pending,
+            TaskState::Running => &mut self.running,
+            TaskState::Succeed => &mut self.succeed,
+            TaskState::Failed => &mut self.failed,
+            TaskState::Cancelled => &mut self.cancelled,
+        }
+    }
+
+    pub fn increment(&mut self, state: TaskState) {
+        *self.value_mut(state) += 1;
+    }
+
+    pub fn transition(&mut self, old: TaskState, new: TaskState) -> Result<(), crate::FlameError> {
+        if old != new {
+            let count = self.value_mut(old);
+            *count = count.checked_sub(1).ok_or_else(|| {
+                crate::FlameError::Internal(format!("task count underflow for {old}"))
+            })?;
+            self.increment(new);
+        }
+        Ok(())
+    }
 }
 
 impl TaskState {

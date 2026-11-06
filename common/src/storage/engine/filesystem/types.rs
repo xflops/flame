@@ -263,26 +263,43 @@ impl SessionEntry {
         self.metadata.state == SessionState::Closed as i32
     }
 
-    /// The lock of one task, created on first use and kept for the life of the
-    /// session entry.
+    /// The gate of one task, retained while an operation or waiter owns it.
     pub(super) fn task_lock(&self, task_id: TaskID) -> RWPtr<()> {
         self.tasks.lock().entry(task_id).or_default().clone()
     }
 
     /// Run `f` holding the task's write lock. `f` is always synchronous, so a
     /// lock is never held across an await and a waiter only waits for one
-    /// record read-modify-write.
+    /// synchronous operation on the same task.
     pub(super) fn with_task<R>(&self, task_id: TaskID, f: impl FnOnce() -> R) -> R {
-        let lock = self.task_lock(task_id);
-        let _guard = write_ptr!(lock).unwrap();
-        f()
+        let result = {
+            let lock = self.task_lock(task_id);
+            let _guard = write_ptr!(lock).unwrap();
+            f()
+        };
+        self.prune_task_lock(task_id);
+        result
     }
 
     /// Run `f` holding the task's read lock: no writer is mid-update.
     pub(super) fn with_task_read<R>(&self, task_id: TaskID, f: impl FnOnce() -> R) -> R {
-        let lock = self.task_lock(task_id);
-        let _guard = read_ptr!(lock).unwrap();
-        f()
+        let result = {
+            let lock = self.task_lock(task_id);
+            let _guard = read_ptr!(lock).unwrap();
+            f()
+        };
+        self.prune_task_lock(task_id);
+        result
+    }
+
+    fn prune_task_lock(&self, task_id: TaskID) {
+        let mut tasks = self.tasks.lock();
+        if tasks
+            .get(&task_id)
+            .is_some_and(|gate| Arc::strong_count(gate) == 1)
+        {
+            tasks.remove(&task_id);
+        }
     }
 
     /// The shared handle for one file, opened on first use.

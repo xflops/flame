@@ -272,6 +272,11 @@ create_external_access() {
     local host_ip=""
     local -a cache_host_ips=()
 
+    # DaemonSet readiness can lag a worker restart; wait on the pods we will use.
+    kubectl -n "$NAMESPACE" wait pod \
+        -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=executor-manager" \
+        --for=condition=Ready --timeout="$TIMEOUT"
+
     # Object refs carry the worker node address <host-ip>:<port>.
     mapfile -t cache_host_ips < <(kubectl -n "$NAMESPACE" get pod \
         -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=executor-manager" \

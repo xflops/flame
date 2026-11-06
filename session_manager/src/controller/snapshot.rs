@@ -273,8 +273,17 @@ impl TryFrom<&Session> for SessionInfo {
 
     fn try_from(ssn: &Session) -> Result<Self, Self::Error> {
         let mut tasks_status = HashMap::new();
-        for (k, v) in &ssn.tasks_index {
-            tasks_status.insert(*k, v.len() as i32);
+        for state in [
+            TaskState::Pending,
+            TaskState::Running,
+            TaskState::Succeed,
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ] {
+            tasks_status.insert(
+                state,
+                ssn.task_counts.get(state).min(i32::MAX as u64) as i32,
+            );
         }
         let mut task_index = HashMap::new();
         for (state, tasks) in ssn
@@ -931,6 +940,42 @@ mod tests {
         let info = SessionInfo::try_from(&session).unwrap();
 
         assert_eq!(info.retry_count, 7);
+    }
+
+    #[test]
+    fn session_info_counts_terminal_tasks_without_retaining_their_records() {
+        let mut session = Session::default();
+        for (id, state) in [
+            (1, TaskState::Pending),
+            (2, TaskState::Running),
+            (3, TaskState::Succeed),
+            (4, TaskState::Failed),
+            (5, TaskState::Cancelled),
+        ] {
+            session
+                .update_task(&Task {
+                    id,
+                    state,
+                    version: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        assert_eq!(session.tasks.len(), 2);
+
+        let info = SessionInfo::try_from(&session).unwrap();
+
+        for state in [
+            TaskState::Pending,
+            TaskState::Running,
+            TaskState::Succeed,
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ] {
+            assert_eq!(info.tasks_status.get(&state), Some(&1));
+        }
+        assert_eq!(info.task_index.len(), 2);
+        assert!(!info.task_index.contains_key(&TaskState::Succeed));
     }
 
     /// Default per-slot unit kept for backward-compatible test scaffolding.
