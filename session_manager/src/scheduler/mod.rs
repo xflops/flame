@@ -1397,7 +1397,8 @@ mod tests {
         // First reproduce one pending task with no configured instance cap,
         // then ensure additional task demand still grows the executor pool.
         for demand in [1, 3] {
-            let existing_tasks = controller.list_tasks(session_id.clone())?.len();
+            let existing_tasks =
+                tokio_test::block_on(controller.list_tasks(session_id.clone()))?.len();
             for _ in existing_tasks..demand {
                 tokio_test::block_on(controller.create_task(session_id.clone(), None, None))?;
             }

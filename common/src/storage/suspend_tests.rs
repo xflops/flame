@@ -18,7 +18,7 @@ mod tests {
     use stdng::lock_ptr;
 
     use crate::apis::{
-        ApplicationAttributes, SessionAttributes, SessionState, TaskResult, TaskState,
+        ApplicationAttributes, SessionAttributes, SessionState, TaskFilter, TaskResult, TaskState,
     };
     use crate::ctx::{FlameCluster, FlameClusterContext};
     use crate::events::MemoryEventManager;
@@ -35,6 +35,7 @@ mod tests {
         };
         let mut storage = (*storage::new_ptr(&context).await.unwrap()).clone();
         storage.engine = engine::connect(url).await.unwrap();
+        storage.context.cluster.storage = url.to_string();
         storage.event_manager = Arc::new(MemoryEventManager::new());
         storage
     }
@@ -108,11 +109,8 @@ mod tests {
                 let ssn = set(&storage, "s", state).await.unwrap();
                 assert_eq!(ssn.status.state, state, "{url}");
                 assert_eq!(storage.get_session("s".into()).unwrap().status.state, state);
-                // The none engine keeps nothing to read back.
-                if url != "none" {
-                    let persisted = storage.engine.get_session("s".into()).await.unwrap();
-                    assert_eq!(persisted.status.state, state, "{url}");
-                }
+                let persisted = storage.engine.get_session("s".into()).await.unwrap();
+                assert_eq!(persisted.status.state, state, "{url}");
             }
 
             assert!(matches!(
@@ -141,12 +139,10 @@ mod tests {
                 storage.get_session("s".into()).unwrap().is_closed(),
                 "{url}"
             );
-            if url != "none" {
-                assert!(
-                    engine.get_session("s".into()).await.unwrap().is_closed(),
-                    "{url}"
-                );
-            }
+            assert!(
+                engine.get_session("s".into()).await.unwrap().is_closed(),
+                "{url}"
+            );
         }
     }
 
@@ -225,13 +221,18 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                storage.get_task("s".into(), 1).unwrap().state,
+                storage.get_task("s".into(), 1).await.unwrap().state,
                 TaskState::Succeed,
+                "{url}"
+            );
+            assert_eq!(
+                storage.get_session("s".into()).unwrap().task_counts.succeed,
+                1,
                 "{url}"
             );
             // The other task is still pending and waits for the resume.
             assert_eq!(
-                storage.get_task("s".into(), 2).unwrap().state,
+                storage.get_task("s".into(), 2).await.unwrap().state,
                 TaskState::Pending
             );
         }
@@ -251,7 +252,7 @@ mod tests {
             let task = storage.create_task("s".into(), None, None).await.unwrap();
             assert_eq!((task.id, task.state), (2, TaskState::Pending), "{url}");
             assert_eq!(
-                storage.get_task("s".into(), 2).unwrap().state,
+                storage.get_task("s".into(), 2).await.unwrap().state,
                 TaskState::Pending
             );
 
@@ -261,10 +262,20 @@ mod tests {
 
             // Closed rejects and writes nothing.
             storage.close_session("s".into()).await.unwrap();
-            let before = storage.engine.find_tasks("s".into()).await.unwrap().len();
+            let before = storage
+                .engine
+                .find_tasks(&TaskFilter::by_session("s"))
+                .await
+                .unwrap()
+                .len();
             assert_invalid_state(storage.create_task("s".into(), None, None).await);
             assert_eq!(
-                storage.engine.find_tasks("s".into()).await.unwrap().len(),
+                storage
+                    .engine
+                    .find_tasks(&TaskFilter::by_session("s"))
+                    .await
+                    .unwrap()
+                    .len(),
                 before,
                 "{url}"
             );
@@ -388,7 +399,14 @@ mod tests {
             let ssn = restarted.get_session("suspending".into()).unwrap();
             // The scheduler completes it once no executor serves the session.
             assert!(ssn.is_suspending(), "{url}");
-            assert_eq!(restarted.list_tasks("suspending".into()).unwrap().len(), 1);
+            assert_eq!(
+                restarted
+                    .list_tasks("suspending".into())
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
             let persisted = restarted
                 .engine
                 .get_session("suspending".into())
@@ -400,7 +418,11 @@ mod tests {
             assert!(ssn.is_suspended(), "{url}");
             // Its pending task survives the restart.
             assert_eq!(
-                restarted.get_task("suspended".into(), 1).unwrap().state,
+                restarted
+                    .get_task("suspended".into(), 1)
+                    .await
+                    .unwrap()
+                    .state,
                 TaskState::Pending,
                 "{url}"
             );

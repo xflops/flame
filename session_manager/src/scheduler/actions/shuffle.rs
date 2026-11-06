@@ -413,6 +413,7 @@ mod tests {
         assert_eq!(
             controller
                 .get_task("session".into(), task.id)
+                .await
                 .unwrap()
                 .state,
             common::apis::TaskState::Running

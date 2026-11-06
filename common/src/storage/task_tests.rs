@@ -169,6 +169,7 @@ mod tests {
 
             let retrieved_task = storage
                 .get_task("get-task-ssn".to_string(), created_task.id)
+                .await
                 .unwrap();
 
             assert_eq!(retrieved_task.id, created_task.id);
@@ -182,7 +183,7 @@ mod tests {
             let attr = create_session_attr("no-task-ssn");
             storage.create_session(attr).await.unwrap();
 
-            let result = storage.get_task("no-task-ssn".to_string(), 999);
+            let result = storage.get_task("no-task-ssn".to_string(), 999).await;
             assert!(result.is_err());
         }
 
@@ -191,7 +192,7 @@ mod tests {
             let ctx = test_context();
             let storage = storage::new_ptr(&ctx).await.unwrap();
 
-            let result = storage.get_task("nonexistent-ssn".to_string(), 1);
+            let result = storage.get_task("nonexistent-ssn".to_string(), 1).await;
             assert!(result.is_err());
         }
 
@@ -230,7 +231,10 @@ mod tests {
             let attr = create_session_attr("empty-task-ssn");
             storage.create_session(attr).await.unwrap();
 
-            let tasks = storage.list_tasks("empty-task-ssn".to_string()).unwrap();
+            let tasks = storage
+                .list_tasks("empty-task-ssn".to_string())
+                .await
+                .unwrap();
             assert!(tasks.is_empty());
         }
 
@@ -249,7 +253,10 @@ mod tests {
                     .unwrap();
             }
 
-            let tasks = storage.list_tasks("list-task-ssn".to_string()).unwrap();
+            let tasks = storage
+                .list_tasks("list-task-ssn".to_string())
+                .await
+                .unwrap();
             assert_eq!(tasks.len(), 5);
         }
 
@@ -258,7 +265,7 @@ mod tests {
             let ctx = test_context();
             let storage = storage::new_ptr(&ctx).await.unwrap();
 
-            let result = storage.list_tasks("nonexistent-ssn".to_string());
+            let result = storage.list_tasks("nonexistent-ssn".to_string()).await;
             assert!(result.is_err());
         }
     }
@@ -295,6 +302,7 @@ mod tests {
 
             let updated_task = storage
                 .get_task("update-state-ssn".to_string(), task.id)
+                .await
                 .unwrap();
             assert_eq!(updated_task.state, TaskState::Running);
         }
@@ -333,6 +341,7 @@ mod tests {
 
             let updated_task = storage
                 .get_task("state-msg-ssn".to_string(), task.id)
+                .await
                 .unwrap();
             assert_eq!(updated_task.state, TaskState::Running);
         }
@@ -372,10 +381,20 @@ mod tests {
                 .await
                 .unwrap();
 
-            let updated_task = storage.get_task("result-ssn".to_string(), task.id).unwrap();
-            assert_eq!(updated_task.state, TaskState::Succeed);
-            assert!(updated_task.output.is_some());
-            assert!(updated_task.completion_time.is_some());
+            let completed = storage
+                .get_task("result-ssn".to_string(), task.id)
+                .await
+                .unwrap();
+            assert_eq!(completed.state, TaskState::Succeed);
+            assert_eq!(
+                completed.output,
+                Some(bytes::Bytes::from(vec![42u8, 43, 44]))
+            );
+            let session = storage.get_session("result-ssn".to_string()).unwrap();
+            assert_eq!(session.task_counts.succeed, 1);
+            assert_eq!(session.task_counts.pending, 0);
+            assert!(session.tasks.is_empty());
+            assert!(session.tasks_index.values().all(|index| index.is_empty()));
         }
 
         #[tokio::test]
@@ -411,10 +430,19 @@ mod tests {
                 .await
                 .unwrap();
 
-            let updated_task = storage
+            let completed = storage
                 .get_task("fail-result-ssn".to_string(), task.id)
+                .await
                 .unwrap();
-            assert_eq!(updated_task.state, TaskState::Failed);
+            assert_eq!(completed.state, TaskState::Failed);
+            assert!(completed
+                .events
+                .iter()
+                .any(|event| event.message.as_deref() == Some("Something went wrong")));
+            let session = storage.get_session("fail-result-ssn".to_string()).unwrap();
+            assert_eq!(session.task_counts.failed, 1);
+            assert_eq!(session.task_counts.pending, 0);
+            assert!(session.tasks.is_empty());
         }
     }
 }

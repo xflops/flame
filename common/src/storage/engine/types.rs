@@ -168,7 +168,8 @@ impl TryFrom<&SessionDao> for Session {
                         .ok_or(FlameError::Storage("invalid completion time".to_string()))
                 })
                 .transpose()?,
-            tasks: HashMap::new(),
+            tasks: Default::default(),
+            task_counts: Default::default(),
             tasks_index: HashMap::new(),
             status: SessionStatus {
                 state: ssn.state.try_into()?,

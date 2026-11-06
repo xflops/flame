@@ -636,16 +636,20 @@ impl Controller {
         Ok(subscription)
     }
 
-    pub fn get_task(&self, ssn_id: SessionID, id: TaskID) -> Result<Task, FlameError> {
-        self.storage.get_task(ssn_id, id)
+    pub async fn get_task(&self, ssn_id: SessionID, id: TaskID) -> Result<Task, FlameError> {
+        self.storage.get_task(ssn_id, id).await
     }
 
-    pub fn get_task_metadata(&self, ssn_id: SessionID, id: TaskID) -> Result<Task, FlameError> {
-        self.storage.get_task_metadata(ssn_id, id)
+    pub async fn get_task_metadata(
+        &self,
+        ssn_id: SessionID,
+        id: TaskID,
+    ) -> Result<Task, FlameError> {
+        self.storage.get_task_metadata(ssn_id, id).await
     }
 
-    pub fn list_tasks(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
-        self.storage.list_tasks(ssn_id)
+    pub async fn list_tasks(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
+        self.storage.list_tasks(ssn_id).await
     }
 
     pub async fn create_executor(
@@ -908,10 +912,26 @@ impl Controller {
         Ok(())
     }
 
+    fn unassign_task(executor: &ExecutorPtr, expected: &TaskGID) -> Result<(), FlameError> {
+        let mut executor = lock_ptr!(executor)?;
+        ensure!(
+            executor.ssn_id.as_ref() == Some(&expected.ssn_id)
+                && executor.task_id == Some(expected.task_id),
+            FlameError::InvalidState(format!(
+                "Executor <{}> no longer owns task <{}>",
+                executor.id, expected
+            ))
+        )?;
+        executor.task_id = None;
+        if executor.state == ExecutorState::Unbinding {
+            executor.ssn_id = None;
+        }
+        Ok(())
+    }
+
     pub async fn launch_task(&self, id: ExecutorID) -> Result<Option<Task>, FlameError> {
         trace_fn!("Controller::launch_task");
         let exe_ptr = self.storage.get_executor_ptr(id.clone())?;
-        let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
         let (ssn_id, task_id) = {
             let exec = lock_ptr!(exe_ptr)?;
             (exec.ssn_id.clone(), exec.task_id)
@@ -925,9 +945,20 @@ impl Controller {
 
         if let Some(task_id) = task_id {
             tracing::warn!("Re-launch the task <{}/{}>", ssn_id, task_id);
-            let task_ptr = self.storage.get_task_ptr(TaskGID { ssn_id, task_id })?;
-            let task = lock_ptr!(task_ptr)?;
-            return Ok(Some((*task).clone()));
+            let gid = TaskGID { ssn_id, task_id };
+            return match self.storage.get_task_ptr(gid.clone()) {
+                Ok(task) => {
+                    let task = { lock_ptr!(task)?.clone() };
+                    Ok(Some(task))
+                }
+                Err(FlameError::NotFound(_)) => {
+                    Self::unassign_task(&exe_ptr, &gid)?;
+                    let executor = { lock_ptr!(exe_ptr)?.clone() };
+                    self.storage.update_executor(&executor).await?;
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            };
         }
 
         tracing::debug!("Launching task for session <{:?}>", ssn_id);
@@ -1044,9 +1075,11 @@ impl Controller {
             ssn_id: ssn_id.clone(),
             task_id,
         };
-
-        let task_ptr = self.storage.get_task_ptr(gid)?;
-        let ssn_ptr = self.storage.get_session_ptr(ssn_id.clone())?;
+        let task = match self.storage.get_task_ptr(gid.clone()) {
+            Ok(task) => Some(task),
+            Err(FlameError::NotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
 
         let msg = match task_result.state {
             TaskState::Failed => task_result.message,
@@ -1068,11 +1101,17 @@ impl Controller {
             ..task_result
         };
 
+        if task.is_none() {
+            Self::unassign_task(&exe_ptr, &gid)?;
+        }
         if let Some(attributes) = attributes {
             self.update_executor_attributes(&id, attributes)?;
         }
-        let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
-        state.complete_task(ssn_ptr, task_ptr, task_result).await?;
+        if let Some(task) = task {
+            let ssn_ptr = self.storage.get_session_ptr(ssn_id.clone())?;
+            let state = executors::from(self.storage.clone(), exe_ptr.clone())?;
+            state.complete_task(ssn_ptr, task, task_result).await?;
+        }
         let _ = self.notifier.tasks.notify(&ssn_id, task_id);
 
         let executor = {
@@ -1212,24 +1251,29 @@ impl Controller {
         // Crash recovery is terminal in v1: after the node confirms targeted
         // service destruction, fail the interrupted task instead of retrying it.
         if let (Some(task_id), Some(ssn_id)) = (executor.task_id, executor.ssn_id.as_ref()) {
-            let gid = TaskGID {
+            let task = match self.storage.get_task_ptr(TaskGID {
                 ssn_id: ssn_id.clone(),
                 task_id,
+            }) {
+                Ok(task) => Some(task),
+                Err(FlameError::NotFound(_)) => None,
+                Err(error) => return Err(error),
             };
-            let ssn_ptr = self.storage.get_session_ptr(ssn_id.clone())?;
-            let task_ptr = self.storage.get_task_ptr(gid)?;
-            self.storage
-                .update_task_state(
-                    ssn_ptr,
-                    task_ptr,
-                    TaskState::Failed,
-                    Some(format!(
-                        "Executor <{}> was lost; its service was destroyed without retry",
-                        executor.id
-                    )),
-                )
-                .await?;
-            let _ = self.notifier.tasks.notify(ssn_id, task_id);
+            if let Some(task) = task {
+                let ssn_ptr = self.storage.get_session_ptr(ssn_id.clone())?;
+                self.storage
+                    .update_task_state(
+                        ssn_ptr,
+                        task,
+                        TaskState::Failed,
+                        Some(format!(
+                            "Executor <{}> was lost; its service was destroyed without retry",
+                            executor.id
+                        )),
+                    )
+                    .await?;
+                let _ = self.notifier.tasks.notify(ssn_id, task_id);
+            }
         }
 
         let next = stdng::new_ptr(executor.clone());
@@ -1615,10 +1659,322 @@ mod tests {
         ));
     }
 
+    async fn completed_task_with_stale_executor() -> (ControllerPtr, String, Task) {
+        completed_task_with_stale_executor_in(create_test_storage().await).await
+    }
+
+    async fn completed_task_with_stale_executor_in(
+        storage: StoragePtr,
+    ) -> (ControllerPtr, String, Task) {
+        let controller = new_ptr(storage.clone());
+        let executor_id = create_binding_executor(&controller, "terminal-task-session").await;
+        controller
+            .bind_executor_completed(executor_id.clone(), None, None)
+            .await
+            .unwrap();
+        let task = controller
+            .create_task("terminal-task-session".into(), None, None)
+            .await
+            .unwrap();
+        controller.launch_task(executor_id.clone()).await.unwrap();
+        let session = storage.get_session_ptr(task.ssn_id.clone()).unwrap();
+        let active = storage.get_task_ptr(task.gid()).unwrap();
+        // Simulate a result commit before executor ownership was cleared.
+        storage
+            .update_task_result(
+                session,
+                active,
+                TaskResult {
+                    state: TaskState::Succeed,
+                    output: Some(bytes::Bytes::from_static(b"first result")),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage.get_task_ptr(task.gid()),
+            Err(FlameError::NotFound(_))
+        ));
+        (controller, executor_id, task)
+    }
+
+    #[tokio::test]
+    async fn missing_active_tasks_allow_executor_cleanup_without_changing_memory_history() {
+        for operation in ["launch", "complete", "unregister"] {
+            let config = FlameClusterContext {
+                cluster: FlameCluster {
+                    storage: "none".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let storage = crate::storage::new_ptr(&config).await.unwrap();
+            let (controller, executor_id, task) =
+                completed_task_with_stale_executor_in(storage).await;
+            assert!(matches!(
+                controller.storage().get_task_ptr(task.gid()),
+                Err(FlameError::NotFound(_))
+            ));
+            let before = controller
+                .get_task(task.ssn_id.clone(), task.id)
+                .await
+                .unwrap();
+            match operation {
+                "launch" => assert!(controller
+                    .launch_task(executor_id.clone())
+                    .await
+                    .unwrap()
+                    .is_none()),
+                "complete" => controller
+                    .complete_task(
+                        executor_id.clone(),
+                        TaskResult {
+                            state: TaskState::Failed,
+                            output: Some(bytes::Bytes::from_static(b"late result")),
+                            message: None,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+                "unregister" => {
+                    let mut executor = controller.get_executor(executor_id.clone()).unwrap();
+                    executor.state = ExecutorState::Releasing;
+                    controller
+                        .storage()
+                        .update_executor(&executor)
+                        .await
+                        .unwrap();
+                    controller
+                        .unregister_executor(executor_id.clone())
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            if operation == "unregister" {
+                assert!(matches!(
+                    controller.get_executor(executor_id),
+                    Err(FlameError::NotFound(_))
+                ));
+            } else {
+                assert_eq!(controller.get_executor(executor_id).unwrap().task_id, None);
+            }
+            let after = controller
+                .get_task(task.ssn_id.clone(), task.id)
+                .await
+                .unwrap();
+            assert_eq!(after.state, before.state);
+            assert_eq!(after.version, before.version);
+            assert_eq!(after.output, before.output);
+            assert_eq!(after.events.len(), before.events.len());
+            let session = controller.get_session(task.ssn_id).unwrap();
+            assert_eq!(session.task_counts.succeed, 1);
+            assert_eq!(session.task_counts.failed, 0);
+            assert!(session.tasks.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_rejects_ownership_changed_during_lookup() {
+        let (controller, executor_id, task) = completed_task_with_stale_executor().await;
+        let executor = controller.storage().get_executor_ptr(executor_id).unwrap();
+        for (session, task_id) in [
+            (task.ssn_id.clone(), task.id + 1),
+            ("a-new-session".to_string(), task.id),
+        ] {
+            {
+                let mut executor = lock_ptr!(executor).unwrap();
+                executor.ssn_id = Some(session.clone());
+                executor.task_id = Some(task_id);
+            }
+
+            let result = Controller::unassign_task(&executor, &task.gid());
+
+            assert!(matches!(result, Err(FlameError::InvalidState(_))));
+            let current = lock_ptr!(executor).unwrap();
+            assert_eq!(current.ssn_id.as_ref(), Some(&session));
+            assert_eq!(current.task_id, Some(task_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_skips_an_assigned_task_on_cache_miss() {
+        let storage = create_test_storage().await;
+        let controller = new_ptr(storage.clone());
+        let executor_id = create_binding_executor(&controller, "missed-task-session").await;
+        controller
+            .bind_executor_completed(executor_id.clone(), None, None)
+            .await
+            .unwrap();
+        let task = controller
+            .create_task("missed-task-session".into(), None, None)
+            .await
+            .unwrap();
+        controller.launch_task(executor_id.clone()).await.unwrap();
+        {
+            let session = storage.get_session_ptr(task.ssn_id.clone()).unwrap();
+            let mut session = lock_ptr!(session).unwrap();
+            session.tasks.remove(&task.id);
+            for index in session.tasks_index.values_mut() {
+                index.remove(&task.id);
+            }
+        }
+
+        assert!(controller
+            .launch_task(executor_id.clone())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(controller.get_executor(executor_id).unwrap().task_id, None);
+        assert_eq!(
+            storage
+                .get_task_metadata(task.ssn_id.clone(), task.id)
+                .await
+                .unwrap()
+                .state,
+            TaskState::Running
+        );
+        assert!(matches!(
+            storage.get_task_ptr(task.gid()),
+            Err(FlameError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn launch_does_not_replay_an_evicted_terminal_task() {
+        let (controller, executor_id, task) = completed_task_with_stale_executor().await;
+
+        assert!(controller
+            .launch_task(executor_id.clone())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(controller.get_executor(executor_id).unwrap().task_id, None);
+        assert!(matches!(
+            controller.storage().get_task_ptr(task.gid()),
+            Err(FlameError::NotFound(_))
+        ));
+        assert_eq!(
+            controller
+                .get_task(task.ssn_id, task.id)
+                .await
+                .unwrap()
+                .state,
+            TaskState::Succeed
+        );
+    }
+
+    #[tokio::test]
+    async fn late_completion_keeps_the_committed_terminal_result() {
+        let (controller, executor_id, task) = completed_task_with_stale_executor().await;
+        let before = controller
+            .get_task(task.ssn_id.clone(), task.id)
+            .await
+            .unwrap();
+
+        controller
+            .complete_task(
+                executor_id.clone(),
+                TaskResult {
+                    state: TaskState::Failed,
+                    output: Some(bytes::Bytes::from_static(b"late result")),
+                    message: Some("late failure".into()),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let after = controller
+            .get_task(task.ssn_id.clone(), task.id)
+            .await
+            .unwrap();
+        assert_eq!(after.state, TaskState::Succeed);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.output, before.output);
+        assert_eq!(after.events.len(), before.events.len());
+        assert_eq!(controller.get_executor(executor_id).unwrap().task_id, None);
+        let session = controller.get_session(task.ssn_id).unwrap();
+        assert_eq!(session.task_counts.succeed, 1);
+        assert_eq!(session.task_counts.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn late_terminal_completion_preserves_unbinding_state_and_clears_ownership() {
+        let (controller, executor_id, task) = completed_task_with_stale_executor().await;
+        let mut executor = controller.get_executor(executor_id.clone()).unwrap();
+        executor.state = ExecutorState::Unbinding;
+        controller
+            .storage()
+            .update_executor(&executor)
+            .await
+            .unwrap();
+
+        controller
+            .complete_task(
+                executor_id.clone(),
+                TaskResult {
+                    state: TaskState::Succeed,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let executor = controller.get_executor(executor_id).unwrap();
+        assert_eq!(executor.state, ExecutorState::Unbinding);
+        assert_eq!(executor.ssn_id, None);
+        assert_eq!(executor.task_id, None);
+        assert_eq!(
+            controller
+                .get_task(task.ssn_id, task.id)
+                .await
+                .unwrap()
+                .state,
+            TaskState::Succeed
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_keeps_an_evicted_terminal_task_successful() {
+        let (controller, executor_id, task) = completed_task_with_stale_executor().await;
+        let mut executor = controller.get_executor(executor_id.clone()).unwrap();
+        executor.state = ExecutorState::Releasing;
+        controller
+            .storage()
+            .update_executor(&executor)
+            .await
+            .unwrap();
+
+        controller
+            .unregister_executor(executor_id.clone())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            controller.get_executor(executor_id),
+            Err(FlameError::NotFound(_))
+        ));
+        assert_eq!(
+            controller
+                .get_task(task.ssn_id.clone(), task.id)
+                .await
+                .unwrap()
+                .state,
+            TaskState::Succeed
+        );
+        let session = controller.get_session(task.ssn_id).unwrap();
+        assert_eq!(session.task_counts.succeed, 1);
+        assert_eq!(session.task_counts.failed, 0);
+    }
+
     async fn bound_task_waiter(minimum: u32) -> (ControllerPtr, String) {
         let config = FlameClusterContext {
             cluster: FlameCluster {
-                storage: "none".into(),
+                storage: "sqlite::memory:".into(),
                 ..Default::default()
             },
             ..Default::default()
@@ -1664,6 +2020,7 @@ mod tests {
         assert_eq!(
             controller
                 .get_task("task-wait-session".into(), task.id)
+                .await
                 .unwrap()
                 .state,
             TaskState::Running
@@ -1791,6 +2148,7 @@ mod tests {
         assert_eq!(
             controller
                 .get_task("task-wait-session".into(), task.id)
+                .await
                 .unwrap()
                 .state,
             TaskState::Pending
@@ -1870,6 +2228,7 @@ mod tests {
         assert_eq!(
             controller
                 .get_task("task-wait-session".into(), task.id)
+                .await
                 .unwrap()
                 .state,
             TaskState::Succeed
@@ -2919,7 +3278,11 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                controller.get_task(session.id, task.id).unwrap().state,
+                controller
+                    .get_task(session.id, task.id)
+                    .await
+                    .unwrap()
+                    .state,
                 TaskState::Failed
             );
             assert!(matches!(
@@ -3129,7 +3492,7 @@ mod tests {
         async fn memory_controller() -> ControllerPtr {
             let config = FlameClusterContext {
                 cluster: FlameCluster {
-                    storage: "none".into(),
+                    storage: "sqlite::memory:".into(),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -3300,7 +3663,11 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                controller.get_task("ssn".into(), task.id).unwrap().state,
+                controller
+                    .get_task("ssn".into(), task.id)
+                    .await
+                    .unwrap()
+                    .state,
                 TaskState::Succeed
             );
             // The executor still serves the session until it unbinds.
@@ -3351,7 +3718,7 @@ mod tests {
             ));
             for id in [first.id, second.id] {
                 assert_eq!(
-                    controller.get_task("ssn".into(), id).unwrap().state,
+                    controller.get_task("ssn".into(), id).await.unwrap().state,
                     TaskState::Pending
                 );
             }
