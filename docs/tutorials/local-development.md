@@ -164,6 +164,16 @@ cache:
   storage: "/tmp/flame-dev/data/cache"
 ```
 
+To restrict the session manager to a local address, add `advertise: "127.0.0.1"`
+under `cluster`. `cluster.advertise` accepts an IPv4/IPv6 address or a network
+interface name/regex (for example `"^eth0$"` or `"^lo0?$"`). For an interface
+selector, it uses the first IPv4 address on the first matching interface in name
+order; missing matches or IPv4 addresses fail startup. Both frontend and backend
+bind to that IP, using the `cluster.endpoint` port (default 8080) and the next
+port respectively. Unset or empty values retain binding to `0.0.0.0`.
+`cluster.endpoint` remains the address clients use and may name a Service or load
+balancer. Choose an interface reachable by those clients and executor managers.
+
 Restart the services after changing this file.
 
 `executors.system_resource` (for example `"cpu=2,mem=4g"`) holds CPU and memory

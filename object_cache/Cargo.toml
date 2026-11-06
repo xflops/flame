@@ -23,8 +23,6 @@ serde_derive = { workspace = true }
 bytes = { workspace = true }
 url = { workspace = true }
 clap = { workspace = true }
-network-interface = "2"
-regex = "1"
 bytesize = "2.7"
 
 [dev-dependencies]

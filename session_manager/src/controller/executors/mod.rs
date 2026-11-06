@@ -131,6 +131,7 @@ mod tests {
             cluster: FlameCluster {
                 name: "test".to_string(),
                 endpoint: "http://localhost:8080".to_string(),
+                advertise: None,
                 storage: url,
                 resreq: None,
                 policies: vec!["priority".to_string(), "drf".to_string()],
