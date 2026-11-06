@@ -550,8 +550,8 @@ def _validate_proxy_endpoint(endpoint: str) -> None:
         port = parsed.port
     except ValueError as exc:
         raise ValueError(f"Invalid object cache proxy endpoint: {endpoint}") from exc
-    if parsed.scheme != "grpcs-proxy" or not parsed.hostname or parsed.username or parsed.password or parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment or port is None:
-        raise ValueError("Object cache proxy endpoint must be grpcs-proxy://<host>:<port> without credentials, a path, query, or fragment")
+    if parsed.scheme not in ("grpc-proxy", "grpcs-proxy") or not parsed.hostname or parsed.username or parsed.password or parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment or port is None:
+        raise ValueError("Object cache proxy endpoint must be grpc-proxy://<host>:<port> or grpcs-proxy://<host>:<port> without credentials, a path, query, or fragment")
 
 
 GRPC_OPTIONS = [
@@ -561,7 +561,7 @@ GRPC_OPTIONS = [
 
 
 def _cache_proxy_endpoint() -> Optional[str]:
-    """Return the configured TLS gRPC proxy, if any."""
+    """Return the configured gRPC proxy, if any."""
     cache_config = _get_cached_context().cache
     if isinstance(cache_config, str):
         endpoint = cache_config
@@ -569,7 +569,7 @@ def _cache_proxy_endpoint() -> Optional[str]:
         endpoint = cache_config.endpoint
     else:
         endpoint = cache_config.get("endpoint") if cache_config else None
-    if endpoint and urlparse(endpoint).scheme == "grpcs-proxy":
+    if endpoint and urlparse(endpoint).scheme in ("grpc-proxy", "grpcs-proxy"):
         _validate_proxy_endpoint(endpoint)
         return endpoint
     return None
@@ -578,9 +578,7 @@ def _cache_proxy_endpoint() -> Optional[str]:
 def _resolve_cache_endpoint(endpoint: str) -> tuple[str, Optional[str]]:
     """Resolve an object endpoint to its dial location and optional cache target."""
     parsed = urlparse(endpoint)
-    if parsed.scheme == "grpc-proxy":
-        raise ValueError("grpc-proxy:// is unsupported; use grpcs-proxy://")
-    if parsed.scheme == "grpcs-proxy":
+    if parsed.scheme in ("grpc-proxy", "grpcs-proxy"):
         _validate_proxy_endpoint(endpoint)
     proxy_endpoint = _cache_proxy_endpoint()
     if parsed.scheme in ("grpc", "grpcs", "grpc+tls") and proxy_endpoint:

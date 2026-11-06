@@ -18,19 +18,17 @@ also need two different names: the public gateway name for TLS and the internal
 cache owner from `ObjectRef.endpoint` for routing. A gateway certificate
 should need only the public name in its subject alternative names.
 
-The Python implementation currently sets `grpc.default_authority` to the
-internal owner on a secure channel. gRPC's secure naming check can reject the
-RPC when the gateway certificate covers only the public proxy name. The owner
-is a routing value, so it can be sent as gRPC metadata while the HTTP/2
-authority retains its normal public proxy name.
+The owner is a routing value carried in `x-flame-object-cache` metadata.
+The gateway uses this header to send reference operations to the owning
+cache replica.
 
 ### Goals
 
 1. Configure a client certificate and private key alongside the existing CA.
 2. Verify the public proxy certificate against its public DNS name or IP while
    presenting the client certificate during the TLS handshake.
-3. Keep HTTP/2 `:authority` at the public proxy name, and pass the owner
-   `host:port` in a routing metadata field for reference operations.
+3. Pass the owner `host:port` in `x-flame-object-cache` metadata for
+   reference operations.
 4. Preserve direct `grpc://`, `grpcs://`, and `grpc+tls://` behavior and clients
    with no configured client certificate.
 5. Fail on an incomplete or unreadable client identity without downgrading to
@@ -85,7 +83,7 @@ retiring the old credentials to avoid a gap in connectivity.
 
 For a configured `grpcs-proxy://cache.example.com:443` endpoint:
 
-| Operation | Public dial target and `:authority` | Target metadata |
+| Operation | Public dial target | Target metadata |
 | --- | --- | --- |
 | Initial upload/put | `cache.example.com:443` | Absent |
 | Reference get/write/download | `cache.example.com:443` | Owner `host:port` |
@@ -93,7 +91,6 @@ For a configured `grpcs-proxy://cache.example.com:443` endpoint:
 The TLS client sends the public proxy host as SNI and verifies the peer
 certificate against that host; a proxy specified by IP needs an IP subject
 alternative name. The client certificate is sent when requested by the gateway.
-HTTP/2 `:authority` remains the public proxy `host:port` for every RPC.
 `x-flame-object-cache` is a gRPC metadata field, represented as a normal
 HTTP/2 request header, containing only the validated owning cache `host:port`.
 Initial operations omit it; the gateway sends them to the cache Service.
@@ -130,8 +127,7 @@ requires a client certificate signed by its configured CA.
 Extend `FlameClientTls` in `sdk/rust/src/apis/ctx.rs` with optional
 `cert_file` and `key_file`. Validate their pairing, read PEM content, and set a
 tonic `Identity` on `ClientTlsConfig`. `sdk/rust/src/object.rs` already builds a
-tonic endpoint from the public proxy host. Keep its normal public origin and
-TLS domain. Attach `x-flame-object-cache` metadata to reference RPCs using the
+tonic endpoint from the public proxy host. Attach `x-flame-object-cache` metadata to reference RPCs using the
 validated owner `host:port`; omit it for initial operations and direct
 connections. Propagate malformed configuration rather than silently dropping
 TLS identity on reference operations.
@@ -143,7 +139,7 @@ Extend `FlameClientTls` and context parsing in
 chain and key into the gRPC credentials for ordinary direct TLS channels.
 
 For proxy operations, create a normal secure gRPC channel to the public proxy
-host. Do not set `grpc.default_authority` to the internal owner. Reference RPCs
+host. Reference RPCs
 carry `x-flame-object-cache` as per-call metadata. Keep the native gRPC
 transport, including its TLS verification, streaming, cancellation, and
 channel lifecycle.
@@ -164,8 +160,8 @@ should reject invalid or unrecognized targets before forwarding.
 1. Start a test gateway with a certificate whose SAN contains only the public
    proxy name. Require a client certificate signed by a distinct test CA.
 2. Exercise initial upload and reference get, update, patch, and download with
-   each SDK. Record TLS SNI, HTTP/2 `:authority`, and
-   `x-flame-object-cache` at the gateway and confirm every reference operation
+   each SDK. Record `x-flame-object-cache` at the gateway and confirm initial
+   operations omit it and every reference operation
    reaches its owning replica.
 3. Confirm a missing client identity is rejected by the mTLS gateway; a
    missing key, invalid PEM pair, untrusted gateway CA, or wrong gateway
@@ -178,4 +174,3 @@ should reject invalid or unrecognized targets before forwarding.
 ## References
 
 - [RFE523: external cache proxy](../RFE523-helm-external-access-and-cache-proxy/FS.md)
-- [gRPC A81 authority rewriting proposal](https://github.com/grpc/proposal/blob/master/A81-xds-authority-rewriting.md)

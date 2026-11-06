@@ -67,10 +67,11 @@ def test_create_storage_backend_grpcs():
     assert isinstance(back, CacheStorage)
 
 
-def test_create_storage_backend_grpcs_proxy():
-    back = create_storage_backend("grpcs-proxy://gateway.example:8080", app_name="myapp")
+@pytest.mark.parametrize("scheme", ["grpc-proxy", "grpcs-proxy"])
+def test_create_storage_backend_grpc_proxy(scheme):
+    back = create_storage_backend(f"{scheme}://gateway.example:8080", app_name="myapp")
     assert isinstance(back, CacheStorage)
-    assert back._endpoint == "grpcs-proxy://gateway.example:8080"
+    assert back._endpoint == f"{scheme}://gateway.example:8080"
 
 
 def test_create_storage_backend_default_uses_cache(monkeypatch):
@@ -243,19 +244,20 @@ class TestCacheStorage:
 
         assert url == "grpc://host:9090/myapp/pkg/myapp-1.0.0.tar.gz"
 
-    def test_upload_preserves_returned_cache_endpoint(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("scheme", ["grpc-proxy", "grpcs-proxy"])
+    def test_upload_preserves_returned_cache_endpoint(self, monkeypatch, tmp_path, scheme):
         from flamepy.core.cache import ObjectRef
 
         test_file = tmp_path / "myapp-1.0.0.tar.gz"
         test_file.write_bytes(b"package content")
 
         def mock_upload_package(app_name, file_path, filename=None, endpoint=None):
-            assert endpoint == "grpcs-proxy://gateway.example:443"
+            assert endpoint == f"{scheme}://gateway.example:443"
             return ObjectRef(endpoint="grpc://10.0.0.42:9090", key=f"{app_name}/pkg/{filename}", version=1)
 
         monkeypatch.setattr("flamepy.core.cache.upload_package", mock_upload_package)
 
-        storage = CacheStorage("grpcs-proxy://gateway.example:443", app_name="myapp")
+        storage = CacheStorage(f"{scheme}://gateway.example:443", app_name="myapp")
         url = storage.upload(str(test_file), "myapp-1.0.0.tar.gz")
 
         assert url == "grpc://10.0.0.42:9090/myapp/pkg/myapp-1.0.0.tar.gz"

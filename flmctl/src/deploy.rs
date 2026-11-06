@@ -460,17 +460,18 @@ fn normalize_cache_endpoint(raw: &str) -> Result<String, FlameError> {
     let scheme = match parsed.scheme() {
         "grpc" => "grpc",
         "grpcs" | "grpc+tls" => "grpcs",
+        "grpc-proxy" => "grpc-proxy",
         "grpcs-proxy" => "grpcs-proxy",
         scheme => {
             return Err(FlameError::InvalidConfig(format!(
-                "unsupported cache endpoint scheme <{}>; expected grpc, grpcs, grpc+tls, or grpcs-proxy",
+                "unsupported cache endpoint scheme <{}>; expected grpc, grpcs, grpc+tls, grpc-proxy, or grpcs-proxy",
                 scheme
             )));
         }
     };
-    if scheme == "grpcs-proxy" && parsed.port().is_none() {
+    if matches!(scheme, "grpc-proxy" | "grpcs-proxy") && parsed.port().is_none() {
         return Err(FlameError::InvalidConfig(
-            "grpcs-proxy endpoint requires an explicit port".to_string(),
+            "cache proxy endpoint requires an explicit port".to_string(),
         ));
     }
     let host = parsed
@@ -586,12 +587,15 @@ mod tests {
 
     #[test]
     fn accepts_proxy_endpoint_for_dry_run_url() {
-        let endpoint = normalize_cache_endpoint("grpcs-proxy://gateway.example.com:9443").unwrap();
-        assert_eq!(endpoint, "grpcs-proxy://gateway.example.com:9443");
-        assert_eq!(
-            object_url(&endpoint, "app/pkg/app.tar.gz"),
-            "grpcs-proxy://gateway.example.com:9443/app/pkg/app.tar.gz"
-        );
+        for scheme in ["grpc-proxy", "grpcs-proxy"] {
+            let endpoint =
+                normalize_cache_endpoint(&format!("{scheme}://gateway.example.com:9443")).unwrap();
+            assert_eq!(endpoint, format!("{scheme}://gateway.example.com:9443"));
+            assert_eq!(
+                object_url(&endpoint, "app/pkg/app.tar.gz"),
+                format!("{scheme}://gateway.example.com:9443/app/pkg/app.tar.gz")
+            );
+        }
         assert_eq!(
             normalize_cache_endpoint("grpc+tls://cache.example.com").unwrap(),
             "grpcs://cache.example.com:9090"
@@ -601,8 +605,13 @@ mod tests {
     #[test]
     fn rejects_non_cache_endpoint_scheme() {
         assert!(normalize_cache_endpoint("http://cache:9090").is_err());
-        assert!(normalize_cache_endpoint("grpcs-proxy://gateway.example.com").is_err());
-        assert!(normalize_cache_endpoint("grpcs-proxy://gateway.example.com:9443/path").is_err());
+        for scheme in ["grpc-proxy", "grpcs-proxy"] {
+            assert!(normalize_cache_endpoint(&format!("{scheme}://gateway.example.com")).is_err());
+            assert!(
+                normalize_cache_endpoint(&format!("{scheme}://gateway.example.com:9443/path"))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

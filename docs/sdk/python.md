@@ -49,8 +49,13 @@ Environment variables set endpoints and fill TLS fields absent from the file:
 Use `https://` for the session-manager endpoint when TLS is enabled. Use `grpcs://` for the object-cache endpoint when cache TLS is enabled.
 For a client certificate, set both `cert_file` and `key_file` under the
 relevant `cluster.tls` or `cache.tls` section. An external cache proxy uses
-`grpcs-proxy://host:port`; reference requests send the owning cache address
-in `x-flame-object-cache` metadata while TLS verifies the public proxy host.
+`grpc-proxy://host:port` for plaintext HTTP/2 or `grpcs-proxy://host:port`
+for TLS. Both require an explicit port and send the owning cache address in
+`x-flame-object-cache` metadata for reference requests. Gateways route these
+requests to the owner named in the header and initial requests without the
+header to the cache Service. With TLS, certificate verification uses the public
+proxy host. The administrator must configure a gateway listener matching the
+selected transport.
 After replacing certificate or CA files, close asyncio cache channels with
 `await flamepy.core.aio.cache.close()` before the next operation.
 

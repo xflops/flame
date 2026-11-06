@@ -51,14 +51,14 @@ if hasattr(os, "register_at_fork"):
 
 def _create_client(location: str, tls_config: Optional[FlameClientTls], target: Optional[str]):
     parsed = urlparse(location)
-    if parsed.scheme not in ("grpc", "grpcs", "grpc+tls", "grpcs-proxy") or not parsed.netloc:
+    if parsed.scheme not in ("grpc", "grpcs", "grpc+tls", "grpc-proxy", "grpcs-proxy") or not parsed.netloc:
         raise ValueError(f"Invalid object cache endpoint: {location}")
+    if parsed.scheme in ("grpc-proxy", "grpcs-proxy"):
+        common._validate_proxy_endpoint(location)
     options = list(common.GRPC_OPTIONS)
     if parsed.scheme in ("grpcs", "grpc+tls", "grpcs-proxy"):
         if tls_config is not None:
             tls_config.validate_identity()
-        if parsed.scheme == "grpcs-proxy":
-            common._validate_proxy_endpoint(location)
         roots = None
         if tls_config and tls_config.ca_file:
             with open(tls_config.ca_file, "rb") as source:

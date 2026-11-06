@@ -450,10 +450,11 @@ to that endpoint. The owning replica may be on another host.
 
 Consequently, the platform network is required to make every advertised
 `ObjectRef.endpoint` routable from every CRI sandbox. Alternatively, operators
-may use the existing `grpcs-proxy://` cache mode: the SDK connects to the
-configured proxy and uses the owning endpoint from the `ObjectRef` as its gRPC
-authority. The proxy must itself be reachable from the sandbox and able to
-route that authority to the owning cache replica.
+may use `grpc-proxy://` or `grpcs-proxy://` cache mode: the SDK connects to
+the configured proxy and sends the owning `host:port` from the `ObjectRef` in
+`x-flame-object-cache` metadata. The proxy must itself be reachable from
+the sandbox and route
+that header to the owning cache replica.
 
 Loopback cache endpoints such as `127.0.0.1` or `localhost` are invalid for the
 CRI shim because they address the application sandbox, not the executor-manager

@@ -289,7 +289,7 @@ class CacheStorage(StorageBackend):
 
         if storage_base is not None:
             parsed_url = urlparse(storage_base)
-            if parsed_url.scheme not in ("grpc", "grpcs", "grpcs-proxy"):
+            if parsed_url.scheme not in ("grpc", "grpcs", "grpc-proxy", "grpcs-proxy"):
                 raise FlameError(FlameErrorCode.INVALID_CONFIG, f"Invalid cache storage URL: {storage_base}")
             self._scheme = parsed_url.scheme
             self._host = parsed_url.hostname or "localhost"
@@ -388,10 +388,10 @@ def create_storage_backend(storage_base: str | None = None, app_name: str | None
         return FileStorage(storage_base)
     elif parsed_url.scheme in ("http", "https"):
         return HttpStorage(storage_base)
-    elif parsed_url.scheme in ("grpc", "grpcs", "grpcs-proxy"):
+    elif parsed_url.scheme in ("grpc", "grpcs", "grpc-proxy", "grpcs-proxy"):
         return CacheStorage(storage_base, app_name=app_name)
     else:
         raise FlameError(
             FlameErrorCode.INVALID_CONFIG,
-            f"Unsupported storage scheme: {parsed_url.scheme}. Supported: file://, http://, https://, grpc://, grpcs://, grpcs-proxy://",
+            f"Unsupported storage scheme: {parsed_url.scheme}. Supported: file://, http://, https://, grpc://, grpcs://, grpc-proxy://, grpcs-proxy://",
         )
