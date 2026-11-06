@@ -11,6 +11,9 @@ data:
     cluster:
       name: {{ .Values.cluster.name | quote }}
       endpoint: {{ include "flame.clusterEndpoint" . | quote }}
+      {{- if .Values.cluster.advertise }}
+      advertise: {{ .Values.cluster.advertise | quote }}
+      {{- end }}
       resreq: {{ .Values.cluster.resreq | quote }}
       policies:
         {{- range .Values.cluster.policies }}

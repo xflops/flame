@@ -54,6 +54,8 @@ struct FlameClusterContextYaml {
 struct FlameClusterYaml {
     pub name: String,
     pub endpoint: String,
+    /// Optional session-manager bind IP address or network interface regex.
+    pub advertise: Option<String>,
     /// Cluster-wide default `resreq` for sessions that supply no explicit
     /// `resreq`. String form `"cpu=2,mem=4g,gpu=1"` parsed by
     /// `ResourceRequirement::parse`.
@@ -174,6 +176,8 @@ pub struct FlameClusterContext {
 pub struct FlameCluster {
     pub name: String,
     pub endpoint: String,
+    /// Optional session-manager bind IP address or network interface regex.
+    pub advertise: Option<String>,
     /// Cluster-wide default `resreq`. Applied server-side when a session
     /// spec sets no explicit `resreq`. `None` if not configured.
     pub resreq: Option<ResourceRequirement>,
@@ -506,6 +510,7 @@ impl TryFrom<FlameClusterYaml> for FlameCluster {
         Ok(FlameCluster {
             name: cluster.name,
             endpoint: cluster.endpoint,
+            advertise: cluster.advertise.filter(|value| !value.is_empty()),
             resreq: cluster
                 .resreq
                 .as_deref()
@@ -693,6 +698,7 @@ impl Default for FlameCluster {
         FlameCluster {
             name: DEFAULT_CONTEXT_NAME.to_string(),
             endpoint: DEFAULT_FLAME_ENDPOINT.to_string(),
+            advertise: None,
             resreq: None,
             policies: DEFAULT_POLICIES.iter().map(|s| s.to_string()).collect(),
             storage: DEFAULT_STORAGE.to_string(),
@@ -938,6 +944,26 @@ mod tests {
             FlameLimits::from(yaml).node.max_executors,
             DEFAULT_MAX_EXECUTORS_PER_NODE
         );
+    }
+
+    #[test]
+    fn cluster_advertise_parses_and_defaults() -> Result<(), FlameError> {
+        assert_eq!(FlameCluster::default().advertise, None);
+        for (field, expected) in [
+            ("", None),
+            ("advertise: \"\"", None),
+            ("advertise: 127.0.0.1", Some("127.0.0.1")),
+            ("advertise: '^eth[01]$'", Some("^eth[01]$")),
+        ] {
+            let yaml: FlameClusterYaml = serde_yaml::from_str(&format!(
+                "name: flame\nendpoint: http://service:8080\n{field}\n"
+            ))
+            .unwrap();
+            let cluster = FlameCluster::try_from(yaml)?;
+            assert_eq!(cluster.advertise.as_deref(), expected);
+            assert_eq!(cluster.endpoint, "http://service:8080");
+        }
+        Ok(())
     }
 
     #[test]

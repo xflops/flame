@@ -14,6 +14,7 @@
     "cluster": {
       "type": "object",
       "properties": {
+        "advertise": { "type": "string" },
         "executors": {
           "type": "object",
           "properties": {

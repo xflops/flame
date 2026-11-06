@@ -39,6 +39,12 @@ executorManager:
   terminationGracePeriodSeconds: 300
 ```
 
+`cluster.advertise` optionally selects the session manager's bind IP or network
+interface regex, for both frontend and backend. For example, `"^eth0$"` selects
+that Pod interface's first IPv4 address. Use an interface reachable by the
+session-manager Service. The default empty value binds all IPv4 interfaces;
+`cluster.endpoint` continues to supply the client address and frontend port.
+
 `cluster.executors.devices` selects FEM device managers and defaults to `[gpu]`.
 Set it to `[]` to disable device discovery and advertise CPU and memory only.
 GPU is currently the implemented manager; configuring an unsupported device

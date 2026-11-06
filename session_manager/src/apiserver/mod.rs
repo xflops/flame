@@ -11,12 +11,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+
 use tonic::transport::Server;
 
 use common::apis::ResourceRequirement;
 use common::ctx::FlameClusterContext;
+use common::net::ip_addr;
 use rpc::flame::v1::backend_server::BackendServer;
 use rpc::flame::v1::frontend_server::FrontendServer;
 
@@ -27,7 +30,34 @@ mod backend;
 mod frontend;
 
 const DEFAULT_PORT: u16 = 8080;
-const ALL_HOST_ADDRESS: &str = "0.0.0.0";
+/// Bind to the selected local IP using the endpoint port plus the listener's
+/// shift: zero for frontend, one for backend.
+fn bind_address(ctx: &FlameClusterContext, port_shift: u16) -> Result<SocketAddr, FlameError> {
+    let url = url::Url::parse(&ctx.cluster.endpoint).map_err(|_| {
+        FlameError::InvalidConfig(format!("invalid endpoint <{}>", ctx.cluster.endpoint))
+    })?;
+    let port = url
+        .port()
+        .unwrap_or(DEFAULT_PORT)
+        .checked_add(port_shift)
+        .ok_or_else(|| {
+            FlameError::InvalidConfig("cluster.endpoint has no available listener port".to_string())
+        })?;
+    let ip = match ctx
+        .cluster
+        .advertise
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => ip_addr(value)?.ok_or_else(|| {
+            FlameError::InvalidConfig(format!(
+                "cluster.advertise <{value}> is not an IP address or matching network interface"
+            ))
+        })?,
+        None => Ipv4Addr::UNSPECIFIED.into(),
+    };
+    Ok(SocketAddr::new(ip, port))
+}
 
 #[derive(Clone)]
 pub struct Flame {
@@ -54,18 +84,8 @@ struct FrontendRunner {
 #[async_trait::async_trait]
 impl FlameThread for FrontendRunner {
     async fn run(&self, ctx: FlameClusterContext) -> Result<(), FlameError> {
-        let url = url::Url::parse(&ctx.cluster.endpoint).map_err(|_| {
-            FlameError::InvalidConfig(format!("invalid endpoint <{}>", ctx.cluster.endpoint))
-        })?;
-
-        let port = url.port().unwrap_or(DEFAULT_PORT);
-
-        // The fsm will bind to all addresses of host directly.
-        let address_str = format!("{ALL_HOST_ADDRESS}:{port}");
-        tracing::info!("Listening apiserver frontend at {}", address_str);
-        let address = address_str.parse().map_err(|_| {
-            FlameError::InvalidConfig(format!("failed to parse url <{address_str}>"))
-        })?;
+        let address = bind_address(&ctx, 0)?;
+        tracing::info!("Listening apiserver frontend at {}", address);
 
         let frontend_service = Flame {
             controller: self.controller.clone(),
@@ -100,17 +120,8 @@ struct BackendRunner {
 #[async_trait::async_trait]
 impl FlameThread for BackendRunner {
     async fn run(&self, ctx: FlameClusterContext) -> Result<(), FlameError> {
-        let url = url::Url::parse(&ctx.cluster.endpoint).map_err(|_| {
-            FlameError::InvalidConfig(format!("invalid endpoint <{}>", ctx.cluster.endpoint))
-        })?;
-        let port = url.port().unwrap_or(DEFAULT_PORT) + 1;
-
-        // The fsm will bind to all addresses of host directly.
-        let address_str = format!("{ALL_HOST_ADDRESS}:{port}");
-        tracing::info!("Listening apiserver backend at {}", address_str);
-        let address = address_str.parse().map_err(|_| {
-            FlameError::InvalidConfig(format!("failed to parse url <{address_str}>"))
-        })?;
+        let address = bind_address(&ctx, 1)?;
+        tracing::info!("Listening apiserver backend at {}", address);
 
         let backend_service = Flame {
             controller: self.controller.clone(),
@@ -137,5 +148,69 @@ impl FlameThread for BackendRunner {
             .map_err(|e| FlameError::Network(e.to_string()))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    #[test]
+    fn bind_defaults_and_literal_ips_do_not_discover_interfaces() {
+        for (value, expected) in [
+            (None, "0.0.0.0"),
+            (Some(""), "0.0.0.0"),
+            (Some("127.0.0.1"), "127.0.0.1"),
+            (Some("192.0.2.10"), "192.0.2.10"),
+            (Some("::1"), "::1"),
+        ] {
+            let mut ctx = FlameClusterContext::default();
+            ctx.cluster.advertise = value.map(str::to_string);
+            assert_eq!(
+                bind_address(&ctx, 0).unwrap().ip(),
+                expected.parse::<IpAddr>().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn bind_invalid_interfaces_fail_without_wildcard_fallback() {
+        for value in ["[", "^flame_nonexistent_interface$", "grpc://cache:9090"] {
+            let mut ctx = FlameClusterContext::default();
+            ctx.cluster.advertise = Some(value.into());
+            assert!(bind_address(&ctx, 0).is_err());
+        }
+        let mut ctx = FlameClusterContext::default();
+        ctx.cluster.advertise = Some("^lo0?$".into());
+        assert_eq!(
+            bind_address(&ctx, 0).unwrap().ip(),
+            "127.0.0.1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn both_listener_addresses_use_advertise_and_endpoint_ports() {
+        let mut ctx = FlameClusterContext::default();
+        ctx.cluster.endpoint = "http://service.flame:18080".into();
+        ctx.cluster.advertise = Some("127.0.0.1".into());
+        assert_eq!(
+            bind_address(&ctx, 0).unwrap(),
+            "127.0.0.1:18080".parse().unwrap()
+        );
+        assert_eq!(
+            bind_address(&ctx, 1).unwrap(),
+            "127.0.0.1:18081".parse().unwrap()
+        );
+        ctx.cluster.advertise = Some("::1".into());
+        ctx.cluster.endpoint = "http://service.flame".into();
+        assert_eq!(
+            bind_address(&ctx, 1).unwrap(),
+            "[::1]:8081".parse().unwrap()
+        );
+        ctx.cluster.endpoint = "http://service.flame:65535".into();
+        assert!(bind_address(&ctx, 1).is_err());
+        ctx.cluster.endpoint = "invalid endpoint".into();
+        assert!(bind_address(&ctx, 0).is_err());
     }
 }

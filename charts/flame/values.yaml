@@ -9,6 +9,8 @@ fullnameOverride: ""
 
 cluster:
   name: flame
+  # Optional session-manager bind IP or interface regex; empty binds all IPv4 interfaces.
+  advertise: ""
   resreq: "cpu=1,mem=2g"
   policies:
     - drf
