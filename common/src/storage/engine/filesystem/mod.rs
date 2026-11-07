@@ -52,13 +52,15 @@ use chrono::{DateTime, Duration, Utc};
 use crate::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationSchema, ApplicationState,
     ExecutorID, ExecutorState, Node, NodeInfo, NodeState, ResourceRequirement, Session,
-    SessionAttributes, SessionID, SessionState, SessionStatus, Shim, Task, TaskGID, TaskID,
-    TaskInput, TaskOptions, TaskResult, TaskState,
+    SessionAttributes, SessionID, SessionState, SessionStatus, Shim, Task, TaskCounts, TaskGID,
+    TaskID, TaskInput, TaskOptions, TaskResult, TaskState,
 };
 use crate::{FlameError, FLAME_HOME};
 
 use crate::apis::{ApplicationFilter, Executor, SessionFilter, TaskFilter};
 
+#[cfg(test)]
+use crate::storage::engine::task_snapshot;
 use crate::storage::engine::{Engine, EnginePtr};
 
 mod payload;
@@ -587,15 +589,20 @@ impl FilesystemEngine {
             )));
         }
 
-        let tasks = entry
-            .part(Part::Tasks)
-            .map_err(|e| FlameError::NotFound(format!("Tasks file not found: {e}")))?;
-        let offset = (task_id as u64 - 1) * self.record_size as u64;
+        let tasks = entry.part(Part::Tasks)?;
+        let offset = (task_id as u64 - 1)
+            .checked_mul(self.record_size as u64)
+            .ok_or_else(|| {
+                FlameError::NotFound(format!("Task {task_id} is outside the record range"))
+            })?;
         let mut buffer = vec![0u8; self.record_size];
-        tasks
-            .file
-            .read_exact_at(&mut buffer, offset)
-            .map_err(|e| FlameError::NotFound(format!("Task {task_id} not found: {e}")))?;
+        tasks.file.read_exact_at(&mut buffer, offset).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                FlameError::NotFound(format!("Task {task_id} not found: {e}"))
+            } else {
+                FlameError::Storage(format!("Cannot read task {task_id}: {e}"))
+            }
+        })?;
 
         let (meta, _): (TaskMetadata, _) = postcard::take_from_bytes(&buffer).map_err(|e| {
             FlameError::Storage(format!("Failed to deserialize task metadata: {e}"))
@@ -707,10 +714,15 @@ impl FilesystemEngine {
     fn _count_task(&self, entry: &SessionEntry, filter: &TaskFilter) -> Result<u64, FlameError> {
         let path = self.session_path(&filter.session).join("tasks.bin");
 
-        let task_count = match fs::metadata(&path) {
-            Ok(metadata) => metadata.len() / self.record_size as u64,
-            Err(_) => 0,
-        };
+        let length = fs::metadata(&path)
+            .map_err(|e| FlameError::Storage(format!("Cannot stat task records: {e}")))?
+            .len();
+        if length % self.record_size as u64 != 0 {
+            return Err(FlameError::Storage(
+                "Partial task record in tasks.bin".into(),
+            ));
+        }
+        let task_count = length / self.record_size as u64;
         let Some(states) = filter.states.as_ref() else {
             return Ok(task_count);
         };
@@ -832,7 +844,8 @@ impl FilesystemEngine {
             version: meta.version,
             common_data,
             tokens: meta.tokens.clone(),
-            tasks: std::collections::HashMap::new(),
+            tasks: Default::default(),
+            task_counts: Default::default(),
             tasks_index: std::collections::HashMap::new(),
             creation_time: DateTime::from_timestamp(meta.creation_time, 0)
                 .ok_or_else(|| FlameError::Storage("Invalid creation time".to_string()))?,
@@ -1284,37 +1297,40 @@ impl Engine for FilesystemEngine {
         let shared = self.session_entry(&id)?;
         let mut entry = write_async!(shared);
         validate_entry(&self.sessions, &id, &shared)?;
-        if entry.is_closed() {
-            entry.release_files();
-            return self.session_from_metadata(&entry.metadata);
-        }
-
+        let already_closed = entry.is_closed();
         let task_count = self._count_task(&entry, &TaskFilter::by_session(&id))?;
         let mut pending_tasks = Vec::new();
+        let mut counts = TaskCounts::default();
         for task_id in 1..=task_count {
             // Do not close over an unreadable task whose state is unknown.
             let task_meta = self.read_task_metadata(&entry, task_id as TaskID)?;
             let state = TaskState::try_from(task_meta.state as i32)?;
-            if state == TaskState::Running {
+            if !already_closed && state == TaskState::Running {
                 return Err(FlameError::Storage(
                     "Cannot close session with running tasks".to_string(),
                 ));
             }
-            if state == TaskState::Pending {
+            if !already_closed && state == TaskState::Pending {
                 pending_tasks.push(task_id as TaskID);
+                counts.increment(TaskState::Cancelled);
+            } else {
+                counts.increment(state);
             }
         }
         for task_id in pending_tasks {
             self._update_task_state(&entry, task_id, TaskState::Cancelled)?;
         }
-
-        let mut metadata = entry.metadata.clone();
-        metadata.state = SessionState::Closed as i32;
-        metadata.completion_time = Some(Utc::now().timestamp());
-        metadata.version += 1;
-        self.commit_session_metadata(&mut entry, metadata)?;
+        if !already_closed {
+            let mut metadata = entry.metadata.clone();
+            metadata.state = SessionState::Closed as i32;
+            metadata.completion_time = Some(Utc::now().timestamp());
+            metadata.version += 1;
+            self.commit_session_metadata(&mut entry, metadata)?;
+        }
         entry.release_files();
-        self.session_from_metadata(&entry.metadata)
+        let mut session = self.session_from_metadata(&entry.metadata)?;
+        session.task_counts = counts;
+        Ok(session)
     }
 
     async fn update_session_state(
@@ -1467,10 +1483,11 @@ impl Engine for FilesystemEngine {
 
     async fn update_task_state(
         &self,
-        gid: TaskGID,
+        current: Task,
         task_state: TaskState,
         _message: Option<String>,
     ) -> Result<Task, FlameError> {
+        let gid = current.gid();
         lock_ssn!(self, &gid.ssn_id, entry);
         // A suspending or suspended session still accepts tasks and task updates.
         ensure!(
@@ -1486,9 +1503,10 @@ impl Engine for FilesystemEngine {
 
     async fn update_task_result(
         &self,
-        gid: TaskGID,
+        current: Task,
         task_result: TaskResult,
     ) -> Result<Task, FlameError> {
+        let gid = current.gid();
         lock_ssn!(self, &gid.ssn_id, entry);
         // A suspending or suspended session still accepts tasks and task updates.
         ensure!(
@@ -1522,20 +1540,27 @@ impl Engine for FilesystemEngine {
         self.task_from_metadata(&entry, &meta)
     }
 
-    async fn find_tasks(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
-        lock_ssn!(self, &ssn_id, entry);
-
+    async fn find_tasks(&self, filter: &TaskFilter) -> Result<Vec<Task>, FlameError> {
+        lock_ssn!(self, &filter.session, entry);
+        if filter.states.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
+        let task_count = {
+            let _commit = entry.commit.lock().await;
+            self._count_task(&entry, &TaskFilter::by_session(&filter.session))?
+        };
         let mut tasks = Vec::new();
-        let task_count = self._count_task(&entry, &TaskFilter::by_session(&ssn_id))?;
-
         for task_id in 1..=task_count {
-            if let Ok(meta) = self.read_task_metadata(&entry, task_id as TaskID) {
-                if let Ok(task) = self.task_from_metadata(&entry, &meta) {
-                    tasks.push(task);
-                }
+            let meta = self.read_task_metadata(&entry, task_id as TaskID)?;
+            let state = TaskState::try_from(meta.state as i32)?;
+            if filter
+                .states
+                .as_ref()
+                .is_none_or(|states| states.contains(&state))
+            {
+                tasks.push(self.task_from_metadata(&entry, &meta)?);
             }
         }
-
         Ok(tasks)
     }
 
@@ -1810,6 +1835,114 @@ mod tests {
         };
 
         (engine, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn history_and_recovery_reads_reject_corrupt_metadata() {
+        let (engine, _dir) = create_test_engine().await;
+        engine
+            .register_application("corrupt".into(), ApplicationAttributes::default())
+            .await
+            .unwrap();
+        engine
+            .create_session(SessionAttributes {
+                id: "corrupt".into(),
+                application: "corrupt".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine
+            .create_task("corrupt".into(), None, None)
+            .await
+            .unwrap();
+        let path = engine.session_path("corrupt").join("tasks.bin");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0] ^= 0xff;
+        fs::write(path, bytes).unwrap();
+        assert!(engine
+            .find_tasks(&TaskFilter::by_session("corrupt"))
+            .await
+            .is_err());
+        assert!(engine
+            .find_tasks(&TaskFilter::terminal("corrupt"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn finished_reads_skip_active_payloads_and_release_task_gates() {
+        let (engine, _dir) = create_test_engine().await;
+        engine
+            .register_application("scan".into(), ApplicationAttributes::default())
+            .await
+            .unwrap();
+        engine
+            .create_session(SessionAttributes {
+                id: "scan".into(),
+                application: "scan".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        for _ in 0..16 {
+            let task = engine.create_task("scan".into(), None, None).await.unwrap();
+            engine
+                .update_task_result(
+                    task.clone(),
+                    TaskResult {
+                        state: TaskState::Succeed,
+                        output: Some(Bytes::from("history")),
+                        message: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        engine
+            .create_task("scan".into(), Some(Bytes::from("active input")), None)
+            .await
+            .unwrap();
+        // Finished reads filter metadata before loading active task payloads.
+        fs::write(engine.session_path("scan").join("inputs.bin"), []).unwrap();
+        assert_eq!(
+            engine
+                .find_tasks(&TaskFilter::terminal("scan"))
+                .await
+                .unwrap()
+                .len(),
+            16
+        );
+        assert!(engine
+            .find_tasks(&TaskFilter::by_session("scan"))
+            .await
+            .is_err());
+        // Corrupt finished payloads must fail both recovery and history reads.
+        fs::write(engine.session_path("scan").join("outputs.bin"), []).unwrap();
+        assert!(engine
+            .find_tasks(&TaskFilter::terminal("scan"))
+            .await
+            .is_err());
+        assert!(engine
+            .find_tasks(&TaskFilter::by_session("scan"))
+            .await
+            .is_err());
+        // Closing counts metadata without loading corrupted task payloads.
+        let closed = engine.close_session("scan".into()).await.unwrap();
+        assert_eq!(closed.task_counts.succeed, 16);
+        assert_eq!(closed.task_counts.cancelled, 1);
+        let repeated = engine.close_session("scan".into()).await.unwrap();
+        assert_eq!(repeated.task_counts, closed.task_counts);
+        let shared = engine.session_entry("scan").unwrap();
+        let entry = read_async!(shared);
+        assert!(entry.tasks.lock().is_empty());
+        {
+            let gate = entry.task_lock(1);
+            entry.with_task_read(1, || ());
+            assert!(Arc::ptr_eq(&gate, &entry.task_lock(1)));
+        }
+        entry.with_task_read(1, || ());
+        assert!(entry.tasks.lock().is_empty());
     }
 
     #[tokio::test]
@@ -2207,7 +2340,7 @@ mod tests {
 
         // Update task state
         let task3 = engine
-            .update_task_state(gid.clone(), TaskState::Running, None)
+            .update_task_state(task_snapshot(gid.clone()), TaskState::Running, None)
             .await
             .unwrap();
         assert_eq!(task3.state, TaskState::Running);
@@ -2220,14 +2353,17 @@ mod tests {
             message: None,
         };
         let task4 = engine
-            .update_task_result(gid.clone(), result)
+            .update_task_result(task_snapshot(gid.clone()), result)
             .await
             .unwrap();
         assert_eq!(task4.state, TaskState::Succeed);
         assert_eq!(task4.output, Some(output));
 
         // Find tasks
-        let tasks = engine.find_tasks("test-session".to_string()).await.unwrap();
+        let tasks = engine
+            .find_tasks(&TaskFilter::by_session("test-session"))
+            .await
+            .unwrap();
         assert_eq!(tasks.len(), 1);
 
         // Create another task
@@ -2243,7 +2379,7 @@ mod tests {
             task_id: 2,
         };
         engine
-            .update_task_state(gid2, TaskState::Succeed, None)
+            .update_task_state(task_snapshot(gid2), TaskState::Succeed, None)
             .await
             .unwrap();
 
@@ -2444,7 +2580,7 @@ mod tests {
             .unwrap();
 
         engine
-            .update_task_state(task.gid(), TaskState::Running, None)
+            .update_task_state(task.clone(), TaskState::Running, None)
             .await
             .unwrap();
 
@@ -2991,20 +3127,28 @@ mod tests {
         // Creation commit gate held: updates to existing tasks proceed.
         {
             let _commit = entry.commit.lock().await;
-            within_a_second(engine.update_task_state(gid("gates", 1), TaskState::Running, None))
-                .await
-                .expect("update waited for the creation commit gate")
-                .unwrap();
+            within_a_second(engine.update_task_state(
+                task_snapshot(gid("gates", 1)),
+                TaskState::Running,
+                None,
+            ))
+            .await
+            .expect("update waited for the creation commit gate")
+            .unwrap();
         }
 
         // Another task's lock is held: creation must still commit, and an unrelated
         // task must still update and be read.
         {
             let _held = entry.task_lock(2).write_arc();
-            within_a_second(engine.update_task_state(gid("gates", 1), TaskState::Succeed, None))
-                .await
-                .expect("unrelated task waited for a held task lock")
-                .unwrap();
+            within_a_second(engine.update_task_state(
+                task_snapshot(gid("gates", 1)),
+                TaskState::Succeed,
+                None,
+            ))
+            .await
+            .expect("unrelated task waited for a held task lock")
+            .unwrap();
             within_a_second(engine.get_task(gid("gates", 1)))
                 .await
                 .expect("unrelated read waited for a held task lock")
@@ -3161,21 +3305,31 @@ mod tests {
         let results = [
             engine
                 .create_task("closed-writes".into(), Some(Bytes::from("late")), None)
-                .await,
-            engine.retry_task(gid("closed-writes", task.id)).await,
+                .await
+                .map(|_| ()),
             engine
-                .update_task_state(gid("closed-writes", task.id), TaskState::Running, None)
-                .await,
+                .retry_task(gid("closed-writes", task.id))
+                .await
+                .map(|_| ()),
+            engine
+                .update_task_state(
+                    task_snapshot(gid("closed-writes", task.id)),
+                    TaskState::Running,
+                    None,
+                )
+                .await
+                .map(|_| ()),
             engine
                 .update_task_result(
-                    gid("closed-writes", task.id),
+                    task_snapshot(gid("closed-writes", task.id)),
                     TaskResult {
                         state: TaskState::Succeed,
                         output: Some(Bytes::from("late output")),
                         message: None,
                     },
                 )
-                .await,
+                .await
+                .map(|_| ()),
         ];
         for result in results {
             assert!(matches!(result, Err(FlameError::InvalidState(_))));

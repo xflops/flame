@@ -34,8 +34,8 @@ use stdng::trace_fn;
 use crate::{
     apis::{
         Application, ApplicationAttributes, ApplicationID, ApplicationState, ExecutorID,
-        ExecutorState, Node, Session, SessionAttributes, SessionID, SessionState, Task, TaskGID,
-        TaskInput, TaskOptions, TaskResult, TaskState,
+        ExecutorState, Node, Session, SessionAttributes, SessionID, SessionState, Task, TaskCounts,
+        TaskGID, TaskInput, TaskOptions, TaskResult, TaskState,
     },
     FlameError,
 };
@@ -56,6 +56,71 @@ pub struct SqliteEngine {
 }
 
 impl SqliteEngine {
+    async fn mutate_task(
+        &self,
+        gid: TaskGID,
+        state: TaskState,
+        output: Option<Option<Bytes>>,
+        retry: bool,
+    ) -> Result<Task, FlameError> {
+        // Take the SQLite writer reservation before reading lifecycle/task state.
+        // Otherwise a deferred transaction can race session close.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| FlameError::Storage(e.to_string()))?;
+        let session = Self::_get_session(&mut tx, gid.ssn_id.clone())
+            .await?
+            .ok_or_else(|| FlameError::NotFound(format!("session <{}>", gid.ssn_id)))?;
+        if session.is_closed() || (retry && !session.is_open()) {
+            return Err(FlameError::InvalidState(format!(
+                "Session {} does not accept task updates",
+                gid.ssn_id
+            )));
+        }
+        let completion_time = state.is_terminal().then(|| Utc::now().timestamp());
+        let task: TaskDao = if let Some(output) = output {
+            sqlx::query_as("UPDATE tasks SET state=?, completion_time=?, output=?, version=version+1 WHERE id=? AND ssn_id=? RETURNING *")
+                .bind(state as i32).bind(completion_time).bind::<Option<Vec<u8>>>(output.map(Bytes::into))
+                .bind(gid.task_id).bind(&gid.ssn_id).fetch_optional(&mut *tx).await
+        } else {
+            sqlx::query_as("UPDATE tasks SET state=?, completion_time=?, version=version+1 WHERE id=? AND ssn_id=? RETURNING *")
+                .bind(state as i32).bind(completion_time).bind(gid.task_id).bind(&gid.ssn_id)
+                .fetch_optional(&mut *tx).await
+        }.map_err(|e| FlameError::Storage(e.to_string()))?
+            .ok_or_else(|| FlameError::NotFound(format!("task <{gid}>")))?;
+        let task = Task::try_from(task)?;
+        tx.commit()
+            .await
+            .map_err(|e| FlameError::Storage(e.to_string()))?;
+        Ok(task)
+    }
+
+    async fn task_counts(
+        tx: &mut SqliteConnection,
+        id: &SessionID,
+    ) -> Result<TaskCounts, FlameError> {
+        let rows: Vec<(i32, i64)> =
+            sqlx::query_as("SELECT state, COUNT(*) FROM tasks WHERE ssn_id=? GROUP BY state")
+                .bind(id)
+                .fetch_all(tx)
+                .await
+                .map_err(|e| FlameError::Storage(e.to_string()))?;
+        let mut counts = TaskCounts::default();
+        for (state, count) in rows {
+            let count = count as u64;
+            match TaskState::try_from(state)? {
+                TaskState::Pending => counts.pending = count,
+                TaskState::Running => counts.running = count,
+                TaskState::Succeed => counts.succeed = count,
+                TaskState::Failed => counts.failed = count,
+                TaskState::Cancelled => counts.cancelled = count,
+            }
+        }
+        Ok(counts)
+    }
+
     pub async fn new_ptr(url: &str) -> Result<EnginePtr, FlameError> {
         tracing::debug!("Try to create and connect to {}", url);
 
@@ -722,9 +787,20 @@ impl Engine for SqliteEngine {
     async fn close_session(&self, id: SessionID) -> Result<Session, FlameError> {
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;
+
+        let mut current = Self::_get_session(&mut tx, id.clone())
+            .await?
+            .ok_or_else(|| FlameError::NotFound(format!("session <{id}>")))?;
+        if current.is_closed() {
+            current.task_counts = Self::task_counts(&mut tx, &id).await?;
+            tx.commit()
+                .await
+                .map_err(|e| FlameError::Storage(e.to_string()))?;
+            return Ok(current);
+        }
 
         let check_running_sql = "SELECT COUNT(*) as cnt FROM tasks WHERE ssn_id=? AND state=?";
         let running_count: (i32,) = sqlx::query_as(check_running_sql)
@@ -741,7 +817,7 @@ impl Engine for SqliteEngine {
         }
 
         let cancel_pending_sql =
-            "UPDATE tasks SET state=?, completion_time=? WHERE ssn_id=? AND state=?";
+            "UPDATE tasks SET state=?, completion_time=?, version=version+1 WHERE ssn_id=? AND state=?";
         sqlx::query(cancel_pending_sql)
             .bind(TaskState::Cancelled as i32)
             .bind(Utc::now().timestamp())
@@ -758,16 +834,18 @@ impl Engine for SqliteEngine {
         let ssn: SessionDao = sqlx::query_as(close_session_sql)
             .bind(SessionState::Closed as i32)
             .bind(Utc::now().timestamp())
-            .bind(id)
+            .bind(&id)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
+        let mut session = Session::try_from(ssn)?;
+        session.task_counts = Self::task_counts(&mut tx, &id).await?;
         tx.commit()
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;
 
-        ssn.try_into()
+        Ok(session)
     }
 
     async fn update_session_state(
@@ -883,10 +961,11 @@ impl Engine for SqliteEngine {
         let sql = r#"SELECT * FROM tasks WHERE id=? AND ssn_id=?"#;
         let task: TaskDao = sqlx::query_as(sql)
             .bind(gid.task_id)
-            .bind(gid.ssn_id)
-            .fetch_one(&mut *tx)
+            .bind(&gid.ssn_id)
+            .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
+            .map_err(|e| FlameError::Storage(e.to_string()))?
+            .ok_or_else(|| FlameError::NotFound(format!("task <{gid}>")))?;
 
         tx.commit()
             .await
@@ -896,131 +975,68 @@ impl Engine for SqliteEngine {
     }
 
     async fn retry_task(&self, gid: TaskGID) -> Result<Task, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let sql =
-            r#"UPDATE tasks SET state=?, version=version+1 WHERE id=? AND ssn_id=? RETURNING *"#;
-        let task: TaskDao = sqlx::query_as(sql)
-            .bind(TaskState::Pending as i32)
-            .bind(gid.task_id)
-            .bind(gid.ssn_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        task.try_into()
+        self.mutate_task(gid, TaskState::Pending, None, true).await
     }
 
     async fn update_task_state(
         &self,
-        gid: TaskGID,
+        current: Task,
         task_state: TaskState,
         _message: Option<String>,
     ) -> Result<Task, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
+        self.mutate_task(current.gid(), task_state, None, false)
             .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let completion_time = match task_state {
-            TaskState::Failed | TaskState::Succeed | TaskState::Cancelled => {
-                Some(Utc::now().timestamp())
-            }
-            _ => None,
-        };
-
-        let sql = r#"UPDATE tasks SET state=?, completion_time=?, version=version+1 WHERE id=? AND ssn_id=? RETURNING *"#;
-        let task: TaskDao = sqlx::query_as(sql)
-            .bind::<i32>(task_state.into())
-            .bind(completion_time)
-            .bind(gid.task_id)
-            .bind(gid.ssn_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        task.try_into()
     }
 
     async fn update_task_result(
         &self,
-        gid: TaskGID,
+        current: Task,
         task_result: TaskResult,
     ) -> Result<Task, FlameError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let completion_time = match task_result.state {
-            TaskState::Failed | TaskState::Succeed => Some(Utc::now().timestamp()),
-            _ => {
-                tracing::warn!(
-                    "Invalid task state <{:?}> for task <{}> when updating task result",
-                    task_result.state,
-                    gid
-                );
-                None
-            }
-        };
-
-        let sql = r#"UPDATE tasks SET state=?, completion_time=?, output=?, version=version+1 WHERE id=? AND ssn_id=? RETURNING *"#;
-
-        let task: TaskDao = sqlx::query_as(sql)
-            .bind::<i32>(task_result.state.into())
-            .bind(completion_time)
-            .bind::<Option<Vec<u8>>>(task_result.output.map(Bytes::into))
-            .bind(gid.task_id)
-            .bind(gid.ssn_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        task.try_into()
+        self.mutate_task(
+            current.gid(),
+            task_result.state,
+            Some(task_result.output),
+            false,
+        )
+        .await
     }
 
-    async fn find_tasks(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
+    async fn find_tasks(&self, filter: &TaskFilter) -> Result<Vec<Task>, FlameError> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let sql = "SELECT * FROM tasks WHERE ssn_id=?";
-        let task_list: Vec<TaskDao> = sqlx::query_as(sql)
-            .bind(ssn_id)
+        Self::_get_session(&mut tx, filter.session.clone())
+            .await?
+            .ok_or_else(|| FlameError::NotFound(format!("session <{}>", filter.session)))?;
+        if filter.states.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT * FROM tasks WHERE ssn_id=");
+        query.push_bind(&filter.session);
+        if let Some(states) = &filter.states {
+            query.push(" AND state IN (");
+            let mut values = query.separated(", ");
+            for state in states {
+                values.push_bind(*state as i32);
+            }
+            values.push_unseparated(")");
+        }
+        query.push(" ORDER BY id");
+        let rows: Vec<TaskDao> = query
+            .build_query_as()
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;
-
-        let tasks: Vec<Task> = task_list
-            .iter()
+        let tasks = rows
+            .into_iter()
             .map(Task::try_from)
-            .filter_map(Result::ok)
-            .collect();
-
+            .collect::<Result<Vec<_>, _>>()?;
         tx.commit()
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;
-
         Ok(tasks)
     }
 
@@ -1438,7 +1454,8 @@ mod tests {
 
         let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
         assert_eq!(task_1_1.id, 1);
-        let tasks = tokio_test::block_on(storage.find_tasks(ssn_1.id.clone()))?;
+        let tasks =
+            tokio_test::block_on(storage.find_tasks(&TaskFilter::by_session(ssn_1.id.clone())))?;
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, 1);
         assert_eq!(tasks[0].ssn_id, ssn_1.id.clone());
@@ -1447,12 +1464,13 @@ mod tests {
         assert_eq!(tasks[0].output, None);
 
         let task_1_1 = tokio_test::block_on(storage.update_task_state(
-            task_1_1.gid(),
+            task_1_1.clone(),
             TaskState::Succeed,
             Some("Task succeeded".to_string()),
         ))?;
         assert_eq!(task_1_1.state, TaskState::Succeed);
-        let tasks = tokio_test::block_on(storage.find_tasks(ssn_1.id.clone()))?;
+        let tasks =
+            tokio_test::block_on(storage.find_tasks(&TaskFilter::by_session(ssn_1.id.clone())))?;
 
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, 1);
@@ -1599,7 +1617,7 @@ mod tests {
         assert_eq!(task_1_1.state, TaskState::Pending);
 
         let task_1_1 = tokio_test::block_on(storage.update_task_state(
-            task_1_1.gid(),
+            task_1_1.clone(),
             TaskState::Succeed,
             None,
         ))?;
@@ -1942,18 +1960,19 @@ mod tests {
         let task_1_2 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
         assert_eq!(task_1_2.id, 2);
 
-        let task_list = tokio_test::block_on(storage.find_tasks(ssn_1.id))?;
+        let task_list =
+            tokio_test::block_on(storage.find_tasks(&TaskFilter::by_session(ssn_1.id)))?;
         assert_eq!(task_list.len(), 2);
 
         let task_1_1 = tokio_test::block_on(storage.update_task_state(
-            task_1_1.gid(),
+            task_1_1.clone(),
             TaskState::Succeed,
             None,
         ))?;
         assert_eq!(task_1_1.state, TaskState::Succeed);
 
         let task_1_2 = tokio_test::block_on(storage.update_task_state(
-            task_1_2.gid(),
+            task_1_2.clone(),
             TaskState::Succeed,
             None,
         ))?;
@@ -1997,14 +2016,14 @@ mod tests {
         assert_eq!(task_1_2.id, 2);
 
         let task_1_1 = tokio_test::block_on(storage.update_task_state(
-            task_1_1.gid(),
+            task_1_1.clone(),
             TaskState::Succeed,
             None,
         ))?;
         assert_eq!(task_1_1.state, TaskState::Succeed);
 
         let task_1_2 = tokio_test::block_on(storage.update_task_state(
-            task_1_2.gid(),
+            task_1_2.clone(),
             TaskState::Succeed,
             None,
         ))?;
@@ -2034,14 +2053,14 @@ mod tests {
         assert_eq!(task_2_2.id, 2);
 
         let task_2_1 = tokio_test::block_on(storage.update_task_state(
-            task_2_1.gid(),
+            task_2_1.clone(),
             TaskState::Succeed,
             None,
         ))?;
         assert_eq!(task_2_1.state, TaskState::Succeed);
 
         let task_2_2 = tokio_test::block_on(storage.update_task_state(
-            task_2_2.gid(),
+            task_2_2.clone(),
             TaskState::Succeed,
             None,
         ))?;
@@ -2125,7 +2144,11 @@ mod tests {
         let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
         assert_eq!(task_1_1.state, TaskState::Pending);
 
-        tokio_test::block_on(storage.update_task_state(task_1_1.gid(), TaskState::Running, None))?;
+        tokio_test::block_on(storage.update_task_state(
+            task_1_1.clone(),
+            TaskState::Running,
+            None,
+        ))?;
 
         let res = tokio_test::block_on(storage.close_session(ssn_1_id.clone()));
         assert!(res.is_err());
@@ -2162,7 +2185,7 @@ mod tests {
         assert_eq!(task_1_1.id, 1);
 
         let task_1_1 = tokio_test::block_on(storage.update_task_state(
-            task_1_1.gid(),
+            task_1_1.clone(),
             TaskState::Succeed,
             None,
         ))?;
@@ -2212,7 +2235,7 @@ mod tests {
         assert_eq!(task_1_1.state, TaskState::Pending);
 
         let task_1_1 = tokio_test::block_on(storage.update_task_state(
-            task_1_1.gid(),
+            task_1_1.clone(),
             TaskState::Succeed,
             None,
         ))?;

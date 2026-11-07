@@ -106,6 +106,7 @@ impl Flame {
         let mut task = self
             .controller
             .get_task_metadata(ssn_id.clone(), task_id)
+            .await
             .map_err(Status::from)?;
         if task.is_completed() {
             // Terminal updates carry failure details in task events. Load those
@@ -113,6 +114,7 @@ impl Flame {
             task = self
                 .controller
                 .get_task(ssn_id.clone(), task_id)
+                .await
                 .map_err(Status::from)?;
             registered_tasks.remove(&task_id);
         }
@@ -218,18 +220,17 @@ impl Frontend for Flame {
             .session_id
             .parse::<apis::SessionID>()
             .map_err(|_| Status::invalid_argument("invalid session id"))?;
-        let task_list = self.controller.list_tasks(ssn_id).map_err(Status::from)?;
-
+        let task_list = self
+            .controller
+            .list_tasks(ssn_id)
+            .await
+            .map_err(Status::from)?;
         let (tx, rx) = mpsc::channel(128);
 
         tokio::spawn(async move {
             for task in task_list {
-                if tx.is_closed() {
-                    break;
-                }
-
-                if let Err(e) = tx.send(Result::<_, Status>::Ok(Task::from(&task))).await {
-                    tracing::error!("Failed to send Task <{}>: {e}", task.id);
+                if tx.send(Ok(Task::from(&task))).await.is_err() {
+                    return;
                 }
             }
         });
@@ -690,6 +691,7 @@ impl Frontend for Flame {
         let task = self
             .controller
             .get_task(ssn_id, task_id)
+            .await
             .map(Task::from)
             .map_err(Status::from)?;
 
@@ -756,11 +758,24 @@ mod tests {
         result
     }
 
-    async fn watch_test_storage_and_controller(
-    ) -> (crate::storage::StoragePtr, crate::controller::ControllerPtr) {
+    async fn watch_test_storage_and_controller() -> (
+        crate::storage::StoragePtr,
+        crate::controller::ControllerPtr,
+        apis::SessionID,
+    ) {
+        task_test_controller("sqlite::memory:".to_string()).await
+    }
+
+    async fn task_test_controller(
+        storage_url: String,
+    ) -> (
+        crate::storage::StoragePtr,
+        crate::controller::ControllerPtr,
+        apis::SessionID,
+    ) {
         let config = common::ctx::FlameClusterContext {
             cluster: common::ctx::FlameCluster {
-                storage: "none".to_string(),
+                storage: storage_url,
                 ..Default::default()
             },
             ..Default::default()
@@ -771,9 +786,11 @@ mod tests {
             .register_application("test-app".to_string(), ApplicationAttributes::default())
             .await
             .unwrap();
+        // File-backed event managers share a root; isolate each fixture's session files.
+        let ssn_id = format!("watch-test-session-{}", uuid::Uuid::new_v4());
         controller
             .create_session(SessionAttributes {
-                id: "watch-test-session".to_string(),
+                id: ssn_id.clone(),
                 application: "test-app".to_string(),
                 resreq: Some(ResourceRequirement {
                     cpu: 1,
@@ -784,17 +801,17 @@ mod tests {
             })
             .await
             .unwrap();
-        (storage, controller)
+        (storage, controller, ssn_id)
     }
 
-    async fn watch_test_controller() -> crate::controller::ControllerPtr {
-        let (_, controller) = watch_test_storage_and_controller().await;
-        controller
+    async fn watch_test_controller() -> (crate::controller::ControllerPtr, apis::SessionID) {
+        let (_, controller, ssn_id) = watch_test_storage_and_controller().await;
+        (controller, ssn_id)
     }
 
-    fn watch_request(task_id: apis::TaskID) -> WatchTaskRequest {
+    fn watch_request(ssn_id: &str, task_id: apis::TaskID) -> WatchTaskRequest {
         WatchTaskRequest {
-            session_id: "watch-test-session".to_string(),
+            session_id: ssn_id.to_string(),
             task_id: task_id.to_string(),
         }
     }
@@ -802,27 +819,250 @@ mod tests {
     type WatchRequest = Result<WatchTaskRequest, Status>;
 
     fn watch_requests(
+        ssn_id: &str,
         task_id: apis::TaskID,
     ) -> (mpsc::Sender<WatchRequest>, ReceiverStream<WatchRequest>) {
         let (tx, rx) = mpsc::channel(1);
-        tx.try_send(Ok(watch_request(task_id))).unwrap();
+        tx.try_send(Ok(watch_request(ssn_id, task_id))).unwrap();
         (tx, ReceiverStream::new(rx))
     }
 
     #[tokio::test]
-    async fn watch_tasks_omits_event_history_until_terminal_state() {
-        let controller = watch_test_controller().await;
+    async fn list_tasks_streams_all_active_tasks_then_finished_history() {
+        use common::apis::{TaskResult, TaskState};
+
+        for backend in ["none", "sqlite", "fs"] {
+            let dir = tempfile::tempdir().unwrap();
+            let url = match backend {
+                "none" => "none".to_string(),
+                "sqlite" => format!("sqlite://{}", dir.path().join("tasks.db").display()),
+                _ => format!("fs://{}", dir.path().join("data").display()),
+            };
+            let (storage, controller, ssn_id) = task_test_controller(url).await;
+            for index in 0..2003 {
+                let task = controller
+                    .create_task(ssn_id.clone(), None, None)
+                    .await
+                    .unwrap();
+                if index % 2 == 0 {
+                    let task_ptr = storage.get_task_ptr(task.gid()).unwrap();
+                    storage
+                        .update_task_result(
+                            storage.get_session_ptr(ssn_id.clone()).unwrap(),
+                            task_ptr,
+                            TaskResult {
+                                state: TaskState::Succeed,
+                                output: Some(bytes::Bytes::from_static(b"stored result")),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert!(storage.get_task_ptr(task.gid()).is_err());
+                }
+            }
+            let flame = Flame {
+                controller: controller.clone(),
+                cluster_default_resreq: None,
+            };
+            let mut stream = Frontend::list_tasks(
+                &flame,
+                Request::new(ListTasksRequest {
+                    session_id: ssn_id.clone(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            let mut ids = Vec::new();
+            while let Some(task) = stream.next().await {
+                let task = task.unwrap();
+                let id = task.metadata.as_ref().unwrap().id.parse::<i64>().unwrap();
+                if id % 2 == 1 {
+                    assert_eq!(
+                        task.spec.as_ref().unwrap().output.as_deref(),
+                        Some(b"stored result".as_slice())
+                    );
+                }
+                ids.push(id);
+            }
+            let active_ids = ids
+                .iter()
+                .take(1001)
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(active_ids, (2..=2002).step_by(2).collect(), "{backend}");
+            let unique_ids = ids
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(ids.len(), unique_ids.len(), "duplicate tasks for {backend}");
+            assert_eq!(ids.len(), 2003, "{backend}");
+            let finished_ids = ids
+                .iter()
+                .skip(1001)
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(finished_ids, (1..=2003).step_by(2).collect(), "{backend}");
+        }
+    }
+
+    #[tokio::test]
+    async fn none_listing_includes_dequeued_pending_tasks() {
+        let (storage, controller, ssn_id) = task_test_controller("none".to_string()).await;
         let task = controller
-            .create_task("watch-test-session".to_string(), None, None)
+            .create_task(ssn_id.clone(), None, None)
+            .await
+            .unwrap();
+        {
+            let session = storage.get_session_ptr(ssn_id.clone()).unwrap();
+            let mut session = stdng::lock_ptr!(session).unwrap();
+            assert!(session.pop_pending_task().is_some());
+        }
+        let flame = Flame {
+            controller,
+            cluster_default_resreq: None,
+        };
+        let mut stream = Frontend::list_tasks(
+            &flame,
+            Request::new(ListTasksRequest { session_id: ssn_id }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            stream.next().await.unwrap().unwrap().metadata.unwrap().id,
+            task.id.to_string()
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn none_finished_task_remains_readable_from_get_watch_and_list() {
+        let (storage, controller, ssn_id) = task_test_controller("none".to_string()).await;
+        let task = controller
+            .create_task(ssn_id.clone(), None, None)
+            .await
+            .unwrap();
+        storage
+            .update_task_result(
+                storage.get_session_ptr(ssn_id.clone()).unwrap(),
+                storage.get_task_ptr(task.gid()).unwrap(),
+                apis::TaskResult {
+                    state: apis::TaskState::Succeed,
+                    output: Some(bytes::Bytes::from_static(b"retained result")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(storage.get_task_ptr(task.gid()).is_err());
+        let history = controller.get_task(ssn_id.clone(), task.id).await.unwrap();
+        assert_eq!(history.state, apis::TaskState::Succeed);
+        assert_eq!(
+            history.output,
+            Some(bytes::Bytes::from_static(b"retained result"))
+        );
+        assert!(!history.events.is_empty());
+        let listed = controller.list_tasks(ssn_id.clone()).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].gid(), task.gid());
+        assert_eq!(listed[0].output, history.output);
+        let session = controller.get_session(ssn_id.clone()).unwrap();
+        assert_eq!(session.task_counts.succeed, 1);
+        assert!(session.tasks.is_empty());
+
+        let (requests_tx, requests) = watch_requests(&ssn_id, task.id);
+        let (tx, mut rx) = mpsc::channel(1);
+        let watcher = tokio::spawn(watch_task_stream(controller, requests, tx));
+        let reported = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reported.spec.unwrap().output.as_deref(),
+            Some(b"retained result".as_slice())
+        );
+        let status = reported.status.unwrap();
+        assert_eq!(status.state, rpc::TaskState::Succeed as i32);
+        assert_eq!(status.events.len(), history.events.len());
+        {
+            let _requests_tx = requests_tx;
+        }
+        watcher.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_watch_reads_evicted_terminal_result_and_events() {
+        use common::apis::{TaskResult, TaskState};
+
+        for backend in ["none", "sqlite", "fs"] {
+            let dir = tempfile::tempdir().unwrap();
+            let url = match backend {
+                "none" => "none".to_string(),
+                "sqlite" => format!("sqlite://{}", dir.path().join("tasks.db").display()),
+                _ => format!("fs://{}", dir.path().join("data").display()),
+            };
+            let (storage, controller, ssn_id) = task_test_controller(url).await;
+            let task = controller
+                .create_task(ssn_id.clone(), None, None)
+                .await
+                .unwrap();
+            storage
+                .update_task_result(
+                    storage.get_session_ptr(ssn_id.clone()).unwrap(),
+                    storage.get_task_ptr(task.gid()).unwrap(),
+                    TaskResult {
+                        state: TaskState::Failed,
+                        message: Some("persisted failure".into()),
+                        output: Some(bytes::Bytes::from_static(b"failure output")),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(storage.get_task_ptr(task.gid()).is_err());
+            let (requests_tx, requests) = watch_requests(&ssn_id, task.id);
+            let (tx, mut rx) = mpsc::channel(1);
+            let watcher = tokio::spawn(watch_task_stream(controller, requests, tx));
+            let reported = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                reported.spec.unwrap().output.as_deref(),
+                Some(b"failure output".as_slice())
+            );
+            let status = reported.status.unwrap();
+            assert_eq!(status.state, rpc::TaskState::Failed as i32);
+            assert!(status
+                .events
+                .iter()
+                .any(|event| event.message.as_deref() == Some("persisted failure")));
+            // Ending registrations lets the stream finish after the terminal response.
+            {
+                let _requests_tx = requests_tx;
+            }
+            watcher.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_tasks_omits_event_history_until_terminal_state() {
+        let (controller, ssn_id) = watch_test_controller().await;
+        let task = controller
+            .create_task(ssn_id.clone(), None, None)
             .await
             .unwrap();
         assert!(!controller
-            .get_task("watch-test-session".to_string(), task.id)
+            .get_task(ssn_id.clone(), task.id)
+            .await
             .unwrap()
             .events
             .is_empty());
 
-        let (_requests_tx, requests) = watch_requests(task.id);
+        let (_requests_tx, requests) = watch_requests(&ssn_id, task.id);
         let (tx, mut rx) = mpsc::channel(1);
         let watcher = tokio::spawn(watch_task_stream(controller, requests, tx));
         let reported = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
@@ -841,17 +1081,15 @@ mod tests {
     async fn watch_tasks_includes_failed_task_event_message() {
         use common::apis::{TaskGID, TaskResult, TaskState};
 
-        let (storage, controller) = watch_test_storage_and_controller().await;
+        let (storage, controller, ssn_id) = watch_test_storage_and_controller().await;
         let task = controller
-            .create_task("watch-test-session".to_string(), None, None)
+            .create_task(ssn_id.clone(), None, None)
             .await
             .unwrap();
-        let ssn_ptr = storage
-            .get_session_ptr("watch-test-session".to_string())
-            .unwrap();
+        let ssn_ptr = storage.get_session_ptr(ssn_id.clone()).unwrap();
         let task_ptr = storage
             .get_task_ptr(TaskGID {
-                ssn_id: "watch-test-session".to_string(),
+                ssn_id: ssn_id.clone(),
                 task_id: task.id,
             })
             .unwrap();
@@ -868,7 +1106,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (_requests_tx, requests) = watch_requests(task.id);
+        let (_requests_tx, requests) = watch_requests(&ssn_id, task.id);
         let (tx, mut rx) = mpsc::channel(1);
         let watcher = tokio::spawn(watch_task_stream(controller, requests, tx));
         let reported = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
@@ -888,8 +1126,8 @@ mod tests {
 
     #[tokio::test]
     async fn watch_tasks_rejects_unknown_task() {
-        let controller = watch_test_controller().await;
-        let (_requests_tx, requests) = watch_requests(999);
+        let (controller, ssn_id) = watch_test_controller().await;
+        let (_requests_tx, requests) = watch_requests(&ssn_id, 999);
         let (tx, _rx) = mpsc::channel(1);
         let result = watch_task_stream(controller, requests, tx).await;
         assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
@@ -897,7 +1135,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_tasks_rejects_empty_registration_stream() {
-        let controller = watch_test_controller().await;
+        let (controller, _ssn_id) = watch_test_controller().await;
         let (_requests_tx, requests_rx) = mpsc::channel::<Result<WatchTaskRequest, Status>>(1);
         drop(_requests_tx);
         let (tx, _rx) = mpsc::channel(1);
@@ -914,8 +1152,8 @@ mod tests {
 
     #[tokio::test]
     async fn suspend_and_resume_session_round_trip() {
-        let flame = test_flame(watch_test_controller().await);
-        let session_id = "watch-test-session".to_string();
+        let (controller, session_id) = watch_test_controller().await;
+        let flame = test_flame(controller);
 
         let suspended = flame
             .suspend_session(Request::new(SuspendSessionRequest {
@@ -948,8 +1186,8 @@ mod tests {
 
     #[tokio::test]
     async fn suspend_session_maps_errors() {
-        let flame = test_flame(watch_test_controller().await);
-        let session_id = "watch-test-session".to_string();
+        let (controller, session_id) = watch_test_controller().await;
+        let flame = test_flame(controller);
 
         let status = flame
             .suspend_session(Request::new(SuspendSessionRequest {
@@ -972,17 +1210,14 @@ mod tests {
 
     #[tokio::test]
     async fn watch_tasks_rejects_registration_after_session_close() {
-        let controller = watch_test_controller().await;
+        let (controller, ssn_id) = watch_test_controller().await;
         let task = controller
-            .create_task("watch-test-session".to_string(), None, None)
+            .create_task(ssn_id.clone(), None, None)
             .await
             .unwrap();
-        controller
-            .close_session("watch-test-session".to_string())
-            .await
-            .unwrap();
+        controller.close_session(ssn_id.clone()).await.unwrap();
 
-        let (_requests_tx, requests) = watch_requests(task.id);
+        let (_requests_tx, requests) = watch_requests(&ssn_id, task.id);
         let (tx, _rx) = mpsc::channel(1);
         let result = watch_task_stream(controller, requests, tx).await;
         let status = result.unwrap_err();
@@ -992,20 +1227,17 @@ mod tests {
 
     #[tokio::test]
     async fn watch_tasks_reports_terminal_state_then_closes_on_session_close() {
-        let controller = watch_test_controller().await;
+        let (controller, ssn_id) = watch_test_controller().await;
         let task = controller
-            .create_task("watch-test-session".to_string(), None, None)
+            .create_task(ssn_id.clone(), None, None)
             .await
             .unwrap();
-        let (_requests_tx, requests) = watch_requests(task.id);
+        let (_requests_tx, requests) = watch_requests(&ssn_id, task.id);
         let (tx, mut rx) = mpsc::channel(2);
         let watcher = tokio::spawn(watch_task_stream(controller.clone(), requests, tx));
         rx.recv().await.unwrap().unwrap();
 
-        controller
-            .close_session("watch-test-session".to_string())
-            .await
-            .unwrap();
+        controller.close_session(ssn_id.clone()).await.unwrap();
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
             .unwrap()
@@ -1026,21 +1258,21 @@ mod tests {
 
     #[tokio::test]
     async fn watch_tasks_reports_only_registered_ids_on_one_stream() {
-        let controller = watch_test_controller().await;
+        let (controller, ssn_id) = watch_test_controller().await;
         let first = controller
-            .create_task("watch-test-session".to_string(), None, None)
+            .create_task(ssn_id.clone(), None, None)
             .await
             .unwrap();
         let second = controller
-            .create_task("watch-test-session".to_string(), None, None)
+            .create_task(ssn_id.clone(), None, None)
             .await
             .unwrap();
         let _unregistered = controller
-            .create_task("watch-test-session".to_string(), None, None)
+            .create_task(ssn_id.clone(), None, None)
             .await
             .unwrap();
 
-        let (requests_tx, requests) = watch_requests(first.id);
+        let (requests_tx, requests) = watch_requests(&ssn_id, first.id);
         let (tx, mut rx) = mpsc::channel(2);
         let watcher = tokio::spawn(watch_task_stream(controller.clone(), requests, tx));
         let initial = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
@@ -1060,7 +1292,10 @@ mod tests {
                 .is_err()
         );
 
-        requests_tx.send(Ok(watch_request(first.id))).await.unwrap();
+        requests_tx
+            .send(Ok(watch_request(&ssn_id, first.id)))
+            .await
+            .unwrap();
         let repeated_snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
             .unwrap()
@@ -1073,7 +1308,7 @@ mod tests {
         );
 
         requests_tx
-            .send(Ok(watch_request(second.id)))
+            .send(Ok(watch_request(&ssn_id, second.id)))
             .await
             .unwrap();
         drop(requests_tx);
@@ -1088,10 +1323,7 @@ mod tests {
             rpc::TaskState::Pending as i32
         );
 
-        controller
-            .close_session("watch-test-session".to_string())
-            .await
-            .unwrap();
+        controller.close_session(ssn_id.clone()).await.unwrap();
         let mut completed = HashSet::new();
         for _ in 0..2 {
             let reported = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
@@ -1116,12 +1348,12 @@ mod tests {
 
     #[tokio::test]
     async fn watch_tasks_stops_when_response_stream_is_dropped() {
-        let controller = watch_test_controller().await;
+        let (controller, ssn_id) = watch_test_controller().await;
         let task = controller
-            .create_task("watch-test-session".to_string(), None, None)
+            .create_task(ssn_id.clone(), None, None)
             .await
             .unwrap();
-        let (_requests_tx, requests) = watch_requests(task.id);
+        let (_requests_tx, requests) = watch_requests(&ssn_id, task.id);
         let (tx, rx) = mpsc::channel(1);
         let watcher = tokio::spawn(watch_task_stream(controller, requests, tx));
         tokio::task::yield_now().await;
@@ -1135,7 +1367,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_tasks_stops_before_first_request_when_response_stream_is_dropped() {
-        let controller = watch_test_controller().await;
+        let (controller, _ssn_id) = watch_test_controller().await;
         let (_requests_tx, requests_rx) = mpsc::channel::<Result<WatchTaskRequest, Status>>(1);
         let (tx, rx) = mpsc::channel(1);
         let watcher = tokio::spawn(watch_task_stream(

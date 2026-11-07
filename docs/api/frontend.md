@@ -167,7 +167,10 @@ Opens an existing session or creates one if spec is provided.
 
 ### CloseSession
 
-Closes a session, preventing new task submissions. A successful close removes all
+Closes a session, preventing new task submissions. Close rejects sessions with
+running tasks and cancels remaining pending tasks. The response includes final
+accurate task counters for every storage backend, including `none`; repeating a
+successful close preserves those counters. A successful close removes all
 session and task events; events are retained while the session remains open.
 
 **Request:** `CloseSessionRequest`
@@ -258,6 +261,14 @@ task = session.create_task(b"input data")
 
 Retrieves task details.
 
+Finished tasks remain readable from the selected storage engine after they
+leave the session manager's active task cache. Filesystem and SQLite retain
+records on disk; `none` retains all task records and results in memory for the
+life of its engine instance. Closing a session or evicting it from the scheduling
+cache does not delete engine task history. Explicit session deletion removes
+that history; a new `none` engine instance starts empty after restart. Session
+status counters include finished tasks for every backend.
+
 **Request:** `GetTaskRequest`
 
 | Field | Type | Description |
@@ -298,7 +309,13 @@ for update in session.watch_task(task.id):
 
 ### ListTasks
 
-Streams all tasks in a session.
+Streams all active tasks copied from the session cache, followed by all
+finished tasks read from the storage engine, with no limit or pagination.
+Task input/output is preserved. A task that finishes between the cache snapshot
+and storage read appears once, using the active snapshot already selected.
+These reads are not a transactional snapshot: concurrent creation and state
+changes can affect which tasks and states are returned. No task-ID ordering is
+promised. This includes completed history retained in memory by `none` storage.
 
 **Request:** `ListTasksRequest`
 

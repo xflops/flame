@@ -192,13 +192,20 @@ impl From<&Session> for rpc::Session {
             cancelled: 0,
             events: ssn.events.clone().into_iter().map(Event::into).collect(),
         };
-        for (s, v) in &ssn.tasks_index {
-            match s {
-                TaskState::Pending => status.pending = v.len() as i32,
-                TaskState::Running => status.running = v.len() as i32,
-                TaskState::Succeed => status.succeed = v.len() as i32,
-                TaskState::Failed => status.failed = v.len() as i32,
-                TaskState::Cancelled => status.cancelled = v.len() as i32,
+        for state in [
+            TaskState::Pending,
+            TaskState::Running,
+            TaskState::Succeed,
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ] {
+            let count = i32::try_from(ssn.task_counts.get(state)).unwrap_or(i32::MAX);
+            match state {
+                TaskState::Pending => status.pending = count,
+                TaskState::Running => status.running = count,
+                TaskState::Succeed => status.succeed = count,
+                TaskState::Failed => status.failed = count,
+                TaskState::Cancelled => status.cancelled = count,
             }
         }
 

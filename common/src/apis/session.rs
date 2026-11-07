@@ -37,63 +37,38 @@ impl Session {
         self.retry_count < retry_limits
     }
 
-    pub fn update_task(&mut self, task: &Task) -> Result<(), FlameError> {
-        let task_ptr = TaskPtr::new(task.clone().into());
-
-        let old_task_ptr = self.tasks.get(&task.id);
-        if let Some(old_task_ptr) = old_task_ptr {
-            let old_task = lock_ptr!(old_task_ptr)?;
-            if old_task.version >= task.version {
-                tracing::debug!(
-                    "Update task: <{task_id}> with an old version (old={old_version}, new={new_version}), ignore it.",
-                    task_id = task.id,
-                    old_version = old_task.version,
-                    new_version = task.version
-                );
-                return Ok(());
-            }
+    /// Cache an active task without changing task counters.
+    pub(crate) fn cache_task(&mut self, task: &Task) {
+        if task.state.is_terminal() {
+            return;
         }
-
-        tracing::debug!(
-            "Updating task <{}> from state {:?} to {:?} (version {})",
-            task.id,
-            self.tasks
-                .get(&task.id)
-                .and_then(|t| lock_ptr!(t).ok())
-                .map(|t| t.state),
-            task.state,
-            task.version
-        );
-
-        self.tasks.insert(task.id, task_ptr.clone());
-        self.tasks_index.entry(task.state).or_default();
-
-        for state in self.tasks_index.values_mut() {
-            state.remove(&task.id);
-        }
-
+        let ptr = TaskPtr::new(task.clone().into());
+        self.tasks.insert(task.id, ptr.clone());
         self.tasks_index
-            .get_mut(&task.state)
-            .unwrap()
-            .insert(task.id, task_ptr);
+            .entry(task.state)
+            .or_default()
+            .insert(task.id, ptr);
+    }
 
-        let pending_count = self
-            .tasks_index
-            .get(&TaskState::Pending)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let running_count = self
-            .tasks_index
-            .get(&TaskState::Running)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        tracing::debug!(
-            "Session <{}> tasks_index after update: pending={}, running={}",
-            self.id,
-            pending_count,
-            running_count
-        );
-
+    /// Insert a new task or publish a newer state for an existing task.
+    pub fn update_task(&mut self, task: &Task) -> Result<(), FlameError> {
+        if let Some(previous) = self.tasks.get(&task.id) {
+            let old = {
+                let previous = lock_ptr!(previous)?;
+                if previous.version >= task.version || previous.is_completed() {
+                    return Ok(());
+                }
+                previous.state
+            };
+            self.task_counts.transition(old, task.state)?;
+        } else {
+            self.task_counts.increment(task.state);
+        }
+        for index in self.tasks_index.values_mut() {
+            index.remove(&task.id);
+        }
+        self.tasks.remove(&task.id);
+        self.cache_task(task);
         Ok(())
     }
 
@@ -186,6 +161,29 @@ mod tests {
             ..Default::default()
         }
         .is_ready(2));
+    }
+
+    #[test]
+    fn update_task_inserts_then_evicts_finished_tasks() {
+        let mut session = Session::default();
+        let mut task = Task {
+            id: 1,
+            version: 1,
+            ..Default::default()
+        };
+        session.update_task(&task).unwrap();
+        assert_eq!(session.task_counts.pending, 1);
+        for (version, state) in [(2, TaskState::Running), (3, TaskState::Succeed)] {
+            task.version = version;
+            task.state = state;
+            session.update_task(&task).unwrap();
+        }
+        assert!(session.tasks.is_empty());
+        assert!(session.tasks_index.values().all(|index| index.is_empty()));
+        assert_eq!(session.task_counts.pending, 0);
+        assert_eq!(session.task_counts.running, 0);
+        assert_eq!(session.task_counts.succeed, 1);
+        assert_eq!(session.task_counts.failed, 0);
     }
 
     #[test]

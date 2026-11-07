@@ -34,7 +34,7 @@ impl SessionPredicate {
 pub struct TaskFilter {
     /// Owning session.
     pub session: SessionID,
-    /// Task states to include. `None` matches every state.
+    /// Task states to include. `None` matches every state; an empty list matches none.
     pub states: Option<Vec<TaskState>>,
 }
 
@@ -56,6 +56,14 @@ impl TaskFilter {
             session: session.into(),
             states: Some(states.into()),
         }
+    }
+
+    /// Creates a filter for finished tasks in a session.
+    pub fn terminal(session: impl Into<SessionID>) -> Self {
+        Self::by_session_states(
+            session,
+            vec![TaskState::Succeed, TaskState::Failed, TaskState::Cancelled],
+        )
     }
 
     /// Creates a filter for non-terminal tasks in a session.
