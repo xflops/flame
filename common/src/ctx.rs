@@ -129,8 +129,8 @@ struct FlameTlsYaml {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FlameCacheYaml {
     pub endpoint: Option<String>,
-    /// Address placed in object references: a network interface name (regex)
-    /// or an address (defaults to `endpoint`)
+    /// Address placed in object references. Explicit IP/interface selectors also
+    /// choose the listener IP; other advertised addresses keep wildcard binding.
     pub advertise: Option<String>,
     pub storage: Option<String>,
     pub eviction: Option<FlameEvictionYaml>,
@@ -310,7 +310,9 @@ pub struct FlameCache {
     pub endpoint: String,
     /// Address placed in the references returned by the cache, reachable by
     /// every client: a network interface name (its first IPv4 address is used)
-    /// or an address. `None` uses the environment or the host's private address.
+    /// or an address. Explicit IP/interface values also select the listener IP;
+    /// Other advertised addresses keep wildcard binding. The listener uses endpoint's port.
+    /// `None` uses the environment or the host's private address for references.
     pub advertise: Option<String>,
     pub storage: Option<String>,
     pub eviction: FlameEviction,

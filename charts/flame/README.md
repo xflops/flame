@@ -169,6 +169,15 @@ an optional network interface name or address; the old `networkInterface` value
 is removed. Without either, a cache advertises the first private IPv4 address of
 a non-loopback interface.
 
+The chart supplies `FLAME_CACHE_ADVERTISE` as a full URL such as
+`grpc://<node-ip>:<port>`, so the cache keeps listening on `0.0.0.0`. A full URL
+or `IP:port` advertisement does not select a bind IP, even with a numeric host.
+An explicit bare IP or interface selector in `cache.advertise` overrides that
+environment value and restricts the listener to the selected address. The
+listener port always comes from `cache.endpoint`. With neither setting,
+listening remains wildcard even when references advertise an automatically
+selected private IP. Cache startup logs show the bind and advertised addresses.
+
 The node IP stays valid across pod restarts on that worker. It changes when
 the node's IP changes. `objectCache.service.port` is bound on every worker, so
 only one cache can run on a node.
@@ -198,9 +207,12 @@ export FLAME_ENDPOINT=http://127.0.0.1:8080
 export FLAME_CACHE_ENDPOINT=grpc://127.0.0.1:9090
 ```
 
-Port-forwarded cache endpoints are suitable for local inspection. Package
-deployment flows should use a cache endpoint that is reachable by both the
-client and executor-manager pods.
+Port-forwarded cache endpoints are suitable for local inspection with the
+chart's default wildcard listener. If an explicit bare-IP/interface override
+binds a non-loopback address, the cache no longer accepts the pod-namespace
+loopback connections used by port-forwarding; use the selected address or a
+cache proxy instead. Package deployment flows should use a cache endpoint
+reachable by both the client and executor-manager pods.
 
 ## External access
 
