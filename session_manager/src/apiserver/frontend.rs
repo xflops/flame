@@ -26,11 +26,12 @@ use tonic::{Request, Response, Status};
 use self::rpc::frontend_server::Frontend;
 use self::rpc::{
     ApplicationList, CloseSessionRequest, CreateSessionRequest, CreateTaskRequest,
-    DeleteSessionRequest, ExecutorList, GetApplicationRequest, GetNodeRequest, GetNodeResponse,
-    GetSessionRequest, GetTaskRequest, ListApplicationsRequest, ListExecutorsRequest,
-    ListNodesRequest, ListSessionsRequest, ListTasksRequest, NodeList, OpenSessionRequest,
-    RegisterApplicationRequest, ResumeSessionRequest, Session, SessionList, SuspendSessionRequest,
-    Task, UnregisterApplicationRequest, UpdateApplicationRequest, WatchTaskRequest,
+    DeleteNodeRequest, DeleteSessionRequest, ExecutorList, GetApplicationRequest, GetNodeRequest,
+    GetNodeResponse, GetSessionRequest, GetTaskRequest, ListApplicationsRequest,
+    ListExecutorsRequest, ListNodesRequest, ListSessionsRequest, ListTasksRequest, NodeList,
+    OpenSessionRequest, RegisterApplicationRequest, ResumeSessionRequest, Session, SessionList,
+    SuspendSessionRequest, Task, UnregisterApplicationRequest, UpdateApplicationRequest,
+    WatchTaskRequest,
 };
 
 use rpc::flame::v1 as rpc;
@@ -434,6 +435,21 @@ impl Frontend for Flame {
             .ok_or_else(|| Status::not_found(format!("node <{}> not found", name)))?;
         Ok(Response::new(GetNodeResponse {
             node: Some(rpc::Node::from(node)),
+        }))
+    }
+
+    async fn delete_node(
+        &self,
+        req: Request<DeleteNodeRequest>,
+    ) -> Result<Response<rpc::Result>, Status> {
+        trace_fn!("Frontend::delete_node");
+        self.controller
+            .release_node(&req.into_inner().name)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(rpc::Result {
+            return_code: 0,
+            message: None,
         }))
     }
 
@@ -1148,6 +1164,68 @@ mod tests {
             controller,
             cluster_default_resreq: None,
         }
+    }
+
+    #[tokio::test]
+    async fn delete_node_rpc_removes_stale_nodes_and_reports_rejections() {
+        let (storage, controller, session_id) = task_test_controller("none".into()).await;
+        let flame = test_flame(controller.clone());
+        for (name, state) in [
+            ("old-worker", apis::NodeState::NotReady),
+            ("ready-worker", apis::NodeState::Ready),
+            ("occupied-worker", apis::NodeState::Unknown),
+        ] {
+            storage
+                .register_node(&apis::Node {
+                    name: name.into(),
+                    state,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        controller
+            .create_executor("occupied-worker".into(), session_id)
+            .await
+            .unwrap();
+        for (name, code) in [
+            ("", tonic::Code::InvalidArgument),
+            ("missing-worker", tonic::Code::NotFound),
+            ("ready-worker", tonic::Code::InvalidArgument),
+            ("occupied-worker", tonic::Code::InvalidArgument),
+        ] {
+            let error = Frontend::delete_node(
+                &flame,
+                Request::new(DeleteNodeRequest { name: name.into() }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), code);
+        }
+        let result = Frontend::delete_node(
+            &flame,
+            Request::new(DeleteNodeRequest {
+                name: "old-worker".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(result.return_code, 0);
+        let listed = Frontend::list_nodes(&flame, Request::new(ListNodesRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.nodes.len(), 2);
+        let error = Frontend::get_node(
+            &flame,
+            Request::new(GetNodeRequest {
+                name: "old-worker".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]

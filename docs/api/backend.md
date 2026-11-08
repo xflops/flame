@@ -75,7 +75,10 @@ Bidirectional streaming for node-executor synchronization. Replaces polling-base
 
 ### ReleaseNode
 
-Releases a node from the cluster.
+Removes an `Unknown` or `NotReady` node that has no retained executors. `Ready`
+nodes and nodes with executor records of any state are rejected; missing nodes
+return `NOT_FOUND`. This uses the same guarded storage release operation as
+frontend `DeleteNode` and does not force-release executors.
 
 **Request:** `ReleaseNodeRequest`
 

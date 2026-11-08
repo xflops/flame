@@ -23,6 +23,7 @@ service Frontend {
   // Node operations
   rpc ListNodes(ListNodesRequest) returns (NodeList) {}
   rpc GetNode(GetNodeRequest) returns (GetNodeResponse) {}
+  rpc DeleteNode(DeleteNodeRequest) returns (Result) {}
 
   rpc CreateSession (CreateSessionRequest) returns (Session) {}
   rpc DeleteSession (DeleteSessionRequest) returns (Session) {}
@@ -75,6 +76,11 @@ message ListNodesRequest {
 
 // GetNodeRequest is the request for getting a specific node by name.
 message GetNodeRequest {
+  string name = 1;
+}
+
+// DeleteNodeRequest removes a registered node that is not ready and owns no executors.
+message DeleteNodeRequest {
   string name = 1;
 }
 
