@@ -27,6 +27,172 @@ mod tests {
     use crate::apis::Executor;
     use crate::storage::engine::SqliteEngine;
 
+    #[tokio::test]
+    async fn release_node_enforces_safety_without_a_controller() {
+        use crate::apis::{ApplicationAttributes, SessionAttributes};
+        use crate::ctx::{FlameCluster, FlameClusterContext};
+
+        let dir = tempfile::tempdir().unwrap();
+        for url in [
+            "none".to_string(),
+            format!("sqlite://{}", dir.path().join("nodes.db").display()),
+            format!("fs://{}", dir.path().join("fs").display()),
+        ] {
+            let config = FlameClusterContext {
+                cluster: FlameCluster {
+                    storage: url,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let storage = crate::storage::new_ptr(&config).await.unwrap();
+            assert!(matches!(
+                storage.release_node(" ").await,
+                Err(FlameError::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                storage.release_node("missing").await,
+                Err(FlameError::NotFound(_))
+            ));
+            let node = Node {
+                name: "worker".into(),
+                state: NodeState::Ready,
+                ..Default::default()
+            };
+            storage.register_node(&node).await.unwrap();
+            assert!(matches!(
+                storage.release_node("worker").await,
+                Err(FlameError::InvalidState(_))
+            ));
+            assert_eq!(
+                storage.get_node("worker").unwrap().unwrap().state,
+                NodeState::Ready
+            );
+
+            storage
+                .register_application("app".into(), ApplicationAttributes::default())
+                .await
+                .unwrap();
+            let session = storage
+                .create_session(SessionAttributes {
+                    id: format!("release-storage-{}", uuid::Uuid::new_v4()),
+                    application: "app".into(),
+                    resreq: Some(ResourceRequirement {
+                        cpu: 1,
+                        memory: 1024,
+                        gpu: 0,
+                    }),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            storage
+                .update_node_state("worker", NodeState::Unknown)
+                .await
+                .unwrap();
+            let mut executor = storage
+                .create_executor("worker".into(), session.id)
+                .await
+                .unwrap();
+            for state in [
+                ExecutorState::Void,
+                ExecutorState::Releasing,
+                ExecutorState::Released,
+            ] {
+                executor.state = state;
+                storage.update_executor(&executor).await.unwrap();
+                assert!(matches!(
+                    storage.release_node("worker").await,
+                    Err(FlameError::InvalidState(_))
+                ));
+                assert!(storage.get_node("worker").unwrap().is_some());
+                assert!(storage.get_executor_ptr(executor.id.clone()).is_ok());
+            }
+            storage.delete_executor(executor.id).await.unwrap();
+            storage.release_node("worker").await.unwrap();
+            assert!(storage.get_node("worker").unwrap().is_none());
+            storage
+                .register_node(&Node {
+                    state: NodeState::NotReady,
+                    ..node
+                })
+                .await
+                .unwrap();
+            storage.release_node("worker").await.unwrap();
+            assert!(storage.get_node("worker").unwrap().is_none());
+        }
+    }
+
+    async fn sqlite_node_storage() -> (
+        tempfile::TempDir,
+        crate::storage::StoragePtr,
+        sqlx::SqlitePool,
+    ) {
+        use crate::ctx::{FlameCluster, FlameClusterContext};
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("release.db").display());
+        let config = FlameClusterContext {
+            cluster: FlameCluster {
+                storage: url.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let storage = crate::storage::new_ptr(&config).await.unwrap();
+        storage
+            .register_node(&Node {
+                name: "worker".into(),
+                state: NodeState::Unknown,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        (dir, storage, pool)
+    }
+
+    #[tokio::test]
+    async fn failed_node_deletion_preserves_cached_node_and_allows_retry() {
+        let (_dir, storage, pool) = sqlite_node_storage().await;
+        let original = storage.get_node_ptr("worker").unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_node_delete BEFORE DELETE ON nodes BEGIN SELECT RAISE(ABORT, 'test node deletion failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = storage.release_node("worker").await.unwrap_err();
+        assert!(
+            error.to_string().contains("test node deletion failure"),
+            "{error}"
+        );
+        let cached = storage.get_node_ptr("worker").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&cached, &original));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM nodes WHERE name='worker'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+
+        sqlx::query("DROP TRIGGER reject_node_delete")
+            .execute(&pool)
+            .await
+            .unwrap();
+        storage.release_node("worker").await.unwrap();
+        assert!(storage.get_node("worker").unwrap().is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM nodes WHERE name='worker'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
     /// Test node CRUD operations.
     #[test]
     fn test_node_crud() -> Result<(), FlameError> {

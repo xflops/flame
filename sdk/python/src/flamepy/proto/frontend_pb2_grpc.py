@@ -78,6 +78,11 @@ class FrontendStub:
                 request_serializer=frontend__pb2.GetNodeRequest.SerializeToString,
                 response_deserializer=frontend__pb2.GetNodeResponse.FromString,
                 _registered_method=True)
+        self.DeleteNode = channel.unary_unary(
+                '/flame.v1.Frontend/DeleteNode',
+                request_serializer=frontend__pb2.DeleteNodeRequest.SerializeToString,
+                response_deserializer=types__pb2.Result.FromString,
+                _registered_method=True)
         self.CreateSession = channel.unary_unary(
                 '/flame.v1.Frontend/CreateSession',
                 request_serializer=frontend__pb2.CreateSessionRequest.SerializeToString,
@@ -190,6 +195,12 @@ class FrontendServicer:
         raise NotImplementedError('Method not implemented!')
 
     def GetNode(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteNode(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -309,6 +320,11 @@ def add_FrontendServicer_to_server(servicer, server):
                     servicer.GetNode,
                     request_deserializer=frontend__pb2.GetNodeRequest.FromString,
                     response_serializer=frontend__pb2.GetNodeResponse.SerializeToString,
+            ),
+            'DeleteNode': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteNode,
+                    request_deserializer=frontend__pb2.DeleteNodeRequest.FromString,
+                    response_serializer=types__pb2.Result.SerializeToString,
             ),
             'CreateSession': grpc.unary_unary_rpc_method_handler(
                     servicer.CreateSession,
@@ -590,6 +606,33 @@ class Frontend:
             '/flame.v1.Frontend/GetNode',
             frontend__pb2.GetNodeRequest.SerializeToString,
             frontend__pb2.GetNodeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteNode(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/flame.v1.Frontend/DeleteNode',
+            frontend__pb2.DeleteNodeRequest.SerializeToString,
+            types__pb2.Result.FromString,
             options,
             channel_credentials,
             insecure,

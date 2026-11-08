@@ -11,51 +11,102 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashSet;
 use std::error::Error;
 
 use flame_rs as flame;
 use flame_rs::apis::{FlameContext, SessionState};
-use flame_rs::client::SessionFilter;
+use flame_rs::client::{NodeState, SessionFilter};
 
 use crate::utils::trim_ids;
 
-/// Which sessions a `delete -s` argument names.
 #[derive(Debug, PartialEq)]
-enum Selection<'a> {
+enum NodeSelection<'a> {
+    AllNotReady,
+    Ids(Vec<&'a str>),
+}
+
+#[derive(Debug, PartialEq)]
+enum SessionSelection<'a> {
     AllClosed,
     Ids(Vec<&'a str>),
 }
 
-/// `None` means `-s` was not given, `Some(&[])` means `-s` with no value.
-fn parse_selection(sessions: Option<&[String]>) -> Result<Selection<'_>, Box<dyn Error>> {
-    let Some(sessions) = sessions else {
-        return Err("--session is required; use `-s` alone for every closed session".into());
-    };
-    if sessions.is_empty() {
-        return Ok(Selection::AllClosed);
+impl<'a> NodeSelection<'a> {
+    fn parse(nodes: &'a [String]) -> Result<Self, Box<dyn Error>> {
+        if nodes.is_empty() {
+            return Ok(Self::AllNotReady);
+        }
+        let mut ids = trim_ids(nodes).map_err(|_| "node names must not be empty")?;
+        let mut seen = HashSet::new();
+        ids.retain(|id| seen.insert(*id));
+        Ok(Self::Ids(ids))
     }
-
-    Ok(Selection::Ids(trim_ids(sessions)?))
 }
 
-pub async fn run(ctx: &FlameContext, sessions: Option<&[String]>) -> Result<(), Box<dyn Error>> {
-    let selection = parse_selection(sessions)?;
+impl<'a> SessionSelection<'a> {
+    fn parse(sessions: &'a [String]) -> Result<Self, Box<dyn Error>> {
+        if sessions.is_empty() {
+            return Ok(Self::AllClosed);
+        }
+        Ok(Self::Ids(trim_ids(sessions)?))
+    }
+}
 
+async fn connect(ctx: &FlameContext) -> Result<flame::Connection, Box<dyn Error>> {
     let current_ctx = ctx.get_current_context()?;
-    let conn = flame::client::connect_with_tls(
+    Ok(flame::client::connect_with_tls(
         &current_ctx.cluster.endpoint,
         current_ctx.cluster.tls.as_ref(),
     )
-    .await?;
+    .await?)
+}
+
+async fn delete_nodes(ctx: &FlameContext, nodes: &[String]) -> Result<(), Box<dyn Error>> {
+    let selection = NodeSelection::parse(nodes)?;
+    let conn = connect(ctx).await?;
+    let names: Vec<String> = match selection {
+        NodeSelection::AllNotReady => conn
+            .list_nodes()
+            .await?
+            .into_iter()
+            .filter(|node| node.state == NodeState::NotReady)
+            .map(|node| node.name)
+            .collect(),
+        NodeSelection::Ids(ids) => ids.into_iter().map(str::to_string).collect(),
+    };
+    let mut deleted = 0;
+    let mut failed = 0;
+    for name in names {
+        match conn.delete_node(&name).await {
+            Ok(()) => deleted += 1,
+            Err(error) => {
+                failed += 1;
+                eprintln!("Failed to delete node <{}>: {}", name, error);
+            }
+        }
+    }
+    println!();
+    println!("Deleted {} node(s), {} failed.", deleted, failed);
+    if failed > 0 {
+        return Err(format!("failed to delete {} node(s)", failed).into());
+    }
+    Ok(())
+}
+
+async fn delete_sessions(ctx: &FlameContext, sessions: &[String]) -> Result<(), Box<dyn Error>> {
+    let selection = SessionSelection::parse(sessions)?;
+    let conn = connect(ctx).await?;
+    let ids = match &selection {
+        SessionSelection::AllClosed => vec![],
+        SessionSelection::Ids(ids) => ids.iter().map(|id| id.to_string()).collect(),
+    };
 
     // Only closed sessions can be deleted, so ask the server for closed ones
     // only (and for just the named ids), and no other session crosses the wire.
     let filter = SessionFilter {
         state: Some(SessionState::Closed),
-        ids: match &selection {
-            Selection::AllClosed => vec![],
-            Selection::Ids(ids) => ids.iter().map(|id| id.to_string()).collect(),
-        },
+        ids,
         ..Default::default()
     };
     // The server returns each matching session once.
@@ -70,7 +121,7 @@ pub async fn run(ctx: &FlameContext, sessions: Option<&[String]>) -> Result<(), 
     let mut failed = 0;
 
     // A named id that did not come back is not a closed session.
-    if let Selection::Ids(ids) = &selection {
+    if let SessionSelection::Ids(ids) = &selection {
         for id in ids.iter().filter(|id| !closed.iter().any(|c| c == **id)) {
             failed += 1;
             eprintln!(
@@ -99,6 +150,21 @@ pub async fn run(ctx: &FlameContext, sessions: Option<&[String]>) -> Result<(), 
     Ok(())
 }
 
+pub async fn run(
+    ctx: &FlameContext,
+    sessions: Option<&[String]>,
+    nodes: Option<&[String]>,
+) -> Result<(), Box<dyn Error>> {
+    match (sessions, nodes) {
+        (Some(sessions), None) => delete_sessions(ctx, sessions).await,
+        (None, Some(nodes)) => delete_nodes(ctx, nodes).await,
+        (Some(_), Some(_)) => Err("--session and --node cannot be combined".into()),
+        (None, None) => Err(
+            "--session or --node is required; use `-s` for all closed sessions or `-n` for all NotReady nodes".into(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,27 +174,46 @@ mod tests {
     }
 
     #[test]
-    fn no_value_selects_every_closed_session() {
-        assert_eq!(parse_selection(Some(&[])).unwrap(), Selection::AllClosed);
-    }
-
-    #[test]
-    fn ids_select_those_sessions() {
-        let a = args(&["id-1", " id-2 "]);
+    fn no_values_select_filtered_defaults_for_each_kind() {
         assert_eq!(
-            parse_selection(Some(&a)).unwrap(),
-            Selection::Ids(vec!["id-1", "id-2"])
+            SessionSelection::parse(&[]).unwrap(),
+            SessionSelection::AllClosed
+        );
+        assert_eq!(
+            NodeSelection::parse(&[]).unwrap(),
+            NodeSelection::AllNotReady
         );
     }
 
     #[test]
-    fn missing_flag_is_rejected() {
-        assert!(parse_selection(None).is_err());
+    fn named_ids_are_trimmed_and_node_duplicates_are_deleted_once() {
+        let sessions = args(&["id-1", " id-2 "]);
+        assert_eq!(
+            SessionSelection::parse(&sessions).unwrap(),
+            SessionSelection::Ids(vec!["id-1", "id-2"])
+        );
+        let nodes = args(&["worker-a", " worker-b ", "worker-a"]);
+        assert_eq!(
+            NodeSelection::parse(&nodes).unwrap(),
+            NodeSelection::Ids(vec!["worker-a", "worker-b"])
+        );
     }
 
-    #[test]
-    fn blank_id_is_rejected() {
-        assert!(parse_selection(Some(&args(&[""]))).is_err());
-        assert!(parse_selection(Some(&args(&["id-1", " "]))).is_err());
+    #[tokio::test]
+    async fn selection_errors_are_reported_before_connecting() {
+        let ctx = FlameContext::default();
+        for (sessions, nodes) in [(None, None), (Some([].as_slice()), Some([].as_slice()))] {
+            let error = run(&ctx, sessions, nodes).await.unwrap_err().to_string();
+            assert!(error.contains("--session"), "{error}");
+        }
+        for values in [args(&[""]), args(&["id-1", " "])] {
+            let error = delete_sessions(&ctx, &values)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("session ids"), "{error}");
+            let error = delete_nodes(&ctx, &values).await.unwrap_err().to_string();
+            assert!(error.contains("node names"), "{error}");
+        }
     }
 }

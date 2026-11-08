@@ -120,6 +120,14 @@ mod tests {
                 .await
                 .unwrap();
 
+            storage
+                .register_node(&Node {
+                    shims: vec![Shim::Cri],
+                    ..create_test_node("cri-node")
+                })
+                .await
+                .unwrap();
+
             let executor = storage
                 .create_executor("cri-node".to_string(), "cri-exec-ssn".to_string())
                 .await
@@ -132,11 +140,18 @@ mod tests {
         async fn returns_error_for_nonexistent_session() {
             let ctx = test_context();
             let storage = storage::new_ptr(&ctx).await.unwrap();
+            storage
+                .register_node(&create_test_node("some-node"))
+                .await
+                .unwrap();
 
             let result = storage
                 .create_executor("some-node".to_string(), "nonexistent-ssn".to_string())
                 .await;
-            assert!(result.is_err());
+            assert!(matches!(
+                result,
+                Err(crate::FlameError::NotFound(id)) if id.contains("nonexistent-ssn")
+            ));
         }
     }
 

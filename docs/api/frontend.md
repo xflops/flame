@@ -19,6 +19,7 @@ service Frontend {
   // Node Operations
   rpc ListNodes(ListNodesRequest) returns (NodeList) {}
   rpc GetNode(GetNodeRequest) returns (GetNodeResponse) {}
+  rpc DeleteNode(DeleteNodeRequest) returns (Result) {}
 
   // Session Management
   rpc CreateSession(CreateSessionRequest) returns (Session) {}
@@ -350,6 +351,48 @@ Retrieves details for a specific node.
 | Field | Type | Description |
 |-------|------|-------------|
 | `node` | [Node](types.md#node) | Node details |
+
+### DeleteNode
+
+Deletes one explicitly named inactive node. The node must be `Unknown` or
+`NotReady` and have no retained executors. A `Ready` node or a node with any
+executor record is rejected; the operation does not force-release executors.
+Missing nodes return `NOT_FOUND`. Successful deletion is logged by the server.
+Nodes are removed only on explicit request; there is no automatic expiry.
+
+**Request:** `DeleteNodeRequest`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Required node name |
+
+**Response:** [Result](types.md#result)
+
+**CLI:**
+
+```sh
+flmctl delete --node worker-a
+flmctl delete -n worker-a,worker-b
+flmctl delete -n                    # Every NotReady node
+```
+
+`--node` accepts comma-separated or space-separated names and cannot be combined
+with `--session`. With no names, it selects all nodes whose state is `NotReady`;
+`Unknown` nodes are excluded from this bulk selection while they are draining.
+Explicitly named `Unknown` nodes remain eligible when they have no executors.
+Review `flmctl list --node` before selecting nodes.
+
+Each selected node is validated by the server at deletion time. A node whose
+executor records remain registered cannot be deleted, even if it is `NotReady`.
+Batch deletion continues after individual failures, reports deleted/failed
+counts, and exits unsuccessfully if any deletion failed.
+
+Existing session deletion is unchanged:
+
+```sh
+flmctl delete -s                    # Every closed session
+flmctl delete -s session-a,session-b
+```
 
 ## Executor Operations
 

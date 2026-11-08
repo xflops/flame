@@ -31,9 +31,9 @@ use stdng::{ensure, lock_ptr, trace_fn, MutexPtr};
 
 use crate::apis::{
     Application, ApplicationAttributes, ApplicationID, ApplicationPtr, ApplicationState, Event,
-    EventOwner, ExecutorID, ExecutorState, Node, NodePtr, Session, SessionAttributes, SessionID,
-    SessionPtr, SessionState, Shim, Task, TaskGID, TaskID, TaskInput, TaskOptions, TaskPtr,
-    TaskResult, TaskState,
+    EventOwner, ExecutorID, ExecutorState, Node, NodePtr, NodeState, Session, SessionAttributes,
+    SessionID, SessionPtr, SessionState, Shim, Task, TaskGID, TaskID, TaskInput, TaskOptions,
+    TaskPtr, TaskResult, TaskState,
 };
 use crate::ctx::FlameClusterContext;
 use crate::FlameError;
@@ -401,11 +401,30 @@ impl Storage {
         Ok(res)
     }
 
+    /// Remove an inactive node only after all of its executors have been removed.
     pub async fn release_node(&self, node_name: &str) -> Result<(), FlameError> {
+        ensure!(
+            !node_name.trim().is_empty(),
+            FlameError::InvalidConfig("node name is required".into())
+        )?;
+        let node = self
+            .get_node(node_name)?
+            .ok_or_else(|| FlameError::NotFound(format!("node <{node_name}> not found")))?;
+        ensure!(
+            node.state != NodeState::Ready,
+            FlameError::InvalidState(format!("Cannot delete Ready node <{node_name}>"))
+        )?;
+        ensure!(
+            self.list_executors(Some(&ExecutorFilter::by_node(node_name)))?
+                .is_empty(),
+            FlameError::InvalidState(format!("Cannot delete node <{node_name}> with executors"))
+        )?;
         self.engine.delete_node(node_name).await?;
-
-        let mut node_map = lock_ptr!(self.nodes)?;
-        node_map.remove(node_name);
+        {
+            let mut nodes = lock_ptr!(self.nodes)?;
+            nodes.remove(node_name);
+        }
+        tracing::info!("Deleted stale node <{node_name}>");
         Ok(())
     }
 
@@ -1086,6 +1105,10 @@ impl Storage {
         ssn_id: SessionID,
     ) -> Result<Executor, FlameError> {
         trace_fn!("Storage::create_executor");
+        ensure!(
+            self.get_node(&node_name)?.is_some(),
+            FlameError::NotFound(format!("node <{node_name}> not found"))
+        )?;
         let ssn = self.get_session_ptr(ssn_id.clone())?;
 
         let (application, resreq) = {

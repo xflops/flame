@@ -32,10 +32,10 @@ use url::Url;
 use self::rpc::frontend_client::FrontendClient as FlameFrontendClient;
 use self::rpc::{
     ApplicationSpec, CloseSessionRequest, CreateSessionRequest, CreateTaskRequest,
-    DeleteSessionRequest, Environment, GetApplicationRequest, GetNodeRequest, GetSessionRequest,
-    GetTaskRequest, ListApplicationsRequest, ListExecutorsRequest, ListNodesRequest,
-    ListSessionsRequest, ListTasksRequest, OpenSessionRequest, RegisterApplicationRequest,
-    ResumeSessionRequest, SessionSpec, SuspendSessionRequest, TaskSpec,
+    DeleteNodeRequest, DeleteSessionRequest, Environment, GetApplicationRequest, GetNodeRequest,
+    GetSessionRequest, GetTaskRequest, ListApplicationsRequest, ListExecutorsRequest,
+    ListNodesRequest, ListSessionsRequest, ListTasksRequest, OpenSessionRequest,
+    RegisterApplicationRequest, ResumeSessionRequest, SessionSpec, SuspendSessionRequest, TaskSpec,
     UnregisterApplicationRequest, UpdateApplicationRequest, WatchTaskRequest,
 };
 use crate::apis::flame::v1 as rpc;
@@ -1125,6 +1125,27 @@ impl Connection {
             .collect())
     }
 
+    /// Delete a registered node that is not ready and owns no executors.
+    pub async fn delete_node(&self, name: &str) -> Result<(), FlameError> {
+        if name.trim().is_empty() {
+            return Err(FlameError::InvalidConfig(
+                "node name must not be empty".to_string(),
+            ));
+        }
+        let mut client = FlameClient::new(self.channel.clone());
+        let result = client
+            .delete_node(DeleteNodeRequest {
+                name: name.to_string(),
+            })
+            .await?
+            .into_inner();
+        if result.return_code < 0 {
+            Err(FlameError::Network(result.message.unwrap_or_default()))
+        } else {
+            Ok(())
+        }
+    }
+
     pub async fn get_node(&self, name: &str) -> Result<Node, FlameError> {
         let mut client = FlameClient::new(self.channel.clone());
         let node = client
@@ -1835,6 +1856,9 @@ mod serde_message {
         Ok(Some(Bytes::from(data.encode_to_vec())))
     }
 }
+
+#[cfg(test)]
+mod node_tests;
 
 #[cfg(test)]
 mod session_filter_tests {
