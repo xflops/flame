@@ -235,6 +235,19 @@ memory. Filesystem and SQLite perform their existing authoritative storage
 mutation under their transaction/task lock. A caller's cached state or version
 cannot replace the stored authority.
 
+NoneEngine looks up a shared session entry under a short global directory lock,
+then releases that lock before taking the session-local mutex. After briefly
+rechecking directory pointer identity, it accesses task history, lifecycle
+state, allocation, and counters under only the local mutex. Deletion removes
+the matching entry; stale waiters return `NotFound` after the identity check.
+Unrelated sessions do not share a task/history critical section.
+
+SQLite's `mutate_task` retains `BEGIN IMMEDIATE` before lifecycle validation and
+task mutation. Lifecycle validation selects only the session's scalar state
+instead of loading and decoding a complete Session, including its common data.
+Missing-session and invalid-state errors keep their existing behavior, and the
+writer reservation continues to coordinate task writes with session close.
+
 Active admission remains above the engine boundary. The initial active-task
 lookup rejects a Closed session, and engine lifecycle validation rejects writes
 after close. Publication uses only the existing Session-locked membership and

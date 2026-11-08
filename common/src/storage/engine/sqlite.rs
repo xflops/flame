@@ -70,10 +70,18 @@ impl SqliteEngine {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| FlameError::Storage(e.to_string()))?;
-        let session = Self::_get_session(&mut tx, gid.ssn_id.clone())
-            .await?
-            .ok_or_else(|| FlameError::NotFound(format!("session <{}>", gid.ssn_id)))?;
-        if session.is_closed() || (retry && !session.is_open()) {
+        // Task lifecycle validation does not need session payloads or tokens.
+        let session_state: Option<i32> =
+            sqlx::query_scalar("SELECT state FROM sessions WHERE id=?")
+                .bind(&gid.ssn_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| FlameError::Storage(e.to_string()))?;
+        let session_state = SessionState::try_from(
+            session_state
+                .ok_or_else(|| FlameError::NotFound(format!("session <{}>", gid.ssn_id)))?,
+        )?;
+        if session_state == SessionState::Closed || (retry && session_state != SessionState::Open) {
             return Err(FlameError::InvalidState(format!(
                 "Session {} does not accept task updates",
                 gid.ssn_id
@@ -1394,6 +1402,91 @@ mod tests {
             .into_iter()
             .map(|name| (name.to_string(), ApplicationAttributes::default()))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn task_mutations_validate_state_without_decoding_session_payloads() {
+        let url = crate::temp_sqlite_url("task_mutations_session_state_only");
+        let storage = SqliteEngine::new_ptr(&url).await.unwrap();
+        storage
+            .register_application("test-app".into(), ApplicationAttributes::default())
+            .await
+            .unwrap();
+        let id = "state-only".to_string();
+        storage
+            .create_session(SessionAttributes {
+                id: id.clone(),
+                application: "test-app".into(),
+                common_data: Some(Bytes::from(vec![0; 1024 * 1024])),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let task = storage.create_task(id.clone(), None, None).await.unwrap();
+        let pool = SqlitePool::connect(&url).await.unwrap();
+        // Unrelated metadata must not be decoded by the task mutation path.
+        sqlx::query("UPDATE sessions SET tokens='not-json' WHERE id=?")
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(storage.get_session(id.clone()).await.is_err());
+
+        let running = storage
+            .update_task_state(task, TaskState::Running, None)
+            .await
+            .unwrap();
+        let output = Bytes::from_static(b"retained-result");
+        let finished = storage
+            .update_task_result(
+                running.clone(),
+                TaskResult {
+                    state: TaskState::Succeed,
+                    output: Some(output.clone()),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(finished.version, running.version + 1);
+        assert_eq!(finished.output, Some(output));
+        let retried = storage.retry_task(finished.gid()).await.unwrap();
+        assert_eq!(retried.state, TaskState::Pending);
+        assert_eq!(retried.version, finished.version + 1);
+
+        for state in [SessionState::Suspending, SessionState::Suspended] {
+            sqlx::query("UPDATE sessions SET state=? WHERE id=?")
+                .bind(state as i32)
+                .bind(&id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(matches!(
+                storage.retry_task(retried.gid()).await,
+                Err(FlameError::InvalidState(_))
+            ));
+            storage
+                .update_task_state(retried.clone(), TaskState::Pending, None)
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE sessions SET state=? WHERE id=?")
+            .bind(SessionState::Closed as i32)
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = storage.get_task(retried.gid()).await.unwrap();
+        assert!(matches!(
+            storage
+                .update_task_state(before.clone(), TaskState::Running, None)
+                .await,
+            Err(FlameError::InvalidState(_))
+        ));
+        assert_eq!(
+            storage.get_task(before.gid()).await.unwrap().version,
+            before.version
+        );
     }
 
     #[test]
