@@ -260,11 +260,16 @@ mod tests {
                 .await
                 .unwrap();
 
-            let task = storage
+            let result = storage
                 .get_task("close-cancel-pending-ssn".to_string(), task.id)
+                .await;
+            assert_eq!(result.unwrap().state, TaskState::Cancelled);
+            let closed = storage
+                .get_session("close-cancel-pending-ssn".to_string())
                 .unwrap();
-            assert_eq!(task.state, TaskState::Cancelled);
-            assert!(task.completion_time.is_some());
+            assert_eq!(closed.task_counts.cancelled, 1);
+            assert_eq!(closed.task_counts.pending, 0);
+            assert!(closed.tasks.is_empty());
         }
 
         #[tokio::test]

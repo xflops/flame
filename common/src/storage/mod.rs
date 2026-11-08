@@ -38,7 +38,9 @@ use crate::apis::{
 use crate::ctx::FlameClusterContext;
 use crate::FlameError;
 
-use crate::apis::{ApplicationFilter, Executor, ExecutorFilter, ExecutorPtr, SessionFilter};
+use crate::apis::{
+    ApplicationFilter, Executor, ExecutorFilter, ExecutorPtr, SessionFilter, TaskFilter,
+};
 
 use crate::events::{EventManagerPtr, FsEventManager, MemoryEventManager};
 use crate::storage::engine::EnginePtr;
@@ -148,17 +150,20 @@ impl Storage {
                     &ssn.id,
                 );
             }
-            let task_list = self.engine.find_tasks(ssn.id.clone()).await?;
-            let mut ssn = ssn.clone();
-            for task in task_list {
-                let task = match task.state {
-                    TaskState::Running if ssn.status.state == SessionState::Open => {
-                        self.engine.retry_task(task.gid()).await?
-                    }
-                    _ => task,
+            let mut ssn = ssn;
+            ssn.task_counts = Default::default();
+            for task in self
+                .engine
+                .find_tasks(&TaskFilter::by_session(ssn.id.clone()))
+                .await?
+            {
+                let task = if ssn.is_open() && task.state == TaskState::Running {
+                    self.engine.retry_task(task.gid()).await?
+                } else {
+                    task
                 };
-
-                ssn.update_task(&task)?;
+                ssn.task_counts.increment(task.state);
+                ssn.cache_task(&task);
             }
 
             let mut ssn_map = lock_ptr!(self.sessions)?;
@@ -421,28 +426,36 @@ impl Storage {
                     ssn_id: ssn_id.clone(),
                     task_id,
                 };
-                match self.engine.retry_task(gid.clone()).await {
-                    Ok(task) => {
-                        // Update the in-memory session with the retried task
-                        if let Ok(ssn_ptr) = self.get_session_ptr(ssn_id.clone()) {
-                            if let Ok(mut ssn) = lock_ptr!(ssn_ptr) {
-                                let _ = ssn.update_task(&task);
+                let active = self.get_session_ptr(ssn_id.clone()).and_then(|session| {
+                    let ssn = lock_ptr!(session)?;
+                    ssn.active_task(task_id)
+                });
+                if let Ok(Some(_)) = active {
+                    match self.engine.retry_task(gid.clone()).await {
+                        Ok(task) => {
+                            // Update the in-memory session with the retried task
+                            if let Ok(ssn_ptr) = self.get_session_ptr(ssn_id.clone()) {
+                                if let Ok(mut ssn) = lock_ptr!(ssn_ptr) {
+                                    if ssn.tasks.contains_key(&task.id) {
+                                        let _ = ssn.update_task(&task);
+                                    }
+                                }
                             }
+                            tracing::info!(
+                                "Retried task {} for session {} due to executor {} cleanup",
+                                task_id,
+                                ssn_id,
+                                executor.id
+                            );
                         }
-                        tracing::info!(
-                            "Retried task {} for session {} due to executor {} cleanup",
-                            task_id,
-                            ssn_id,
-                            executor.id
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to retry task {} for session {}: {}",
-                            task_id,
-                            ssn_id,
-                            e
-                        );
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to retry task {} for session {}: {}",
+                                task_id,
+                                ssn_id,
+                                e
+                            );
+                        }
                     }
                 }
             }
@@ -491,60 +504,18 @@ impl Storage {
                 .ok_or(FlameError::NotFound(format!("session <{}>", id)))?
         };
 
-        {
-            let ssn = lock_ptr!(ssn_ptr)?;
-            if ssn
-                .tasks_index
-                .get(&TaskState::Running)
-                .is_some_and(|tasks| !tasks.is_empty())
-            {
-                return Err(FlameError::Storage(
-                    "Cannot close session with running tasks".to_string(),
-                ));
-            }
-        }
-
-        let persisted_ssn = match self.engine.close_session(id.clone()).await {
-            Ok(ssn) => Some(ssn),
-            Err(FlameError::NotFound(_)) => None,
-            Err(e) => return Err(e),
-        };
-
-        let completion_time = persisted_ssn
-            .as_ref()
-            .and_then(|ssn| ssn.completion_time)
-            .unwrap_or_else(Utc::now);
+        let persisted_ssn = self.engine.close_session(id.clone()).await?;
+        let completion_time = persisted_ssn.completion_time.unwrap_or_else(Utc::now);
 
         let result_ssn = {
             let mut ssn = lock_ptr!(ssn_ptr)?;
-            ssn.status.state = persisted_ssn
-                .as_ref()
-                .map(|ssn| ssn.status.state)
-                .unwrap_or(SessionState::Closed);
+            ssn.status.state = persisted_ssn.status.state;
             ssn.completion_time = Some(completion_time);
-            ssn.version = persisted_ssn
-                .as_ref()
-                .map(|ssn| ssn.version)
-                .unwrap_or(ssn.version + 1);
 
-            let pending_tasks = ssn
-                .tasks_index
-                .get(&TaskState::Pending)
-                .map(|tasks| tasks.values().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-
-            for task_ptr in pending_tasks {
-                let task = {
-                    let task = lock_ptr!(task_ptr)?;
-                    Task {
-                        state: TaskState::Cancelled,
-                        version: task.version + 1,
-                        completion_time: Some(completion_time),
-                        ..task.clone()
-                    }
-                };
-                ssn.update_task(&task)?;
-            }
+            ssn.version = persisted_ssn.version;
+            ssn.task_counts = persisted_ssn.task_counts;
+            ssn.tasks.clear();
+            ssn.tasks_index.clear();
 
             // Publish Closed before cleanup so a cleanup failure cannot allow
             // later event writers to recreate the session's files.
@@ -874,47 +845,63 @@ impl Storage {
         Ok(task)
     }
 
-    pub fn get_task(&self, ssn_id: SessionID, id: TaskID) -> Result<Task, FlameError> {
-        let mut task = self.get_task_metadata(ssn_id, id)?;
+    pub async fn get_task(&self, ssn_id: SessionID, id: TaskID) -> Result<Task, FlameError> {
+        let mut task = self.get_task_metadata(ssn_id, id).await?;
         task.events = event_result(
             self.event_manager.find_events(EventOwner::from(task.gid())),
             "load",
             &task.ssn_id,
         );
-
         Ok(task)
     }
 
-    /// Clone the current task state without loading historical events from disk.
-    /// Nonterminal watch updates need current state without serializing
-    /// unrelated sessions behind event storage I/O.
-    pub fn get_task_metadata(&self, ssn_id: SessionID, id: TaskID) -> Result<Task, FlameError> {
-        let task_ptr = self.get_task_ptr(TaskGID {
+    /// Current full task without historical events; terminal reads do not repopulate the cache.
+    pub async fn get_task_metadata(
+        &self,
+        ssn_id: SessionID,
+        id: TaskID,
+    ) -> Result<Task, FlameError> {
+        let gid = TaskGID {
             ssn_id,
             task_id: id,
-        })?;
-        let mut task = lock_ptr!(task_ptr)?.clone();
+        };
+        let mut task = match self.get_task_ptr(gid.clone()) {
+            Ok(ptr) => lock_ptr!(ptr)?.clone(),
+            Err(FlameError::NotFound(_)) => self.engine.get_task(gid).await?,
+            Err(error) => return Err(error),
+        };
         task.events.clear();
         Ok(task)
     }
 
-    pub fn list_tasks(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
-        let ssn_map = lock_ptr!(self.sessions)?;
-        let ssn = ssn_map
-            .get(&ssn_id)
-            .ok_or(FlameError::NotFound(ssn_id.to_string()))?;
-
-        let ssn = lock_ptr!(ssn)?;
-        let task_list = ssn
-            .tasks
-            .values()
-            .map(|task_ptr| {
-                let task = lock_ptr!(task_ptr)?;
-                Ok(task.clone())
-            })
-            .collect::<Result<Vec<Task>, FlameError>>()?;
-
-        Ok(task_list)
+    /// Return cached active work followed by finished records from storage.
+    pub async fn list_tasks(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
+        let cached = {
+            let sessions = lock_ptr!(self.sessions)?;
+            sessions.get(&ssn_id).cloned()
+        };
+        let mut tasks = if let Some(session) = cached {
+            let session = lock_ptr!(session)?;
+            session
+                .tasks
+                .values()
+                .map(|task| Ok(lock_ptr!(task)?.clone()))
+                .collect::<Result<Vec<_>, FlameError>>()?
+        } else {
+            Vec::new()
+        };
+        let active_ids: std::collections::HashSet<_> = tasks.iter().map(|task| task.id).collect();
+        let finished = self
+            .engine
+            .find_tasks(&TaskFilter::terminal(ssn_id))
+            .await?;
+        // A cached task may finish during the history read. Keep its first snapshot once.
+        tasks.extend(
+            finished
+                .into_iter()
+                .filter(|task| !active_ids.contains(&task.id)),
+        );
+        Ok(tasks)
     }
 
     pub async fn get_application(&self, id: ApplicationID) -> Result<Application, FlameError> {
@@ -1005,62 +992,21 @@ impl Storage {
         message: Option<String>,
     ) -> Result<(), FlameError> {
         trace_fn!("Storage::update_task_state");
-        let gid = TaskGID {
-            ssn_id: {
-                let ssn_ptr = lock_ptr!(ssn)?;
-                ssn_ptr.id.clone()
-            },
-            task_id: {
-                let task_ptr = lock_ptr!(task)?;
-                task_ptr.id
-            },
-        };
+        let task_id = lock_ptr!(task)?.id;
 
-        // Check before the engine writes, so a rejected update leaves nothing behind.
-        // A suspending session lets its running tasks finish; only a closed one rejects.
-        {
+        // A completed task has left the active cache and must not be updated.
+        let current = {
             let ssn_ptr = lock_ptr!(ssn)?;
-            if ssn_ptr.is_closed() {
-                return Err(FlameError::InvalidState(format!(
-                    "Session <{}> is closed",
-                    ssn_ptr.id
-                )));
-            }
-        }
-
-        let updated_task = match self
-            .engine
-            .update_task_state(gid.clone(), task_state, message)
-            .await
-        {
-            Ok(task) => task,
-            Err(FlameError::NotFound(_)) => {
-                // Clone first without mutating the Arc in self.tasks.
-                // Mutating in-place would advance the version on the shared Arc,
-                // causing update_task() to see equal versions and skip tasks_index update.
-                let current = {
-                    let task_guard = lock_ptr!(task)?;
-                    task_guard.clone()
-                };
-                crate::apis::Task {
-                    state: task_state,
-                    version: current.version + 1,
-                    ..current
-                }
-            }
-            Err(e) => return Err(e),
+            ssn_ptr.active_task(task_id)?
+        };
+        let Some(current) = current else {
+            return Ok(());
         };
 
-        {
-            let mut ssn_ptr = lock_ptr!(ssn)?;
-            if ssn_ptr.is_closed() {
-                return Err(FlameError::InvalidState(format!(
-                    "Session <{}> is closed",
-                    ssn_ptr.id
-                )));
-            }
-            ssn_ptr.update_task(&updated_task)?;
-        }
+        let updated_task = self
+            .engine
+            .update_task_state(current, task_state, message)
+            .await?;
 
         self.record_event(
             EventOwner::from(updated_task.gid()),
@@ -1072,6 +1018,14 @@ impl Storage {
         )
         .await?;
 
+        {
+            let mut ssn_ptr = lock_ptr!(ssn)?;
+            // A late engine response must not reinsert an evicted task.
+            if ssn_ptr.tasks.contains_key(&updated_task.id) {
+                ssn_ptr.update_task(&updated_task)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -1082,68 +1036,21 @@ impl Storage {
         task_result: TaskResult,
     ) -> Result<(), FlameError> {
         trace_fn!("Storage::update_task_result");
-        let gid = TaskGID {
-            ssn_id: {
-                let ssn_ptr = lock_ptr!(ssn)?;
-                ssn_ptr.id.clone()
-            },
-            task_id: {
-                let task_ptr = lock_ptr!(task)?;
-                task_ptr.id
-            },
-        };
+        let task_id = lock_ptr!(task)?.id;
 
         let task_state = task_result.state;
         let task_message = task_result.message.clone();
-        let task_output = task_result.output.clone();
 
-        // Check before the engine writes, so a rejected update leaves nothing behind.
-        // A suspending session lets its running tasks finish; only a closed one rejects.
-        {
+        // A completed task has left the active cache and must not be updated.
+        let current = {
             let ssn_ptr = lock_ptr!(ssn)?;
-            if ssn_ptr.is_closed() {
-                return Err(FlameError::InvalidState(format!(
-                    "Session <{}> is closed",
-                    ssn_ptr.id
-                )));
-            }
-        }
-
-        let updated_task = match self
-            .engine
-            .update_task_result(gid.clone(), task_result)
-            .await
-        {
-            Ok(task) => task,
-            Err(FlameError::NotFound(_)) => {
-                // Clone first without mutating the Arc in self.tasks.
-                // Mutating in-place would advance the version on the shared Arc,
-                // causing update_task() to see equal versions and skip tasks_index update.
-                let current = {
-                    let task_guard = lock_ptr!(task)?;
-                    task_guard.clone()
-                };
-                crate::apis::Task {
-                    state: task_state,
-                    version: current.version + 1,
-                    completion_time: Some(Utc::now()),
-                    output: task_output,
-                    ..current
-                }
-            }
-            Err(e) => return Err(e),
+            ssn_ptr.active_task(task_id)?
+        };
+        let Some(current) = current else {
+            return Ok(());
         };
 
-        {
-            let mut ssn_ptr = lock_ptr!(ssn)?;
-            if ssn_ptr.is_closed() {
-                return Err(FlameError::InvalidState(format!(
-                    "Session <{}> is closed",
-                    ssn_ptr.id
-                )));
-            }
-            ssn_ptr.update_task(&updated_task)?;
-        }
+        let updated_task = self.engine.update_task_result(current, task_result).await?;
 
         let event_message = match task_state {
             TaskState::Failed => {
@@ -1161,6 +1068,14 @@ impl Storage {
             },
         )
         .await?;
+
+        {
+            let mut ssn_ptr = lock_ptr!(ssn)?;
+            // A late engine response must not reinsert an evicted task.
+            if ssn_ptr.tasks.contains_key(&updated_task.id) {
+                ssn_ptr.update_task(&updated_task)?;
+            }
+        }
 
         Ok(())
     }
@@ -1306,6 +1221,9 @@ mod suspend_tests;
 mod task_tests;
 
 #[cfg(test)]
+mod eviction_tests;
+
+#[cfg(test)]
 mod session_limit_tests;
 
 #[cfg(test)]
@@ -1337,6 +1255,7 @@ mod event_lifecycle_tests {
         };
         let mut storage = (*new_ptr(&context).await.unwrap()).clone();
         storage.engine = engine::connect(url).await.unwrap();
+        storage.context.cluster.storage = url.to_string();
         storage.event_manager = events;
         storage
     }
@@ -1436,13 +1355,23 @@ mod event_lifecycle_tests {
                 )
                 .await
                 .unwrap();
-            let previous = storage.get_task(id.clone(), task.id).unwrap().events.len();
+            let previous = storage
+                .get_task(id.clone(), task.id)
+                .await
+                .unwrap()
+                .events
+                .len();
             assert!(storage.close_session(id.clone()).await.is_err());
             let session = storage.get_session(id.clone()).unwrap();
             assert_eq!(session.status.state, SessionState::Open);
             assert_eq!(session.events[0].message.as_deref(), Some("before"));
             assert_eq!(
-                storage.get_task(id.clone(), task.id).unwrap().events.len(),
+                storage
+                    .get_task(id.clone(), task.id)
+                    .await
+                    .unwrap()
+                    .events
+                    .len(),
                 previous
             );
             assert!(dir.path().join(&id).exists());
@@ -1562,11 +1491,15 @@ mod event_lifecycle_tests {
         storage.engine.close_session(id.clone()).await.unwrap();
         // Older engines allowed late task writers to publish Running after
         // Closed. Recovery preserves that history without retrying its task.
-        let persisted = storage
-            .engine
-            .update_task_state(task.gid(), TaskState::Running, None)
+        let connection = sqlx::SqlitePool::connect(&url).await.unwrap();
+        sqlx::query("UPDATE tasks SET state=?, version=version+1 WHERE ssn_id=? AND id=?")
+            .bind(TaskState::Running as i32)
+            .bind(&id)
+            .bind(task.id)
+            .execute(&connection)
             .await
             .unwrap();
+        let persisted = storage.engine.get_task(task.gid()).await.unwrap();
         let recovered = Storage {
             sessions: stdng::new_ptr(HashMap::new()),
             ..storage.clone()
@@ -1576,7 +1509,7 @@ mod event_lifecycle_tests {
             recovered.get_session(id.clone()).unwrap().status.state,
             SessionState::Closed
         );
-        let history = recovered.get_task_metadata(id, task.id).unwrap();
+        let history = recovered.get_task_metadata(id, task.id).await.unwrap();
         assert_eq!(history.state, TaskState::Running);
         assert_eq!(history.version, persisted.version);
         let on_disk = storage.engine.get_task(task.gid()).await.unwrap();

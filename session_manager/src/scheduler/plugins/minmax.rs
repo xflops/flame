@@ -765,7 +765,7 @@ mod tests {
                     .iter()
                     .all(|executor| executor.state == ExecutorState::Binding
                         && executor.ssn_id.as_ref() == Some(&session.id)));
-                assert!(controller.list_tasks(session.id).unwrap().is_empty());
+                assert!(controller.list_tasks(session.id).await.unwrap().is_empty());
                 drop(controller);
                 let _ = std::fs::remove_file(database);
             }
