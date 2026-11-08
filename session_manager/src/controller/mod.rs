@@ -1668,15 +1668,13 @@ mod tests {
         storage: StoragePtr,
     ) -> (ControllerPtr, String, Task) {
         let controller = new_ptr(storage.clone());
-        let executor_id = create_binding_executor(&controller, "terminal-task-session").await;
+        let ssn_id = format!("terminal-task-session-{}", uuid::Uuid::new_v4());
+        let executor_id = create_binding_executor(&controller, &ssn_id).await;
         controller
             .bind_executor_completed(executor_id.clone(), None, None)
             .await
             .unwrap();
-        let task = controller
-            .create_task("terminal-task-session".into(), None, None)
-            .await
-            .unwrap();
+        let task = controller.create_task(ssn_id, None, None).await.unwrap();
         controller.launch_task(executor_id.clone()).await.unwrap();
         let session = storage.get_session_ptr(task.ssn_id.clone()).unwrap();
         let active = storage.get_task_ptr(task.gid()).unwrap();

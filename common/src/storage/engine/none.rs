@@ -45,7 +45,7 @@ struct SessionEntry {
 /// Stores complete task history in memory without disk persistence.
 pub struct NoneEngine {
     applications: MutexPtr<HashMap<ApplicationID, Application>>,
-    sessions: MutexPtr<HashMap<SessionID, SessionEntry>>,
+    sessions: MutexPtr<HashMap<SessionID, MutexPtr<SessionEntry>>>,
 }
 
 impl NoneEngine {
@@ -57,6 +57,35 @@ impl NoneEngine {
         }))
     }
 
+    fn session_entry(&self, id: &str) -> Result<MutexPtr<SessionEntry>, FlameError> {
+        lock_ptr!(self.sessions)?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| FlameError::NotFound(format!("session <{id}>")))
+    }
+
+    fn validate_session(&self, id: &str, entry: &MutexPtr<SessionEntry>) -> Result<(), FlameError> {
+        ensure!(
+            lock_ptr!(self.sessions)?
+                .get(id)
+                .is_some_and(|current| Arc::ptr_eq(current, entry)),
+            FlameError::NotFound(format!("session <{id}>"))
+        )
+    }
+
+    /// Never wait for an entry while holding the directory lock. Validate after
+    /// locking so a waiter cannot mutate a deleted or replaced session.
+    fn with_session<T>(
+        &self,
+        id: &str,
+        op: impl FnOnce(&mut SessionEntry) -> Result<T, FlameError>,
+    ) -> Result<T, FlameError> {
+        let shared = self.session_entry(id)?;
+        let mut entry = lock_ptr!(shared)?;
+        self.validate_session(id, &shared)?;
+        op(&mut entry)
+    }
+
     fn mutate_task(
         &self,
         gid: TaskGID,
@@ -64,31 +93,29 @@ impl NoneEngine {
         output: Option<Option<bytes::Bytes>>,
         retry: bool,
     ) -> Result<Task, FlameError> {
-        let mut sessions = lock_ptr!(self.sessions)?;
-        let entry = sessions
-            .get_mut(&gid.ssn_id)
-            .ok_or_else(|| FlameError::NotFound(format!("session <{}>", gid.ssn_id)))?;
-        ensure!(
-            !entry.metadata.is_closed() && (!retry || entry.metadata.is_open()),
-            FlameError::InvalidState(format!(
-                "Session <{}> does not accept task updates",
-                gid.ssn_id
-            ))
-        )?;
-        let old_state = entry
-            .tasks
-            .get(&gid.task_id)
-            .ok_or_else(|| FlameError::NotFound(format!("task <{gid}>")))?
-            .state;
-        entry.metadata.task_counts.transition(old_state, state)?;
-        let task = entry.tasks.get_mut(&gid.task_id).unwrap();
-        task.state = state;
-        task.version += 1;
-        task.completion_time = (output.is_some() || state.is_terminal()).then(Utc::now);
-        if let Some(output) = output {
-            task.output = output;
-        }
-        Ok(task.clone())
+        self.with_session(&gid.ssn_id, |entry| {
+            ensure!(
+                !entry.metadata.is_closed() && (!retry || entry.metadata.is_open()),
+                FlameError::InvalidState(format!(
+                    "Session <{}> does not accept task updates",
+                    gid.ssn_id
+                ))
+            )?;
+            let old_state = entry
+                .tasks
+                .get(&gid.task_id)
+                .ok_or_else(|| FlameError::NotFound(format!("task <{gid}>")))?
+                .state;
+            entry.metadata.task_counts.transition(old_state, state)?;
+            let task = entry.tasks.get_mut(&gid.task_id).unwrap();
+            task.state = state;
+            task.version += 1;
+            task.completion_time = (output.is_some() || state.is_terminal()).then(Utc::now);
+            if let Some(output) = output {
+                task.output = output;
+            }
+            Ok(task.clone())
+        })
     }
 }
 
@@ -159,12 +186,21 @@ impl Engine for NoneEngine {
             )));
         }
 
-        {
-            let sessions = lock_ptr!(self.sessions)?;
-            if sessions
-                .values()
-                .any(|entry| entry.metadata.application == id)
-            {
+        let sessions = {
+            let directory = lock_ptr!(self.sessions)?;
+            directory
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry.clone()))
+                .collect::<Vec<_>>()
+        };
+        for (session_id, shared) in sessions {
+            let entry = lock_ptr!(shared)?;
+            match self.validate_session(&session_id, &shared) {
+                Ok(()) => {}
+                Err(FlameError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            }
+            if entry.metadata.application == id {
                 return Err(FlameError::InvalidState(format!(
                     "application <{id}> still has sessions"
                 )));
@@ -266,21 +302,17 @@ impl Engine for NoneEngine {
         )?;
         sessions.insert(
             session.id.clone(),
-            SessionEntry {
+            stdng::new_ptr(SessionEntry {
                 metadata: session.clone(),
                 tasks: BTreeMap::new(),
                 next_task_id: 1,
-            },
+            }),
         );
         Ok(session)
     }
 
     async fn get_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        let sessions = lock_ptr!(self.sessions)?;
-        sessions
-            .get(&id)
-            .map(|entry| entry.metadata.clone())
-            .ok_or_else(|| FlameError::NotFound(format!("session <{id}>")))
+        self.with_session(&id, |entry| Ok(entry.metadata.clone()))
     }
 
     async fn open_session(
@@ -308,32 +340,30 @@ impl Engine for NoneEngine {
     }
 
     async fn close_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        let mut sessions = lock_ptr!(self.sessions)?;
-        let entry = sessions
-            .get_mut(&id)
-            .ok_or_else(|| FlameError::NotFound(format!("session <{id}>")))?;
-        if !entry.metadata.is_closed() {
-            ensure!(
-                entry.metadata.task_counts.running == 0,
-                FlameError::Storage("Cannot close session with running tasks".to_string())
-            )?;
-            let now = Utc::now();
-            for task in entry.tasks.values_mut() {
-                if task.state == TaskState::Pending {
-                    entry
-                        .metadata
-                        .task_counts
-                        .transition(TaskState::Pending, TaskState::Cancelled)?;
-                    task.state = TaskState::Cancelled;
-                    task.completion_time = Some(now);
-                    task.version += 1;
+        self.with_session(&id, |entry| {
+            if !entry.metadata.is_closed() {
+                ensure!(
+                    entry.metadata.task_counts.running == 0,
+                    FlameError::Storage("Cannot close session with running tasks".to_string())
+                )?;
+                let now = Utc::now();
+                for task in entry.tasks.values_mut() {
+                    if task.state == TaskState::Pending {
+                        entry
+                            .metadata
+                            .task_counts
+                            .transition(TaskState::Pending, TaskState::Cancelled)?;
+                        task.state = TaskState::Cancelled;
+                        task.completion_time = Some(now);
+                        task.version += 1;
+                    }
                 }
+                entry.metadata.status.state = SessionState::Closed;
+                entry.metadata.completion_time = Some(now);
+                entry.metadata.version += 1;
             }
-            entry.metadata.status.state = SessionState::Closed;
-            entry.metadata.completion_time = Some(now);
-            entry.metadata.version += 1;
-        }
-        Ok(entry.metadata.clone())
+            Ok(entry.metadata.clone())
+        })
     }
 
     async fn update_session_state(
@@ -341,30 +371,53 @@ impl Engine for NoneEngine {
         id: SessionID,
         state: SessionState,
     ) -> Result<Session, FlameError> {
-        let mut sessions = lock_ptr!(self.sessions)?;
-        let entry = sessions
-            .get_mut(&id)
-            .ok_or_else(|| FlameError::NotFound(format!("session <{id}>")))?;
-        ensure!(
-            !entry.metadata.is_closed(),
-            FlameError::InvalidState(format!("session <{id}> is closed"))
-        )?;
-        entry.metadata.status.state = state;
-        Ok(entry.metadata.clone())
+        self.with_session(&id, |entry| {
+            ensure!(
+                !entry.metadata.is_closed(),
+                FlameError::InvalidState(format!("session <{id}> is closed"))
+            )?;
+            entry.metadata.status.state = state;
+            Ok(entry.metadata.clone())
+        })
     }
 
     async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        let entry = lock_ptr!(self.sessions)?
-            .remove(&id)
-            .ok_or_else(|| FlameError::NotFound(format!("session <{id}>")))?;
-        Ok(entry.metadata)
+        let shared = self.session_entry(&id)?;
+        let metadata = {
+            let entry = lock_ptr!(shared)?;
+            {
+                let mut directory = lock_ptr!(self.sessions)?;
+                ensure!(
+                    directory
+                        .get(&id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &shared)),
+                    FlameError::NotFound(format!("session <{id}>"))
+                )?;
+                directory.remove(&id);
+            }
+            entry.metadata.clone()
+        };
+        Ok(metadata)
     }
 
     async fn find_sessions(&self) -> Result<Vec<Session>, FlameError> {
-        Ok(lock_ptr!(self.sessions)?
-            .values()
-            .map(|entry| entry.metadata.clone())
-            .collect())
+        let entries = {
+            let directory = lock_ptr!(self.sessions)?;
+            directory
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut sessions = Vec::with_capacity(entries.len());
+        for (id, shared) in entries {
+            let entry = lock_ptr!(shared)?;
+            match self.validate_session(&id, &shared) {
+                Ok(()) => sessions.push(entry.metadata.clone()),
+                Err(FlameError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(sessions)
     }
 
     // ========== Task operations ==========
@@ -375,39 +428,38 @@ impl Engine for NoneEngine {
         task_input: Option<TaskInput>,
         options: Option<TaskOptions>,
     ) -> Result<Task, FlameError> {
-        let mut sessions = lock_ptr!(self.sessions)?;
-        let entry = sessions
-            .get_mut(&ssn_id)
-            .ok_or_else(|| FlameError::NotFound(format!("session <{ssn_id}>")))?;
-        ensure!(
-            !entry.metadata.is_closed(),
-            FlameError::InvalidState(format!("Session <{ssn_id}> is closed"))
-        )?;
-        let task = Task {
-            ssn_id,
-            id: entry.next_task_id,
-            version: 1,
-            state: TaskState::Pending,
-            creation_time: Utc::now(),
-            completion_time: None,
-            input: task_input,
-            output: None,
-            affinity: options.unwrap_or_default().affinity,
-            events: vec![],
-        };
-        entry.tasks.insert(task.id, task.clone());
-        entry.next_task_id += 1;
-        entry.metadata.task_counts.increment(TaskState::Pending);
-        Ok(task)
+        self.with_session(&ssn_id, |entry| {
+            ensure!(
+                !entry.metadata.is_closed(),
+                FlameError::InvalidState(format!("Session <{ssn_id}> is closed"))
+            )?;
+            let task = Task {
+                ssn_id: ssn_id.clone(),
+                id: entry.next_task_id,
+                version: 1,
+                state: TaskState::Pending,
+                creation_time: Utc::now(),
+                completion_time: None,
+                input: task_input,
+                output: None,
+                affinity: options.unwrap_or_default().affinity,
+                events: vec![],
+            };
+            entry.tasks.insert(task.id, task.clone());
+            entry.next_task_id += 1;
+            entry.metadata.task_counts.increment(TaskState::Pending);
+            Ok(task)
+        })
     }
 
     async fn get_task(&self, gid: TaskGID) -> Result<Task, FlameError> {
-        let sessions = lock_ptr!(self.sessions)?;
-        sessions
-            .get(&gid.ssn_id)
-            .and_then(|entry| entry.tasks.get(&gid.task_id))
-            .cloned()
-            .ok_or_else(|| FlameError::NotFound(format!("task <{gid}>")))
+        self.with_session(&gid.ssn_id, |entry| {
+            entry
+                .tasks
+                .get(&gid.task_id)
+                .cloned()
+                .ok_or_else(|| FlameError::NotFound(format!("task <{gid}>")))
+        })
     }
 
     async fn retry_task(&self, gid: TaskGID) -> Result<Task, FlameError> {
@@ -437,21 +489,19 @@ impl Engine for NoneEngine {
     }
 
     async fn find_tasks(&self, filter: &TaskFilter) -> Result<Vec<Task>, FlameError> {
-        let sessions = lock_ptr!(self.sessions)?;
-        let entry = sessions
-            .get(&filter.session)
-            .ok_or_else(|| FlameError::NotFound(format!("session <{}>", filter.session)))?;
-        Ok(entry
-            .tasks
-            .values()
-            .filter(|task| {
-                filter
-                    .states
-                    .as_ref()
-                    .is_none_or(|states| states.contains(&task.state))
-            })
-            .cloned()
-            .collect())
+        self.with_session(&filter.session, |entry| {
+            Ok(entry
+                .tasks
+                .values()
+                .filter(|task| {
+                    filter
+                        .states
+                        .as_ref()
+                        .is_none_or(|states| states.contains(&task.state))
+                })
+                .cloned()
+                .collect())
+        })
     }
 
     // ========== Node operations ==========
@@ -510,6 +560,121 @@ impl Engine for NoneEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_engine() -> NoneEngine {
+        NoneEngine {
+            applications: stdng::new_ptr(HashMap::new()),
+            sessions: stdng::new_ptr(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn locked_session_does_not_block_other_session_history_or_mutations() {
+        let engine = test_engine();
+        for id in ["held", "free"] {
+            tokio_test::block_on(engine.create_session(SessionAttributes {
+                id: id.into(),
+                application: "app".into(),
+                ..Default::default()
+            }))
+            .unwrap();
+        }
+        let shared = engine.session_entry("held").unwrap();
+        let result = std::thread::scope(|scope| {
+            let result = {
+                let _held = lock_ptr!(shared).unwrap();
+                let (sent, received) = std::sync::mpsc::channel();
+                let engine = &engine;
+                scope.spawn(move || {
+                    let result = tokio_test::block_on(async {
+                        let task = engine.create_task("free".into(), None, None).await?;
+                        let running = engine
+                            .update_task_state(task, TaskState::Running, None)
+                            .await?;
+                        let finished = engine
+                            .update_task_result(
+                                running,
+                                TaskResult {
+                                    state: TaskState::Succeed,
+                                    output: Some(bytes::Bytes::from_static(b"result")),
+                                    message: None,
+                                },
+                            )
+                            .await?;
+                        let tasks = engine.find_tasks(&TaskFilter::terminal("free")).await?;
+                        assert_eq!(tasks.len(), 1);
+                        assert_eq!(tasks[0].output, finished.output);
+                        let closed = engine.close_session("free".into()).await?;
+                        assert_eq!(closed.task_counts.succeed, 1);
+                        Ok::<_, FlameError>(())
+                    });
+                    sent.send(result).unwrap();
+                });
+                received.recv_timeout(std::time::Duration::from_secs(5))
+            };
+            // Releasing the held entry before joining prevents a failing lock
+            // regression from leaving a blocked test thread behind.
+            result
+        });
+        result
+            .expect("another session must make progress while an entry is locked")
+            .unwrap();
+    }
+
+    #[test]
+    fn stale_session_handles_are_rejected_after_delete_and_recreate() {
+        let engine = test_engine();
+        let attr = SessionAttributes {
+            id: "same".into(),
+            application: "app".into(),
+            ..Default::default()
+        };
+        tokio_test::block_on(engine.create_session(attr.clone())).unwrap();
+        let stale = engine.session_entry("same").unwrap();
+        let old_task = tokio_test::block_on(engine.create_task(
+            "same".into(),
+            Some(bytes::Bytes::from_static(b"old")),
+            None,
+        ))
+        .unwrap();
+        tokio_test::block_on(engine.delete_session("same".into())).unwrap();
+        {
+            let _old_entry = lock_ptr!(stale).unwrap();
+            assert!(matches!(
+                engine.validate_session("same", &stale),
+                Err(FlameError::NotFound(_))
+            ));
+        }
+        tokio_test::block_on(engine.create_session(attr)).unwrap();
+        let replacement = engine.session_entry("same").unwrap();
+        assert!(!Arc::ptr_eq(&stale, &replacement));
+        {
+            let _old_entry = lock_ptr!(stale).unwrap();
+            assert!(matches!(
+                engine.validate_session("same", &stale),
+                Err(FlameError::NotFound(_))
+            ));
+        }
+        assert!(matches!(
+            tokio_test::block_on(engine.get_task(old_task.gid())),
+            Err(FlameError::NotFound(_))
+        ));
+        let task = tokio_test::block_on(engine.create_task(
+            "same".into(),
+            Some(bytes::Bytes::from_static(b"new")),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(task.id, 1);
+        assert_eq!(task.input, Some(bytes::Bytes::from_static(b"new")));
+        assert_eq!(
+            tokio_test::block_on(engine.get_session("same".into()))
+                .unwrap()
+                .task_counts
+                .pending,
+            1
+        );
+    }
 
     #[tokio::test]
     async fn test_none_engine_create_session() {

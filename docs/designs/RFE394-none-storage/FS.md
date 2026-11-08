@@ -113,11 +113,24 @@ new state/version from that authoritative record. The common state/result
 methods receive an active Task snapshot, but its cached state or version is
 not authoritative over the stored record.
 
-The engine uses its existing synchronization to coordinate its records and
-lifecycle transitions. No new task-operation gate, per-version history, or
-backend capability flag is introduced. Retaining the current task record is
-sufficient for reads and version checks; finished task payloads remain owned
-by the engine.
+The global session directory holds shared pointers to session entries. Lookup
+clones a pointer under the directory lock, then releases that lock before
+waiting for the entry's mutex. Each session-local mutex protects its lifecycle
+metadata, task ID allocation, counters, and complete task history. Operations
+briefly recheck directory pointer identity after locking the entry, then access
+the session with only its local mutex held. Task reads, writes, and history
+scans therefore do not hold a global lock across unrelated sessions.
+
+Deletion locks the entry and removes it only if the directory still identifies
+that entry. A waiting operation whose entry was deleted or replaced returns
+`NotFound` after the identity recheck. Session listing copies entry pointers
+before inspecting them; it does not hold the directory lock while waiting on
+session mutexes or scanning history. No tombstone or additional registry is
+required.
+
+No new task-operation gate, per-version history, or backend capability flag is
+introduced. Retaining the current task record is sufficient for reads and
+version checks; finished task payloads remain owned by the engine.
 
 The relevant Engine contracts are:
 
