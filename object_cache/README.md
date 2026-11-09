@@ -4,7 +4,7 @@ Object cache service for Flame distributed system.
 
 ## Overview
 
-The `flame-object-cache` is a standalone service that stores opaque client-encoded bytes. It uses a streaming gRPC API end to end: payloads are written to and read from storage in chunks and are never held in memory in one piece. The open files of recently used objects of a persistent store are kept in memory; `storage: none` has no store at all, only the in-memory cache. Clients choose their own value encoding, including Arrow IPC for table values, and provide a data type such as `raw.zstd` when they compress the bytes.
+The `flame-object-cache` is a standalone service that stores opaque client-encoded bytes. It uses a streaming gRPC API; persistent PUT and GET process payloads in bounded chunks, while PATCH buffers its uploaded part before appending it. The open files of recently used objects of a persistent store are kept in memory; `storage: none` has no store at all, only the in-memory cache. Clients choose their own value encoding, including Arrow IPC for table values, and provide a data type such as `raw.zstd` when they compress the bytes.
 
 ## Features
 
@@ -12,8 +12,9 @@ The `flame-object-cache` is a standalone service that stores opaque client-encod
 - **Version Tracking**: The version of an object is its number of data parts: 1 when created, incremented by each append
 - **Conditional Get**: Clients can check if their cached copy is still valid (RFE426)
 - **Client-Side Caching**: Python SDK caches objects locally, reducing network round-trips
+- **Payload Integrity**: Persistent stores write a SHA-256 checksum for each payload part and verify it while streaming reads; a checksum mismatch fails the stream
 - **Persistent Storage**: An object is a directory of `metadata.json`, `index.bin` and `data.bin` files, or with `storage: none` not at all (the in-memory cache is then the only copy, and nothing survives a restart)
-- **Streaming gRPC API**: Chunked transfer without server-side value encoding; memory per write is one chunk, and a read holds one chunk at a time
+- **Streaming gRPC API**: Chunked transfer without server-side value encoding; persistent PUT and GET use bounded chunk buffers, while PATCH buffers its uploaded part
 - **Metadata-Only Startup**: Startup scans object metadata; payloads are never loaded at startup
 - **Client-Side Compression**: The Python SDK compresses structured data and tensors; the cache stores their bytes unchanged
 - **Create-Only Objects**: An object is created once and then only grows by appended data, like the layers of an overlay filesystem; it is never replaced
@@ -208,34 +209,68 @@ Client                              Server
 
 ## Storage Structure
 
-```
+```text
 /var/lib/flame/cache/
 └── app_name/
     └── session_id/
         └── object1/
-            ├── metadata.json   # data type, shared by all the parts
-            ├── index.bin       # one 24-byte record per part: offset, length, creation time
-            └── data.bin        # payloads of the parts, concatenated, append-only
+            ├── metadata.json   # shared data type
+            ├── index.bin       # one 56-byte record per committed part
+            └── data.bin        # append-only payload bytes
 ```
 
-An object is a list of data parts, like the layers of an overlay filesystem: they
-are all alike, and the first is the one written when the object was created. The
-version of a part is its index + 1, so no version is stored. The index gives each payload's offset and length
-in `data.bin`, so a payload is read with one positional read. An append is two writes: its payload to `data.bin`, then its fixed-size record to
-`index.bin`, which commits it. Payload bytes without a record, left by an
-interrupted append, are ignored, and a partial record is cut off when the object
-is opened.
-All the parts have the same data type, kept once in `metadata.json`. Clients encode
-Arrow tables to bytes and optionally compress them before uploading. The cache
-does not decompress hot or persisted objects.
+`metadata.json` contains the client-defined `data_type`.
+Every `index.bin` record contains these
+fields in order, without a file header:
 
-Storage is accessed through a streaming interface (`write_stream`, `read_range`,
-`open`, `stat`, `scan`, `patch_object`). `DiskStorage` implements it on files and
-`ResidentStorage` decorates an engine with a cache of open object handles.
-`storage::connect(url, eviction)` builds the stack from the storage url: a path
-gives a `ResidentStorage` over `DiskStorage`. For `storage: none` the engine is
-`NoStorage`, which discards writes, so `ResidentStorage` alone holds the objects
-(cache only).
+| Field | Encoding | Bytes |
+|-------|----------|-------|
+| Payload offset | Little-endian unsigned integer | 8 |
+| Payload length | Little-endian unsigned integer | 8 |
+| Creation time | Little-endian signed Unix milliseconds | 8 |
+| Payload checksum | SHA-256 digest bytes | 32 |
+
+An object's version is its number of committed parts; the first PUT creates
+part 1 and every PATCH appends another part. The checksum covers the exact
+encoded payload bytes of that part, including an empty payload. Clients encode
+and optionally compress their values before upload; the cache checks those
+opaque bytes without decoding or decompressing them.
+
+PUT computes its digest incrementally as chunks arrive, syncs the payload,
+index and metadata in a temporary directory, and renames the directory into
+place only when complete. PATCH buffers its uploaded part, computes its digest,
+then writes and syncs that payload before appending and syncing the index record
+containing its digest. A complete index record
+commits the part. Bytes beyond committed payload ranges can remain after an
+interrupted append and are ignored. Opening an object removes an incomplete
+trailing index record using its 56-byte record width.
+
+### Integrity and streaming failures
+
+Reads calculate SHA-256 incrementally and compare each delivered part against
+its persisted expected checksum. Memory use is bounded by the stream's chunks,
+not the size of the object. A modified payload fails even when its length is
+unchanged or the object's file handle was already cached.
+
+Earlier chunks may reach a reader before the checksum comparison fails. A
+non-OK stream termination invalidates the whole read: clients must discard all
+partially delivered data and must not publish a value or mark it cached until
+the stream completes successfully. A suffix read verifies the parts it returns;
+a conditional GET that returns no payload does not reread or verify bytes the
+client already holds. Listing objects and reading metadata do not verify
+payload integrity.
+
+These checks detect payload corruption relative to its persisted digest. They
+are not authentication: someone able to replace both a payload and its checksum
+can make them agree. The digest does not authenticate the data type, timestamps,
+or other index fields.
+
+Storage uses `DiskStorage` for persistent files and `ResidentStorage` to cache
+open object handles. Persistent PUT and GET stream in bounded chunks; PATCH
+buffers its uploaded part before appending it.
+`storage: none` instead assembles complete payloads in memory, including PATCH
+payloads, and has no persisted integrity record; its contents do not survive a
+restart.
 
 ## API
 

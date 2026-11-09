@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 #[cfg(test)]
-use futures::{future, stream};
+use futures::{future, stream, TryStreamExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -42,6 +42,7 @@ pub struct Record {
     pub offset: u64,
     pub len: u64,
     pub creation_time: i64,
+    pub checksum: Option<[u8; 32]>,
 }
 
 /// Metadata of a stored object, read without touching its payload. An object
@@ -71,6 +72,7 @@ impl ObjectStat {
                     offset,
                     len: part.size_bytes(),
                     creation_time: part.creation_time,
+                    checksum: None,
                 };
                 offset += record.len;
                 record
@@ -152,15 +154,55 @@ pub trait StorageEngine: Send + Sync + 'static {
             .map(|_| ())
     }
 
-    /// Read `len` bytes of part `part` of the object (0 is the first) starting
-    /// at `offset`. This is the one way payload bytes are read for serving.
+    /// Stream one complete part (0 is the first), verifying persisted payload
+    /// integrity before the stream finishes successfully. An empty part emits
+    /// one empty chunk. Callers must consume the stream through its end.
+    async fn read_part(
+        &self,
+        key: &ObjectKey,
+        part: usize,
+    ) -> Result<BoxStream<'static, Result<Bytes, FlameError>>, FlameError>;
+
+    /// Read a range only after the complete part has passed verification,
+    /// including bytes outside the requested range.
+    #[cfg(test)]
     async fn read_range(
         &self,
         key: &ObjectKey,
         part: usize,
         offset: u64,
         len: usize,
-    ) -> Result<Bytes, FlameError>;
+    ) -> Result<Bytes, FlameError> {
+        let key_string = key.to_key().unwrap_or_default();
+        let stat = self
+            .stat(key)
+            .await?
+            .ok_or_else(|| FlameError::NotFound(format!("object <{key_string}> not found")))?;
+        let record = stat.records.get(part).ok_or_else(|| {
+            FlameError::NotFound(format!("part {part} of object <{key_string}> not found"))
+        })?;
+        let range = payload_range(&key_string, offset, len, record.len)?;
+        let mut stream = self.read_part(key, part).await?;
+        let mut output = Vec::with_capacity(len);
+        let mut position = 0usize;
+        while let Some(chunk) = stream.try_next().await? {
+            let end = position.checked_add(chunk.len()).ok_or_else(|| {
+                FlameError::InvalidState(format!("object <{key_string}> size overflow"))
+            })?;
+            let start = position.max(range.start);
+            let overlap_end = end.min(range.end);
+            if start < overlap_end {
+                output.extend_from_slice(&chunk[start - position..overlap_end - position]);
+            }
+            position = end;
+        }
+        if position as u64 != record.len {
+            return Err(FlameError::InvalidState(format!(
+                "object <{key_string}> part {part} length mismatch"
+            )));
+        }
+        Ok(Bytes::from(output))
+    }
 
     /// Open an object's files for reading, for engines that store objects in
     /// files: the handle can be kept to read the object without opening it

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::BoxStream;
+use futures::stream::{self, BoxStream};
 use futures::TryStreamExt;
 use stdng::{lock_ptr, new_ptr, MutexPtr};
 
@@ -25,7 +25,7 @@ use common::FlameError;
 use crate::cache::{Object, ObjectData, ObjectKey, ObjectMetadata};
 use crate::eviction::{new_policy, EvictionConfig, EvictionPolicyPtr};
 
-use super::{payload_range, NoStorage, ObjectFiles, ObjectStat, StorageEngine, StorageEnginePtr};
+use super::{NoStorage, ObjectFiles, ObjectStat, StorageEngine, StorageEnginePtr};
 
 /// Batch size for eviction operations.
 const EVICTION_BATCH_SIZE: usize = 10;
@@ -194,34 +194,40 @@ impl StorageEngine for ResidentStorage {
         Ok(meta)
     }
 
-    async fn read_range(
+    async fn read_part(
         &self,
         key: &ObjectKey,
         part: usize,
-        offset: u64,
-        len: usize,
-    ) -> Result<Bytes, FlameError> {
+    ) -> Result<BoxStream<'static, Result<Bytes, FlameError>>, FlameError> {
         let key_str = key_string(key)?;
         if self.cache_only {
             let object = self
                 .resident_of(&key_str)?
                 .ok_or_else(|| FlameError::NotFound(format!("object <{}> not found", key_str)))?;
-            let data = &object
+            let data = object
                 .data
                 .get(part)
                 .ok_or_else(|| {
                     FlameError::NotFound(format!("part {} of object <{}> not found", part, key_str))
                 })?
-                .data;
-            let range = payload_range(&key_str, offset, len, data.len() as u64)?;
-            return Ok(data.slice(range));
+                .data
+                .clone();
+            // Keep only the shared Bytes handle in the stream, not a second
+            // allocation of the part. The empty part still has one message.
+            return Ok(Box::pin(stream::unfold(
+                Some((data, 0usize)),
+                |state| async move {
+                    let (data, offset) = state?;
+                    let end = data.len().min(offset.saturating_add(1024 * 1024));
+                    let chunk = data.slice(offset..end);
+                    let next = (end < data.len()).then_some((data, end));
+                    Some((Ok(chunk), next))
+                },
+            )));
         }
         match self.files(key).await? {
-            Some(files) => joined(
-                tokio::task::spawn_blocking(move || files.read_range(&key_str, part, offset, len))
-                    .await,
-            )?,
-            None => self.inner.read_range(key, part, offset, len).await,
+            Some(files) => files.read_part(key_str, part),
+            None => self.inner.read_part(key, part).await,
         }
     }
 
@@ -427,14 +433,12 @@ mod tests {
             self.inner.write_stream(key, meta, chunks).await
         }
 
-        async fn read_range(
+        async fn read_part(
             &self,
             key: &ObjectKey,
             part: usize,
-            offset: u64,
-            len: usize,
-        ) -> Result<Bytes, FlameError> {
-            self.inner.read_range(key, part, offset, len).await
+        ) -> Result<BoxStream<'static, Result<Bytes, FlameError>>, FlameError> {
+            self.inner.read_part(key, part).await
         }
 
         async fn open(&self, key: &ObjectKey) -> Result<Option<Arc<ObjectFiles>>, FlameError> {

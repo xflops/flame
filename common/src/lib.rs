@@ -70,6 +70,10 @@ pub enum FlameError {
     #[error("{0}")]
     Storage(String),
 
+    /// Persisted data failed an integrity check.
+    #[error("{0}")]
+    DataLoss(String),
+
     #[error("{0}")]
     VersionMismatch(String),
 
@@ -89,6 +93,7 @@ impl From<FlameError> for Status {
         match value {
             FlameError::NotFound(msg) => Status::not_found(msg),
             FlameError::AlreadyExist(msg) => Status::already_exists(msg),
+            FlameError::DataLoss(msg) => Status::data_loss(msg),
             FlameError::InvalidConfig(msg)
             | FlameError::InvalidState(msg)
             | FlameError::InvalidVersion(msg) => Status::invalid_argument(msg),
@@ -266,5 +271,9 @@ mod tests {
         let status = Status::from(error);
         assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(status.message(), "test");
+
+        let status = Status::from(FlameError::DataLoss("checksum mismatch".to_string()));
+        assert_eq!(status.code(), Code::DataLoss);
+        assert_eq!(status.message(), "checksum mismatch");
     }
 }
