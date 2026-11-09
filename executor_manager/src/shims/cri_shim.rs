@@ -351,6 +351,14 @@ impl Shim for CriShim {
         self.create(&app_manager).await
     }
 
+    async fn on_instance_create(&mut self) -> Result<(), FlameError> {
+        self.instance_client
+            .as_mut()
+            .ok_or_else(|| FlameError::InvalidState("CRI instance is not created".into()))?
+            .on_instance_create()
+            .await
+    }
+
     async fn on_session_enter(
         &mut self,
         context: &SessionContext,
@@ -382,8 +390,29 @@ impl Shim for CriShim {
     }
 
     async fn destroy_instance(&mut self) -> Result<(), FlameError> {
-        if let Some(client) = self.instance_client.as_mut() {
-            client.close();
+        validate_path_component(&self.executor.id)?;
+        let graceful = async {
+            if self.instance_client.is_none() {
+                // A cleanup-only shim can reconnect a surviving service without
+                // restoring its application context or recreating the workload.
+                let socket = Path::new(WORK_ROOT)
+                    .join(&self.executor.id)
+                    .join(INSTANCE_SOCKET);
+                if ready_file(&socket).exists() {
+                    let mut client = GrpcShim::new_at(&socket)?;
+                    client.connect().await?;
+                    // Retain the client's once-only notification state if runtime
+                    // deletion fails and Releasing retries cleanup.
+                    self.instance_client = Some(client);
+                }
+            }
+            if let Some(client) = self.instance_client.as_mut() {
+                client.destroy_instance().await?;
+            }
+            Ok::<(), FlameError>(())
+        };
+        if let Err(error) = graceful.await {
+            tracing::warn!(executor_id = %self.executor.id, %error, "CRI graceful teardown failed; deleting runtime");
         }
         let result =
             if let (Some(manager), Some(handle)) = (self.manager.as_mut(), self.handle.as_ref()) {

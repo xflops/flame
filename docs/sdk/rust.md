@@ -227,6 +227,20 @@ published and retracted keys. A manually constructed `FlameInstance` is not
 attached to a service publisher, so its `publish()` and `retract()` methods
 return an error.
 
+`FlameService` also provides default async `on_instance_create()` and
+`on_instance_destroy()` hooks. Override them for resources shared across an
+executor's session bindings. FEM calls create after connection and before the
+first session enter, and destroy before stopping the runtime. The gRPC handlers
+forward directly to these hooks; FEM owns ordering. The SDK adds no lifecycle
+locks, cached results, or lazy initialization. Services depending on these hooks
+require an updated FEM. Existing implementations retain default no-op behavior.
+Make setup idempotent if FEM may reconnect to a surviving service process.
+
+The existing connection limits apply before setup. Instance hooks are awaited
+without a separate deadline; timeout policy/configuration is deferred. An
+unresponsive teardown can delay release, and a crash can skip teardown.
+Instance RPC responses contain only status; executor attributes use the existing session/task responses.
+
 ## Use Object Cache
 
 Object keys use either a prefix, `<app>/<session>`, or a full key, `<app>/<session>/<object>`.

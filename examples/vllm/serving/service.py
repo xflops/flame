@@ -8,18 +8,36 @@ from flamepy import serving
 # Preserve explicit runtime settings and FEM's GPU assignment.
 os.environ.setdefault("VLLM_RPC_BASE_PATH", "/tmp")
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
-from vllm import LLM, SamplingParams  # noqa: E402
-
 ins = serving.Instance()
-llm = LLM(
-    model=os.getenv("VLLM_MODEL", "facebook/opt-125m"),
-    enable_prefix_caching=True,
-    tensor_parallel_size=1,
-    gpu_memory_utilization=0.1,
-    max_model_len=1024,
-    enforce_eager=True,
-    attention_config={"backend": "TRITON_ATTN"},
-)
+llm = None
+
+
+@ins.setup
+def create_engine():
+    global llm
+    if llm is not None:
+        return
+    # Heavy imports and model loading happen after the shim is listening.
+    from vllm import LLM
+
+    llm = LLM(
+        model=os.getenv("VLLM_MODEL", "facebook/opt-125m"),
+        enable_prefix_caching=True,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.1,
+        max_model_len=1024,
+        enforce_eager=True,
+        attention_config={"backend": "TRITON_ATTN"},
+    )
+
+
+@ins.teardown
+def destroy_engine():
+    global llm
+    if llm is not None:
+        # vLLM 0.32.0 exposes shutdown on the engine-core client, not LLM.
+        llm.llm_engine.engine_core.shutdown()
+        llm = None
 
 
 @ins.entrypoint
@@ -31,6 +49,8 @@ def generate(request: dict) -> list[dict]:
         or any(not isinstance(prompt, str) or not prompt for prompt in prompts)
     ):
         raise ValueError("prompts must be a nonempty list of nonempty strings")
+
+    from vllm import SamplingParams
 
     context = ins.context() or {}
     parameters = SamplingParams(

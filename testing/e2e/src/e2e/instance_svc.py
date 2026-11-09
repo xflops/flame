@@ -11,15 +11,80 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import base64
+import os
+import time
+from pathlib import Path
+
 from flamepy import serving
+from flamepy.core import ObjectRef, patch_object
 
 from e2e.api import TestContext, TestRequest, TestResponse
 
-instance = serving.Instance()
+
+class Instance(serving.Instance):
+    """Serving fixture with optional cache-backed lifecycle observations."""
+
+    def __init__(self):
+        super().__init__()
+        observer = os.environ.get("FLAME_E2E_LIFECYCLE_EVENTS")
+        self.events = ObjectRef.decode(base64.b64decode(observer)) if observer else None
+        self.executor_id = None
+        if self.events is not None:
+            endpoint = Path(os.environ["FLAME_INSTANCE_ENDPOINT"])
+            self.executor_id = endpoint.parent.name if endpoint.name == "instance.sock" else endpoint.stem
+        self.setup_complete = False
+        self.session_id = None
+
+    def record(self, phase, **attributes):
+        if self.events is None:
+            return
+        self.events = patch_object(
+            self.events,
+            {
+                "phase": phase,
+                "executor_id": self.executor_id,
+                "pid": os.getpid(),
+                "session_id": self.session_id,
+                "at": time.monotonic(),
+                **attributes,
+            },
+        )
+
+    def on_session_enter(self, context):
+        self.session_id = context.session_id
+        self.record("session_enter", setup_complete=self.setup_complete)
+        if self.events is not None and not self.setup_complete:
+            raise RuntimeError("instance setup must finish before session enter")
+        super().on_session_enter(context)
+
+    def on_session_leave(self):
+        self.record("session_leave")
+        super().on_session_leave()
+        self.session_id = None
+
+
+instance = Instance()
+
+
+@instance.setup
+def setup():
+    instance.record("setup_started")
+    delay = float(os.environ.get("FLAME_E2E_SETUP_DELAY", "0"))
+    if delay:
+        time.sleep(delay)
+    instance.setup_complete = True
+    instance.record("setup_complete")
+
+
+@instance.teardown
+def teardown():
+    instance.record("teardown")
 
 
 @instance.entrypoint
 def e2e_service_entrypoint(req: TestRequest) -> TestResponse:
+    instance.record("task")
     cxt = instance.context()
     data = cxt.common_data if cxt is not None else None
 

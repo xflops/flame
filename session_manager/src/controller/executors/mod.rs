@@ -491,7 +491,7 @@ mod tests {
 
             let result = state
                 .bind_session_completed(Some(FlameResult {
-                    return_code: common::apis::BIND_RESULT_ON_SESSION_ENTER_FAILED,
+                    return_code: -1,
                     message: Some("enter failed".to_string()),
                 }))
                 .await;
@@ -807,8 +807,9 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_unregister_executor_fails() {
+        async fn test_unregister_executor_rejects_active_task() {
             let exe_ptr = create_test_executor("exe-1", ExecutorState::Unbinding);
+            lock_ptr!(exe_ptr).unwrap().task_id = Some(1);
             let state = UnbindingState {
                 storage: create_mock_storage().await,
                 executor: exe_ptr.clone(),
@@ -818,6 +819,22 @@ mod tests {
 
             assert!(result.is_err());
             assert!(matches!(result, Err(FlameError::InvalidState(_))));
+        }
+
+        #[tokio::test]
+        async fn test_unregister_failed_bind_after_runtime_cleanup() {
+            let exe_ptr = create_test_executor("exe-1", ExecutorState::Unbinding);
+            lock_ptr!(exe_ptr).unwrap().ssn_id = Some("failed-session".into());
+            let state = UnbindingState {
+                storage: create_mock_storage().await,
+                executor: exe_ptr.clone(),
+            };
+
+            state.unregister_executor().await.unwrap();
+
+            let executor = lock_ptr!(exe_ptr).unwrap();
+            assert_eq!(executor.state, ExecutorState::Released);
+            assert!(executor.ssn_id.is_none());
         }
 
         #[tokio::test]

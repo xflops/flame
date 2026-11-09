@@ -21,6 +21,7 @@ class FakeLLM:
         self.model = kwargs["model"]
         self.options = kwargs
         self.environment = dict(os.environ)
+        self.llm_engine = types.SimpleNamespace(engine_core=MagicMock())
         self.cached_prompts = set()
         type(self).creations += 1
 
@@ -88,6 +89,7 @@ class VllmServingTest(unittest.TestCase):
         return cloudpickle.loads(output)
 
     def test_supported_attention_configuration_preserves_runtime_settings(self):
+        self.worker.on_instance_create()
         llm = self.service.llm
         self.assertEqual(llm.options["attention_config"], {"backend": "TRITON_ATTN"})
         self.assertEqual(llm.environment["CUDA_VISIBLE_DEVICES"], "GPU-assigned")
@@ -96,6 +98,8 @@ class VllmServingTest(unittest.TestCase):
 
     def test_transport_batches_prompts_and_retains_model_across_sessions(self):
         worker = self.worker
+        self.assertEqual(FakeLLM.creations, 0)
+        self.worker.on_instance_create()
         self.assertEqual(FakeLLM.creations, 1)
         self.assertEqual(self.sampling.call_count, 0)
         self.enter("first", {"max_tokens": 16, "temperature": 0.2})
@@ -125,6 +129,7 @@ class VllmServingTest(unittest.TestCase):
         self.assertEqual(FakeLLM.creations, 1)
 
     def test_invalid_prompts_do_not_reinitialize_model(self):
+        self.worker.on_instance_create()
         self.enter("first")
         for prompts in [None, [], "hello", [""], [1]]:
             with self.subTest(prompts=prompts), self.assertRaises(ValueError):
@@ -132,6 +137,7 @@ class VllmServingTest(unittest.TestCase):
         self.assertEqual(FakeLLM.creations, 1)
 
     def test_deployment_model_cannot_be_overridden_by_session_context(self):
+        self.worker.on_instance_create()
         self.enter("first", {"model": "other-model", "max_tokens": 16})
         retained = self.service.llm
         self.assertEqual(retained.model, "test-model")
@@ -141,6 +147,23 @@ class VllmServingTest(unittest.TestCase):
         self.invoke(self.worker, "second", ["hello"])
         self.assertEqual(self.service.llm.parameters["max_tokens"], 48)
         self.assertEqual(FakeLLM.creations, 1)
+
+    def test_model_load_is_deferred_until_setup_and_cleanup_uses_engine_core(self):
+        self.assertIsNone(self.service.llm)
+        self.assertEqual(FakeLLM.creations, 0)
+        self.worker.on_instance_destroy()  # Partial/no setup is safe.
+        self.worker.on_instance_create()
+        retained = self.service.llm
+        self.worker.on_instance_create()  # FEM can reconnect to a surviving service.
+        self.assertIs(self.service.llm, retained)
+        self.assertEqual(FakeLLM.creations, 1)
+        engine = retained.llm_engine.engine_core
+        self.enter("first")
+        self.worker.on_session_leave()
+        engine.shutdown.assert_not_called()
+        self.worker.on_instance_destroy()
+        engine.shutdown.assert_called_once_with()
+        self.assertIsNone(self.service.llm)
 
     def test_client_sends_configuration_as_context_and_prompts_as_request(self):
         session = MagicMock()

@@ -35,6 +35,16 @@ class InstanceStub:
         Args:
             channel: A grpc.Channel.
         """
+        self.OnInstanceCreate = channel.unary_unary(
+                '/flame.v1.Instance/OnInstanceCreate',
+                request_serializer=types__pb2.EmptyRequest.SerializeToString,
+                response_deserializer=types__pb2.Result.FromString,
+                _registered_method=True)
+        self.OnInstanceDestroy = channel.unary_unary(
+                '/flame.v1.Instance/OnInstanceDestroy',
+                request_serializer=types__pb2.EmptyRequest.SerializeToString,
+                response_deserializer=types__pb2.Result.FromString,
+                _registered_method=True)
         self.OnSessionEnter = channel.unary_unary(
                 '/flame.v1.Instance/OnSessionEnter',
                 request_serializer=shim__pb2.SessionContext.SerializeToString,
@@ -54,6 +64,18 @@ class InstanceStub:
 
 class InstanceServicer:
     """Missing associated documentation comment in .proto file."""
+
+    def OnInstanceCreate(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def OnInstanceDestroy(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def OnSessionEnter(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -76,6 +98,16 @@ class InstanceServicer:
 
 def add_InstanceServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'OnInstanceCreate': grpc.unary_unary_rpc_method_handler(
+                    servicer.OnInstanceCreate,
+                    request_deserializer=types__pb2.EmptyRequest.FromString,
+                    response_serializer=types__pb2.Result.SerializeToString,
+            ),
+            'OnInstanceDestroy': grpc.unary_unary_rpc_method_handler(
+                    servicer.OnInstanceDestroy,
+                    request_deserializer=types__pb2.EmptyRequest.FromString,
+                    response_serializer=types__pb2.Result.SerializeToString,
+            ),
             'OnSessionEnter': grpc.unary_unary_rpc_method_handler(
                     servicer.OnSessionEnter,
                     request_deserializer=shim__pb2.SessionContext.FromString,
@@ -101,6 +133,60 @@ def add_InstanceServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class Instance:
     """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def OnInstanceCreate(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/flame.v1.Instance/OnInstanceCreate',
+            types__pb2.EmptyRequest.SerializeToString,
+            types__pb2.Result.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def OnInstanceDestroy(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/flame.v1.Instance/OnInstanceDestroy',
+            types__pb2.EmptyRequest.SerializeToString,
+            types__pb2.Result.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def OnSessionEnter(request,

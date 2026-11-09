@@ -21,10 +21,7 @@ use crate::client::BackendClient;
 use crate::executor::Executor;
 use crate::shims;
 use crate::states::State;
-use common::apis::{
-    ExecutorState, FlameResult, BIND_RESULT_OK, BIND_RESULT_ON_SESSION_ENTER_FAILED,
-    BIND_RESULT_SHIM_CREATE_FAILED,
-};
+use common::apis::{ExecutorState, FlameResult};
 use common::FlameError;
 
 pub struct IdleState {
@@ -106,12 +103,8 @@ impl State for IdleState {
                 let shim_ptr = match shims::new_ptr(&self.executor, Some(&ssn.application)) {
                     Ok(shim_ptr) => shim_ptr,
                     Err(e) => {
-                        self.bind_executor_failed(
-                            BIND_RESULT_SHIM_CREATE_FAILED,
-                            format!("shim creation failed: {e}"),
-                            &ssn,
-                        )
-                        .await?;
+                        self.bind_executor_failed(format!("shim creation failed: {e}"), &ssn)
+                            .await?;
                         return Ok(self.executor.clone());
                     }
                 };
@@ -120,14 +113,15 @@ impl State for IdleState {
                     if self.executor.state == ExecutorState::Releasing {
                         tracing::error!(executor_id = %self.executor.id, %error,
                             "Service startup cleanup failed; transitioning to Releasing");
+                        if let Err(report_error) =
+                            self.bind_executor_failed(error.to_string(), &ssn).await
+                        {
+                            tracing::error!(executor_id = %self.executor.id, %report_error,
+                                "Failed to report startup failure; retaining runtime for release");
+                        }
                         return Ok(self.executor.clone());
                     }
-                    self.bind_executor_failed(
-                        BIND_RESULT_SHIM_CREATE_FAILED,
-                        format!("shim service creation failed: {error}"),
-                        &ssn,
-                    )
-                    .await?;
+                    self.bind_executor_failed(error.to_string(), &ssn).await?;
                     return Ok(self.executor.clone());
                 }
 
@@ -142,12 +136,8 @@ impl State for IdleState {
         let response = match enter_result {
             Ok(response) => response,
             Err(e) => {
-                self.bind_executor_failed(
-                    BIND_RESULT_ON_SESSION_ENTER_FAILED,
-                    format!("on_session_enter failed: {e}"),
-                    &ssn,
-                )
-                .await?;
+                self.bind_executor_failed(format!("on_session_enter failed: {e}"), &ssn)
+                    .await?;
                 return Ok(self.executor.clone());
             }
         };
@@ -159,7 +149,7 @@ impl State for IdleState {
             .bind_executor_completed(
                 &self.executor.clone(),
                 Some(FlameResult {
-                    return_code: BIND_RESULT_OK,
+                    return_code: 0,
                     message: None,
                 }),
                 response.executor_attributes.map(|attributes| {
@@ -192,25 +182,34 @@ impl IdleState {
         self.executor.shim_instance = Some(shim.clone());
         let result = {
             let mut service = await_ptr!(shim);
-            service.create_instance(app_mgr).await
+            match service.create_instance(app_mgr).await {
+                Err(error) => Err(FlameError::Internal(format!(
+                    "shim service creation failed: {error}"
+                ))),
+                Ok(()) => service.on_instance_create().await.map_err(|error| {
+                    FlameError::Internal(format!("on_instance_create failed: {error}"))
+                }),
+            }
         };
-        if result.is_err() {
+        if let Err(failure) = result {
             let cleanup = await_ptr!(shim).destroy_instance().await;
             if let Err(error) = cleanup {
                 // Preserve the tracked shim and allocation. The executor loop
                 // retries destruction through Releasing, rather than rebinding
                 // an instance whose startup or cleanup did not finish.
                 self.executor.state = ExecutorState::Releasing;
-                return Err(error);
+                return Err(FlameError::Internal(format!(
+                    "{failure}; runtime cleanup failed: {error}"
+                )));
             }
             self.executor.shim_instance = None;
+            return Err(failure);
         }
-        result
+        Ok(())
     }
 
     async fn bind_executor_failed(
         &mut self,
-        return_code: i32,
         message: String,
         ssn: &common::apis::SessionContext,
     ) -> Result<(), FlameError> {
@@ -220,14 +219,16 @@ impl IdleState {
             ssn.session_id,
             message
         );
-        self.executor.session = Some(ssn.clone());
-        self.executor.state = ExecutorState::Unbinding;
+        if self.executor.state != ExecutorState::Releasing {
+            self.executor.session = Some(ssn.clone());
+            self.executor.state = ExecutorState::Unbinding;
+        }
         let completed = self
             .client
             .bind_executor_completed(
                 &self.executor.clone(),
                 Some(FlameResult {
-                    return_code,
+                    return_code: -1,
                     message: Some(message),
                 }),
                 None,
@@ -251,6 +252,7 @@ mod tests {
         destroyed: Arc<AtomicUsize>,
         fail_start: bool,
         fail_cleanup: bool,
+        fail_setup: bool,
     }
 
     #[async_trait]
@@ -258,6 +260,13 @@ mod tests {
         async fn create_instance(&mut self, _: Arc<ApplicationManager>) -> Result<(), FlameError> {
             if self.fail_start {
                 Err(FlameError::Internal("startup failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+        async fn on_instance_create(&mut self) -> Result<(), FlameError> {
+            if self.fail_setup {
+                Err(FlameError::Internal("model setup failed".into()))
             } else {
                 Ok(())
             }
@@ -342,8 +351,76 @@ mod tests {
             destroyed: destroyed.clone(),
             fail_start,
             fail_cleanup,
+            fail_setup: false,
         });
         (state, shim, destroyed, workdir, allocator)
+    }
+
+    #[tokio::test]
+    async fn setup_failure_has_context_and_discards_runtime() {
+        let (mut state, _, destroyed, _workdir, _) = fixture(false, false);
+        let shim: shims::ShimPtr = async_ptr(CountDestroy {
+            destroyed: destroyed.clone(),
+            fail_start: false,
+            fail_cleanup: false,
+            fail_setup: true,
+        });
+        let app_mgr = state.executor.app_mgr.clone().unwrap();
+        let failure = state.create_instance(shim, app_mgr).await.unwrap_err();
+        assert!(failure.to_string().contains("model setup failed"));
+        assert!(failure.to_string().contains("on_instance_create failed"));
+        assert!(state.executor.shim_instance.is_none());
+        assert_eq!(destroyed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn setup_failure_report_preserves_releasing_ownership_when_cleanup_fails() {
+        let (mut state, _, destroyed, _workdir, allocator) = fixture(false, false);
+        let shim: shims::ShimPtr = async_ptr(CountDestroy {
+            destroyed: destroyed.clone(),
+            fail_start: false,
+            fail_cleanup: true,
+            fail_setup: true,
+        });
+        let app_mgr = state.executor.app_mgr.clone().unwrap();
+        let failure = state
+            .create_instance(shim.clone(), app_mgr)
+            .await
+            .unwrap_err();
+        let session = SessionContext {
+            session_id: "test-session".into(),
+            application: ApplicationContext {
+                name: "test-app".into(),
+                shim: common::apis::Shim::Host,
+                image: None,
+                command: None,
+                arguments: vec![],
+                working_directory: None,
+                environments: Default::default(),
+                url: None,
+                installer: None,
+            },
+            common_data: None,
+            tokens: Default::default(),
+            batch_size: 1,
+        };
+        // Even a backend reporting error must not discard the runtime that
+        // Releasing still needs to terminate before freeing its devices.
+        assert!(state
+            .bind_executor_failed(failure.to_string(), &session)
+            .await
+            .is_err());
+        assert_eq!(state.executor.state, ExecutorState::Releasing);
+        assert!(Arc::ptr_eq(
+            state.executor.shim_instance.as_ref().unwrap(),
+            &shim
+        ));
+        assert_eq!(destroyed.load(Ordering::SeqCst), 1);
+        assert!(allocator
+            .allocate(&crate::devices::test_executor(
+                state.executor.resreq.clone()
+            ))
+            .is_err());
     }
 
     #[tokio::test]
@@ -388,8 +465,7 @@ mod tests {
         };
         assert!(state
             .bind_executor_failed(
-                BIND_RESULT_ON_SESSION_ENTER_FAILED,
-                "enter failed".to_string(),
+                "on_session_enter failed: enter failed".to_string(),
                 &session
             )
             .await
@@ -422,7 +498,12 @@ mod tests {
     async fn failed_startup_clears_instance_after_cleanup() {
         let (mut state, shim, destroyed, _workdir, allocator) = fixture(true, false);
         let app_mgr = state.executor.app_mgr.clone().unwrap();
-        assert!(state.create_instance(shim, app_mgr).await.is_err());
+        assert!(state
+            .create_instance(shim, app_mgr)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("shim service creation failed"));
         assert_eq!(destroyed.load(Ordering::SeqCst), 1);
         assert!(state.executor.shim_instance.is_none());
         assert!(allocator

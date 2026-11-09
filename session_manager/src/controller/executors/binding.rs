@@ -19,7 +19,7 @@ use crate::model::ExecutorPtr;
 use crate::storage::StoragePtr;
 use common::apis::{
     Event, EventOwner, ExecutorState, FlameResult, SessionPtr, Task, TaskPtr, TaskResult,
-    BIND_RESULT_OK, SESSION_BIND_FAILED, SESSION_RETRY_LIMIT_REACHED,
+    SESSION_BIND_FAILED, SESSION_RETRY_LIMIT_REACHED,
 };
 use common::FlameError;
 
@@ -186,9 +186,7 @@ impl States for BindingState {
         trace_fn!("BindingState::bind_session_completed");
 
         match result.as_ref() {
-            Some(result) if result.return_code != BIND_RESULT_OK => {
-                self.bind_session_failed(result).await?
-            }
+            Some(result) if result.return_code != 0 => self.bind_session_failed(result).await?,
             _ => self.bind_session_success().await?,
         }
 

@@ -3,7 +3,8 @@
 This example serves batched text generation through `flamepy.serving`.
 The client opens a Flame session, submits prompts, and receives generated text.
 The worker declares its handler with `@ins.entrypoint`.
-The worker creates one global `LLM` at startup. The entrypoint reads
+The worker loads one `LLM` in `@ins.setup`, after its shim socket is listening.
+`@ins.teardown` stops the engine before the executor runtime exits. The entrypoint reads
 session settings with `ins.context()` and calls the model directly for each request.
 The worker retains the model and prefix cache
 across session bindings until the executor is released.
@@ -24,7 +25,7 @@ the package, and registers the worker. FEM installs its pinned vLLM dependencies
 The console client needs only the Flame SDK; run it with `python3` to avoid
 installing CUDA dependencies on the console.
 
-The example pins vLLM 0.31.0, which accepts FEM-assigned GPU UUIDs. It uses
+The example pins vLLM 0.32.0, which accepts FEM-assigned GPU UUIDs. It uses
 Triton attention and disables FlashInfer sampling by default so the worker does
 not need `nvcc`. Engine sockets default to `/tmp` to avoid Unix socket path limits
 under executor work directories. Explicit `VLLM_RPC_BASE_PATH` and
@@ -41,7 +42,12 @@ Set `VLLM_MODEL` during deployment to select the application model; it defaults
 to `facebook/opt-125m`. Sessions cannot change the model. Deploy a separate
 application for another model. The engine uses one GPU, a 1024-token context,
 10% GPU memory utilization, and eager execution for a small-model smoke test.
-Workers need Hugging Face access or locally cached model files.
+Workers need Hugging Face access or locally cached model files. FEM keeps its
+short connection deadline separate from model setup; no additional setup or
+teardown deadline is imposed in this version.
+Heavy vLLM imports and model construction run inside setup, so model loading
+does not delay the listening marker. The teardown uses the pinned version's
+[engine-core shutdown API](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core_client.py).
 
 ## Run
 

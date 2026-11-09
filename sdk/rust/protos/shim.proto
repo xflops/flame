@@ -41,6 +41,8 @@ message OnTaskInvokeResponse {
 }
 
 service Instance {
+    rpc OnInstanceCreate(EmptyRequest) returns (Result) {}
+    rpc OnInstanceDestroy(EmptyRequest) returns (Result) {}
     rpc OnSessionEnter(SessionContext) returns (OnSessionEnterResponse) {}
     rpc OnTaskInvoke(TaskContext) returns (OnTaskInvokeResponse) {}
     rpc OnSessionLeave(EmptyRequest) returns (Result) {}

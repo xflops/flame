@@ -22,10 +22,6 @@ use stdng::MutexPtr;
 
 pub const DEFAULT_MAX_INSTANCES: u32 = 1_000_000;
 pub const DEFAULT_DELAY_RELEASE: Duration = Duration::seconds(60);
-pub const BIND_RESULT_OK: i32 = 0;
-pub const BIND_RESULT_SHIM_CREATE_FAILED: i32 = 11;
-pub const BIND_RESULT_ON_SESSION_ENTER_FAILED: i32 = 12;
-pub const BIND_RESULT_UNKNOWN_FAILED: i32 = 19;
 pub const SESSION_EVENT_TASK_ID: i64 = 0;
 pub const SESSION_BIND_FAILED: i32 = 1001;
 pub const SESSION_RETRY_LIMIT_REACHED: i32 = 1002;

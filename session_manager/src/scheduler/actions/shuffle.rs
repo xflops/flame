@@ -108,7 +108,7 @@ mod tests {
     use crate::model::AppInfo;
     use common::apis::{
         ApplicationAttributes, ExecutorState, FlameResult, Node, NodeState, ResourceRequirement,
-        SessionAttributes, Signal, BIND_RESULT_OK,
+        SessionAttributes, Signal,
     };
     use common::ctx::{FlameCluster, FlameClusterContext};
 
@@ -331,7 +331,7 @@ mod tests {
             .bind_session_completed(
                 id.clone(),
                 Some(FlameResult {
-                    return_code: common::apis::BIND_RESULT_UNKNOWN_FAILED,
+                    return_code: -1,
                     message: Some("boom".to_string()),
                 }),
             )
@@ -587,7 +587,7 @@ mod tests {
             .bind_executor_completed(
                 executor.id.clone(),
                 Some(FlameResult {
-                    return_code: BIND_RESULT_OK,
+                    return_code: 0,
                     message: None,
                 }),
                 None,

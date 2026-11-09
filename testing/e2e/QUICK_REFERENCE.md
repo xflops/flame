@@ -11,7 +11,7 @@ testing/e2e/
 │
 └── tests/
     ├── test_app.py          # Application management tests
-    ├── test_service.py      # Tests for instance_svc.py
+    ├── test_serving.py      # Tests for instance_svc.py
     └── test_core.py         # Tests for basic_svc.py (with context info)
 ```
 
@@ -31,7 +31,7 @@ if __name__ == "__main__":
 ```
 
 **Application Name:** `flme2e`
-**Test File:** `test_service.py`
+**Test File:** `test_serving.py`
 **Features:**
 - ✅ Simple request/response
 - ✅ Common data management
@@ -135,7 +135,7 @@ response = TestResponse(
 pytest testing/e2e/tests/ -v
 
 # Instance tests only (serving.Instance-based)
-pytest testing/e2e/tests/test_service.py -v
+pytest testing/e2e/tests/test_serving.py -v
 
 # Service tests only (FlameService-based with context)
 pytest testing/e2e/tests/test_core.py -v
