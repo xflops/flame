@@ -11,6 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -41,6 +42,17 @@ impl GrpcCacheServer {
     pub fn new(cache: Arc<ObjectCache>) -> Self {
         Self { cache }
     }
+}
+
+/// Keep the mutation's writer guard alive through storage commit and metadata
+/// publication even when the RPC future waiting for it is cancelled.
+async fn write_payload(
+    write: impl Future<Output = Result<ObjectMetadata, FlameError>> + Send + 'static,
+) -> Result<ObjectMetadata, Status> {
+    tokio::spawn(write)
+        .await
+        .map_err(|error| Status::internal(format!("cache write task failed: {error}")))?
+        .map_err(Status::from)
 }
 
 impl From<ObjectMetadata> for CacheObjectMetadata {
@@ -115,7 +127,8 @@ impl ObjectCacheService for GrpcCacheServer {
         request: Request<Streaming<CacheWriteRequest>>,
     ) -> Result<Response<CacheObjectMetadata>, Status> {
         let request = write_request(request).await?;
-        let metadata = self.cache.put_stream(request).await.map_err(Status::from)?;
+        let cache = Arc::clone(&self.cache);
+        let metadata = write_payload(async move { cache.put_stream(request).await }).await?;
         Ok(Response::new(metadata.into()))
     }
 
@@ -133,7 +146,6 @@ impl ObjectCacheService for GrpcCacheServer {
                 "patch requires a complete object key",
             ));
         }
-        // The data of a patch is small by construction, so it is buffered in memory.
         let data = chunks
             .try_fold(Vec::new(), |mut data, chunk| async move {
                 data.extend_from_slice(&chunk);
@@ -141,14 +153,16 @@ impl ObjectCacheService for GrpcCacheServer {
             })
             .await
             .map_err(Status::from)?;
-        let metadata = self
-            .cache
-            .patch(
-                &key,
-                Object::new().append_data(data).with_data_type(data_type),
-            )
-            .await
-            .map_err(Status::from)?;
+        let cache = Arc::clone(&self.cache);
+        let metadata = write_payload(async move {
+            cache
+                .patch(
+                    &key,
+                    Object::new().append_data(data).with_data_type(data_type),
+                )
+                .await
+        })
+        .await?;
         Ok(Response::new(metadata.into()))
     }
 
@@ -275,6 +289,176 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
 
+    #[derive(Default)]
+    struct CommitBarrier {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        patches: std::sync::atomic::AtomicUsize,
+    }
+
+    /// Pause the first append after the actual disk commit, before its caller
+    /// can publish metadata or release the object's writer guard.
+    struct PauseAfterCommitStorage {
+        inner: crate::storage::StorageEnginePtr,
+        barrier: Arc<CommitBarrier>,
+    }
+
+    #[tonic::async_trait]
+    impl crate::storage::StorageEngine for PauseAfterCommitStorage {
+        async fn write_stream(
+            &self,
+            key: &ObjectKey,
+            meta: ObjectMetadata,
+            chunks: futures::stream::BoxStream<'_, Result<Bytes, FlameError>>,
+        ) -> Result<ObjectMetadata, FlameError> {
+            self.inner.write_stream(key, meta, chunks).await
+        }
+
+        async fn read_part(
+            &self,
+            key: &ObjectKey,
+            part: usize,
+        ) -> Result<futures::stream::BoxStream<'static, Result<Bytes, FlameError>>, FlameError>
+        {
+            self.inner.read_part(key, part).await
+        }
+
+        async fn stat(
+            &self,
+            key: &ObjectKey,
+        ) -> Result<Option<crate::storage::ObjectStat>, FlameError> {
+            self.inner.stat(key).await
+        }
+
+        async fn read_object(
+            &self,
+            key: &ObjectKey,
+            version: u64,
+        ) -> Result<Option<crate::cache::Object>, FlameError> {
+            self.inner.read_object(key, version).await
+        }
+
+        async fn patch_object(
+            &self,
+            key: &ObjectKey,
+            data: &crate::cache::ObjectData,
+        ) -> Result<ObjectMetadata, FlameError> {
+            let committed = self.inner.patch_object(key, data).await?;
+            if self
+                .barrier
+                .patches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                self.barrier.entered.notify_one();
+                self.barrier.release.notified().await;
+            }
+            Ok(committed)
+        }
+
+        async fn delete_objects(&self, key: &ObjectKey) -> Result<(), FlameError> {
+            self.inner.delete_objects(key).await
+        }
+
+        async fn scan(&self) -> Result<Vec<(ObjectKey, crate::storage::ObjectStat)>, FlameError> {
+            self.inner.scan().await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_rpc_keeps_its_write_guard_through_commit_publication() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let directory = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(CommitBarrier::default());
+        let cache = Arc::new(
+            ObjectCache::new(
+                CacheEndpoint {
+                    scheme: "grpc".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 9090,
+                },
+                Box::new(PauseAfterCommitStorage {
+                    inner: crate::storage::connect(directory.path().to_str().unwrap(), None)
+                        .await
+                        .unwrap(),
+                    barrier: Arc::clone(&barrier),
+                }),
+            )
+            .unwrap(),
+        );
+        let key = ObjectKey::try_from("integrity/session/cancelled").unwrap();
+        let request = |bytes: &'static [u8]| WriteRequest {
+            key: key.clone(),
+            data_type: "raw".to_string(),
+            chunks: Box::pin(stream::iter(vec![Ok(Bytes::from_static(bytes))])),
+        };
+        cache.put_stream(request(b"base")).await.unwrap();
+        let first_cache = Arc::clone(&cache);
+        let first_key = key.clone();
+        let first_rpc = tokio::spawn(write_payload(async move {
+            first_cache
+                .patch(&first_key, Object::new().append_data(b"first".to_vec()))
+                .await
+        }));
+        timeout(Duration::from_secs(5), barrier.entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.storage.stat(&key).await.unwrap().unwrap().version(),
+            2
+        );
+        assert_eq!(
+            cache
+                .metadata_of(&key.to_key().unwrap())
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+
+        // Deterministically cancel the exact future the RPC handler awaits;
+        // an HTTP/2 reset need not immediately drop a Tonic handler future.
+        first_rpc.abort();
+        assert!(first_rpc.await.unwrap_err().is_cancelled());
+        let second_cache = Arc::clone(&cache);
+        let second_key = key.clone();
+        let mut second = tokio::spawn(async move {
+            second_cache
+                .patch(&second_key, Object::new().append_data(b"second".to_vec()))
+                .await
+        });
+        let blocked = timeout(Duration::from_millis(100), &mut second)
+            .await
+            .is_err();
+        barrier.release.notify_one();
+        assert!(
+            blocked,
+            "the cancelled RPC released its writer guard before publication"
+        );
+        let metadata = timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!((metadata.version, metadata.size), (3, 15));
+        assert_eq!(
+            cache.metadata_of(&metadata.key).unwrap().unwrap().version,
+            3
+        );
+        let stored = cache.get(&key).await.unwrap();
+        let parts: Vec<_> = stored.data.iter().map(|part| part.data.as_ref()).collect();
+        assert_eq!(
+            parts,
+            [
+                b"base".as_slice(),
+                b"first".as_slice(),
+                b"second".as_slice()
+            ]
+        );
+    }
+
     async fn client() -> ObjectCacheServiceClient<tonic::transport::Channel> {
         client_with_storage("none").await.0
     }
@@ -359,6 +543,128 @@ mod tests {
             responses.push(message);
         }
         responses
+    }
+
+    #[tokio::test]
+    async fn grpc_get_rejects_corruption_through_a_warm_disk_handle() {
+        use std::os::unix::fs::FileExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut client, cache) = client_with_storage(directory.path().to_str().unwrap()).await;
+        let payload = vec![37u8; CHUNK_SIZE * 3 + 17];
+        let object = client
+            .put(stream::iter(write_messages(
+                "integrity/session",
+                "raw",
+                &payload,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Populate the resident file-handle cache before corrupting the disk.
+        let clean = get_responses(&mut client, &object.key, 0).await;
+        let received: Vec<_> = clean
+            .iter()
+            .skip(1)
+            .flat_map(|response| chunk_data(response).1.iter().copied())
+            .collect();
+        assert_eq!(received, payload);
+        assert_eq!(resident(&cache).0, 1);
+
+        let suffix = b"clean appended part";
+        client
+            .patch(stream::iter(write_messages(&object.key, "raw", suffix)))
+            .await
+            .unwrap();
+        let path = directory.path().join(&object.key).join("data.bin");
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.write_all_at(&[38], payload.len() as u64 - 1).unwrap();
+        file.sync_data().unwrap();
+
+        let mut response = client
+            .get(CacheGetRequest {
+                key: object.key.clone(),
+                version: 0,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            response.message().await.unwrap().unwrap().payload,
+            Some(cache_get_response::Payload::Header(_))
+        ));
+        let mut bytes_before_error = 0usize;
+        let error = loop {
+            match response.message().await {
+                Ok(Some(message)) => {
+                    let (version, data) = chunk_data(&message);
+                    assert_eq!(version, 1);
+                    bytes_before_error += data.len();
+                }
+                Ok(None) => panic!("corrupted object completed successfully"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.code(), tonic::Code::DataLoss);
+        assert!(
+            bytes_before_error > 0,
+            "integrity error must follow streamed data"
+        );
+        assert!(bytes_before_error < payload.len());
+
+        // An incremental read must verify only the requested new parts; it
+        // must not reread or reject the corrupted base already held by a client.
+        let incremental = get_responses(&mut client, &object.key, 1).await;
+        assert_eq!(incremental.len(), 2);
+        let (version, data) = chunk_data(&incremental[1]);
+        assert_eq!(version, 2);
+        assert_eq!(data.as_ref(), suffix);
+    }
+
+    #[tokio::test]
+    async fn grpc_failed_patch_upload_does_not_publish_a_version() {
+        let directory = tempfile::tempdir().unwrap();
+        for storage in ["none", directory.path().to_str().unwrap()] {
+            let (mut client, _) = client_with_storage(storage).await;
+            let object = client
+                .put(stream::iter(write_messages(
+                    "integrity/session",
+                    "raw",
+                    b"base",
+                )))
+                .await
+                .unwrap()
+                .into_inner();
+            let mut messages = write_messages(&object.key, "raw", b"uncommitted bytes");
+            messages.push(messages[0].clone());
+            let failure = client.patch(stream::iter(messages)).await.unwrap_err();
+            assert_eq!(failure.code(), tonic::Code::InvalidArgument);
+            let metadata = client
+                .get_metadata(CacheGetMetadataRequest {
+                    key: object.key.clone(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!((metadata.version, metadata.size), (1, 4));
+            let original = get_responses(&mut client, &object.key, 0).await;
+            assert_eq!(first_bytes(&original), (1, b"base".to_vec()));
+
+            let appended = client
+                .patch(stream::iter(write_messages(
+                    &object.key,
+                    "raw",
+                    b"committed",
+                )))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!((appended.version, appended.size), (2, 13));
+            let suffix = get_responses(&mut client, &object.key, 1).await;
+            assert_eq!(suffix.len(), 2);
+            assert_eq!(chunk_data(&suffix[1]).1.as_ref(), b"committed");
+        }
     }
 
     #[tokio::test]
@@ -563,33 +869,74 @@ mod tests {
         assert_eq!(count, 1);
         assert!(bytes < 1024);
 
+        let appended_data = vec![91u8; 2 * CHUNK_SIZE + 13];
         let appended = client
-            .patch(stream::iter(write_messages(&put.key, "raw", b"second")))
+            .patch(stream::iter(write_messages(
+                &put.key,
+                "raw",
+                &appended_data,
+            )))
             .await
             .unwrap()
             .into_inner();
         assert_eq!(appended.version, 2);
-        assert_eq!(appended.size, data.len() as u64 + 6);
+        assert_eq!(appended.size, (data.len() + appended_data.len()) as u64);
 
         let suffix = get_responses(&mut client, &put.key, 1).await;
-        assert_eq!(suffix.len(), 2);
+        assert_eq!(suffix.len(), 1 + appended_data.len().div_ceil(CHUNK_SIZE));
         let Some(cache_get_response::Payload::Header(header)) = &suffix[0].payload else {
             panic!("expected response header")
         };
         assert_eq!(header.version, 2);
-        let (version, chunk) = chunk_data(&suffix[1]);
-        assert_eq!(version, 2);
-        assert_eq!(chunk.as_ref(), b"second");
+        let received: Vec<u8> = suffix
+            .iter()
+            .skip(1)
+            .flat_map(|response| {
+                let (version, chunk) = chunk_data(response);
+                assert_eq!(version, 2);
+                assert!(chunk.len() <= CHUNK_SIZE);
+                chunk.iter().copied()
+            })
+            .collect();
+        assert_eq!(received, appended_data);
 
         let all = get_responses(&mut client, &put.key, 0).await;
         let (version, chunk) = chunk_data(all.last().unwrap());
         assert_eq!(version, 2);
-        assert_eq!(chunk.as_ref(), b"second");
-        assert_eq!(all.len(), 2 + data.len().div_ceil(CHUNK_SIZE));
+        assert_eq!(chunk.as_ref(), &appended_data[2 * CHUNK_SIZE..]);
+        assert_eq!(
+            all.len(),
+            1 + data.len().div_ceil(CHUNK_SIZE) + appended_data.len().div_ceil(CHUNK_SIZE)
+        );
 
         let unchanged = get_responses(&mut client, &put.key, 2).await;
         assert_eq!(unchanged.len(), 1);
         assert!(resident(&cache).1 < 1024);
+
+        // Appended parts carry their own checksums, including when the same
+        // resident handle wrote the part and continues serving reads.
+        use std::os::unix::fs::FileExt;
+        let path = directory.path().join(&put.key).join("data.bin");
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.write_all_at(&[92], (data.len() + appended_data.len() - 1) as u64)
+            .unwrap();
+        file.sync_data().unwrap();
+        let mut corrupt = client
+            .get(CacheGetRequest {
+                key: put.key,
+                version: 1,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let error = loop {
+            match corrupt.message().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("corrupted appended part completed successfully"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.code(), tonic::Code::DataLoss);
     }
 
     #[tokio::test]

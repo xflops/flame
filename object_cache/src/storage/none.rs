@@ -59,13 +59,11 @@ impl StorageEngine for NoStorage {
         Ok(meta.with_size(size))
     }
 
-    async fn read_range(
+    async fn read_part(
         &self,
         key: &ObjectKey,
         _patch: usize,
-        _offset: u64,
-        _len: usize,
-    ) -> Result<Bytes, FlameError> {
+    ) -> Result<BoxStream<'static, Result<Bytes, FlameError>>, FlameError> {
         Err(FlameError::NotFound(format!(
             "object <{:?}> not found",
             key.to_key()
@@ -108,7 +106,7 @@ impl StorageEngine for NoStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::Object;
+    use crate::cache::{Object, ObjectData};
 
     fn test_key() -> ObjectKey {
         ObjectKey::from_path("app/session")

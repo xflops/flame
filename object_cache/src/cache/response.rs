@@ -18,7 +18,7 @@ limitations under the License.
 //! ```text
 //! Header -> Next -> Reading -+-> Next (part complete) -> ... -> Done
 //!             |              +-> Reading (more chunks)
-//!             |              +-> Done (read error, after the error message)
+//!             |              +-> Error -> Done
 //!             +-> Done (no parts left)
 //! ```
 //!
@@ -27,12 +27,17 @@ limitations under the License.
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream;
+use bytes::Bytes;
+use common::FlameError;
+use futures::stream::{self, BoxStream};
+use futures::StreamExt;
 use rpc::flame::v1::{cache_get_response, CacheGetChunk, CacheGetHeader, CacheGetResponse};
 use tokio::sync::OwnedRwLockReadGuard;
 use tonic::Status;
 
-use super::grpc::{ResponseStream, CHUNK_SIZE};
+use super::grpc::ResponseStream;
+#[cfg(test)]
+use super::grpc::CHUNK_SIZE;
 use super::{ObjectCache, ObjectKey};
 
 /// A part of a get response, read from storage chunk by chunk while the
@@ -48,89 +53,42 @@ enum ResponseStage {
     Header,
     Next,
     Reading,
+    Error,
     Done,
 }
 
-/// The data shared by all stages of one response.
+/// The context shared by all stages of one response.
 struct ResponseData {
-    stage: ResponseStage,
     cache: Arc<ObjectCache>,
     key: ObjectKey,
     header: Option<CacheGetHeader>,
     parts: std::vec::IntoIter<ObjectPart>,
-    current: Option<ObjectPart>,
-    offset: u64,
-    /// Held while chunks are read from storage so writers cannot replace the
-    /// object mid-response.
+    /// Held until the stream ends or is dropped, including after an error.
     _guard: Option<OwnedRwLockReadGuard<()>>,
 }
 
-impl ResponseData {
-    /// Read and emit one chunk of the current part.
-    async fn read_chunk(&mut self) -> Option<Result<CacheGetResponse, Status>> {
-        let (index, len) = {
-            let part = self.current.as_ref()?;
-            (part.index, part.len)
-        };
-        let size = (len - self.offset).min(CHUNK_SIZE as u64) as usize;
-        let read = self
-            .cache
-            .storage
-            .read_range(&self.key, index, self.offset, size)
-            .await;
-        match read {
-            Ok(data) => {
-                self.offset += data.len() as u64;
-                if self.offset == len {
-                    self.current = None;
-                    self.stage = ResponseStage::Next;
-                }
-                Some(Ok(CacheGetResponse {
-                    payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                        version: index as u64 + 1,
-                        data,
-                    })),
-                }))
-            }
-            Err(error) => {
-                self.current = None;
-                self.parts = Vec::new().into_iter();
-                self.stage = ResponseStage::Done;
-                Some(Err(Status::from(error)))
-            }
-        }
-    }
+struct StateResult {
+    response: Option<CacheGetResponse>,
+    next: Box<dyn State>,
 }
 
-/// Emits the next message of the response, or `None` at the end of the stream.
+/// Emits the next message and transfers ownership to the next response stage.
 #[async_trait]
 trait State: Send {
-    async fn execute(&mut self) -> Option<Result<CacheGetResponse, Status>>;
+    async fn execute(self: Box<Self>) -> StateResult;
 
     fn stage(&self) -> ResponseStage;
 
-    fn into_data(self: Box<Self>) -> ResponseData;
-}
-
-fn from(data: ResponseData) -> Box<dyn State> {
-    match data.stage {
-        ResponseStage::Header => Box::new(HeaderState { data }),
-        ResponseStage::Next => Box::new(NextPartState { data }),
-        ResponseStage::Reading => Box::new(ReadingState { data }),
-        ResponseStage::Done => Box::new(DoneState { data }),
+    fn error(&self) -> Option<Status> {
+        None
     }
 }
 
-macro_rules! state_data {
-    () => {
-        fn stage(&self) -> ResponseStage {
-            self.data.stage
-        }
-
-        fn into_data(self: Box<Self>) -> ResponseData {
-            self.data
-        }
-    };
+fn failed(data: ResponseData, error: Status) -> StateResult {
+    StateResult {
+        response: None,
+        next: Box::new(ErrorState { data, error }),
+    }
 }
 
 struct HeaderState {
@@ -139,15 +97,24 @@ struct HeaderState {
 
 #[async_trait]
 impl State for HeaderState {
-    async fn execute(&mut self) -> Option<Result<CacheGetResponse, Status>> {
-        let header = self.data.header.take()?;
-        self.data.stage = ResponseStage::Next;
-        Some(Ok(CacheGetResponse {
-            payload: Some(cache_get_response::Payload::Header(header)),
-        }))
+    async fn execute(mut self: Box<Self>) -> StateResult {
+        let Some(header) = self.data.header.take() else {
+            return StateResult {
+                response: None,
+                next: Box::new(DoneState { _data: self.data }),
+            };
+        };
+        StateResult {
+            response: Some(CacheGetResponse {
+                payload: Some(cache_get_response::Payload::Header(header)),
+            }),
+            next: Box::new(NextPartState { data: self.data }),
+        }
     }
 
-    state_data!();
+    fn stage(&self) -> ResponseStage {
+        ResponseStage::Header
+    }
 }
 
 struct NextPartState {
@@ -156,45 +123,147 @@ struct NextPartState {
 
 #[async_trait]
 impl State for NextPartState {
-    async fn execute(&mut self) -> Option<Result<CacheGetResponse, Status>> {
-        self.data.current = self.data.parts.next();
-        self.data.offset = 0;
-        if self.data.current.is_none() {
-            self.data.stage = ResponseStage::Done;
-            return None;
-        }
+    async fn execute(mut self: Box<Self>) -> StateResult {
+        let Some(part) = self.data.parts.next() else {
+            return StateResult {
+                response: None,
+                next: Box::new(DoneState { _data: self.data }),
+            };
+        };
+        let reader = match self
+            .data
+            .cache
+            .storage
+            .read_part(&self.data.key, part.index)
+            .await
+        {
+            Ok(reader) => reader,
+            Err(error) => return failed(self.data, Status::from(error)),
+        };
         // A part has no message of its own; emit its first chunk.
-        self.data.stage = ResponseStage::Reading;
-        self.data.read_chunk().await
+        Box::new(ReadingState {
+            data: self.data,
+            part,
+            offset: 0,
+            reader,
+        })
+        .execute()
+        .await
     }
 
-    state_data!();
+    fn stage(&self) -> ResponseStage {
+        ResponseStage::Next
+    }
 }
 
 struct ReadingState {
     data: ResponseData,
+    part: ObjectPart,
+    offset: u64,
+    reader: BoxStream<'static, Result<Bytes, FlameError>>,
+}
+
+impl ReadingState {
+    /// At the advertised boundary, poll through EOF before sending the last
+    /// chunk: integrity failures can arrive after all payload bytes were read.
+    async fn read_chunk(&mut self) -> Result<CacheGetResponse, Status> {
+        let data = self
+            .reader
+            .next()
+            .await
+            .ok_or_else(|| Status::data_loss("object part ended before its advertised length"))?
+            .map_err(Status::from)?;
+        let offset = self
+            .offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| Status::data_loss("object part length overflow"))?;
+        if offset > self.part.len || (data.is_empty() && self.part.len != 0) {
+            return Err(Status::data_loss("object part length mismatch"));
+        }
+        self.offset = offset;
+        if self.offset == self.part.len {
+            match self.reader.next().await {
+                Some(Err(error)) => return Err(Status::from(error)),
+                Some(Ok(_)) => {
+                    return Err(Status::data_loss(
+                        "object part exceeds its advertised length",
+                    ))
+                }
+                None => {}
+            }
+        }
+        Ok(CacheGetResponse {
+            payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
+                version: self.part.index as u64 + 1,
+                data,
+            })),
+        })
+    }
 }
 
 #[async_trait]
 impl State for ReadingState {
-    async fn execute(&mut self) -> Option<Result<CacheGetResponse, Status>> {
-        self.data.read_chunk().await
+    async fn execute(mut self: Box<Self>) -> StateResult {
+        match self.read_chunk().await {
+            Ok(response) => {
+                let next: Box<dyn State> = if self.offset == self.part.len {
+                    Box::new(NextPartState { data: self.data })
+                } else {
+                    self
+                };
+                StateResult {
+                    response: Some(response),
+                    next,
+                }
+            }
+            Err(error) => failed(self.data, error),
+        }
     }
 
-    state_data!();
+    fn stage(&self) -> ResponseStage {
+        ResponseStage::Reading
+    }
+}
+
+struct ErrorState {
+    data: ResponseData,
+    error: Status,
+}
+
+#[async_trait]
+impl State for ErrorState {
+    async fn execute(self: Box<Self>) -> StateResult {
+        StateResult {
+            response: None,
+            next: Box::new(DoneState { _data: self.data }),
+        }
+    }
+
+    fn stage(&self) -> ResponseStage {
+        ResponseStage::Error
+    }
+
+    fn error(&self) -> Option<Status> {
+        Some(self.error.clone())
+    }
 }
 
 struct DoneState {
-    data: ResponseData,
+    _data: ResponseData,
 }
 
 #[async_trait]
 impl State for DoneState {
-    async fn execute(&mut self) -> Option<Result<CacheGetResponse, Status>> {
-        None
+    async fn execute(self: Box<Self>) -> StateResult {
+        StateResult {
+            response: None,
+            next: self,
+        }
     }
 
-    state_data!();
+    fn stage(&self) -> ResponseStage {
+        ResponseStage::Done
+    }
 }
 
 /// The get response: the header, then every part chunk by chunk.
@@ -205,24 +274,30 @@ pub(super) fn response_stream(
     parts: Vec<ObjectPart>,
     guard: Option<OwnedRwLockReadGuard<()>>,
 ) -> ResponseStream<CacheGetResponse> {
-    let state = from(ResponseData {
-        stage: ResponseStage::Header,
-        cache,
-        key,
-        header: Some(header),
-        parts: parts.into_iter(),
-        current: None,
-        offset: 0,
-        _guard: guard,
+    let state: Box<dyn State> = Box::new(HeaderState {
+        data: ResponseData {
+            cache,
+            key,
+            header: Some(header),
+            parts: parts.into_iter(),
+            _guard: guard,
+        },
     });
-    // A handler is built only when the stage changes.
     Box::pin(stream::unfold(state, |mut state| async move {
-        let stage = state.stage();
-        let response = state.execute().await?;
-        if state.stage() != stage {
-            state = from(state.into_data());
+        loop {
+            if state.stage() == ResponseStage::Done {
+                return None;
+            }
+            let error = state.error();
+            let StateResult { response, next } = state.execute().await;
+            state = next;
+            if let Some(error) = error {
+                return Some((Err(error), state));
+            }
+            if let Some(response) = response {
+                return Some((Ok(response), state));
+            }
         }
-        Some((response, state))
     }))
 }
 
@@ -281,22 +356,12 @@ mod tests {
 
     fn data(cache: Arc<ObjectCache>, parts: Vec<ObjectPart>) -> ResponseData {
         ResponseData {
-            stage: ResponseStage::Header,
             cache,
             key: ObjectKey::try_from(KEY).unwrap(),
             header: Some(header()),
             parts: parts.into_iter(),
-            current: None,
-            offset: 0,
             _guard: None,
         }
-    }
-
-    /// Run one handler for the current stage and return its output.
-    async fn step(data: ResponseData) -> (Option<Result<CacheGetResponse, Status>>, ResponseData) {
-        let mut state = from(data);
-        let output = state.execute().await;
-        (output, state.into_data())
     }
 
     fn two_parts() -> Vec<ObjectPart> {
@@ -305,12 +370,17 @@ mod tests {
 
     #[tokio::test]
     async fn full_response_walks_every_stage() {
-        let mut data = data(cache_with_object().await, two_parts());
+        let mut state: Box<dyn State> = Box::new(HeaderState {
+            data: data(cache_with_object().await, two_parts()),
+        });
         let mut seen = Vec::new();
         loop {
-            let (output, next) = step(data).await;
-            data = next;
-            seen.push(data.stage);
+            let StateResult {
+                response: output,
+                next,
+            } = state.execute().await;
+            state = next;
+            seen.push(state.stage());
             if output.is_none() {
                 break;
             }
@@ -336,12 +406,15 @@ mod tests {
             .unwrap();
         let mut data = data(cache, vec![part(0, size as u64)]);
         data.key = key;
-        data.stage = ResponseStage::Next;
+        let mut state: Box<dyn State> = Box::new(NextPartState { data });
         let mut seen = Vec::new();
         loop {
-            let (output, next) = step(data).await;
-            data = next;
-            seen.push(data.stage);
+            let StateResult {
+                response: output,
+                next,
+            } = state.execute().await;
+            state = next;
+            seen.push(state.stage());
             if output.is_none() {
                 break;
             }
@@ -404,14 +477,60 @@ mod tests {
         let cache = cache_with_object().await;
         // The part claims more bytes than the object holds.
         let parts = vec![part(0, 100), part(1, 6)];
-        let mut data = data(cache, parts);
-        data.stage = ResponseStage::Next;
-        let (output, data) = step(data).await;
-        assert!(output.unwrap().is_err());
-        assert_eq!(data.stage, ResponseStage::Done);
-        assert!(data.current.is_none());
-        assert_eq!(data.parts.len(), 0);
-        let (output, _) = step(data).await;
+        let state: Box<dyn State> = Box::new(NextPartState {
+            data: data(cache, parts),
+        });
+        let StateResult {
+            response: output,
+            next: state,
+        } = state.execute().await;
+        assert!(output.is_some());
+        let StateResult {
+            response: output,
+            next: state,
+        } = state.execute().await;
+        assert!(output.is_none());
+        assert_eq!(state.stage(), ResponseStage::Error);
+        assert_eq!(state.error().unwrap().code(), tonic::Code::DataLoss);
+        let StateResult {
+            response: output,
+            next: state,
+        } = state.execute().await;
+        assert!(output.is_none());
+        assert_eq!(state.stage(), ResponseStage::Done);
+        let StateResult {
+            response: output, ..
+        } = state.execute().await;
+        assert!(output.is_none());
+    }
+
+    #[tokio::test]
+    async fn integrity_error_after_the_last_payload_chunk_is_not_dropped() {
+        let state: Box<dyn State> = Box::new(ReadingState {
+            data: data(cache_with_object().await, Vec::new()),
+            part: part(0, 5),
+            offset: 0,
+            reader: Box::pin(stream::iter(vec![
+                Ok(Bytes::from_static(b"first")),
+                Err(FlameError::DataLoss("checksum mismatch".to_string())),
+            ])),
+        });
+        let StateResult {
+            response: output,
+            next: state,
+        } = state.execute().await;
+        assert!(output.is_none());
+        assert_eq!(state.stage(), ResponseStage::Error);
+        assert_eq!(state.error().unwrap().code(), tonic::Code::DataLoss);
+        let StateResult {
+            response: output,
+            next: state,
+        } = state.execute().await;
+        assert!(output.is_none());
+        assert_eq!(state.stage(), ResponseStage::Done);
+        let StateResult {
+            response: output, ..
+        } = state.execute().await;
         assert!(output.is_none());
     }
 
@@ -432,6 +551,51 @@ mod tests {
             if lock.try_write().is_ok() {
                 panic!("guard released before the stream ended");
             }
+        }
+        assert!(lock.try_write().is_ok());
+    }
+
+    #[tokio::test]
+    async fn guard_is_retained_after_an_error_until_the_stream_ends() {
+        let cache = cache_with_object().await;
+        let lock = cache.get_key_lock(KEY).unwrap();
+        let guard = Arc::clone(&lock).read_owned().await;
+        let mut stream = response_stream(
+            cache,
+            ObjectKey::try_from(KEY).unwrap(),
+            header(),
+            vec![part(99, 1)],
+            Some(guard),
+        );
+        stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.unwrap().is_err());
+        assert!(lock.try_write().is_err());
+        assert!(stream.next().await.is_none());
+        assert!(lock.try_write().is_ok());
+    }
+
+    #[tokio::test]
+    async fn guard_is_released_when_a_reading_stream_is_dropped() {
+        let cache = cache_with_object().await;
+        let key = ObjectKey::try_from("app/ssn/cancelled").unwrap();
+        let size = CHUNK_SIZE + 10;
+        cache
+            .put(key.clone(), Object::new().append_data(vec![7u8; size]))
+            .await
+            .unwrap();
+        let lock = cache.get_key_lock(&key.to_key().unwrap()).unwrap();
+        {
+            let guard = Arc::clone(&lock).read_owned().await;
+            let mut stream = response_stream(
+                cache,
+                key,
+                header(),
+                vec![part(0, size as u64)],
+                Some(guard),
+            );
+            stream.next().await.unwrap().unwrap();
+            stream.next().await.unwrap().unwrap();
+            assert!(lock.try_write().is_err());
         }
         assert!(lock.try_write().is_ok());
     }

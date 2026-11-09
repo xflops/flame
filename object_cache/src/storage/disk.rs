@@ -31,6 +31,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
@@ -51,8 +52,9 @@ const METADATA_FILE: &str = "metadata.json";
 const INDEX_FILE: &str = "index.bin";
 const DATA_FILE: &str = "data.bin";
 const LOST_FOUND_DIR: &str = "lost+found";
-/// Bytes of one record in `index.bin`: payload offset, length and creation time.
-const RECORD_LEN: usize = 3 * 8;
+/// Payload offset, length, creation time, and the SHA-256 of one committed part.
+const RECORD_LEN: usize = 3 * 8 + 32;
+const READ_CHUNK_SIZE: usize = 1024 * 1024;
 /// Chunks buffered between the async writer and the blocking file writer.
 const WRITE_QUEUE_DEPTH: usize = 4;
 
@@ -69,6 +71,11 @@ impl Record {
         bytes[0..8].copy_from_slice(&self.offset.to_le_bytes());
         bytes[8..16].copy_from_slice(&self.len.to_le_bytes());
         bytes[16..24].copy_from_slice(&self.creation_time.to_le_bytes());
+        bytes[24..].copy_from_slice(
+            &self
+                .checksum
+                .expect("new disk records always carry a checksum"),
+        );
         bytes
     }
 
@@ -78,11 +85,12 @@ impl Record {
             offset: u64::from_le_bytes(word(0)),
             len: u64::from_le_bytes(word(8)),
             creation_time: i64::from_le_bytes(word(16)),
+            checksum: Some(<[u8; 32]>::try_from(&bytes[24..]).unwrap()),
         }
     }
 
-    fn end(&self) -> u64 {
-        self.offset + self.len
+    fn end(&self) -> Option<u64> {
+        self.offset.checked_add(self.len)
     }
 }
 
@@ -137,8 +145,9 @@ impl ObjectFiles {
         };
         // The last payload is the furthest, so it being in `data.bin` is
         // enough to know the data was not truncated.
+        let data_len = files.data.metadata()?.len();
         match files.record(count.wrapping_sub(1))? {
-            Some(last) if last.end() <= files.data.metadata()?.len() => Ok(Some(files)),
+            Some(last) if last.end().is_some_and(|end| end <= data_len) => Ok(Some(files)),
             _ => Err(invalid("Truncated object data")),
         }
     }
@@ -180,7 +189,7 @@ impl ObjectFiles {
 
     /// Read `len` bytes of part `part` (0 is the first) at `offset`: its record
     /// is read by position, then the payload.
-    pub fn read_range(
+    fn read_chunk(
         &self,
         key: &str,
         part: usize,
@@ -192,8 +201,58 @@ impl ObjectFiles {
         })?;
         payload_range(key, offset, len, record.len)?;
         let mut buf = vec![0u8; len];
-        self.data.read_exact_at(&mut buf, record.offset + offset)?;
+        let at = record.offset.checked_add(offset).ok_or_else(|| {
+            FlameError::DataLoss(format!("Payload offset overflow in object <{key}>"))
+        })?;
+        self.data.read_exact_at(&mut buf, at)?;
         Ok(Bytes::from(buf))
+    }
+
+    /// Read and verify one part once, with bounded memory. The final chunk is
+    /// withheld on mismatch; previously emitted chunks end in a stream error.
+    pub fn read_part(
+        self: Arc<Self>,
+        key: String,
+        part: usize,
+    ) -> Result<BoxStream<'static, Result<Bytes, FlameError>>, FlameError> {
+        let record = self.record(part)?.ok_or_else(|| {
+            FlameError::NotFound(format!("part {part} of object <{key}> not found"))
+        })?;
+        let expected = record.checksum.expect("checksum-format record");
+        let state = (self, key, 0u64, Sha256::new(), false);
+        Ok(Box::pin(futures::stream::try_unfold(
+            state,
+            move |(files, key, offset, mut hash, done)| async move {
+                if done {
+                    return Ok(None);
+                }
+                let len = (record.len - offset).min(READ_CHUNK_SIZE as u64) as usize;
+                let chunk = {
+                    let files = Arc::clone(&files);
+                    let key = key.clone();
+                    tokio::task::spawn_blocking(move || files.read_chunk(&key, part, offset, len))
+                        .await
+                        .map_err(|error| {
+                            FlameError::Internal(format!("Task join error: {error}"))
+                        })??
+                };
+                hash.update(&chunk);
+                let next_offset = offset + chunk.len() as u64;
+                let done = next_offset == record.len;
+                if done {
+                    let actual: [u8; 32] = hash.clone().finalize().into();
+                    if actual != expected {
+                        tracing::error!(object = %key, part = part + 1, "Object payload checksum mismatch");
+                        return Err(FlameError::DataLoss(format!(
+                            "SHA-256 checksum mismatch for part {} of object <{}>",
+                            part + 1,
+                            key
+                        )));
+                    }
+                }
+                Ok(Some((chunk, (files, key, next_offset, hash, done))))
+            },
+        )))
     }
 
     /// Append data through the open files. The payload is made durable
@@ -212,9 +271,12 @@ impl ObjectFiles {
             offset: self.data.metadata()?.len(),
             len: part.size_bytes(),
             creation_time: part.creation_time,
+            checksum: Some(Sha256::digest(&part.data).into()),
         };
         (&self.data).write_all(&part.data)?;
         self.data.sync_data()?;
+        // A failed index write may have left an uncommitted tail.
+        self.index.set_len((self.count() * RECORD_LEN) as u64)?;
         (&self.index).write_all(&record.encode())?;
         self.index.sync_data()?;
         self.count.fetch_add(1, Ordering::Release);
@@ -304,21 +366,17 @@ impl StorageEngine for DiskStorage {
         Ok(meta.with_size(written?))
     }
 
-    async fn read_range(
+    async fn read_part(
         &self,
         key: &ObjectKey,
         part: usize,
-        offset: u64,
-        len: usize,
-    ) -> Result<Bytes, FlameError> {
+    ) -> Result<BoxStream<'static, Result<Bytes, FlameError>>, FlameError> {
         let key_str = key.to_key().expect("object_id required");
         let files = self
             .open(key)
             .await?
             .ok_or_else(|| FlameError::NotFound(format!("object <{}> not found", key_str)))?;
-        tokio::task::spawn_blocking(move || files.read_range(&key_str, part, offset, len))
-            .await
-            .map_err(|e| FlameError::Internal(format!("Task join error: {}", e)))?
+        files.read_part(key_str, part)
     }
 
     async fn open(&self, key: &ObjectKey) -> Result<Option<Arc<ObjectFiles>>, FlameError> {
@@ -358,7 +416,7 @@ impl StorageEngine for DiskStorage {
         let mut parts = Vec::new();
         let records = files.records()?;
         for (index, record) in records.iter().enumerate().skip(version as usize) {
-            let data = files.read_range(&key_str, index, 0, record.len as usize)?;
+            let data = self.read_range(key, index, 0, record.len as usize).await?;
             parts.push(ObjectData {
                 creation_time: record.creation_time,
                 data,
@@ -541,10 +599,12 @@ fn create_object(
         .open(temp_dir.join(DATA_FILE))?;
     let mut writer = BufWriter::new(file);
     let mut len = 0u64;
+    let mut hash = Sha256::new();
     loop {
         match chunks.blocking_recv() {
             Some(Some(chunk)) => {
                 writer.write_all(&chunk)?;
+                hash.update(&chunk);
                 len += chunk.len() as u64;
             }
             Some(None) => break,
@@ -560,6 +620,7 @@ fn create_object(
         offset: 0,
         len,
         creation_time: meta.creation_time,
+        checksum: Some(hash.finalize().into()),
     };
     write_synced(&temp_dir.join(INDEX_FILE), &record.encode())?;
     let metadata = StoredMetadata {
@@ -587,6 +648,10 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), FlameError> {
     file.sync_all()?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "checksum_tests.rs"]
+mod checksum_tests;
 
 #[cfg(test)]
 mod tests {
