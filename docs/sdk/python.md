@@ -238,6 +238,27 @@ if __name__ == "__main__":
 
 The service runtime provides `FLAME_INSTANCE_ENDPOINT` and calls the service through a Unix domain socket. The SDK creates `<FLAME_INSTANCE_ENDPOINT>.ready` once the server is listening, and the runtime waits for that file before it connects. Service methods should return bytes or `None`.
 
+Services may override `on_instance_create()` and `on_instance_destroy()` to
+initialize and clean up resources owned by the executor's service process.
+Both default to no-ops. FEM connects to the listening server before calling
+create, then calls session enter only after setup succeeds. Session leave
+retains instance resources; destroy runs before the runtime stops. The aio
+`FlameService` provides matching async hooks. Keep expensive imports and model
+construction inside create so they do not delay the listening marker.
+
+The existing connection timeout applies before setup. Instance setup and
+teardown await their hook results without a separate deadline; timeout policy
+and configuration are deferred. Bind failure messages distinguish setup errors
+from connection failures. A failed setup discards the runtime. Crashes can skip
+teardown, and an unresponsive teardown hook can delay release.
+
+Older services need no changes: FEM treats the new RPCs' `UNIMPLEMENTED` status
+as a no-op. The SDK forwards instance RPCs directly through its existing
+callback dispatcher; FEM owns ordering. Services that rely on these hooks need
+an updated FEM, since older FEMs do not send the calls. There is no implicit
+first-task setup. Instance RPC responses contain only status; executor
+attributes use the existing session/task responses.
+
 `self.publish()` adds opaque locality keys to the next successful session-enter
 response or the next task response, including a failed task. Calls within one
 response are unioned, and Session Manager extends the executor's retained set
@@ -284,6 +305,41 @@ with open_session("agent-app", ctx=[]) as session:
 future. Use this helper when request, response, or session context objects are
 easier to model as Python objects than raw bytes. Use the core `FlameService`
 API when you need explicit byte-level protocol control.
+
+### Initialize and clean up a serving instance
+
+Register synchronous, zero-argument callbacks with `setup` and `teardown`:
+
+```python
+instance = serving.Instance()
+engine = None
+
+@instance.setup
+def create_engine():
+    global engine
+    from my_runtime import Engine
+    engine = Engine()
+
+@instance.teardown
+def destroy_engine():
+    global engine
+    if engine is not None:
+        engine.close()
+        engine = None
+
+@instance.entrypoint
+def generate(request):
+    return engine.generate(request)
+```
+
+FEM invokes setup before the first session enters and retains the service
+across session bindings, then invokes teardown before releasing the runtime.
+The SDK forwards each RPC without caching its result. Make setup idempotent
+when FEM can reconnect to a surviving process; teardown should tolerate partial
+initialization. Duplicate
+callback registrations and async setup/teardown callbacks are rejected; use the
+aio service API for async lifecycle hooks. Debug HTTP mode uses the same hooks
+at startup and graceful shutdown.
 
 ### Data-aware scheduling with the serving helper
 

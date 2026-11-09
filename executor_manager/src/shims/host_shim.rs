@@ -548,6 +548,14 @@ impl Shim for HostShim {
         Ok(())
     }
 
+    async fn on_instance_create(&mut self) -> Result<(), FlameError> {
+        self.instance_client
+            .as_mut()
+            .ok_or_else(|| FlameError::InvalidState("Host instance is not created".into()))?
+            .on_instance_create()
+            .await
+    }
+
     async fn on_session_enter(
         &mut self,
         ctx: &SessionContext,
@@ -602,7 +610,7 @@ impl Shim for HostShim {
 
     async fn destroy_instance(&mut self) -> Result<(), FlameError> {
         if let Some(mut client) = self.instance_client.take() {
-            client.close();
+            client.destroy_instance().await?;
         }
         if let Some(instance) = self.instance.as_mut() {
             instance.stop().await?;

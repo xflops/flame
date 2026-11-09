@@ -249,6 +249,46 @@ impl Shim for GrpcShim {
         self.connect().await
     }
 
+    async fn on_instance_create(&mut self) -> Result<(), FlameError> {
+        let mut client = self.client.take().ok_or_else(|| {
+            FlameError::Network(format!(
+                "instance setup failed: no connection to <{}>",
+                self.endpoint
+            ))
+        })?;
+        // Restore the connection only after a conclusive reply. Cancellation or
+        // a transport failure must not race unfinished setup with teardown.
+        let start = std::time::Instant::now();
+        let request = Request::new(EmptyRequest::default());
+        let response = client.on_instance_create(request).await;
+        let result = match response {
+            Ok(response) => {
+                self.client = Some(client);
+                let result = response.into_inner();
+                if result.return_code == 0 {
+                    Ok(())
+                } else {
+                    Err(FlameError::Internal(format!(
+                        "instance setup failed: {}",
+                        result.message.unwrap_or_default()
+                    )))
+                }
+            }
+            Err(status) if status.code() == tonic::Code::Unimplemented => {
+                self.client = Some(client);
+                Ok(())
+            }
+            Err(status) => Err(FlameError::Network(format!(
+                "instance setup failed: RPC to <{}>: {status}",
+                self.endpoint
+            ))),
+        };
+        tracing::info!(endpoint = %self.endpoint, phase = "instance_create",
+            elapsed_ms = start.elapsed().as_secs_f64() * 1e3, success = result.is_ok(),
+            "Instance setup completed");
+        result
+    }
+
     async fn on_session_enter(
         &mut self,
         ctx: &SessionContext,
@@ -333,7 +373,25 @@ impl Shim for GrpcShim {
     }
 
     async fn destroy_instance(&mut self) -> Result<(), FlameError> {
-        self.close();
+        let Some(mut client) = self.client.take() else {
+            return Ok(());
+        };
+        let start = std::time::Instant::now();
+        let request = Request::new(EmptyRequest::default());
+        match client.on_instance_destroy(request).await {
+            Ok(response) => {
+                let result = response.into_inner();
+                if result.return_code != 0 {
+                    tracing::warn!(endpoint = %self.endpoint, message = ?result.message, "Instance teardown failed; terminating runtime");
+                }
+            }
+            Err(status) if status.code() == tonic::Code::Unimplemented => {}
+            Err(status) => {
+                tracing::warn!(endpoint = %self.endpoint, %status, "Instance teardown RPC failed; terminating runtime")
+            }
+        }
+        tracing::info!(endpoint = %self.endpoint, phase = "instance_destroy",
+            elapsed_ms = start.elapsed().as_secs_f64() * 1e3, "Instance teardown attempted");
         Ok(())
     }
 }
@@ -348,6 +406,185 @@ mod tests {
     use tempfile::tempdir;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Clone)]
+    struct HookService {
+        setup: Result<rpc::Result, tonic::Status>,
+        setup_delay: Duration,
+        destroy_delay: Duration,
+        destroyed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl rpc::instance_server::Instance for HookService {
+        async fn on_instance_create(
+            &self,
+            _: Request<EmptyRequest>,
+        ) -> Result<tonic::Response<rpc::Result>, tonic::Status> {
+            tokio::time::sleep(self.setup_delay).await;
+            self.setup.clone().map(tonic::Response::new)
+        }
+        async fn on_instance_destroy(
+            &self,
+            _: Request<EmptyRequest>,
+        ) -> Result<tonic::Response<rpc::Result>, tonic::Status> {
+            self.destroyed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.destroy_delay).await;
+            Ok(tonic::Response::new(rpc::Result::default()))
+        }
+        async fn on_session_enter(
+            &self,
+            _: Request<rpc::SessionContext>,
+        ) -> Result<tonic::Response<rpc::OnSessionEnterResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used"))
+        }
+        async fn on_task_invoke(
+            &self,
+            _: Request<rpc::TaskContext>,
+        ) -> Result<tonic::Response<rpc::OnTaskInvokeResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used"))
+        }
+        async fn on_session_leave(
+            &self,
+            _: Request<EmptyRequest>,
+        ) -> Result<tonic::Response<rpc::Result>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used"))
+        }
+    }
+
+    async fn hook_fixture(
+        setup: Result<rpc::Result, tonic::Status>,
+        setup_delay: Duration,
+        destroy_delay: Duration,
+    ) -> (
+        GrpcShim,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let destroyed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = HookService {
+            setup,
+            setup_delay,
+            destroy_delay,
+            destroyed: destroyed.clone(),
+        };
+        let incoming = futures::stream::unfold(listener, |listener| async {
+            Some((listener.accept().await.map(|(socket, _)| socket), listener))
+        });
+        let server = tokio::spawn(async {
+            tonic::transport::Server::builder()
+                .add_service(rpc::instance_server::InstanceServer::new(service))
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+        let client = InstanceClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        (
+            GrpcShim {
+                client: Some(client),
+                endpoint: address.to_string(),
+            },
+            destroyed,
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn setup_application_error_preserves_message_and_allows_one_teardown() {
+        let (mut shim, destroyed, server) = hook_fixture(
+            Ok(rpc::Result {
+                return_code: 5,
+                message: Some("model download failed".into()),
+            }),
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await;
+        let error = shim.on_instance_create().await.unwrap_err();
+        assert!(error.to_string().contains("model download failed"));
+        shim.destroy_instance().await.unwrap();
+        shim.destroy_instance().await.unwrap();
+        assert!(shim.client.is_none());
+        assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unsupported_setup_is_compatible_but_other_statuses_fail() {
+        for (status, succeeds) in [
+            (tonic::Status::unimplemented("old service"), true),
+            (tonic::Status::unavailable("service lost"), false),
+        ] {
+            let (mut shim, destroyed, server) =
+                hook_fixture(Err(status), Duration::ZERO, Duration::ZERO).await;
+            assert_eq!(shim.on_instance_create().await.is_ok(), succeeds);
+            assert_eq!(shim.client.is_some(), succeeds);
+            shim.destroy_instance().await.unwrap();
+            assert_eq!(
+                destroyed.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(succeeds)
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_cancellation_suppresses_concurrent_teardown() {
+        let (mut shim, destroyed, server) = hook_fixture(
+            Ok(rpc::Result::default()),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), shim.on_instance_create())
+                .await
+                .is_err()
+        );
+        assert!(shim.client.is_none());
+        shim.destroy_instance().await.unwrap();
+        assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn teardown_cancellation_does_not_retry_user_callback() {
+        let (mut shim, destroyed, server) = hook_fixture(
+            Ok(rpc::Result::default()),
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .await;
+        shim.on_instance_create().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), shim.destroy_instance())
+                .await
+                .is_err()
+        );
+        shim.destroy_instance().await.unwrap();
+        assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connected_service_setup_waits_for_application_completion() {
+        let (mut shim, _, server) = hook_fixture(
+            Ok(rpc::Result::default()),
+            Duration::from_millis(80),
+            Duration::ZERO,
+        )
+        .await;
+        let start = std::time::Instant::now();
+        shim.on_instance_create().await.unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(80));
+        assert!(shim.client.is_some());
+        server.abort();
+    }
 
     fn setup_test_env(temp: &tempfile::TempDir) -> PathBuf {
         let socket_dir = temp.path().join("sockets");

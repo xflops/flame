@@ -192,6 +192,12 @@ class FlameService:
     def _take_attributes(self) -> ExecutorAttributes:
         return self._publisher().take()
 
+    def on_instance_create(self) -> None:
+        """Initialize resources for this executor's service instance."""
+
+    def on_instance_destroy(self) -> None:
+        """Release resources before the executor's runtime is stopped."""
+
     @abstractmethod
     def on_session_enter(self, context: SessionContext):
         """
@@ -247,6 +253,12 @@ class FlameInstanceServicer:
             return AioFlameInstanceServicer(service)
 
         self._aio = self._loop_thread.call(create())
+
+    def OnInstanceCreate(self, request, context):  # noqa: N802
+        return self._loop_thread.call(self._aio.OnInstanceCreate(request, context))
+
+    def OnInstanceDestroy(self, request, context):  # noqa: N802
+        return self._loop_thread.call(self._aio.OnInstanceDestroy(request, context))
 
     def OnSessionEnter(self, request, context):  # noqa: N802
         return self._loop_thread.call(self._aio.OnSessionEnter(request, context))

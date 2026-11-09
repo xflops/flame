@@ -266,6 +266,10 @@ pub trait Shim: Send + 'static {
         &mut self,
         app_manager: Arc<ApplicationManager>,
     ) -> Result<(), FlameError>;
+    /// Initialize the connected application service before its first session.
+    async fn on_instance_create(&mut self) -> Result<(), FlameError> {
+        Ok(())
+    }
     async fn on_session_enter(
         &mut self,
         ctx: &SessionContext,

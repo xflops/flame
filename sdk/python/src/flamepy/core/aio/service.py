@@ -51,6 +51,12 @@ class _HookError(Exception):
 class FlameService(SyncFlameService):
     """Implement shim hooks as coroutines on the server's event loop."""
 
+    async def on_instance_create(self) -> None:
+        """Initialize resources for this executor's service instance."""
+
+    async def on_instance_destroy(self) -> None:
+        """Release resources before the executor's runtime is stopped."""
+
     async def on_session_enter(self, context: SessionContext):
         raise NotImplementedError
 
@@ -131,6 +137,24 @@ class FlameInstanceServicer(InstanceServicer):
             if not work.cancelled():
                 work.exception()  # Consume a hook failure after the caller has gone.
             raise
+
+    async def OnInstanceCreate(self, request, context):  # noqa: N802
+        try:
+            async with self._binding_lock:
+                await self._binding_hook("on_instance_create")
+            return Result(return_code=0)
+        except Exception as exc:
+            logger.exception("OnInstanceCreate failed")
+            return Result(return_code=-1, message=str(exc))
+
+    async def OnInstanceDestroy(self, request, context):  # noqa: N802
+        try:
+            async with self._binding_lock:
+                await self._binding_hook("on_instance_destroy")
+            return Result(return_code=0)
+        except Exception as exc:
+            logger.exception("OnInstanceDestroy failed")
+            return Result(return_code=-1, message=str(exc))
 
     async def OnSessionEnter(self, request, context):  # noqa: N802
         try:

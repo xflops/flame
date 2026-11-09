@@ -45,9 +45,17 @@ impl States for UnbindingState {
     async fn unregister_executor(&self) -> Result<(), FlameError> {
         trace_fn!("UnbindingState::unregister_executor");
 
-        Err(FlameError::InvalidState(
-            "Executor is unbinding".to_string(),
-        ))
+        let mut executor = lock_ptr!(self.executor)?;
+        if executor.task_id.is_some() {
+            return Err(FlameError::InvalidState(
+                "Executor is unbinding with an active task".to_string(),
+            ));
+        }
+        // A failed bind may have reported its error before runtime cleanup
+        // finished. FEM unregisters only after that cleanup and device release.
+        executor.ssn_id = None;
+        executor.set_state(ExecutorState::Released);
+        Ok(())
     }
 
     async fn bind_session(&self, _ssn_ptr: SessionPtr) -> Result<(), FlameError> {

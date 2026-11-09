@@ -289,6 +289,16 @@ pub trait FlameService: Send + Sync + 'static {
         self.publisher().retract(attributes)
     }
 
+    /// Initialize resources retained across all session bindings of this instance.
+    async fn on_instance_create(&self) -> Result<(), FlameError> {
+        Ok(())
+    }
+
+    /// Release instance resources before its runtime is terminated.
+    async fn on_instance_destroy(&self) -> Result<(), FlameError> {
+        Ok(())
+    }
+
     async fn on_session_enter(&self, _: SessionContext) -> Result<(), FlameError>;
     async fn on_task_invoke(&self, _: TaskContext) -> Result<Option<TaskOutput>, FlameError>;
     async fn on_session_leave(&self) -> Result<(), FlameError>;
@@ -302,8 +312,40 @@ struct ShimService {
 }
 
 #[cfg(unix)]
+impl ShimService {
+    fn result(result: Result<(), FlameError>) -> rpc::Result {
+        match result {
+            Ok(()) => rpc::Result {
+                return_code: 0,
+                message: None,
+            },
+            Err(error) => rpc::Result {
+                return_code: -1,
+                message: Some(error.to_string()),
+            },
+        }
+    }
+}
+
+#[cfg(unix)]
 #[tonic::async_trait]
 impl Instance for ShimService {
+    async fn on_instance_create(
+        &self,
+        _: Request<rpc::EmptyRequest>,
+    ) -> Result<Response<rpc::Result>, Status> {
+        let result = self.service.on_instance_create().await;
+        Ok(Response::new(Self::result(result)))
+    }
+
+    async fn on_instance_destroy(
+        &self,
+        _: Request<rpc::EmptyRequest>,
+    ) -> Result<Response<rpc::Result>, Status> {
+        let result = self.service.on_instance_destroy().await;
+        Ok(Response::new(Self::result(result)))
+    }
+
     async fn on_session_enter(
         &self,
         req: Request<rpc::SessionContext>,
@@ -541,6 +583,175 @@ mod tests {
         ctx.tokens
             .insert("example_service".to_string(), "secret-token".to_string());
         assert!(!format!("{ctx:?}").contains("secret-token"));
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct LifecycleService {
+        publisher: Publisher,
+        created: std::sync::atomic::AtomicUsize,
+        destroyed: std::sync::atomic::AtomicUsize,
+        fail_create: bool,
+        fail_destroy: bool,
+        publish_create: bool,
+        publish_destroy: bool,
+    }
+
+    #[cfg(unix)]
+    #[tonic::async_trait]
+    impl FlameService for LifecycleService {
+        fn publisher(&self) -> &Publisher {
+            &self.publisher
+        }
+
+        async fn on_instance_create(&self) -> Result<(), FlameError> {
+            self.created
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_create {
+                return Err(FlameError::Internal("model load failed".into()));
+            }
+            if self.publish_create {
+                self.publish([b"setup-key".to_vec()])?;
+            }
+            Ok(())
+        }
+
+        async fn on_instance_destroy(&self) -> Result<(), FlameError> {
+            self.destroyed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_destroy {
+                return Err(FlameError::Internal("model cleanup failed".into()));
+            }
+            if self.publish_destroy {
+                self.retract([b"setup-key".to_vec()])?;
+            }
+            Ok(())
+        }
+
+        async fn on_session_enter(&self, _: SessionContext) -> Result<(), FlameError> {
+            Ok(())
+        }
+        async fn on_session_leave(&self) -> Result<(), FlameError> {
+            Ok(())
+        }
+        async fn on_task_invoke(&self, _: TaskContext) -> Result<Option<TaskOutput>, FlameError> {
+            Ok(None)
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn instance_callbacks_dispatch_directly_without_task_initialization() {
+        let service = Arc::new(LifecycleService::default());
+        let shim = ShimService {
+            service: service.clone(),
+        };
+        Instance::on_task_invoke(&shim, Request::new(rpc::TaskContext::default()))
+            .await
+            .unwrap();
+        assert_eq!(service.created.load(std::sync::atomic::Ordering::SeqCst), 0);
+        for _ in 0..2 {
+            assert_eq!(
+                Instance::on_instance_create(&shim, Request::new(rpc::EmptyRequest {}))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .return_code,
+                0
+            );
+            assert_eq!(
+                Instance::on_instance_destroy(&shim, Request::new(rpc::EmptyRequest {}))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .return_code,
+                0
+            );
+        }
+        assert_eq!(service.created.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            service.destroyed.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn instance_callbacks_preserve_service_errors() {
+        let shim = ShimService {
+            service: Arc::new(LifecycleService {
+                fail_create: true,
+                fail_destroy: true,
+                ..Default::default()
+            }),
+        };
+        let create = Instance::on_instance_create(&shim, Request::new(rpc::EmptyRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(create.return_code, -1);
+        assert!(create.message.unwrap().contains("model load failed"));
+        let destroy = Instance::on_instance_destroy(&shim, Request::new(rpc::EmptyRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(destroy.return_code, -1);
+        assert!(destroy.message.unwrap().contains("model cleanup failed"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_services_inherit_noop_instance_callbacks() {
+        let shim = ShimService {
+            service: Arc::new(TaskPublishingService::default()),
+        };
+        assert_eq!(
+            Instance::on_instance_create(&shim, Request::new(rpc::EmptyRequest {}))
+                .await
+                .unwrap()
+                .into_inner()
+                .return_code,
+            0
+        );
+        assert_eq!(
+            Instance::on_instance_destroy(&shim, Request::new(rpc::EmptyRequest {}))
+                .await
+                .unwrap()
+                .into_inner()
+                .return_code,
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn instance_hooks_use_the_existing_publisher() {
+        let service = Arc::new(LifecycleService {
+            publish_create: true,
+            publish_destroy: true,
+            ..Default::default()
+        });
+        let shim = ShimService {
+            service: service.clone(),
+        };
+        let create = Instance::on_instance_create(&shim, Request::new(rpc::EmptyRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(create.return_code, 0);
+        assert_eq!(
+            service.publisher.take().publish,
+            vec![b"setup-key".to_vec()]
+        );
+        let destroy = Instance::on_instance_destroy(&shim, Request::new(rpc::EmptyRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(destroy.return_code, 0);
+        assert_eq!(
+            service.publisher.take().retract,
+            vec![b"setup-key".to_vec()]
+        );
     }
 
     #[cfg(unix)]

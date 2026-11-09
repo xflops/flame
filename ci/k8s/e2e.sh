@@ -489,7 +489,8 @@ run_e2e_tests() {
         python -m pytest -vv --durations=0 \
         tests/test_app.py \
         tests/test_flmexec.py \
-        tests/test_sandbox.py
+        tests/test_sandbox.py \
+        tests/test_serving.py
     popd >/dev/null
 }
 

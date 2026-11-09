@@ -11,9 +11,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import base64
+import time
+
 import flamepy
 import pytest
 from flamepy import SessionState
+from flamepy.core import ObjectRef, delete_objects, get_object, put_object
 from flamepy.serving import open_session
 
 from e2e.api import TestContext, TestRequest
@@ -24,12 +28,22 @@ FLM_TEST_APP = "flme2e"
 
 @pytest.fixture(scope="module", autouse=True)
 def setup_test_env():
-    deploy_e2e_application(FLM_TEST_APP, arguments=["-m", "e2e.instance_svc"])
+    runtime = flamepy.get_application("flmrun")
+    deploy_e2e_application(
+        FLM_TEST_APP,
+        command=runtime.command if runtime is not None else None,
+        arguments=[*runtime.arguments[:-1], "e2e.instance_svc"] if runtime is not None else ["-m", "e2e.instance_svc"],
+        shim=runtime.shim.name.lower() if runtime is not None and runtime.shim is not None else None,
+        image=runtime.image if runtime is not None else None,
+        environments=runtime.environments if runtime is not None else None,
+        delay_release=5,
+        max_instances=1,
+    )
 
     yield
 
-    # Clean up all sessions before unregistering
-    sessions = flamepy.list_sessions()
+    # Clean up this application's sessions before unregistering.
+    sessions = flamepy.list_sessions(application=FLM_TEST_APP)
     for sess in sessions:
         try:
             flamepy.close_session(sess.id)
@@ -40,7 +54,7 @@ def setup_test_env():
 
 
 # ============================================================================
-# Service Session API Tests
+# Serving Session API Tests
 # ============================================================================
 
 
@@ -195,3 +209,106 @@ def test_service_session_validation_both_provided():
     """Test that service Session raises ValueError when both name and session_id are provided."""
     with pytest.raises(ValueError, match="Cannot provide both 'name' and 'session_id'"):
         open_session(name=FLM_TEST_APP, session_id="some-session-id")
+
+
+def _events(ref):
+    # A fresh read observes writes from the executor and does not rely on a
+    # local version surviving service shutdown or application removal.
+    fresh = ObjectRef(endpoint=ref.endpoint, key=ref.key, version=0)
+    return get_object(fresh, deserializer=lambda parts: parts)[1:]
+
+
+def _wait_for_events(ref, predicate, timeout=90):
+    deadline = time.monotonic() + timeout
+    events = []
+    while time.monotonic() < deadline:
+        events = _events(ref)
+        bad_enter = [event for event in events if event["phase"] == "session_enter" and not event["setup_complete"]]
+        assert not bad_enter, f"FEM entered a session before instance setup: {bad_enter}"
+        if predicate(events):
+            return events
+        time.sleep(0.1)
+    pytest.fail(f"Timed out waiting for lifecycle events; observed: {events}")
+
+
+def _wait_for_executor_removed(executor_id, timeout=90):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(executor.metadata.id == executor_id for executor in flamepy.list_executors()):
+            return
+        time.sleep(0.1)
+    pytest.fail(f"Executor {executor_id} still exists after lifecycle teardown")
+
+
+@pytest.mark.parametrize("setup_delay", [0, 31], ids=["ordinary-setup", "setup-longer-than-connection-timeout"])
+def test_setup_retained_across_sessions_and_teardown_on_executor_release(setup_delay):
+    """A deployed process initializes before enter, stays warm, and tears down once."""
+    suffix = random_string(8).lower()
+    application = f"flme2e-lifecycle-{suffix}"
+    # Keep observations outside the deployed application's cache namespace, so
+    # application GC cannot erase evidence of the process's teardown.
+    observer_application = f"flme2e-lifecycle-observer-{suffix}"
+    observer_prefix = f"{observer_application}/events"
+    flamepy.register_application(observer_application, flamepy.ApplicationAttributes())
+    ref = None
+    sessions = []
+    deployed = False
+    try:
+        ref = put_object(observer_prefix, {"observer": application})
+        # Reuse the cluster's configured runtime launch profile in CRI and
+        # Kubernetes jobs; a standalone Host cluster needs no template.
+        runtime = flamepy.get_application("flmrun")
+        deploy_e2e_application(
+            application,
+            command=runtime.command if runtime is not None else None,
+            arguments=[*runtime.arguments[:-1], "e2e.instance_svc"] if runtime is not None else ["-m", "e2e.instance_svc"],
+            shim=runtime.shim.name.lower() if runtime is not None and runtime.shim is not None else None,
+            image=runtime.image if runtime is not None else None,
+            max_instances=1,
+            delay_release=5,
+            environments={
+                **(runtime.environments or {} if runtime is not None else {}),
+                "FLAME_E2E_LIFECYCLE_EVENTS": base64.b64encode(ref.encode()).decode(),
+                "FLAME_E2E_SETUP_DELAY": str(setup_delay),
+            },
+        )
+        deployed = True
+        first = flamepy.create_session(application, min_instances=1, max_instances=1)
+        sessions.append(first)
+
+        # Warm-up binding happens with no queued tasks. An older FEM's SDK lazy
+        # fallback cannot satisfy this assertion (or the service's enter guard).
+        events = _wait_for_events(ref, lambda current: any(event["phase"] == "session_enter" for event in current))
+        assert [event["phase"] for event in events] == ["setup_started", "setup_complete", "session_enter"]
+        assert events[1]["at"] - events[0]["at"] >= setup_delay
+        identity = (events[0]["executor_id"], events[0]["pid"])
+        first_output = open_session(session_id=first.id).run(TestRequest(input="first"))
+        assert first_output.output == "first"
+
+        # The second session exists before releasing the first binding; one
+        # application instance and the retention window allow immediate reuse.
+        second = flamepy.create_session(application, max_instances=1)
+        sessions.append(second)
+        first.close()
+        _wait_for_events(ref, lambda current: any(event["phase"] == "session_leave" for event in current))
+        second_output = open_session(session_id=second.id).run(TestRequest(input="second"))
+        assert second_output.output == "second"
+        events = _events(ref)
+        assert sum(event["phase"] == "setup_complete" for event in events) == 1
+        assert not any(event["phase"] == "teardown" for event in events)
+
+        second.close()
+        _wait_for_events(ref, lambda current: any(event["phase"] == "teardown" for event in current))
+        _wait_for_executor_removed(identity[0])
+        events = _events(ref)
+        assert [event["phase"] for event in events] == ["setup_started", "setup_complete", "session_enter", "task", "session_leave", "session_enter", "task", "session_leave", "teardown"]
+        assert {(event["executor_id"], event["pid"]) for event in events} == {identity}
+        assert [event["session_id"] for event in events if event["phase"] == "session_enter"] == [first.id, second.id]
+    finally:
+        for session in sessions:
+            session.close()
+        if deployed:
+            flamepy.unregister_application(application)
+        if ref is not None:
+            delete_objects(observer_prefix, endpoint=ref.endpoint)
+        flamepy.unregister_application(observer_application)

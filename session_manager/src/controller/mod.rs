@@ -1314,7 +1314,7 @@ impl Controller {
 mod tests {
     use super::*;
     use common::apis::{
-        Node, NodeInfo, NodeState, ResourceRequirement, Shim, BIND_RESULT_OK, SESSION_BIND_FAILED,
+        Node, NodeInfo, NodeState, ResourceRequirement, Shim, SESSION_BIND_FAILED,
         SESSION_RETRY_LIMIT_REACHED,
     };
     use common::ctx::{
@@ -2264,7 +2264,7 @@ mod tests {
             .bind_executor_completed(
                 executor_id.clone(),
                 Some(FlameResult {
-                    return_code: BIND_RESULT_OK,
+                    return_code: 0,
                     message: None,
                 }),
                 Some(rpc::ExecutorAttributes {
@@ -2373,7 +2373,7 @@ mod tests {
             .bind_executor_completed(
                 executor_id.clone(),
                 Some(FlameResult {
-                    return_code: BIND_RESULT_OK,
+                    return_code: 0,
                     message: None,
                 }),
                 Some(rpc::ExecutorAttributes {
@@ -2488,7 +2488,7 @@ mod tests {
             .bind_executor_completed(
                 executor_id.clone(),
                 Some(FlameResult {
-                    return_code: BIND_RESULT_OK,
+                    return_code: 0,
                     message: None,
                 }),
                 None,
@@ -2778,7 +2778,7 @@ mod tests {
                 .bind_executor_completed(
                     executor_id.to_string(),
                     Some(FlameResult {
-                        return_code: common::apis::BIND_RESULT_ON_SESSION_ENTER_FAILED,
+                        return_code: -1,
                         message: Some("on_session_enter failed: boom".to_string()),
                     }),
                     None,
@@ -2938,7 +2938,7 @@ mod tests {
                 .bind_executor_completed(
                     executor_id.clone(),
                     Some(FlameResult {
-                        return_code: BIND_RESULT_OK,
+                        return_code: 0,
                         message: None,
                     }),
                     None,
@@ -2971,7 +2971,7 @@ mod tests {
                 .bind_executor_completed(
                     executor_id.clone(),
                     Some(FlameResult {
-                        return_code: BIND_RESULT_OK,
+                        return_code: 0,
                         message: None,
                     }),
                     None,

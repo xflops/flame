@@ -33,6 +33,8 @@ def deploy_e2e_application(
     shim: Optional[str] = None,
     image: Optional[str] = None,
     environments: Optional[Mapping[str, str]] = None,
+    max_instances: Optional[int] = None,
+    delay_release: Optional[int] = None,
 ) -> None:
     """Deploy the E2E project through the same package path as user applications."""
     args = ["flmctl", "deploy", "--name", name, "--application", str(E2E_PROJECT)]
@@ -46,6 +48,10 @@ def deploy_e2e_application(
         args.extend(["--shim", shim])
     if image is not None:
         args.extend(["--image", image])
+    if max_instances is not None:
+        args.extend(["--max-instances", str(max_instances)])
+    if delay_release is not None:
+        args.extend(["--delay-release", str(delay_release)])
     if environments is not None:
         args.extend(f"--env={key}={value}" for key, value in environments.items())
 

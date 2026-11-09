@@ -15,6 +15,7 @@ import asyncio
 import inspect
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 import cloudpickle
@@ -32,6 +33,7 @@ from flamepy.core.service import (
 )
 from flamepy.core.service import run as run_service
 from flamepy.core.types import TaskOutput
+from flamepy.proto import shim_pb2, types_pb2
 
 debug_service = None
 
@@ -40,6 +42,8 @@ class Instance(FlameService):
     def __init__(self):
         self._entrypoint = None
         self._parameter = None
+        self._setup = None
+        self._teardown = None
 
         self._object_ref: ObjectRef = None
 
@@ -76,6 +80,40 @@ class Instance(FlameService):
 
         # Append to the object; the ObjectRef gets the new version
         self._object_ref = patch_object(self._object_ref, serialized_data)
+
+    def setup(self, func):
+        """Register a synchronous instance initialization callback."""
+        self._validate_lifecycle_callback(func)
+        if self._setup is not None:
+            raise ValueError("setup callback is already registered")
+        self._setup = func
+        return func
+
+    def teardown(self, func):
+        """Register a synchronous instance cleanup callback."""
+        self._validate_lifecycle_callback(func)
+        if self._teardown is not None:
+            raise ValueError("teardown callback is already registered")
+        self._teardown = func
+        return func
+
+    @staticmethod
+    def _validate_lifecycle_callback(func):
+        call = getattr(func, "__call__", None)
+        if not callable(func) or inspect.iscoroutinefunction(func) or inspect.isasyncgenfunction(func) or inspect.iscoroutinefunction(call) or inspect.isasyncgenfunction(call):
+            raise TypeError("lifecycle callbacks must be synchronous functions")
+        if inspect.isgeneratorfunction(func) or inspect.isgeneratorfunction(call):
+            raise TypeError("lifecycle callbacks cannot be generator functions")
+        if inspect.signature(func).parameters:
+            raise TypeError("lifecycle callbacks must accept zero arguments")
+
+    def on_instance_create(self):
+        if self._setup is not None:
+            self._setup()
+
+    def on_instance_destroy(self):
+        if self._teardown is not None:
+            self._teardown()
 
     def entrypoint(self, func):
         logger = logging.getLogger(__name__)
@@ -161,7 +199,26 @@ class Instance(FlameService):
 
 def run_debug_service(instance: Instance):
     global debug_service
-    debug_service = FastAPI()
+    from flamepy.core.aio.service import FlameInstanceServicer
+
+    @asynccontextmanager
+    async def lifespan(app):
+        servicer = FlameInstanceServicer(instance)
+        app.state.servicer = servicer
+        try:
+            result = await servicer.OnInstanceCreate(types_pb2.EmptyRequest(), None)
+            if result.return_code != 0:
+                raise RuntimeError(result.message)
+            yield
+        finally:
+            try:
+                result = await servicer.OnInstanceDestroy(types_pb2.EmptyRequest(), None)
+                if result.return_code != 0:
+                    logging.getLogger(__name__).error("Instance teardown failed: %s", result.message)
+            finally:
+                await servicer.close()
+
+    debug_service = FastAPI(lifespan=lifespan)
     debug_service.state.instance = instance
 
     if instance._entrypoint is not None:
@@ -172,15 +229,18 @@ def run_debug_service(instance: Instance):
 
 
 async def entrypoint_local_api(s: FastAPIRequest):
-    instance = s.app.state.instance
     body_str = await s.body()
 
-    output = instance.on_task_invoke(
-        TaskContext(
+    response = await s.app.state.servicer.OnTaskInvoke(
+        shim_pb2.TaskContext(
             task_id=s.query_params.get("task_id") or "0",
             session_id=s.query_params.get("session_id") or "0",
             input=body_str,
-        )
+        ),
+        None,
     )
+    result = response.task_result
+    if result.return_code != 0:
+        return FastAPIResponse(status_code=500, content=result.message)
 
-    return FastAPIResponse(status_code=200, content=output.data)
+    return FastAPIResponse(status_code=200, content=result.output if result.HasField("output") else b"")

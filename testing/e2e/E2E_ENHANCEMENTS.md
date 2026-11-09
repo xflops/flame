@@ -25,7 +25,7 @@ testing/e2e/src/e2e/
   - basic_svc.py       (NEW: FlameService-based)
   - api.py             (ENHANCED with context info classes)
 testing/e2e/tests/
-  - test_service.py     (tests for instance_svc.py)
+  - test_serving.py     (tests for instance_svc.py)
   - test_core.py        (tests for basic_svc.py)
   - test_app.py
 ```
@@ -142,7 +142,7 @@ class BasicTestService(flamepy.FlameService):
 
 ### 4. Test Coverage
 
-#### test_service.py (Instance Tests)
+#### test_serving.py (Instance Tests)
 Tests for `instance_svc.py` focusing on:
 - Session creation and closure
 - Task invocation
@@ -234,7 +234,7 @@ session.close()
 pytest testing/e2e/tests/ -v
 
 # Run instance-based tests only
-pytest testing/e2e/tests/test_service.py -v
+pytest testing/e2e/tests/test_serving.py -v
 
 # Run service-based tests only
 pytest testing/e2e/tests/test_core.py -v
