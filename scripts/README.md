@@ -52,6 +52,16 @@ For a real cluster set at least `FLAME_ENDPOINT` (the head's address), `FLAME_CA
 `FLAME_CACHE_ADVERTISE` (the worker's interface), or edit the file afterwards; the site administrator owns
 the cluster configuration, which has many more settings than these.
 
+An explicit cache advertise IP or interface selector also restricts the cache
+listener to that address, using the port of `cache.endpoint`. The generated
+`lo` default suits local clients; select the worker's reachable interface for
+remote clients. Runtime `cache.advertise` overrides `FLAME_CACHE_ADVERTISE`.
+When neither advertise setting is supplied, wildcard listening remains even
+with automatic private-address advertisement. Full URLs (including numeric IP
+hosts), `IP:port` values, and DNS addresses also keep wildcard listening unless
+the raw value matches an interface selector. Check the cache startup log for
+its bind and advertised addresses.
+
 | Option | Meaning |
 |---|---|
 | `--join` | install a worker (the executor manager and the object cache) instead of the head node |

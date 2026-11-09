@@ -164,6 +164,21 @@ cache:
   storage: "/tmp/flame-dev/data/cache"
 ```
 
+For the object cache, an explicit IP or interface selector in `cache.advertise`
+sets both its listener IP and the address used in object references. The
+`"lo"` example selects loopback; use `"127.0.0.1"` for an explicit local address
+or `"^eth0$"` for a worker interface. The listener always uses the port from
+`cache.endpoint`, even if an advertised address specifies a different port.
+`cache.advertise` takes precedence over `FLAME_CACHE_ADVERTISE`; when only the
+environment supplies an IP/interface selector, it selects the same listener IP.
+If neither is set, the cache keeps listening on `0.0.0.0` while references may
+advertise an automatically selected private address. Startup logs show both
+the bind address and advertised endpoint.
+Full advertised URLs (including numeric IP hosts), `IP:port` values, and DNS
+addresses retain wildcard listening when they do not match an interface
+selector. Binding uses the raw value; it does not extract or resolve a URL host.
+These forms still supply the address used in object references.
+
 To restrict the session manager to a local address, add `advertise: "127.0.0.1"`
 under `cluster`. `cluster.advertise` accepts an IPv4/IPv6 address or a network
 interface name/regex (for example `"^eth0$"` or `"^lo0?$"`). For an interface
@@ -194,6 +209,12 @@ limits; unbinding removes an executor only from its session count.
 If services do not start, inspect the matching log file first. Common issues are an occupied port, an invalid configuration file, or a missing `FLAME_HOME` environment variable when starting services manually.
 
 If a Python client cannot connect, verify `FLAME_ENDPOINT` and `FLAME_CACHE_ENDPOINT`, then confirm the corresponding services are listening on ports `8080` and `9090`.
+
+If `cache.advertise` selects a non-loopback address, a local client using
+`127.0.0.1:9090` cannot reach that listener. Set the client's cache endpoint to
+the selected address, select loopback for local-only use, or remove both
+`cache.advertise` and `FLAME_CACHE_ADVERTISE` to retain wildcard binding. Check
+the cache startup log for the actual bind address.
 
 If App fails to find the `flmrun` template, check that the session manager is running and that `flmctl list -a` shows `flmrun`.
 

@@ -35,22 +35,36 @@ cache:
     interval: 60s
 ```
 
-The cache binds `0.0.0.0:<port of endpoint>`. Object references carry the
-address the cache advertises, and clients read, patch and delete through the
-address in the reference, so with several instances every reference identifies
-the instance that holds the object. The advertised address is, in order:
+Object references carry the address the cache advertises. Clients read, patch,
+and delete through that address, so each reference identifies the instance
+holding its object. The advertised address is selected in this order:
 
-1. `cache.advertise`, when set;
-2. the `FLAME_CACHE_ADVERTISE` environment variable, when set (for instances
-   that share one configuration file, such as StatefulSet pods);
+1. `cache.advertise`, when nonempty;
+2. the `FLAME_CACHE_ADVERTISE` environment variable, when nonempty;
 3. the first private IPv4 address of a non-loopback interface;
 4. `cache.endpoint` as configured.
 
-A value is matched first (unanchored regex) against network interface names and
-becomes that interface's first IPv4 address, with the scheme and port of
-`endpoint`. A value containing `://` is used verbatim. Otherwise it is an
-address: a bare `host` or `host:port` takes the missing scheme and port from
-`endpoint`.
+An explicit IP address or interface name/regex selects both the listener IP
+and the address in object references. For example, `"eth0"` or `"^eth0$"` uses
+the first IPv4 address on the first matching interface in name order;
+`"127.0.0.1"` selects loopback. Binding resolves the raw effective advertise
+value as an IP or interface selector, without parsing a URL or extracting a
+host. The listener port always comes from `cache.endpoint`.
+
+Full URLs, `IP:port` values, and DNS addresses remain valid advertisements but
+keep the listener on `0.0.0.0` when they do not match an interface selector.
+This includes URLs with numeric IP hosts. They can name a proxy without
+restricting the listener. A full URL supplies its own scheme and advertised
+port; bare hosts or `host:port` inherit missing values from `cache.endpoint`.
+An advertised port override changes only object references. If neither advertise setting is supplied, the listener also
+stays on `0.0.0.0`, even when references use an automatically selected private
+address. Startup logs show the bind address and advertised endpoint together.
+
+A client using `127.0.0.1` cannot reach a listener bound only to a non-loopback
+IP. Point local clients at the selected IP, use a loopback IP/interface for
+local-only access, or unset both advertise settings to keep wildcard listening.
+The configuration value takes precedence over the environment for both
+binding and advertisement.
 
 Stale application-data garbage collection is always enabled. The `gc` section
 only overrides its 60-second default interval.
