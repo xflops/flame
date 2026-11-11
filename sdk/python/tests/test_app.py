@@ -296,21 +296,6 @@ class TestCacheStorage:
         assert dest_file.exists()
         assert dest_file.read_bytes() == b"downloaded content"
 
-    def test_delete(self, monkeypatch):
-        deleted_key = None
-
-        def mock_delete_package(app_name, filename, endpoint=None):
-            nonlocal deleted_key
-            deleted_key = f"{app_name}/pkg/{filename}"
-            assert endpoint == "grpc://host:9090"
-
-        monkeypatch.setattr("flamepy.core.cache.delete_package", mock_delete_package)
-
-        storage = CacheStorage("grpc://host:9090", app_name="myapp")
-        storage.delete("myapp-1.0.0.tar.gz")
-
-        assert deleted_key == "myapp/pkg/myapp-1.0.0.tar.gz"
-
     def test_upload_requires_app_name(self, tmp_path):
         import pytest
 
@@ -2761,17 +2746,14 @@ def test_unregister_failure_preserves_cache_and_package_artifacts(monkeypatch):
     runtime = object.__new__(Runtime)
     runtime._name = "unregister-failure-app"
     runtime._cleanup_package_artifacts = MagicMock()
-    delete_objects = MagicMock()
     monkeypatch.setattr(
         "flamepy.app.client.core_client.unregister_application",
         MagicMock(side_effect=RuntimeError("control plane unavailable")),
     )
-    monkeypatch.setattr("flamepy.core.cache.delete_objects", delete_objects)
 
     with pytest.raises(RuntimeError, match="control plane unavailable"):
         runtime._unregister_application()
 
-    delete_objects.assert_not_called()
     runtime._cleanup_package_artifacts.assert_not_called()
 
 
@@ -2782,16 +2764,13 @@ def test_unregister_leaves_registered_package_cleanup_to_object_cache(monkeypatc
     runtime._cleanup_local_package = MagicMock()
     runtime._cleanup_storage = MagicMock()
     unregister = MagicMock()
-    delete_objects = MagicMock()
     monkeypatch.setattr("flamepy.app.client.core_client.unregister_application", unregister)
-    monkeypatch.setattr("flamepy.core.cache.delete_objects", delete_objects)
 
     runtime._unregister_application()
 
     unregister.assert_called_once_with("draining-app")
     runtime._cleanup_local_package.assert_called_once_with()
     runtime._cleanup_storage.assert_not_called()
-    delete_objects.assert_not_called()
 
 
 def test_runtime_close_serializes_with_service_creation(monkeypatch):
@@ -2869,3 +2848,12 @@ def test_executor_environments_default_to_the_client_python_version():
     assert _executor_environments({"A": "1"}, None) == {"A": "1", "FLAME_PYTHON_VERSION": client}
     assert _executor_environments({"FLAME_PYTHON_VERSION": "3.12"}, None) == {"FLAME_PYTHON_VERSION": "3.12"}
     assert _executor_environments({"FLAME_PYTHON_VERSION": "3.12"}, "3.13") == {"FLAME_PYTHON_VERSION": "3.13"}
+
+
+def test_cache_storage_cleanup_does_not_delete_remote_packages():
+    """Object-service package cleanup is owned by server garbage collection."""
+    runtime = object.__new__(Runtime)
+    runtime._package_filename = "package.tar.gz"
+    runtime._storage_backend = CacheStorage("grpc://host:9090", app_name="app")
+    assert not hasattr(runtime._storage_backend, "delete")
+    runtime._cleanup_storage()

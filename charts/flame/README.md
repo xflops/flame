@@ -11,7 +11,10 @@ and tasks within those workers. The chart installs executor managers as a Daemon
 with host networking, host PID access, and root privileges. The object cache always runs
 in that pod and uses the same host network, so each worker stores and serves its
 own objects. With persistence enabled, cache files stay on the node's
-`objectCache.persistence.hostPath` across pod restarts.
+`objectCache.persistence.hostPath` across pod restarts. Object storage uses the
+filesystem directly, with bounded streaming I/O and no in-memory object eviction
+policy. Active GET requests share one data-file descriptor per request; writes
+and metadata operations need additional file-descriptor headroom.
 
 ## Host workers
 

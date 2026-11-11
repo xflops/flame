@@ -381,13 +381,19 @@ next_value = flamepy.get_object(next_ref)
 all_values = flamepy.get_object(next_ref, deserializer=lambda parts: parts)
 ```
 
+PUT and PATCH declare the exact encoded byte count in their write header. The
+SDK derives this after serialization and compression, or from the opened file
+for package uploads; callers do not supply a size. Zero declares an empty
+payload. A truncated or oversized stream is rejected without committing a part.
+
 Object references are versioned: an object's version is its number of data parts, so a new object is version 1. `version=0` forces a fresh download. Nonzero versions allow the client to reuse cached state and request only the data after that version. Objects are never replaced; `patch_object()` appends data.
 
-Lower-level helpers under `flamepy.core` expose `ObjectKey`,
-`delete_objects()`, and the application package helpers `upload_package()`,
-`download_package()` and `delete_package()`, which keep a package at
-`<app>/pkg/<filename>` and replace one of the same name. The `flamepy.cache` namespace provides common object cache
-operations and reference types.
+Lower-level helpers under `flamepy.core` expose `ObjectKey`, `upload_package()`,
+and `download_package()`. Packages use `<app>/pkg/<filename>` keys. Reusing a
+filename appends another part, while package downloads require one part; use a
+new name for each package. The `flamepy.cache` namespace provides object operations and
+reference types without a deletion API. Server garbage collection removes data
+after its owning session is gone; packages follow application lifetime.
 
 For asyncio callers, `flamepy.core.aio.cache` exposes awaitable versions of
 these cache operations with the same names. Import it as `aio_cache` and call
@@ -469,7 +475,8 @@ Class-level calls such as `Counter.increment()` are not supported. Call methods
 on the remote proxy with `counter.increment()`. The decorator options configure
 the session created by each `.remote()` call. `app.destroy()` closes the
 sessions created by this process. If this process registered the application,
-`app.destroy()` also unregisters it and removes its package and cache. With
+`app.destroy()` also unregisters it; server garbage collection later reclaims
+its session data and application packages. With
 `fail_if_exists=False`,
 an existing application is borrowed and its lifecycle remains the user's
 responsibility; `app.destroy()` does not unregister it. Application execution
@@ -531,7 +538,7 @@ The repository-level check validates the `flmrun` template, App package upload/i
 | Tasks | `Session.run()`, `Session.submit()`, `Session.create_task()`, `Session.watch_task()` |
 | Applications | `register_application()`, `unregister_application()`, `get_application()`, `list_applications()` |
 | Services | `FlameService`, `flamepy.run()`, `flamepy.serving.Instance`, `flamepy.serving.open_session()` |
-| Objects | `put_object()`, `get_object()`, `patch_object()`, `delete_objects()`, `upload_package()`, `download_package()` |
+| Objects | `put_object()`, `get_object()`, `patch_object()`, `upload_package()`, `download_package()` |
 | App | `flamepy.app.init()`, `flamepy.app.service()`, `flamepy.app.destroy()`, `flamepy.app.session_context()`, `flamepy.app.publish_attributes()`, `flamepy.app.retract_attributes()`, `ServiceInstance`, `ObjectFuture` |
 
 See also:

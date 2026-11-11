@@ -52,12 +52,6 @@ data:
     cache:
       endpoint: {{ include "flame.cacheEndpoint" . | quote }}
       storage: {{ .Values.objectCache.storage | quote }}
-      eviction:
-        policy: {{ .Values.objectCache.eviction.policy | quote }}
-        max_memory: {{ .Values.objectCache.eviction.maxMemory | quote }}
-        {{- if .Values.objectCache.eviction.maxObjects }}
-        max_objects: {{ .Values.objectCache.eviction.maxObjects }}
-        {{- end }}
       gc:
         interval: {{ .Values.objectCache.gc.interval | quote }}
       {{- if .Values.tls.enabled }}

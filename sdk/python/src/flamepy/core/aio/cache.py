@@ -17,8 +17,10 @@ namespace. Channels are owned by the event loop that created them.
 """
 
 import asyncio
+import contextlib
 import logging
 import os
+import stat
 import tempfile
 import threading
 from typing import Any, AsyncIterator, Optional
@@ -27,7 +29,7 @@ from urllib.parse import urlparse
 import grpc
 
 from flamepy.core import cache as common
-from flamepy.core.cache import Deserializer, FetchResult, ObjectKey, ObjectRef, Ref, ValueRef
+from flamepy.core.cache import PACKAGE_SESSION, Deserializer, FetchResult, ObjectKey, ObjectRef, Ref, ValueRef
 from flamepy.core.types import FlameClientCache, FlameClientTls
 from flamepy.proto import cache_pb2, cache_pb2_grpc
 
@@ -141,14 +143,29 @@ def _configured_endpoint():
     return endpoint, tls
 
 
-async def _write_remote(client: Any, key: str, data_type: str, chunks: AsyncIterator[bytes], *, patch: bool = False, timeout: Optional[int] = None) -> ObjectRef:
+async def _write_remote(client: Any, key: str, data_type: str, chunks: AsyncIterator[bytes], *, size: int, patch: bool = False, timeout: Optional[int] = None) -> ObjectRef:
+    source_error = None
+
     async def requests():
-        yield cache_pb2.CacheWriteRequest(header=cache_pb2.CacheWriteHeader(key=key, data_type=data_type))
-        async for chunk in chunks:
-            yield cache_pb2.CacheWriteRequest(data=chunk)
+        nonlocal source_error
+        yield cache_pb2.CacheWriteRequest(header=cache_pb2.CacheWriteHeader(key=key, data_type=data_type, size=size))
+        try:
+            async for chunk in chunks:
+                yield cache_pb2.CacheWriteRequest(data=chunk)
+        except Exception as error:
+            source_error = error
+            raise
 
     rpc = client.Patch if patch else client.Put
-    metadata = await rpc(requests(), timeout=timeout)
+    try:
+        metadata = await rpc(requests(), timeout=timeout)
+    except (asyncio.CancelledError, grpc.aio.AioRpcError):
+        # gRPC cancels the request when its producer fails. Preserve that
+        # producer's error instead of making a local read failure look like
+        # cancellation of the caller's task.
+        if source_error is not None:
+            raise source_error
+        raise
     return ObjectRef(endpoint=metadata.endpoint, key=metadata.key, version=metadata.version)
 
 
@@ -161,7 +178,7 @@ async def put_object(key_prefix: str, obj: Any) -> ObjectRef:
     object_key = ObjectKey.from_prefix(key_prefix)
     endpoint, tls = _configured_endpoint()
     data_type, data = await asyncio.to_thread(common._encode_object_data, obj)
-    ref = await _write_remote(_get_client(endpoint, tls), object_key.to_prefix(), data_type, _byte_chunks(data))
+    ref = await _write_remote(_get_client(endpoint, tls), object_key.to_prefix(), data_type, _byte_chunks(data), size=len(data))
     logger.debug("put_object: key=%s, version=%s", ref.key, ref.version)
     return ref
 
@@ -176,46 +193,75 @@ async def _read_get_parts(responses: Any):
         raise ValueError("Cache Get returned no header")
     if first.WhichOneof("payload") != "header":
         raise ValueError("Cache Get must start with a header")
-    header = first.header
+    if not first.header.HasField("metadata"):
+        raise ValueError("Cache Get header omitted metadata")
+    metadata = first.header.metadata
+    if not metadata.uuid or metadata.version < 1 or not metadata.data_type:
+        raise ValueError("Cache Get metadata must identify an object and its committed parts")
     parts = []
-    version = None
+    part = None
     data = bytearray()
     async for response in responses:
         if response.WhichOneof("payload") != "chunk":
             raise ValueError("Unexpected Cache Get header after data")
         chunk = response.chunk
-        if version is None:
-            version = chunk.version
-        elif chunk.version != version:
-            parts.append((version, bytes(data)))
-            version = chunk.version
+        if part is None:
+            part = chunk.part
+        elif chunk.part != part:
+            parts.append((part, bytes(data)))
+            part = chunk.part
             data.clear()
         data.extend(chunk.data)
-    if version is not None:
-        parts.append((version, bytes(data)))
-    return header, parts
+    if part is not None:
+        parts.append((part, bytes(data)))
+    return metadata, parts
 
 
-def _decode_parts(header: Any, parts: list) -> Optional[FetchResult]:
-    """Decode the parts of a Get response, one per version, in increasing order.
-
-    No parts means the client already has the current version. Otherwise the
-    parts are consecutive and the last one is the current version.
-    """
+def _decode_parts(metadata: Any, parts: list, requested_version: int = 0, requested_uuid: str = "", mode: int = cache_pb2.OBJECT) -> Optional[FetchResult]:
+    """Validate the requested part range before decoding any payload."""
+    if mode == cache_pb2.METADATA:
+        if parts:
+            raise ValueError("Metadata Get must not contain data parts")
+        return None
+    if requested_uuid and metadata.uuid != requested_uuid:
+        raise ValueError("Cache Get returned a different object UUID")
+    if mode == cache_pb2.PATCHES:
+        if requested_version and not requested_uuid:
+            raise ValueError("Incremental Get requires an object UUID")
+        if requested_version > metadata.version:
+            raise ValueError("Cache Get cursor is ahead of the returned object")
+        first = requested_version
+    elif mode == cache_pb2.OBJECT:
+        first = 0
+        if requested_version and metadata.version != requested_version:
+            raise ValueError("Object Get did not return the requested prefix")
+    else:
+        raise ValueError("Unknown Cache Get mode")
+    expected = list(range(first, metadata.version))
+    if [part for part, _ in parts] != expected:
+        raise ValueError("Cache Get parts must be consecutive, start at the requested part, and end at the object version")
     if not parts:
         return None
-    versions = [version for version, _ in parts]
-    if versions != list(range(versions[0], versions[0] + len(versions))) or versions[-1] != header.version:
-        raise ValueError("Cache Get response versions must be consecutive and end at the version of the object")
-    data_type, compression = common._type_and_compression(header.data_type)
+    data_type, compression = common._type_and_compression(metadata.data_type)
     data = [common._deserialize_object_data(data_type, common._decompress_data(raw, compression)) for _, raw in parts]
-    return FetchResult(version=header.version, data=data)
+    return FetchResult(version=metadata.version, data=data, uuid=metadata.uuid)
 
 
-async def _fetch_object_data(ref: ObjectRef, cached_version: int) -> Optional[FetchResult]:
+async def _fetch_object_data(ref: ObjectRef, cached_version: int, cached_uuid: str = "") -> Optional[FetchResult]:
     client = _get_client(ref.endpoint, common._get_cache_tls_config())
-    header, parts = await _read_get_parts(client.Get(cache_pb2.CacheGetRequest(key=ref.key, version=cached_version)))
-    return await asyncio.to_thread(_decode_parts, header, parts)
+    mode = cache_pb2.PATCHES if cached_version else cache_pb2.OBJECT
+    metadata, parts = await _read_get_parts(client.Get(cache_pb2.CacheGetRequest(key=ref.key, version=cached_version, uuid=cached_uuid, mode=mode)))
+    if metadata.key != ref.key:
+        raise ValueError("Cache Get returned metadata for a different key")
+    return await asyncio.to_thread(_decode_parts, metadata, parts, cached_version, cached_uuid, mode)
+
+
+async def _get_metadata(client: Any, key: str):
+    metadata, parts = await _read_get_parts(client.Get(cache_pb2.CacheGetRequest(key=key, mode=cache_pb2.METADATA)))
+    if metadata.key != key:
+        raise ValueError("Cache Get returned metadata for a different key")
+    _decode_parts(metadata, parts, mode=cache_pb2.METADATA)
+    return metadata
 
 
 async def get_object(ref: Ref, deserializer: Optional[Deserializer] = None) -> Any:
@@ -226,66 +272,66 @@ async def get_object(ref: Ref, deserializer: Optional[Deserializer] = None) -> A
     ObjectKey.from_key(ref.key)
     cache_key = (ref.endpoint, ref.key)
     if ref.version == 0:
-        # A forced refresh starts over.
         common._cache_remove(cache_key)
-    cached = common._cache_get(cache_key)
-    cached_version = cached.version if cached else 0
-    try:
-        result = await _fetch_object_data(ref, cached_version)
-    except grpc.aio.AioRpcError as error:
-        if not cached_version or error.code() != grpc.StatusCode.INVALID_ARGUMENT:
-            raise
-        # The cached version is ahead of the object (an invalid version): it is
-        # another object of the same key.
-        common._cache_remove(cache_key)
-        cached_version = 0
-        result = await _fetch_object_data(ref, 0)
-    if result is None:
-        cached = common._cache_get(cache_key) if cached_version else None
-        if cached is None:
-            raise ValueError(f"Object not found: {ref.key}")
-    else:
-        cached = common._cache_append_parts(cache_key, result, cached_version)
-        if cached is None:
-            # The cached object was dropped while fetching, so the data after
-            # its version is not enough: get all the data.
-            everything = await _fetch_object_data(ref, 0)
-            if everything is None:
+    while True:
+        cached, token = common._cache_snapshot(cache_key)
+        cached_version = cached.version if cached else 0
+        cached_uuid = cached.uuid if cached else ""
+        try:
+            result = await _fetch_object_data(ref, cached_version, cached_uuid)
+        except grpc.aio.AioRpcError as error:
+            if not cached_version or error.code() not in (grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.FAILED_PRECONDITION):
+                raise
+            # Invalidate only the entry used by this request; a newer fetch may
+            # already have installed a replacement object.
+            with common._cache_lock:
+                if common._object_cache.get(cache_key) is cached and common._cache_tokens.get(cache_key) is token:
+                    common._object_cache.pop(cache_key, None)
+                    common._cache_tokens.pop(cache_key, None)
+            continue
+        if result is None:
+            if cached is None:
                 raise ValueError(f"Object not found: {ref.key}")
-            cached = common._cache_append_parts(cache_key, everything)
-    return await asyncio.to_thread(common._materialize_object, cached, deserializer)
+            if not common._cache_snapshot_matches(cache_key, cached, token):
+                continue
+            return await asyncio.to_thread(common._materialize_object, cached, deserializer)
+        published = common._cache_append_parts(cache_key, result, cached_version, expected=cached, token=token)
+        if published is not None:
+            return await asyncio.to_thread(common._materialize_object, published, deserializer)
 
 
 async def patch_object(ref: ObjectRef, data: Any) -> ObjectRef:
     ObjectKey.from_key(ref.key)
     client = _get_client(ref.endpoint, common._get_cache_tls_config())
-    metadata = await client.GetMetadata(cache_pb2.CacheGetMetadataRequest(key=ref.key))
+    metadata = await _get_metadata(client, ref.key)
     stored_type, compression = common._type_and_compression(metadata.data_type)
     data_type, payload = await asyncio.to_thread(common._serialize_object_data, data)
     if data_type != stored_type:
         raise ValueError(f"Patch data type {data_type!r} does not match cached object type {stored_type!r}")
     payload = await asyncio.to_thread(common._compress_data, payload, compression)
     # The cached parts stay valid: the next get adds what was appended.
-    return await _write_remote(client, ref.key, metadata.data_type, _byte_chunks(payload), patch=True)
+    return await _write_remote(client, ref.key, metadata.data_type, _byte_chunks(payload), size=len(payload), patch=True)
 
 
-async def delete_objects(key_prefix: str, endpoint: Optional[str] = None) -> None:
-    object_key = ObjectKey.from_path(key_prefix)
+async def _upload_file(key: str, file_path: str, endpoint: Optional[str], source=None) -> ObjectRef:
     endpoint, tls = _endpoint_and_tls(endpoint)
-    await _get_client(endpoint, tls).Delete(cache_pb2.CacheDeleteRequest(key=str(object_key)))
-    common._cache_remove_matching(object_key)
-
-
-async def _upload_file(key: str, file_path: str, endpoint: Optional[str]) -> ObjectRef:
-    endpoint, tls = _endpoint_and_tls(endpoint)
-
-    async def chunks():
-        with open(file_path, "rb") as source:
-            while data := await asyncio.to_thread(source.read, common._UPLOAD_CHUNK_SIZE):
-                yield data
 
     try:
-        return await _write_remote(_get_client(endpoint, tls), key, common._TYPE_RAW, chunks(), timeout=300)
+        with contextlib.nullcontext(source) if source is not None else open(file_path, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError(f"Package source is not a regular file: {file_path}")
+            size = info.st_size - handle.tell()
+            if size < 0:
+                raise ValueError("Package source position is beyond its size")
+
+            async def chunks():
+                while data := await asyncio.to_thread(handle.read, common._UPLOAD_CHUNK_SIZE):
+                    yield data
+
+            return await _write_remote(_get_client(endpoint, tls), key, common._TYPE_RAW, chunks(), size=size, timeout=300)
+    except grpc.RpcError:
+        raise
     except Exception as exc:
         raise ValueError(f"Failed to upload file to cache server: {exc}") from exc
 
@@ -297,26 +343,28 @@ async def _download_file(ref: ObjectRef, dest_path: str) -> None:
     if dest_dir:
         await asyncio.to_thread(os.makedirs, dest_dir, exist_ok=True)
     try:
-        responses = client.Get(cache_pb2.CacheGetRequest(key=ref.key, version=0)).__aiter__()
+        responses = client.Get(cache_pb2.CacheGetRequest(key=ref.key, mode=cache_pb2.OBJECT)).__aiter__()
         try:
             first = await responses.__anext__()
         except StopAsyncIteration:
             first = None
         if first is None or first.WhichOneof("payload") != "header":
             raise ValueError("Cache Get must start with a header")
-        data_type, compression = common._type_and_compression(first.header.data_type)
+        if not first.header.HasField("metadata") or first.header.metadata.version != 1 or not first.header.metadata.uuid:
+            raise ValueError("expected raw data of the first version only")
+        data_type, compression = common._type_and_compression(first.header.metadata.data_type)
         saw_base = False
         with open(dest_path, "wb") as output:
             if compression == common._COMPRESSION_NONE:
                 async for response in responses:
-                    if response.WhichOneof("payload") != "chunk" or response.chunk.version != 1 or data_type != common._TYPE_RAW:
+                    if response.WhichOneof("payload") != "chunk" or response.chunk.part != 0 or data_type != common._TYPE_RAW:
                         raise ValueError("expected raw data of the first version only")
                     saw_base = True
                     await asyncio.to_thread(output.write, response.chunk.data)
             else:
                 with tempfile.TemporaryFile() as compressed:
                     async for response in responses:
-                        if response.WhichOneof("payload") != "chunk" or response.chunk.version != 1 or data_type != common._TYPE_RAW:
+                        if response.WhichOneof("payload") != "chunk" or response.chunk.part != 0 or data_type != common._TYPE_RAW:
                             raise ValueError("expected raw data of the first version only")
                         saw_base = True
                         await asyncio.to_thread(compressed.write, response.chunk.data)
@@ -339,10 +387,6 @@ async def _download_file(ref: ObjectRef, dest_path: str) -> None:
         raise ValueError(f"Failed to download file from cache server: {exc}") from exc
 
 
-# Application packages are objects of the "pkg" session of their application.
-PACKAGE_SESSION = "pkg"
-
-
 def _package_key(app_name: str, filename: str) -> str:
     key = str(ObjectKey(app_name=app_name, session_id=PACKAGE_SESSION, object_id=filename))
     ObjectKey.from_key(key)
@@ -351,24 +395,22 @@ def _package_key(app_name: str, filename: str) -> str:
 
 async def upload_package(app_name: str, file_path: str, filename: Optional[str] = None, endpoint: Optional[str] = None) -> ObjectRef:
     """Upload the application package `file_path` as `<app_name>/pkg/<filename>`
-    (the file's name by default). An object is never replaced, so a package of
-    the same name is deleted first."""
-    if not await asyncio.to_thread(os.path.exists, file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
+    (the file's name by default). Uploading an existing name appends another
+    part. Package downloads require one part, so use a new filename for each
+    package revision."""
     key = _package_key(app_name, filename or os.path.basename(file_path))
-    await delete_objects(key, endpoint)
-    return await _upload_file(key, file_path, endpoint)
+    # Validate and reuse one handle so changing the path cannot switch the source
+    # between validation and upload.
+    with open(file_path, "rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise ValueError(f"Package source is not a regular file: {file_path}")
+        return await _upload_file(key, file_path, endpoint, source)
 
 
 async def download_package(app_name: str, filename: str, dest_path: str, endpoint: Optional[str] = None) -> None:
-    """Download the application package `<app_name>/pkg/<filename>` to `dest_path`."""
+    """Download the single-part package `<app_name>/pkg/<filename>` to `dest_path`."""
     endpoint, _ = _endpoint_and_tls(endpoint)
     await _download_file(ObjectRef(endpoint=endpoint, key=_package_key(app_name, filename), version=0), dest_path)
-
-
-async def delete_package(app_name: str, filename: str, endpoint: Optional[str] = None) -> None:
-    """Delete the application package `<app_name>/pkg/<filename>`."""
-    await delete_objects(_package_key(app_name, filename), endpoint)
 
 
 __all__ = [
@@ -379,9 +421,7 @@ __all__ = [
     "put_object",
     "get_object",
     "patch_object",
-    "delete_objects",
     "upload_package",
     "download_package",
-    "delete_package",
     "close",
 ]

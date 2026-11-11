@@ -21,6 +21,7 @@ clap_complete = { workspace = true }
 chrono = { workspace = true }
 
 url = { workspace = true }
+uuid = { workspace = true }
 
 comfy-table = { workspace = true }
 

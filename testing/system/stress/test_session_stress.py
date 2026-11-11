@@ -22,12 +22,12 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import suppress
 from dataclasses import replace
+
 import flamepy
 import pytest
 from e2e.api import TestContext
 from e2e.api import TestRequest as E2ETestRequest
 from e2e.helpers import invoke_task, serialize_common_data
-
 from system_common import (
     FLM_SYSTEM_TEST_APP,
     FuzzedTaskSpec,
@@ -39,7 +39,6 @@ from system_common import (
     _stress_profile,
     _write_system_report,
 )
-
 
 pytestmark = pytest.mark.usefixtures("setup_system_test_env")
 
@@ -123,7 +122,7 @@ def test_parallel_sessions_task_stress():
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = [executor.submit(run_task, task_spec) for task_spec in task_specs]
             for future in as_completed(futures):
-                session_index, session_id, output, elapsed_ms = future.result()
+                session_index, _session_id, output, elapsed_ms = future.result()
                 assert output.startswith("output:")
                 outputs_by_session[session_index] += 1
                 task_latency_ms.append(round(elapsed_ms, 3))

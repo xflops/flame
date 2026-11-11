@@ -1,389 +1,205 @@
-# Flame Object Cache
+# Flame Object Storage Service
 
-Object cache service for Flame distributed system.
+`flame-object-cache` stores opaque client-encoded object bytes in the filesystem.
+Despite its existing service name, it has no server-side payload cache, LRU,
+object proxies, memory budget, or `none` storage backend. PUT, PATCH, and GET
+stream bounded chunks directly through filesystem part writers and readers.
 
-## Overview
+Clients choose the encoding, such as Arrow IPC, cloudpickle, or compressed raw
+bytes. Existing Python/Rust SDK client caches are separate from server storage.
 
-The `flame-object-cache` is a standalone service that stores opaque client-encoded bytes. It uses a streaming gRPC API; persistent PUT and GET process payloads in bounded chunks, while PATCH buffers its uploaded part before appending it. The open files of recently used objects of a persistent store are kept in memory; `storage: none` has no store at all, only the in-memory cache. Clients choose their own value encoding, including Arrow IPC for table values, and provide a data type such as `raw.zstd` when they compress the bytes.
+## Objects, parts, and chunks
 
-## Features
+- **Object:** UUID, key, encoding, committed part count, size, and the part
+  descriptors selected for a captured request.
+- **Part:** A zero-based index, size, creation timestamp, and SHA-256 checksum.
+  Part descriptors contain no payload buffers.
+- **Chunk:** Internal transfer bytes with their owning part index and
+  part-relative offset. A part may span many chunks, including an empty chunk
+  for an empty part.
 
-- **Standalone Service**: Runs as a dedicated process/container for centralized caching
-- **Version Tracking**: The version of an object is its number of data parts: 1 when created, incremented by each append
-- **Conditional Get**: Clients can check if their cached copy is still valid (RFE426)
-- **Client-Side Caching**: Python SDK caches objects locally, reducing network round-trips
-- **Payload Integrity**: Persistent stores write a SHA-256 checksum for each payload part and verify it while streaming reads; a checksum mismatch fails the stream
-- **Persistent Storage**: An object is a directory of `metadata.json`, `index.bin` and `data.bin` files, or with `storage: none` not at all (the in-memory cache is then the only copy, and nothing survives a restart)
-- **Streaming gRPC API**: Chunked transfer without server-side value encoding; persistent PUT and GET use bounded chunk buffers, while PATCH buffers its uploaded part
-- **Metadata-Only Startup**: Startup scans object metadata; payloads are never loaded at startup
-- **Client-Side Compression**: The Python SDK compresses structured data and tensors; the cache stores their bytes unchanged
-- **Create-Only Objects**: An object is created once and then only grows by appended data, like the layers of an overlay filesystem; it is never replaced
-- **Eviction Policies**: LRU eviction with `max_memory` and `max_objects` limits for the resident (in-memory) data. With a disk store the resident data is only the handle of an object, its key, data type, number of parts and open `index.bin` and `data.bin`, so reads need no open or close and never hold payload or index bytes: a read seeks to the part's fixed-size record in `index.bin`, then to its payload in `data.bin`. Data is appended through the same handle, so the handle stays valid; an evicted handle is opened again. Under `storage: none` there is no store to read back from: every object is resident with all its parts whatever its size, eviction applies, and an evicted object is lost. A `none` cache cannot stream objects larger than memory, because a write is assembled in memory (bounded by `max_memory`)
+The service exposes PUT, PATCH, and GET. Metadata listing is internal; deletion
+is internal to GC.
+PUT and PATCH create an object if missing; otherwise they append a part.
+Each committed part increments its version. Readers select Committed parts in logical commit order and skip
+Writing and Stale slots. Deletion and
+recreation produce a new UUID. Payloads persist across server restart.
+
+## Modules
+
+| Module | Responsibility |
+| --- | --- |
+| [`model/`](src/model/mod.rs) | Object/Part descriptors, metadata/filter/key types, and internal Chunk. |
+| [`storage/`](src/storage/mod.rs) | Direct filesystem implementation, checksummed files, part reader/writer contracts, metadata catalog, recovery, and deletion. |
+| [`controller/`](src/controller/mod.rs) | Direct storage operations, advertised endpoint, and server startup. |
+| [`storage/dao.rs`](src/storage/dao.rs) | Filesystem object, metadata, and part DAO records and domain conversions. |
+| [`storage/object_reader.rs`](src/storage/object_reader.rs) | Select and stream captured filesystem part readers. |
+| [`storage/object_writer.rs`](src/storage/object_writer.rs) | Incremental hashing and filesystem part writes without catalog access. |
+| [`storage/part_reader.rs`](src/storage/part_reader.rs) | Part reader contract, positional filesystem reads, and checksum validation. |
+| [`storage/part_writer.rs`](src/storage/part_writer.rs) | Physical part allocation, parallel positional writes, and durability operations. |
+| [`controller/grpc.rs`](src/controller/grpc.rs) | RPC framing and the three GET handlers. |
+| [`controller/gc.rs`](src/controller/gc.rs) | Garbage collection through internal storage deletion. |
 
 ## Configuration
 
-### Server Configuration (`flame-cluster.yaml`)
-
 ```yaml
+cluster:
+  name: flame
+  endpoint: http://127.0.0.1:8080
 cache:
-  endpoint: "grpc://0.0.0.0:9090"
-  advertise: "eth0"
-  storage: "fs:///var/lib/flame/cache"
-  eviction:
-    policy: lru
-    max_memory: "8G"
+  endpoint: grpc://0.0.0.0:9090
+  advertise: eth0
+  storage: fs://cache
   gc:
     interval: 60s
 ```
 
-Object references carry the address the cache advertises. Clients read, patch,
-and delete through that address, so each reference identifies the instance
-holding its object. The advertised address is selected in this order:
+Storage defaults to `fs://cache` when omitted. Relative fs/file URLs resolve under
+`FLAME_HOME` (default `/var/lib/flame`); plain paths and absolute filesystem URLs
+are supported. `FLAME_CACHE_STORAGE` overrides the storage path. Empty paths,
+`none`, and non-filesystem URL schemes are rejected. Eviction configuration is
+removed.
 
-1. `cache.advertise`, when nonempty;
-2. the `FLAME_CACHE_ADVERTISE` environment variable, when nonempty;
-3. the first private IPv4 address of a non-loopback interface;
-4. `cache.endpoint` as configured.
+`cache.advertise` accepts an interface selector, IP, hostname, host:port, or URL.
+It takes precedence over `FLAME_CACHE_ADVERTISE`. Explicit IP/interface selectors
+also choose the listener address. DNS advertisements retain wildcard binding;
+the listener port comes from `cache.endpoint`. With neither setting, references
+use a discovered private interface address or the configured endpoint.
 
-An explicit IP address or interface name/regex selects both the listener IP
-and the address in object references. For example, `"eth0"` or `"^eth0$"` uses
-the first IPv4 address on the first matching interface in name order;
-`"127.0.0.1"` selects loopback. Binding resolves the raw effective advertise
-value as an IP or interface selector, without parsing a URL or extracting a
-host. The listener port always comes from `cache.endpoint`.
+GC is enabled with a default 60-second interval; `cache.gc.interval` overrides
+that interval. Its FSM client uses the cluster endpoint/TLS configuration.
+Existing `cache.tls` and `cache.pprof` settings remain available. TLS uses a
+`grpcs://` endpoint; returned references use the client-compatible `grpc+tls://`
+scheme.
 
-Full URLs, `IP:port` values, and DNS addresses remain valid advertisements but
-keep the listener on `0.0.0.0` when they do not match an interface selector.
-This includes URLs with numeric IP hosts. They can name a proxy without
-restricting the listener. A full URL supplies its own scheme and advertised
-port; bare hosts or `host:port` inherit missing values from `cache.endpoint`.
-An advertised port override changes only object references. If neither advertise setting is supplied, the listener also
-stays on `0.0.0.0`, even when references use an automatically selected private
-address. Startup logs show the bind address and advertised endpoint together.
-
-A client using `127.0.0.1` cannot reach a listener bound only to a non-loopback
-IP. Point local clients at the selected IP, use a loopback IP/interface for
-local-only access, or unset both advertise settings to keep wildcard listening.
-The configuration value takes precedence over the environment for both
-binding and advertisement.
-
-Stale application-data garbage collection is always enabled. The `gc` section
-only overrides its 60-second default interval.
-
-Disk reads and writes use positional file I/O on blocking threads. An object is
-created in a temporary directory, synced and renamed into place, so an aborted
-or failed upload leaves nothing behind. An append adds its payload to
-`data.bin` and is committed by its record in `index.bin`. A `Get` holds the object's
-read lock until its response ends, so a slow client delays writers and
-deleters of that object: put, patch and delete take the object's write lock,
-and a delete of a prefix takes the lock of every object it matches.
-
-Disk storage removes empty session and application directories after deletion.
-Startup recovery also removes empty directories left by earlier versions.
-Nonempty directories, the cache root, and the filesystem's `lost+found`
-directory are preserved.
-
-### Client Configuration (`flame.yaml`)
-
-```yaml
-clusters:
-  - name: flame
-    endpoint: "http://flame-session-manager:8080"
-    cache:
-      endpoint: "grpc://flame-object-cache:9090"
-      storage: "/tmp/flame_cache"  # Optional: local storage path
-```
-
-### Environment Variables
-
-- `FLAME_CACHE_STORAGE`: Override cache storage path
-- `FLAME_HOME`: Flame installation directory
-
-## Running
-
-### Standalone Binary
-
-```bash
-# Run with default config location
-flame-object-cache --config /etc/flame/flame-cluster.yaml
-
-# Run with custom config
-flame-object-cache --config ./my-config.yaml
-```
-
-### Using the install script
-
-The object cache runs on each worker, so a worker install includes it:
-
-```bash
-# A worker: the executor manager and the object cache, joined to the head
-curl -fsSL https://xflops.io/flame/setup.sh | sudo FLAME_ENDPOINT=http://HEAD:8080 sh -s -- --join
-```
-
-### Docker
-
-```bash
-# Build the image
-docker build -f docker/Dockerfile.foc -t xflops/flame-object-cache .
-
-# Run container
-docker run -d \
-  -v ./flame-cluster.yaml:/root/.flame/flame-cluster.yaml \
-  -v flame-cache:/var/lib/flame/cache \
-  -p 9090:9090 \
-  xflops/flame-object-cache
-```
-
-### Docker Compose
-
-```bash
-# Start all services including object cache
-docker compose up -d
-
-# View cache logs
-docker compose logs flame-object-cache
-
-# Stop services
-docker compose down
-```
-
-## Python SDK Usage
-
-```python
-from flamepy.core.cache import (
-    ObjectRef,
-    get_object,
-    patch_object,
-    put_object,
-    update_object,
-)
-
-# Put an object (returns ObjectRef with version=1)
-ref = put_object("app/session", my_data)
-print(f"Stored at: {ref.key}, version: {ref.version}")
-
-# The SDK uses ZSTD for arrays, tables, data frames, and tensors regardless
-# of payload size; their data type gains a .zstd suffix. Arbitrary pickled
-# objects and raw file uploads, including .tar.gz packages, remain uncompressed.
-
-# Get an object (uses client-side cache if version matches). The value is the
-# newest data part, so an object with appended data returns the newest.
-data = get_object(ref)
-
-# Force fresh fetch (bypass cache)
-ref.version = 0
-fresh_data = get_object(ref)
-
-# Patch appends data to the object
-patched_ref = patch_object(ref, delta_data)
-
-# Get with a deserializer that makes a value of all the data parts, in the
-# order they were written (the first is the data the object was created with)
-def merge_lists(parts):
-    result = []
-    for part in parts:
-        result.extend(part)
-    return result
-
-merged = get_object(ref, deserializer=merge_lists)
-```
-
-## Version Tracking (RFE426)
-
-Objects have version numbers that enable efficient client-side caching:
-
-1. **PUT**: Creates object with `version=1`; an existing key is an error
-2. **PATCH**: Appends data, increments version
-3. **GET**: Get the data after a version: nothing if the client has the current version
-
-Client-side caching workflow:
-```
-Client                              Server
-  |                                    |
-  |-- Get(key, version=0) ------------>|  (version=0 means "give me latest")
-  |<-- [header, bytes] ---------------|  (client caches object, version=1)
-  |                                    |
-  |-- Get(key, version=1) ------------>|  (client has version 1)
-  |<-- [header] -----------------------|  (no data: nothing after version 1)
-```
-
-## Storage Structure
+## Filesystem layout
 
 ```text
-/var/lib/flame/cache/
-└── app_name/
-    └── session_id/
-        └── object1/
-            ├── metadata.json   # shared data type
-            ├── index.bin       # one 56-byte record per committed part
-            └── data.bin        # append-only payload bytes
+<storage-root>/
+├── .uploads/
+└── <application>/<session>/<object>/
+    ├── metadata.json
+    ├── index.bin
+    └── data.bin
 ```
 
-`metadata.json` contains the client-defined `data_type`.
-Every `index.bin` record contains these
-fields in order, without a file header:
+Filesystem records use `ObjectDao`, `ObjectMetadataDao`, and `PartDao`, kept
+private to storage. ObjectDao combines the stored metadata and all physical part states;
+readers and writers exchange the domain types instead. The metadata JSON retains UUID/type fields; each 72-byte index entry also
+persists its Writing, Committed, or Stale state and logical commit index.
 
-| Field | Encoding | Bytes |
-|-------|----------|-------|
-| Payload offset | Little-endian unsigned integer | 8 |
-| Payload length | Little-endian unsigned integer | 8 |
-| Creation time | Little-endian signed Unix milliseconds | 8 |
-| Payload checksum | SHA-256 digest bytes | 32 |
+Metadata persists the UUID and encoding. The index records each part's physical
+offset, length, creation time, and SHA-256 checksum. Chunks use part-relative
+offsets; physical extents remain private to storage.
 
-An object's version is its number of committed parts; the first PUT creates
-part 1 and every PATCH appends another part. The checksum covers the exact
-encoded payload bytes of that part, including an empty payload. Clients encode
-and optionally compress their values before upload; the cache checks those
-opaque bytes without decoding or decompressing them.
+Storage creates missing object files before allocating a
+block under a short catalog lock. It owns the input stream through commit or
+cleanup, so writers need no catalog handles or mutation callbacks.
 
-PUT computes its digest incrementally as chunks arrive, syncs the payload,
-index and metadata in a temporary directory, and renames the directory into
-place only when complete. PATCH buffers its uploaded part, computes its digest,
-then writes and syncs that payload before appending and syncing the index record
-containing its digest. A complete index record
-commits the part. Bytes beyond committed payload ranges can remain after an
-interrupted append and are ignored. Opening an object removes an incomplete
-trailing index record using its 56-byte record width.
+Each PUT/PATCH header declares the exact encoded payload size. Storage reserves
+a physical ordinal and a disjoint sparse data-file block under a short lock, persists its
+Writing descriptor, then streams bounded chunks directly into that block outside
+the lock. Extra bytes and incomplete bodies are rejected; zero declares an empty
+part. Both SDKs derive sizes from encoded bytes or the already-opened file.
 
-### Integrity and streaming failures
+Commit makes payload and index state durable and assigns a dense logical part
+index. Payload writes and syncs run in parallel; a short metadata lock orders
+commit indexes. A completed part never waits for an earlier allocated upload.
+For example, if the second patch finishes first, it receives the next logical
+index; the first patch receives the following index when it commits. Persisted
+commit indexes keep historical prefixes stable across later writes and restart.
+Storage publishes Committed state and the cached version from the successful
+durability result. Object and part writers perform filesystem I/O without
+accessing the catalog.
+Abort marks only its physical slot Stale. Retried writes append new physical
+slots; delayed I/O cannot overwrite them.
 
-Reads calculate SHA-256 incrementally and compare each delivered part against
-its persisted expected checksum. Memory use is bounded by the stream's chunks,
-not the size of the object. A modified payload fails even when its length is
-unchanged or the object's file handle was already cached.
+Startup calls explicit object recovery. Ordinary descriptor opening only loads
+and validates complete records; it never trims indexes or rewrites part state.
 
-Earlier chunks may reach a reader before the checksum comparison fails. A
-non-OK stream termination invalidates the whole read: clients must discard all
-partially delivered data and must not publish a value or mark it cached until
-the stream completes successfully. A suffix read verifies the parts it returns;
-a conditional GET that returns no payload does not reread or verify bytes the
-client already holds. Listing objects and reading metadata do not verify
-payload integrity.
+Storage initialization changes interrupted Writing parts to Stale, retains the
+dense logical Committed prefix, and trims torn index records without loading
+payloads. A partially persisted commit tail beyond a missing logical index is
+marked Stale without renumbering; acknowledged prefixes remain unchanged.
+Objects with no committed data are removed; stale payload blocks are ignored. Callers use `list(filter)` for discovery; listing does
+not perform recovery. Valid dot-prefixed object IDs are preserved.
 
-These checks detect payload corruption relative to its persisted digest. They
-are not authentication: someone able to replace both a payload and its checksum
-can make them agree. The digest does not authenticate the data type, timestamps,
-or other index fields.
+There is no payload or file-handle cache. Storage's small metadata catalog tracks
+committed files and is updated on commit/deletion. Handles belong to active
+operations and are released when their readers/writers finish or are dropped.
 
-Storage uses `DiskStorage` for persistent files and `ResidentStorage` to cache
-open object handles. Persistent PUT and GET stream in bounded chunks; PATCH
-buffers its uploaded part before appending it.
-`storage: none` instead assembles complete payloads in memory, including PATCH
-payloads, and has no persisted integrity record; its contents do not survive a
-restart.
+## GET modes
 
-## API
+| Mode | Result |
+| --- | --- |
+| `METADATA` | One current metadata header and EOF; no payload reads. |
+| `OBJECT` | Parts before the requested version; version zero selects latest. |
+| `PATCHES` | Parts from the requested cursor to the captured current end. |
 
-The cache server implements `ObjectCacheService` in `cache.proto`:
+OBJECT prefix metadata reports that prefix's count and size. PATCHES metadata
+reports the captured full object. An unchanged suffix returns its header and
+EOF. Nonzero PATCHES cursors require UUID. UUID mismatch returns
+`FAILED_PRECONDITION`; an ahead version returns `INVALID_ARGUMENT`; missing
+objects return `NOT_FOUND`.
 
-| Operation | Description |
-|-----------|-------------|
-| `Put` | Stream a new object; return its metadata |
-| `Patch` | Stream a delta for an existing object; return updated metadata |
-| `Get` | Stream an object's data after a version: all of it for 0 |
-| `GetMetadata` | Get metadata for one object |
-| `List` | Stream metadata for all objects |
-| `Delete` | Delete a key or prefix, including `{app}/*` |
+The controller queries `list(ObjectFilter)`, then calls storage
+`read_object(&mut metadata)` or `read_patch(&mut metadata)`, returning a
+`ChunkStream` of `Result<Chunk, FlameError>`. Object reads use version as the
+exclusive end; patch reads use it as the starting cursor. Storage replaces
+metadata with the captured snapshot before returning the stream. Storage validates
+identity/range and opens only the selected part readers. `ObjectFilter::AllObject`
+selects all current metadata for internal enumeration. `ByKey { key, version }`
+selects an exact key or namespace; `version=None` selects current metadata and
+`Some(N)` projects `[0, N)`, including an empty prefix for `Some(0)`.
+The wire OBJECT value zero instead means latest.
 
-### Wire Protocol Details
+Capturing a chunk stream and emitting its header do not load payload data. A private ObjectReader
+traverses the captured Part descriptors; each PartReader streams bounded Chunk
+values and verifies integrity through `next_chunk`; EOF releases that reader
+before advancing.
+The gRPC adapter maps chunks directly to responses. Corruption fails with
+`DATA_LOSS`; SDKs reject the entire failed result even if earlier chunks arrived.
 
-**GET (`Get`)**:
-- Request: full key and `version`
-- If `version == 0`: Returns all the data of the object (force refresh)
-- If `0 < version < server_version`: Returns only the data after `version`
-- If `version == server_version`: Returns the header only, no chunks
-- If `version` is ahead of the server's: Fails with `INVALID_ARGUMENT` (invalid version): the client has another object of the same key, which it must discard and get again from version 0
-- The header carries the current version and the data type shared by all data.
-- A chunk carries the version of the data it belongs to: its position in the
-  object, starting at 1. A client tells data from the start (version 1) from later
-  data by the version of the first chunk. A new version or the end of the stream completes
-  a part. Empty parts have one empty chunk.
-- The Python SDK interprets types such as `arrow.table.zstd` and decompresses
-  each part before decoding its value. Other clients receive the type and bytes
-  unchanged. The cache does not parse the type.
+## Writes, snapshots, and deletion
 
-**PUT (`Put`)**:
-- Starts with a key or prefix and client-provided data type, followed by
-  byte chunks of at most 1 MiB
-- New objects are created with `version=1`
-- An existing object is not replaced: the request fails with `AlreadyExist`
+PUT and PATCH both stream request chunks directly. There is no whole-part PATCH
+buffer in the server. Writers incrementally hash bytes and commit only after
+successful input EOF. A source error marks only that unfinished part Stale;
+other concurrent commits remain readable.
 
-**PATCH (`Patch`)**:
-- Starts with a full object key and the same data type as the object, followed
-  by byte chunks
-- Appends the data to the object, increments version
-- Returns an error if the object doesn't exist
+Parallel writers share `ObjectDao.parts` and its `PartDao` state; there is no
+separate allocation registry or duplicate parts list. A short lock protects block
+allocation and index/catalog updates. Streaming and fsync happen outside it. Readers and GC have no admission guards.
 
-**gRPC server settings**: the server uses 16 MiB HTTP/2 stream windows and a
-64 MiB connection window (the 64 KiB default caps the upload rate of one stream
-at about window / round-trip time) and enables TCP no-delay. Chunks stay at
-1 MiB.
+Reads validate UUID and requested version against the current Committed prefix before
+opening payload handles. Historical OBJECT prefixes and older PATCHES cursors are
+supported; versions beyond the Committed prefix are rejected immediately. Reads never
+wait for Writing parts. Writing and Stale slots are skipped. The DAO caches the
+version derived from its committed logical parts and rebuilds it on recovery;
+there is no separately persisted object version. An initial create with no committed part
+is NOT_FOUND. Captured file handles survive unlink.
 
-## Building
+GC unlinks vanished-session data without waiting for readers or writers. An
+in-flight write may fail; it cannot republish collected metadata. A late upload
+for an absent session is collected in a later cycle. Storage write tasks retain ownership
+independently of the client waiting for them.
 
-```bash
-# Build the standalone binary
-cargo build --package flame-object-cache --release
+GC lists object metadata and validates current application/session snapshots from
+FSM. Session objects remain while their session exists, including closed sessions.
+After the session is absent and a short creation grace has passed, GC confirms
+absence with a fresh snapshot and removes the object. The reserved `pkg` namespace
+belongs to its application instead. Failed or malformed frontend responses cannot
+authorize collection. Collection proceeds regardless of active readers or
+writers. Appending to an object whose session is gone does not retain it.
 
-# Run tests
-cargo test --package flame-object-cache
-```
+There is no delete RPC or SDK helper, and no `delete_if_unchanged` API. Package
+uploads never delete or replace an existing name. Filesystem metadata is retired
+on internal deletion, with no memory payload cache to invalidate.
 
-### Performance benchmark
+## Validation
 
-Run the opt-in microbenchmarks with optimized code and one test thread:
-
-```bash
-cargo test -p flame-object-cache --release cache_benchmarks -- --ignored --nocapture --test-threads=1
-```
-
-The disk benchmarks measure 8 MiB opaque writes and object reloads, plus
-sequential 1 KiB appends. Reloads bypass the resident cache but
-may be served by the operating system's page cache; these timings are not
-physical cold-disk measurements.
-
-## Architecture
-
-```
-                    ┌──────────────────┐
-                    │ flame-object-    │
-                    │ cache            │
-                    │ (standalone)     │
-                    └────────┬─────────┘
-                             │ gRPC bytes
-         ┌───────────────────┼───────────────────┐
-         │                   │                   │
-┌────────┴───────┐  ┌────────┴───────┐  ┌────────┴───────┐
-│ executor-mgr-1 │  │ executor-mgr-2 │  │ executor-mgr-3 │
-│ (worker)       │  │ (worker)       │  │ (worker)       │
-└────────────────┘  └────────────────┘  └────────────────┘
-```
-
-Benefits of standalone architecture:
-- **Centralized caching**: Single cache for all workers
-- **Independent scaling**: Scale cache separately from workers
-- **Version consistency**: All workers see same object versions
-- **Simpler configuration**: Workers just point to cache endpoint
-
-## Systemd Service
-
-A worker install (`setup.sh --join`) creates a systemd service for the cache:
-
-```bash
-# Check status
-sudo systemctl status flame-object-cache
-
-# View logs
-sudo journalctl -u flame-object-cache -f
-tail -f /usr/local/flame/logs/foc.log
-
-# Restart
-sudo systemctl restart flame-object-cache
-```
-
-## See Also
-
-- Design Document: `docs/designs/RFE318-cache/FS.md`
-- Version Tracking: `docs/designs/RFE426-cache-versioning/FS.md`
-- Python SDK Cache Module: `sdk/python/src/flamepy/core/cache.py`
-- Install scripts: `scripts/README.md`
+The package tests cover bounded direct streaming, all GET modes, empty/multiple
+parts, corruption, failed input/commit, UUID races, captured-inode snapshots,
+namespace deletion, GC revalidation, and filesystem recovery. Helm templates and
+CI configurations use filesystem storage. See the [design](../docs/designs/RFE703-object-cache-refactor/FS.md)
+for the contracts and verification matrix.

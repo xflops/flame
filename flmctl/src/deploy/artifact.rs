@@ -23,6 +23,7 @@ use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, EntryType, Header};
 use tempfile::TempDir;
+use uuid::Uuid;
 
 const PACKAGE_EXTENSIONS: [&str; 2] = [".tar.gz", ".tgz"];
 
@@ -50,13 +51,15 @@ pub struct PreparedApplication {
     pub detection_root: PathBuf,
     pub package_path: PathBuf,
     pub sha256: String,
+    /// Keep repeated name calculations stable while isolating separately prepared deployments.
+    upload_id: Uuid,
     _temp_dir: TempDir,
 }
 
 impl PreparedApplication {
-    /// The file name of the package of an application: content addressed.
+    /// Reuse one deployment identity while keeping repeated uploads in distinct single-part objects.
     pub fn package_filename(&self, app_name: &str) -> String {
-        format!("{}-{}.tar.gz", app_name, &self.sha256[..16])
+        format!("{}-{}.tar.gz", app_name, self.upload_id)
     }
 
     pub fn object_key(&self, app_name: &str) -> String {
@@ -150,6 +153,7 @@ pub fn prepare_application(path: &Path) -> Result<PreparedApplication, FlameErro
         detection_root,
         package_path,
         sha256,
+        upload_id: Uuid::new_v4(),
         _temp_dir: temp_dir,
     })
 }
@@ -549,9 +553,39 @@ mod tests {
         assert_eq!(prepared.package_path.file_name().unwrap(), "service.tar.gz");
         assert_eq!(
             prepared.object_key("demo"),
-            format!("demo/pkg/demo-{}.tar.gz", &prepared.sha256[..16])
+            format!("demo/pkg/demo-{}.tar.gz", prepared.upload_id)
         );
         assert_eq!(prepared.sha256.len(), 64);
+    }
+
+    /// Identical deployment content gets distinct remote objects while each prepared plan keeps a stable identity.
+    #[test]
+    fn repeated_preparation_uses_unique_stable_package_objects() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("app.py");
+        fs::write(&source, b"print('hello')\n").unwrap();
+
+        let first = prepare_application(&source).unwrap();
+        let second = prepare_application(&source).unwrap();
+        assert_eq!(first.sha256, second.sha256);
+        assert_eq!(
+            fs::read(&first.package_path).unwrap(),
+            fs::read(&second.package_path).unwrap()
+        );
+        assert_ne!(first.object_key("demo"), second.object_key("demo"));
+        assert_ne!(first.upload_id, second.upload_id);
+        let filename = first.package_filename("demo");
+        let key = first.object_key("demo");
+        assert_eq!(filename, first.package_filename("demo"));
+        assert_eq!(key, first.object_key("demo"));
+        assert_eq!(key, flame_rs::object::package_key("demo", &filename));
+        let identity = filename
+            .strip_prefix("demo-")
+            .unwrap()
+            .strip_suffix(".tar.gz")
+            .unwrap();
+        assert_eq!(Uuid::parse_str(identity).unwrap(), first.upload_id);
+        assert_eq!(first.package_path.file_name().unwrap(), "app.py.tar.gz");
     }
 
     #[test]
@@ -622,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_package_is_content_addressed() {
+    fn directory_package_preserves_content_digest_and_source_name() {
         let temp = TempDir::new().unwrap();
         let source = temp.path().join("source");
         fs::create_dir(&source).unwrap();
@@ -644,7 +678,7 @@ mod tests {
         assert!(entries.next().is_none());
         assert_eq!(
             prepared.object_key("demo"),
-            format!("demo/pkg/demo-{}.tar.gz", &prepared.sha256[..16])
+            format!("demo/pkg/demo-{}.tar.gz", prepared.upload_id)
         );
     }
 

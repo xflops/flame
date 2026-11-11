@@ -17,13 +17,12 @@ Longevity test (session API): keep one session active for a sustained period.
 
 import time
 from contextlib import suppress
+
 import flamepy
 import pytest
 from e2e.api import TestContext
 from e2e.api import TestRequest as E2ETestRequest
 from e2e.helpers import invoke_task, serialize_common_data
-from tests.utils import random_string
-
 from system_common import (
     FLM_SYSTEM_TEST_APP,
     _cluster_snapshot,
@@ -34,7 +33,7 @@ from system_common import (
     _requires_system_profile,
     _write_system_report,
 )
-
+from tests.utils import random_string
 
 pytestmark = pytest.mark.usefixtures("setup_system_test_env")
 

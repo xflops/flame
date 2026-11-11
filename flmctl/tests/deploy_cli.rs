@@ -40,7 +40,7 @@ fn deploy_dry_run_executable_file_through_cli() {
     );
 
     let object_key = json_string(&json, "/object_key");
-    assert_content_addressed_package_key(object_key, "demo-app");
+    assert_deployment_package_key(object_key, "demo-app");
     assert_eq!(
         json_string(&json, "/url"),
         format!("{}/{}", CACHE_ENDPOINT, object_key)
@@ -73,7 +73,7 @@ fn deploy_dry_run_python_directory_through_cli() {
     assert_eq!(json_string(&json, "/input_kind"), "directory");
     assert_eq!(json_string(&json, "/installer"), "python");
     assert_eq!(json_string(&json, "/command"), "demo-app");
-    assert_content_addressed_package_key(json_string(&json, "/object_key"), "demo-app");
+    assert_deployment_package_key(json_string(&json, "/object_key"), "demo-app");
     assert_eq!(
         json_string(&json, "/application/spec/url"),
         json_string(&json, "/url")
@@ -96,7 +96,7 @@ fn deploy_dry_run_python_file_through_cli() {
         json.pointer("/arguments/0").and_then(Value::as_str),
         Some("main.py")
     );
-    assert_content_addressed_package_key(json_string(&json, "/object_key"), "demo-app");
+    assert_deployment_package_key(json_string(&json, "/object_key"), "demo-app");
 }
 
 #[test]
@@ -416,7 +416,8 @@ fn json_string<'a>(json: &'a Value, pointer: &str) -> &'a str {
         .unwrap_or_else(|| panic!("missing string at {} in {}", pointer, json))
 }
 
-fn assert_content_addressed_package_key(key: &str, app_name: &str) {
+/// Require a three-component package key named with the application and a deployment UUID.
+fn assert_deployment_package_key(key: &str, app_name: &str) {
     let prefix = format!("{}/pkg/{}-", app_name, app_name);
     assert!(
         key.starts_with(&prefix),
@@ -436,13 +437,10 @@ fn assert_content_addressed_package_key(key: &str, app_name: &str) {
         key
     );
 
-    let digest = &key[prefix.len()..key.len() - ".tar.gz".len()];
-    assert_eq!(digest.len(), 16, "object key {} should use sha16", key);
-    assert!(
-        digest.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
-        "object key {} should use lowercase hex digest",
-        key
-    );
+    let identity = &key[prefix.len()..key.len() - ".tar.gz".len()];
+    let upload_id = uuid::Uuid::parse_str(identity)
+        .expect("package key must contain only a UUID after the application name");
+    assert_eq!(upload_id.get_version_num(), 4);
 }
 
 fn make_executable(path: &Path) {

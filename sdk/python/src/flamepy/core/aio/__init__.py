@@ -1,8 +1,6 @@
 """AsyncIO Flame core APIs. I/O methods use the caller's event loop."""
 
 from flamepy.core.aio.cache import (
-    delete_objects,
-    delete_package,
     download_package,
     get_object,
     patch_object,
@@ -67,8 +65,6 @@ __all__ = [
     "put_object",
     "get_object",
     "patch_object",
-    "delete_objects",
     "upload_package",
     "download_package",
-    "delete_package",
 ]

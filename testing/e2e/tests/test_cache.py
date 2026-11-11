@@ -13,7 +13,9 @@ limitations under the License.
 
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from threading import Barrier
 from urllib.parse import urlparse
 
 import flamepy.core.cache as cache_module
@@ -23,8 +25,6 @@ import pytest
 from flamepy.core import (
     FlameContext,
     ObjectRef,
-    delete_objects,
-    delete_package,
     download_package,
     get_object,
     patch_object,
@@ -62,31 +62,31 @@ def _remote_cache_client(ref: ObjectRef):
 
 def _remote_metadata(ref: ObjectRef):
     with _remote_cache_client(ref) as (client, metadata):
-        return client.GetMetadata(cache_pb2.CacheGetMetadataRequest(key=ref.key), metadata=metadata)
+        responses = list(client.Get(cache_pb2.CacheGetRequest(key=ref.key, mode=cache_pb2.METADATA), metadata=metadata))
+    assert len(responses) == 1 and responses[0].WhichOneof("payload") == "header"
+    return responses[0].header.metadata
 
 
-def _remote_write(rpc: str, ref: ObjectRef, data_type: str, data: bytes) -> ObjectRef:
+def _remote_write(rpc: str, ref: ObjectRef, data_type: str, data: bytes, *, timeout=None) -> ObjectRef:
     def requests():
-        yield cache_pb2.CacheWriteRequest(header=cache_pb2.CacheWriteHeader(key=ref.key, data_type=data_type))
+        yield cache_pb2.CacheWriteRequest(header=cache_pb2.CacheWriteHeader(key=ref.key, data_type=data_type, size=len(data)))
         for offset in range(0, len(data), cache_module._UPLOAD_CHUNK_SIZE):
             yield cache_pb2.CacheWriteRequest(data=data[offset : offset + cache_module._UPLOAD_CHUNK_SIZE])
 
     with _remote_cache_client(ref) as (client, routing):
-        response = getattr(client, rpc)(requests(), metadata=routing)
+        response = getattr(client, rpc)(requests(), metadata=routing, timeout=timeout)
     return ObjectRef(endpoint=response.endpoint, key=response.key, version=response.version)
 
 
-def _remote_delete(ref: ObjectRef) -> None:
+def _remote_get(ref: ObjectRef, version: int, mode=None):
+    if mode is None:
+        mode = cache_pb2.PATCHES if version else cache_pb2.OBJECT
+    uuid = _remote_metadata(ref).uuid if version else ""
     with _remote_cache_client(ref) as (client, metadata):
-        client.Delete(cache_pb2.CacheDeleteRequest(key=ref.key), metadata=metadata)
-
-
-def _remote_get(ref: ObjectRef, version: int):
-    with _remote_cache_client(ref) as (client, metadata):
-        responses = list(client.Get(cache_pb2.CacheGetRequest(key=ref.key, version=version), metadata=metadata))
+        responses = list(client.Get(cache_pb2.CacheGetRequest(key=ref.key, version=version, mode=mode, uuid=uuid), metadata=metadata))
     assert responses and responses[0].WhichOneof("payload") == "header"
     assert all(response.WhichOneof("payload") == "chunk" for response in responses[1:])
-    return responses[0].header, [response.chunk for response in responses[1:]]
+    return responses[0].header.metadata, [response.chunk for response in responses[1:]]
 
 
 def test_cache_put_and_get():
@@ -218,17 +218,25 @@ def test_object_is_created_with_one_part_at_version_one():
     assert _remote_metadata(ref).version == 1
 
 
-def test_put_cannot_replace_an_existing_object():
-    """An object is created once: a put to an existing key fails and changes nothing."""
-    ref = put_object(f"test-app/test-create-only-{uuid.uuid4().hex[:8]}", {"first": True})
-    data_type, payload = cache_module._serialize_object_data({"second": True})
-
-    with pytest.raises(grpc.RpcError) as error:
-        _remote_write("Put", ref, data_type, payload)
-    assert error.value.code() == grpc.StatusCode.ALREADY_EXISTS
-
-    assert get_object(ref, deserializer=_parts) == [{"first": True}]
-    assert _remote_metadata(ref).version == 1
+@pytest.mark.parametrize("rpc", ["Put", "Patch"])
+def test_writes_create_missing_objects_and_append_to_existing_parts(rpc):
+    """Both write RPCs create missing objects and retain prior parts on subsequent writes."""
+    owner = put_object(f"test-app/test-create-if-missing-{uuid.uuid4().hex[:8]}", {"routing": True})
+    target = ObjectRef(endpoint=owner.endpoint, key=f"{owner.key}-missing", version=0)
+    data_type, first = cache_module._serialize_object_data({"first": True})
+    created = _remote_write(rpc, target, data_type, first)
+    identity = _remote_metadata(created).uuid
+    data_type, second = cache_module._serialize_object_data({"second": True})
+    appended = _remote_write(rpc, created, data_type, second)
+    assert created.version == 1 and appended.version == 2
+    assert _remote_metadata(appended).uuid == identity
+    with _remote_cache_client(created) as (client, routing):
+        prefix = list(client.Get(cache_pb2.CacheGetRequest(
+            key=created.key, mode=cache_pb2.OBJECT, version=1, uuid=identity,
+        ), metadata=routing))
+    assert prefix[0].header.metadata.version == 1
+    assert b"".join(frame.chunk.data for frame in prefix[1:]) == first
+    assert get_object(appended, deserializer=_parts) == [{"first": True}, {"second": True}]
 
 
 def test_patch_appends_a_part_and_bumps_the_version():
@@ -280,10 +288,10 @@ def test_get_returns_only_the_data_after_a_version():
         ref = patch_object(ref, {"n": n})
     assert ref.version == 4
 
-    for version, expected in [(0, [1, 2, 3, 4]), (1, [2, 3, 4]), (2, [3, 4]), (3, [4]), (4, [])]:
+    for version, expected in [(0, [0, 1, 2, 3]), (1, [1, 2, 3]), (2, [2, 3]), (3, [3]), (4, [])]:
         header, chunks = _remote_get(ref, version)
         assert header.version == 4
-        assert [chunk.version for chunk in chunks] == expected
+        assert [chunk.part for chunk in chunks] == expected
         if chunks:
             assert header.data_type == "cloudpickle"
 
@@ -302,7 +310,7 @@ def test_incremental_get_applies_only_the_data_another_client_appended():
     second = _remote_patch_without_local_cache_invalidation(ref, {"items": ["second"]})
     header, chunks = _remote_get(ref, ref.version)
     assert header.version == second.version
-    assert [chunk.version for chunk in chunks] == [second.version]
+    assert [chunk.part for chunk in chunks] == [second.version - 1]
 
     assert get_object(ref, deserializer=_parts) == [{"items": ["first"]}, {"items": ["second"]}]
     cached = _cached_object(ref)
@@ -312,7 +320,7 @@ def test_incremental_get_applies_only_the_data_another_client_appended():
     third = _remote_patch_without_local_cache_invalidation(ref, {"items": ["third"]})
     header, chunks = _remote_get(ref, cached.version)
     assert header.version == third.version
-    assert [chunk.version for chunk in chunks] == [third.version]
+    assert [chunk.part for chunk in chunks] == [third.version - 1]
 
     assert get_object(ref, deserializer=_parts)[-1] == {"items": ["third"]}
     assert _cached_object(ref).version == third.version
@@ -327,26 +335,9 @@ def test_version_zero_gets_all_the_parts_even_with_a_cached_object():
     forced = ObjectRef(endpoint=ref.endpoint, key=ref.key, version=0)
     header, chunks = _remote_get(forced, 0)
     assert header.version == appended.version
-    assert [chunk.version for chunk in chunks] == [1, 2]
+    assert [chunk.part for chunk in chunks] == [0, 1]
 
     assert get_object(forced, deserializer=_parts) == [{"items": ["first"]}, {"items": ["second"]}]
-
-
-def test_get_after_the_object_was_created_again():
-    """A client whose cached version is ahead of a new object of the same key starts over."""
-    ref = put_object(f"test-app/test-again-{uuid.uuid4().hex[:8]}", {"n": 1})
-    ref = patch_object(ref, {"n": 2})
-    ref = patch_object(ref, {"n": 3})
-    assert get_object(ref, deserializer=_parts) == [{"n": 1}, {"n": 2}, {"n": 3}]
-    assert _cached_object(ref).version == 3
-
-    # Another client deletes the object and creates it again, shorter.
-    _remote_delete(ref)
-    data_type, payload = cache_module._serialize_object_data({"again": True})
-    _remote_write("Put", ref, data_type, payload)
-
-    assert get_object(ref, deserializer=_parts) == [{"again": True}]
-    assert _cached_object(ref).version == 1
 
 
 def test_appending_keeps_the_cached_parts_of_the_object():
@@ -424,30 +415,6 @@ def test_patch_nonexistent_object():
         patch_object(fake_ref, {"data": "data"})
 
 
-def test_delete_objects_removes_the_object():
-    ref = put_object(f"test-app/test-delete-{uuid.uuid4().hex[:8]}", {"first": True})
-    ref = patch_object(ref, {"second": True})
-    assert get_object(ref, deserializer=_parts) == [{"first": True}, {"second": True}]
-
-    delete_objects(ref.key)
-
-    with pytest.raises(Exception):
-        get_object(ObjectRef(endpoint=ref.endpoint, key=ref.key, version=0))
-
-
-def test_put_after_delete_creates_a_new_object_at_version_one():
-    prefix = f"test-app/test-recreate-{uuid.uuid4().hex[:8]}"
-    ref = put_object(prefix, {"first": True})
-    ref = patch_object(ref, {"second": True})
-    delete_objects(ref.key)
-
-    new_ref = put_object(prefix, {"new": True})
-
-    assert new_ref.key != ref.key
-    assert new_ref.version == 1
-    assert get_object(new_ref, deserializer=_parts) == [{"new": True}]
-
-
 @pytest.mark.skip(reason="MAX_DELTAS_PER_OBJECT=1000 is too slow for E2E; tested via unit tests")
 def test_patch_limit():
     """Appending beyond the limit of 1000 parts raises an error."""
@@ -459,7 +426,7 @@ def test_patch_limit():
 # ============================================================================
 
 
-def test_package_upload_download_replace_and_delete(tmp_path):
+def test_package_upload_download_and_repeated_name_appends_a_part(tmp_path):
     app_name = f"test-pkg-{uuid.uuid4().hex[:8]}"
     filename = "app.tar.gz"
     source = tmp_path / filename
@@ -473,24 +440,17 @@ def test_package_upload_download_replace_and_delete(tmp_path):
     download_package(app_name, filename, str(downloaded))
     assert downloaded.read_bytes() == source.read_bytes()
 
-    # A package with the same name is replaced.
     source.write_bytes(b"second package" * 1000)
-    replaced = upload_package(app_name, str(source))
-    assert replaced.key == ref.key
-    assert replaced.version == 1
-    download_package(app_name, filename, str(downloaded))
-    assert downloaded.read_bytes() == source.read_bytes()
+    appended = upload_package(app_name, str(source))
+    assert appended.key == ref.key and appended.version == 2
+    # Package download requires one part; repeated names retain both uploads.
+    with pytest.raises(ValueError, match="first version"):
+        download_package(app_name, filename, str(tmp_path / "repeated.tar.gz"))
 
-    # A name can be given for the package, which is how it is kept.
     renamed = upload_package(app_name, str(source), "other.tar.gz")
     assert renamed.key == f"{app_name}/pkg/other.tar.gz"
-
-    delete_package(app_name, filename)
-    with pytest.raises(Exception):
-        download_package(app_name, filename, str(tmp_path / "gone.tar.gz"))
     download_package(app_name, "other.tar.gz", str(downloaded))
     assert downloaded.read_bytes() == source.read_bytes()
-    delete_package(app_name, "other.tar.gz")
 
 
 def test_package_with_appended_data_cannot_be_downloaded(tmp_path):
@@ -506,7 +466,6 @@ def test_package_with_appended_data_cannot_be_downloaded(tmp_path):
     with pytest.raises(Exception):
         download_package(app_name, "app.tar.gz", str(tmp_path / "out.tar.gz"))
     assert not (tmp_path / "out.tar.gz").exists()
-    delete_package(app_name, "app.tar.gz")
 
 
 # ============================================================================
@@ -514,12 +473,11 @@ def test_package_with_appended_data_cannot_be_downloaded(tmp_path):
 # ============================================================================
 
 """
-Integration stress tests for object retrieval under cache pressure.
+Integration stress tests for filesystem object retrieval after many writes.
 
-These tests intentionally assert only observable cache behavior through the
-public API: objects remain retrievable and data stays intact after many writes.
-The actual LRU eviction policy and ordering are covered by object_cache unit
-tests, where cache limits and policy internals are directly configurable.
+These tests assert observable behavior through the public API: persisted objects
+remain retrievable and data stays intact. SDK-side client caching is independent
+of the server filesystem storage.
 """
 
 TEST_APP = "cache-pressure-test-app"
@@ -780,3 +738,84 @@ class TestCachePressureDataIntegrity:
         for marker in markers:
             retrieved = get_object(refs[marker])
             assert retrieved["marker"] == marker, f"Object {marker} data mismatch"
+
+
+def test_metadata_object_and_patches_get_modes():
+    """Metadata has no payload; OBJECT selects a prefix and PATCHES a suffix."""
+    config = FlameContext().cache
+    endpoint = config if isinstance(config, str) else config.get("endpoint") if isinstance(config, dict) else config.endpoint
+    ref = ObjectRef(endpoint=endpoint, key=f"test-app/test-get-modes-{uuid.uuid4().hex[:8]}/object", version=0)
+    ref = _remote_write("Put", ref, "raw", b"")
+    ref = _remote_write("Patch", ref, "raw", b"body")
+    ref = _remote_write("Patch", ref, "raw", b"")
+    metadata = _remote_metadata(ref)
+    assert metadata.uuid and metadata.version == 3 and metadata.size == 4
+
+    prefix, parts = _remote_get(ref, 2, cache_pb2.OBJECT)
+    assert prefix.uuid == metadata.uuid and prefix.version == 2 and prefix.size == 4
+    assert [chunk.part for chunk in parts] == [0, 1]
+    assert [chunk.data for chunk in parts] == [b"", b"body"]
+
+    suffix, parts = _remote_get(ref, 2, cache_pb2.PATCHES)
+    assert suffix.uuid == metadata.uuid and suffix.version == 3 and suffix.size == 4
+    assert [chunk.part for chunk in parts] == [2]
+    assert parts[0].data == b""
+
+
+@pytest.mark.parametrize("rpc", ["Put", "Patch"])
+@pytest.mark.parametrize("declared_size", [0, 2, 4])
+def test_write_rejects_inexact_declared_size_and_preserves_committed_data(rpc, declared_size):
+    owner = put_object(f"test-app/test-write-size-{uuid.uuid4().hex[:8]}", b"owner")
+    target = ObjectRef(endpoint=owner.endpoint, key=f"{owner.key}-raw", version=0)
+    if rpc == "Patch":
+        target = _remote_write("Put", target, "raw", b"")
+
+    def requests():
+        yield cache_pb2.CacheWriteRequest(header=cache_pb2.CacheWriteHeader(key=target.key, data_type="raw", size=declared_size))
+        yield cache_pb2.CacheWriteRequest(data=b"abc")
+
+    with _remote_cache_client(target) as (client, routing):
+        with pytest.raises(grpc.RpcError) as failure:
+            getattr(client, rpc)(requests(), metadata=routing)
+    assert failure.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    if rpc == "Patch":
+        assert _remote_metadata(target).version == 1
+        assert _remote_metadata(target).size == 0
+    else:
+        with pytest.raises(grpc.RpcError) as missing:
+            _remote_metadata(target)
+        assert missing.value.code() == grpc.StatusCode.NOT_FOUND
+        target = _remote_write("Put", target, "raw", b"")
+    updated = _remote_write("Patch", target, "raw", b"")
+    metadata, chunks = _remote_get(updated, 0)
+    assert (metadata.version, metadata.size) == (2, 0)
+    assert [(chunk.part, chunk.data) for chunk in chunks] == [(0, b""), (1, b"")]
+
+
+def test_concurrent_raw_patches_publish_every_part_without_losing_payloads():
+    """Concurrent raw RPCs publish all distinct parts with a complete committed prefix."""
+    owner = put_object(f"test-app/test-parallel-patch-{uuid.uuid4().hex[:8]}", b"owner")
+    target = ObjectRef(endpoint=owner.endpoint, key=f"{owner.key}-raw", version=0)
+    base = b"base"
+    target = _remote_write("Put", target, "raw", base)
+    payloads = [f"parallel-part-{index}".encode() * (index + 1) for index in range(4)]
+    started = Barrier(len(payloads))
+
+    def patch(payload):
+        """Start one independent blocking RPC alongside the other worker calls."""
+        started.wait(timeout=30)
+        return _remote_write("Patch", target, "raw", payload, timeout=30)
+
+    with ThreadPoolExecutor(max_workers=len(payloads)) as executor:
+        pending = [executor.submit(patch, payload) for payload in payloads]
+        results = [future.result(timeout=30) for future in pending]
+    assert all(result.key == target.key for result in results)
+    metadata, chunks = _remote_get(target, 0)
+    assert metadata.version == 1 + len(payloads)
+    assert metadata.size == len(base) + sum(map(len, payloads))
+    parts = {}
+    for chunk in chunks:
+        parts.setdefault(chunk.part, bytearray()).extend(chunk.data)
+    assert sorted(parts) == list(range(1 + len(payloads)))
+    assert bytes(parts[0]) == base
+    assert sorted(bytes(parts[index]) for index in range(1, len(parts))) == sorted(payloads)

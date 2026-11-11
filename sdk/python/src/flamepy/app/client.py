@@ -1323,12 +1323,15 @@ py-modules = []
                 logger.error(f"Error removing local package: {e}", exc_info=True)
 
     def _cleanup_storage(self) -> None:
-        """Delete the package from storage."""
+        """Clean supported external storage; object-service packages are collected by GC."""
         if not self._package_filename or not self._storage_backend:
             return
 
+        delete = getattr(self._storage_backend, "delete", None)
+        if not callable(delete):
+            return
         try:
-            self._storage_backend.delete(self._package_filename)
+            delete(self._package_filename)
         except Exception as e:
             logger.error(f"Error cleaning up storage: {e}", exc_info=True)
 

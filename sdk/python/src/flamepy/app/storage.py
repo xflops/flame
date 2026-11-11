@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 class StorageBackend(ABC):
     """Abstract base class for storage backends.
 
-    This interface provides a unified way to upload and delete packages
+    This interface provides a unified way to upload and download packages
     from different storage systems (file, HTTP, etc.).
     """
 
@@ -44,19 +44,6 @@ class StorageBackend(ABC):
 
         Raises:
             FlameError: If upload fails
-        """
-        pass
-
-    @abstractmethod
-    def delete(self, filename: str) -> None:
-        """Delete a package file from storage.
-
-        Args:
-            filename: Name of the file to delete
-
-        Note:
-            This method should not raise exceptions for non-existent files,
-            as cleanup operations should be idempotent.
         """
         pass
 
@@ -351,18 +338,6 @@ class CacheStorage(StorageBackend):
             logger.debug(f"Downloaded package from cache: {self._app_name}/pkg/{filename} -> {local_path}")
         except Exception as e:
             raise FlameError(FlameErrorCode.INTERNAL, f"Failed to download package from cache: {str(e)}")
-
-    def delete(self, filename: str) -> None:
-        from flamepy.core.cache import delete_package
-
-        if not self._app_name:
-            return
-
-        try:
-            delete_package(self._app_name, filename, endpoint=self._endpoint)
-            logger.debug(f"Deleted package from cache: {self._app_name}/pkg/{filename}")
-        except Exception as e:
-            logger.warning(f"Error deleting package from cache: {e}")
 
 
 def create_storage_backend(storage_base: str | None = None, app_name: str | None = None) -> StorageBackend:

@@ -21,6 +21,11 @@ pub mod pprof;
 pub mod python;
 pub mod storage;
 
+/// Reserved session namespace for application-owned package objects.
+pub const PACKAGE_SESSION: &str = "pkg";
+/// Reserved session namespace for application-owned data shared across sessions.
+pub const SHARED_SESSION: &str = "shared";
+
 pub const FLAME_PYTHON_VERSION_ENV: &str = "FLAME_PYTHON_VERSION";
 pub const DEFAULT_PYTHON_VERSION: &str = "3.12";
 

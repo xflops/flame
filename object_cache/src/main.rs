@@ -17,9 +17,8 @@ use clap::Parser;
 
 use common::ctx::FlameClusterContext;
 
-mod cache;
-mod eviction;
-mod gc;
+mod controller;
+mod model;
 mod storage;
 
 #[derive(Parser)]
@@ -32,6 +31,7 @@ struct Args {
     config: Option<PathBuf>,
 }
 
+/// Load server configuration, initialize observability, and run the object-cache controller.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _log_guard = common::init_logger(Some("foc"))?;
@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    cache::run(&ctx.cluster, cache_config).await?;
+    controller::run(&ctx.cluster, cache_config).await?;
 
     Ok(())
 }
