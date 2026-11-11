@@ -108,11 +108,13 @@ update_protos: ## Update protobuf files
 	@cp rpc/protos/frontend.proto sdk/rust/protos
 	@cp rpc/protos/types.proto sdk/rust/protos
 	@cp rpc/protos/shim.proto sdk/rust/protos
+	@cp rpc/protos/cache.proto sdk/rust/protos
 	@echo "Copied protobuf files to sdk/rust/protos"
 
 	@cp rpc/protos/frontend.proto sdk/python/protos
 	@cp rpc/protos/types.proto sdk/python/protos
 	@cp rpc/protos/shim.proto sdk/python/protos
+	@cp rpc/protos/cache.proto sdk/python/protos
 	@echo "Copied protobuf files to sdk/python/protos"
 
 sdk-python-generate: update_protos ## Generate the Python protobuf files

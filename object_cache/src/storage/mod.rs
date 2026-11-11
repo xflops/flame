@@ -11,289 +11,841 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-mod disk;
-mod none;
-mod resident;
-
-pub use disk::{DiskStorage, ObjectFiles};
-pub use none::NoStorage;
-pub use resident::ResidentStorage;
-
+use crate::model::{Chunk, Object, ObjectFilter, ObjectKey, ObjectMetadata, Part};
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::BoxStream;
-#[cfg(test)]
-use futures::{future, stream, TryStreamExt};
-use std::path::PathBuf;
-use std::sync::Arc;
-
 use common::FlameError;
+use futures::{Stream, StreamExt};
+use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
-use crate::cache::{Object, ObjectData, ObjectKey, ObjectMetadata};
-use crate::eviction::EvictionConfig;
+mod dao;
+mod object_reader;
+mod object_writer;
+mod part_reader;
+mod part_writer;
 
-/// Most data an object can have appended after the data it is created with.
-const MAX_APPENDS_PER_OBJECT: u64 = 1000;
+use dao::{ObjectDao, ObjectMetadataDao, PartDao};
+use object_reader::ObjectReader;
+pub(crate) use object_writer::ObjectWriter;
+use part_reader::open_readers;
+pub(crate) use part_reader::PartReader;
+pub(crate) use part_writer::PartWriter;
 
-/// The record of one part: where its payload is in the object's payload
-/// storage, its length and its creation time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Record {
-    pub offset: u64,
-    pub len: u64,
-    pub creation_time: i64,
-    pub checksum: Option<[u8; 32]>,
-}
+pub(crate) const MAX_APPENDS_PER_OBJECT: u64 = 1000;
+pub(crate) const CHUNK_SIZE: usize = 1024 * 1024;
 
-/// Metadata of a stored object, read without touching its payload. An object
-/// is a list of data parts in the order they were written; its version is the
-/// number of parts.
-#[derive(Debug, Clone)]
-pub struct ObjectStat {
-    pub data_type: String,
-    /// One record per part.
-    pub records: Vec<Record>,
-}
-
-impl ObjectStat {
-    /// The metadata of an object held in memory, whose parts are laid out one
-    /// after the other.
-    fn of(object: &Object) -> Self {
-        debug_assert_eq!(
-            object.version, 0,
-            "the metadata needs all the data of the object"
-        );
-        let mut offset = 0;
-        let records = object
-            .data
-            .iter()
-            .map(|part| {
-                let record = Record {
-                    offset,
-                    len: part.size_bytes(),
-                    creation_time: part.creation_time,
-                    checksum: None,
-                };
-                offset += record.len;
-                record
-            })
-            .collect();
-        Self {
-            data_type: object.data_type.clone(),
-            records,
-        }
-    }
-
-    /// Current version: one per part, so a new object is version 1.
-    pub fn version(&self) -> u64 {
-        self.records.len() as u64
-    }
-
-    /// Creation time of the object: that of its first part.
-    pub fn creation_time(&self) -> i64 {
-        self.records[0].creation_time
-    }
-
-    /// Payload size of all the parts.
-    pub fn size(&self) -> u64 {
-        self.records.iter().map(|record| record.len).sum()
-    }
-}
-
-/// `offset..offset + len` as a range within a payload of `total` bytes.
-fn payload_range(
-    key: &str,
-    offset: u64,
-    len: usize,
-    total: u64,
-) -> Result<std::ops::Range<usize>, FlameError> {
-    match offset.checked_add(len as u64) {
-        Some(end) if end <= total => Ok(offset as usize..end as usize),
-        _ => Err(FlameError::InvalidState(format!(
-            "Range {}+{} is outside object <{}> of {} bytes",
-            offset, len, key, total
-        ))),
-    }
-}
-
-/// Storage engine trait for ObjectCache.
-///
-/// Implementations must be thread-safe (Send + Sync).
+/// Allocate parallel immutable parts, expose committed logical views, and allow GC to unlink expired session data.
 #[async_trait]
-pub trait StorageEngine: Send + Sync + 'static {
-    /// Create an object from a stream of chunks, its first part, and commit
-    /// it atomically. An object is never replaced: creating one that exists is
-    /// an `AlreadyExist` error, and it only changes by `patch_object`. The
-    /// object is not stored unless the stream ends successfully.
-    ///
-    /// `meta` describes the object being written: its data type and creation
-    /// time are stored (its version is 1 by construction); `meta.key` is the same key as `key`, and
-    /// `endpoint` is ignored. Returns `meta` with `size` set to the number of
-    /// payload bytes written.
-    ///
-    /// Writes to one object (`write_stream`, `patch_object`, `delete_objects`)
-    /// must be serialized by the caller.
-    async fn write_stream(
+pub(crate) trait StorageEngine: Send + Sync + 'static {
+    /// Capture one fixed prefix, refresh its metadata, and lazily stream its filesystem payload chunks.
+    async fn read_object(&self, metadata: &mut ObjectMetadata) -> Result<ChunkStream, FlameError>;
+    /// Capture patches after the supplied version and replace metadata with the selected latest committed end.
+    async fn read_patch(&self, metadata: &mut ObjectMetadata) -> Result<ChunkStream, FlameError>;
+    /// Consume object bytes, creating missing objects and publishing cached state after filesystem commit.
+    async fn write_object(
         &self,
         key: &ObjectKey,
-        meta: ObjectMetadata,
-        chunks: BoxStream<'_, Result<Bytes, FlameError>>,
+        data_type: &str,
+        size: u64,
+        chunks: ByteStream,
     ) -> Result<ObjectMetadata, FlameError>;
+    /// Consume patch bytes with the same create-if-missing allocation and durable publication.
+    async fn write_patch(
+        &self,
+        key: &ObjectKey,
+        data_type: &str,
+        size: u64,
+        chunks: ByteStream,
+    ) -> Result<ObjectMetadata, FlameError>;
+    /// List matching metadata, optionally restricted to a committed part prefix.
+    async fn list(&self, filter: &ObjectFilter) -> Result<Vec<ObjectMetadata>, FlameError>;
+    /// Delete the exact object or all objects selected by an application/session key.
+    async fn delete_objects(&self, key: &ObjectKey) -> Result<(), FlameError>;
+}
 
-    /// Create an object from its first data.
-    #[cfg(test)]
-    async fn write_object(&self, key: &ObjectKey, object: &Object) -> Result<(), FlameError> {
-        let chunks = stream::once(future::ready(Ok(object.data[0].data.clone())));
-        let meta = ObjectMetadata::new()
-            .with_key(key.to_key().unwrap_or_default())
-            .with_version(1)
-            .with_creation_time(object.data[0].creation_time)
-            .with_data_type(object.data_type.clone());
-        self.write_stream(key, meta, Box::pin(chunks))
-            .await
-            .map(|_| ())
+pub(crate) type StorageEnginePtr = Box<dyn StorageEngine>;
+
+/// Carry domain payload chunks across the storage boundary without exposing RPC frame types.
+pub(crate) type ByteStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, FlameError>> + Send + 'static>>;
+
+/// Own captured filesystem readers and expose only domain chunks through EOF, failure, or stream destruction.
+pub(crate) type ChunkStream =
+    Pin<Box<dyn Stream<Item = Result<Chunk, FlameError>> + Send + 'static>>;
+
+const METADATA_FILE: &str = "metadata.json";
+const INDEX_FILE: &str = "index.bin";
+const DATA_FILE: &str = "data.bin";
+const STAGING_DIR: &str = ".uploads";
+const RECORD_LEN: usize = 72;
+type Catalog = Arc<Mutex<HashMap<String, ObjectDao>>>;
+
+struct ObjectFiles {
+    object: ObjectDao,
+}
+impl ObjectFiles {
+    /// Load complete descriptors without modifying filesystem state or interpreting interrupted writes.
+    fn load(dir: &Path) -> Result<Option<Self>, FlameError> {
+        let index = match fs::File::open(dir.join(INDEX_FILE)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata: ObjectMetadataDao =
+            serde_json::from_slice(&fs::read(dir.join(METADATA_FILE))?).map_err(|error| {
+                FlameError::InvalidState(format!(
+                    "invalid object metadata in {}: {error}",
+                    dir.display()
+                ))
+            })?;
+        let size = index.metadata()?.len() as usize;
+        let complete = size / RECORD_LEN * RECORD_LEN;
+        let mut bytes = vec![0; complete];
+        index.read_exact_at(&mut bytes, 0)?;
+        let parts = bytes
+            .as_chunks::<RECORD_LEN>()
+            .0
+            .iter()
+            .map(PartDao::decode)
+            .collect();
+        Ok(Some(Self {
+            object: ObjectDao {
+                metadata,
+                parts,
+                cached_version: 0,
+            },
+        }))
     }
 
-    /// Stream one complete part (0 is the first), verifying persisted payload
-    /// integrity before the stream finishes successfully. An empty part emits
-    /// one empty chunk. Callers must consume the stream through its end.
-    async fn read_part(
-        &self,
-        key: &ObjectKey,
-        part: usize,
-    ) -> Result<BoxStream<'static, Result<Bytes, FlameError>>, FlameError>;
-
-    /// Read a range only after the complete part has passed verification,
-    /// including bytes outside the requested range.
+    /// Load and validate the complete committed view without repairing or rewriting records.
     #[cfg(test)]
-    async fn read_range(
-        &self,
-        key: &ObjectKey,
-        part: usize,
-        offset: u64,
-        len: usize,
-    ) -> Result<Bytes, FlameError> {
-        let key_string = key.to_key().unwrap_or_default();
-        let stat = self
-            .stat(key)
-            .await?
-            .ok_or_else(|| FlameError::NotFound(format!("object <{key_string}> not found")))?;
-        let record = stat.records.get(part).ok_or_else(|| {
-            FlameError::NotFound(format!("part {part} of object <{key_string}> not found"))
-        })?;
-        let range = payload_range(&key_string, offset, len, record.len)?;
-        let mut stream = self.read_part(key, part).await?;
-        let mut output = Vec::with_capacity(len);
-        let mut position = 0usize;
-        while let Some(chunk) = stream.try_next().await? {
-            let end = position.checked_add(chunk.len()).ok_or_else(|| {
-                FlameError::InvalidState(format!("object <{key_string}> size overflow"))
-            })?;
-            let start = position.max(range.start);
-            let overlap_end = end.min(range.end);
-            if start < overlap_end {
-                output.extend_from_slice(&chunk[start - position..overlap_end - position]);
-            }
-            position = end;
+    fn open(dir: &Path) -> Result<Option<Self>, FlameError> {
+        let Some(mut files) = Self::load(dir)? else {
+            return Ok(None);
+        };
+        files.object.refresh_version()?;
+        files.validate_extents(dir)?;
+        Ok(Some(files))
+    }
+
+    /// Repair interrupted states and torn index tails explicitly during storage startup.
+    fn recover(dir: &Path) -> Result<Option<Self>, FlameError> {
+        let Some(mut files) = Self::load(dir)? else {
+            return Ok(None);
+        };
+        // Retire unacknowledged logical tails before checking extents to preserve acknowledged data.
+        files.object.recover_parts()?;
+        let index = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(INDEX_FILE))?;
+        index.set_len(files.object.parts.len() as u64 * RECORD_LEN as u64)?;
+        for (ordinal, part) in files.object.parts.iter().enumerate() {
+            index.write_all_at(&part.encode(), ordinal as u64 * RECORD_LEN as u64)?;
         }
-        if position as u64 != record.len {
-            return Err(FlameError::InvalidState(format!(
-                "object <{key_string}> part {part} length mismatch"
+        index.sync_data()?;
+        files.validate_extents(dir)?;
+        Ok(Some(files))
+    }
+
+    /// Reject retained committed descriptors whose payload extents do not fit in the data file.
+    fn validate_extents(&self, dir: &Path) -> Result<(), FlameError> {
+        let data_len = fs::File::open(dir.join(DATA_FILE))?.metadata()?.len();
+        if self
+            .object
+            .parts
+            .iter()
+            .filter(|part| part.state == dao::PartState::Committed)
+            .any(|part| {
+                part.offset
+                    .checked_add(part.len)
+                    .is_none_or(|end| end > data_len)
+            })
+        {
+            return Err(FlameError::DataLoss(format!(
+                "truncated object in {}",
+                dir.display()
             )));
         }
-        Ok(Bytes::from(output))
-    }
-
-    /// Open an object's files for reading, for engines that store objects in
-    /// files: the handle can be kept to read the object without opening it
-    /// again, but is a snapshot that a write makes stale. Returns None if the
-    /// object is not found or the engine has no files.
-    async fn open(&self, _key: &ObjectKey) -> Result<Option<Arc<ObjectFiles>>, FlameError> {
-        Ok(None)
-    }
-
-    /// Read an object's metadata. Returns None if not found.
-    async fn stat(&self, key: &ObjectKey) -> Result<Option<ObjectStat>, FlameError>;
-
-    #[cfg(test)]
-    /// Read an object after `version`: all the parts for 0, else only the
-    /// parts after that version. Returns None if not found, and an
-    /// `InvalidState` error if `version` is beyond the object's.
-    async fn read_object(
-        &self,
-        key: &ObjectKey,
-        version: u64,
-    ) -> Result<Option<Object>, FlameError>;
-
-    /// Append data to an existing object. Returns NotFound if the object doesn't exist.
-    async fn patch_object(
-        &self,
-        key: &ObjectKey,
-        data: &ObjectData,
-    ) -> Result<ObjectMetadata, FlameError>;
-
-    /// Delete all objects matching the key prefix (app/session).
-    async fn delete_objects(&self, key: &ObjectKey) -> Result<(), FlameError>;
-
-    /// List all stored objects with their metadata (for startup recovery).
-    async fn scan(&self) -> Result<Vec<(ObjectKey, ObjectStat)>, FlameError>;
-
-    /// Record that an object is being read, as a recency hint for engines that
-    /// evict.
-    fn touch(&self, _key: &ObjectKey) {}
-
-    /// Objects and payload bytes held in memory on top of the engine's own
-    /// storage.
-    #[cfg(test)]
-    fn resident(&self) -> (usize, u64) {
-        (0, 0)
+        Ok(())
     }
 }
 
-pub type StorageEnginePtr = Box<dyn StorageEngine>;
+#[derive(Clone)]
+pub struct FsStorage {
+    storage_path: PathBuf,
+    catalog: Catalog,
+}
+impl FsStorage {
+    /// Open filesystem storage with recovered committed metadata and abandoned uploads removed.
+    pub fn new(storage_path: PathBuf) -> Result<Self, FlameError> {
+        fs::create_dir_all(&storage_path)?;
+        let catalog = recover(&storage_path)?;
+        Ok(Self {
+            storage_path,
+            catalog: Arc::new(Mutex::new(catalog)),
+        })
+    }
+    /// Locate the session directory containing this object.
+    fn session_dir(&self, key: &ObjectKey) -> PathBuf {
+        self.storage_path.join(&key.app_name).join(&key.session_id)
+    }
+    /// Locate the directory for a complete object key.
+    fn object_dir(&self, key: &ObjectKey) -> PathBuf {
+        self.session_dir(key)
+            .join(key.object_id.as_ref().expect("complete object key"))
+    }
+}
 
-/// Open the storage engine named by `url`. The handles of the objects of a
-/// persistent engine are also kept open in memory as `eviction` allows. `none`
-/// has no store: the in-memory cache is the only copy of its objects and
-/// evicted objects are lost.
-pub async fn connect(
-    url: &str,
-    eviction: Option<&EvictionConfig>,
-) -> Result<StorageEnginePtr, FlameError> {
+/// Initialize one object's filesystem metadata before inserting its first Writing descriptor in storage's catalog.
+fn create_object_files(dir: &Path, metadata: &ObjectMetadataDao) -> Result<(), FlameError> {
+    fs::create_dir_all(dir.parent().expect("object session"))?;
+    fs::create_dir(dir)?;
+    let result = (|| {
+        let bytes = serde_json::to_vec(metadata)
+            .map_err(|error| FlameError::Internal(error.to_string()))?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(METADATA_FILE))?;
+        file.write_all(&bytes)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(INDEX_FILE))?;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(DATA_FILE))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(dir);
+    }
+    result
+}
+
+/// Recover committed descriptors and clean abandoned staging before storage serves requests.
+fn recover(root: &Path) -> Result<HashMap<String, ObjectDao>, FlameError> {
+    let mut items = HashMap::new();
+    for app in fs::read_dir(root)? {
+        let app = app?;
+        if !app.path().is_dir() || app.file_name() == "lost+found" {
+            continue;
+        }
+        for session in fs::read_dir(app.path())? {
+            let session = session?;
+            if !session.path().is_dir() {
+                continue;
+            }
+            for object in fs::read_dir(session.path())? {
+                let object = object?;
+                if !object.path().is_dir() {
+                    continue;
+                }
+                if object.file_name() == STAGING_DIR {
+                    fs::remove_dir_all(object.path())?;
+                    continue;
+                }
+                let object_path = object.path();
+                let relative = object_path
+                    .strip_prefix(root)
+                    .map_err(|error| FlameError::InvalidState(error.to_string()))?;
+                let key = ObjectKey::try_from(relative.to_str().ok_or_else(|| {
+                    FlameError::InvalidState("object path is not UTF-8".to_string())
+                })?)?;
+                if fs::metadata(object.path().join(INDEX_FILE))
+                    .map(|metadata| metadata.len() == 0)
+                    .unwrap_or(true)
+                {
+                    fs::remove_dir_all(object.path())?;
+                    continue;
+                }
+                if let Some(files) = ObjectFiles::recover(&object.path())? {
+                    if files.object.version() == 0 {
+                        fs::remove_dir_all(object.path())?;
+                    } else {
+                        items.insert(key.to_key().expect("complete key"), files.object);
+                    }
+                }
+            }
+            remove_empty_dir(&session.path());
+        }
+        remove_empty_dir(&app.path());
+    }
+    Ok(items)
+}
+
+/// Translate a blocking worker failure into a cache internal error.
+fn joined<T>(result: Result<T, tokio::task::JoinError>) -> Result<T, FlameError> {
+    result.map_err(|error| FlameError::Internal(format!("storage task failed: {error}")))
+}
+/// Describe a poisoned published-metadata catalog lock.
+fn catalog_error() -> FlameError {
+    FlameError::Internal("storage catalog poisoned".to_string())
+}
+/// Project the readable committed sequence, skipping stale slots and never waiting for active writers.
+fn project_metadata(
+    catalog: &Catalog,
+    key: &str,
+    version: Option<u64>,
+) -> Result<Option<ObjectMetadata>, FlameError> {
+    let objects = catalog.lock().map_err(|_| catalog_error())?;
+    let Some(object) = objects.get(key).filter(|object| object.version() > 0) else {
+        return Ok(None);
+    };
+    let mut metadata = object.metadata(key, "");
+    if let Some(version) = version {
+        if version > metadata.version {
+            return Err(FlameError::InvalidConfig(
+                "requested version is ahead of object".into(),
+            ));
+        }
+        metadata.version = version;
+        metadata.size = object
+            .visible_parts()
+            .take(version as usize)
+            .map(|part| part.len)
+            .sum();
+    }
+    Ok(Some(metadata))
+}
+
+/// Reject a changed incarnation after handles are opened without retaining reader/deletion locks.
+fn validate_uuid(dir: &Path, expected: &str) -> Result<(), FlameError> {
+    let metadata: ObjectMetadataDao =
+        serde_json::from_slice(&fs::read(dir.join(METADATA_FILE))?)
+            .map_err(|error| FlameError::DataLoss(format!("invalid object metadata: {error}")))?;
+    if metadata.uuid != expected {
+        return Err(FlameError::InvalidVersion("object UUID changed".into()));
+    }
+    Ok(())
+}
+
+/// Unlink committed objects directly; captured descriptors remain readable and GC never waits for active I/O.
+fn delete_committed(root: &Path, catalog: &Catalog, key: &ObjectKey) -> Result<(), FlameError> {
+    let keys: Vec<_> = if let Some(key) = key.to_key() {
+        vec![key]
+    } else {
+        catalog
+            .lock()
+            .map_err(|_| catalog_error())?
+            .keys()
+            .filter(|candidate| key.matches(candidate))
+            .cloned()
+            .collect()
+    };
+    for key in keys {
+        let path = root.join(&key);
+        {
+            let mut published = catalog.lock().map_err(|_| catalog_error())?;
+            match fs::remove_dir_all(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            published.remove(&key);
+        }
+        if let Some(session) = path.parent() {
+            remove_empty_dir(&session.join(STAGING_DIR));
+            remove_empty_dir(session);
+            if let Some(app) = session.parent() {
+                remove_empty_dir(app);
+            }
+        }
+    }
+    Ok(())
+}
+
+impl FsStorage {
+    #[cfg(test)]
+    /// Capture one part reader through the shared snapshot-opening path.
+    async fn reader(&self, key: &ObjectKey, part: u64) -> Result<Box<dyn PartReader>, FlameError> {
+        let mut readers = self.readers(key, &[part]).await?;
+        Ok(readers.remove(0))
+    }
+
+    #[cfg(test)]
+    /// Open captured file handles at the catalog's committed boundary without retaining read registrations.
+    async fn readers(
+        &self,
+        key: &ObjectKey,
+        parts: &[u64],
+    ) -> Result<Vec<Box<dyn PartReader>>, FlameError> {
+        if parts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let key_string = key
+            .to_key()
+            .ok_or_else(|| FlameError::InvalidConfig("complete object key required".into()))?;
+        let dir = self.object_dir(key);
+        let selected = {
+            let objects = self.catalog.lock().map_err(|_| catalog_error())?;
+            let object = objects
+                .get(&key_string)
+                .ok_or_else(|| FlameError::NotFound(format!("object <{key_string}> not found")))?;
+            let visible: Vec<_> = object.visible_parts().copied().collect();
+            let selected = parts
+                .iter()
+                .map(|part| {
+                    visible
+                        .get(*part as usize)
+                        .copied()
+                        .map(|record| (*part, record))
+                        .ok_or_else(|| FlameError::NotFound(format!("part {part} not found")))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (object.metadata.uuid.clone(), selected)
+        };
+        joined(
+            tokio::task::spawn_blocking(move || open_readers(&dir, &selected.1, &selected.0)).await,
+        )?
+    }
+
+    /// Select committed metadata and open an immutable file view, failing if GC removes or replaces it during capture.
+    async fn capture(
+        &self,
+        selected: &ObjectMetadata,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<ObjectReader, FlameError> {
+        if ObjectKey::try_from(selected.key.as_str())?
+            .to_key()
+            .is_none()
+        {
+            return Err(FlameError::InvalidConfig(
+                "complete object key required".into(),
+            ));
+        }
+        let root = self.storage_path.clone();
+        let catalog = Arc::clone(&self.catalog);
+        let selected = selected.clone();
+        joined(
+            tokio::task::spawn_blocking(move || {
+                let (metadata, records, uuid) = {
+                    let objects = catalog.lock().map_err(|_| catalog_error())?;
+                    let object = objects
+                        .get(&selected.key)
+                        .filter(|object| object.version() > 0)
+                        .ok_or_else(|| {
+                            FlameError::NotFound(format!("object <{}> not found", selected.key))
+                        })?;
+                    if selected.uuid.is_empty() || selected.uuid != object.metadata.uuid {
+                        return Err(FlameError::InvalidVersion("object UUID changed".into()));
+                    }
+                    let visible: Vec<_> = object.visible_parts().copied().collect();
+                    let version = visible.len() as u64;
+                    let end = end.unwrap_or(version);
+                    if selected.version > version || end > version {
+                        return Err(FlameError::InvalidConfig(
+                            "requested version is ahead of object".into(),
+                        ));
+                    }
+                    if start > end {
+                        return Err(FlameError::InvalidConfig(
+                            "starting part is ahead of ending part".into(),
+                        ));
+                    }
+                    let mut metadata = object.metadata(&selected.key, "");
+                    metadata.version = end;
+                    metadata.size = visible.iter().take(end as usize).map(|part| part.len).sum();
+                    let records = visible
+                        .iter()
+                        .enumerate()
+                        .skip(start as usize)
+                        .take((end - start) as usize)
+                        .map(|(part, record)| (part as u64, *record))
+                        .collect::<Vec<_>>();
+                    (metadata, records, object.metadata.uuid.clone())
+                };
+                let readers = open_readers(&root.join(&selected.key), &records, &uuid)?;
+                let parts = readers.iter().map(|reader| reader.part()).collect();
+                Ok(ObjectReader::new(Object { metadata, parts }, readers))
+            })
+            .await,
+        )?
+    }
+
+    /// Reserve one disjoint payload extent under a short allocation lock, then stream without that lock.
+    async fn writer(
+        &self,
+        key: &ObjectKey,
+        data_type: &str,
+        size: u64,
+    ) -> Result<ObjectWriter, FlameError> {
+        if key.is_all_sessions() {
+            return Err(FlameError::InvalidConfig(
+                "wildcard is not an upload namespace".into(),
+            ));
+        }
+        let key = if key.object_id.is_none() {
+            key.clone().with_generated_id()
+        } else {
+            key.clone()
+        };
+        let key_string = key
+            .to_key()
+            .ok_or_else(|| FlameError::InvalidConfig("complete object key required".into()))?;
+        let dir = self.object_dir(&key);
+        let data_type = data_type.to_owned();
+        let catalog = Arc::clone(&self.catalog);
+        joined(
+            tokio::task::spawn_blocking(move || {
+                let mut objects = catalog.lock().map_err(|_| catalog_error())?;
+                let created = !objects.contains_key(&key_string);
+                if created {
+                    let metadata = ObjectMetadataDao {
+                        uuid: uuid::Uuid::new_v4().to_string(),
+                        data_type: data_type.clone(),
+                    };
+                    create_object_files(&dir, &metadata)?;
+                    objects.insert(
+                        key_string.clone(),
+                        ObjectDao {
+                            metadata,
+                            parts: Vec::new(),
+                            cached_version: 0,
+                        },
+                    );
+                }
+                let result = (|| {
+                    let object = objects.get_mut(&key_string).expect("initialized object");
+                    validate_uuid(&dir, &object.metadata.uuid)?;
+                    if object.metadata.data_type != data_type {
+                        return Err(FlameError::InvalidConfig(
+                            "patch data type does not match object".into(),
+                        ));
+                    }
+                    if object
+                        .parts
+                        .iter()
+                        .filter(|part| part.state != dao::PartState::Stale)
+                        .count() as u64
+                        > MAX_APPENDS_PER_OBJECT
+                    {
+                        return Err(FlameError::InvalidState(
+                            "maximum number of appends reached".into(),
+                        ));
+                    }
+                    let physical = object.parts.len() as u64;
+                    let (record, writer) = part_writer::open(dir.clone(), physical, size)?;
+                    object.parts.push(record);
+                    let part = Part {
+                        part: physical,
+                        size,
+                        creation_time: record.creation_time,
+                        checksum: [0; 32],
+                    };
+                    Ok(ObjectWriter::new(
+                        key_string.clone(),
+                        object.metadata.uuid.clone(),
+                        part,
+                        writer,
+                    ))
+                })();
+                if result.is_err() && created {
+                    objects.remove(&key_string);
+                    let _ = fs::remove_dir_all(&dir);
+                }
+                result
+            })
+            .await,
+        )?
+    }
+    /// Own an accepted upload task through source consumption, filesystem durability, and state publication or cleanup.
+    async fn write_part(
+        &self,
+        key: &ObjectKey,
+        data_type: &str,
+        size: u64,
+        chunks: ByteStream,
+    ) -> Result<ObjectMetadata, FlameError> {
+        let storage = self.clone();
+        let key = key.clone();
+        let data_type = data_type.to_owned();
+        tokio::spawn(async move { storage.write_chunks(&key, &data_type, size, chunks).await })
+            .await
+            .map_err(|error| FlameError::Internal(format!("storage write task failed: {error}")))?
+    }
+    /// Consume a domain byte stream and finalize every ordinary source, size, or filesystem failure inside storage.
+    async fn write_chunks(
+        &self,
+        key: &ObjectKey,
+        data_type: &str,
+        size: u64,
+        mut chunks: ByteStream,
+    ) -> Result<ObjectMetadata, FlameError> {
+        let mut writer = self.writer(key, data_type, size).await?;
+        while let Some(chunk) = chunks.next().await {
+            let result = match chunk {
+                Ok(bytes) => writer.write_chunk(bytes).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                self.abort_writer(writer)?;
+                return Err(error);
+            }
+        }
+        let metadata = match writer.descriptor() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.abort_writer(writer)?;
+                return Err(error);
+            }
+        };
+        self.commit_part(writer, metadata).await
+    }
+    /// Require an unchanged filesystem incarnation and a live physical part before mutating its cached descriptor.
+    fn check_writer<'a>(
+        &self,
+        writer: &ObjectWriter,
+        objects: &'a mut HashMap<String, ObjectDao>,
+    ) -> Result<&'a mut ObjectDao, FlameError> {
+        let object = objects
+            .get_mut(&writer.key)
+            .ok_or_else(|| FlameError::InvalidVersion("part was collected".into()))?;
+        if object.metadata.uuid != writer.uuid
+            || !object
+                .parts
+                .get(writer.part.part as usize)
+                .is_some_and(|part| part.state != dao::PartState::Stale)
+        {
+            return Err(FlameError::InvalidVersion(
+                "part is stale or was collected".into(),
+            ));
+        }
+        Ok(object)
+    }
+    /// Commit one part and publish its durable prefix, retiring only unprepared failures.
+    async fn commit_part(
+        &self,
+        mut writer: ObjectWriter,
+        metadata: Part,
+    ) -> Result<ObjectMetadata, FlameError> {
+        let result = async {
+            writer.sync_payload(metadata).await?;
+            let dir = self.storage_path.join(&writer.key);
+            let fence = {
+                let mut objects = self.catalog.lock().map_err(|_| catalog_error())?;
+                validate_uuid(&dir, &writer.uuid)?;
+                let object = self.check_writer(&writer, &mut objects)?;
+                let logical = object
+                    .parts
+                    .iter()
+                    .filter(|part| part.part != u64::MAX && part.state != dao::PartState::Stale)
+                    .count() as u64;
+                let mut prepared = metadata;
+                prepared.part = logical;
+                writer.prepare(prepared)?;
+                let offset = object.parts[writer.part.part as usize].offset;
+                let mut record = PartDao::from_part(prepared, offset);
+                record.state = dao::PartState::Writing;
+                object.parts[writer.part.part as usize] = record;
+                logical
+            };
+            writer.commit().await?;
+            let mut objects = self.catalog.lock().map_err(|_| catalog_error())?;
+            validate_uuid(&dir, &writer.uuid)?;
+            let object = self.check_writer(&writer, &mut objects)?;
+            object.publish(fence);
+            Ok(object.metadata_prefix(&writer.key, "", fence + 1))
+        }
+        .await;
+        if result.is_err() {
+            self.abort_writer(writer)?;
+        }
+        result
+    }
+    /// Mark only unprepared failures stale; prepared logical IDs remain available to another durability fence or recovery.
+    fn abort_writer(&self, mut writer: ObjectWriter) -> Result<(), FlameError> {
+        let mut objects = self.catalog.lock().map_err(|_| catalog_error())?;
+        let Ok(object) = self.check_writer(&writer, &mut objects) else {
+            return Ok(());
+        };
+        let part = &mut object.parts[writer.part.part as usize];
+        if part.state != dao::PartState::Writing || part.part != u64::MAX {
+            return Ok(());
+        }
+        let result = writer.abort();
+        part.state = dao::PartState::Stale;
+        if object
+            .parts
+            .iter()
+            .all(|part| part.state == dao::PartState::Stale)
+        {
+            objects.remove(&writer.key);
+            let dir = self.storage_path.join(&writer.key);
+            if validate_uuid(&dir, &writer.uuid).is_ok() {
+                fs::remove_dir_all(dir)?;
+            }
+        }
+        result
+    }
+    /// Open a partial create in filesystem tests while keeping the production streaming boundary closed.
+    #[cfg(test)]
+    async fn object_writer(
+        &self,
+        key: &ObjectKey,
+        data_type: &str,
+        size: u64,
+    ) -> Result<ObjectWriter, FlameError> {
+        self.writer(key, data_type, size).await
+    }
+    /// Open a partial append in filesystem tests for deterministic independent-write scenarios.
+    #[cfg(test)]
+    async fn patch_writer(
+        &self,
+        key: &ObjectKey,
+        data_type: &str,
+        size: u64,
+    ) -> Result<ObjectWriter, FlameError> {
+        self.writer(key, data_type, size).await
+    }
+    /// Exercise storage's normal commit coordinator with a manually driven filesystem payload in tests.
+    #[cfg(test)]
+    async fn commit_test_writer(&self, writer: ObjectWriter) -> Result<ObjectMetadata, FlameError> {
+        let metadata = match writer.descriptor() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.abort_writer(writer)?;
+                return Err(error);
+            }
+        };
+        self.commit_part(writer, metadata).await
+    }
+}
+
+#[async_trait]
+impl StorageEngine for FsStorage {
+    /// Capture a fixed requested prefix and return its authoritative metadata before payload polling begins.
+    async fn read_object(&self, metadata: &mut ObjectMetadata) -> Result<ChunkStream, FlameError> {
+        let reader = self.capture(metadata, 0, Some(metadata.version)).await?;
+        *metadata = reader.metadata().clone();
+        Ok(reader.into_stream())
+    }
+    /// Treat the input version as the patch cursor and replace metadata with the captured latest committed view.
+    async fn read_patch(&self, metadata: &mut ObjectMetadata) -> Result<ChunkStream, FlameError> {
+        let reader = self.capture(metadata, metadata.version, None).await?;
+        *metadata = reader.metadata().clone();
+        Ok(reader.into_stream())
+    }
+    /// Run a create stream to completion under storage ownership, independently of the waiting caller.
+    async fn write_object(
+        &self,
+        key: &ObjectKey,
+        data_type: &str,
+        size: u64,
+        chunks: ByteStream,
+    ) -> Result<ObjectMetadata, FlameError> {
+        self.write_part(key, data_type, size, chunks).await
+    }
+    /// Run an append stream to completion with result-based state publication and cleanup.
+    async fn write_patch(
+        &self,
+        key: &ObjectKey,
+        data_type: &str,
+        size: u64,
+        chunks: ByteStream,
+    ) -> Result<ObjectMetadata, FlameError> {
+        self.write_part(key, data_type, size, chunks).await
+    }
+    /// List committed metadata and project requested prefixes without reader/deletion bookkeeping.
+    async fn list(&self, filter: &ObjectFilter) -> Result<Vec<ObjectMetadata>, FlameError> {
+        let (key, version) = match filter {
+            ObjectFilter::AllObject => (None, None),
+            ObjectFilter::ByKey { key, version } => (Some(key), *version),
+        };
+        let current: Vec<_> = {
+            let objects = self.catalog.lock().map_err(|_| catalog_error())?;
+            if let Some(key) = key.and_then(ObjectKey::to_key) {
+                objects
+                    .get(&key)
+                    .filter(|object| object.version() > 0)
+                    .map(|object| object.metadata(&key, ""))
+                    .into_iter()
+                    .collect()
+            } else {
+                objects
+                    .iter()
+                    .filter(|(key, object)| filter.matches(key) && object.version() > 0)
+                    .map(|(key, object)| object.metadata(key, ""))
+                    .collect()
+            }
+        };
+        let Some(version) = version else {
+            return Ok(current);
+        };
+        let mut items = Vec::with_capacity(current.len());
+        for metadata in current {
+            if let Some(metadata) = project_metadata(&self.catalog, &metadata.key, Some(version))? {
+                items.push(metadata);
+            }
+        }
+        Ok(items)
+    }
+    /// Unlink expired-session data on a blocking worker without waiting for readers or writers.
+    async fn delete_objects(&self, key: &ObjectKey) -> Result<(), FlameError> {
+        let root = self.storage_path.clone();
+        let catalog = Arc::clone(&self.catalog);
+        let key = key.clone();
+        joined(tokio::task::spawn_blocking(move || delete_committed(&root, &catalog, &key)).await)?
+    }
+}
+/// Prune an empty directory while tolerating absent or still-populated namespaces.
+fn remove_empty_dir(path: &Path) {
+    match fs::remove_dir(path) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(error) => tracing::warn!(path = %path.display(), %error, "failed to prune directory"),
+    }
+}
+
+/// Open configured filesystem object storage, honoring `FLAME_CACHE_STORAGE`.
+pub(crate) async fn connect(url: &str) -> Result<StorageEnginePtr, FlameError> {
     let url = std::env::var("FLAME_CACHE_STORAGE")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| url.to_string());
-
-    if url.is_empty() {
-        tracing::warn!("No cache storage configured - using none storage (cache only)");
-        return Ok(Box::new(ResidentStorage::cache_only(eviction)));
+    if url.is_empty() || url == "none" {
+        return Err(FlameError::InvalidConfig(
+            "filesystem object storage is required".into(),
+        ));
     }
-
-    if url == "none" {
-        tracing::info!("Cache storage: none (cache only, evicted objects are lost)");
-        return Ok(Box::new(ResidentStorage::cache_only(eviction)));
+    if url.contains("://") && !url.starts_with("fs://") && !url.starts_with("file://") {
+        return Err(FlameError::InvalidConfig(format!(
+            "unsupported object storage URL: {url}"
+        )));
     }
-
-    let storage_path = if url.starts_with("fs://") || url.starts_with("file://") {
+    let path = if url.starts_with("fs://") || url.starts_with("file://") {
         parse_storage_url(&url)?
     } else {
-        PathBuf::from(&url)
+        PathBuf::from(url)
     };
-
-    tracing::info!("Cache storage: filesystem at {:?}", storage_path);
-    Ok(Box::new(ResidentStorage::new(
-        Box::new(DiskStorage::new(storage_path)?),
-        eviction,
-    )))
+    let storage = joined(tokio::task::spawn_blocking(move || FsStorage::new(path)).await)??;
+    Ok(Box::new(storage))
 }
 
+/// Resolve filesystem storage URLs, relative to `FLAME_HOME` when needed.
 fn parse_storage_url(url: &str) -> Result<PathBuf, FlameError> {
     let path_part = url
         .strip_prefix("fs://")
         .or_else(|| url.strip_prefix("file://"))
         .ok_or_else(|| FlameError::InvalidConfig(format!("Invalid storage URL: {}", url)))?;
 
+    if path_part.is_empty() {
+        return Err(FlameError::InvalidConfig(
+            "filesystem storage path is empty".into(),
+        ));
+    }
     if path_part.starts_with('/') {
         Ok(PathBuf::from(path_part))
     } else {
@@ -304,32 +856,4 @@ fn parse_storage_url(url: &str) -> Result<PathBuf, FlameError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_storage_url_absolute() {
-        let path = parse_storage_url("fs:///var/lib/flame/cache").unwrap();
-        assert_eq!(path, PathBuf::from("/var/lib/flame/cache"));
-    }
-
-    #[test]
-    fn test_parse_storage_url_relative() {
-        let path = parse_storage_url("fs://cache").unwrap();
-        assert!(path.ends_with("cache"));
-        assert!(path.is_absolute() || path.starts_with("cache"));
-    }
-
-    #[test]
-    fn test_parse_storage_url_file_scheme() {
-        let path = parse_storage_url("file:///tmp/cache").unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/cache"));
-    }
-
-    #[tokio::test]
-    async fn test_connect_none() {
-        let storage = connect("none", None).await.unwrap();
-        let objects = storage.scan().await.unwrap();
-        assert!(objects.is_empty());
-    }
-}
+mod tests;

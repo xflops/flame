@@ -18,12 +18,9 @@ cluster:
     key_file: "/etc/flame/certs/server.key"
     ca_file: "/etc/flame/certs/ca.crt"
 cache:
+  storage: "fs://cache"
   endpoint: "grpcs://flame-object-cache:9090"
   advertise: "eth0"
-  eviction:
-    policy: "lru"
-    max_memory: "1024M"
-    max_objects: 100000
   tls:
     cert_file: "/etc/flame/certs/server.crt"
     key_file: "/etc/flame/certs/server.key"

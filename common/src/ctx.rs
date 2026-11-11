@@ -37,8 +37,6 @@ pub const DEFAULT_SESSION_RETRY_LIMITS: u32 = 5;
 const DEFAULT_SCHEDULE_INTERVAL: u64 = 100;
 const DEFAULT_SHIM: &str = "host";
 const DEFAULT_FLAME_CACHE_ENDPOINT: &str = "http://127.0.0.1:9090";
-const DEFAULT_EVICTION_POLICY: &str = "lru";
-const DEFAULT_MAX_MEMORY: &str = "1G";
 
 // ============================================================
 // YAML deserialization structs (serde layer)
@@ -133,7 +131,6 @@ struct FlameCacheYaml {
     /// choose the listener IP; other advertised addresses keep wildcard binding.
     pub advertise: Option<String>,
     pub storage: Option<String>,
-    pub eviction: Option<FlameEvictionYaml>,
     pub gc: Option<FlameCacheGcYaml>,
     /// TLS configuration for Object Cache (optional, independent from cluster.tls)
     pub tls: Option<FlameTlsYaml>,
@@ -145,16 +142,6 @@ struct FlameCacheYaml {
 #[serde(deny_unknown_fields)]
 struct FlameCacheGcYaml {
     pub interval: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FlameEvictionYaml {
-    /// Eviction policy: "lru" or "none"
-    pub policy: Option<String>,
-    /// Maximum memory for cached objects (string with units: "1G", "512M", "1024K")
-    pub max_memory: Option<String>,
-    /// Maximum number of objects in memory
-    pub max_objects: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,7 +302,6 @@ pub struct FlameCache {
     /// `None` uses the environment or the host's private address for references.
     pub advertise: Option<String>,
     pub storage: Option<String>,
-    pub eviction: FlameEviction,
     pub gc: FlameCacheGc,
     /// TLS configuration for Object Cache (optional, independent from cluster.tls)
     pub tls: Option<FlameTls>,
@@ -348,29 +334,6 @@ impl FlameCluster {
     /// Check if cluster endpoint requires TLS (https:// scheme)
     pub fn requires_tls(&self) -> bool {
         self.endpoint.starts_with("https://")
-    }
-}
-
-/// Eviction configuration for the cache.
-#[derive(Debug, Clone)]
-pub struct FlameEviction {
-    /// Eviction policy: "lru" or "none"
-    pub policy: String,
-    /// Maximum memory for cached objects in bytes
-    pub max_memory: u64,
-    /// Maximum number of objects in memory (None means unlimited)
-    pub max_objects: Option<usize>,
-}
-
-impl Default for FlameEviction {
-    fn default() -> Self {
-        let default_max_memory =
-            parse_memory_size(DEFAULT_MAX_MEMORY).unwrap_or(1024 * 1024 * 1024); // 1GiB fallback
-        FlameEviction {
-            policy: DEFAULT_EVICTION_POLICY.to_string(),
-            max_memory: default_max_memory,
-            max_objects: None,
-        }
     }
 }
 
@@ -752,11 +715,6 @@ impl TryFrom<FlameCacheYaml> for FlameCache {
                 .unwrap_or(DEFAULT_FLAME_CACHE_ENDPOINT.to_string()),
             advertise: cache.advertise.filter(|advertise| !advertise.is_empty()),
             storage: cache.storage,
-            eviction: cache
-                .eviction
-                .map(FlameEviction::try_from)
-                .transpose()?
-                .unwrap_or_default(),
             gc,
             tls,
             pprof,
@@ -784,26 +742,6 @@ impl TryFrom<FlameCacheGcYaml> for FlameCacheGc {
         }
 
         Ok(Self { interval })
-    }
-}
-
-impl TryFrom<FlameEvictionYaml> for FlameEviction {
-    type Error = FlameError;
-    fn try_from(eviction: FlameEvictionYaml) -> Result<Self, Self::Error> {
-        // Parse max_memory using bytesize crate
-        let max_memory = if let Some(ref max_memory_str) = eviction.max_memory {
-            parse_memory_size(max_memory_str)?
-        } else {
-            parse_memory_size(DEFAULT_MAX_MEMORY)?
-        };
-
-        Ok(FlameEviction {
-            policy: eviction
-                .policy
-                .unwrap_or(DEFAULT_EVICTION_POLICY.to_string()),
-            max_memory,
-            max_objects: eviction.max_objects,
-        })
     }
 }
 
@@ -1032,7 +970,7 @@ cluster:
     }
 
     #[test]
-    fn test_flame_context_with_cache_eviction() -> Result<(), FlameError> {
+    fn test_flame_context_with_filesystem_object_storage() -> Result<(), FlameError> {
         let context_string = r#"---
 cluster:
   name: flame
@@ -1042,10 +980,6 @@ cluster:
 cache:
   endpoint: "grpc://127.0.0.1:9090"
   storage: "/var/lib/flame/cache"
-  eviction:
-    policy: "lru"
-    max_memory: "512M"
-    max_objects: 5000
         "#;
 
         let tmp_dir = TempDir::new().unwrap();
@@ -1059,9 +993,6 @@ cache:
         let cache = ctx.cache.unwrap();
         assert_eq!(cache.endpoint, "grpc://127.0.0.1:9090");
         assert_eq!(cache.storage, Some("/var/lib/flame/cache".to_string()));
-        assert_eq!(cache.eviction.policy, "lru");
-        assert_eq!(cache.eviction.max_memory, 512 * 1024 * 1024); // 512MB in bytes
-        assert_eq!(cache.eviction.max_objects, Some(5000));
 
         Ok(())
     }
@@ -1106,72 +1037,6 @@ cache:
         )?;
         assert_eq!(cache.endpoint, "grpc://127.0.0.1:9090");
         assert_eq!(cache.advertise, None);
-        Ok(())
-    }
-
-    #[test]
-    fn test_flame_context_with_cache_no_eviction() -> Result<(), FlameError> {
-        let context_string = r#"---
-cluster:
-  name: flame
-  endpoint: "http://flame-session-manager:8080"
-  executors:
-    shims: [host]
-cache:
-  endpoint: "grpc://127.0.0.1:9090"
-  eviction:
-    policy: "none"
-        "#;
-
-        let tmp_dir = TempDir::new().unwrap();
-        let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
-
-        fs::write(&tmp_file, context_string).map_err(|e| FlameError::Internal(e.to_string()))?;
-
-        let ctx = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()))
-            .map_err(|e| FlameError::Internal(e.to_string()))?;
-
-        assert!(ctx.cache.is_some());
-        let cache = ctx.cache.unwrap();
-        assert_eq!(cache.eviction.policy, "none");
-        // Default max_memory should be applied (1G = 1073741824 bytes)
-        assert_eq!(cache.eviction.max_memory, 1024 * 1024 * 1024);
-        assert_eq!(cache.eviction.max_objects, None);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_flame_context_with_cache_default_eviction() -> Result<(), FlameError> {
-        let context_string = r#"---
-cluster:
-  name: flame
-  endpoint: "http://flame-session-manager:8080"
-  executors:
-    shims: [host]
-cache:
-  endpoint: "grpc://127.0.0.1:9090"
-        "#;
-
-        let tmp_dir = TempDir::new().unwrap();
-        let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
-
-        fs::write(&tmp_file, context_string).map_err(|e| FlameError::Internal(e.to_string()))?;
-
-        let ctx = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()))
-            .map_err(|e| FlameError::Internal(e.to_string()))?;
-
-        assert!(ctx.cache.is_some());
-        let cache = ctx.cache.unwrap();
-        // Default eviction config should be applied
-        assert_eq!(cache.eviction.policy, DEFAULT_EVICTION_POLICY);
-        assert_eq!(cache.eviction.max_memory, 1024 * 1024 * 1024); // 1G in bytes
-        assert_eq!(cache.eviction.max_objects, None);
-        assert_eq!(
-            cache.gc.interval,
-            std::time::Duration::from_secs(DEFAULT_CACHE_GC_INTERVAL_SECS)
-        );
-
         Ok(())
     }
 
@@ -1419,116 +1284,8 @@ cache:
     }
 
     // ============================================================
-    // Integration tests for max_memory in config files
+    // Resource requirement configuration tests
     // ============================================================
-
-    #[test]
-    fn test_flame_context_with_max_memory_gigabytes() -> Result<(), FlameError> {
-        let context_string = r#"---
-cluster:
-  name: flame
-  endpoint: "http://flame-session-manager:8080"
-  executors:
-    shims: [host]
-cache:
-  endpoint: "grpc://127.0.0.1:9090"
-  eviction:
-    policy: "lru"
-    max_memory: "1G"
-        "#;
-
-        let tmp_dir = TempDir::new().unwrap();
-        let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
-        fs::write(&tmp_file, context_string).map_err(|e| FlameError::Internal(e.to_string()))?;
-
-        let ctx = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()))?;
-
-        assert!(ctx.cache.is_some());
-        let cache = ctx.cache.unwrap();
-        assert_eq!(cache.eviction.max_memory, 1024 * 1024 * 1024); // 1G in bytes
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_flame_context_with_max_memory_megabytes() -> Result<(), FlameError> {
-        let context_string = r#"---
-cluster:
-  name: flame
-  endpoint: "http://flame-session-manager:8080"
-  executors:
-    shims: [host]
-cache:
-  endpoint: "grpc://127.0.0.1:9090"
-  eviction:
-    policy: "lru"
-    max_memory: "512M"
-        "#;
-
-        let tmp_dir = TempDir::new().unwrap();
-        let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
-        fs::write(&tmp_file, context_string).map_err(|e| FlameError::Internal(e.to_string()))?;
-
-        let ctx = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()))?;
-
-        assert!(ctx.cache.is_some());
-        let cache = ctx.cache.unwrap();
-        assert_eq!(cache.eviction.max_memory, 512 * 1024 * 1024); // 512M in bytes
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_flame_context_with_max_memory_lowercase() -> Result<(), FlameError> {
-        let context_string = r#"---
-cluster:
-  name: flame
-  endpoint: "http://flame-session-manager:8080"
-  executors:
-    shims: [host]
-cache:
-  endpoint: "grpc://127.0.0.1:9090"
-  eviction:
-    policy: "lru"
-    max_memory: "2g"
-        "#;
-
-        let tmp_dir = TempDir::new().unwrap();
-        let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
-        fs::write(&tmp_file, context_string).map_err(|e| FlameError::Internal(e.to_string()))?;
-
-        let ctx = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()))?;
-
-        assert!(ctx.cache.is_some());
-        let cache = ctx.cache.unwrap();
-        assert_eq!(cache.eviction.max_memory, 2 * 1024 * 1024 * 1024); // 2G in bytes
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_flame_context_with_invalid_max_memory_unit() {
-        // Test invalid unit should fail
-        let context_string = r#"---
-cluster:
-  name: flame
-  endpoint: "http://flame-session-manager:8080"
-  executors:
-    shims: [host]
-cache:
-  endpoint: "grpc://127.0.0.1:9090"
-  eviction:
-    policy: "lru"
-    max_memory: "512X"
-        "#;
-
-        let tmp_dir = TempDir::new().unwrap();
-        let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
-        fs::write(&tmp_file, context_string).unwrap();
-
-        let result = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()));
-        assert!(result.is_err());
-    }
 
     // ============================================================
     // Tests for cluster.resreq (cluster-wide default
@@ -1591,30 +1348,6 @@ cluster:
   resreq: "cpu=two,mem=4g"
   executors:
     shims: [host]
-        "#;
-
-        let tmp_dir = TempDir::new().unwrap();
-        let tmp_file = tmp_dir.path().join("flame-cluster.yaml");
-        fs::write(&tmp_file, context_string).unwrap();
-
-        let result = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_flame_context_with_invalid_max_memory_number() {
-        // Test invalid number should fail
-        let context_string = r#"---
-cluster:
-  name: flame
-  endpoint: "http://flame-session-manager:8080"
-  executors:
-    shims: [host]
-cache:
-  endpoint: "grpc://127.0.0.1:9090"
-  eviction:
-    policy: "lru"
-    max_memory: "abcM"
         "#;
 
         let tmp_dir = TempDir::new().unwrap();

@@ -22,7 +22,7 @@ use tonic::transport::ClientTlsConfig;
 
 use common::FlameError;
 use rpc::flame::v1::object_cache_service_client::ObjectCacheServiceClient;
-use rpc::flame::v1::{cache_get_response, CacheGetRequest, CacheGetResponse};
+use rpc::flame::v1::{cache_get_response, CacheGetMode, CacheGetRequest, CacheGetResponse};
 
 const HTTP_TIMEOUT_SECS: u64 = 300;
 const GRPC_CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -175,6 +175,8 @@ impl PackageDownloader for GrpcDownloader {
             .get(CacheGetRequest {
                 key: key.to_string(),
                 version: 0,
+                uuid: String::new(),
+                mode: CacheGetMode::Object as i32,
             })
             .await
             .map_err(|e| FlameError::Internal(format!("cache get failed: {}", e)))?
@@ -205,7 +207,15 @@ where
             "cache get returned data before its header".to_string(),
         ));
     };
-    let compressed = match header.data_type.as_str() {
+    let metadata = header.metadata.ok_or_else(|| {
+        FlameError::Internal("cache get header omitted object metadata".to_string())
+    })?;
+    if metadata.version != 1 || metadata.uuid.is_empty() {
+        return Err(FlameError::InvalidConfig(
+            "package must be a single part with an object UUID".to_string(),
+        ));
+    }
+    let compressed = match metadata.data_type.as_str() {
         "raw" => false,
         "raw.zstd" => true,
         other => {
@@ -219,44 +229,51 @@ where
     let encoded_path = dest_path.with_extension("zstd.tmp");
     let result = async {
         let write_path = if compressed { &encoded_path } else { &temp_path };
-        let mut file = tokio::fs::File::create(write_path)
-            .await
-            .map_err(|e| FlameError::Internal(format!("failed to create temp file: {}", e)))?;
-
-        let mut total_size = 0usize;
-        // All the parts are requested: they follow each other from
-        // version 1, and a package is all of them, one after the other.
-        let mut version = 0;
-        while let Some(message) = stream.next().await {
-            let message = message
-                .map_err(|e| FlameError::Internal(format!("cache get stream failed: {}", e)))?;
-            let Some(cache_get_response::Payload::Chunk(chunk)) = message.payload else {
-                return Err(FlameError::Internal(
-                    "cache get returned an unexpected message".to_string(),
-                ));
-            };
-            if chunk.version < version || (version == 0 && chunk.version != 1) {
-                return Err(FlameError::Internal(format!(
-                    "cache get returned version {} out of order",
-                    chunk.version
-                )));
-            }
-            version = chunk.version;
-            file.write_all(&chunk.data)
+        let total_size = {
+            let mut file = tokio::fs::File::create(write_path)
                 .await
-                .map_err(|e| FlameError::Internal(format!("failed to write chunk: {}", e)))?;
-            total_size += chunk.data.len();
-        }
-        if version == 0 {
-            return Err(FlameError::Internal(
-                "cache get omitted the object data".to_string(),
-            ));
-        }
+                .map_err(|e| FlameError::Internal(format!("failed to create temp file: {}", e)))?;
 
-        file.sync_all()
-            .await
-            .map_err(|e| FlameError::Internal(format!("failed to sync file: {}", e)))?;
-        drop(file);
+            let mut total_size = 0usize;
+            // A package is one raw part, potentially split into many chunks.
+            let mut saw_part = false;
+            while let Some(message) = stream.next().await {
+                let message = message
+                    .map_err(|e| FlameError::Internal(format!("cache get stream failed: {}", e)))?;
+                let Some(cache_get_response::Payload::Chunk(chunk)) = message.payload else {
+                    return Err(FlameError::Internal(
+                        "cache get returned an unexpected message".to_string(),
+                    ));
+                };
+                if chunk.part != 0 {
+                    return Err(FlameError::Internal(format!(
+                        "cache get returned package chunk for part {} instead of 0",
+                        chunk.part
+                    )));
+                }
+                saw_part = true;
+                file.write_all(&chunk.data)
+                    .await
+                    .map_err(|e| FlameError::Internal(format!("failed to write chunk: {}", e)))?;
+                total_size += chunk.data.len();
+            }
+            if !saw_part {
+                return Err(FlameError::Internal(
+                    "cache get omitted the object data".to_string(),
+                ));
+            }
+
+            if total_size as u64 != metadata.size {
+                return Err(FlameError::Internal(
+                    "cache get package length differs from metadata".to_string(),
+                ));
+            }
+
+            file.sync_all()
+                .await
+                .map_err(|e| FlameError::Internal(format!("failed to sync file: {}", e)))?;
+            total_size
+        };
 
         if compressed {
             let encoded = encoded_path.clone();
@@ -366,7 +383,7 @@ impl Default for DownloaderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpc::flame::v1::{CacheGetChunk, CacheGetHeader};
+    use rpc::flame::v1::{CacheGetChunk, CacheGetHeader, CacheObjectMetadata};
     use tempfile::TempDir;
     use tokio::io::AsyncWriteExt;
     use tonic::transport::ClientTlsConfig;
@@ -578,25 +595,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_grpc_download_stream_writes_all_parts_in_order() {
+    async fn test_grpc_download_stream_writes_part_chunks_in_order() {
         let temp_dir = TempDir::new().unwrap();
         let dest_path = temp_dir.path().join("package.tar.gz");
         let responses = vec![
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
-                    version: 2,
-                    data_type: "raw".to_string(),
+                    metadata: Some(package_metadata("raw", 11)),
                 })),
             }),
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                    version: 1,
+                    part: 0,
                     data: b"first".to_vec().into(),
                 })),
             }),
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                    version: 2,
+                    part: 0,
                     data: b"second".to_vec().into(),
                 })),
             }),
@@ -609,7 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_grpc_download_stream_decodes_each_compressed_part() {
+    async fn test_grpc_download_stream_decodes_compressed_chunks() {
         let temp_dir = TempDir::new().unwrap();
         let dest_path = temp_dir.path().join("package.tar.gz");
         let first = zstd::stream::encode_all(b"first".as_slice(), 0).unwrap();
@@ -617,19 +633,21 @@ mod tests {
         let responses = vec![
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
-                    version: 2,
-                    data_type: "raw.zstd".to_string(),
+                    metadata: Some(package_metadata(
+                        "raw.zstd",
+                        (first.len() + second.len()) as u64,
+                    )),
                 })),
             }),
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                    version: 1,
+                    part: 0,
                     data: first.into(),
                 })),
             }),
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                    version: 2,
+                    part: 0,
                     data: second.into(),
                 })),
             }),
@@ -641,19 +659,28 @@ mod tests {
         assert_eq!(tokio::fs::read(dest_path).await.unwrap(), b"firstsecond");
     }
 
+    fn package_metadata(data_type: &str, size: u64) -> CacheObjectMetadata {
+        CacheObjectMetadata {
+            version: 1,
+            data_type: data_type.to_string(),
+            uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+            size,
+            ..Default::default()
+        }
+    }
+
     fn header_response(data_type: &str) -> Result<CacheGetResponse, tonic::Status> {
         Ok(CacheGetResponse {
             payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
-                version: 2,
-                data_type: data_type.to_string(),
+                metadata: Some(package_metadata(data_type, 0)),
             })),
         })
     }
 
-    fn chunk_response(version: u64, data: &[u8]) -> Result<CacheGetResponse, tonic::Status> {
+    fn chunk_response(part: u64, data: &[u8]) -> Result<CacheGetResponse, tonic::Status> {
         Ok(CacheGetResponse {
             payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                version,
+                part,
                 data: data.to_vec().into(),
             })),
         })
@@ -664,8 +691,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let dest_path = temp_dir.path().join("package.tar.gz");
 
-        // The parts must start at version 1 and not go back.
-        for versions in [vec![2], vec![1, 2, 1], vec![]] {
+        // All chunks belong to the package's single part0.
+        for versions in [vec![1], vec![0, 1, 0], vec![]] {
             let mut responses = vec![header_response("raw")];
             responses.extend(
                 versions
@@ -687,13 +714,12 @@ mod tests {
         let responses = vec![
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
-                    version: 1,
-                    data_type: "raw.zstd".to_string(),
+                    metadata: Some(package_metadata("raw.zstd", 7)),
                 })),
             }),
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                    version: 1,
+                    part: 0,
                     data: b"invalid".to_vec().into(),
                 })),
             }),
@@ -715,17 +741,16 @@ mod tests {
         let responses = vec![
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
-                    version: 1,
-                    data_type: "raw".to_string(),
+                    metadata: Some(package_metadata("raw", 7)),
                 })),
             }),
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                    version: 1,
+                    part: 0,
                     data: b"partial".to_vec().into(),
                 })),
             }),
-            Err(tonic::Status::internal("stream interrupted")),
+            Err(tonic::Status::data_loss("payload checksum mismatch")),
         ];
         let result =
             write_cache_stream(&mut futures_util::stream::iter(responses), &dest_path).await;
@@ -741,13 +766,12 @@ mod tests {
         let responses = vec![
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
-                    version: 1,
-                    data_type: "arrow".to_string(),
+                    metadata: Some(package_metadata("arrow", 7)),
                 })),
             }),
             Ok(CacheGetResponse {
                 payload: Some(cache_get_response::Payload::Chunk(CacheGetChunk {
-                    version: 1,
+                    part: 0,
                     data: b"encoded".to_vec().into(),
                 })),
             }),
@@ -757,5 +781,65 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("non-raw"));
         assert!(!dest_path.exists());
         assert!(!dest_path.with_extension("tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn test_grpc_download_rejects_missing_metadata_and_multiple_parts() {
+        let directory = TempDir::new().unwrap();
+        let destination = directory.path().join("package.tar");
+        let mut multipart = package_metadata("raw", 0);
+        multipart.version = 2;
+        for metadata in [None, Some(multipart)] {
+            let responses = [Ok(CacheGetResponse {
+                payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
+                    metadata,
+                })),
+            })];
+            assert!(
+                write_cache_stream(&mut futures_util::stream::iter(responses), &destination,)
+                    .await
+                    .is_err()
+            );
+            assert!(!destination.exists());
+            assert!(!destination.with_extension("tmp").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_grpc_download_rejects_incomplete_payload_without_replacing_file() {
+        let directory = TempDir::new().unwrap();
+        let destination = directory.path().join("package.tar");
+        tokio::fs::write(&destination, b"old package")
+            .await
+            .unwrap();
+        let responses = [
+            Ok(CacheGetResponse {
+                payload: Some(cache_get_response::Payload::Header(CacheGetHeader {
+                    metadata: Some(package_metadata("raw", 100)),
+                })),
+            }),
+            chunk_response(0, b"partial"),
+        ];
+        assert!(
+            write_cache_stream(&mut futures_util::stream::iter(responses), &destination,)
+                .await
+                .is_err()
+        );
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"old package");
+        assert!(!destination.with_extension("tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn test_grpc_download_accepts_explicit_empty_part_zero() {
+        let directory = TempDir::new().unwrap();
+        let destination = directory.path().join("package.tar");
+        let responses = [header_response("raw"), chunk_response(0, b"")];
+        assert_eq!(
+            write_cache_stream(&mut futures_util::stream::iter(responses), &destination,)
+                .await
+                .unwrap(),
+            0,
+        );
+        assert!(tokio::fs::read(&destination).await.unwrap().is_empty());
     }
 }

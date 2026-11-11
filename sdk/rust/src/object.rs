@@ -18,33 +18,36 @@ use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use stdng::{lock_ptr, new_ptr};
 
 use bson::{doc, Bson, Document};
 use bytes::Bytes;
 use futures::stream;
 use serde_derive::{Deserialize, Serialize as DeriveSerialize};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tonic::transport::Channel;
 use tonic::Request;
 use url::Url;
 
 use crate::apis::flame::v1::object_cache_service_client::ObjectCacheServiceClient;
 use crate::apis::flame::v1::{
-    cache_get_response, cache_write_request, CacheDeleteRequest, CacheGetChunk, CacheGetHeader,
+    cache_get_response, cache_write_request, CacheGetChunk, CacheGetHeader, CacheGetMode,
     CacheGetRequest, CacheWriteHeader, CacheWriteRequest,
 };
 use crate::apis::{FlameClientCache, FlameClientTls, FlameContext, FlameError};
 use crate::message::FlameMessage;
 
 const WILDCARD_SESSION: &str = "*";
+/// Reserved session namespace for application-owned package objects.
+const PACKAGE_SESSION: &str = "pkg";
+/// Reserved session namespace for application-owned data shared across sessions.
+const SHARED_SESSION: &str = "shared";
 const DEFAULT_CACHE_PORT: u16 = 9090;
 const CONNECT_TIMEOUT_SECS: u64 = 30;
 const UPLOAD_CHUNK_SIZE: usize = 1024 * 1024;
 const CACHE_TARGET_HEADER: &str = "x-flame-object-cache";
 
 /// An object as the cache returns it: its data parts in the order they were
-/// written, the first at version 1, and their client-defined type.
+/// written, starting at part 0, and their client-defined type.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ObjectParts {
     data_type: String,
@@ -119,7 +122,7 @@ impl ObjectKey {
     }
 
     pub fn for_shared(app_name: impl Into<String>) -> Result<Self, FlameError> {
-        Self::prefix(app_name, "shared")
+        Self::prefix(app_name, SHARED_SESSION)
     }
 
     pub fn for_all_sessions(app_name: impl Into<String>) -> Result<Self, FlameError> {
@@ -202,6 +205,11 @@ impl ObjectKey {
         }
 
         if let Some(object_id) = object_id.as_deref() {
+            if object_id == ".uploads" {
+                return Err(FlameError::InvalidConfig(
+                    "reserved object name .uploads".to_string(),
+                ));
+            }
             validate_component("object_id", object_id, true)?;
         }
 
@@ -349,28 +357,6 @@ where
     .await
 }
 
-pub async fn delete_objects(key_prefix: impl AsRef<str>) -> Result<(), FlameError> {
-    let context = FlameContext::load(None)?;
-    delete_with_context(&context, key_prefix.as_ref()).await
-}
-
-async fn delete_with_context(context: &FlameContext, key_prefix: &str) -> Result<(), FlameError> {
-    let object_key = ObjectKey::from_path(key_prefix)?;
-    let cache = cache_from_context(context)?;
-    let mut client =
-        ObjectCacheServiceClient::new(connect_cache(&cache.endpoint, cache.tls.as_ref()).await?);
-    client
-        .delete(CacheDeleteRequest {
-            key: object_key.to_string(),
-        })
-        .await
-        .map_err(|e| FlameError::Internal(format!("cache delete failed: {}", e)))?;
-    Ok(())
-}
-
-/// Application packages are objects of the `pkg` session of their application.
-const PACKAGE_SESSION: &str = "pkg";
-
 /// The key of the package `filename` of an application: `<app>/pkg/<filename>`.
 pub fn package_key(app_name: &str, filename: &str) -> String {
     format!("{}/{}/{}", app_name, PACKAGE_SESSION, filename)
@@ -378,8 +364,8 @@ pub fn package_key(app_name: &str, filename: &str) -> String {
 
 /// Upload the application package `file_path` as `<app>/pkg/<filename>`, with
 /// the cache configured by `context` (the other helpers use the default
-/// context). An object is never replaced, so a package of the same name is
-/// deleted first.
+/// context). Uploading an existing package name appends a new part while
+/// preserving its previously committed parts.
 pub async fn upload_package(
     context: &FlameContext,
     app_name: &str,
@@ -389,15 +375,8 @@ pub async fn upload_package(
     let key = package_key(app_name, filename);
     ObjectKey::from_key(&key)?;
     let cache = cache_from_context(context)?;
-    delete_with_context(context, &key).await?;
-    do_put_file(
-        &cache.endpoint,
-        cache.tls.as_ref(),
-        key,
-        file_path.as_ref(),
-        "raw",
-    )
-    .await
+    let (file, size) = open_package_source(file_path.as_ref()).await?;
+    do_put_file(&cache.endpoint, cache.tls.as_ref(), key, file, size, "raw").await
 }
 
 #[derive(Debug, Clone)]
@@ -612,11 +591,12 @@ async fn connect_cache(
         .map_err(|e| FlameError::Internal(format!("failed to connect to object cache: {}", e)))
 }
 
-fn put_header(key: String, data_type: &str) -> CacheWriteRequest {
+fn put_header(key: String, data_type: &str, size: u64) -> CacheWriteRequest {
     CacheWriteRequest {
         payload: Some(cache_write_request::Payload::Header(CacheWriteHeader {
             key,
             data_type: data_type.to_string(),
+            size,
         })),
     }
 }
@@ -632,7 +612,7 @@ fn write_bytes_stream(
     data: Bytes,
     data_type: &str,
 ) -> impl futures::Stream<Item = CacheWriteRequest> {
-    let header = put_header(key, data_type);
+    let header = put_header(key, data_type, data.len() as u64);
     stream::unfold(
         (Some(header), data, 0usize),
         |(header, data, offset)| async move {
@@ -675,50 +655,79 @@ async fn do_put_bytes(
     object_ref_from_metadata(metadata)
 }
 
-async fn do_put_file(
+async fn open_package_source(path: &Path) -> Result<(tokio::fs::File, u64), FlameError> {
+    let file = tokio::fs::File::open(path).await.map_err(|error| {
+        FlameError::InvalidConfig(format!("failed to open {}: {error}", path.display()))
+    })?;
+    let metadata = file.metadata().await.map_err(|error| {
+        FlameError::InvalidConfig(format!("failed to inspect {}: {error}", path.display()))
+    })?;
+    if !metadata.is_file() {
+        return Err(FlameError::InvalidConfig(format!(
+            "package source {} must be a regular file",
+            path.display()
+        )));
+    }
+    Ok((file, metadata.len()))
+}
+
+async fn do_put_file<R>(
     endpoint: &CacheEndpoint,
     tls: Option<&FlameClientTls>,
     key: String,
-    path: &Path,
+    reader: R,
+    size: u64,
     data_type: &str,
-) -> Result<ObjectRef, FlameError> {
-    let file = tokio::fs::File::open(path).await.map_err(|e| {
-        FlameError::InvalidConfig(format!("failed to open {}: {}", path.display(), e))
-    })?;
-    let read_error = new_ptr(None);
-    let error_for_stream = read_error.clone();
-    let header = put_header(key, data_type);
-    let input = stream::unfold((file, Some(header)), move |(mut file, header)| {
-        let read_error = error_for_stream.clone();
-        async move {
+) -> Result<ObjectRef, FlameError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let (error_tx, mut error_rx) = tokio::sync::oneshot::channel();
+    let header = put_header(key, data_type, size);
+    let input = stream::unfold(
+        (reader, Some(header), Some(error_tx)),
+        |(mut reader, header, error_tx)| async move {
             if let Some(header) = header {
-                return Some((header, (file, None)));
+                return Some((header, (reader, None, error_tx)));
             }
             let mut chunk = vec![0_u8; UPLOAD_CHUNK_SIZE];
-            match file.read(&mut chunk).await {
+            match reader.read(&mut chunk).await {
                 Ok(0) => None,
                 Ok(count) => {
                     chunk.truncate(count);
-                    Some((put_chunk(Bytes::from(chunk)), (file, None)))
+                    Some((put_chunk(Bytes::from(chunk)), (reader, None, error_tx)))
                 }
                 Err(error) => {
-                    *lock_ptr!(read_error).expect("upload error mutex poisoned") = Some(error);
-                    None
+                    if let Some(tx) = error_tx {
+                        let _ = tx.send(error);
+                    }
+                    // A read error is not EOF. Keep the request open until the
+                    // driver resets it, so the server cannot commit this prefix.
+                    std::future::pending().await
                 }
             }
-        }
-    });
+        },
+    );
     let mut client = ObjectCacheServiceClient::new(connect_cache(endpoint, tls).await?);
-    let response = client.put(cache_request(endpoint, input)?).await;
-    if let Some(error) = lock_ptr!(read_error)
-        .expect("upload error mutex poisoned")
-        .take()
-    {
-        return Err(FlameError::Internal(format!(
-            "failed to read object chunk: {}",
-            error
-        )));
-    }
+    let mut request = cache_request(endpoint, input)?;
+    let cancellation = request.cancellation_handle();
+    let response = client.put(request);
+    tokio::pin!(response);
+    let response = tokio::select! {
+        response = &mut response => response,
+        error = &mut error_rx => {
+            match error {
+                Ok(error) => {
+                    cancellation.cancel();
+                    let _ = response.await;
+                    return Err(FlameError::Internal(format!(
+                        "failed to read object chunk: {error}"
+                    )));
+                }
+                Err(_) => response.await,
+            }
+        }
+    };
     let metadata = response
         .map_err(|e| FlameError::Internal(format!("cache upload failed: {}", e)))?
         .into_inner();
@@ -752,13 +761,15 @@ async fn fetch_object(reference: &ObjectRef) -> Result<ObjectParts, FlameError> 
             CacheGetRequest {
                 key: reference.key.clone(),
                 version: 0,
+                uuid: String::new(),
+                mode: CacheGetMode::Object as i32,
             },
         )?)
         .await
         .map_err(|e| FlameError::Internal(format!("cache get failed: {}", e)))?
         .into_inner();
     let header = read_header(&mut stream).await?;
-    let mut builder = ObjectPartsBuilder::new(header);
+    let mut builder = ObjectPartsBuilder::new(header)?;
     while let Some(message) = stream
         .message()
         .await
@@ -777,42 +788,59 @@ async fn fetch_object(reference: &ObjectRef) -> Result<ObjectParts, FlameError> 
 struct ObjectPartsBuilder {
     data_type: String,
     version: u64,
-    /// The data parts by version, starting at 1.
+    /// Contiguous zero-based parts, assembled from their chunks.
     parts: Vec<(u64, Vec<u8>)>,
 }
 
 impl ObjectPartsBuilder {
-    fn new(header: CacheGetHeader) -> Self {
-        Self {
-            data_type: header.data_type,
-            version: header.version,
-            parts: Vec::new(),
+    fn new(header: CacheGetHeader) -> Result<Self, FlameError> {
+        let metadata = header.metadata.ok_or_else(|| {
+            FlameError::InvalidConfig("cache response missing object metadata".to_string())
+        })?;
+        if metadata.uuid.is_empty() || metadata.version == 0 {
+            return Err(FlameError::InvalidConfig(
+                "cache response has invalid object identity or part count".to_string(),
+            ));
         }
+        Ok(Self {
+            data_type: metadata.data_type,
+            version: metadata.version,
+            parts: Vec::new(),
+        })
     }
 
     fn push(&mut self, chunk: CacheGetChunk) -> Result<(), FlameError> {
+        if chunk.part >= self.version {
+            return Err(FlameError::InvalidConfig(
+                "cache response part exceeds the advertised count".to_string(),
+            ));
+        }
         match self.parts.last_mut() {
-            Some((version, data)) if *version == chunk.version => {
+            Some((part, data)) if *part == chunk.part => {
                 data.extend_from_slice(&chunk.data);
             }
-            Some((version, _)) if *version + 1 != chunk.version => {
+            Some((part, _)) if *part + 1 != chunk.part => {
                 return Err(FlameError::InvalidConfig(
-                    "invalid object response: versions must be consecutive".to_string(),
+                    "invalid object response: part indexes must be consecutive".to_string(),
                 ));
             }
-            None if chunk.version != 1 => {
+            None if chunk.part != 0 => {
                 return Err(FlameError::InvalidConfig(
-                    "invalid object response: the data must start at version 1".to_string(),
+                    "invalid object response: data must start at part 0".to_string(),
                 ));
             }
-            _ => self.parts.push((chunk.version, chunk.data.to_vec())),
+            _ => self.parts.push((chunk.part, chunk.data.to_vec())),
         }
         Ok(())
     }
 
     fn finish(self, key: &str) -> Result<ObjectParts, FlameError> {
-        if self.parts.is_empty() {
-            return Err(FlameError::NotFound(key.to_string()));
+        if self.parts.len() as u64 != self.version {
+            return Err(FlameError::InvalidConfig(format!(
+                "incomplete object response for {key}: received {} of {} parts",
+                self.parts.len(),
+                self.version
+            )));
         }
         Ok(ObjectParts {
             data_type: self.data_type,
@@ -1074,6 +1102,7 @@ mod tests {
             Some(cache_write_request::Payload::Header(header)) => {
                 assert_eq!(header.key, "app/session/object");
                 assert_eq!(header.data_type, "client.codec.v1");
+                assert_eq!(header.size, data.len() as u64);
             }
             _ => panic!("first message must be a header"),
         }
@@ -1095,24 +1124,36 @@ mod tests {
                 .collect()
                 .await;
         assert_eq!(empty.len(), 1);
+        let Some(cache_write_request::Payload::Header(header)) = &empty[0].payload else {
+            panic!("empty upload requires a header");
+        };
+        assert_eq!(header.size, 0);
+    }
+
+    fn response_header(version: u64, data_type: &str) -> CacheGetHeader {
+        CacheGetHeader {
+            metadata: Some(crate::apis::flame::v1::CacheObjectMetadata {
+                version,
+                data_type: data_type.to_string(),
+                uuid: "object-uuid".to_string(),
+                ..Default::default()
+            }),
+        }
     }
 
     #[test]
-    fn response_assembles_one_part_per_version() {
-        let mut builder = ObjectPartsBuilder::new(CacheGetHeader {
-            version: 3,
-            data_type: "custom.binary".to_string(),
-        });
-        for (version, data) in [
-            (1, b"fir".as_slice()),
-            (1, b"st".as_slice()),
-            (2, b"sec".as_slice()),
-            (2, b"ond".as_slice()),
-            (3, b"next".as_slice()),
+    fn response_assembles_contiguous_zero_based_parts() {
+        let mut builder = ObjectPartsBuilder::new(response_header(3, "custom.binary")).unwrap();
+        for (part, data) in [
+            (0, b"fir".as_slice()),
+            (0, b"st".as_slice()),
+            (1, b"sec".as_slice()),
+            (1, b"ond".as_slice()),
+            (2, b"".as_slice()),
         ] {
             builder
                 .push(CacheGetChunk {
-                    version,
+                    part,
                     data: Bytes::copy_from_slice(data),
                 })
                 .unwrap();
@@ -1122,33 +1163,337 @@ mod tests {
         assert_eq!(object.version, 3);
         assert_eq!(
             object.parts,
-            vec![
+            [
                 Bytes::from_static(b"first"),
                 Bytes::from_static(b"second"),
-                Bytes::from_static(b"next"),
+                Bytes::new(),
             ]
         );
     }
 
     #[test]
-    fn response_must_start_at_version_one_and_be_consecutive() {
-        let chunk = |version| CacheGetChunk {
-            version,
+    fn response_rejects_missing_metadata_and_invalid_identity() {
+        assert!(ObjectPartsBuilder::new(CacheGetHeader::default()).is_err());
+        let mut header = response_header(1, "raw");
+        header.metadata.as_mut().unwrap().uuid.clear();
+        assert!(ObjectPartsBuilder::new(header).is_err());
+        assert!(ObjectPartsBuilder::new(response_header(0, "raw")).is_err());
+    }
+
+    #[test]
+    fn response_rejects_missing_gapped_and_excess_parts() {
+        let chunk = |part| CacheGetChunk {
+            part,
             data: Bytes::new(),
         };
-        let header = || CacheGetHeader {
-            version: 3,
-            data_type: "raw".to_string(),
-        };
-        let mut late = ObjectPartsBuilder::new(header());
-        assert!(late.push(chunk(2)).is_err());
-        let mut gap = ObjectPartsBuilder::new(header());
-        gap.push(chunk(1)).unwrap();
-        assert!(gap.push(chunk(3)).is_err());
-        let empty = ObjectPartsBuilder::new(header());
-        assert!(matches!(
-            empty.finish("app/session/object"),
-            Err(FlameError::NotFound(_))
-        ));
+        let mut late = ObjectPartsBuilder::new(response_header(3, "raw")).unwrap();
+        assert!(late.push(chunk(1)).is_err());
+        let mut gap = ObjectPartsBuilder::new(response_header(3, "raw")).unwrap();
+        gap.push(chunk(0)).unwrap();
+        assert!(gap.push(chunk(2)).is_err());
+        let mut short = ObjectPartsBuilder::new(response_header(3, "raw")).unwrap();
+        short.push(chunk(0)).unwrap();
+        assert!(short.finish("app/session/object").is_err());
+        let mut excess = ObjectPartsBuilder::new(response_header(1, "raw")).unwrap();
+        assert!(excess.push(chunk(1)).is_err());
+    }
+
+    #[derive(Clone, Default)]
+    struct UploadRecorder {
+        commits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        puts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        objects: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<Vec<u8>>>>>,
+        chunks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        received: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    }
+
+    #[tonic::async_trait]
+    impl crate::apis::flame::v1::object_cache_service_server::ObjectCacheService for UploadRecorder {
+        type GetStream = Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<crate::apis::flame::v1::CacheGetResponse, tonic::Status>,
+                    > + Send,
+            >,
+        >;
+        async fn put(
+            &self,
+            request: Request<tonic::Streaming<CacheWriteRequest>>,
+        ) -> Result<tonic::Response<crate::apis::flame::v1::CacheObjectMetadata>, tonic::Status>
+        {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut input = request.into_inner();
+            let mut key = String::new();
+            let mut expected_size = None;
+            let mut actual_size = 0;
+            let mut body = Vec::new();
+            while let Some(message) = input.message().await? {
+                match message.payload {
+                    Some(cache_write_request::Payload::Header(header)) => {
+                        key = header.key;
+                        expected_size = Some(header.size);
+                    }
+                    Some(cache_write_request::Payload::Data(data)) => {
+                        actual_size += data.len() as u64;
+                        body.extend_from_slice(&data);
+                        if expected_size.is_none_or(|size| actual_size > size) {
+                            return Err(tonic::Status::invalid_argument(
+                                "body exceeds declared size",
+                            ));
+                        }
+                        self.chunks
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if let Some(tx) = self.received.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    None => return Err(tonic::Status::invalid_argument("missing payload")),
+                }
+            }
+            if expected_size != Some(actual_size) {
+                return Err(tonic::Status::invalid_argument(
+                    "body differs from declared size",
+                ));
+            }
+            let version = {
+                let mut objects = self.objects.lock().unwrap();
+                let parts = objects.entry(key.clone()).or_default();
+                parts.push(body);
+                parts.len() as u64
+            };
+            self.commits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(tonic::Response::new(
+                crate::apis::flame::v1::CacheObjectMetadata {
+                    endpoint: "grpc://127.0.0.1:9090".to_string(),
+                    key,
+                    version,
+                    uuid: "object-uuid".to_string(),
+                    ..Default::default()
+                },
+            ))
+        }
+
+        async fn patch(
+            &self,
+            request: Request<tonic::Streaming<CacheWriteRequest>>,
+        ) -> Result<tonic::Response<crate::apis::flame::v1::CacheObjectMetadata>, tonic::Status>
+        {
+            self.put(request).await
+        }
+        async fn get(
+            &self,
+            _: Request<CacheGetRequest>,
+        ) -> Result<tonic::Response<Self::GetStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used"))
+        }
+    }
+
+    async fn upload_server(
+        recorder: UploadRecorder,
+    ) -> (
+        CacheEndpoint,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint =
+            CacheEndpoint::parse(&format!("grpc://{}", listener.local_addr().unwrap())).unwrap();
+        let incoming = stream::try_unfold(listener, |listener| async move {
+            let (socket, _) = listener.accept().await?;
+            Ok::<_, std::io::Error>(Some((socket, listener)))
+        });
+        let handle = tokio::spawn(tonic::transport::Server::builder()
+            .add_service(crate::apis::flame::v1::object_cache_service_server::ObjectCacheServiceServer::new(recorder))
+            .serve_with_incoming(incoming));
+        (endpoint, handle)
+    }
+
+    struct FailingReader {
+        bytes: std::io::Cursor<Vec<u8>>,
+        received: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            output: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if (self.bytes.position() as usize) < self.bytes.get_ref().len() {
+                return Pin::new(&mut self.bytes).poll_read(cx, output);
+            }
+            if let Some(rx) = self.received.as_mut() {
+                if Pin::new(rx).poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.received = None;
+            }
+            Poll::Ready(Err(std::io::Error::other("injected read failure")))
+        }
+    }
+
+    #[tokio::test]
+    async fn local_read_errors_reset_upload_before_committing() {
+        for after_chunk in [false, true] {
+            let recorder = UploadRecorder::default();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if after_chunk {
+                *recorder.received.lock().unwrap() = Some(tx);
+            }
+            let (endpoint, server) = upload_server(recorder.clone()).await;
+            let reader = FailingReader {
+                bytes: Cursor::new(if after_chunk {
+                    b"received prefix".to_vec()
+                } else {
+                    Vec::new()
+                }),
+                received: after_chunk.then_some(rx),
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                do_put_file(
+                    &endpoint,
+                    None,
+                    "app/pkg/upload".to_string(),
+                    reader,
+                    15,
+                    "raw",
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("injected read failure"));
+            assert_eq!(
+                recorder.commits.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            if after_chunk {
+                assert_eq!(recorder.chunks.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    /// Declare exact wire sizes for empty, multipart, patch, and file-style streams.
+    #[tokio::test]
+    async fn upload_headers_match_complete_stream_sizes() {
+        let recorder = UploadRecorder::default();
+        let (endpoint, server) = upload_server(recorder.clone()).await;
+        for (index, patch, size) in [
+            (0, false, 0),
+            (1, false, UPLOAD_CHUNK_SIZE + 3),
+            (2, true, 7),
+        ] {
+            do_put_bytes(
+                &endpoint,
+                None,
+                format!("app/session/object{index}"),
+                patch,
+                Bytes::from(vec![5; size]),
+                "raw",
+            )
+            .await
+            .unwrap();
+        }
+        let data = vec![9; UPLOAD_CHUNK_SIZE + 1];
+        do_put_file(
+            &endpoint,
+            None,
+            "app/pkg/file".into(),
+            Cursor::new(data.clone()),
+            data.len() as u64,
+            "raw",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recorder.commits.load(std::sync::atomic::Ordering::SeqCst),
+            4
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// Build a context targeting the isolated upload recorder.
+    fn upload_context(endpoint: &CacheEndpoint) -> FlameContext {
+        FlameContext {
+            current_context: "test".to_string(),
+            contexts: vec![crate::apis::FlameContextEntry {
+                name: "test".to_string(),
+                cluster: Default::default(),
+                cache: Some(FlameClientCache {
+                    endpoint: Some(format!("grpc://{}:{}", endpoint.host, endpoint.port)),
+                    ..Default::default()
+                }),
+                package: None,
+                app: None,
+            }],
+        }
+    }
+
+    /// Reject a directory before opening an upload RPC.
+    #[tokio::test]
+    async fn package_directory_is_rejected_before_upload() {
+        let recorder = UploadRecorder::default();
+        let (endpoint, server) = upload_server(recorder.clone()).await;
+        let context = upload_context(&endpoint);
+        let result = upload_package(&context, "app", "existing.tar", std::env::temp_dir()).await;
+        assert!(result.unwrap_err().to_string().contains("regular file"));
+        assert_eq!(recorder.puts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            recorder.commits.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// Append a repeated package upload without replacing its previously committed bytes.
+    #[tokio::test]
+    async fn repeated_package_upload_appends_and_preserves_existing_parts() {
+        let recorder = UploadRecorder::default();
+        let (endpoint, server) = upload_server(recorder.clone()).await;
+        let context = upload_context(&endpoint);
+        let source = std::env::temp_dir().join(format!("flame-package-{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&source, b"original package")
+            .await
+            .unwrap();
+        let reference = upload_package(&context, "app", "package.tar", &source)
+            .await
+            .unwrap();
+        assert_eq!(reference.key, "app/pkg/package.tar");
+        tokio::fs::write(&source, b"replacement package")
+            .await
+            .unwrap();
+        let appended = upload_package(&context, "app", "package.tar", &source)
+            .await
+            .unwrap();
+        assert_eq!(reference.version, 1);
+        assert_eq!(appended.version, 2);
+        assert_eq!(appended.key, reference.key);
+        assert_eq!(recorder.puts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            recorder.commits.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            recorder
+                .objects
+                .lock()
+                .unwrap()
+                .get("app/pkg/package.tar")
+                .unwrap(),
+            &[
+                b"original package".to_vec(),
+                b"replacement package".to_vec()
+            ]
+        );
+        tokio::fs::remove_file(source).await.unwrap();
+        server.abort();
+        let _ = server.await;
     }
 }

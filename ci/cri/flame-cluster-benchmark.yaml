@@ -15,9 +15,6 @@ cluster:
     node:
       max_executors: 4
 cache:
+  storage: "fs://cache"
   endpoint: "grpc://10.250.0.1:9090"
   advertise: "flame0"
-  eviction:
-    policy: "lru"
-    max_memory: "1024M"
-    max_objects: 100000

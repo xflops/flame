@@ -22,10 +22,6 @@ cache:
   endpoint: "grpcs://flame-object-cache:9090"
   advertise: "eth0"
   storage: "/var/lib/flame/cache"
-  eviction:
-    policy: "lru"
-    max_memory: "512M"
-    max_objects: 10000
   # TLS Configuration for Object Cache
   tls:
     cert_file: "/etc/flame/certs/server.crt"

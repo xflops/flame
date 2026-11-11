@@ -14,7 +14,7 @@ from typing import Optional
 import cloudpickle
 import flamepy.app as app
 from flamepy import ObjectRef, get_object, put_object
-from flamepy.util import short_name
+from flamepy.core.cache import ObjectKey
 
 from e2e.api import (
     ApplicationContextInfo,
@@ -133,15 +133,15 @@ def serialize_service_context(service_context: app.ServiceContext, app_name: str
 
     Args:
         service_context: app.ServiceContext object to serialize
-        app_name: Application name for generating session ID
+        app_name: Application that owns the shared context object
 
     Returns:
         bytes representation of ObjectRef
     """
     # Serialize the context using cloudpickle
     serialized_ctx = cloudpickle.dumps(service_context, protocol=cloudpickle.DEFAULT_PROTOCOL)
-    # Generate key prefix in <app>/<session> format for caching
-    key_prefix = f"{app_name}/{short_name(app_name)}"
+    # Retain context data for the application lifetime, across session bindings.
+    key_prefix = ObjectKey.for_shared(app_name).to_prefix()
     # Put in cache to get ObjectRef
     object_ref = put_object(key_prefix, serialized_ctx)
     # Encode ObjectRef to bytes for core API
@@ -186,7 +186,7 @@ def serialize_common_data(common_data: Optional[TestContext], app_name: str) -> 
 
     Args:
         common_data: TestContext object to serialize, or None
-        app_name: Application name for generating session ID
+        app_name: Application that owns the shared common-data object
 
     Returns:
         bytes representation of ObjectRef, or None if common_data is None
@@ -197,7 +197,7 @@ def serialize_common_data(common_data: Optional[TestContext], app_name: str) -> 
     # Serialize with JSON
     serialized_ctx = json.dumps(asdict(common_data)).encode("utf-8")
     # Put in cache to get ObjectRef
-    key_prefix = f"{app_name}/{short_name(app_name)}"
+    key_prefix = ObjectKey.for_shared(app_name).to_prefix()
     object_ref = put_object(key_prefix, serialized_ctx)
     # Encode ObjectRef to bytes for core API
     return object_ref.encode()

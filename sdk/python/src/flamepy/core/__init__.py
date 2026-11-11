@@ -18,8 +18,6 @@ from .cache import (
     ObjectRef,
     Ref,
     ValueRef,
-    delete_objects,
-    delete_package,
     download_package,
     get_object,
     patch_object,
@@ -185,9 +183,7 @@ __all__ = [
     "ValueRef",
     # Cache functions
     "download_package",
-    "delete_package",
     "upload_package",
-    "delete_objects",
     "get_object",
     "patch_object",
     "put_object",

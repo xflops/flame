@@ -650,8 +650,9 @@ mod tests {
         assert_eq!(attributes.installer.as_deref(), Some("python"));
     }
 
+    /// Use the same prepared package identity in upload keys and advertised deployment URLs.
     #[test]
-    fn binary_package_url_uses_three_part_content_addressed_object_key() {
+    fn binary_package_url_uses_prepared_deployment_object_key() {
         let temp = tempfile::TempDir::new().unwrap();
         let bin = temp.path().join("service");
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
@@ -661,13 +662,13 @@ mod tests {
         let object_key = prepared.object_key("demo");
         assert_eq!(
             object_key,
-            format!("demo/pkg/demo-{}.tar.gz", &prepared.sha256[..16])
+            format!("demo/pkg/{}", prepared.package_filename("demo"))
         );
         assert_eq!(
             object_url("grpc://cache:9090", &object_key),
             format!(
-                "grpc://cache:9090/demo/pkg/demo-{}.tar.gz",
-                &prepared.sha256[..16]
+                "grpc://cache:9090/demo/pkg/{}",
+                prepared.package_filename("demo")
             )
         );
     }

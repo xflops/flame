@@ -18,6 +18,7 @@ import sys
 import threading
 import types
 import uuid
+import weakref
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
@@ -73,6 +74,9 @@ def _required_module(name: str) -> Any:
 Deserializer = Callable[[List[Any]], Any]
 
 WILDCARD_SESSION = "*"
+# Application-owned namespaces; these follow application rather than session lifetime.
+PACKAGE_SESSION = "pkg"
+SHARED_SESSION = "shared"
 
 
 class Ref:
@@ -112,22 +116,22 @@ class ObjectRef(Ref):
 
 @dataclass
 class Object:
-    """Cached object: its data parts in the order they were written, the first
-    at version 1, and the values the deserializers made of them."""
+    """One object's UUID, committed part count, ordered parts and materializations."""
 
     version: int
     data: List[Any]
+    uuid: str = ""
+    _token: Any = field(default=None, repr=False, compare=False)
     materialized: Dict[Any, Any] = field(default_factory=dict)
 
 
 @dataclass
 class FetchResult:
-    """What a Get returned: the version of the object, and its data parts after
-    the version the client asked for, one part per version (all of them for
-    version 0)."""
+    """The UUID, final part count and verified parts selected by a Get request."""
 
     version: int
     data: List[Any]
+    uuid: str = ""
 
 
 class _IdentityKey:
@@ -156,6 +160,13 @@ _object_cache: OrderedDict[tuple, Object] = OrderedDict()
 _cache_lock = threading.Lock()
 
 
+class _CacheToken:
+    pass
+
+
+_cache_tokens: weakref.WeakValueDictionary[tuple, _CacheToken] = weakref.WeakValueDictionary()
+
+
 def _cache_get(key: tuple) -> Optional[Object]:
     """Get from cache and update LRU order (O(1) with OrderedDict)."""
     with _cache_lock:
@@ -165,18 +176,29 @@ def _cache_get(key: tuple) -> Optional[Object]:
         return _object_cache[key]
 
 
+def _cache_snapshot(key: tuple):
+    """Capture an entry and invalidation token, including an absent entry."""
+    with _cache_lock:
+        cached = _object_cache.get(key)
+        if cached is not None:
+            _object_cache.move_to_end(key)
+        token = _cache_tokens.get(key)
+        if token is None:
+            token = cached._token if cached is not None and cached._token is not None else _CacheToken()
+            _cache_tokens[key] = token
+        return cached, token
+
+
+def _cache_snapshot_matches(key: tuple, entry: Optional[Object], token: object) -> bool:
+    with _cache_lock:
+        return _object_cache.get(key) is entry and _cache_tokens.get(key) is token
+
+
 def _cache_remove(key: tuple) -> None:
     """Remove from cache."""
     with _cache_lock:
         _object_cache.pop(key, None)
-
-
-def _cache_remove_matching(object_key: "ObjectKey") -> None:
-    """Remove all entries matched by an ObjectKey."""
-    with _cache_lock:
-        keys_to_remove = [k for k in _object_cache if object_key.matches_key(k[1])]
-        for key in keys_to_remove:
-            _object_cache.pop(key, None)
+        _cache_tokens.pop(key, None)
 
 
 def _materialized_cache_key(deserializer: Optional[Deserializer]) -> Any:
@@ -205,24 +227,36 @@ def _materialize_object(obj: Object, deserializer: Optional[Deserializer] = None
             return obj.materialized.setdefault(materialized_key, value)
 
 
-def _cache_append_parts(key: tuple, result: FetchResult, requested_version: int = 0) -> Optional[Object]:
-    """Add the data parts of a Get result, asked for after `requested_version`,
-    to the cache and return the cached object: it is created if it is not cached
-    and the parts are appended to it otherwise, except for the ones it already
-    has. Returns None if the object is not cached but the result is only the
-    data after `requested_version`, or if the cache is behind it: the caller must
-    get all the data.
+_ANY_ENTRY = object()
+
+
+def _cache_append_parts(key: tuple, result: FetchResult, requested_version: int = 0, expected: Any = _ANY_ENTRY, token: Any = _ANY_ENTRY) -> Optional[Object]:
+    """Publish verified parts only against the entry used to request them.
+
+    A replaced/invalidated entry cannot be resurrected by a delayed fetch. Two
+    concurrent fetches of the same UUID may still merge their missing suffix.
     """
     with _cache_lock:
         cached = _object_cache.get(key)
+        if token is not _ANY_ENTRY and _cache_tokens.get(key) is not token:
+            return None
+        if token is _ANY_ENTRY:
+            token = _cache_tokens.get(key) or _CacheToken()
+            _cache_tokens[key] = token
+        if expected is not _ANY_ENTRY and cached is not expected:
+            if cached is None or cached.uuid != result.uuid:
+                return None
         if cached is None:
             if requested_version:
                 return None
-            cached = Object(version=result.version, data=list(result.data))
+            cached = Object(version=result.version, data=list(result.data), uuid=result.uuid, _token=token)
+            _object_cache[key] = cached
+        elif cached.uuid != result.uuid:
+            if requested_version:
+                return None
+            cached = Object(version=result.version, data=list(result.data), uuid=result.uuid, _token=token)
             _object_cache[key] = cached
         else:
-            # Parts the cache got after the request, from another call, are
-            # already in it.
             have = cached.version - requested_version
             if have < 0:
                 return None
@@ -230,10 +264,10 @@ def _cache_append_parts(key: tuple, result: FetchResult, requested_version: int 
                 cached.data.extend(result.data[have:])
                 cached.version = result.version
                 cached.materialized.clear()
-
         _object_cache.move_to_end(key)
         while len(_object_cache) > _CACHE_MAX_SIZE:
-            _object_cache.popitem(last=False)
+            evicted, _ = _object_cache.popitem(last=False)
+            _cache_tokens.pop(evicted, None)
         return cached
 
 
@@ -270,6 +304,8 @@ class ObjectKey:
                 raise ValueError("Wildcard session '*' cannot have object_id")
             if not self.object_id:
                 raise ValueError("object_id cannot be empty string")
+            if self.object_id == ".uploads":
+                raise ValueError("object_id .uploads is reserved for cache staging")
             if self.object_id == WILDCARD_SESSION:
                 raise ValueError("Wildcard '*' not allowed for object_id")
             if ".." in self.object_id or "\\" in self.object_id or "/" in self.object_id:
@@ -307,7 +343,7 @@ class ObjectKey:
     @classmethod
     def for_shared(cls, app_name: str) -> "ObjectKey":
         """Create key for shared storage: '<app>/shared'."""
-        return cls(app_name=app_name, session_id="shared", object_id=None)
+        return cls(app_name=app_name, session_id=SHARED_SESSION, object_id=None)
 
     @classmethod
     def for_all_sessions(cls, app_name: str) -> "ObjectKey":
@@ -681,17 +717,9 @@ def patch_object(ref: ObjectRef, data: Any) -> ObjectRef:
     return _call_aio_cache("patch_object", ref, data)
 
 
-def delete_objects(key_prefix: str, endpoint: Optional[str] = None) -> None:
-    _call_aio_cache("delete_objects", key_prefix, endpoint)
-
-
 def upload_package(app_name: str, file_path: str, filename: Optional[str] = None, endpoint: Optional[str] = None) -> ObjectRef:
     return _call_aio_cache("upload_package", app_name, file_path, filename, endpoint)
 
 
 def download_package(app_name: str, filename: str, dest_path: str, endpoint: Optional[str] = None) -> None:
     _call_aio_cache("download_package", app_name, filename, dest_path, endpoint)
-
-
-def delete_package(app_name: str, filename: str, endpoint: Optional[str] = None) -> None:
-    _call_aio_cache("delete_package", app_name, filename, endpoint)

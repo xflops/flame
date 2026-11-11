@@ -13,7 +13,8 @@ supersedes those sections.
 The enhancement accepts regular files, packages directories with project
 ignore rules, reads directory application profiles, and names temporary
 archives after their input. The uploaded
-cache object remains content-addressed by application name and archive digest.
+cache object includes the application name and a UUID generated
+once for each prepared deployment.
 The same ignore-file names are also accepted by `flamepy.app.init()`; its
 packaging contract is described separately below.
 
@@ -34,7 +35,7 @@ uses a generic name that does not identify the source input.
 2. Accept executable binaries, regular files, directories, and existing gzip
    tarballs through the same `--application` option.
 3. Give the temporary archive a name derived from the input while preserving
-   the content-addressed cache key.
+   the content digest and giving each deployment a distinct cache key.
 4. Detect the runtime from the files the executor will actually receive.
 5. Reuse the existing cache upload and application registration APIs.
 
@@ -164,19 +165,23 @@ summary, YAML application spec, and JSON result forms.
 
 The temporary archive name describes the source input. It is not the cache
 object name. After packaging, `flmctl` computes the SHA-256 digest of the
-archive and proposes this cache key for every input kind:
+archive for deployment output and uses this cache key for every input kind:
 
 ```text
-<application-name>/pkg/<application-name>-<first-16-sha256-hex>.tar.gz
+<application-name>/pkg/<application-name>-<upload-uuid>.tar.gz
 ```
 
 The registered URL uses the cache server's advertised endpoint and the key
 returned by the upload. This allows a CLI upload through an external proxy
 while executors download from the internal cache endpoint. Dry-run output uses
 the normalized context endpoint because no upload response is available.
-Changing archive bytes changes the proposed object key without changing the
-application name. The temporary archive and extracted detection tree are
-removed when the deploy plan is dropped.
+Each prepared deployment generates one upload UUID and reuses it for every
+filename, object key, and URL calculation in that plan. Preparing the same
+content again retains its digest but produces a distinct object key. This keeps
+each uploaded package in its own single-part object when cache PUT appends to
+existing keys. The local archive name and reported SHA-256 stay unchanged. The
+temporary archive and extracted detection tree are removed when the deploy
+plan is dropped.
 
 ### Interaction with `flamepy.app.init()`
 

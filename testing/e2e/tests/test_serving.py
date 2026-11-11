@@ -17,7 +17,8 @@ import time
 import flamepy
 import pytest
 from flamepy import SessionState
-from flamepy.core import ObjectRef, delete_objects, get_object, put_object
+from flamepy.core import ObjectRef, get_object, put_object
+from flamepy.core.cache import ObjectKey
 from flamepy.serving import open_session
 
 from e2e.api import TestContext, TestRequest
@@ -245,15 +246,14 @@ def test_setup_retained_across_sessions_and_teardown_on_executor_release(setup_d
     """A deployed process initializes before enter, stays warm, and tears down once."""
     suffix = random_string(8).lower()
     application = f"flme2e-lifecycle-{suffix}"
-    # Keep observations outside the deployed application's cache namespace, so
-    # application GC cannot erase evidence of the process's teardown.
+    # The observer application owns the shared event log through teardown assertions.
     observer_application = f"flme2e-lifecycle-observer-{suffix}"
-    observer_prefix = f"{observer_application}/events"
     flamepy.register_application(observer_application, flamepy.ApplicationAttributes())
     ref = None
     sessions = []
     deployed = False
     try:
+        observer_prefix = ObjectKey.for_shared(observer_application).to_prefix()
         ref = put_object(observer_prefix, {"observer": application})
         # Reuse the cluster's configured runtime launch profile in CRI and
         # Kubernetes jobs; a standalone Host cluster needs no template.
@@ -309,6 +309,4 @@ def test_setup_retained_across_sessions_and_teardown_on_executor_release(setup_d
             session.close()
         if deployed:
             flamepy.unregister_application(application)
-        if ref is not None:
-            delete_objects(observer_prefix, endpoint=ref.endpoint)
         flamepy.unregister_application(observer_application)

@@ -118,16 +118,32 @@ Top-level `flamepy` exports:
 - `patch_object(ref, delta)`
 - `upload_package(app_name, file_path, filename=None)`
 - `download_package(app_name, filename, dest_path)`
-- `delete_package(app_name, filename)`
 
-`flamepy.cache` exports `delete_objects(key_prefix)` in addition to the basic cache helpers.
+`flamepy.cache` exposes object helpers without a deletion API. Objects remain
+until server garbage collection removes data whose owning session is gone.
+Packages use `<app>/pkg/<filename>` and remain tied to application lifetime;
+uploading the same filename again appends another part. Package downloads
+require one part, so choose a new filename for each package.
+
+PUT and PATCH declare the exact encoded byte count in their write header. The
+SDK derives this after serialization and compression, or from the opened file
+for package uploads; callers do not supply a size. Zero declares an empty
+payload. A truncated or oversized stream is rejected without committing a part.
 
 Object references are versioned:
 
 - `version=0` forces a fresh download.
 - `version>=1` lets the client reuse its cached parts and fetch only the data after that version.
+- The version is a committed part count. Parts are indexed from zero; they do not have independent versions.
+- The client also tracks the object's UUID. If another client recreates the same key, the old parts are discarded and the new object is fetched in full, even if its part count is equal or greater.
 - Without a deserializer, `get_object()` returns the newest data part of the object.
 - With a deserializer, `get_object(ref, deserializer)` calls `deserializer(parts)` with all the data parts in the order they were written.
+
+The cache protocol has three GET modes: `METADATA` returns only object metadata;
+`OBJECT` returns the prefix before the requested part count (zero selects the
+latest object); and `PATCHES` returns parts after that count. Metadata reads do
+not advance the client's cached payload count. The regular `get_object()` API
+chooses `OBJECT` for an initial read and `PATCHES` for subsequent reads.
 
 ## Service API
 
@@ -255,7 +271,7 @@ Key classes and helpers:
 - `get(futures)`, `ref(futures)`, `wait(futures)`, `select(futures)`
 - `put(obj)` stores a shared object under the active application's cache prefix.
 - `destroy()` closes services. If this process registered the application, it
-  also unregisters it and removes its package/cache. With
+  also unregisters it. Server garbage collection reclaims its objects and packages after their owning session or application is gone. With
   `fail_if_exists=False`, an existing application is borrowed and remains the
   user's lifecycle responsibility.
 - `ObjectFuture.get()`, `ObjectFuture.ref()`, `ObjectFuture.wait()`

@@ -51,21 +51,6 @@ class ObjectCacheServiceStub:
                 request_serializer=cache__pb2.CacheGetRequest.SerializeToString,
                 response_deserializer=cache__pb2.CacheGetResponse.FromString,
                 _registered_method=True)
-        self.Delete = channel.unary_unary(
-                '/flame.v1.ObjectCacheService/Delete',
-                request_serializer=cache__pb2.CacheDeleteRequest.SerializeToString,
-                response_deserializer=cache__pb2.CacheDeleteResponse.FromString,
-                _registered_method=True)
-        self.GetMetadata = channel.unary_unary(
-                '/flame.v1.ObjectCacheService/GetMetadata',
-                request_serializer=cache__pb2.CacheGetMetadataRequest.SerializeToString,
-                response_deserializer=cache__pb2.CacheObjectMetadata.FromString,
-                _registered_method=True)
-        self.List = channel.unary_stream(
-                '/flame.v1.ObjectCacheService/List',
-                request_serializer=cache__pb2.CacheListRequest.SerializeToString,
-                response_deserializer=cache__pb2.CacheObjectMetadata.FromString,
-                _registered_method=True)
 
 
 class ObjectCacheServiceServicer:
@@ -74,36 +59,20 @@ class ObjectCacheServiceServicer:
     """
 
     def Put(self, request_iterator, context):
-        """Missing associated documentation comment in .proto file."""
+        """Add one part, creating the object if missing; a namespace key generates an object ID.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def Patch(self, request_iterator, context):
-        """Missing associated documentation comment in .proto file."""
+        """Add one part to a full object key, creating the object if missing.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def Get(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def Delete(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def GetMetadata(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def List(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -126,21 +95,6 @@ def add_ObjectCacheServiceServicer_to_server(servicer, server):
                     servicer.Get,
                     request_deserializer=cache__pb2.CacheGetRequest.FromString,
                     response_serializer=cache__pb2.CacheGetResponse.SerializeToString,
-            ),
-            'Delete': grpc.unary_unary_rpc_method_handler(
-                    servicer.Delete,
-                    request_deserializer=cache__pb2.CacheDeleteRequest.FromString,
-                    response_serializer=cache__pb2.CacheDeleteResponse.SerializeToString,
-            ),
-            'GetMetadata': grpc.unary_unary_rpc_method_handler(
-                    servicer.GetMetadata,
-                    request_deserializer=cache__pb2.CacheGetMetadataRequest.FromString,
-                    response_serializer=cache__pb2.CacheObjectMetadata.SerializeToString,
-            ),
-            'List': grpc.unary_stream_rpc_method_handler(
-                    servicer.List,
-                    request_deserializer=cache__pb2.CacheListRequest.FromString,
-                    response_serializer=cache__pb2.CacheObjectMetadata.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -226,87 +180,6 @@ class ObjectCacheService:
             '/flame.v1.ObjectCacheService/Get',
             cache__pb2.CacheGetRequest.SerializeToString,
             cache__pb2.CacheGetResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def Delete(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/flame.v1.ObjectCacheService/Delete',
-            cache__pb2.CacheDeleteRequest.SerializeToString,
-            cache__pb2.CacheDeleteResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def GetMetadata(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/flame.v1.ObjectCacheService/GetMetadata',
-            cache__pb2.CacheGetMetadataRequest.SerializeToString,
-            cache__pb2.CacheObjectMetadata.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def List(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_stream(
-            request,
-            target,
-            '/flame.v1.ObjectCacheService/List',
-            cache__pb2.CacheListRequest.SerializeToString,
-            cache__pb2.CacheObjectMetadata.FromString,
             options,
             channel_credentials,
             insecure,

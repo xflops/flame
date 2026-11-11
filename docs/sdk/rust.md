@@ -254,7 +254,7 @@ let loaded: ModelConfig = reference.get().await?; // the newest data part
 let patched = flame::patch_object(&reference, &model_patch).await?;
 ```
 
-An object is created once and then only grows by appended data: use `patch_object()` to append to it and `delete_objects()` to remove an object or prefix. `upload_package(context, app, filename, path)` uploads an application package, stored at `package_key(app, filename)`, `<app>/pkg/<filename>`, replacing one of the same name. These helpers match the Python SDK (`put_object`, `get_object`, `patch_object`, `delete_objects`, `upload_package`); all but `upload_package` use the default Flame context. `ObjectRef` carries the cache endpoint, full key, and object version.
+Writes create an object if missing and append a part if it already exists; `patch_object()` uses the same storage behavior. Object deletion is internal to GC after the owning session is gone; closing a session retains its objects. `upload_package(context, app, filename, path)` uploads an application package, stored at `package_key(app, filename)`, `<app>/pkg/<filename>`. Uploading an existing package name appends another part. Package downloads require one part, so use a new name for each package. Packages follow application lifetime. These helpers match the Python SDK (`put_object`, `get_object`, `patch_object`, `upload_package`); all but `upload_package` use the default Flame context. `ObjectRef` carries the cache endpoint, full key, and object version.
 
 The helpers use the `raw` data type and the `FlameMessage` encoding. `get_object::<T>(reference)` (or `reference.get::<T>()`) makes a `T` of the data parts of the object, as `Vec<Bytes>` in the order they were written, so `T` must implement `TryFrom<Vec<Bytes>, Error = FlameError>`. A type that derives `FlameMessage` gets that implementation and is made of the newest part; implement it yourself to combine the parts, like the Python `deserializer(parts)`.
 
@@ -282,7 +282,7 @@ honor nested `.flmignore` and `.flameignore` files with Gitignore-style rules.
 | Tasks | `Session::run()`, `Session::invoke()`, `Session::create_task()`, `Session::watch_task()` |
 | Services | `flame_rs::run()`, `FlameService`, `#[flame::entrypoint]`, `#[flame::instance]` |
 | Messages | `FlameMessage`, `IntoTaskInput`, `FromTaskOutput`, `IntoCommonData` |
-| Objects | `put_object()`, `get_object()`, `patch_object()`, `delete_objects()`, `upload_package()` |
+| Objects | `put_object()`, `get_object()`, `patch_object()`, `upload_package()` |
 
 See also:
 

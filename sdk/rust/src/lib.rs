@@ -27,8 +27,8 @@ pub use client::{
 pub use flame_rs_macros::{entrypoint, instance, FlameMessage};
 pub use message::{FlameMessage, FromTaskOutput, IntoCommonData, IntoTaskInput};
 pub use object::{
-    delete_objects, get_object, package_key, patch_object, put_object, upload_package,
-    ObjectFuture, ObjectKey, ObjectRef,
+    get_object, package_key, patch_object, put_object, upload_package, ObjectFuture, ObjectKey,
+    ObjectRef,
 };
 
 /// Logs a point on the performance timeline: a debug event on the `flame::perf` target with the

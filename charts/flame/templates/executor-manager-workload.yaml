@@ -97,7 +97,7 @@ spec:
           workingDir: /usr/local/flame
           {{- if .Values.objectCache.openFiles }}
           # Runtimes often start a container with a soft limit of 1024 open
-          # files; the cache keeps two files open per object it serves.
+          # files; direct filesystem streams keep handles only for active requests.
           command:
             - /bin/sh
             - -c

@@ -7,12 +7,11 @@ option go_package = "github.com/flame-sh/flame/sdk/go/rpc/v1";
 // The cache stores opaque bytes. Clients serialize and deserialize values,
 // including Arrow values, before sending them over this service.
 service ObjectCacheService {
+  // Add one part, creating the object if missing; a namespace key generates an object ID.
   rpc Put(stream CacheWriteRequest) returns (CacheObjectMetadata) {}
+  // Add one part to a full object key, creating the object if missing.
   rpc Patch(stream CacheWriteRequest) returns (CacheObjectMetadata) {}
   rpc Get(CacheGetRequest) returns (stream CacheGetResponse) {}
-  rpc Delete(CacheDeleteRequest) returns (CacheDeleteResponse) {}
-  rpc GetMetadata(CacheGetMetadataRequest) returns (CacheObjectMetadata) {}
-  rpc List(CacheListRequest) returns (stream CacheObjectMetadata) {}
 }
 
 message CacheWriteHeader {
@@ -21,6 +20,8 @@ message CacheWriteHeader {
   // Client-defined payload type (for example, "raw.zstd"). The cache stores
   // this without interpreting its encoding or compression.
   string data_type = 2;
+  // Exact number of encoded payload bytes in this PUT or PATCH, zero for empty.
+  uint64 size = 3;
 }
 
 message CacheWriteRequest {
@@ -43,33 +44,36 @@ message CacheObjectMetadata {
   int64 creation_time = 6;
   // Client-defined type shared by all the data parts of the object.
   string data_type = 7;
+  // Identity of this object; unchanged by append and new on key recreation.
+  string uuid = 8;
+}
+
+enum CacheGetMode {
+  OBJECT = 0;
+  METADATA = 1;
+  PATCHES = 2;
 }
 
 message CacheGetRequest {
   string key = 1;
-  // The data parts after this version are returned: all of them for zero, none
-  // if the client has the current version. A version ahead of the object's is an
-  // INVALID_ARGUMENT error (invalid version): the client has another object of
-  // the same key.
+  // Part count: OBJECT returns [0, version), PATCHES returns [version, current).
+  // OBJECT with zero selects the latest complete object. METADATA ignores it.
   uint64 version = 2;
+  // Expected object UUID; required for PATCHES with a nonzero cursor.
+  string uuid = 3;
+  CacheGetMode mode = 4;
 }
 
 message CacheGetHeader {
-  // The current version of the object: its number of data parts.
-  uint64 version = 1;
-  // Client-defined type shared by all data parts of the object.
-  string data_type = 2;
+  // OBJECT prefix reads describe that prefix; other modes describe current state.
+  CacheObjectMetadata metadata = 1;
 }
 
 message CacheGetChunk {
-  // The version of the data part this chunk belongs to: its position in the
-  // object, starting at 1. The parts returned start at version 1 for request
-  // version zero, and at the version after the request's otherwise.
-  uint64 version = 1;
+  // Zero-based owning part. Chunks for a part are contiguous; empty parts emit
+  // one empty chunk. Only objects have versions (their committed part count).
+  uint64 part = 1;
   bytes data = 2;
-  // Chunks for a part are contiguous and share a version. The next version or
-  // the end of the stream completes the current part. Empty parts are sent as
-  // one chunk with empty data.
 }
 
 message CacheGetResponse {
@@ -80,16 +84,3 @@ message CacheGetResponse {
     CacheGetChunk chunk = 2;
   }
 }
-
-message CacheDeleteRequest {
-  // A full key, an app/session prefix, or an app/* prefix.
-  string key = 1;
-}
-
-message CacheDeleteResponse {}
-
-message CacheGetMetadataRequest {
-  string key = 1;
-}
-
-message CacheListRequest {}

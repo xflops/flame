@@ -45,10 +45,10 @@ def test_late_data_loss_does_not_publish_partial_client_cache(monkeypatch, cache
 
         async def Get(self, request, context):  # noqa: N802 - gRPC method
             requested_versions.append(request.version)
-            yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(version=final_version, data_type="cloudpickle"))
+            yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(metadata=cache_pb2.CacheObjectMetadata(key=request.key, uuid="object-uuid", version=final_version, data_type="cloudpickle")))
             middle = len(payload) // 2
             for chunk in (payload[:middle], payload[middle:]):
-                yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(version=final_version, data=chunk))
+                yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(part=(final_version) - 1, data=chunk))
             if self.fail:
                 await context.abort(grpc.StatusCode.DATA_LOSS, "payload checksum mismatch")
 
@@ -63,7 +63,7 @@ def test_late_data_loss_does_not_publish_partial_client_cache(monkeypatch, cache
         cache_key = (endpoint, ref.key)
         cache_module._cache_remove(cache_key)
         if cached_base:
-            cache_module._cache_append_parts(cache_key, FetchResult(version=1, data=[[1]]))
+            cache_module._cache_append_parts(cache_key, FetchResult(version=1, data=[[1]], uuid="object-uuid"))
         await server.start()
         try:
             with pytest.raises(grpc.aio.AioRpcError) as failure:
