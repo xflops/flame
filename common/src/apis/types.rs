@@ -468,10 +468,39 @@ pub enum NodeState {
     NotReady = 2,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NodeInfo {
     pub arch: String,
     pub os: String,
+    pub kernel_version: String,
+    pub os_image: String,
+    pub network_interfaces: Vec<NodeNetworkInterface>,
+    pub pci_devices: Vec<NodePciDevice>,
+}
+
+/// An interface and its assigned addresses, as observed by the executor manager.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeNetworkInterface {
+    pub name: String,
+    pub index: u32,
+    pub mac_address: String,
+    pub addresses: Vec<String>,
+    /// Zero means the platform did not report an MTU.
+    pub mtu: u32,
+    pub state: String,
+    /// Empty for virtual interfaces or unavailable PCI association.
+    pub pci_address: String,
+}
+
+/// A PCI device identified by its bus address and numeric hardware IDs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodePciDevice {
+    pub address: String,
+    pub vendor_id: String,
+    pub device_id: String,
+    pub class_id: String,
+    pub driver: String,
+    pub numa_node: Option<i32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -512,6 +541,7 @@ impl Node {
             info: NodeInfo {
                 arch: env::consts::ARCH.to_string(),
                 os: env::consts::OS.to_string(),
+                ..Default::default()
             },
             ..Default::default()
         }

@@ -909,6 +909,7 @@ impl FilesystemEngine {
             info: NodeInfo {
                 arch: meta.info_arch.clone(),
                 os: meta.info_os.clone(),
+                ..Default::default()
             },
             // Reported by the executor manager each time the node registers.
             shims: Vec::new(),
@@ -2608,6 +2609,7 @@ mod tests {
             info: NodeInfo {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             shims: Vec::new(),
         };
@@ -2654,6 +2656,7 @@ mod tests {
             info: NodeInfo {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             shims: Vec::new(),
         };
@@ -2728,6 +2731,7 @@ mod tests {
             info: NodeInfo {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             shims: Vec::new(),
         };
@@ -2817,6 +2821,7 @@ mod tests {
             info: NodeInfo {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             shims: Vec::new(),
         }

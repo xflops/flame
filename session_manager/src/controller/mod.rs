@@ -1493,6 +1493,7 @@ mod tests {
             info: NodeInfo {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             shims: vec![common::apis::Shim::Host],
         }

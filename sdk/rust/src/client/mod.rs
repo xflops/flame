@@ -535,7 +535,43 @@ pub struct Executor {
     pub node: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+/// A reported address of a node, such as its hostname or an internal IP.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NodeAddress {
+    pub address_type: String,
+    pub address: String,
+}
+
+/// A network interface visible to the node's executor manager.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NodeNetworkInterface {
+    pub name: String,
+    /// Operating-system interface index; zero when unavailable.
+    pub index: u32,
+    pub mac_address: String,
+    /// Interface addresses in IP/CIDR form.
+    pub addresses: Vec<String>,
+    /// Interface MTU; zero when unavailable.
+    pub mtu: u32,
+    pub state: String,
+    pub pci_address: String,
+}
+
+/// A PCI device visible to the node's executor manager.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NodePciDevice {
+    pub address: String,
+    pub vendor_id: String,
+    pub device_id: String,
+    pub class_id: String,
+    pub driver: String,
+    pub numa_node: Option<i32>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Node {
     pub name: String,
     pub hostname: String,
@@ -546,6 +582,16 @@ pub struct Node {
     pub gpu: i32,
     pub arch: String,
     pub os: String,
+    #[serde(default)]
+    pub kernel_version: String,
+    #[serde(default)]
+    pub os_image: String,
+    #[serde(default)]
+    pub addresses: Vec<NodeAddress>,
+    #[serde(default)]
+    pub network_interfaces: Vec<NodeNetworkInterface>,
+    #[serde(default)]
+    pub pci_devices: Vec<NodePciDevice>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -1755,6 +1801,42 @@ impl TryFrom<&rpc::Executor> for Executor {
     }
 }
 
+impl From<rpc::NodeAddress> for NodeAddress {
+    fn from(address: rpc::NodeAddress) -> Self {
+        Self {
+            address_type: address.r#type,
+            address: address.address,
+        }
+    }
+}
+
+impl From<rpc::NodeNetworkInterface> for NodeNetworkInterface {
+    fn from(interface: rpc::NodeNetworkInterface) -> Self {
+        Self {
+            name: interface.name,
+            index: interface.index,
+            mac_address: interface.mac_address,
+            addresses: interface.addresses,
+            mtu: interface.mtu,
+            state: interface.state,
+            pci_address: interface.pci_address,
+        }
+    }
+}
+
+impl From<rpc::NodePciDevice> for NodePciDevice {
+    fn from(device: rpc::NodePciDevice) -> Self {
+        Self {
+            address: device.address,
+            vendor_id: device.vendor_id,
+            device_id: device.device_id,
+            class_id: device.class_id,
+            driver: device.driver,
+            numa_node: device.numa_node,
+        }
+    }
+}
+
 impl From<&rpc::Node> for Node {
     fn from(n: &rpc::Node) -> Self {
         let metadata = n.metadata.clone().unwrap_or_default();
@@ -1779,6 +1861,15 @@ impl From<&rpc::Node> for Node {
             gpu: capacity.gpu,
             arch: info.arch,
             os: info.os,
+            kernel_version: info.kernel_version,
+            os_image: info.os_image,
+            addresses: status.addresses.into_iter().map(Into::into).collect(),
+            network_interfaces: info
+                .network_interfaces
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            pci_devices: info.pci_devices.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -1938,6 +2029,11 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(node.gpu, 0);
+        assert!(node.kernel_version.is_empty());
+        assert!(node.os_image.is_empty());
+        assert!(node.addresses.is_empty());
+        assert!(node.network_interfaces.is_empty());
+        assert!(node.pci_devices.is_empty());
     }
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]

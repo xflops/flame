@@ -43,6 +43,7 @@ mod tests {
             info: NodeInfo {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             shims: Vec::new(),
         };
@@ -80,6 +81,7 @@ mod tests {
             info: NodeInfo {
                 arch: "aarch64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             shims: Vec::new(),
         };
@@ -139,6 +141,7 @@ mod tests {
             info: NodeInfo {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             shims: Vec::new(),
         };
@@ -174,6 +177,7 @@ mod tests {
             info: NodeInfo {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             shims: Vec::new(),
         };

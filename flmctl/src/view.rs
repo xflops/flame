@@ -243,24 +243,95 @@ async fn view_node(
         return Ok(());
     }
 
+    print!("{}", format_node(&node));
+    Ok(())
+}
+
+/// Render reported node inventory, using a dash for unavailable information.
+fn format_node(node: &client::Node) -> String {
     let status = match node.state {
         NodeState::Ready => "Ready",
         NodeState::NotReady => "NotReady",
         NodeState::Unknown => "Unknown",
     };
 
-    println!("{:<15}{}", "Name:", node.name);
-    println!("{:<15}{}", "Hostname:", node.hostname);
-    println!("{:<15}{}", "Status:", status);
-    println!("{:<15}", "Capacity:");
-    println!("  {:<13}{}", "CPU:", node.cpu);
-    println!("  {:<13}{}", "Memory:", format_memory(node.memory));
-    println!("  {:<13}{}", "GPU:", node.gpu);
-    println!("{:<15}", "Info:");
-    println!("  {:<13}{}", "Arch:", node.arch);
-    println!("  {:<13}{}", "OS:", node.os);
+    let mut output = [
+        format!("{:<15}{}", "Name:", value_or_dash(&node.name)),
+        format!("{:<15}{}", "Hostname:", value_or_dash(&node.hostname)),
+        format!("{:<15}{}", "Status:", status),
+        "Capacity:".into(),
+        format!("  {:<13}{}", "CPU:", node.cpu),
+        format!("  {:<13}{}", "Memory:", format_memory(node.memory)),
+        format!("  {:<13}{}", "GPU:", node.gpu),
+        "Info:".into(),
+        format!("  {:<13}{}", "Arch:", value_or_dash(&node.arch)),
+        format!("  {:<13}{}", "OS:", value_or_dash(&node.os)),
+        format!("  {:<13}{}", "OS Image:", value_or_dash(&node.os_image)),
+        format!("  {:<13}{}", "Kernel:", value_or_dash(&node.kernel_version)),
+        "Addresses:".into(),
+    ]
+    .join("\n");
+    output.push('\n');
 
-    Ok(())
+    let mut addresses = Table::new();
+    addresses.load_style(NOTHING);
+    for address in &node.addresses {
+        if address.address_type == "Hostname" {
+            continue;
+        }
+        let interface = node.network_interfaces.iter().find(|interface| {
+            interface
+                .addresses
+                .iter()
+                .any(|value| value.split('/').next() == Some(address.address.as_str()))
+        });
+        addresses.add_row([
+            interface
+                .map(|interface| value_or_dash(&interface.name))
+                .unwrap_or("-"),
+            value_or_dash(&address.address),
+        ]);
+    }
+    if addresses.is_empty() {
+        output.push_str("  -\n");
+    } else {
+        for line in addresses.to_string().lines() {
+            output.push_str(&format!("  {}\n", line.trim()));
+        }
+    }
+    output.push_str("PCI Devices:\n");
+    let mut devices = Table::new();
+    devices.load_style(NOTHING);
+    if node.pci_devices.is_empty() {
+        devices.add_row(["-"; 6]);
+    } else {
+        for device in &node.pci_devices {
+            devices.add_row([
+                value_or_dash(&device.address).to_string(),
+                value_or_dash(&device.vendor_id).to_string(),
+                value_or_dash(&device.device_id).to_string(),
+                value_or_dash(&device.class_id).to_string(),
+                value_or_dash(&device.driver).to_string(),
+                device
+                    .numa_node
+                    .map(|node| node.to_string())
+                    .unwrap_or_else(|| "-".into()),
+            ]);
+        }
+    }
+    for line in devices.to_string().lines() {
+        output.push_str(&format!("  {}\n", line.trim()));
+    }
+    output
+}
+
+/// Keep missing inventory readable in both scalar fields and table cells.
+fn value_or_dash(value: &str) -> &str {
+    if value.is_empty() {
+        "-"
+    } else {
+        value
+    }
 }
 
 fn get_type(schema: Option<String>) -> Result<String, FlameError> {
@@ -276,6 +347,10 @@ fn get_type(schema: Option<String>) -> Result<String, FlameError> {
         None => Ok("-".to_string()),
     }
 }
+
+#[cfg(test)]
+#[path = "view_node_tests.rs"]
+mod node_tests;
 
 #[cfg(test)]
 mod tests {

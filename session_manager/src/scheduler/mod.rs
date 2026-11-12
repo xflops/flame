@@ -127,6 +127,7 @@ mod tests {
             info: NodeInfo {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             state: NodeState::Ready,
             shims: vec![common::apis::Shim::Host],

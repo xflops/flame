@@ -16,6 +16,101 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tonic::codegen::{http, BoxFuture, Service};
 
+/// Node details survive RPC decoding and the SDK's JSON output.
+#[test]
+fn inventory_survives_rpc_and_json_conversion() {
+    let node = super::Node::from(rpc::Node {
+        metadata: Some(rpc::Metadata {
+            name: "node-1".into(),
+            ..Default::default()
+        }),
+        spec: Some(rpc::NodeSpec {
+            hostname: "host-1".into(),
+            ..Default::default()
+        }),
+        status: Some(rpc::NodeStatus {
+            state: rpc::NodeState::Ready as i32,
+            addresses: vec![rpc::NodeAddress {
+                r#type: "InternalIP".into(),
+                address: "192.0.2.10".into(),
+            }],
+            info: Some(rpc::NodeInfo {
+                arch: "x86_64".into(),
+                os: "linux".into(),
+                kernel_version: "6.8.0".into(),
+                os_image: "Ubuntu 24.04 LTS".into(),
+                network_interfaces: vec![rpc::NodeNetworkInterface {
+                    name: "eth0".into(),
+                    index: 2,
+                    mac_address: "02:00:00:00:00:01".into(),
+                    addresses: vec!["192.0.2.10/24".into(), "2001:db8::10/64".into()],
+                    mtu: 1500,
+                    state: "up".into(),
+                    pci_address: "0000:01:00.0".into(),
+                }],
+                pci_devices: vec![rpc::NodePciDevice {
+                    address: "0000:01:00.0".into(),
+                    vendor_id: "8086".into(),
+                    device_id: "100e".into(),
+                    class_id: "020000".into(),
+                    driver: "e1000".into(),
+                    numa_node: Some(0),
+                }],
+            }),
+            ..Default::default()
+        }),
+    });
+
+    assert_eq!(node.name, "node-1");
+    assert_eq!(node.hostname, "host-1");
+    assert_eq!(node.kernel_version, "6.8.0");
+    assert_eq!(node.os_image, "Ubuntu 24.04 LTS");
+    assert_eq!(node.addresses[0].address_type, "InternalIP");
+    assert_eq!(node.addresses[0].address, "192.0.2.10");
+    let interface = &node.network_interfaces[0];
+    assert_eq!(interface.name, "eth0");
+    assert_eq!(interface.index, 2);
+    assert_eq!(interface.mac_address, "02:00:00:00:00:01");
+    assert_eq!(interface.addresses, ["192.0.2.10/24", "2001:db8::10/64"]);
+    assert_eq!(interface.mtu, 1500);
+    assert_eq!(interface.state, "up");
+    assert_eq!(interface.pci_address, "0000:01:00.0");
+    let device = &node.pci_devices[0];
+    assert_eq!(device.address, interface.pci_address);
+    assert_eq!(device.vendor_id, "8086");
+    assert_eq!(device.device_id, "100e");
+    assert_eq!(device.class_id, "020000");
+    assert_eq!(device.driver, "e1000");
+    assert_eq!(device.numa_node, Some(0));
+
+    let encoded = serde_json::to_value(&node).unwrap();
+    assert_eq!(encoded["addresses"][0]["address_type"], "InternalIP");
+    assert_eq!(
+        encoded["network_interfaces"][0]["addresses"][1],
+        "2001:db8::10/64"
+    );
+    assert_eq!(encoded["pci_devices"][0]["numa_node"], 0);
+    let decoded: super::Node = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded.addresses, node.addresses);
+    assert_eq!(decoded.network_interfaces, node.network_interfaces);
+    assert_eq!(decoded.pci_devices, node.pci_devices);
+}
+
+/// Missing inventory is representable without inventing addresses or device data.
+#[test]
+fn absent_inventory_defaults_to_empty_values() {
+    let node = super::Node::from(rpc::Node::default());
+    assert!(node.kernel_version.is_empty());
+    assert!(node.os_image.is_empty());
+    assert!(node.addresses.is_empty());
+    assert!(node.network_interfaces.is_empty());
+    assert!(node.pci_devices.is_empty());
+
+    let device = super::NodePciDevice::from(rpc::NodePciDevice::default());
+    assert_eq!(device.numa_node, None);
+    assert!(serde_json::to_value(device).unwrap()["numa_node"].is_null());
+}
+
 #[derive(Clone, Default)]
 struct FrontendStub {
     list_calls: Arc<AtomicUsize>,

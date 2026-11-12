@@ -572,6 +572,31 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_updates_and_preserves_node_inventory() {
+        let info = common::apis::NodeInfo {
+            kernel_version: "6.8.0".into(),
+            os_image: "Ubuntu".into(),
+            network_interfaces: vec![common::apis::NodeNetworkInterface {
+                name: "eth0".into(),
+                addresses: vec!["192.168.3.149/24".into()],
+                ..Default::default()
+            }],
+            pci_devices: vec![common::apis::NodePciDevice {
+                address: "0000:01:00.0".into(),
+                driver: "igc".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut status = heartbeat_status();
+        status.info = Some(info.clone().into());
+        let node = build_node_from_heartbeat(None, "worker", status);
+        assert_eq!(node.info, info);
+        let node = build_node_from_heartbeat(Some(node), "worker", heartbeat_status());
+        assert_eq!(node.info, info);
+    }
+
+    #[test]
     fn heartbeat_of_an_unknown_node_has_no_shims() {
         let node = build_node_from_heartbeat(None, "node-1", heartbeat_status());
         assert!(node.shims.is_empty());

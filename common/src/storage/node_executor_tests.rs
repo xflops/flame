@@ -27,6 +27,54 @@ mod tests {
     use crate::apis::Executor;
     use crate::storage::engine::SqliteEngine;
 
+    /// Detailed reports must survive the engine/cache boundary without new persistence columns.
+    #[tokio::test]
+    async fn registration_preserves_live_inventory_for_all_storage_engines() {
+        use crate::apis::NodeNetworkInterface;
+        use crate::ctx::{FlameCluster, FlameClusterContext};
+        let dir = tempfile::tempdir().unwrap();
+        for url in [
+            "none".to_string(),
+            format!("sqlite://{}", dir.path().join("inventory.db").display()),
+            format!("fs://{}", dir.path().join("inventory-fs").display()),
+        ] {
+            let config = FlameClusterContext {
+                cluster: FlameCluster {
+                    storage: url,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let storage = crate::storage::new_ptr(&config).await.unwrap();
+            let mut node = Node {
+                name: "inventory-worker".into(),
+                info: NodeInfo {
+                    arch: "x86_64".into(),
+                    os: "linux".into(),
+                    kernel_version: "6.8.0".into(),
+                    network_interfaces: vec![NodeNetworkInterface {
+                        name: "eth0".into(),
+                        addresses: vec!["192.168.3.149/24".into()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            storage.register_node(&node).await.unwrap();
+            assert_eq!(
+                storage.get_node(&node.name).unwrap().unwrap().info,
+                node.info
+            );
+            node.info.network_interfaces[0].addresses = vec!["192.168.3.150/24".into()];
+            storage.register_node(&node).await.unwrap();
+            assert_eq!(
+                storage.get_node(&node.name).unwrap().unwrap().info,
+                node.info
+            );
+        }
+    }
+
     #[tokio::test]
     async fn release_node_enforces_safety_without_a_controller() {
         use crate::apis::{ApplicationAttributes, SessionAttributes};
@@ -216,6 +264,7 @@ mod tests {
             info: NodeInfo {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             shims: Vec::new(),
         };
@@ -249,6 +298,7 @@ mod tests {
             info: NodeInfo {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             shims: Vec::new(),
         };
@@ -294,6 +344,7 @@ mod tests {
             info: NodeInfo {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             shims: Vec::new(),
         };
@@ -380,6 +431,7 @@ mod tests {
             info: NodeInfo {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             shims: Vec::new(),
         };
