@@ -243,6 +243,13 @@ uninstall_flame() {
         /etc/systemd/system/flame-object-cache.service \
         /etc/systemd/system/flame-session-manager.service
     sudo systemctl daemon-reload || true
+    # runsc keeps a reusable network-namespace bind mount outside its sandbox
+    # directories. Stopping the services does not unmount it, so release it
+    # explicitly before removing the installation. Keep unmount failures fatal.
+    local null_netns="$INSTALL_PREFIX/data/flmbox/runsc/null-netns"
+    if sudo mountpoint -q -- "$null_netns"; then
+        sudo umount -- "$null_netns"
+    fi
     sudo rm -rf "$INSTALL_PREFIX" "$HOME/.flame"
 }
 

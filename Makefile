@@ -166,7 +166,7 @@ e2e-py-system-app: ## Run Python system App tests with docker compose
 	$(MAKE) e2e-py-system-docker E2E_SYSTEM_PROFILE=app E2E_SYSTEM_PYTEST_ARGS="-m app"
 
 e2e-rs: ## Run Rust E2E tests
-	FLAME_ROOT=$(FLAME_ROOT) cargo test -p flame-rs --test integration_test -- --nocapture
+	FLAME_ROOT=$(FLAME_ROOT) cargo test -p flame-rs --test integration_test --all-features -- --nocapture
 
 e2e: e2e-py-docker e2e-rs ## Run all E2E tests (Python and Rust) with docker compose
 

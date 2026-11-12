@@ -146,7 +146,6 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ matrix.rust }}
-          profile: minimal
       - name: Run Rust E2E Test
         run: |
           make e2e-rs
@@ -320,7 +319,6 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
-          profile: minimal
 
       - name: Run Flame benchmark
         env:
@@ -721,6 +719,11 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
 
       - name: Download the package
         uses: actions/download-artifact@v8

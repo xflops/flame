@@ -16,8 +16,8 @@ jobs:
         uses: docker/setup-buildx-action@v4
       - name: Validate publishing scripts
         run: |
-          bash -n ci/release/image-manifests.sh
-          python3 -m unittest discover -s ci/release -p test_image_manifests.py -v
+          bash -n ci/release/image-manifests.sh ci/release/publication.sh
+          python3 -m unittest discover -s ci/release -p 'test_*.py' -v
       - name: Validate Bake targets
         run: |
           for arch in amd64 arm64; do
@@ -56,6 +56,12 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Cargo test
         run: cargo test --workspace --exclude flame-rs
+      - name: Generate TLS test certificates
+        run: ci/docker/generate-certs.sh -o ci/docker/certs
+      - name: Rust SDK unit and macro tests
+        run: |
+          cargo test -p flame-rs --lib --all-features
+          cargo test -p flame-rs --test integration_test --all-features macros::
       - name: Cargo build
         run: cargo build --workspace --exclude flame-rs
 

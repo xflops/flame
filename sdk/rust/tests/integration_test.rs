@@ -13,7 +13,11 @@ limitations under the License.
 
 //! Integration tests for Flame SDK.
 //!
-//! These tests require a running Flame server.
+//! Cluster tests require a running Flame server; macro tests exercise service callbacks locally.
+
+#[cfg(feature = "macros")]
+#[path = "integration/macros.rs"]
+mod macros;
 
 use std::collections::HashMap;
 
