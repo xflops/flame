@@ -31,6 +31,27 @@ already exists it asks whether to overwrite (it reads the answer from the termin
 from curl; with no terminal it stops with an error and changes nothing); `--force` replaces an existing
 installation without asking, restarting its units.
 
+Systemd installs require `logrotate` to be installed before running `setup.sh`
+(for example, `sudo apt-get install logrotate` on Ubuntu). Keep the distribution's
+`logrotate.timer` or cron job enabled; the installer writes the policy but does
+not change the system-wide rotation schedule. `--no-systemd` needs neither
+logrotate nor access to system configuration directories.
+
+Daemon output is appended to `<prefix>/logs/*.log`. The installer writes a
+prefix-specific rule under `/etc/logrotate.d/flame-<prefix-checksum>` with daily
+rotation, `maxsize 100M`, seven retained rotations, compression, and
+`copytruncate` so services keep writing without restarting. The newest rotated
+file stays uncompressed until the next rotation. The size threshold is checked
+when the distribution runs logrotate, so it is not a hard disk usage cap. Use a
+more frequent system logrotate schedule if logs can grow rapidly. Copytruncate
+can lose lines written between copying and truncation. Head and worker installs
+at the same prefix share one rule. `FLAME_LOGROTATE_DIR` overrides the policy
+directory; `FLAME_LOGROTATE` selects the logrotate executable.
+
+Flame also writes dated `<component>-<hostname>.YYYY-MM-DD` files. Its logger
+retains at most seven files per component and hostname, independently of
+systemd and logrotate, and prunes older files when opening a log file.
+
 `setup.sh` generates `<prefix>/conf/flame-cluster.yaml` from `FLAME_*` settings, read from the
 environment and from a `.env` file in the current directory (the environment wins), with these defaults:
 
@@ -69,7 +90,7 @@ its bind and advertised addresses.
 | `--package DIR\|FILE\|URL` | install this package (a directory, a `.tar.gz`, or the URL of one) instead of downloading |
 | `--version TAG` | the release to install (`FLAME_VERSION` is the same) |
 | `--python-version V` | the Python versions to install `flamepy` for (repeatable; default 3.11 to 3.14) |
-| `--no-systemd` | do not write units or start anything (containers, image builds) |
+| `--no-systemd` | do not write units or log rotation rules, or start anything (containers, image builds) |
 | `--force` | replace an installation that is already there without asking (without it, `setup.sh` asks, and stops when there is no terminal) |
 
 `FLAME_BASE_URL` points at a mirror of the release assets. Anyone who can reach the head's port can join a
@@ -87,6 +108,10 @@ sudo rm -f /etc/systemd/system/flame-executor-manager.service \
            /etc/systemd/system/flame-object-cache.service \
            /etc/systemd/system/flame-session-manager.service
 sudo systemctl daemon-reload
+
+# remove this prefix's log rotation rule (adjust the prefix if installed elsewhere)
+prefix_checksum=$(printf '%s' /usr/local/flame | cksum | awk '{print $1}')
+sudo rm -f "/etc/logrotate.d/flame-$prefix_checksum"
 
 # keep a copy of what you want first: data/ (sessions, the cache), conf/ and logs/ are in the prefix
 sudo cp -R /usr/local/flame/conf /usr/local/flame/data ~/flame-backup     # optional

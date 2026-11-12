@@ -59,8 +59,8 @@ impl FlmboxService {
     }
 
     /// Removes everything an earlier run of this executor left behind.
-    pub async fn cleanup_stale(&self) {
-        self.sandbox.kill_prefixed(&self.id_prefix()).await;
+    pub async fn cleanup_stale(&self) -> Result<(), FlameError> {
+        self.sandbox.kill_prefixed(&self.id_prefix()).await
     }
 
     /// Creates and starts the sandbox of `session_id`, replacing any sandbox
@@ -77,8 +77,8 @@ impl FlmboxService {
 
         let id = sandbox_id(&self.executor_id, session_id);
         let mut active = self.active.lock().await;
+        self.cleanup_stale().await?;
         *active = None;
-        self.cleanup_stale().await;
         self.sandbox.create(&id, &reference).await?;
         *active = Some(id);
         Ok(())
@@ -96,13 +96,13 @@ impl FlmboxService {
         self.sandbox.exec(&id, request).await
     }
 
-    async fn leave(&self) {
-        let taken = self.active.lock().await.take();
-        if let Some(id) = taken {
-            if let Err(e) = self.sandbox.kill(&id).await {
-                tracing::warn!("failed to remove sandbox {id}: {e}");
-            }
-        }
+    /// Removes this executor's sandboxes, including an interrupted creation.
+    /// Ownership is retained on failure so a later leave or destroy can retry.
+    async fn leave(&self) -> Result<(), FlameError> {
+        let mut active = self.active.lock().await;
+        self.cleanup_stale().await?;
+        *active = None;
+        Ok(())
     }
 }
 
@@ -198,8 +198,12 @@ impl FlameService for FlmboxService {
     }
 
     async fn on_session_leave(&self) -> Result<(), FlameError> {
-        self.leave().await;
-        Ok(())
+        self.leave().await
+    }
+
+    /// Retries cleanup when the executor is released, even if leave failed.
+    async fn on_instance_destroy(&self) -> Result<(), FlameError> {
+        self.leave().await
     }
 }
 
@@ -221,6 +225,42 @@ mod tests {
         svc: FlmboxService,
         runner: Arc<FakeRunner>,
         _dirs: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    /// Pauses creation after the runtime is running, before ownership is set.
+    struct InterruptedRuntime {
+        inner: Arc<dyn crate::runtime::Runtime>,
+        started: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::runtime::Runtime for InterruptedRuntime {
+        /// Creates the runtime and exposes a deterministic cancellation point.
+        async fn start(&self, spec: &crate::runtime::SandboxSpec<'_>) -> Result<(), FlameError> {
+            self.inner.start(spec).await?;
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        /// Delegates task execution to the fake runsc runtime.
+        async fn exec(
+            &self,
+            id: &str,
+            argv: &[String],
+            opts: crate::runtime::ExecOptions,
+        ) -> Result<CommandOutput, FlameError> {
+            self.inner.exec(id, argv, opts).await
+        }
+
+        /// Delegates cleanup to the fake runsc runtime.
+        async fn kill(&self, id: &str) -> Result<(), FlameError> {
+            self.inner.kill(id).await
+        }
+
+        /// Delegates runtime discovery to the fake runsc runtime.
+        async fn list(&self) -> Result<Vec<crate::runtime::SandboxInfo>, FlameError> {
+            self.inner.list().await
+        }
     }
 
     fn fixture() -> Fixture {
@@ -417,6 +457,7 @@ mod tests {
         assert_eq!(
             f.runner.subcommands(),
             vec![
+                "list".to_string(),
                 format!("kill {ID1} SIGKILL"),
                 format!("delete --force {ID1}")
             ]
@@ -424,7 +465,97 @@ mod tests {
 
         f.runner.clear();
         f.svc.on_session_leave().await.unwrap();
-        assert!(f.runner.specs().is_empty());
+        assert_eq!(f.runner.subcommands(), vec!["list"]);
+    }
+
+    /// Failed leave retains ownership, and instance teardown retries it.
+    #[tokio::test]
+    async fn failed_leave_can_be_retried_by_instance_destroy() {
+        let f = fixture();
+        f.svc.on_session_enter(session("s1", None)).await.unwrap();
+        f.runner.respond(|spec| {
+            if spec.args.iter().any(|a| a == "kill") {
+                Ok(out(1, "", "permission denied"))
+            } else {
+                Ok(out(0, "", ""))
+            }
+        });
+        assert!(f.svc.on_session_leave().await.is_err());
+        assert_eq!(f.svc.active.lock().await.as_deref(), Some(ID1));
+        assert!(f._dirs.0.path().join("sandboxes").join(ID1).exists());
+        f.runner.respond(|_| Ok(out(0, "", "")));
+        f.svc.on_instance_destroy().await.unwrap();
+        assert!(f.svc.active.lock().await.is_none());
+        assert!(!f._dirs.0.path().join("sandboxes").join(ID1).exists());
+        f.svc.on_instance_destroy().await.unwrap();
+    }
+
+    /// Failed reconciliation prevents a replacement session from being started.
+    #[tokio::test]
+    async fn failed_cleanup_blocks_session_enter() {
+        let f = fixture();
+        f.svc.on_session_enter(session("s1", None)).await.unwrap();
+        f.runner.clear();
+        f.runner.respond(|spec| {
+            if spec.args.iter().any(|a| a == "kill") {
+                Ok(out(1, "", "permission denied"))
+            } else {
+                Ok(out(0, "", ""))
+            }
+        });
+        assert!(f.svc.on_session_enter(session("s2", None)).await.is_err());
+        assert_eq!(f.svc.active.lock().await.as_deref(), Some(ID1));
+        assert!(!f
+            .runner
+            .subcommands()
+            .iter()
+            .any(|s| s.starts_with("create")));
+    }
+
+    /// Cancellation before active ownership is published still leaves cleanup
+    /// enough persistent metadata to stop the runtime at session leave.
+    #[tokio::test]
+    async fn cancelled_enter_is_cleaned_on_leave() {
+        let mut f = fixture();
+        let cfg = FlameSandbox::from_map(&HashMap::from([(
+            ENV_STATE_DIR.to_string(),
+            f._dirs.0.path().display().to_string(),
+        )]))
+        .unwrap();
+        let runtime = Arc::new(InterruptedRuntime {
+            inner: runsc_runtime(&cfg, f.runner.clone()),
+            started: tokio::sync::Notify::new(),
+        });
+        f.svc = FlmboxService::new(
+            Sandbox::with_runtime(
+                cfg,
+                FakeImages::new(f._dirs.1.path().to_path_buf()),
+                runtime.clone(),
+            ),
+            "exec1",
+        );
+        {
+            let enter = f.svc.on_session_enter(session("s1", None));
+            tokio::pin!(enter);
+            tokio::select! {
+                _ = runtime.started.notified() => {}
+                result = &mut enter => panic!("creation unexpectedly completed: {result:?}"),
+            }
+        }
+        assert!(f.svc.active.lock().await.is_none());
+        let dir = f._dirs.0.path().join("sandboxes").join(ID1);
+        assert!(dir.exists());
+        f.runner.clear();
+        f.svc.on_session_leave().await.unwrap();
+        assert_eq!(
+            f.runner.subcommands(),
+            vec![
+                "list".to_string(),
+                format!("kill {ID1} SIGKILL"),
+                format!("delete --force {ID1}"),
+            ]
+        );
+        assert!(!dir.exists());
     }
 
     #[tokio::test]

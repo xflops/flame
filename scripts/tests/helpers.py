@@ -161,13 +161,17 @@ class ScriptCase(unittest.TestCase):
         write_executable(self.tools / "python3", FAKE_PYTHON3)
         write_executable(self.tools / "systemctl", FAKE_SYSTEMCTL)
         write_executable(self.tools / "ip", FAKE_IP)
+        write_executable(self.tools / "logrotate", "#!/bin/sh\nexit 0\n")
         self.unit_dir = self.root / "units"
+        self.logrotate_dir = self.root / "logrotate.d"
         self.env = {
             **os.environ,
             "PATH": f"{self.tools}:{os.environ['PATH']}",
             "FAKE_LOG": str(self.log),
             "FLAME_SYSTEMD_DIR": str(self.unit_dir),
             "FLAME_SYSTEMCTL": str(self.tools / "systemctl"),
+            "FLAME_LOGROTATE_DIR": str(self.logrotate_dir),
+            "FLAME_LOGROTATE": str(self.tools / "logrotate"),
             "FLAME_OS": "linux",
             "FLAME_ARCH": "amd64",
             "HOME": str(self.root / "home"),

@@ -99,7 +99,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
 async fn daemon(sandbox: Sandbox) -> Result<(), Box<dyn std::error::Error>> {
     let service = FlmboxService::new(sandbox, &executor_id_from_env());
     let start = std::time::Instant::now();
-    service.cleanup_stale().await;
+    service.cleanup_stale().await?;
     perf_log!(
         "flmbox_cleanup_stale",
         elapsed_ms = start.elapsed().as_secs_f64() * 1e3,

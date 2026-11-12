@@ -22,7 +22,7 @@ usage: setup.sh [--join] [--prefix DIR] [--package DIR|FILE|URL] [--version TAG]
                        (default: the package this script is in, else the latest release, or
                        --version / FLAME_VERSION)
   --python-version V   Python version to install flamepy for (repeatable; default 3.11 3.12 3.13 3.14)
-  --no-systemd         do not write unit files or start anything
+  --no-systemd         do not write units or log rotation rules, or start anything
   --force              replace an installation that is already there without asking (without it,
                        setup.sh asks, and with no terminal to ask on, stops)
 
@@ -45,6 +45,8 @@ SERVICE_EXECUTOR_MANAGER=flame-executor-manager
 SERVICE_OBJECT_CACHE=flame-object-cache
 SYSTEMD_DIR="${FLAME_SYSTEMD_DIR:-/etc/systemd/system}"
 SYSTEMCTL="${FLAME_SYSTEMCTL:-systemctl}"
+LOGROTATE_DIR="${FLAME_LOGROTATE_DIR:-/etc/logrotate.d}"
+LOGROTATE="${FLAME_LOGROTATE:-logrotate}"
 
 join=0
 prefix=/usr/local/flame
@@ -128,6 +130,7 @@ acquire_package() {
 # target_files lists the files this install writes, so an existing one is found before anything changes.
 target_files() {
     printf '%s\n' "$prefix/conf/flame-cluster.yaml"
+    [ "$systemd" -eq 1 ] && printf '%s\n' "$(logrotate_file)"
     for tool in flmctl flmping flmexec flmbench; do
         printf '%s\n' "$prefix/bin/$tool"
     done
@@ -149,6 +152,11 @@ target_files() {
             printf '%s\n' "$(unit_file "$SERVICE_OBJECT_CACHE")" "$(unit_file "$SERVICE_EXECUTOR_MANAGER")"
         fi
     fi
+}
+
+# logrotate_file is shared by head and worker installs at one prefix, but separate across prefixes.
+logrotate_file() {
+    printf '%s/flame-%s\n' "$LOGROTATE_DIR" "$(printf '%s' "$prefix" | cksum | awk '{print $1}')"
 }
 
 # check_existing: when something this install would write already exists, ask before overwriting
@@ -331,6 +339,24 @@ write_units() {
     log "  wrote systemd units: $units"
 }
 
+# Bound retained daemon logs without restarting services that hold append-only file descriptors.
+write_logrotate() {
+    mkdir -p "$LOGROTATE_DIR"
+    cat > "$(logrotate_file)" <<ROTATE
+"$prefix/logs/*.log" {
+    daily
+    maxsize 100M
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+ROTATE
+    log "  wrote log rotation: $(logrotate_file)"
+}
+
 enable_units() {
     "$SYSTEMCTL" daemon-reload
     for unit in $units; do
@@ -350,8 +376,11 @@ enable_units() {
 # --- installing: the flow ----------------------------------------------------------------------
 
 install_node() {
-    check_settings FLAME_CLUSTER_NAME FLAME_ENDPOINT FLAME_RESREQ FLAME_POLICIES FLAME_STORAGE FLAME_SHIMS \
+    check_settings prefix FLAME_CLUSTER_NAME FLAME_ENDPOINT FLAME_RESREQ FLAME_POLICIES FLAME_STORAGE FLAME_SHIMS \
         FLAME_MAX_EXECUTORS FLAME_SYSTEM_RESOURCE FLAME_CACHE_ENDPOINT FLAME_CACHE_ADVERTISE FLAME_CACHE_STORAGE
+    if [ "$systemd" -eq 1 ]; then
+        need "$LOGROTATE"
+    fi
     acquire_package
     check_existing
     log "Installing to $prefix..."
@@ -377,6 +406,7 @@ install_node() {
             have "$SYSTEMCTL" || die "$SYSTEMCTL not found; use --no-systemd to install without services"
         fi
         write_units
+        write_logrotate
         enable_units
     else
         log "Skipped systemd (--no-systemd). Run the binaries with:"

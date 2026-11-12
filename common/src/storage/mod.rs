@@ -619,45 +619,73 @@ impl Storage {
     ) -> Result<Session, FlameError> {
         trace_fn!("Storage::open_session");
 
-        // Check if session already exists in cache - if so, return it directly
-        // to preserve in-memory task state
-        {
-            let ssn_map = lock_ptr!(self.sessions)?;
-            if let Some(ssn_ptr) = ssn_map.get(&id) {
-                let ssn = lock_ptr!(ssn_ptr)?;
-                // A suspended session is resumed, never reopened or replaced.
-                if ssn.is_suspending() || ssn.is_suspended() {
-                    return Err(FlameError::InvalidState(format!(
-                        "Session <{id}> is suspended"
-                    )));
-                }
-                // Verify the session is still open before returning cached version
-                if ssn.status.state == SessionState::Open {
-                    // If spec provided, validate it matches the existing session
-                    if let Some(ref attr) = spec {
-                        ssn.validate_spec(attr)?;
-                    }
-                    tracing::debug!(
-                        "Session <{}> already exists in cache with {} tasks, returning cached version",
-                        id,
-                        ssn.tasks.len()
-                    );
-                    return Ok(ssn.clone());
-                }
-            }
+        let cached = { lock_ptr!(self.sessions)?.get(&id).cloned() };
+        if let Some(ssn_ptr) = cached {
+            let ssn = lock_ptr!(ssn_ptr)?;
+            return self.setup_session(&ssn, spec.as_ref());
         }
 
-        // Session not in cache or not open, delegate to engine for atomic get-or-create operation
-        let ssn = self.engine.open_session(id.clone(), spec).await?;
-
-        {
-            let mut ssn_map = lock_ptr!(self.sessions)?;
-            ssn_map.insert(ssn.id.clone(), SessionPtr::new(ssn.clone().into()));
-        }
-
+        let ssn = self.engine.open_session(id, spec.clone()).await?;
+        let ssn = self.cache_session(ssn, spec.as_ref())?;
         self.evict_sessions()?;
-
         Ok(ssn)
+    }
+
+    /// Publishes an engine snapshot without replacing an existing session pointer.
+    fn cache_session(
+        &self,
+        ssn: Session,
+        spec: Option<&SessionAttributes>,
+    ) -> Result<Session, FlameError> {
+        let ssn_ptr = {
+            let fresh = SessionPtr::new(ssn.into());
+            // Lock the unpublished pointer first: readers cannot observe it
+            // before event setup, and no existing map entry can wait on it yet.
+            let ssn = lock_ptr!(fresh)?;
+            let published = {
+                let mut ssn_map = lock_ptr!(self.sessions)?;
+                ssn_map
+                    .entry(ssn.id.clone())
+                    .or_insert_with(|| fresh.clone())
+                    .clone()
+            };
+            if Arc::ptr_eq(&fresh, &published) {
+                return self.setup_session(&ssn, spec);
+            }
+            published
+        };
+        // A competing opener owns this pointer. Release the unpublished
+        // candidate's guard before acquiring the existing session's lock.
+        let ssn = lock_ptr!(ssn_ptr)?;
+        self.setup_session(&ssn, spec)
+    }
+
+    /// Validates a locked cached session and initializes events, serializing
+    /// setup with close without holding the global session map.
+    fn setup_session(
+        &self,
+        ssn: &Session,
+        spec: Option<&SessionAttributes>,
+    ) -> Result<Session, FlameError> {
+        if ssn.is_suspending() || ssn.is_suspended() {
+            return Err(FlameError::InvalidState(format!(
+                "Session <{}> is suspended",
+                ssn.id
+            )));
+        }
+        ensure!(
+            ssn.is_open(),
+            FlameError::InvalidState(format!("Session <{}> is not open", ssn.id))
+        )?;
+        if let Some(attr) = spec {
+            ssn.validate_spec(attr)?;
+        }
+        event_result(
+            self.event_manager.setup_events(ssn.id.clone()),
+            "create",
+            &ssn.id,
+        );
+        Ok(ssn.clone())
     }
 
     pub fn get_task_ptr(&self, gid: TaskGID) -> Result<TaskPtr, FlameError> {
@@ -1289,6 +1317,201 @@ mod event_lifecycle_tests {
             format!("sqlite://{}", dir.join("events.db").display()),
             format!("fs://{}", dir.join("filesystem").display()),
         ]
+    }
+
+    /// OpenSession must initialize event storage just like CreateSession does.
+    #[tokio::test]
+    async fn open_session_records_session_and_task_events() {
+        let engine_dir = tempfile::tempdir().unwrap();
+        for url in test_urls(engine_dir.path()) {
+            let dir = tempfile::tempdir().unwrap();
+            let events = Arc::new(FsEventManager::new(dir.path().to_str().unwrap()).unwrap());
+            let storage = test_storage(&url, events.clone()).await;
+            let id = "opened-events".to_string();
+            storage
+                .open_session(
+                    id.clone(),
+                    Some(SessionAttributes {
+                        id: id.clone(),
+                        application: "test-app".to_string(),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            for task_id in [0, 99] {
+                let owner = EventOwner {
+                    session_id: id.clone(),
+                    task_id,
+                };
+                storage
+                    .record_event(owner.clone(), event("opened"))
+                    .await
+                    .unwrap();
+                assert_eq!(events.find_events(owner).unwrap().len(), 1, "{url}");
+            }
+            let retained = storage.get_session_ptr(id.clone()).unwrap();
+            let task = storage.create_task(id.clone(), None, None).await.unwrap();
+            storage.open_session(id.clone(), None).await.unwrap();
+            assert!(Arc::ptr_eq(
+                &retained,
+                &storage.get_session_ptr(id.clone()).unwrap()
+            ));
+            assert!(lock_ptr!(retained)
+                .unwrap()
+                .active_task(task.id)
+                .unwrap()
+                .is_some());
+            let task_ptr = storage.get_task_ptr(task.gid()).unwrap();
+            for state in [TaskState::Running, TaskState::Succeed] {
+                storage
+                    .update_task_state(
+                        storage.get_session_ptr(id.clone()).unwrap(),
+                        task_ptr.clone(),
+                        state,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let recorded = storage.get_task(id.clone(), task.id).await.unwrap().events;
+            let states: Vec<i32> = recorded.iter().map(|event| event.code).collect();
+            assert_eq!(
+                states,
+                vec![
+                    i32::from(TaskState::Pending),
+                    i32::from(TaskState::Running),
+                    i32::from(TaskState::Succeed),
+                ],
+                "{url}"
+            );
+            assert_eq!(
+                events.find_events(EventOwner::session(id)).unwrap().len(),
+                1
+            );
+        }
+    }
+
+    /// A delayed opener must preserve tasks published by a competing opener,
+    /// and must not recreate event files after close wins the publication race.
+    #[tokio::test]
+    async fn delayed_open_preserves_cached_tasks_and_observes_close() {
+        let engine_dir = tempfile::tempdir().unwrap();
+        for url in test_urls(engine_dir.path()) {
+            let dir = tempfile::tempdir().unwrap();
+            let events = Arc::new(FsEventManager::new(dir.path().to_str().unwrap()).unwrap());
+            let storage = test_storage(&url, events).await;
+            let id = "delayed-open".to_string();
+            // Pause the first OpenSession after the engine returns its snapshot.
+            let snapshot = storage
+                .engine
+                .open_session(
+                    id.clone(),
+                    Some(SessionAttributes {
+                        id: id.clone(),
+                        application: "test-app".to_string(),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            storage.open_session(id.clone(), None).await.unwrap();
+            let retained = storage.get_session_ptr(id.clone()).unwrap();
+            let task = storage.create_task(id.clone(), None, None).await.unwrap();
+            // Resume publication after another opener has admitted a task.
+            storage.cache_session(snapshot.clone(), None).unwrap();
+            assert!(Arc::ptr_eq(
+                &retained,
+                &storage.get_session_ptr(id.clone()).unwrap()
+            ));
+            assert!(lock_ptr!(retained)
+                .unwrap()
+                .active_task(task.id)
+                .unwrap()
+                .is_some());
+
+            storage.close_session(id.clone()).await.unwrap();
+            assert!(!dir.path().join(&id).exists());
+            // The same stale engine result cannot override Closed or setup events.
+            assert!(matches!(
+                storage.cache_session(snapshot, None),
+                Err(FlameError::InvalidState(_))
+            ));
+            assert!(!dir.path().join(&id).exists());
+            assert_eq!(
+                storage.get_session(id).unwrap().status.state,
+                SessionState::Closed
+            );
+        }
+    }
+
+    /// Checks publication keeps the session locked while setup can access the map.
+    struct SetupLockCheck {
+        sessions: MutexPtr<HashMap<SessionID, SessionPtr>>,
+        inner: MemoryEventManager,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl EventManager for SetupLockCheck {
+        /// Checks the fresh pointer is published with its mutex already held.
+        fn setup_events(&self, id: SessionID) -> Result<(), FlameError> {
+            let ptr = {
+                let sessions = self.sessions.try_lock().expect("map held during event IO");
+                sessions
+                    .get(&id)
+                    .expect("session was not published")
+                    .clone()
+            };
+            assert!(ptr.try_lock().is_none(), "unlocked session during setup");
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.setup_events(id)
+        }
+
+        /// Delegates diagnostic writes to memory.
+        fn record_event(&self, owner: EventOwner, event: Event) -> Result<(), FlameError> {
+            self.inner.record_event(owner, event)
+        }
+
+        /// Delegates diagnostic reads to memory.
+        fn find_events(&self, owner: EventOwner) -> Result<Vec<Event>, FlameError> {
+            self.inner.find_events(owner)
+        }
+
+        /// Delegates cleanup to memory.
+        fn remove_events(&self, id: SessionID) -> Result<(), FlameError> {
+            self.inner.remove_events(id)
+        }
+
+        /// Delegates reset to memory.
+        fn clear(&self) -> Result<(), FlameError> {
+            self.inner.clear()
+        }
+    }
+
+    /// Fresh publication and cached reopen both serialize setup using only
+    /// the individual session mutex, leaving unrelated session lookups free.
+    #[tokio::test]
+    async fn open_session_event_setup_holds_only_its_session_lock() {
+        let mut storage = test_storage("none", Arc::new(MemoryEventManager::new())).await;
+        let events = Arc::new(SetupLockCheck {
+            sessions: storage.sessions.clone(),
+            inner: MemoryEventManager::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        storage.event_manager = events.clone();
+        let id = "setup-lock".to_string();
+        storage
+            .open_session(
+                id.clone(),
+                Some(SessionAttributes {
+                    id: id.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        storage.open_session(id, None).await.unwrap();
+        assert_eq!(events.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
