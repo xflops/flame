@@ -71,6 +71,11 @@ objectCache:
     # Bound on each worker node's host network.
     port: 9090
   storage: "/var/lib/flame/cache"
+  pool:
+    # Byte budget for ready resident part payloads; "0" disables caching.
+    size: "256M"
+    # Supported replacement policy: lru.
+    policy: "lru"
   persistence:
     enabled: true
     # Node directory mounted at `storage`. Data stays on the worker across pod restarts.

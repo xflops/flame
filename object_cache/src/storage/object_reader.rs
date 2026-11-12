@@ -14,7 +14,7 @@ limitations under the License.
 //! Capture descriptor-only object snapshots and stream selected storage parts.
 use super::{ChunkStream, PartReader};
 use crate::model::ObjectMetadata;
-use crate::model::{Chunk, Object};
+use crate::model::{Chunk, Object, Part};
 use common::FlameError;
 
 /// Own selected part descriptors and preopened storage readers independently of later path mutation.
@@ -40,6 +40,11 @@ impl ObjectReader {
     /// Return selected-prefix metadata or current full metadata for an open-ended suffix.
     pub(super) fn metadata(&self) -> &ObjectMetadata {
         &self.object.metadata
+    }
+
+    /// Return the captured part descriptors for verified stream cache population.
+    pub(super) fn parts(&self) -> &[Part] {
+        &self.object.parts
     }
 
     /// Let the storage-owned stream retain captured readers and terminate permanently after any error.

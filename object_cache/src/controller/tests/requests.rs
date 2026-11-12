@@ -43,7 +43,9 @@ fn endpoint() -> CacheEndpoint {
 async fn cache(storage: &str) -> Arc<Controller> {
     Arc::new(Controller::new(
         endpoint(),
-        crate::storage::connect(storage).await.unwrap(),
+        crate::storage::connect(storage, &pool(16 * 1024 * 1024))
+            .await
+            .unwrap(),
     ))
 }
 
@@ -356,9 +358,12 @@ async fn namespace_delete_proceeds_after_backend_commit_before_delayed_response(
         let directory = tempfile::tempdir().unwrap();
         let barrier = Arc::new(CommitBarrier::default());
         let storage = TrackedStorage {
-            inner: crate::storage::connect(directory.path().to_str().unwrap())
-                .await
-                .unwrap(),
+            inner: crate::storage::connect(
+                directory.path().to_str().unwrap(),
+                &pool(16 * 1024 * 1024),
+            )
+            .await
+            .unwrap(),
             reads: Arc::new(AtomicUsize::new(0)),
             barrier: Some(Arc::clone(&barrier)),
             delete_barrier: None,
@@ -420,7 +425,7 @@ async fn cancelled_rpc_does_not_retain_exclusion_after_backend_commit() {
     let directory = tempfile::tempdir().unwrap();
     let barrier = Arc::new(CommitBarrier::default());
     let storage = TrackedStorage {
-        inner: crate::storage::connect(directory.path().to_str().unwrap())
+        inner: crate::storage::connect(directory.path().to_str().unwrap(), &pool(16 * 1024 * 1024))
             .await
             .unwrap(),
         reads: Arc::new(AtomicUsize::new(0)),
@@ -766,7 +771,7 @@ async fn opening_payload_reader_does_not_preload_the_object() {
     let directory = tempfile::tempdir().unwrap();
     let reads = Arc::new(AtomicUsize::new(0));
     let storage = TrackedStorage {
-        inner: crate::storage::connect(directory.path().to_str().unwrap())
+        inner: crate::storage::connect(directory.path().to_str().unwrap(), &pool(16 * 1024 * 1024))
             .await
             .unwrap(),
         reads: Arc::clone(&reads),

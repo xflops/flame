@@ -131,11 +131,20 @@ struct FlameCacheYaml {
     /// choose the listener IP; other advertised addresses keep wildcard binding.
     pub advertise: Option<String>,
     pub storage: Option<String>,
+    /// Resident part-cache size and replacement policy.
+    pub pool: Option<FlameCachePoolYaml>,
     pub gc: Option<FlameCacheGcYaml>,
     /// TLS configuration for Object Cache (optional, independent from cluster.tls)
     pub tls: Option<FlameTlsYaml>,
     /// pprof profiling configuration
     pub pprof: Option<FlamePprofYaml>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlameCachePoolYaml {
+    pub size: Option<String>,
+    pub policy: Option<FlameCachePolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,7 +301,7 @@ impl FlameTls {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FlameCache {
     pub endpoint: String,
     /// Address placed in the references returned by the cache, reachable by
@@ -302,10 +311,30 @@ pub struct FlameCache {
     /// `None` uses the environment or the host's private address for references.
     pub advertise: Option<String>,
     pub storage: Option<String>,
+    /// Resident part-cache size and replacement policy.
+    pub pool: FlameCachePool,
     pub gc: FlameCacheGc,
     /// TLS configuration for Object Cache (optional, independent from cluster.tls)
     pub tls: Option<FlameTls>,
     pub pprof: Option<FlamePprof>,
+}
+
+/// Size and replacement policy of storage's resident part cache.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FlameCachePool {
+    /// Byte budget for resident payloads; zero disables caching.
+    /// In-flight reads and evicted bytes retained by readers are outside this budget.
+    pub size: u64,
+    /// Replacement policy used when inserting a ready part would exceed the pool size.
+    pub policy: FlameCachePolicy,
+}
+
+/// Replacement policies supported by the storage part cache.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlameCachePolicy {
+    #[default]
+    Lru,
 }
 
 #[derive(Debug, Clone)]
@@ -314,6 +343,32 @@ pub struct FlameCacheGc {
 }
 
 const DEFAULT_CACHE_GC_INTERVAL_SECS: u64 = 60;
+const DEFAULT_CACHE_POOL: u64 = 256 * 1024 * 1024;
+
+impl Default for FlameCache {
+    /// Preserve endpoint discovery defaults while enabling a bounded storage part cache.
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            advertise: None,
+            storage: None,
+            pool: FlameCachePool::default(),
+            gc: FlameCacheGc::default(),
+            tls: None,
+            pprof: None,
+        }
+    }
+}
+
+impl Default for FlameCachePool {
+    /// Use a 256 MiB resident payload pool with least-recently-used eviction.
+    fn default() -> Self {
+        Self {
+            size: DEFAULT_CACHE_POOL,
+            policy: FlameCachePolicy::Lru,
+        }
+    }
+}
 
 impl Default for FlameCacheGc {
     fn default() -> Self {
@@ -715,9 +770,31 @@ impl TryFrom<FlameCacheYaml> for FlameCache {
                 .unwrap_or(DEFAULT_FLAME_CACHE_ENDPOINT.to_string()),
             advertise: cache.advertise.filter(|advertise| !advertise.is_empty()),
             storage: cache.storage,
+            pool: cache
+                .pool
+                .map(FlameCachePool::try_from)
+                .transpose()?
+                .unwrap_or_default(),
             gc,
             tls,
             pprof,
+        })
+    }
+}
+
+impl TryFrom<FlameCachePoolYaml> for FlameCachePool {
+    type Error = FlameError;
+
+    /// Parse a pool size while independently defaulting omitted size and policy fields.
+    fn try_from(pool: FlameCachePoolYaml) -> Result<Self, Self::Error> {
+        Ok(Self {
+            size: pool
+                .size
+                .as_deref()
+                .map(parse_memory_size)
+                .transpose()?
+                .unwrap_or(DEFAULT_CACHE_POOL),
+            policy: pool.policy.unwrap_or_default(),
         })
     }
 }
@@ -1009,6 +1086,72 @@ cache:
         Ok(ctx.cache.unwrap())
     }
 
+    /// Omitted YAML and direct configuration construction use the same part-cache budget.
+    #[test]
+    fn test_flame_context_cache_pool_default() -> Result<(), FlameError> {
+        let cache = cache_context("  endpoint: \"grpc://127.0.0.1:9090\"\n")?;
+        assert_eq!(cache.pool.size, 256 * 1024 * 1024);
+        assert_eq!(cache.pool.policy, FlameCachePolicy::Lru);
+        assert_eq!(FlameCache::default().pool, cache.pool);
+        Ok(())
+    }
+
+    /// Parse human-readable sizes and preserve zero as the cache-disable setting.
+    #[test]
+    fn test_flame_context_cache_pool_sizes_and_disabled() -> Result<(), FlameError> {
+        for (value, expected) in [
+            ("64M", 64 * 1024 * 1024),
+            ("1Gi", 1024 * 1024 * 1024),
+            ("4096", 4096),
+            ("0", 0),
+        ] {
+            let cache = cache_context(&format!("  pool:\n    size: \"{value}\"\n"))?;
+            assert_eq!(cache.pool.size, expected, "pool.size={value}");
+            assert_eq!(cache.pool.policy, FlameCachePolicy::Lru);
+        }
+        Ok(())
+    }
+
+    /// Reject malformed cache budgets instead of silently disabling memory bounds.
+    #[test]
+    fn test_flame_context_cache_pool_invalid() {
+        for value in ["", "invalid", "-1M", "1X"] {
+            assert!(
+                cache_context(&format!("  pool:\n    size: \"{value}\"\n")).is_err(),
+                "pool.size={value} should be rejected"
+            );
+        }
+    }
+
+    /// Empty and partial mappings default each omitted pool property independently.
+    #[test]
+    fn test_flame_context_cache_pool_partial_configuration() -> Result<(), FlameError> {
+        for yaml in ["  pool: {}\n", "  pool:\n    policy: lru\n"] {
+            let cache = cache_context(yaml)?;
+            assert_eq!(cache.pool, FlameCachePool::default());
+        }
+        let cache = cache_context("  pool:\n    size: 32M\n    policy: lru\n")?;
+        assert_eq!(cache.pool.size, 32 * 1024 * 1024);
+        assert_eq!(cache.pool.policy, FlameCachePolicy::Lru);
+        Ok(())
+    }
+
+    /// Unsupported policies, unknown fields, and the previous scalar shape are rejected.
+    #[test]
+    fn test_flame_context_cache_pool_rejects_invalid_configuration() {
+        for yaml in [
+            "  pool:\n    policy: fifo\n",
+            "  pool:\n    policy: LRU\n",
+            "  pool:\n    size: 32M\n    enabled: true\n",
+            "  pool: 256M\n",
+        ] {
+            assert!(
+                cache_context(yaml).is_err(),
+                "invalid pool accepted: {yaml}"
+            );
+        }
+    }
+
     #[test]
     fn test_flame_context_cache_advertise_default() -> Result<(), FlameError> {
         let cache = cache_context("  endpoint: \"grpc://127.0.0.1:9090\"\n")?;
@@ -1134,7 +1277,7 @@ cache:
     }
 
     // ============================================================
-    // Tests for max_memory config parsing with units (using bytesize)
+    // Tests for pool config parsing with units (using bytesize)
     // ============================================================
 
     #[test]

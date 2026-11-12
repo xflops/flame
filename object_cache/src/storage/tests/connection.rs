@@ -47,7 +47,10 @@ async fn test_connect_rejects_non_filesystem_backends() {
         "file://",
     ] {
         assert!(
-            matches!(connect(url).await, Err(FlameError::InvalidConfig(_))),
+            matches!(
+                connect(url, &pool(0)).await,
+                Err(FlameError::InvalidConfig(_))
+            ),
             "{url}"
         );
     }
@@ -56,7 +59,9 @@ async fn test_connect_rejects_non_filesystem_backends() {
 /// Connect filesystem storage through a plain absolute directory path.
 async fn test_connect_filesystem_path() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = connect(directory.path().to_str().unwrap()).await.unwrap();
+    let storage = connect(directory.path().to_str().unwrap(), &pool(0))
+        .await
+        .unwrap();
     assert!(storage
         .list(&ObjectFilter::AllObject)
         .await

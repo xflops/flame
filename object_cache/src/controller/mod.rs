@@ -277,7 +277,7 @@ pub async fn run(
     );
 
     let storage_url = cache_config.storage.as_deref().unwrap_or("fs://cache");
-    let storage = storage::connect(storage_url).await?;
+    let storage = storage::connect(storage_url, &cache_config.pool).await?;
     let controller = Arc::new(Controller::new(advertised, storage));
 
     let collector = GarbageCollector::new(

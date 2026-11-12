@@ -14,7 +14,7 @@ limitations under the License.
 use crate::model::{Chunk, Object, ObjectFilter, ObjectKey, ObjectMetadata, Part};
 use async_trait::async_trait;
 use bytes::Bytes;
-use common::FlameError;
+use common::{ctx::FlameCachePool, FlameError};
 use futures::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::fs;
@@ -27,13 +27,14 @@ use std::sync::{Arc, Mutex};
 mod dao;
 mod object_reader;
 mod object_writer;
+mod part_cache;
 mod part_reader;
 mod part_writer;
 
 use dao::{ObjectDao, ObjectMetadataDao, PartDao};
 use object_reader::ObjectReader;
 pub(crate) use object_writer::ObjectWriter;
-use part_reader::open_readers;
+use part_cache::PartCache;
 pub(crate) use part_reader::PartReader;
 pub(crate) use part_writer::PartWriter;
 
@@ -180,15 +181,29 @@ impl ObjectFiles {
 pub struct FsStorage {
     storage_path: PathBuf,
     catalog: Catalog,
+    part_cache: Arc<PartCache>,
 }
 impl FsStorage {
-    /// Open filesystem storage with recovered committed metadata and abandoned uploads removed.
+    /// Open an uncached filesystem fixture to exercise the authoritative disk path.
+    #[cfg(test)]
     pub fn new(storage_path: PathBuf) -> Result<Self, FlameError> {
+        Self::with_cache(
+            storage_path,
+            FlameCachePool {
+                size: 0,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Recover filesystem storage and initialize a shared byte-bounded part cache.
+    pub fn with_cache(storage_path: PathBuf, pool: FlameCachePool) -> Result<Self, FlameError> {
         fs::create_dir_all(&storage_path)?;
         let catalog = recover(&storage_path)?;
         Ok(Self {
             storage_path,
             catalog: Arc::new(Mutex::new(catalog)),
+            part_cache: Arc::new(PartCache::new(pool)),
         })
     }
     /// Locate the session directory containing this object.
@@ -327,42 +342,133 @@ fn validate_uuid(dir: &Path, expected: &str) -> Result<(), FlameError> {
     Ok(())
 }
 
-/// Unlink committed objects directly; captured descriptors remain readable and GC never waits for active I/O.
-fn delete_committed(root: &Path, catalog: &Catalog, key: &ObjectKey) -> Result<(), FlameError> {
-    let keys: Vec<_> = if let Some(key) = key.to_key() {
-        vec![key]
-    } else {
-        catalog
-            .lock()
-            .map_err(|_| catalog_error())?
-            .keys()
-            .filter(|candidate| key.matches(candidate))
-            .cloned()
-            .collect()
-    };
-    for key in keys {
-        let path = root.join(&key);
-        {
-            let mut published = catalog.lock().map_err(|_| catalog_error())?;
-            match fs::remove_dir_all(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-            published.remove(&key);
-        }
-        if let Some(session) = path.parent() {
-            remove_empty_dir(&session.join(STAGING_DIR));
-            remove_empty_dir(session);
-            if let Some(app) = session.parent() {
-                remove_empty_dir(app);
-            }
-        }
-    }
-    Ok(())
-}
-
 impl FsStorage {
+    /// Unlink committed objects directly; captured descriptors remain readable and GC never waits for active I/O.
+    fn delete_committed(&self, key: &ObjectKey) -> Result<(), FlameError> {
+        let keys: Vec<_> = if let Some(key) = key.to_key() {
+            vec![key]
+        } else {
+            self.catalog
+                .lock()
+                .map_err(|_| catalog_error())?
+                .keys()
+                .filter(|candidate| key.matches(candidate))
+                .cloned()
+                .collect()
+        };
+        for key in keys {
+            let path = self.storage_path.join(&key);
+            {
+                let mut published = self.catalog.lock().map_err(|_| catalog_error())?;
+                match fs::remove_dir_all(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                if let Some(object) = published.remove(&key) {
+                    self.part_cache.remove_object(&object.metadata.uuid);
+                }
+            }
+            if let Some(session) = path.parent() {
+                remove_empty_dir(&session.join(STAGING_DIR));
+                remove_empty_dir(session);
+                if let Some(app) = session.parent() {
+                    remove_empty_dir(app);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Merge cached and filesystem reader maps in captured order, opening only misses.
+    fn part_readers(
+        &self,
+        metadata: &ObjectMetadata,
+        records: &[PartDao],
+    ) -> Result<Vec<Box<dyn PartReader>>, FlameError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cached: HashMap<_, _> = self
+            .part_cache
+            .patch_readers(&metadata.uuid)
+            .into_iter()
+            .map(|reader| (reader.part().part, reader))
+            .collect();
+        let misses: Vec<_> = records
+            .iter()
+            .filter(|part| !cached.contains_key(&part.part))
+            .copied()
+            .collect();
+        let disk = self.open_readers(&metadata.key, &misses)?;
+        validate_uuid(&self.storage_path.join(&metadata.key), &metadata.uuid)?;
+        records
+            .iter()
+            .map(|part| {
+                if let Some(reader) = cached.get(&part.part) {
+                    Ok(Box::new(reader.clone()) as Box<dyn PartReader>)
+                } else if let Some(reader) = disk.get(&part.part) {
+                    Ok(Box::new(reader.clone()) as Box<dyn PartReader>)
+                } else {
+                    Err(FlameError::DataLoss(format!(
+                        "captured reader missing for part {}",
+                        part.part
+                    )))
+                }
+            })
+            .collect()
+    }
+
+    /// Stream direct memory/filesystem readers and cache complete verified misses without another reader wrapper.
+    fn read_stream(&self, reader: ObjectReader) -> ChunkStream {
+        let key = reader.metadata().key.clone();
+        let uuid = reader.metadata().uuid.clone();
+        let parts: HashMap<_, _> = reader
+            .parts()
+            .iter()
+            .filter(|part| {
+                self.part_cache.cacheable(part.size)
+                    && self.part_cache.get_patch(&uuid, part.part).is_none()
+            })
+            .map(|part| (part.part, *part))
+            .collect();
+        if parts.is_empty() {
+            return reader.into_stream();
+        }
+        let storage = self.clone();
+        let mut loading: Option<Vec<Bytes>> = None;
+        Box::pin(reader.into_stream().inspect(move |result| {
+            let Ok(chunk) = result else {
+                loading = None;
+                return;
+            };
+            let Some(part) = parts.get(&chunk.part) else {
+                loading = None;
+                return;
+            };
+            if chunk.offset == 0 {
+                loading = Some(Vec::new());
+            }
+            if let Some(chunks) = &mut loading {
+                chunks.push(chunk.data.clone());
+            }
+            // FsReader verifies the checksum before returning the final chunk.
+            if chunk.offset + chunk.data.len() as u64 == part.size {
+                if let Some(chunks) = loading.take() {
+                    // Optional cache publication requires a live matching incarnation.
+                    if let Ok(objects) = storage.catalog.lock() {
+                        if objects
+                            .get(&key)
+                            .is_some_and(|object| object.metadata.uuid == uuid)
+                        {
+                            storage.part_cache.insert_patch(&uuid, *part, chunks);
+                        }
+                    }
+                }
+            }
+        }))
+    }
+
     #[cfg(test)]
     /// Capture one part reader through the shared snapshot-opening path.
     async fn reader(&self, key: &ObjectKey, part: u64) -> Result<Box<dyn PartReader>, FlameError> {
@@ -383,7 +489,7 @@ impl FsStorage {
         let key_string = key
             .to_key()
             .ok_or_else(|| FlameError::InvalidConfig("complete object key required".into()))?;
-        let dir = self.object_dir(key);
+        let storage = self.clone();
         let selected = {
             let objects = self.catalog.lock().map_err(|_| catalog_error())?;
             let object = objects
@@ -396,14 +502,14 @@ impl FsStorage {
                     visible
                         .get(*part as usize)
                         .copied()
-                        .map(|record| (*part, record))
                         .ok_or_else(|| FlameError::NotFound(format!("part {part} not found")))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            (object.metadata.uuid.clone(), selected)
+            (object.metadata(&key_string, ""), selected)
         };
         joined(
-            tokio::task::spawn_blocking(move || open_readers(&dir, &selected.1, &selected.0)).await,
+            tokio::task::spawn_blocking(move || storage.part_readers(&selected.0, &selected.1))
+                .await,
         )?
     }
 
@@ -422,13 +528,12 @@ impl FsStorage {
                 "complete object key required".into(),
             ));
         }
-        let root = self.storage_path.clone();
-        let catalog = Arc::clone(&self.catalog);
+        let storage = self.clone();
         let selected = selected.clone();
         joined(
             tokio::task::spawn_blocking(move || {
-                let (metadata, records, uuid) = {
-                    let objects = catalog.lock().map_err(|_| catalog_error())?;
+                let (metadata, records) = {
+                    let objects = storage.catalog.lock().map_err(|_| catalog_error())?;
                     let object = objects
                         .get(&selected.key)
                         .filter(|object| object.version() > 0)
@@ -456,14 +561,13 @@ impl FsStorage {
                     metadata.size = visible.iter().take(end as usize).map(|part| part.len).sum();
                     let records = visible
                         .iter()
-                        .enumerate()
                         .skip(start as usize)
                         .take((end - start) as usize)
-                        .map(|(part, record)| (part as u64, *record))
+                        .copied()
                         .collect::<Vec<_>>();
-                    (metadata, records, object.metadata.uuid.clone())
+                    (metadata, records)
                 };
-                let readers = open_readers(&root.join(&selected.key), &records, &uuid)?;
+                let readers = storage.part_readers(&metadata, &records)?;
                 let parts = readers.iter().map(|reader| reader.part()).collect();
                 Ok(ObjectReader::new(Object { metadata, parts }, readers))
             })
@@ -726,13 +830,13 @@ impl StorageEngine for FsStorage {
     async fn read_object(&self, metadata: &mut ObjectMetadata) -> Result<ChunkStream, FlameError> {
         let reader = self.capture(metadata, 0, Some(metadata.version)).await?;
         *metadata = reader.metadata().clone();
-        Ok(reader.into_stream())
+        Ok(self.read_stream(reader))
     }
     /// Treat the input version as the patch cursor and replace metadata with the captured latest committed view.
     async fn read_patch(&self, metadata: &mut ObjectMetadata) -> Result<ChunkStream, FlameError> {
         let reader = self.capture(metadata, metadata.version, None).await?;
         *metadata = reader.metadata().clone();
-        Ok(reader.into_stream())
+        Ok(self.read_stream(reader))
     }
     /// Run a create stream to completion under storage ownership, independently of the waiting caller.
     async fn write_object(
@@ -790,10 +894,9 @@ impl StorageEngine for FsStorage {
     }
     /// Unlink expired-session data on a blocking worker without waiting for readers or writers.
     async fn delete_objects(&self, key: &ObjectKey) -> Result<(), FlameError> {
-        let root = self.storage_path.clone();
-        let catalog = Arc::clone(&self.catalog);
+        let storage = self.clone();
         let key = key.clone();
-        joined(tokio::task::spawn_blocking(move || delete_committed(&root, &catalog, &key)).await)?
+        joined(tokio::task::spawn_blocking(move || storage.delete_committed(&key)).await)?
     }
 }
 /// Prune an empty directory while tolerating absent or still-populated namespaces.
@@ -810,7 +913,10 @@ fn remove_empty_dir(path: &Path) {
 }
 
 /// Open configured filesystem object storage, honoring `FLAME_CACHE_STORAGE`.
-pub(crate) async fn connect(url: &str) -> Result<StorageEnginePtr, FlameError> {
+pub(crate) async fn connect(
+    url: &str,
+    pool: &FlameCachePool,
+) -> Result<StorageEnginePtr, FlameError> {
     let url = std::env::var("FLAME_CACHE_STORAGE")
         .ok()
         .filter(|s| !s.is_empty())
@@ -830,7 +936,9 @@ pub(crate) async fn connect(url: &str) -> Result<StorageEnginePtr, FlameError> {
     } else {
         PathBuf::from(url)
     };
-    let storage = joined(tokio::task::spawn_blocking(move || FsStorage::new(path)).await)??;
+    let pool = pool.clone();
+    let storage =
+        joined(tokio::task::spawn_blocking(move || FsStorage::with_cache(path, pool)).await)??;
     Ok(Box::new(storage))
 }
 

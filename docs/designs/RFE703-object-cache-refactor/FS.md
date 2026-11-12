@@ -5,8 +5,10 @@ Status: Implemented.
 ## Goal
 
 Keep a simple filesystem-backed object service. Objects persist only in the
-filesystem; requests read and write their bytes directly. Remove the server's
-payload cache, proxies, loading state, LRU, memory budgets, and `none` backend.
+filesystem. The original refactor removed the object payload cache, proxies,
+loading state, LRU, memory budgets, and `none` backend. A later enhancement adds
+the bounded storage-owned part cache described below, without restoring object
+proxies or changing filesystem authority.
 The service name remains unchanged; its public RPCs are Put, Patch, and Get.
 
 Keep the `Object -> Part -> Chunk` hierarchy and UUID-aware GET modes. Client SDK
@@ -50,8 +52,9 @@ including an empty part, without replacing prior payloads.
 PartDao records persist Writing/Committed/Stale state. The readable sequence
 skips Writing and Stale slots. Committed parts have stable dense logical indexes
 assigned in commit order; object version is their cached derived count. State
-lives in the storage DAO, with no object payload cache or loading proxy. Captured descriptors are not changed
-by later appends or deletion.
+lives in the storage DAO, with no object payload cache or loading proxy. The
+optional part cache holds verified bytes independently of domain descriptors.
+Captured descriptors are not changed by later appends or deletion.
 
 ## Module ownership
 
@@ -64,6 +67,7 @@ by later appends or deletion.
 | [`storage/object_reader.rs`](../../../object_cache/src/storage/object_reader.rs) | Capture requested Object/Part views and forward storage chunks. |
 | [`storage/object_writer.rs`](../../../object_cache/src/storage/object_writer.rs) | Hash chunks and perform filesystem writes without catalog access. |
 | [`storage/part_reader.rs`](../../../object_cache/src/storage/part_reader.rs) | Part reader contract, positional filesystem reads, and checksum validation. |
+| [`storage/part_cache.rs`](../../../object_cache/src/storage/part_cache.rs) | Byte-bounded part LRU, memory-reader construction, resident-byte accounting, and incarnation invalidation. |
 | [`storage/part_writer.rs`](../../../object_cache/src/storage/part_writer.rs) | Physical part allocation, positional writes, and durability operations. |
 | [`controller/grpc.rs`](../../../object_cache/src/controller/grpc.rs) | Wire framing and the metadata/object/patch GET handlers. |
 | [`controller/gc.rs`](../../../object_cache/src/controller/gc.rs) | Classify vanished-session data and stale application packages for internal deletion. |
@@ -173,7 +177,7 @@ a sparse void block of the declared size, and writes its Writing descriptor.
 Each part writer awaits bounded positional writes at its physical offsets
 outside the lock. Idle uploads use async tasks rather than
 occupying the blocking I/O thread pool. Concurrent parts have disjoint extents, including when earlier uploads are
-still pending. Payload data is never assembled in server memory.
+still pending. Write payloads are never assembled in server memory.
 
 Payload writes and syncs run independently. A short metadata update assigns a
 dense logical commit index; index durability is established outside the lock
@@ -208,7 +212,8 @@ listing never preload payload bytes.
 The filesystem is the authoritative persistent copy. A restart retains committed
 objects and UUIDs. Service deletion is internal to GC; there is no Delete RPC or public SDK deletion
 helper. Objects persist until their owning session is gone. External filesystem
-actions can also remove files; there is no cache capacity eviction.
+actions can also remove files. Part-cache eviction releases memory only; it never
+deletes persistent objects or changes committed metadata.
 
 ## Reads and GET modes
 
@@ -301,6 +306,74 @@ object live again. There is no `delete_if_unchanged` API or object-version-based
 retention rule. No external delete RPC, SDK object/package delete helper or
 pre-upload delete exists. Client cache integrity still uses UUID and part counts.
 
+## Storage part cache
+
+Storage owns a byte-bounded LRU of immutable, committed parts. Entries are keyed
+by object UUID and logical part number, so parallel allocation slots and recreated
+object keys cannot alias cached payloads. The controller still selects metadata
+and GET modes through storage; there is no separate controller cache or public
+RPC change.
+
+A read uses a ready cached part when available. On a miss, storage reads the
+captured filesystem part with the existing bounded-chunk and checksum behavior.
+`PartCache::patch_readers(object_id)` creates readers for all cached parts of
+that object using each cached part's own metadata. `FsStorage::part_readers` calls `open_readers(object_id, parts)` for misses and
+merges cached and disk reader maps in captured order. The filesystem opener
+returns a map keyed by PartDao.part; selected readers are independent clones
+sharing immutable file handles, preserving repeated selections. The opener resolves the storage key
+under its storage root and uses each PartDao's existing logical part ID; no
+duplicate index is passed. Snapshot capture rechecks UUID after opening handles.
+Fully cached reads validate UUID without
+opening the payload file. The only concrete part readers are MemoryReader and
+FsReader; neither needs a cache-population wrapper.
+`FsStorage::read_stream` observes complete, checksum-verified miss payloads and
+inserts them into `self.part_cache` after checking the current catalog UUID.
+Cached-only, disabled-cache, and oversized-only streams use the direct reader
+stream. Failure or cancellation releases incomplete buffers without insertion.
+`FsStorage::delete_committed` uses the same owned fields to remove files, catalog
+metadata, and cached parts under the established lock order.
+Only a complete read that verifies the entire part is eligible for insertion;
+partial, canceled, or corrupt reads never publish an entry. Writes still commit
+durably to the filesystem and do not populate the part cache in this iteration.
+A restart begins with an empty part cache and recovered committed descriptors.
+
+`entries: HashMap<String, HashMap<u64, CachedPart>>` groups ready parts first
+by object ID and then by logical part ID. Each cached
+part holds its full `Part` descriptor, `object_id`, latest access clock, and an `Arc`
+of immutable chunks. The descriptor supplies part ID, size, creation time, and
+checksum for memory readers and pool accounting.
+Nested hash lookups provide constant-time part access. The cache `object_id` is
+the object incarnation UUID. `PartCache::patch_readers(object_id)` returns all
+cached parts for that object using stored descriptors. FsStorage selects only
+parts in the captured OBJECT prefix or PATCHES suffix, so unused cached parts
+are not streamed or marked recently used. A separate
+`order: BTreeMap<u64, PartKey>` sorts parts by their access clocks.
+`State` owns the pool and all lookup, insertion, and removal operations;
+`PartCache` acquires the mutex and delegates to those operations.
+On a hit, storage removes the previous clock from the ordered map, assigns a new
+clock to CachedPart, and reinserts its key as most recently used. This updates
+recency in logarithmic time without scanning entries or retaining stale keys.
+Eviction removes the first ordered key and its cached part. GC removes both the
+cached payload and its exact order key. Active readers share immutable chunks
+through `Arc`. On insertion of a verified ready part, storage evicts least
+recently used entries until it fits.
+The pool counts only payload bytes resident in this LRU. Checking eligibility or
+buffering an in-flight read does not reserve space or evict ready parts. Empty
+parts and parts larger than the pool are not cached.
+
+Eviction releases resident capacity immediately and never interrupts a captured
+reader. Readers and returned chunks can retain shared immutable bytes after
+eviction. These retained bytes and buffers collected by in-flight reads are
+outside the resident pool. Concurrent misses may independently read and buffer
+the same part; inserting an already resident identity keeps one copy in the LRU.
+
+GC invalidates all cached parts for the collected object incarnation. A read
+already holding a captured inode can finish, but cannot repopulate a deleted
+incarnation. Catalog identity and requested versions are checked before cache
+access; cached bytes cannot make a collected object visible or bypass UUID checks.
+Append commits retain existing immutable parts, including historical OBJECT
+prefixes and PATCHES cursors.
+
 ## Configuration
 
 ```yaml
@@ -308,6 +381,9 @@ cache:
   endpoint: grpc://0.0.0.0:9090
   advertise: eth0
   storage: fs://cache
+  pool:
+    size: 256M
+    policy: lru
   gc:
     interval: 60s
 ```
@@ -316,9 +392,18 @@ An omitted storage setting uses `fs://cache`. Relative fs/file paths resolve
 under `FLAME_HOME`, defaulting to `/var/lib/flame`; absolute paths and plain
 filesystem paths are supported. `FLAME_CACHE_STORAGE` can override the backend
 path. `none`, empty backend URLs, and non-filesystem URL schemes are rejected.
-Eviction/memory/object-count configuration is removed. Helm and CI templates use
-filesystem storage. Endpoint advertisement, interface binding, TLS, GC interval,
-and profiling behavior remain supported.
+`cache.pool.size` accepts the existing memory-size notation (for example, `256M`,
+`1Gi`, or a byte count). It defaults to 256 MiB; `"0"` disables part caching.
+`cache.pool.policy` defaults to `lru`, the only supported replacement policy.
+An omitted pool, `{}`, or an omitted property uses the corresponding default.
+Unknown properties and unsupported policies are rejected; the pool is a mapping,
+not a scalar. Helm exposes `objectCache.pool.size` and `objectCache.pool.policy`.
+The size limits only ready payload bytes resident in the part LRU. It does not bound in-flight
+read buffers or evicted bytes retained by readers and returned chunks. Metadata,
+allocator overhead, filesystem-stream buffers, and the operating-system page
+cache are also separate; the pool is not a process RSS limit.
+Helm and CI templates use filesystem storage. Endpoint advertisement, interface
+binding, TLS, GC interval, and profiling behavior remain supported.
 
 ## Validation
 

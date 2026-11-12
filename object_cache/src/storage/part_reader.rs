@@ -11,13 +11,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{joined, validate_uuid, PartDao, CHUNK_SIZE, DATA_FILE};
+use super::{joined, FsStorage, PartDao, CHUNK_SIZE, DATA_FILE};
 use crate::model::{Chunk, Part};
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::FlameError;
 use sha2::{Digest, Sha256};
-use std::{fs, os::unix::fs::FileExt, path::Path, sync::Arc};
+use std::{collections::HashMap, fs, os::unix::fs::FileExt, sync::Arc};
 
 #[async_trait]
 pub(crate) trait PartReader: Send {
@@ -26,25 +26,27 @@ pub(crate) trait PartReader: Send {
     /// Read the next part-relative chunk; verify integrity before successful EOF.
     async fn next_chunk(&mut self) -> Result<Option<Chunk>, FlameError>;
 }
-struct FsReader {
-    part: u64,
+#[derive(Clone)]
+pub(super) struct FsReader {
     record: PartDao,
     data: Arc<fs::File>,
     offset: u64,
     hash: Sha256,
     state: ReadState,
 }
+#[derive(Clone)]
 enum ReadState {
     Reading,
     Verified,
     Failed,
 }
+
 #[async_trait]
 impl PartReader for FsReader {
     /// Return the captured part descriptor without exposing absolute index offsets.
     fn part(&self) -> Part {
         Part {
-            part: self.part,
+            part: self.record.part,
             size: self.record.len,
             creation_time: self.record.creation_time,
             checksum: self.record.checksum,
@@ -82,52 +84,58 @@ impl PartReader for FsReader {
                 self.state = ReadState::Failed;
                 return Err(FlameError::DataLoss(format!(
                     "SHA-256 checksum mismatch for part {}",
-                    self.part
+                    self.record.part
                 )));
             }
             self.state = ReadState::Verified;
         }
         Ok(Some(Chunk {
-            part: self.part,
+            part: self.record.part,
             offset,
             data: bytes,
         }))
     }
 }
 
-/// Open a captured inode from logical part IDs and immutable physical descriptors selected before payload access.
-pub(super) fn open_readers(
-    dir: &Path,
-    parts: &[(u64, PartDao)],
-    uuid: &str,
-) -> Result<Vec<Box<dyn PartReader>>, FlameError> {
-    if parts.is_empty() {
-        return Ok(Vec::new());
-    }
-    let file = fs::File::open(dir.join(DATA_FILE))?;
-    let data_len = file.metadata()?.len();
-    let data = Arc::new(file);
-    let mut readers = Vec::with_capacity(parts.len());
-    for &(part, record) in parts {
-        if record.state != super::dao::PartState::Committed {
-            return Err(FlameError::InvalidVersion("part is not committed".into()));
+impl FsStorage {
+    /// Open captured payload handles for an object storage key using committed descriptors' logical IDs.
+    pub(super) fn open_readers(
+        &self,
+        object_id: &str,
+        parts: &[PartDao],
+    ) -> Result<HashMap<u64, FsReader>, FlameError> {
+        if parts.is_empty() {
+            return Ok(HashMap::new());
         }
-        if record
-            .offset
-            .checked_add(record.len)
-            .is_none_or(|end| end > data_len)
-        {
-            return Err(FlameError::DataLoss(format!("truncated part {part}")));
+        let file = fs::File::open(self.storage_path.join(object_id).join(DATA_FILE))?;
+        let data_len = file.metadata()?.len();
+        let data = Arc::new(file);
+        let mut readers = HashMap::with_capacity(parts.len());
+        for &record in parts {
+            if record.state != super::dao::PartState::Committed {
+                return Err(FlameError::InvalidVersion("part is not committed".into()));
+            }
+            if record
+                .offset
+                .checked_add(record.len)
+                .is_none_or(|end| end > data_len)
+            {
+                return Err(FlameError::DataLoss(format!(
+                    "truncated part {}",
+                    record.part
+                )));
+            }
+            readers.insert(
+                record.part,
+                FsReader {
+                    record,
+                    data: Arc::clone(&data),
+                    offset: 0,
+                    hash: Sha256::new(),
+                    state: ReadState::Reading,
+                },
+            );
         }
-        readers.push(Box::new(FsReader {
-            part,
-            record,
-            data: Arc::clone(&data),
-            offset: 0,
-            hash: Sha256::new(),
-            state: ReadState::Reading,
-        }) as Box<dyn PartReader>);
+        Ok(readers)
     }
-    validate_uuid(dir, uuid)?;
-    Ok(readers)
 }
