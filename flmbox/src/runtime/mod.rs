@@ -102,8 +102,8 @@ pub trait Runtime: Send + Sync {
         opts: ExecOptions,
     ) -> Result<CommandOutput, FlameError>;
 
-    /// Stops and deletes the sandbox. An unknown sandbox is success. Every
-    /// step runs; the first failure is returned.
+    /// Stops and then deletes the sandbox. An unknown sandbox is success.
+    /// Runtime state must be retained if stopping fails, so cleanup can retry.
     async fn kill(&self, id: &str) -> Result<(), FlameError>;
 
     /// The sandboxes the runtime knows.

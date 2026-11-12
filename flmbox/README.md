@@ -52,6 +52,13 @@ with Sandbox.create(image="ubuntu:26.04") as box:
 
 See `examples/sandbox` for a longer example.
 
+The service remains alive across session bindings. Startup, session leave and instance teardown reconcile only
+sandboxes with this executor's `flmbox-<executor-id>.` prefix, including interrupted creation attempts. Cleanup
+stops the runtime before deleting its state and bundle. A failure retains metadata and is returned to the caller;
+the service refuses to start a replacement sandbox until cleanup succeeds. Sandboxes belonging to other executors
+or the command line are left alone. Processes whose runtime state and bundle were already removed require operator
+identification and cleanup; the service does not infer ownership from process names.
+
 ## Configuration
 
 `flmbox` reads the `sandbox:` section of a YAML file. Every key is optional.

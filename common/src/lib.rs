@@ -223,7 +223,13 @@ pub fn init_logger(component: Option<&str>) -> Result<Option<WorkerGuard>, Flame
 
             std::fs::create_dir_all(&log_dir)?;
 
-            let file_appender = rolling::daily(&log_dir, log_file);
+            // Bound dated files independently of systemd's stdout log rotation.
+            let file_appender = rolling::RollingFileAppender::builder()
+                .rotation(rolling::Rotation::DAILY)
+                .filename_prefix(log_file)
+                .max_log_files(7)
+                .build(&log_dir)
+                .map_err(|error| FlameError::Internal(error.to_string()))?;
             let (non_blocking_file, guard) = tracing_appender::non_blocking(file_appender);
 
             fmt_builder

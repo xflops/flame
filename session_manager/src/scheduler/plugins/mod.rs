@@ -267,7 +267,7 @@ impl PluginManager {
                 .map(|info| (info.name.to_string(), (info.constructor)())),
         );
 
-        tracing::info!(
+        tracing::debug!(
             "Enabled scheduler plugins: {:?}",
             plugins.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
         );

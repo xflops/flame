@@ -58,6 +58,59 @@ class SetupTests(ScriptCase):
             ],
         )
 
+    def test_systemd_installs_rotation_for_all_daemon_logs(self):
+        self.ok(self.setup())
+
+        rules = list(self.logrotate_dir.iterdir())
+        self.assertEqual(len(rules), 1)
+        rule = rules[0].read_text()
+        self.assertIn(f'"{self.prefix}/logs/*.log" {{', rule)
+        for directive in ("daily", "maxsize 100M", "rotate 7", "compress", "delaycompress",
+                          "missingok", "notifempty", "copytruncate"):
+            self.assertIn(f"    {directive}\n", rule)
+
+        self.ok(self.setup("--join", "--force"))
+        self.assertEqual(list(self.logrotate_dir.iterdir()), rules)
+        self.assertEqual(rules[0].read_text(), rule)
+
+    def test_rotation_keeps_separate_rules_for_custom_prefixes(self):
+        self.ok(self.setup())
+        self.prefix = self.root / "another flame"
+        self.ok(self.setup("--force"))
+
+        rules = list(self.logrotate_dir.iterdir())
+        self.assertEqual(len(rules), 2)
+        self.assertTrue(any(f'"{self.prefix}/logs/*.log"' in rule.read_text() for rule in rules))
+
+    def test_missing_logrotate_fails_before_changing_an_existing_install(self):
+        self.ok(self.setup())
+        conf = self.prefix / "conf/flame-cluster.yaml"
+        conf.write_text("edited\n")
+        rule = next(self.logrotate_dir.iterdir())
+        rule.write_text("existing rotation\n")
+        calls_before = self.calls()
+
+        result = self.setup("--force", env={"FLAME_LOGROTATE": str(self.tools / "missing-logrotate")})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing-logrotate", result.stderr)
+        self.assertEqual(conf.read_text(), "edited\n")
+        self.assertEqual(rule.read_text(), "existing rotation\n")
+        self.assertEqual(self.calls(), calls_before)
+
+    def test_an_existing_rotation_rule_is_not_overwritten_without_force(self):
+        self.ok(self.setup())
+        rule = next(self.logrotate_dir.iterdir())
+        rule.write_text("existing rotation\n")
+        shutil.rmtree(self.prefix)
+        shutil.rmtree(self.unit_dir)
+
+        result = self.setup()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(rule.read_text(), "existing rotation\n")
+        self.assertFalse(self.prefix.exists())
+
     # --- flame-cluster.yaml: from FLAME_* settings, with defaults ---------------------------------
 
     def config(self):
@@ -329,9 +382,12 @@ class SetupTests(ScriptCase):
         self.assertEqual(len(restarts), 2)
 
     def test_no_systemd_writes_no_units_and_calls_nothing(self):
-        out = self.ok(self.setup("--no-systemd")).stdout
+        out = self.ok(self.setup("--no-systemd", env={
+            "FLAME_LOGROTATE": str(self.tools / "missing-logrotate"),
+        })).stdout
 
         self.assertFalse(self.unit_dir.exists())
+        self.assertFalse(self.logrotate_dir.exists())
         self.assertEqual([c for c in self.calls() if c.startswith("systemctl")], [])
         self.assertIn("flame-session-manager --config", out)
 

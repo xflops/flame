@@ -96,14 +96,13 @@ impl Sandbox {
         self.images.pull_image(reference, policy).await
     }
 
-    /// Pulls the image, then creates and starts sandbox `id` on it. Nothing is
-    /// left behind on failure. An existing sandbox of the same id is replaced.
+    /// Pulls the image, then creates and starts sandbox `id` on it. An existing
+    /// sandbox is replaced only after cleanup succeeds. Failed rollback keeps
+    /// its metadata available for a later cleanup attempt.
     pub async fn create(&self, id: &str, reference: &str) -> Result<(), FlameError> {
         validate_id(id)?;
         parse_reference(reference)?;
-        if let Err(e) = self.kill(id).await {
-            tracing::warn!("failed to remove the previous sandbox {id}: {e}");
-        }
+        self.kill(id).await?;
         match self.start(id, reference).await {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -164,14 +163,12 @@ impl Sandbox {
             .any(|known| known.id == id))
     }
 
-    /// Kills sandbox `id`, deletes it and removes its directory. Idempotent:
-    /// an unknown sandbox is success. The directory is removed even when the
-    /// runtime fails; that failure is returned.
+    /// Stops and deletes sandbox `id` before removing its directory. An unknown
+    /// sandbox is success; failed runtime cleanup retains metadata for retry.
     pub async fn kill(&self, id: &str) -> Result<(), FlameError> {
         validate_id(id)?;
-        let killed = self.runtime.kill(id).await;
-        remove_dir(&self.sandboxes_dir().join(id));
-        killed
+        self.runtime.kill(id).await?;
+        remove_dir(&self.sandboxes_dir().join(id))
     }
 
     /// Runs one request in sandbox `id`. A nonzero exit code is a normal
@@ -226,10 +223,11 @@ impl Sandbox {
     }
 
     /// Kills every sandbox whose id starts with `prefix`: the ones `runsc`
-    /// knows and the directories an earlier run left behind. Failures are
-    /// logged; this runs on cleanup paths.
-    pub async fn kill_prefixed(&self, prefix: &str) {
+    /// knows and the directories an earlier run left behind. Attempts every
+    /// matching sandbox and returns the first failure so cleanup can retry.
+    pub async fn kill_prefixed(&self, prefix: &str) -> Result<(), FlameError> {
         let mut ids: BTreeSet<String> = BTreeSet::new();
+        let mut failure = None;
         match self.runtime.list().await {
             Ok(known) => ids.extend(
                 known
@@ -237,22 +235,42 @@ impl Sandbox {
                     .map(|s| s.id)
                     .filter(|i| i.starts_with(prefix)),
             ),
-            Err(e) => tracing::warn!("failed to list sandboxes: {e}"),
+            Err(e) => failure = Some(e),
         }
-        if let Ok(entries) = fs::read_dir(self.sandboxes_dir()) {
-            ids.extend(
-                entries
-                    .flatten()
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .filter(|n| n.starts_with(prefix)),
-            );
+        match fs::read_dir(self.sandboxes_dir()) {
+            Ok(entries) => {
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => {
+                            if let Ok(id) = entry.file_name().into_string() {
+                                if id.starts_with(prefix) {
+                                    ids.insert(id);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            failure.get_or_insert_with(|| {
+                                FlameError::Internal(format!("list sandbox directories: {e}"))
+                            });
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                failure.get_or_insert_with(|| {
+                    FlameError::Internal(format!("list sandbox directories: {e}"))
+                });
+            }
         }
         for id in &ids {
             tracing::info!("removing sandbox {id}");
             if let Err(e) = self.kill(id).await {
                 tracing::warn!("failed to remove sandbox {id}: {e}");
+                failure.get_or_insert(e);
             }
         }
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -274,11 +292,15 @@ pub fn validate_id(id: &str) -> Result<(), FlameError> {
     }
 }
 
-fn remove_dir(dir: &Path) {
-    if let Err(e) = fs::remove_dir_all(dir) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!("failed to remove {}: {e}", dir.display());
-        }
+/// Removes stopped sandbox metadata, retaining filesystem errors for retry.
+fn remove_dir(dir: &Path) -> Result<(), FlameError> {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(FlameError::Internal(format!(
+            "remove {}: {e}",
+            dir.display()
+        ))),
     }
 }
 
@@ -521,18 +543,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kill_is_idempotent_and_still_removes_the_directory_on_errors() {
+    async fn kill_retains_metadata_on_failure_and_retries_idempotently() {
         let f = fixture();
         f.sb.create(ID, DEFAULT_IMAGE).await.unwrap();
         f.runner.respond(|_| Ok(out(1, "", "permission denied")));
         f.runner.clear();
         assert!(f.sb.kill(ID).await.is_err());
-        assert_eq!(f.runner.subcommands().len(), 2);
-        assert!(!sandbox_dir(&f, ID).exists());
+        assert_eq!(f.runner.subcommands(), vec![format!("kill {ID} SIGKILL")]);
+        assert!(sandbox_dir(&f, ID).exists());
 
         f.runner
             .respond(|_| Ok(out(1, "", "container does not exist")));
         f.sb.kill(ID).await.unwrap();
+        assert!(!sandbox_dir(&f, ID).exists());
+        f.sb.kill(ID).await.unwrap();
+    }
+
+    /// Runtime deletion sees the original bundle, and a failed delete retains it.
+    #[tokio::test]
+    async fn delete_failure_retains_bundle_until_successful_retry() {
+        let f = fixture();
+        f.sb.create(ID, DEFAULT_IMAGE).await.unwrap();
+        let dir = sandbox_dir(&f, ID);
+        let observed = dir.clone();
+        f.runner.respond(move |spec| {
+            assert!(observed.join("bundle/config.json").exists());
+            if spec.args.iter().any(|a| a == "delete") {
+                Ok(out(1, "", "permission denied"))
+            } else {
+                Ok(out(0, "", ""))
+            }
+        });
+        assert!(f.sb.kill(ID).await.is_err());
+        assert!(dir.exists());
+        f.runner.respond(|_| Ok(out(0, "", "")));
+        f.sb.kill(ID).await.unwrap();
+        assert!(!dir.exists());
+    }
+
+    /// Replacement never pulls or starts another sandbox after failed cleanup.
+    #[tokio::test]
+    async fn create_does_not_replace_a_sandbox_that_failed_to_stop() {
+        let f = fixture();
+        f.sb.create(ID, DEFAULT_IMAGE).await.unwrap();
+        f.runner.clear();
+        f.runner.respond(|_| Ok(out(1, "", "permission denied")));
+        assert!(f.sb.create(ID, "alpine:latest").await.is_err());
+        assert_eq!(f.runner.subcommands(), vec![format!("kill {ID} SIGKILL")]);
+        assert_eq!(f.images.calls(), vec![DEFAULT_IMAGE]);
+        assert!(sandbox_dir(&f, ID).exists());
+    }
+
+    /// A failed rollback preserves the identifier and bundle for later cleanup.
+    #[tokio::test]
+    async fn failed_start_and_failed_rollback_keep_metadata() {
+        let f = fixture();
+        let dir = sandbox_dir(&f, ID);
+        let observed = dir.clone();
+        f.runner.respond(move |spec| {
+            if spec.args.iter().any(|a| a == "start") {
+                Ok(out(1, "", "init failed"))
+            } else if observed.exists() && spec.args.iter().any(|a| a == "kill") {
+                Ok(out(1, "", "permission denied"))
+            } else {
+                Ok(out(0, "", ""))
+            }
+        });
+        assert!(f.sb.create(ID, DEFAULT_IMAGE).await.is_err());
+        assert!(dir.join("bundle/config.json").exists());
+        f.runner.respond(|_| Ok(out(0, "", "")));
+        f.sb.kill(ID).await.unwrap();
+        assert!(!dir.exists());
+    }
+
+    /// Listing failure is reported even when known directories can be cleaned.
+    #[tokio::test]
+    async fn prefixed_cleanup_reports_incomplete_discovery() {
+        let f = fixture();
+        let dir = sandbox_dir(&f, "flmbox-exec1.old");
+        fs::create_dir_all(&dir).unwrap();
+        f.runner.respond(|spec| {
+            if spec.args.iter().any(|a| a == "list") {
+                Ok(out(1, "", "permission denied"))
+            } else {
+                Ok(out(0, "", ""))
+            }
+        });
+        assert!(f.sb.kill_prefixed("flmbox-exec1.").await.is_err());
+        assert!(!dir.exists());
     }
 
     #[tokio::test]
@@ -591,7 +689,7 @@ mod tests {
                 "",
             ))
         });
-        f.sb.kill_prefixed("flmbox-exec1.").await;
+        f.sb.kill_prefixed("flmbox-exec1.").await.unwrap();
         let subs = f.runner.subcommands();
         assert!(subs.contains(&"delete --force flmbox-exec1.listed".to_string()));
         assert!(subs.contains(&"delete --force flmbox-exec1.old".to_string()));

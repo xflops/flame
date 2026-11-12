@@ -258,9 +258,9 @@ impl Runtime for Runsc {
     }
 
     async fn kill(&self, id: &str) -> Result<(), FlameError> {
-        let killed = Runsc::kill(self, id, "SIGKILL").await;
-        let deleted = self.delete(id).await;
-        killed.and(deleted)
+        // Keep runtime state available for a retry when stopping is uncertain.
+        Runsc::kill(self, id, "SIGKILL").await?;
+        self.delete(id).await
     }
 
     async fn list(&self) -> Result<Vec<SandboxInfo>, FlameError> {
