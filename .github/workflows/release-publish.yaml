@@ -195,7 +195,7 @@ jobs:
           sh -s -- --package "http://127.0.0.1:8000/${name}.tar.gz" --prefix "${RUNNER_TEMP}/flame" --no-systemd \
               < "${RUNNER_TEMP}/hosted/setup.sh"
           sh -s -- --package "http://127.0.0.1:8000/${name}.tar.gz" --prefix "${RUNNER_TEMP}/flame" \
-              --join --python-version 3.12 --no-systemd \
+              --join --python-version 3.12 --no-systemd --force \
               < "${RUNNER_TEMP}/hosted/setup.sh"
           FLAME_BASE_URL="http://127.0.0.1:8000" sh -s -- --version "${RELEASE_TAG}" --prefix "${RUNNER_TEMP}/client0" \
               --python-version 3.12 < "${RUNNER_TEMP}/hosted/sdk.sh"
@@ -216,23 +216,30 @@ jobs:
 
   # The install scripts of this release, with the release as their default version, to the xflops.io site
   # (xflops/xflops.github.io): flame/<tag>/setup.sh and sdk.sh for every release, and flame/setup.sh and
-  # sdk.sh, which install the latest release, for a stable one (not a release candidate). Runs after the
+  # sdk.sh, which install the latest release, only for the newest stable release. Runs after the
   # assets and flamepy are published, because the scripts install them.
   publish-scripts:
     name: Publish install scripts
     needs: [release-metadata, publish-python, publish-binaries]
     runs-on: ubuntu-26.04
     steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+
       - name: Checkout release source
         uses: actions/checkout@v7
         with:
           ref: ${{ needs.release-metadata.outputs.source-sha }}
+          path: source
 
       - name: Test the scripts
-        working-directory: scripts/tests
+        working-directory: source/scripts/tests
         run: python3 -m unittest discover -s . -p 'test_*.py'
 
       - name: Inline the shared code for this release
+        working-directory: source
         run: scripts/inline.sh --version "${RELEASE_TAG}" hosted
 
       - name: Checkout the site
@@ -243,13 +250,15 @@ jobs:
           path: site
 
       - name: Publish to the site
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "site/flame/${RELEASE_TAG}"
-          cp hosted/setup.sh hosted/sdk.sh "site/flame/${RELEASE_TAG}/"
-          case "${RELEASE_TAG}" in
-            *-*) echo "${RELEASE_TAG} is a pre-release: the latest scripts are not updated" ;;
-            *) cp hosted/setup.sh hosted/sdk.sh site/flame/ ;;
-          esac
+          current="$(bash ci/release/publication.sh release "${RELEASE_TAG}")"
+          cp source/hosted/setup.sh source/hosted/sdk.sh "site/flame/${RELEASE_TAG}/"
+          if [ "${current}" = true ]; then
+            cp source/hosted/setup.sh source/hosted/sdk.sh site/flame/
+          fi
           cd site
           git config user.name "flame-release[bot]"
           git config user.email "flame-release@users.noreply.github.com"

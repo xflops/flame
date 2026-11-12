@@ -1,5 +1,3 @@
-#![cfg(feature = "macros")]
-
 use std::sync::Mutex;
 
 use flame_rs as flame;
