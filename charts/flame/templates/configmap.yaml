@@ -52,6 +52,9 @@ data:
     cache:
       endpoint: {{ include "flame.cacheEndpoint" . | quote }}
       storage: {{ .Values.objectCache.storage | quote }}
+      pool:
+        size: {{ .Values.objectCache.pool.size | quote }}
+        policy: {{ .Values.objectCache.pool.policy | quote }}
       gc:
         interval: {{ .Values.objectCache.gc.interval | quote }}
       {{- if .Values.tls.enabled }}

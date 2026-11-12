@@ -28,7 +28,9 @@ async fn controller(storage: &str) -> Arc<Controller> {
             host: "127.0.0.1".into(),
             port: 9090,
         },
-        crate::storage::connect(storage).await.unwrap(),
+        crate::storage::connect(storage, &pool(16 * 1024 * 1024))
+            .await
+            .unwrap(),
     ))
 }
 /// Return the shared complete key used by snapshot regressions.

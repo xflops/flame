@@ -183,7 +183,7 @@ mod advertise {
         let directory = tempfile::tempdir().unwrap();
         let cache = Arc::new(Controller::new(
             endpoint("cache-1.cache.flame.svc"),
-            storage::connect(directory.path().to_str().unwrap())
+            storage::connect(directory.path().to_str().unwrap(), &pool(0))
                 .await
                 .unwrap(),
         ));

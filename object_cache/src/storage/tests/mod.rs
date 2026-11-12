@@ -9,8 +9,18 @@ specific language governing permissions and limitations under the License. */
 
 use super::*;
 
+mod cached_reads;
 mod connection;
 mod filesystem;
 mod object_reader;
+mod part_cache;
 
 mod parallel_writes;
+
+/// Configure a test pool with the requested resident payload budget.
+fn pool(size: u64) -> common::ctx::FlameCachePool {
+    common::ctx::FlameCachePool {
+        size,
+        ..Default::default()
+    }
+}

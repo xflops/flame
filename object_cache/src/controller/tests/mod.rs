@@ -17,3 +17,11 @@ mod config;
 mod gc;
 mod requests;
 mod snapshots;
+
+/// Configure a test pool with the requested resident payload budget.
+fn pool(size: u64) -> common::ctx::FlameCachePool {
+    common::ctx::FlameCachePool {
+        size,
+        ..Default::default()
+    }
+}

@@ -756,7 +756,9 @@ async fn connect_recovers_existing_objects_before_returning() {
         )
         .await
     };
-    let connected = connect(dir.path().to_str().unwrap()).await.unwrap();
+    let connected = connect(dir.path().to_str().unwrap(), &pool(0))
+        .await
+        .unwrap();
     let listed = connected.list(&ObjectFilter::AllObject).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(

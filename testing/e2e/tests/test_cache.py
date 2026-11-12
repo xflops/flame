@@ -819,3 +819,57 @@ def test_concurrent_raw_patches_publish_every_part_without_losing_payloads():
     assert sorted(parts) == list(range(1 + len(payloads)))
     assert bytes(parts[0]) == base
     assert sorted(bytes(parts[index]) for index in range(1, len(parts))) == sorted(payloads)
+
+
+def _assert_raw_part_frames(ref, cursor, mode, expected_parts, expected_metadata):
+    """Check metadata, selected part IDs, payload bytes, and identical bounded wire chunking."""
+    metadata, chunks = _remote_get(ref, cursor, mode)
+    assert (metadata.uuid, metadata.version, metadata.size) == expected_metadata
+    assert metadata.key == ref.key and metadata.data_type == "raw"
+    expected_frames = []
+    for part, data in expected_parts:
+        expected_frames.extend((part, data[offset : offset + cache_module._UPLOAD_CHUNK_SIZE]) for offset in range(0, len(data), cache_module._UPLOAD_CHUNK_SIZE))
+        if not data:
+            expected_frames.append((part, b""))
+    assert [(chunk.part, len(chunk.data)) for chunk in chunks] == [(part, len(data)) for part, data in expected_frames]
+    for chunk, (_, expected) in zip(chunks, expected_frames):
+        assert chunk.data == expected
+
+
+def test_raw_get_merges_nonadjacent_warmed_parts_with_identical_chunk_frames():
+    """Warm parts zero and two separately, then read the mixed range and its warm repeat."""
+    config = FlameContext().cache
+    endpoint = config if isinstance(config, str) else config.get("endpoint") if isinstance(config, dict) else config.endpoint
+    ref = ObjectRef(endpoint=endpoint, key=f"test-app/shared/part-merge-{uuid.uuid4().hex[:8]}", version=0)
+    size = cache_module._UPLOAD_CHUNK_SIZE
+    payloads = [b"a" * (size + 11), b"b" * (size + 23), b"c" * (size + 37)]
+    for part, data in enumerate(payloads):
+        ref = _remote_write("Put" if part == 0 else "Patch", ref, "raw", data, timeout=10)
+    metadata = _remote_metadata(ref)
+    latest = (metadata.uuid, 3, sum(map(len, payloads)))
+    _assert_raw_part_frames(ref, 1, cache_pb2.OBJECT, [(0, payloads[0])], (metadata.uuid, 1, len(payloads[0])))
+    _assert_raw_part_frames(ref, 2, cache_pb2.PATCHES, [(2, payloads[2])], latest)
+    _assert_raw_part_frames(ref, 0, cache_pb2.OBJECT, list(enumerate(payloads)), latest)
+    _assert_raw_part_frames(ref, 0, cache_pb2.OBJECT, list(enumerate(payloads)), latest)
+
+
+def test_raw_repeated_reads_and_append_preserve_selected_prefix_and_suffix():
+    """Repeat a full read, append a new part, and keep historical prefixes and suffixes isolated."""
+    config = FlameContext().cache
+    endpoint = config if isinstance(config, str) else config.get("endpoint") if isinstance(config, dict) else config.endpoint
+    ref = ObjectRef(endpoint=endpoint, key=f"test-app/shared/part-ranges-{uuid.uuid4().hex[:8]}", version=0)
+    size = cache_module._UPLOAD_CHUNK_SIZE
+    payloads = [b"base", b"", b"c" * (size + 5)]
+    for part, data in enumerate(payloads):
+        ref = _remote_write("Put" if part == 0 else "Patch", ref, "raw", data, timeout=10)
+    metadata = _remote_metadata(ref)
+    initial = (metadata.uuid, 3, sum(map(len, payloads)))
+    _assert_raw_part_frames(ref, 0, cache_pb2.OBJECT, list(enumerate(payloads)), initial)
+    _assert_raw_part_frames(ref, 0, cache_pb2.OBJECT, list(enumerate(payloads)), initial)
+    payloads.append(b"d" * (size + 17))
+    ref = _remote_write("Patch", ref, "raw", payloads[-1], timeout=10)
+    latest = (metadata.uuid, 4, sum(map(len, payloads)))
+    _assert_raw_part_frames(ref, 2, cache_pb2.OBJECT, [(0, payloads[0]), (1, payloads[1])], (metadata.uuid, 2, len(payloads[0])))
+    _assert_raw_part_frames(ref, 3, cache_pb2.PATCHES, [(3, payloads[3])], latest)
+    _assert_raw_part_frames(ref, 1, cache_pb2.PATCHES, list(enumerate(payloads))[1:], latest)
+    _assert_raw_part_frames(ref, 0, cache_pb2.OBJECT, list(enumerate(payloads)), latest)
