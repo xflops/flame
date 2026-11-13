@@ -747,14 +747,27 @@ def test_object_prefix_and_patches_use_zero_based_part_ranges():
         aio_cache._decode_parts(metadata, [], 3, "object", cache_pb2.PATCHES)
 
 
-def test_file_read_failure_does_not_commit_an_upload(monkeypatch):
+@pytest.mark.parametrize("patch", [False, True])
+def test_file_read_failure_does_not_commit_an_upload(patch):
     committed = []
+    finished = asyncio.Event()
 
     class Service(cache_pb2_grpc.ObjectCacheServiceServicer):
         async def Put(self, requests, context):  # noqa: N802
-            messages = [request async for request in requests]
-            committed.append(b"".join(request.data for request in messages[1:]))
-            return cache_pb2.CacheObjectMetadata(key="audit/pkg/file", endpoint="grpc://cache:1", version=1)
+            try:
+                messages = [request async for request in requests]
+                data = b"".join(request.data for request in messages[1:])
+                # Cancellation may appear as EOF. Match storage's declared-size
+                # check rather than treating any stream ending as a commit.
+                if not messages or len(data) != messages[0].header.size:
+                    await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "incomplete upload")
+                committed.append(data)
+                return cache_pb2.CacheObjectMetadata(key="audit/pkg/file", endpoint="grpc://cache:1", version=1)
+            finally:
+                finished.set()
+
+        async def Patch(self, requests, context):  # noqa: N802
+            return await self.Put(requests, context)
 
     async def run():
         server = grpc.aio.server()
@@ -770,8 +783,8 @@ def test_file_read_failure_does_not_commit_an_upload(monkeypatch):
                 raise OSError("source read failed")
 
             with pytest.raises(OSError, match="source read failed"):
-                await aio_cache._write_remote(client, "audit/pkg/file", "raw", chunks(), size=64)
-            await asyncio.sleep(0)
+                await aio_cache._write_remote(client, "audit/pkg/file", "raw", chunks(), size=64, patch=patch)
+            await asyncio.wait_for(finished.wait(), timeout=5)
             assert committed == []
         finally:
             await channel.close()
