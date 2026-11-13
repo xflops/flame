@@ -215,6 +215,31 @@ enum NodeState {
 message NodeInfo {
   string arch = 1;
   string os = 2;
+  string kernel_version = 3;
+  string os_image = 4;
+  repeated NodeNetworkInterface network_interfaces = 5;
+  repeated NodePciDevice pci_devices = 6;
+}
+
+// Network inventory visible to the node's executor manager.
+message NodeNetworkInterface {
+  string name = 1;
+  uint32 index = 2;
+  string mac_address = 3;
+  repeated string addresses = 4; // IPv4/IPv6 addresses with CIDR prefixes when available.
+  uint32 mtu = 5; // Zero when unavailable.
+  string state = 6;
+  string pci_address = 7; // Empty for virtual/non-PCI interfaces.
+}
+
+// PCI identifiers are hexadecimal without a 0x prefix; no external ID database is required.
+message NodePciDevice {
+  string address = 1; // Domain:bus:device.function.
+  string vendor_id = 2;
+  string device_id = 3;
+  string class_id = 4;
+  string driver = 5;
+  optional int32 numa_node = 6; // Absent when unknown or not applicable.
 }
 
 // NodeAddress represents a network address for a node.

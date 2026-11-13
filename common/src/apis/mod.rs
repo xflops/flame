@@ -14,6 +14,7 @@ limitations under the License.
 mod executor;
 mod filters;
 mod from_rpc;
+mod node_info;
 mod session;
 mod to_rpc;
 mod types;
@@ -75,6 +76,62 @@ mod tests {
         let mut wire = rpc::Node::from(&node);
         wire.spec.as_mut().unwrap().shims.push(99);
         assert_eq!(Node::from(wire).shims, [Shim::Cri, Shim::Host]);
+    }
+
+    #[test]
+    fn node_inventory_round_trips_and_reports_assigned_addresses() {
+        let node = Node {
+            name: "worker".into(),
+            info: NodeInfo {
+                arch: "x86_64".into(),
+                os: "linux".into(),
+                kernel_version: "6.8.0".into(),
+                os_image: "Ubuntu".into(),
+                network_interfaces: vec![NodeNetworkInterface {
+                    name: "eth0".into(),
+                    index: 2,
+                    mac_address: "02:00:00:00:00:01".into(),
+                    addresses: vec![
+                        "192.168.3.149/24".into(),
+                        "100.117.27.41/32".into(),
+                        "192.168.3.149/24".into(),
+                        "127.0.0.1/8".into(),
+                        "::1/128".into(),
+                        "fe80::1/64".into(),
+                        "bad".into(),
+                    ],
+                    mtu: 1500,
+                    state: "up".into(),
+                    pci_address: "0000:01:00.0".into(),
+                }],
+                pci_devices: vec![NodePciDevice {
+                    address: "0000:01:00.0".into(),
+                    vendor_id: "8086".into(),
+                    device_id: "1234".into(),
+                    class_id: "020000".into(),
+                    driver: "igc".into(),
+                    numa_node: Some(0),
+                }],
+            },
+            ..Default::default()
+        };
+        let wire = rpc::flame::v1::Node::from(&node);
+        let addresses = &wire.status.as_ref().unwrap().addresses;
+        assert_eq!(
+            addresses
+                .iter()
+                .map(|a| (a.r#type.as_str(), a.address.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("Hostname", "worker"),
+                ("InternalIP", "100.117.27.41"),
+                ("InternalIP", "192.168.3.149")
+            ]
+        );
+        assert_eq!(Node::from(wire).info, node.info);
+        assert!(NodeInfo::from(rpc::flame::v1::NodeInfo::default())
+            .network_interfaces
+            .is_empty());
     }
 
     #[test]

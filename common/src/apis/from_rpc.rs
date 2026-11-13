@@ -33,6 +33,41 @@ impl From<rpc::NodeInfo> for NodeInfo {
         Self {
             arch: info.arch,
             os: info.os,
+            kernel_version: info.kernel_version,
+            os_image: info.os_image,
+            network_interfaces: info
+                .network_interfaces
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            pci_devices: info.pci_devices.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<rpc::NodeNetworkInterface> for NodeNetworkInterface {
+    fn from(info: rpc::NodeNetworkInterface) -> Self {
+        Self {
+            name: info.name,
+            index: info.index,
+            mac_address: info.mac_address,
+            addresses: info.addresses,
+            mtu: info.mtu,
+            state: info.state,
+            pci_address: info.pci_address,
+        }
+    }
+}
+
+impl From<rpc::NodePciDevice> for NodePciDevice {
+    fn from(info: rpc::NodePciDevice) -> Self {
+        Self {
+            address: info.address,
+            vendor_id: info.vendor_id,
+            device_id: info.device_id,
+            class_id: info.class_id,
+            driver: info.driver,
+            numa_node: info.numa_node,
         }
     }
 }

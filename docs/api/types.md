@@ -558,8 +558,52 @@ enum NodeState {
 message NodeInfo {
   string arch = 1;
   string os = 2;
+  string kernel_version = 3;
+  string os_image = 4;
+  repeated NodeNetworkInterface network_interfaces = 5;
+  repeated NodePciDevice pci_devices = 6;
+}
+
+// Network inventory visible to the node's executor manager.
+message NodeNetworkInterface {
+  string name = 1;
+  uint32 index = 2;
+  string mac_address = 3;
+  repeated string addresses = 4; // IPv4/IPv6 addresses with CIDR prefixes when available.
+  uint32 mtu = 5; // Zero when unavailable.
+  string state = 6;
+  string pci_address = 7; // Empty for virtual/non-PCI interfaces.
+}
+
+// PCI identifiers are hexadecimal without a 0x prefix; no external ID database is required.
+message NodePciDevice {
+  string address = 1; // Domain:bus:device.function.
+  string vendor_id = 2;
+  string device_id = 3;
+  string class_id = 4;
+  string driver = 5;
+  optional int32 numa_node = 6; // Absent when unknown or not applicable.
 }
 ```
+
+FEM collects visible interfaces, assigned IPv4/IPv6 addresses, kernel/OS image,
+and Linux PCI inventory during registration and each heartbeat. Full snapshots
+allow later heartbeats to repair a missed update. Discovery runs
+outside the node lock on a blocking worker. Missing sysfs attributes or unsupported
+platform details remain empty; they do not prevent node registration. PCI IDs are
+hexadecimal without `0x`; NUMA is absent when unknown. Collection does not require
+`ip`, `lspci`, or a PCI names database. Inventory is descriptive; resource
+capacity and allocatable values continue to come from FEM device managers.
+
+Detailed inventory is live-reported rather than persisted in storage. After a
+manager restart, FEM registration/heartbeats restore it. Existing architecture/OS
+persistence is unchanged. Node addresses include the hostname and assigned
+non-loopback, non-link-local IPs; external/NAT addresses are not inferred.
+
+`flmctl view -n <node>` shows labeled node properties, capacity and system info.
+Addresses list the interface name beside each reported IP; PCI devices use an
+indented borderless table. Missing values use `-`. Use `-o json` for the complete
+structured interface and PCI inventory, including MAC/MTU/state and associations.
 
 ### NodeAddress
 

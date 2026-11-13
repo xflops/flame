@@ -30,6 +30,41 @@ impl From<NodeInfo> for rpc::NodeInfo {
         Self {
             arch: info.arch,
             os: info.os,
+            kernel_version: info.kernel_version,
+            os_image: info.os_image,
+            network_interfaces: info
+                .network_interfaces
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            pci_devices: info.pci_devices.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<NodeNetworkInterface> for rpc::NodeNetworkInterface {
+    fn from(info: NodeNetworkInterface) -> Self {
+        Self {
+            name: info.name,
+            index: info.index,
+            mac_address: info.mac_address,
+            addresses: info.addresses,
+            mtu: info.mtu,
+            state: info.state,
+            pci_address: info.pci_address,
+        }
+    }
+}
+
+impl From<NodePciDevice> for rpc::NodePciDevice {
+    fn from(info: NodePciDevice) -> Self {
+        Self {
+            address: info.address,
+            vendor_id: info.vendor_id,
+            device_id: info.device_id,
+            class_id: info.class_id,
+            driver: info.driver,
+            numa_node: info.numa_node,
         }
     }
 }
@@ -54,16 +89,49 @@ impl From<NodeState> for i32 {
     }
 }
 
+/// Build one consistent status for registration, API reads, and heartbeat reports.
+impl From<&Node> for rpc::NodeStatus {
+    fn from(node: &Node) -> Self {
+        let mut addresses = Vec::new();
+        if !node.name.is_empty() {
+            addresses.push(rpc::NodeAddress {
+                r#type: "Hostname".to_string(),
+                address: node.name.clone(),
+            });
+        }
+        let ips: std::collections::BTreeSet<std::net::IpAddr> = node
+            .info
+            .network_interfaces
+            .iter()
+            .flat_map(|interface| &interface.addresses)
+            .filter_map(|address| address.split('/').next()?.parse().ok())
+            .filter(|address: &std::net::IpAddr| {
+                !address.is_loopback() && !address.is_unspecified()
+            })
+            .filter(|address| match address {
+                std::net::IpAddr::V4(address) => !address.is_link_local(),
+                std::net::IpAddr::V6(address) => !address.is_unicast_link_local(),
+            })
+            .collect();
+        // These are addresses assigned to the node, not inferred public/NAT addresses.
+        addresses.extend(ips.into_iter().map(|address| rpc::NodeAddress {
+            r#type: "InternalIP".to_string(),
+            address: address.to_string(),
+        }));
+        Self {
+            state: node.state.into(),
+            capacity: Some(node.capacity.clone().into()),
+            allocatable: Some(node.allocatable.clone().into()),
+            info: Some(node.info.clone().into()),
+            addresses,
+            last_heartbeat_time: 0,
+        }
+    }
+}
+
 impl From<Node> for rpc::Node {
     fn from(node: Node) -> Self {
-        let status = Some(rpc::NodeStatus {
-            state: node.state.into(),
-            capacity: Some(node.capacity.into()),
-            allocatable: Some(node.allocatable.into()),
-            info: Some(node.info.into()),
-            addresses: vec![],
-            last_heartbeat_time: 0,
-        });
+        let status = Some(rpc::NodeStatus::from(&node));
 
         Self {
             metadata: Some(rpc::Metadata {

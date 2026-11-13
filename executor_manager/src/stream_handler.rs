@@ -25,7 +25,7 @@ use tokio::time::{interval, timeout};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Streaming;
 
-use common::apis::Node;
+use common::apis::{Node, NodeInfo};
 use common::ctx::FlameClusterContext;
 use common::FlameError;
 use rpc::flame::v1 as proto;
@@ -147,8 +147,15 @@ impl StreamHandler {
         executor_tx: &mpsc::Sender<ExecutorMessage>,
     ) -> Result<(), FlameError> {
         // Get current node state
+        // Inventory discovery may read sysfs; keep it off Tokio and outside the node lock.
+        let info = tokio::task::spawn_blocking(NodeInfo::discover)
+            .await
+            .map_err(|error| {
+                FlameError::Internal(format!("Node inventory discovery failed: {error}"))
+            })?;
         let node = {
             let mut node = lock_ptr!(self.node)?;
+            node.info = info;
             self.manager.dev_mgr.discover()?;
             node.with_shims(&self.manager.ctx.cluster.executors.shims)
                 .with_capability(self.manager.dev_mgr.capacity());
@@ -189,14 +196,7 @@ impl StreamHandler {
         let initial_heartbeat = proto::WatchNodeRequest {
             heartbeat: Some(proto::NodeHeartbeat {
                 node_name: node.name.clone(),
-                status: Some(proto::NodeStatus {
-                    state: proto::NodeState::from(node.state) as i32,
-                    capacity: Some(node.capacity.clone().into()),
-                    allocatable: Some(node.allocatable.clone().into()),
-                    info: Some(node.info.clone().into()),
-                    addresses: vec![],
-                    last_heartbeat_time: 0,
-                }),
+                status: Some((&node).into()),
             }),
         };
         request_tx
@@ -215,6 +215,14 @@ impl StreamHandler {
             loop {
                 ticker.tick().await;
 
+                // One awaited collection per tick prevents overlapping hardware scans.
+                let info = match tokio::task::spawn_blocking(NodeInfo::discover).await {
+                    Ok(info) => info,
+                    Err(error) => {
+                        tracing::warn!(%error, "Failed to discover node inventory for heartbeat");
+                        continue;
+                    }
+                };
                 // Refresh and collect current node status
                 let (node_name, status) = match lock_ptr!(node_ptr) {
                     Ok(mut node) => {
@@ -223,15 +231,9 @@ impl StreamHandler {
                             tracing::warn!(%error, "Failed to discover devices for heartbeat");
                             continue;
                         }
+                        node.info = info;
                         node.with_shims(&shims).with_capability(dev_mgr.capacity());
-                        let status = proto::NodeStatus {
-                            state: proto::NodeState::from(node.state) as i32,
-                            capacity: Some(node.capacity.clone().into()),
-                            allocatable: Some(node.allocatable.clone().into()),
-                            info: Some(node.info.clone().into()),
-                            addresses: vec![],
-                            last_heartbeat_time: 0,
-                        };
+                        let status = proto::NodeStatus::from(&*node);
                         (node.name.clone(), Some(status))
                     }
                     Err(e) => {
@@ -445,19 +447,14 @@ mod tests {
             info: NodeInfo {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             shims: Vec::new(),
         };
 
         // Verify the node can be converted to proto NodeStatus
-        let status = proto::NodeStatus {
-            state: proto::NodeState::from(node.state) as i32,
-            capacity: Some(node.capacity.clone().into()),
-            allocatable: Some(node.allocatable.clone().into()),
-            info: Some(node.info.clone().into()),
-            addresses: vec![],
-            last_heartbeat_time: 0,
-        };
+        let status = proto::NodeStatus::from(&node);
+        assert_eq!(status.addresses[0].address, "test-node");
 
         assert_eq!(status.state, proto::NodeState::Ready as i32);
         assert!(status.capacity.is_some());
@@ -489,6 +486,7 @@ mod tests {
             info: NodeInfo {
                 arch: "x86_64".to_string(),
                 os: "linux".to_string(),
+                ..Default::default()
             },
             shims: Vec::new(),
         };
