@@ -3,28 +3,6 @@
 version = 4
 
 [[package]]
-name = "actix-macros"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "367f814ad4afbac74f07df5001214da65f65e185c90ef56c4dd8df23f8695b9b"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.10",
-]
-
-[[package]]
-name = "actix-rt"
-version = "2.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5f794807f82bbd36430c12cd600c73bbab0f52fdde4f0ed49978df113f4807f"
-dependencies = [
- "actix-macros",
- "futures-core",
- "tokio",
-]
-
-[[package]]
 name = "addr2line"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -850,7 +828,6 @@ dependencies = [
  "serde_yaml",
  "sqlx",
  "stdng",
- "strum 0.28.0",
  "strum_macros 0.28.0",
  "tempfile",
  "thiserror 2.0.21",
@@ -1218,10 +1195,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
- "clap",
  "common",
  "hyper-util",
- "nix 0.31.3",
  "prost 0.14.6",
  "rand 0.10.3",
  "stdng",
@@ -1820,7 +1795,6 @@ checksum = "5905ec755cc8386d7928353e4d356d2be3e89e81e5ca01fe630a1ca4d08dc175"
 name = "flame-executor-manager"
 version = "0.7.0"
 dependencies = [
- "actix-rt",
  "anyhow",
  "async-trait",
  "bytes",
@@ -1907,7 +1881,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "stdng",
- "strum 0.28.0",
  "strum_macros 0.28.0",
  "thiserror 2.0.21",
  "time",
@@ -2032,7 +2005,6 @@ dependencies = [
  "flame-rs",
  "flate2",
  "ignore",
- "jsonschema",
  "serde",
  "serde_derive",
  "serde_json",
@@ -5044,8 +5016,6 @@ name = "rpc"
 version = "0.7.0"
 dependencies = [
  "prost 0.14.6",
- "prost-build 0.14.6",
- "prost-types 0.14.6",
  "tonic",
  "tonic-build",
  "tonic-prost",
@@ -5773,7 +5743,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

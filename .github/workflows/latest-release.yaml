@@ -48,7 +48,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           version: 0.13.8
 
