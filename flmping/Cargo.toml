@@ -15,11 +15,11 @@ serde_derive = { workspace = true }
 
 futures = { workspace = true }
 clap = { workspace = true }
-indicatif = {version = "*", features = ["rayon"]}
-byte-unit = "5.2"
+indicatif = {version = "0.18.6", features = ["rayon"]}
+byte-unit = "5.2.6"
 comfy-table = { workspace = true }
 
-gethostname = "*"
+gethostname = "1.1.0"
 
 [[bin]]
 name = "flmping-service"

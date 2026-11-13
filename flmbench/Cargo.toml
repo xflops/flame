@@ -15,4 +15,4 @@ serde_json = { workspace = true }
 futures = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true }
-byte-unit = "5.2"
+byte-unit = "5.2.6"

@@ -52,7 +52,7 @@ services:
       - ./examples:/opt/examples
 
   qdrant:
-    image: qdrant/qdrant:v1.16.1
+    image: qdrant/qdrant:v1.20.0
     logging:
       options:
         max-size: "100m"

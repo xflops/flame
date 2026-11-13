@@ -30,9 +30,9 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 serde_derive = { workspace = true }
 jsonschema = { workspace = true }
-flate2 = "1"
-tar = "0.4"
-sha2 = "0.11"
-ignore = "0.4"
+flate2 = "1.1.11"
+tar = "0.4.46"
+sha2 = "0.11.1"
+ignore = "0.4.34"
 tempfile = { workspace = true }
-toml = "1.1"
+toml = "1.2.1"

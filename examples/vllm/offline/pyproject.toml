@@ -5,11 +5,11 @@ description = "Retained vLLM engine and prefix-cache reuse with flamepy.app"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-	"vllm==0.32.0",
+	"vllm==0.33.0",
 ]
 
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=84.2.1", "wheel>=0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

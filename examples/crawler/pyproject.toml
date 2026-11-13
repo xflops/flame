@@ -3,9 +3,9 @@ name = "crawler"
 version = "0.2.0"
 description = "Crawler Application"
 dependencies = [
-  "requests",
-  "markitdown",
-  "beautifulsoup4",
+  "requests>=2.34.2",
+  "markitdown>=0.1.9",
+  "beautifulsoup4>=4.15.0",
   "flamepy",
 ]
 

@@ -3,15 +3,15 @@ name = "rl"
 version = "0.2.0"
 description = "Distributed Reinforcement Learning Example using Flame App"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
-    "torch",
-    "numpy",
-    "gymnasium[mujoco]",
+    "torch>=2.15.0",
+    "numpy>=2.5.4",
+    "gymnasium[mujoco]>=1.4.0",
 ]
 
 [project.optional-dependencies]
-plot = ["matplotlib"]
+plot = ["matplotlib>=3.11.2"]
 
 [dependency-groups]
 dev = ["flamepy"]
