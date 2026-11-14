@@ -1,13 +1,16 @@
 """AsyncIO frontend client and task watches."""
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Union
 from urllib.parse import urlparse
 
 import grpc
+from google.protobuf.message import DecodeError
 
 from flamepy.core.types import (
+    DEFAULT_PAGE_SIZE,
     Application,
     ApplicationAttributes,
     ApplicationSchema,
@@ -16,6 +19,9 @@ from flamepy.core.types import (
     FlameClientTls,
     FlameError,
     FlameErrorCode,
+    Page,
+    PageInfo,
+    PageRequest,
     SessionAttributes,
     SessionID,
     SessionState,
@@ -26,6 +32,7 @@ from flamepy.core.types import (
     TaskState,
     short_name,
 )
+from flamepy.proto import types_pb2 as rpc_types
 from flamepy.proto.frontend_pb2 import (
     CloseSessionRequest,
     CreateSessionRequest,
@@ -136,14 +143,61 @@ def _raise_for_result(response, operation: str) -> None:
 
 
 def _grpc_error(error: grpc.RpcError, operation: str) -> FlameError:
-    code = error.code()
+    return _grpc_status_error(error.code(), error.details(), operation)
+
+
+def _grpc_status_error(code: grpc.StatusCode, details: str, operation: str) -> FlameError:
+    """Preserve server errors even when a streamed page has no initial metadata."""
     mapping = {
         grpc.StatusCode.NOT_FOUND: FlameErrorCode.NOT_FOUND,
         grpc.StatusCode.ALREADY_EXISTS: FlameErrorCode.ALREADY_EXISTS,
         grpc.StatusCode.INVALID_ARGUMENT: FlameErrorCode.INVALID_ARGUMENT,
         grpc.StatusCode.FAILED_PRECONDITION: FlameErrorCode.INVALID_STATE,
     }
-    return FlameError(mapping.get(code, FlameErrorCode.INTERNAL), f"{operation}: {error.details() or ''}")
+    return FlameError(mapping.get(code, FlameErrorCode.INTERNAL), f"{operation}: {details or ''}")
+
+
+def _paging_request(paging: Optional[PageRequest]):
+    """Always send message presence, including the explicit default-page request."""
+    paging = paging or PageRequest()
+    return rpc_types.PageRequest(page_size=paging.page_size, page_number=paging.page_number, order_by=paging.order_by)
+
+
+def _paging_info(response) -> PageInfo:
+    """Copy page metadata into an SDK value independent of protobuf ownership."""
+    return PageInfo(page_number=response.page_number, page_size=response.page_size, total_pages=response.total_pages, total_count=response.total_count, resource_count=response.resource_count, state_counts=dict(response.state_counts), totals=dict(response.totals))
+
+
+def _require_page(response, items, paging: Optional[PageRequest]) -> Page:
+    """Reject old servers instead of silently accepting an unbounded list."""
+    if not response.HasField("paging"):
+        raise FlameError(FlameErrorCode.INVALID_STATE, "server does not support list pagination; upgrade Flame before requesting pages")
+    if len(items) > ((paging or PageRequest()).page_size or DEFAULT_PAGE_SIZE):
+        raise FlameError(FlameErrorCode.INTERNAL, "server returned more records than the requested page size")
+    return Page(items, _paging_info(response.paging))
+
+
+async def _iter_pages(fetch, paging: Optional[PageRequest], **filters):
+    """Fetch the next page only when the caller advances the async iterator."""
+    query = paging or PageRequest()
+    while True:
+        page = await fetch(query, **filters)
+        yield page
+        current = query.page_number or 1
+        if current >= page.paging.total_pages:
+            return
+        query = replace(query, page_number=current + 1)
+
+
+def _task_ids(ids: Optional[Iterable[TaskID]]) -> List[int]:
+    """Convert the SDK's textual task IDs into the wire's numeric filter."""
+    try:
+        values = [int(value) for value in ids] if ids is not None else []
+    except (TypeError, ValueError):
+        raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "task ids must be integers") from None
+    if any(not -(2**63) <= value < 2**63 for value in values):
+        raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "task ids must fit a signed 64-bit integer")
+    return values
 
 
 def _session_spec(attrs: SessionAttributes) -> SessionSpec:
@@ -355,6 +409,86 @@ class Connection:
         response = await self._rpc("ResumeSession", ResumeSessionRequest(session_id=session_id), "failed to resume session")
         return _session_from_proto(self, response)
 
+    async def list_applications_page(self, paging: Optional[PageRequest] = None, *, state: Optional[ApplicationState] = None, names: Optional[Iterable[str]] = None) -> Page[Application]:
+        """Read one bounded application page, including filtered counts."""
+        response = await self._rpc("ListApplications", ListApplicationsRequest(paging=_paging_request(paging), state=int(state) if state is not None else None, names=list(names or ())), "failed to list applications")
+        return _require_page(response, [_application_from_proto(item) for item in response.applications], paging)
+
+    async def list_sessions_page(self, paging: Optional[PageRequest] = None, *, state: Optional[SessionState] = None, ids: Optional[Iterable[SessionID]] = None, application: Optional[str] = None) -> Page["Session"]:
+        """Read one bounded session page using server-side filters."""
+        response = await self._rpc("ListSessions", ListSessionsRequest(paging=_paging_request(paging), state=int(state) if state is not None else None, ids=list(ids or ()), application=application), "failed to list sessions")
+        return _require_page(response, [_session_from_proto(self, item) for item in response.sessions], paging)
+
+    async def list_nodes_page(self, paging: Optional[PageRequest] = None, *, state: Optional[int] = None, names: Optional[Iterable[str]] = None) -> Page[Any]:
+        """Read one bounded node page; node values retain their protobuf type."""
+        response = await self._rpc("ListNodes", ListNodesRequest(paging=_paging_request(paging), state=state, names=list(names or ())), "failed to list nodes")
+        return _require_page(response, list(response.nodes), paging)
+
+    async def list_executors_page(self, paging: Optional[PageRequest] = None, *, state: Optional[int] = None, application: Optional[str] = None, node: Optional[str] = None, session_id: Optional[str] = None, ids: Optional[Iterable[str]] = None) -> Page[Any]:
+        """Read one bounded executor page with assignment filters."""
+        response = await self._rpc("ListExecutors", ListExecutorsRequest(paging=_paging_request(paging), state=state, application=application, node=node, session_id=session_id, ids=list(ids or ())), "failed to list executors")
+        return _require_page(response, list(response.executors), paging)
+
+    async def list_tasks_page(self, session_id: SessionID, paging: Optional[PageRequest] = None, *, state: Optional[TaskState] = None, ids: Optional[Iterable[TaskID]] = None, include_payloads: bool = False) -> Page[Task]:
+        """Read one task page, checking initial metadata before consuming tasks.
+
+        Payloads and events are omitted unless ``include_payloads`` is true.
+        """
+        self._check_loop()
+        stream = self._frontend.ListTasks(ListTasksRequest(session_id=session_id, paging=_paging_request(paging), state=int(state) if state is not None else None, ids=_task_ids(ids), include_payloads=include_payloads))
+        try:
+            metadata = await stream.initial_metadata()
+            headers = [value for key, value in metadata if key == "flame-page-bin"]
+            if not headers:
+                if stream.done():
+                    code = await stream.code()
+                    if code != grpc.StatusCode.OK:
+                        raise _grpc_status_error(code, await stream.details(), "failed to list tasks")
+                raise FlameError(FlameErrorCode.INVALID_STATE, "server does not support task pagination; upgrade Flame before requesting pages")
+            if len(headers) != 1 or not isinstance(headers[0], bytes):
+                raise FlameError(FlameErrorCode.INTERNAL, "invalid task page metadata")
+            try:
+                info = _paging_info(rpc_types.PageInfo.FromString(headers[0]))
+            except DecodeError:
+                raise FlameError(FlameErrorCode.INTERNAL, "invalid task page metadata") from None
+            items = []
+            limit = (paging or PageRequest()).page_size or DEFAULT_PAGE_SIZE
+            async for item in stream:
+                if len(items) >= limit:
+                    raise FlameError(FlameErrorCode.INTERNAL, "server returned more tasks than the requested page size")
+                items.append(_task_from_proto(item, session_id))
+            return Page(items, info)
+        except grpc.RpcError as error:
+            stream.cancel()
+            raise _grpc_error(error, "failed to list tasks") from None
+        except BaseException:
+            stream.cancel()
+            raise
+
+    def iter_applications_pages(self, paging: Optional[PageRequest] = None, *, state=None, names=None):
+        """Lazily fetch applications pages, retaining filters and ordering."""
+        return _iter_pages(self.list_applications_page, paging, state=state, names=tuple(names) if names is not None else None)
+
+    def iter_sessions_pages(self, paging: Optional[PageRequest] = None, *, state=None, ids=None, application=None):
+        """Lazily fetch sessions pages, retaining filters and ordering."""
+        return _iter_pages(self.list_sessions_page, paging, state=state, ids=tuple(ids) if ids is not None else None, application=application)
+
+    def iter_nodes_pages(self, paging: Optional[PageRequest] = None, *, state=None, names=None):
+        """Lazily fetch nodes pages, retaining filters and ordering."""
+        return _iter_pages(self.list_nodes_page, paging, state=state, names=tuple(names) if names is not None else None)
+
+    def iter_executors_pages(self, paging: Optional[PageRequest] = None, *, state=None, application=None, node=None, session_id=None, ids=None):
+        """Lazily fetch executors pages, retaining filters and ordering."""
+        return _iter_pages(self.list_executors_page, paging, state=state, application=application, node=node, session_id=session_id, ids=tuple(ids) if ids is not None else None)
+
+    def iter_tasks_pages(self, session_id: SessionID, paging: Optional[PageRequest] = None, *, state: Optional[TaskState] = None, ids: Optional[Iterable[TaskID]] = None, include_payloads: bool = False):
+        """Lazily fetch task pages for one session."""
+
+        async def fetch(query, **filters):
+            return await self.list_tasks_page(session_id, query, **filters)
+
+        return _iter_pages(fetch, paging, state=state, ids=tuple(ids) if ids is not None else None, include_payloads=include_payloads)
+
     def _watch_task(self, session_id: SessionID, task_id: TaskID, timeout: Optional[float]) -> "TaskWatcher":
         self._check_loop()
         session_watch = self._session_watches.get(session_id)
@@ -407,6 +541,14 @@ class Session:
         self.connection._check_loop()
         stream = self.connection._frontend.ListTasks(ListTasksRequest(session_id=self.id))
         return TaskIterator(stream, self.id)
+
+    async def list_tasks_page(self, paging: Optional[PageRequest] = None, *, state: Optional[TaskState] = None, ids: Optional[Iterable[TaskID]] = None, include_payloads: bool = False) -> Page[Task]:
+        """Read one bounded page of this session's tasks."""
+        return await self.connection.list_tasks_page(self.id, paging, state=state, ids=ids, include_payloads=include_payloads)
+
+    def iter_tasks_pages(self, paging: Optional[PageRequest] = None, *, state: Optional[TaskState] = None, ids: Optional[Iterable[TaskID]] = None, include_payloads: bool = False):
+        """Lazily fetch this session's task pages."""
+        return self.connection.iter_tasks_pages(self.id, paging, state=state, ids=ids, include_payloads=include_payloads)
 
     def watch_task(self, task_id: TaskID, timeout: Optional[float] = None) -> "TaskWatcher":
         return self.connection._watch_task(self.id, task_id, timeout)

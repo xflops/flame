@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from dataclasses import replace
 from typing import Any, Dict, Iterable, List, Optional, Union
 
 from flamepy.core._bridge import LoopThread
@@ -12,10 +13,13 @@ from flamepy.core.aio import client as aio_client
 from flamepy.core.types import (
     Application,
     ApplicationAttributes,
+    ApplicationState,
     FlameClientTls,
     FlameContext,
     FlameError,
     FlameErrorCode,
+    Page,
+    PageRequest,
     ResourceRequirement,
     SessionAttributes,
     SessionID,
@@ -23,6 +27,7 @@ from flamepy.core.types import (
     Task,
     TaskID,
     TaskOptions,
+    TaskState,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,6 +107,56 @@ def suspend_session(session_id: SessionID) -> "Session":
 
 def resume_session(session_id: SessionID) -> "Session":
     return ConnectionInstance.instance().resume_session(session_id)
+
+
+def list_applications_page(paging: Optional[PageRequest] = None, *, state: Optional[ApplicationState] = None, names: Optional[Iterable[str]] = None) -> Page[Application]:
+    """Read one bounded applications page using the default connection."""
+    return ConnectionInstance.instance().list_applications_page(paging, state=state, names=names)
+
+
+def iter_applications_pages(paging: Optional[PageRequest] = None, *, state: Optional[ApplicationState] = None, names: Optional[Iterable[str]] = None):
+    """Lazily fetch applications pages using the default connection."""
+    yield from ConnectionInstance.instance().iter_applications_pages(paging, state=state, names=names)
+
+
+def list_sessions_page(paging: Optional[PageRequest] = None, *, state: Optional[SessionState] = None, ids: Optional[Iterable[SessionID]] = None, application: Optional[str] = None) -> Page["Session"]:
+    """Read one bounded sessions page using the default connection."""
+    return ConnectionInstance.instance().list_sessions_page(paging, state=state, ids=ids, application=application)
+
+
+def iter_sessions_pages(paging: Optional[PageRequest] = None, *, state: Optional[SessionState] = None, ids: Optional[Iterable[SessionID]] = None, application: Optional[str] = None):
+    """Lazily fetch sessions pages using the default connection."""
+    yield from ConnectionInstance.instance().iter_sessions_pages(paging, state=state, ids=ids, application=application)
+
+
+def list_nodes_page(paging: Optional[PageRequest] = None, *, state: Optional[int] = None, names: Optional[Iterable[str]] = None) -> Page[Any]:
+    """Read one bounded nodes page using the default connection."""
+    return ConnectionInstance.instance().list_nodes_page(paging, state=state, names=names)
+
+
+def iter_nodes_pages(paging: Optional[PageRequest] = None, *, state: Optional[int] = None, names: Optional[Iterable[str]] = None):
+    """Lazily fetch nodes pages using the default connection."""
+    yield from ConnectionInstance.instance().iter_nodes_pages(paging, state=state, names=names)
+
+
+def list_executors_page(paging: Optional[PageRequest] = None, *, state: Optional[int] = None, application: Optional[str] = None, node: Optional[str] = None, session_id: Optional[str] = None, ids: Optional[Iterable[str]] = None) -> Page[Any]:
+    """Read one bounded executors page using the default connection."""
+    return ConnectionInstance.instance().list_executors_page(paging, state=state, application=application, node=node, session_id=session_id, ids=ids)
+
+
+def iter_executors_pages(paging: Optional[PageRequest] = None, *, state: Optional[int] = None, application: Optional[str] = None, node: Optional[str] = None, session_id: Optional[str] = None, ids: Optional[Iterable[str]] = None):
+    """Lazily fetch executors pages using the default connection."""
+    yield from ConnectionInstance.instance().iter_executors_pages(paging, state=state, application=application, node=node, session_id=session_id, ids=ids)
+
+
+def list_tasks_page(session_id: SessionID, paging: Optional[PageRequest] = None, *, state: Optional[TaskState] = None, ids: Optional[Iterable[TaskID]] = None, include_payloads: bool = False) -> Page[Task]:
+    """Read one bounded tasks page using the default connection."""
+    return ConnectionInstance.instance().list_tasks_page(session_id, paging, state=state, ids=ids, include_payloads=include_payloads)
+
+
+def iter_tasks_pages(session_id: SessionID, paging: Optional[PageRequest] = None, *, state: Optional[TaskState] = None, ids: Optional[Iterable[TaskID]] = None, include_payloads: bool = False):
+    """Lazily fetch tasks pages using the default connection."""
+    yield from ConnectionInstance.instance().iter_tasks_pages(session_id, paging, state=state, ids=ids, include_payloads=include_payloads)
 
 
 class ConnectionInstance:
@@ -287,6 +342,87 @@ class Connection:
     def resume_session(self, session_id: SessionID) -> "Session":
         return self._session(self._call(self._aio.resume_session(session_id)))
 
+    def list_applications_page(self, paging: Optional[PageRequest] = None, *, state: Optional[ApplicationState] = None, names: Optional[Iterable[str]] = None) -> Page[Application]:
+        """Read one bounded applications page."""
+        return self._call(self._aio.list_applications_page(paging, state=state, names=names))
+
+    def iter_applications_pages(self, paging: Optional[PageRequest] = None, *, state: Optional[ApplicationState] = None, names: Optional[Iterable[str]] = None):
+        """Lazily fetch applications pages, retaining filters and ordering."""
+        names = tuple(names) if names is not None else None
+        query = paging or PageRequest()
+        while True:
+            page = self.list_applications_page(query, state=state, names=names)
+            yield page
+            current = query.page_number or 1
+            if current >= page.paging.total_pages:
+                return
+            query = replace(query, page_number=current + 1)
+
+    def list_sessions_page(self, paging: Optional[PageRequest] = None, *, state: Optional[SessionState] = None, ids: Optional[Iterable[SessionID]] = None, application: Optional[str] = None) -> Page["Session"]:
+        """Read one bounded sessions page."""
+        page = self._call(self._aio.list_sessions_page(paging, state=state, ids=ids, application=application))
+        return Page([self._session(item) for item in page.items], page.paging)
+
+    def iter_sessions_pages(self, paging: Optional[PageRequest] = None, *, state: Optional[SessionState] = None, ids: Optional[Iterable[SessionID]] = None, application: Optional[str] = None):
+        """Lazily fetch sessions pages, retaining filters and ordering."""
+        ids = tuple(ids) if ids is not None else None
+        query = paging or PageRequest()
+        while True:
+            page = self.list_sessions_page(query, state=state, ids=ids, application=application)
+            yield page
+            current = query.page_number or 1
+            if current >= page.paging.total_pages:
+                return
+            query = replace(query, page_number=current + 1)
+
+    def list_nodes_page(self, paging: Optional[PageRequest] = None, *, state: Optional[int] = None, names: Optional[Iterable[str]] = None) -> Page[Any]:
+        """Read one bounded nodes page."""
+        return self._call(self._aio.list_nodes_page(paging, state=state, names=names))
+
+    def iter_nodes_pages(self, paging: Optional[PageRequest] = None, *, state: Optional[int] = None, names: Optional[Iterable[str]] = None):
+        """Lazily fetch nodes pages, retaining filters and ordering."""
+        names = tuple(names) if names is not None else None
+        query = paging or PageRequest()
+        while True:
+            page = self.list_nodes_page(query, state=state, names=names)
+            yield page
+            current = query.page_number or 1
+            if current >= page.paging.total_pages:
+                return
+            query = replace(query, page_number=current + 1)
+
+    def list_executors_page(self, paging: Optional[PageRequest] = None, *, state: Optional[int] = None, application: Optional[str] = None, node: Optional[str] = None, session_id: Optional[str] = None, ids: Optional[Iterable[str]] = None) -> Page[Any]:
+        """Read one bounded executors page."""
+        return self._call(self._aio.list_executors_page(paging, state=state, application=application, node=node, session_id=session_id, ids=ids))
+
+    def iter_executors_pages(self, paging: Optional[PageRequest] = None, *, state: Optional[int] = None, application: Optional[str] = None, node: Optional[str] = None, session_id: Optional[str] = None, ids: Optional[Iterable[str]] = None):
+        """Lazily fetch executors pages, retaining filters and ordering."""
+        ids = tuple(ids) if ids is not None else None
+        query = paging or PageRequest()
+        while True:
+            page = self.list_executors_page(query, state=state, application=application, node=node, session_id=session_id, ids=ids)
+            yield page
+            current = query.page_number or 1
+            if current >= page.paging.total_pages:
+                return
+            query = replace(query, page_number=current + 1)
+
+    def list_tasks_page(self, session_id: SessionID, paging: Optional[PageRequest] = None, *, state: Optional[TaskState] = None, ids: Optional[Iterable[TaskID]] = None, include_payloads: bool = False) -> Page[Task]:
+        """Read one bounded tasks page."""
+        return self._call(self._aio.list_tasks_page(session_id, paging, state=state, ids=ids, include_payloads=include_payloads))
+
+    def iter_tasks_pages(self, session_id: SessionID, paging: Optional[PageRequest] = None, *, state: Optional[TaskState] = None, ids: Optional[Iterable[TaskID]] = None, include_payloads: bool = False):
+        """Lazily fetch tasks pages, retaining filters and ordering."""
+        ids = tuple(ids) if ids is not None else None
+        query = paging or PageRequest()
+        while True:
+            page = self.list_tasks_page(session_id, query, state=state, ids=ids, include_payloads=include_payloads)
+            yield page
+            current = query.page_number or 1
+            if current >= page.paging.total_pages:
+                return
+            query = replace(query, page_number=current + 1)
+
 
 class Session:
     """Blocking facade for one aio session handle."""
@@ -312,6 +448,14 @@ class Session:
             return self._aio.list_tasks()
 
         return TaskIterator(self.connection._bridge, self.connection._call(start()))
+
+    def list_tasks_page(self, paging: Optional[PageRequest] = None, *, state: Optional[TaskState] = None, ids: Optional[Iterable[TaskID]] = None, include_payloads: bool = False) -> Page[Task]:
+        """Read one bounded page of this session's tasks."""
+        return self.connection.list_tasks_page(self.id, paging, state=state, ids=ids, include_payloads=include_payloads)
+
+    def iter_tasks_pages(self, paging: Optional[PageRequest] = None, *, state: Optional[TaskState] = None, ids: Optional[Iterable[TaskID]] = None, include_payloads: bool = False):
+        """Lazily fetch this session's task pages."""
+        return self.connection.iter_tasks_pages(self.id, paging, state=state, ids=ids, include_payloads=include_payloads)
 
     def watch_task(self, task_id: TaskID, timeout: Optional[float] = None) -> "TaskWatcher":
         async def start():

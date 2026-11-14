@@ -105,7 +105,10 @@ impl FrontendLivenessProvider {
 impl LivenessProvider for FrontendLivenessProvider {
     /// Fetch unfiltered application and session lists, failing closed if either RPC or validation fails.
     async fn snapshot(&mut self) -> Result<LivenessSnapshot, FlameError> {
-        let mut request = Request::new(ListApplicationsRequest { state: None });
+        let mut request = Request::new(ListApplicationsRequest {
+            state: None,
+            ..Default::default()
+        });
         request.set_timeout(LIST_TIMEOUT);
         let applications = validate_applications(
             self.client

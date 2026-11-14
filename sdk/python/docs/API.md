@@ -366,3 +366,52 @@ try:
 except flamepy.FlameError as exc:
     print(exc.code, exc.message)
 ```
+
+## Paged resource lists
+
+Existing `list_applications`, `list_sessions`, `list_nodes`, `list_executors`, and
+`Session.list_tasks` retain their return types and list all matching records.
+Use the corresponding `Connection.list_*_page` methods for bounded queries:
+
+```python
+from flamepy import PageRequest, SessionState
+
+page = connection.list_sessions_page(
+    PageRequest(page_size=100, order_by="creation_time desc"),
+    state=SessionState.OPEN,
+    application="trainer",
+)
+for session in page.items:
+    print(session.id)
+print(page.paging.total_count, page.paging.state_counts)
+```
+
+`PageRequest()` selects 100 records; sizes above 1000 or below zero are rejected.
+`page_number` is one-based; zero selects page 1 and negative numbers are rejected.
+`PageInfo` contains the effective `page_number`, `page_size`, `total_pages`,
+filtered `total_count`, overall `resource_count`, `state_counts`, and
+resource-specific aggregate `totals`. Pages describe live data rather than a
+frozen snapshot: concurrent insertions or deletions can shift later pages.
+
+`iter_applications_pages`, `iter_sessions_pages`, `iter_nodes_pages`,
+`iter_executors_pages`, and `iter_tasks_pages` fetch lazily. They preserve the
+query and filters while incrementing page numbers and stop after the final page:
+
+```python
+for page in connection.iter_tasks_pages(session.id, PageRequest(page_size=200)):
+    for task in page.items:
+        print(task.id, task.state)
+```
+
+Applications and nodes accept `state` and `names`; sessions accept `state`, `ids`,
+and `application`; executors accept `state`, `ids`, `application`, `node`, and
+`session_id`. Tasks accept `state`, numeric task `ids`, and `include_payloads`.
+Task pages omit input, output, affinity, and events by default; pass
+`include_payloads=True` when these values are required. Session handles expose
+`list_tasks_page` and `iter_tasks_pages` conveniences.
+
+The same methods exist on `flamepy.core.aio.Connection` and asynchronous session
+handles. Await individual page methods and use `async for` for page iterators.
+Paged methods reject servers that do not support pagination. Task pages read
+page information from the initial `flame-page-bin` gRPC metadata before consuming
+the existing task stream, including when the page is empty.

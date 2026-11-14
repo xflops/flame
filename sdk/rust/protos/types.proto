@@ -9,6 +9,29 @@ message Metadata {
   string name = 2;
 }
 
+// Optional list paging. Omitting this message preserves legacy full-list behavior.
+message PageRequest {
+  // 0 selects 100; valid explicit sizes are 1..1000.
+  int32 page_size = 1;
+  // One-based page number; 0 selects the first page. Negative values are invalid.
+  int64 page_number = 2;
+  // Immutable sort field with optional "asc" or "desc". See the API guide.
+  string order_by = 4;
+}
+
+// Counts apply before page selection. Resource counts ignore table filters.
+message PageInfo {
+  int64 page_number = 1;
+  uint64 total_count = 2;
+  uint64 resource_count = 3;
+  // State names match the corresponding protobuf enum names.
+  map<string, uint64> state_counts = 4;
+  // Resource-specific aggregates: session running_tasks; node cpu/memory/gpu.
+  map<string, uint64> totals = 5;
+  int32 page_size = 6;
+  uint64 total_pages = 7;
+}
+
 enum SessionState {
   Open = 0;
   Closed = 1;
@@ -183,14 +206,17 @@ message Executor {
 
 message ExecutorList {
   repeated Executor executors = 1;
+  PageInfo paging = 2;
 }
 
 message SessionList {
   repeated Session sessions = 1;
+  PageInfo paging = 2;
 }
 
 message ApplicationList {
   repeated Application applications = 1;
+  PageInfo paging = 2;
 }
 
 message ResourceRequirement {
@@ -268,6 +294,7 @@ message Node {
 // NodeList contains a list of nodes.
 message NodeList {
   repeated Node nodes = 1;
+  PageInfo paging = 2;
 }
 
 message Result {

@@ -146,7 +146,10 @@ impl tonic::server::UnaryService<rpc::ListNodesRequest> for ListNodes {
             ..Default::default()
         })
         .collect();
-        std::future::ready(Ok(tonic::Response::new(rpc::NodeList { nodes })))
+        std::future::ready(Ok(tonic::Response::new(rpc::NodeList {
+            nodes,
+            ..Default::default()
+        })))
     }
 }
 

@@ -15,12 +15,14 @@ mod executor;
 mod filters;
 mod from_rpc;
 mod node_info;
+mod pagination;
 mod session;
 mod to_rpc;
 mod types;
 
 pub use executor::{Executor, ExecutorPtr};
 pub use filters::*;
+pub use pagination::*;
 pub use types::*;
 
 #[cfg(test)]

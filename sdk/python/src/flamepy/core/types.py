@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Generic, List, Optional, Set, TypeVar
 
 import yaml
 
@@ -111,6 +111,49 @@ class FlameError(Exception):
         self.code = code
         self.message = message
         super().__init__(f"{message} (code: {code})")
+
+
+DEFAULT_PAGE_SIZE = 100
+MAX_PAGE_SIZE = 1000
+_PageItem = TypeVar("_PageItem")
+
+
+@dataclass(frozen=True)
+class PageRequest:
+    """An explicit bounded list query; zero selects the server's default size."""
+
+    page_size: int = 0
+    page_number: int = 0
+    order_by: str = ""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.page_size, bool) or not isinstance(self.page_size, int) or not 0 <= self.page_size <= MAX_PAGE_SIZE:
+            raise FlameError(FlameErrorCode.INVALID_ARGUMENT, f"page_size must be an integer between 0 and {MAX_PAGE_SIZE}")
+        if isinstance(self.page_number, bool) or not isinstance(self.page_number, int) or not 0 <= self.page_number <= 2**63 - 1:
+            raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "page_number must be a nonnegative signed 64-bit integer")
+        if not isinstance(self.order_by, str):
+            raise FlameError(FlameErrorCode.INVALID_ARGUMENT, "order_by must be a string")
+
+
+@dataclass(frozen=True)
+class PageInfo:
+    """Effective page settings and filtered/overall counts for one query."""
+
+    page_number: int = 0
+    page_size: int = 0
+    total_pages: int = 0
+    total_count: int = 0
+    resource_count: int = 0
+    state_counts: Dict[str, int] = field(default_factory=dict)
+    totals: Dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class Page(Generic[_PageItem]):
+    """One bounded page; counts describe the resource rather than this item list."""
+
+    items: List[_PageItem]
+    paging: PageInfo
 
 
 @dataclass

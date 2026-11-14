@@ -792,6 +792,7 @@ mod tests {
     fn application_filter_maps_rpc_state() {
         let filter = ApplicationFilter::try_from(rpc::ListApplicationsRequest {
             state: Some(rpc::ApplicationState::Disabled as i32),
+            ..Default::default()
         })
         .unwrap();
 
@@ -800,9 +801,11 @@ mod tests {
 
     #[test]
     fn application_filter_rejects_unknown_rpc_state() {
-        assert!(
-            ApplicationFilter::try_from(rpc::ListApplicationsRequest { state: Some(99) }).is_err()
-        );
+        assert!(ApplicationFilter::try_from(rpc::ListApplicationsRequest {
+            state: Some(99),
+            ..Default::default()
+        })
+        .is_err());
     }
 
     #[test]
@@ -811,6 +814,7 @@ mod tests {
             application: Some("test-app".to_string()),
             state: Some(rpc::SessionState::Open as i32),
             ids: vec![],
+            ..Default::default()
         })
         .unwrap();
 
@@ -825,6 +829,7 @@ mod tests {
             application: None,
             state: None,
             ids: vec!["ssn-1".to_string(), "ssn-2".to_string()],
+            ..Default::default()
         })
         .unwrap();
 
@@ -840,6 +845,7 @@ mod tests {
             application: None,
             state: Some(99),
             ids: vec![],
+            ..Default::default()
         })
         .is_err());
     }

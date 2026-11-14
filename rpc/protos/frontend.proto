@@ -40,6 +40,8 @@ service Frontend {
 
   rpc GetTask (GetTaskRequest) returns (Task) {}
   rpc WatchTasks (stream WatchTaskRequest) returns (stream Task) {}
+  // Paged calls return encoded PageInfo in initial metadata "flame-page-bin".
+  // This includes empty pages; no synthetic Task is added to the stream.
   rpc ListTasks (ListTasksRequest) returns (stream Task) {}
 }
 
@@ -63,15 +65,24 @@ message GetApplicationRequest {
 
 message ListApplicationsRequest {
   optional ApplicationState state = 1;
+  PageRequest paging = 2;
+  repeated string names = 3;
 }
 
 message ListExecutorsRequest {
-  
+  PageRequest paging = 1;
+  optional ExecutorState state = 2;
+  optional string application = 3;
+  optional string node = 4;
+  optional string session_id = 5;
+  repeated string ids = 6;
 }
 
-// ListNodesRequest is the request for listing all registered nodes.
+// ListNodesRequest lists registered nodes, optionally in bounded pages.
 message ListNodesRequest {
-  // No pagination for now.
+  PageRequest paging = 1;
+  optional NodeState state = 2;
+  repeated string names = 3;
 }
 
 // GetNodeRequest is the request for getting a specific node by name.
@@ -124,6 +135,7 @@ message ListSessionsRequest {
   optional SessionState state = 2;
   // Only these sessions; an empty list means no filter on ids.
   repeated string ids = 3;
+  PageRequest paging = 4;
 }
 
 message CreateTaskRequest {
@@ -142,4 +154,9 @@ message WatchTaskRequest {
 
 message ListTasksRequest {
   string session_id = 1;
+  PageRequest paging = 2;
+  optional TaskState state = 3;
+  repeated int64 ids = 4;
+  // Paged calls omit input/output/affinity by default. Legacy calls are unchanged.
+  bool include_payloads = 5;
 }

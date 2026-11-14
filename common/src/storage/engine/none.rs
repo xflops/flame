@@ -34,6 +34,11 @@ use crate::apis::{ApplicationFilter, Executor, TaskFilter};
 use crate::FlameError;
 
 use super::{Engine, EnginePtr};
+use crate::apis::{SessionPageFilter, TaskPageFilter};
+use crate::storage::pagination::{
+    session_matches, session_metadata, task_matches, task_metadata, PageCollector, PageQuery,
+    PageResult,
+};
 
 /// Session metadata and task history share one lock for atomic lifecycle changes.
 struct SessionEntry {
@@ -418,6 +423,86 @@ impl Engine for NoneEngine {
             }
         }
         Ok(sessions)
+    }
+
+    async fn page_sessions(
+        &self,
+        query: &PageQuery,
+        filter: &SessionPageFilter,
+    ) -> Result<PageResult<Session>, FlameError> {
+        let entries = {
+            let directory = lock_ptr!(self.sessions)?;
+            directory
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut selected = PageCollector::new(&["Open", "Closed", "Suspending", "Suspended"]);
+        for (id, shared) in entries {
+            let entry = lock_ptr!(shared)?;
+            if self.validate_session(&id, &shared).is_err() {
+                continue;
+            }
+            let item = &entry.metadata;
+            selected.observe(item.status.state);
+            if session_matches(filter, &item.id, &item.application, item.status.state) {
+                selected.offer(
+                    query,
+                    query.text_key(&item.id, item.creation_time.timestamp()),
+                    || (id.clone(), shared.clone()),
+                );
+            }
+        }
+        let page = selected.finish(query);
+        let mut items = Vec::with_capacity(page.items.len());
+        for (id, shared) in page.items {
+            let entry = lock_ptr!(shared)?;
+            if self.validate_session(&id, &shared).is_ok() {
+                items.push(session_metadata(&entry.metadata));
+            }
+        }
+        Ok(PageResult {
+            items,
+            info: page.info,
+        })
+    }
+
+    async fn page_tasks(
+        &self,
+        query: &PageQuery,
+        filter: &TaskPageFilter,
+    ) -> Result<PageResult<Task>, FlameError> {
+        self.with_session(&filter.session_id, |entry| {
+            let mut selected =
+                PageCollector::new(&["Pending", "Running", "Succeed", "Failed", "Cancelled"]);
+            for item in entry.tasks.values() {
+                selected.observe(item.state);
+                if task_matches(filter, item.id, item.state) {
+                    selected.offer(
+                        query,
+                        query.task_key(item.id, item.creation_time.timestamp()),
+                        || item.id,
+                    );
+                }
+            }
+            let page = selected.finish(query);
+            let items = page
+                .items
+                .into_iter()
+                .map(|id| {
+                    let task = &entry.tasks[&id];
+                    if filter.include_payloads {
+                        task.clone()
+                    } else {
+                        task_metadata(task)
+                    }
+                })
+                .collect();
+            Ok(PageResult {
+                items,
+                info: page.info,
+            })
+        })
     }
 
     // ========== Task operations ==========

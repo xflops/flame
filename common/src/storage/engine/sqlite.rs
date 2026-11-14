@@ -47,7 +47,61 @@ use crate::storage::engine::types::{
     AppSchemaDao, ApplicationDao, ExecutorDao, NodeDao, SessionDao, TaskDao,
 };
 
+use crate::apis::{PageInfo, SessionPageFilter, TaskPageFilter};
 use crate::storage::engine::{Engine, EnginePtr};
+use crate::storage::pagination::{PageQuery, PageResult};
+
+fn page_error(error: sqlx::Error) -> FlameError {
+    FlameError::Storage(error.to_string())
+}
+
+fn session_where(builder: &mut QueryBuilder<Sqlite>, filter: &SessionPageFilter) {
+    builder.push(" WHERE 1=1");
+    if let Some(state) = filter.state {
+        builder.push(" AND state=").push_bind(state as i32);
+    }
+    if let Some(app) = &filter.application {
+        builder.push(" AND application=").push_bind(app.clone());
+    }
+    if !filter.ids.is_empty() {
+        builder.push(" AND id IN (");
+        let mut values = builder.separated(",");
+        for id in &filter.ids {
+            values.push_bind(id.clone());
+        }
+        values.push_unseparated(")");
+    }
+}
+fn task_where(builder: &mut QueryBuilder<Sqlite>, filter: &TaskPageFilter) {
+    builder
+        .push(" WHERE ssn_id=")
+        .push_bind(filter.session_id.clone());
+    if let Some(state) = filter.state {
+        builder.push(" AND state=").push_bind(state as i32);
+    }
+    if !filter.ids.is_empty() {
+        builder.push(" AND id IN (");
+        let mut values = builder.separated(",");
+        for id in &filter.ids {
+            values.push_bind(*id);
+        }
+        values.push_unseparated(")");
+    }
+}
+fn page_order(builder: &mut QueryBuilder<Sqlite>, query: &PageQuery) {
+    let direction = if query.descending { " DESC" } else { " ASC" };
+    builder.push(" ORDER BY ");
+    if query.creation {
+        builder.push("creation_time").push(direction).push(",");
+    }
+    builder
+        .push("id")
+        .push(direction)
+        .push(" LIMIT ")
+        .push_bind(query.limit as i64)
+        .push(" OFFSET ")
+        .push_bind(query.offset);
+}
 
 const SQLITE_SQL: &str = "migrations/sqlite";
 
@@ -907,6 +961,159 @@ impl Engine for SqliteEngine {
             .map(Session::try_from)
             .filter_map(Result::ok)
             .collect())
+    }
+
+    async fn page_sessions(
+        &self,
+        query: &PageQuery,
+        filter: &SessionPageFilter,
+    ) -> Result<PageResult<Session>, FlameError> {
+        let mut tx = self.pool.begin().await.map_err(page_error)?;
+        let mut info = PageInfo::default();
+        for state in [
+            SessionState::Open,
+            SessionState::Closed,
+            SessionState::Suspending,
+            SessionState::Suspended,
+        ] {
+            info.state_counts.insert(state.to_string(), 0);
+        }
+        let states: Vec<(i32, i64)> =
+            sqlx::query_as("SELECT state,COUNT(*) FROM sessions GROUP BY state")
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(page_error)?;
+        for (state, count) in states {
+            info.resource_count += count as u64;
+            info.state_counts
+                .insert(SessionState::try_from(state)?.to_string(), count as u64);
+        }
+        let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM sessions");
+        session_where(&mut count, filter);
+        let (total,): (i64,) = count
+            .build_query_as()
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(page_error)?;
+        info.total_count = total as u64;
+        let mut select = QueryBuilder::<Sqlite>::new("SELECT * FROM sessions");
+        session_where(&mut select, filter);
+        page_order(&mut select, query);
+        let rows: Vec<SessionDao> = select
+            .build_query_as()
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(page_error)?;
+        let mut items = rows
+            .into_iter()
+            .map(Session::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        // Count the selected sessions in one grouped metadata query.
+        if !items.is_empty() {
+            let mut counts = QueryBuilder::<Sqlite>::new(
+                "SELECT ssn_id,state,COUNT(*) FROM tasks WHERE ssn_id IN (",
+            );
+            {
+                let mut ids = counts.separated(",");
+                for item in &items {
+                    ids.push_bind(item.id.clone());
+                }
+                ids.push_unseparated(") GROUP BY ssn_id,state");
+            }
+            let groups: Vec<(String, i32, i64)> = counts
+                .build_query_as()
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(page_error)?;
+            let mut by_session = std::collections::HashMap::<String, TaskCounts>::new();
+            for (id, state, count) in groups {
+                let counts = by_session.entry(id).or_default();
+                match TaskState::try_from(state)? {
+                    TaskState::Pending => counts.pending = count as u64,
+                    TaskState::Running => counts.running = count as u64,
+                    TaskState::Succeed => counts.succeed = count as u64,
+                    TaskState::Failed => counts.failed = count as u64,
+                    TaskState::Cancelled => counts.cancelled = count as u64,
+                }
+            }
+            for item in &mut items {
+                item.task_counts = by_session.remove(&item.id).unwrap_or_default();
+            }
+        }
+        tx.commit().await.map_err(page_error)?;
+        Ok(PageResult { items, info })
+    }
+
+    async fn page_tasks(
+        &self,
+        query: &PageQuery,
+        filter: &TaskPageFilter,
+    ) -> Result<PageResult<Task>, FlameError> {
+        let mut tx = self.pool.begin().await.map_err(page_error)?;
+        let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM sessions WHERE id=?")
+            .bind(&filter.session_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(page_error)?;
+        if exists.is_none() {
+            return Err(FlameError::NotFound(format!(
+                "session <{}>",
+                filter.session_id
+            )));
+        }
+        let mut info = PageInfo::default();
+        for state in [
+            TaskState::Pending,
+            TaskState::Running,
+            TaskState::Succeed,
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ] {
+            info.state_counts.insert(state.to_string(), 0);
+        }
+        let states: Vec<(i32, i64)> =
+            sqlx::query_as("SELECT state,COUNT(*) FROM tasks WHERE ssn_id=? GROUP BY state")
+                .bind(&filter.session_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(page_error)?;
+        for (state, count) in states {
+            info.resource_count += count as u64;
+            info.state_counts
+                .insert(TaskState::try_from(state)?.to_string(), count as u64);
+        }
+        let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM tasks");
+        task_where(&mut count, filter);
+        let (total,): (i64,) = count
+            .build_query_as()
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(page_error)?;
+        info.total_count = total as u64;
+        let mut select=QueryBuilder::<Sqlite>::new("SELECT id,ssn_id,version,NULL AS input,NULL AS output,NULL AS affinity,creation_time,completion_time,state FROM tasks");
+        task_where(&mut select, filter);
+        page_order(&mut select, query);
+        let rows: Vec<TaskDao> = select
+            .build_query_as()
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(page_error)?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let row = if filter.include_payloads {
+                sqlx::query_as("SELECT * FROM tasks WHERE ssn_id=? AND id=?")
+                    .bind(&filter.session_id)
+                    .bind(row.id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(page_error)?
+            } else {
+                row
+            };
+            items.push(Task::try_from(row)?);
+        }
+        tx.commit().await.map_err(page_error)?;
+        Ok(PageResult { items, info })
     }
 
     async fn create_task(

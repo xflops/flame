@@ -15,6 +15,7 @@ Flame exposes three gRPC services:
 ## Quick Links
 
 - [Type Definitions](types.md) - Common message types used across all services
+- [List Pagination](pagination.md) - Numbered pages, filters and totals
 - [Frontend Service](frontend.md) - For client SDK developers
 - [Backend Service](backend.md) - For executor/node developers
 - [Instance Service](shim.md) - For application shim developers

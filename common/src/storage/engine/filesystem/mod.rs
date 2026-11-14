@@ -37,6 +37,11 @@ limitations under the License.
 //! - **No file locks**: Relies on in-memory locks in the Session Manager
 //! - **CRC32 checksums**: Detects corruption on read
 
+use crate::apis::{SessionPageFilter, TaskPageFilter};
+use crate::storage::pagination::{
+    session_matches, task_matches, PageCollector, PageQuery, PageResult,
+};
+
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::FileExt;
@@ -1395,6 +1400,101 @@ impl Engine for FilesystemEngine {
             }
         }
         Ok(sessions)
+    }
+
+    async fn page_sessions(
+        &self,
+        query: &PageQuery,
+        filter: &SessionPageFilter,
+    ) -> Result<PageResult<Session>, FlameError> {
+        let entries = self
+            .sessions
+            .read()
+            .map_err(poisoned)?
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.clone()))
+            .collect::<Vec<_>>();
+        let mut selected = PageCollector::new(&["Open", "Closed", "Suspending", "Suspended"]);
+        for (id, shared) in entries {
+            let entry = read_async!(shared);
+            if validate_entry(&self.sessions, &id, &shared).is_err() {
+                continue;
+            }
+            let meta = &entry.metadata;
+            let state = SessionState::try_from(meta.state)?;
+            selected.observe(state);
+            if session_matches(filter, &meta.id, &meta.application, state) {
+                selected.offer(query, query.text_key(&meta.id, meta.creation_time), || id);
+            }
+        }
+        let page = selected.finish(query);
+        let mut items = Vec::with_capacity(page.items.len());
+        for id in page.items {
+            let shared = match self.session_entry(&id) {
+                Ok(shared) => shared,
+                Err(FlameError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let entry = read_async!(shared);
+            if validate_entry(&self.sessions, &id, &shared).is_err() {
+                continue;
+            }
+            let mut item = self.session_from_metadata(&entry.metadata)?;
+            let count = {
+                let _commit = entry.commit.lock().await;
+                self._count_task(&entry, &TaskFilter::by_session(&id))?
+            };
+            let mut counts = TaskCounts::default();
+            for task in 1..=count {
+                let meta = self.read_task_metadata(&entry, task as TaskID)?;
+                counts.increment(TaskState::try_from(meta.state as i32)?);
+            }
+            item.task_counts = counts;
+            items.push(item);
+        }
+        Ok(PageResult {
+            items,
+            info: page.info,
+        })
+    }
+
+    async fn page_tasks(
+        &self,
+        query: &PageQuery,
+        filter: &TaskPageFilter,
+    ) -> Result<PageResult<Task>, FlameError> {
+        lock_ssn!(self, &filter.session_id, entry);
+        let count = {
+            let _commit = entry.commit.lock().await;
+            self._count_task(&entry, &TaskFilter::by_session(&filter.session_id))?
+        };
+        let mut selected =
+            PageCollector::new(&["Pending", "Running", "Succeed", "Failed", "Cancelled"]);
+        for id in 1..=count {
+            let meta = self.read_task_metadata(&entry, id as TaskID)?;
+            let state = TaskState::try_from(meta.state as i32)?;
+            selected.observe(state);
+            if task_matches(filter, meta.id as TaskID, state) {
+                selected.offer(
+                    query,
+                    query.task_key(meta.id as TaskID, meta.creation_time),
+                    || meta,
+                );
+            }
+        }
+        let page = selected.finish(query);
+        let mut items = Vec::with_capacity(page.items.len());
+        for meta in page.items {
+            items.push(if filter.include_payloads {
+                self.task_from_metadata(&entry, &meta)?
+            } else {
+                Self::task_with_data(&filter.session_id, &meta, None, None, Default::default())?
+            });
+        }
+        Ok(PageResult {
+            items,
+            info: page.info,
+        })
     }
 
     async fn create_task(

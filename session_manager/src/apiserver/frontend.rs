@@ -17,6 +17,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use common::apis::{ApplicationAttributes, SessionAttributes, Signal};
 use futures::Stream;
+use prost::Message;
 use serde_json::Value;
 use stdng::trace_fn;
 use tokio::sync::mpsc;
@@ -40,6 +41,52 @@ use common::apis::ResourceRequirement;
 use common::{apis, FlameError};
 
 use crate::apiserver::Flame;
+
+/// Translate transport paging fields into the storage query contract.
+fn page_request(request: rpc::PageRequest) -> apis::PageRequest {
+    apis::PageRequest {
+        page_size: request.page_size,
+        page_number: request.page_number,
+        order_by: request.order_by,
+    }
+}
+
+/// Preserve collection summaries across the transport boundary.
+fn page_info(info: apis::PageInfo) -> rpc::PageInfo {
+    rpc::PageInfo {
+        page_number: info.page_number,
+        page_size: info.page_size,
+        total_pages: info.total_pages,
+        total_count: info.total_count,
+        resource_count: info.resource_count,
+        state_counts: info.state_counts.into_iter().collect(),
+        totals: info.totals.into_iter().collect(),
+    }
+}
+
+fn node_state(value: i32) -> Result<apis::NodeState, Status> {
+    match rpc::NodeState::try_from(value)
+        .map_err(|_| Status::invalid_argument("invalid node state"))?
+    {
+        rpc::NodeState::Unknown => Ok(apis::NodeState::Unknown),
+        rpc::NodeState::Ready => Ok(apis::NodeState::Ready),
+        rpc::NodeState::NotReady => Ok(apis::NodeState::NotReady),
+    }
+}
+
+fn executor_state(value: i32) -> Result<apis::ExecutorState, Status> {
+    match value {
+        0 => Ok(apis::ExecutorState::Unknown),
+        1 => Ok(apis::ExecutorState::Void),
+        2 => Ok(apis::ExecutorState::Idle),
+        3 => Ok(apis::ExecutorState::Binding),
+        4 => Ok(apis::ExecutorState::Bound),
+        5 => Ok(apis::ExecutorState::Unbinding),
+        6 => Ok(apis::ExecutorState::Releasing),
+        7 => Ok(apis::ExecutorState::Released),
+        _ => Err(Status::invalid_argument("invalid executor state")),
+    }
+}
 
 /// Hardcoded safety-net default `resreq` applied when a session spec supplies
 /// no explicit `resreq` AND `cluster.resreq` is unset.
@@ -217,15 +264,38 @@ impl Frontend for Flame {
     ) -> Result<Response<Self::ListTasksStream>, Status> {
         trace_fn!("Frontend::list_tasks");
         let req = req.into_inner();
-        let ssn_id = req
-            .session_id
-            .parse::<apis::SessionID>()
-            .map_err(|_| Status::invalid_argument("invalid session id"))?;
-        let task_list = self
-            .controller
-            .list_tasks(ssn_id)
-            .await
+        let state = req
+            .state
+            .map(apis::TaskState::try_from)
+            .transpose()
             .map_err(Status::from)?;
+        let (task_list, paging) = if let Some(paging) = req.paging {
+            let page = self
+                .controller
+                .page_tasks(
+                    &page_request(paging),
+                    &apis::TaskPageFilter {
+                        session_id: req.session_id,
+                        state,
+                        ids: req.ids,
+                        include_payloads: req.include_payloads,
+                    },
+                )
+                .await
+                .map_err(Status::from)?;
+            (page.items, Some(page_info(page.paging)))
+        } else {
+            let mut tasks = self
+                .controller
+                .list_tasks(req.session_id)
+                .await
+                .map_err(Status::from)?;
+            tasks.retain(|task| {
+                state.is_none_or(|state| task.state == state)
+                    && (req.ids.is_empty() || req.ids.contains(&task.id))
+            });
+            (tasks, None)
+        };
         let (tx, rx) = mpsc::channel(128);
 
         tokio::spawn(async move {
@@ -237,9 +307,14 @@ impl Frontend for Flame {
         });
 
         let output_stream = ReceiverStream::new(rx);
-        Ok(Response::new(
-            Box::pin(output_stream) as Self::ListTasksStream
-        ))
+        let mut response = Response::new(Box::pin(output_stream) as Self::ListTasksStream);
+        if let Some(paging) = paging {
+            response.metadata_mut().insert_bin(
+                "flame-page-bin",
+                tonic::metadata::MetadataValue::from_bytes(&paging.encode_to_vec()),
+            );
+        }
+        Ok(response)
     }
 
     async fn register_application(
@@ -389,37 +464,130 @@ impl Frontend for Flame {
         request: Request<ListApplicationsRequest>,
     ) -> Result<Response<ApplicationList>, Status> {
         trace_fn!("Frontend::list_applications");
-        let filter = crate::model::ApplicationFilter::try_from(request.into_inner())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let app_list = self
+        let request = request.into_inner();
+        let state = request
+            .state
+            .map(apis::ApplicationState::try_from)
+            .transpose()
+            .map_err(Status::from)?;
+        if let Some(paging) = request.paging.clone() {
+            let page = self
+                .controller
+                .page_applications(
+                    &page_request(paging),
+                    &apis::ApplicationPageFilter {
+                        state,
+                        names: request.names,
+                    },
+                )
+                .await
+                .map_err(Status::from)?;
+            return Ok(Response::new(ApplicationList {
+                applications: page.items.iter().map(rpc::Application::from).collect(),
+                paging: Some(page_info(page.paging)),
+            }));
+        }
+        let names = request.names.clone();
+        let filter = crate::model::ApplicationFilter::try_from(request).map_err(Status::from)?;
+        let applications = self
             .controller
             .list_applications(Some(&filter))
             .await
-            .map_err(Status::from)?;
-
-        let applications = app_list.iter().map(rpc::Application::from).collect();
-
-        Ok(Response::new(ApplicationList { applications }))
+            .map_err(Status::from)?
+            .iter()
+            .filter(|app| names.is_empty() || names.contains(&app.name))
+            .map(rpc::Application::from)
+            .collect();
+        Ok(Response::new(ApplicationList {
+            applications,
+            paging: None,
+        }))
     }
 
     async fn list_executors(
         &self,
-        _: tonic::Request<ListExecutorsRequest>,
+        request: Request<ListExecutorsRequest>,
     ) -> Result<Response<ExecutorList>, Status> {
-        trace_fn!("Frontend::list_executors");
-        let executor_list = self.controller.list_executors().map_err(Status::from)?;
-        let executors = executor_list.iter().map(rpc::Executor::from).collect();
-        Ok(Response::new(ExecutorList { executors }))
+        let request = request.into_inner();
+        let filter = apis::ExecutorPageFilter {
+            state: request.state.map(executor_state).transpose()?,
+            application: request.application,
+            node: request.node,
+            session_id: request.session_id,
+            ids: request.ids,
+        };
+        if let Some(paging) = request.paging {
+            let page = self
+                .controller
+                .page_executors(&page_request(paging), &filter)
+                .await
+                .map_err(Status::from)?;
+            return Ok(Response::new(ExecutorList {
+                executors: page.items.iter().map(rpc::Executor::from).collect(),
+                paging: Some(page_info(page.paging)),
+            }));
+        }
+        let executors = self
+            .controller
+            .list_executors()
+            .map_err(Status::from)?
+            .iter()
+            .filter(|item| {
+                filter.state.is_none_or(|state| item.state == state)
+                    && filter
+                        .application
+                        .as_ref()
+                        .is_none_or(|app| &item.application == app)
+                    && filter.node.as_ref().is_none_or(|node| &item.node == node)
+                    && filter
+                        .session_id
+                        .as_ref()
+                        .is_none_or(|id| item.ssn_id.as_ref() == Some(id))
+                    && (filter.ids.is_empty() || filter.ids.contains(&item.id))
+            })
+            .map(rpc::Executor::from)
+            .collect();
+        Ok(Response::new(ExecutorList {
+            executors,
+            paging: None,
+        }))
     }
 
     async fn list_nodes(
         &self,
-        _: tonic::Request<ListNodesRequest>,
+        request: Request<ListNodesRequest>,
     ) -> Result<Response<NodeList>, Status> {
-        trace_fn!("Frontend::list_nodes");
-        let node_list = self.controller.list_nodes().map_err(Status::from)?;
-        let nodes = node_list.iter().map(rpc::Node::from).collect();
-        Ok(Response::new(NodeList { nodes }))
+        let request = request.into_inner();
+        let filter = apis::NodePageFilter {
+            state: request.state.map(node_state).transpose()?,
+            names: request.names,
+        };
+        if let Some(paging) = request.paging {
+            let page = self
+                .controller
+                .page_nodes(&page_request(paging), &filter)
+                .await
+                .map_err(Status::from)?;
+            return Ok(Response::new(NodeList {
+                nodes: page.items.iter().map(rpc::Node::from).collect(),
+                paging: Some(page_info(page.paging)),
+            }));
+        }
+        let nodes = self
+            .controller
+            .list_nodes()
+            .map_err(Status::from)?
+            .iter()
+            .filter(|node| {
+                filter.state.is_none_or(|state| node.state == state)
+                    && (filter.names.is_empty() || filter.names.contains(&node.name))
+            })
+            .map(rpc::Node::from)
+            .collect();
+        Ok(Response::new(NodeList {
+            nodes,
+            paging: None,
+        }))
     }
 
     async fn get_node(
@@ -650,7 +818,30 @@ impl Frontend for Flame {
         request: Request<ListSessionsRequest>,
     ) -> Result<Response<SessionList>, Status> {
         trace_fn!("Frontend::list_sessions");
-        let filter = crate::model::SessionFilter::try_from(request.into_inner())
+        let request = request.into_inner();
+        if let Some(paging) = request.paging.clone() {
+            let page = self
+                .controller
+                .page_sessions(
+                    &page_request(paging),
+                    &apis::SessionPageFilter {
+                        application: request.application,
+                        state: request
+                            .state
+                            .map(apis::SessionState::try_from)
+                            .transpose()
+                            .map_err(Status::from)?,
+                        ids: request.ids,
+                    },
+                )
+                .await
+                .map_err(Status::from)?;
+            return Ok(Response::new(SessionList {
+                sessions: page.items.iter().map(Session::from).collect(),
+                paging: Some(page_info(page.paging)),
+            }));
+        }
+        let filter = crate::model::SessionFilter::try_from(request)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let ssn_list = self
             .controller
@@ -659,7 +850,10 @@ impl Frontend for Flame {
 
         let sessions = ssn_list.iter().map(Session::from).collect();
 
-        Ok(Response::new(SessionList { sessions }))
+        Ok(Response::new(SessionList {
+            sessions,
+            paging: None,
+        }))
     }
 
     async fn create_task(&self, req: Request<CreateTaskRequest>) -> Result<Response<Task>, Status> {
@@ -844,6 +1038,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paged_tasks_keep_stream_shape_and_return_initial_metadata() {
+        for backend in ["none", "sqlite", "fs"] {
+            let directory = tempfile::tempdir().unwrap();
+            let url = match backend {
+                "none" => "none".into(),
+                "sqlite" => format!("sqlite://{}", directory.path().join("page.db").display()),
+                _ => format!("fs://{}", directory.path().join("data").display()),
+            };
+            let (_, controller, session_id) = task_test_controller(url).await;
+            for _ in 0..5 {
+                controller
+                    .create_task(
+                        session_id.clone(),
+                        Some(bytes::Bytes::from_static(b"payload")),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let flame = Flame {
+                controller,
+                cluster_default_resreq: None,
+            };
+            let mut page_number = 1;
+            let mut ids = Vec::new();
+            loop {
+                let response = Frontend::list_tasks(
+                    &flame,
+                    Request::new(ListTasksRequest {
+                        session_id: session_id.clone(),
+                        paging: Some(rpc::PageRequest {
+                            page_size: 2,
+                            page_number,
+                            order_by: "id asc".into(),
+                        }),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+                let info = rpc::PageInfo::decode(
+                    response
+                        .metadata()
+                        .get_bin("flame-page-bin")
+                        .unwrap()
+                        .to_bytes()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(info.total_count, 5, "{backend}");
+                assert_eq!(info.page_number, page_number);
+                assert_eq!(info.page_size, 2);
+                assert_eq!(info.total_pages, 3);
+                assert_eq!(info.resource_count, 5);
+                assert_eq!(info.state_counts.get("Pending"), Some(&5));
+                let mut stream = response.into_inner();
+                let mut length = 0;
+                while let Some(task) = stream.next().await {
+                    let task = task.unwrap();
+                    assert!(task.spec.as_ref().unwrap().input.is_none());
+                    ids.push(task.metadata.unwrap().id.parse::<i64>().unwrap());
+                    length += 1;
+                }
+                assert!(length <= 2);
+                if page_number as u64 >= info.total_pages {
+                    break;
+                }
+                page_number += 1;
+            }
+            assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+            let empty = Frontend::list_tasks(
+                &flame,
+                Request::new(ListTasksRequest {
+                    session_id: session_id.clone(),
+                    ids: vec![999],
+                    paging: Some(rpc::PageRequest::default()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let info = rpc::PageInfo::decode(
+                empty
+                    .metadata()
+                    .get_bin("flame-page-bin")
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(info.total_count, 0);
+            assert_eq!(info.page_number, 1);
+            assert_eq!(info.page_size, 100);
+            assert_eq!(info.total_pages, 0);
+            assert_eq!(info.resource_count, 5);
+            assert!(empty.into_inner().next().await.is_none());
+            for (size, state, page_number) in [
+                (1001, None, 1),
+                (-1, None, 1),
+                (1, Some(99), 1),
+                (1, None, -1),
+                (1000, None, i64::MAX),
+            ] {
+                let result = Frontend::list_tasks(
+                    &flame,
+                    Request::new(ListTasksRequest {
+                        session_id: session_id.clone(),
+                        state,
+                        paging: Some(rpc::PageRequest {
+                            page_size: size,
+                            page_number,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                )
+                .await;
+                assert_eq!(result.err().unwrap().code(), tonic::Code::InvalidArgument);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unary_lists_preserve_paging_presence_and_validate_states() {
+        let (_, controller, _) = task_test_controller("none".into()).await;
+        let flame = Flame {
+            controller,
+            cluster_default_resreq: None,
+        };
+        let legacy = Frontend::list_sessions(&flame, Request::new(ListSessionsRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(legacy.paging.is_none());
+        let page = Frontend::list_sessions(
+            &flame,
+            Request::new(ListSessionsRequest {
+                paging: Some(rpc::PageRequest::default()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(page.paging.unwrap().total_count, 1);
+        for state in [None, Some(99)] {
+            let nodes = Frontend::list_nodes(
+                &flame,
+                Request::new(ListNodesRequest {
+                    state,
+                    paging: Some(rpc::PageRequest::default()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            let executors = Frontend::list_executors(
+                &flame,
+                Request::new(ListExecutorsRequest {
+                    state,
+                    paging: Some(rpc::PageRequest::default()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            if state.is_some() {
+                assert_eq!(nodes.unwrap_err().code(), tonic::Code::InvalidArgument);
+                assert_eq!(executors.unwrap_err().code(), tonic::Code::InvalidArgument);
+            } else {
+                assert_eq!(nodes.unwrap().into_inner().paging.unwrap().total_count, 0);
+                assert_eq!(
+                    executors.unwrap().into_inner().paging.unwrap().total_count,
+                    0
+                );
+            }
+        }
+        let apps = Frontend::list_applications(
+            &flame,
+            Request::new(ListApplicationsRequest {
+                paging: Some(rpc::PageRequest::default()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(apps.paging.is_some());
+    }
+
+    #[tokio::test]
     async fn list_tasks_streams_all_active_tasks_then_finished_history() {
         use common::apis::{TaskResult, TaskState};
 
@@ -885,6 +1268,7 @@ mod tests {
                 &flame,
                 Request::new(ListTasksRequest {
                     session_id: ssn_id.clone(),
+                    ..Default::default()
                 }),
             )
             .await
@@ -941,7 +1325,10 @@ mod tests {
         };
         let mut stream = Frontend::list_tasks(
             &flame,
-            Request::new(ListTasksRequest { session_id: ssn_id }),
+            Request::new(ListTasksRequest {
+                session_id: ssn_id,
+                ..Default::default()
+            }),
         )
         .await
         .unwrap()
@@ -1212,7 +1599,7 @@ mod tests {
         .unwrap()
         .into_inner();
         assert_eq!(result.return_code, 0);
-        let listed = Frontend::list_nodes(&flame, Request::new(ListNodesRequest {}))
+        let listed = Frontend::list_nodes(&flame, Request::new(ListNodesRequest::default()))
             .await
             .unwrap()
             .into_inner();

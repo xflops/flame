@@ -29,6 +29,11 @@ use tonic::transport::Endpoint;
 use tonic::Request;
 use url::Url;
 
+mod pagination;
+pub use pagination::{
+    ApplicationFilter, ExecutorFilter, NodeFilter, Page, PageInfo, PageRequest, TaskFilter,
+};
+
 use self::rpc::frontend_client::FrontendClient as FlameFrontendClient;
 use self::rpc::{
     ApplicationSpec, CloseSessionRequest, CreateSessionRequest, CreateTaskRequest,
@@ -136,6 +141,7 @@ impl SessionFilter {
             application: self.application.clone(),
             state: self.state.map(|state| state as i32),
             ids: self.ids.clone(),
+            ..Default::default()
         }
     }
 }
@@ -1128,7 +1134,10 @@ impl Connection {
     pub async fn list_applications(&self) -> Result<Vec<Application>, FlameError> {
         let mut client = FlameClient::new(self.channel.clone());
         let app_list = client
-            .list_applications(ListApplicationsRequest { state: None })
+            .list_applications(ListApplicationsRequest {
+                state: None,
+                ..Default::default()
+            })
             .await?;
 
         app_list
@@ -1151,7 +1160,9 @@ impl Connection {
 
     pub async fn list_executors(&self) -> Result<Vec<Executor>, FlameError> {
         let mut client = FlameClient::new(self.channel.clone());
-        let executor_list = client.list_executors(ListExecutorsRequest {}).await?;
+        let executor_list = client
+            .list_executors(ListExecutorsRequest::default())
+            .await?;
         let inner = executor_list.into_inner();
         inner
             .executors
@@ -1162,7 +1173,7 @@ impl Connection {
 
     pub async fn list_nodes(&self) -> Result<Vec<Node>, FlameError> {
         let mut client = FlameClient::new(self.channel.clone());
-        let node_list = client.list_nodes(ListNodesRequest {}).await?;
+        let node_list = client.list_nodes(ListNodesRequest::default()).await?;
         Ok(node_list
             .into_inner()
             .nodes
@@ -1349,6 +1360,7 @@ impl Session {
         let task_stream = client
             .list_tasks(Request::new(ListTasksRequest {
                 session_id: self.id.to_string(),
+                ..Default::default()
             }))
             .await?;
 

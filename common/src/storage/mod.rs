@@ -46,6 +46,7 @@ use crate::events::{EventManagerPtr, FsEventManager, MemoryEventManager};
 use crate::storage::engine::EnginePtr;
 
 mod engine;
+mod pagination;
 
 pub type StoragePtr = Arc<Storage>;
 
@@ -1815,3 +1816,6 @@ mod event_lifecycle_tests {
             .is_empty());
     }
 }
+
+#[cfg(test)]
+mod pagination_tests;
