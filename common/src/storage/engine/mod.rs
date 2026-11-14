@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use super::pagination::{PageQuery, PageResult};
 #[cfg(test)]
 use crate::apis::TaskCounts;
 use crate::apis::{
@@ -23,6 +24,7 @@ use crate::apis::{
     TaskOptions, TaskResult, TaskState,
 };
 use crate::apis::{ApplicationFilter, Executor, TaskFilter};
+use crate::apis::{SessionPageFilter, TaskPageFilter};
 use crate::FlameError;
 
 mod filesystem;
@@ -80,6 +82,17 @@ pub trait Engine: Send + Sync + 'static {
     ) -> Result<Session, FlameError>;
     async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError>;
     async fn find_sessions(&self) -> Result<Vec<Session>, FlameError>;
+
+    async fn page_sessions(
+        &self,
+        query: &PageQuery,
+        filter: &SessionPageFilter,
+    ) -> Result<PageResult<Session>, FlameError>;
+    async fn page_tasks(
+        &self,
+        query: &PageQuery,
+        filter: &TaskPageFilter,
+    ) -> Result<PageResult<Task>, FlameError>;
 
     // Task operations
     async fn create_task(

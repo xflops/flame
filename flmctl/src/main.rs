@@ -78,23 +78,7 @@ enum Commands {
         application: Option<String>,
     },
     /// List the objects of Flame
-    List {
-        /// List the applications of Flame
-        #[arg(short, long)]
-        application: bool,
-        /// List the sessions of Flame
-        #[arg(short, long)]
-        session: bool,
-        /// List the executors of Flame
-        #[arg(short, long)]
-        executor: bool,
-        /// List the nodes of Flame
-        #[arg(short, long)]
-        node: bool,
-        /// Output format for the list
-        #[arg(short, long, default_value = "table", value_parser = ["table", "json"])]
-        output_format: String,
-    },
+    List(list::ListOptions),
     /// Close sessions in Flame
     Close {
         /// Comma-separated session ids
@@ -173,23 +157,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let ctx = FlameContext::from_file(cli.config)?;
 
     match &cli.command {
-        Some(Commands::List {
-            application,
-            session,
-            executor,
-            node,
-            output_format,
-        }) => {
-            list::run(
-                &ctx,
-                *application,
-                *session,
-                *executor,
-                *node,
-                output_format,
-            )
-            .await?
-        }
+        Some(Commands::List(options)) => list::run(&ctx, options).await?,
         Some(Commands::Close { session }) => close::run(&ctx, session).await?,
         Some(Commands::Delete { session, node }) => {
             delete::run(&ctx, session.as_deref(), node.as_deref()).await?

@@ -6,7 +6,7 @@ import warnings
 import flamepy.proto.frontend_pb2 as frontend__pb2
 import flamepy.proto.types_pb2 as types__pb2
 
-GRPC_GENERATED_VERSION = '1.85.0'
+GRPC_GENERATED_VERSION = '1.85.1'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -273,7 +273,9 @@ class FrontendServicer:
         raise NotImplementedError('Method not implemented!')
 
     def ListTasks(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Paged calls return encoded PageInfo in initial metadata "flame-page-bin".
+        This includes empty pages; no synthetic Task is added to the stream.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')

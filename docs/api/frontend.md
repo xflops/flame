@@ -2,6 +2,10 @@
 
 The Frontend service is the client-facing API for Flame. It handles session management, task operations, and application registration.
 
+All five existing List RPCs accept optional paging parameters. See
+[List pagination](pagination.md) for filters, defaults, totals and task-stream
+response metadata. Omitting paging preserves legacy complete-list behavior.
+
 ## Service Definition
 
 ```protobuf
@@ -111,6 +115,8 @@ Lists registered applications, optionally filtered by state.
 | Field | Type | Description |
 |-------|------|-------------|
 | `state` | optional [ApplicationState](types.md#applicationstate) | Application state filter |
+| `names` | repeated string | Exact names; empty selects all |
+| `paging` | optional [PageRequest](pagination.md) | Bounded page; omit for the complete list |
 
 **Response:** [ApplicationList](types.md#applicationlist)
 
@@ -236,6 +242,8 @@ Lists sessions, optionally filtered by application and state.
 |-------|------|-------------|
 | `application` | optional string | Application name filter |
 | `state` | optional [SessionState](types.md#sessionstate) | Session state filter |
+| `ids` | repeated string | Exact session IDs; empty selects all |
+| `paging` | optional [PageRequest](pagination.md) | Bounded page; omit for the complete list |
 
 **Response:** [SessionList](types.md#sessionlist)
 
@@ -310,8 +318,8 @@ for update in session.watch_task(task.id):
 
 ### ListTasks
 
-Streams all active tasks copied from the session cache, followed by all
-finished tasks read from the storage engine, with no limit or pagination.
+With paging omitted, streams all active tasks copied from the session cache,
+followed by all finished tasks read from the storage engine.
 Task input/output is preserved. A task that finishes between the cache snapshot
 and storage read appears once, using the active snapshot already selected.
 These reads are not a transactional snapshot: concurrent creation and state
@@ -323,8 +331,16 @@ promised. This includes completed history retained in memory by `none` storage.
 | Field | Type | Description |
 |-------|------|-------------|
 | `session_id` | string | Session ID |
+| `state` | optional TaskState | Exact state |
+| `ids` | repeated int64 | Exact numeric task IDs |
+| `paging` | optional [PageRequest](pagination.md) | Bounded page with stable ordering |
+| `include_payloads` | bool | Include task data in paged results; default false |
 
 **Response:** `stream` [Task](types.md#task)
+
+Paged requests read authoritative storage metadata, return selected tasks only,
+and include protobuf `PageInfo` in initial binary metadata `flame-page-bin`.
+See [List pagination](pagination.md) for ordering and numbered-page semantics.
 
 ## Node Operations
 
@@ -332,7 +348,13 @@ promised. This includes completed history retained in memory by `none` storage.
 
 Lists all registered nodes in the cluster.
 
-**Request:** `ListNodesRequest` (empty)
+**Request:** `ListNodesRequest`
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `state` | optional NodeState | Exact state |
+| `names` | repeated string | Exact node names |
+| `paging` | optional [PageRequest](pagination.md) | Bounded page; omit for the complete list |
 
 **Response:** [NodeList](types.md#nodelist)
 
@@ -400,6 +422,15 @@ flmctl delete -s session-a,session-b
 
 Lists all executors in the cluster.
 
-**Request:** `ListExecutorsRequest` (empty)
+**Request:** `ListExecutorsRequest`
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `state` | optional ExecutorState | Exact state |
+| `application` | optional string | Application name |
+| `node` | optional string | Node name |
+| `session_id` | optional string | Current session ID |
+| `ids` | repeated string | Exact executor IDs |
+| `paging` | optional [PageRequest](pagination.md) | Bounded page; omit for the complete list |
 
 **Response:** [ExecutorList](types.md#executorlist)
