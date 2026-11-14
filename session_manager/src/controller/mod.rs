@@ -1432,7 +1432,7 @@ mod tests {
         assert_eq!(update.retract.len(), 1);
     }
 
-    /// Creates a test storage with a unique SQLite database.
+    /// Creates test storage in a unique filesystem directory.
     async fn create_test_storage() -> StoragePtr {
         create_test_storage_with_retry_limits(common::ctx::DEFAULT_SESSION_RETRY_LIMITS).await
     }
@@ -1445,8 +1445,7 @@ mod tests {
         );
         let test_dir = std::env::temp_dir().join(format!("flame_test_{}", unique_id));
         std::fs::create_dir_all(&test_dir).unwrap();
-        let db_path = test_dir.join("flame.db");
-        let url = format!("sqlite://{}", db_path.display());
+        let url = format!("fs://{}", test_dir.display());
 
         let ctx = FlameClusterContext {
             cluster: FlameCluster {
@@ -1974,7 +1973,7 @@ mod tests {
     async fn bound_task_waiter(minimum: u32) -> (ControllerPtr, String) {
         let config = FlameClusterContext {
             cluster: FlameCluster {
-                storage: "sqlite::memory:".into(),
+                storage: "none".into(),
                 ..Default::default()
             },
             ..Default::default()
@@ -2649,54 +2648,50 @@ mod tests {
         #[tokio::test]
         async fn deletion_is_persistent_and_keeps_other_nodes() {
             let dir = tempfile::tempdir().unwrap();
-            for url in [
-                format!("fs://{}", dir.path().join("fs").display()),
-                format!("sqlite://{}", dir.path().join("nodes.db").display()),
-            ] {
-                let config = FlameClusterContext {
-                    cluster: FlameCluster {
-                        storage: url,
-                        ..Default::default()
-                    },
+            let url = format!("fs://{}", dir.path().display());
+            let config = FlameClusterContext {
+                cluster: FlameCluster {
+                    storage: url,
                     ..Default::default()
-                };
-                let storage = crate::storage::new_ptr(&config).await.unwrap();
-                let controller = new_ptr(storage.clone());
-                for (name, state) in [
-                    ("unknown-old", NodeState::Unknown),
-                    ("not-ready-old", NodeState::NotReady),
-                    ("current", NodeState::Ready),
-                ] {
-                    let mut node = create_test_node(name);
-                    node.state = state;
-                    storage.register_node(&node).await.unwrap();
-                }
-                assert!(matches!(
-                    controller.release_node("current").await,
-                    Err(FlameError::InvalidState(_))
-                ));
-                for name in ["unknown-old", "not-ready-old"] {
-                    controller.release_node(name).await.unwrap();
-                    assert!(controller.get_node(name).unwrap().is_none());
-                    assert!(matches!(
-                        controller.release_node(name).await,
-                        Err(FlameError::NotFound(_))
-                    ));
-                }
-                let recovered = crate::storage::new_ptr(&config).await.unwrap();
-                recovered.load_data().await.unwrap();
-                let nodes = recovered.list_nodes().unwrap();
-                assert_eq!(nodes.len(), 1);
-                assert_eq!(nodes[0].name, "current");
-                controller
-                    .register_node(&create_test_node("unknown-old"), &[])
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    controller.get_node("unknown-old").unwrap().unwrap().state,
-                    NodeState::Ready
-                );
+                },
+                ..Default::default()
+            };
+            let storage = crate::storage::new_ptr(&config).await.unwrap();
+            let controller = new_ptr(storage.clone());
+            for (name, state) in [
+                ("unknown-old", NodeState::Unknown),
+                ("not-ready-old", NodeState::NotReady),
+                ("current", NodeState::Ready),
+            ] {
+                let mut node = create_test_node(name);
+                node.state = state;
+                storage.register_node(&node).await.unwrap();
             }
+            assert!(matches!(
+                controller.release_node("current").await,
+                Err(FlameError::InvalidState(_))
+            ));
+            for name in ["unknown-old", "not-ready-old"] {
+                controller.release_node(name).await.unwrap();
+                assert!(controller.get_node(name).unwrap().is_none());
+                assert!(matches!(
+                    controller.release_node(name).await,
+                    Err(FlameError::NotFound(_))
+                ));
+            }
+            let recovered = crate::storage::new_ptr(&config).await.unwrap();
+            recovered.load_data().await.unwrap();
+            let nodes = recovered.list_nodes().unwrap();
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].name, "current");
+            controller
+                .register_node(&create_test_node("unknown-old"), &[])
+                .await
+                .unwrap();
+            assert_eq!(
+                controller.get_node("unknown-old").unwrap().unwrap().state,
+                NodeState::Ready
+            );
         }
 
         #[tokio::test]
@@ -2992,10 +2987,9 @@ mod tests {
         use super::*;
         use uuid::Uuid;
 
-        async fn persistent_lifecycle_executor(
-        ) -> (tempfile::TempDir, ControllerPtr, Executor, String) {
+        async fn persistent_lifecycle_executor() -> (tempfile::TempDir, ControllerPtr, Executor) {
             let directory = tempfile::TempDir::new().unwrap();
-            let url = format!("sqlite://{}", directory.path().join("binding.db").display());
+            let url = format!("fs://{}", directory.path().display());
             let ctx = FlameClusterContext {
                 cluster: FlameCluster {
                     storage: url.clone(),
@@ -3022,30 +3016,28 @@ mod tests {
                 .create_executor("persist-binding-node".to_string(), session_id.clone())
                 .await
                 .unwrap();
-            (directory, controller, executor, url)
+            (directory, controller, executor)
         }
 
-        async fn assert_transition_is_staged<F>(
-            pool: &sqlx::SqlitePool,
+        /// Force persistence to fail before publication, then retry after repairing the path.
+        async fn assert_transition_is_staged<F, Fut>(
+            directory: &std::path::Path,
             executor: &ExecutorPtr,
-            transition: F,
+            mut transition: F,
             expected: ExecutorState,
         ) where
-            F: std::future::Future<Output = Result<(), FlameError>>,
+            F: FnMut() -> Fut,
+            Fut: std::future::Future<Output = Result<(), FlameError>>,
         {
-            use tokio::time::{timeout, Duration};
-
             let before = lock_ptr!(executor).unwrap().clone();
-            let mut transaction = pool.begin().await.unwrap();
-            sqlx::query("UPDATE executors SET state = state WHERE id = ?")
-                .bind(&before.id)
-                .execute(&mut *transaction)
-                .await
-                .unwrap();
-            tokio::pin!(transition);
-            assert!(timeout(Duration::from_millis(50), &mut transition)
-                .await
-                .is_err());
+            let parent = directory.join("nodes").join(&before.node).join("executors");
+            let saved = parent.with_extension("saved");
+            std::fs::rename(&parent, &saved).unwrap();
+            std::fs::write(&parent, b"block executor persistence").unwrap();
+            let failed = transition().await;
+            std::fs::remove_file(&parent).unwrap();
+            std::fs::rename(&saved, &parent).unwrap();
+            assert!(matches!(failed, Err(FlameError::Storage(_))));
             {
                 let current = lock_ptr!(executor).unwrap();
                 assert_eq!(current.state, before.state);
@@ -3053,59 +3045,54 @@ mod tests {
                 assert_eq!(current.task_id, before.task_id);
                 assert_eq!(current.signal, before.signal);
             }
-            transaction.commit().await.unwrap();
-            timeout(Duration::from_secs(1), transition)
-                .await
-                .expect("transition should finish after persistence is unblocked")
-                .unwrap();
+            transition().await.unwrap();
             assert_eq!(lock_ptr!(executor).unwrap().state, expected);
-            let persisted: Option<i32> =
-                sqlx::query_scalar("SELECT state FROM executors WHERE id = ?")
-                    .bind(&before.id)
-                    .fetch_optional(pool)
-                    .await
-                    .unwrap();
-            assert_eq!(
-                persisted,
-                (expected != ExecutorState::Released).then(|| i32::from(expected))
-            );
+            let metadata = parent.join(&before.id).join("metadata");
+            if expected == ExecutorState::Released {
+                assert!(!metadata.exists());
+            } else {
+                let persisted: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(metadata).unwrap()).unwrap();
+                assert_eq!(persisted["state"], i32::from(expected));
+            }
         }
 
         #[tokio::test]
         async fn lifecycle_transitions_are_visible_only_after_persistence() {
-            let (_directory, controller, executor, url) = persistent_lifecycle_executor().await;
-            let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+            let (directory, controller, executor) = persistent_lifecycle_executor().await;
             let shared = controller
                 .storage()
                 .get_executor_ptr(executor.id.clone())
                 .unwrap();
             assert_eq!(lock_ptr!(shared).unwrap().state, ExecutorState::Void);
             assert_transition_is_staged(
-                &pool,
+                directory.path(),
                 &shared,
-                controller.register_executor(&executor),
+                || controller.register_executor(&executor),
                 ExecutorState::Idle,
             )
             .await;
             assert_transition_is_staged(
-                &pool,
+                directory.path(),
                 &shared,
-                controller
-                    .bind_session(executor.id.clone(), "persist-before-assignment".to_string()),
+                || {
+                    controller
+                        .bind_session(executor.id.clone(), "persist-before-assignment".to_string())
+                },
                 ExecutorState::Binding,
             )
             .await;
             assert_transition_is_staged(
-                &pool,
+                directory.path(),
                 &shared,
-                controller.bind_executor_completed(executor.id.clone(), None, None),
+                || controller.bind_executor_completed(executor.id.clone(), None, None),
                 ExecutorState::Bound,
             )
             .await;
             assert_transition_is_staged(
-                &pool,
+                directory.path(),
                 &shared,
-                controller.unbind_executor(executor.id.clone()),
+                || controller.unbind_executor(executor.id.clone()),
                 ExecutorState::Unbinding,
             )
             .await;
@@ -3115,24 +3102,24 @@ mod tests {
                 .unwrap();
             assert_eq!(lock_ptr!(shared).unwrap().signal, Some(Signal::Interrupt));
             assert_transition_is_staged(
-                &pool,
+                directory.path(),
                 &shared,
-                controller.unbind_executor_completed(executor.id.clone()),
+                || controller.unbind_executor_completed(executor.id.clone()),
                 ExecutorState::Idle,
             )
             .await;
             assert_eq!(lock_ptr!(shared).unwrap().signal, None);
             assert_transition_is_staged(
-                &pool,
+                directory.path(),
                 &shared,
-                controller.release_executor(executor.id.clone()),
+                || controller.release_executor(executor.id.clone()),
                 ExecutorState::Releasing,
             )
             .await;
             assert_transition_is_staged(
-                &pool,
+                directory.path(),
                 &shared,
-                controller.unregister_executor(executor.id.clone()),
+                || controller.unregister_executor(executor.id.clone()),
                 ExecutorState::Released,
             )
             .await;
@@ -3146,25 +3133,21 @@ mod tests {
         async fn assignment_is_visible_only_after_binding_is_persisted() {
             use tokio::time::{timeout, Duration};
 
-            let (_directory, controller, executor, url) = persistent_lifecycle_executor().await;
+            let (directory, controller, executor) = persistent_lifecycle_executor().await;
             let session_id = "persist-before-assignment".to_string();
             controller.register_executor(&executor).await.unwrap();
-
-            // An external transaction holds SQLite's write lock while the
-            // scheduler attempts to persist the new executor assignment.
-            let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
-            let mut transaction = pool.begin().await.unwrap();
-            sqlx::query("UPDATE executors SET state = state WHERE id = ?")
-                .bind(&executor.id)
-                .execute(&mut *transaction)
-                .await
-                .unwrap();
-            let binding = controller.bind_session(executor.id.clone(), session_id.clone());
-            tokio::pin!(binding);
-            assert!(timeout(Duration::from_millis(50), &mut binding)
-                .await
-                .is_err());
-
+            let parent = directory
+                .path()
+                .join("nodes/persist-binding-node/executors");
+            let saved = parent.with_extension("saved");
+            std::fs::rename(&parent, &saved).unwrap();
+            std::fs::write(&parent, b"block binding persistence").unwrap();
+            let failed = controller
+                .bind_session(executor.id.clone(), session_id.clone())
+                .await;
+            std::fs::remove_file(&parent).unwrap();
+            std::fs::rename(&saved, &parent).unwrap();
+            assert!(matches!(failed, Err(FlameError::Storage(_))));
             let current = controller.get_executor(executor.id.clone()).unwrap();
             assert_eq!(current.state, ExecutorState::Idle);
             assert_eq!(current.ssn_id, None);
@@ -3173,11 +3156,9 @@ mod tests {
             assert!(timeout(Duration::from_millis(20), &mut waiting)
                 .await
                 .is_err());
-
-            transaction.commit().await.unwrap();
-            timeout(Duration::from_secs(1), binding)
+            controller
+                .bind_session(executor.id.clone(), session_id.clone())
                 .await
-                .expect("binding should finish after persistence is unblocked")
                 .unwrap();
             let assigned = timeout(Duration::from_secs(1), waiting)
                 .await
@@ -3185,13 +3166,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(assigned.id, session_id);
-            timeout(
-                Duration::from_secs(1),
-                controller.bind_executor_completed(executor.id.clone(), None, None),
-            )
-            .await
-            .expect("bind acknowledgement should finish")
-            .unwrap();
+            controller
+                .bind_executor_completed(executor.id.clone(), None, None)
+                .await
+                .unwrap();
             assert_eq!(
                 controller.get_executor(executor.id).unwrap().state,
                 ExecutorState::Bound
@@ -3612,7 +3590,7 @@ mod tests {
         async fn memory_controller() -> ControllerPtr {
             let config = FlameClusterContext {
                 cluster: FlameCluster {
-                    storage: "sqlite::memory:".into(),
+                    storage: "none".into(),
                     ..Default::default()
                 },
                 ..Default::default()

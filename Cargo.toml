@@ -47,7 +47,6 @@ clap = { version = "4.6.7", features = ["derive"] }
 clap_complete = "4.6.11"
 rand = { version = "0.10.3" }
 
-sqlx = { version = "0.9.0", features = [ "runtime-tokio", "tls-native-tls", "sqlite", "postgres", "macros" ] }
 
 url = { version = "2.5.8", features = ["serde"] }
 

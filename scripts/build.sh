@@ -66,7 +66,7 @@ stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT INT TERM
 pkg="$stage/arch/$name"
 assets="$stage/assets"
-mkdir -p "$pkg/bin" "$pkg/sbin" "$pkg/wheels" "$pkg/config/migrations" "$assets"
+mkdir -p "$pkg/bin" "$pkg/sbin" "$pkg/wheels" "$pkg/config" "$assets"
 
 log "Building Flame..."
 (cd "$root" && cargo build --release)
@@ -84,7 +84,6 @@ rm -f "$pkg/wheels/.gitignore"
 [ "$(find "$pkg/wheels" -name '*.whl' | wc -l | tr -d ' ')" -eq 1 ] \
     || die "expected exactly one wheel in $pkg/wheels"
 
-cp -R "$root/common/migrations/sqlite" "$pkg/config/migrations/sqlite"
 cp -R "$root/config/applications" "$pkg/config/applications"
 cp "$here/flmenv.sh.in" "$pkg/sbin/flmenv.sh.in"
 # setup.sh and sdk.sh, self-contained, so a downloaded package installs itself

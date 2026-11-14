@@ -124,8 +124,7 @@ mod tests {
         );
         let test_dir = std::env::temp_dir().join(format!("flame_exec_test_{}", unique_id));
         std::fs::create_dir_all(&test_dir).unwrap();
-        let db_path = test_dir.join("flame.db");
-        let url = format!("sqlite://{}", db_path.display());
+        let url = format!("fs://{}", test_dir.display());
 
         let ctx = FlameClusterContext {
             cluster: FlameCluster {

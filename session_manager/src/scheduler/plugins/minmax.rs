@@ -687,10 +687,10 @@ mod tests {
             vec!["priority", "das"],
         ] {
             for cluster_ceiling in [None, Some(2)] {
-                let database = common::temp_db_path("minmax_warmup");
+                let directory = tempfile::tempdir().unwrap();
                 let config = FlameClusterContext {
                     cluster: FlameCluster {
-                        storage: format!("sqlite:///{database}"),
+                        storage: format!("fs://{}", directory.path().display()),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -766,8 +766,6 @@ mod tests {
                     .all(|executor| executor.state == ExecutorState::Binding
                         && executor.ssn_id.as_ref() == Some(&session.id)));
                 assert!(controller.list_tasks(session.id).await.unwrap().is_empty());
-                drop(controller);
-                let _ = std::fs::remove_file(database);
             }
         }
     }

@@ -29,11 +29,8 @@ async fn storage(url: &str) -> Storage {
     storage
 }
 
-fn persistent_urls(dir: &std::path::Path) -> [String; 2] {
-    [
-        format!("sqlite://{}", dir.join("history.db").display()),
-        format!("fs://{}", dir.join("history").display()),
-    ]
+fn persistent_urls(dir: &std::path::Path) -> [String; 1] {
+    [format!("fs://{}", dir.join("history").display())]
 }
 
 async fn session(storage: &Storage) -> SessionPtr {

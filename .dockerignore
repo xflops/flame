@@ -16,7 +16,6 @@
 !flmctl/
 !flmexec/
 !flmping/
-!migrations/
 !object_cache/
 !rpc/
 !scripts/

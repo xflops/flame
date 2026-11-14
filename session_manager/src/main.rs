@@ -116,7 +116,7 @@ async fn main() -> Result<(), FlameError> {
 
     let storage = storage::new_ptr(&ctx).await?;
 
-    // Load data from engine, e.g. sqlite.
+    // Load persisted cluster data from the storage engine.
     storage.load_data().await?;
 
     let controller = controller::new_ptr(storage.clone());

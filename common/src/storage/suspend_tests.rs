@@ -40,10 +40,9 @@ mod tests {
         storage
     }
 
-    fn urls(dir: &std::path::Path) -> [String; 3] {
+    fn urls(dir: &std::path::Path) -> [String; 2] {
         [
             "none".to_string(),
-            format!("sqlite://{}", dir.join("suspend.db").display()),
             format!("fs://{}", dir.join("filesystem").display()),
         ]
     }
@@ -149,17 +148,23 @@ mod tests {
     #[tokio::test]
     async fn a_failed_persist_reverts_the_cached_state() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite://{}", dir.path().join("revert.db").display());
+        let url = format!("fs://{}", dir.path().display());
         let storage = test_storage(&url).await;
         storage.create_session(attr("s")).await.unwrap();
-        // The row vanishes behind the cache: the engine reports a failure other than
-        // NotFound once its table is gone.
-        sqlx::query("DROP TABLE sessions")
-            .execute(&sqlx::SqlitePool::connect(&url).await.unwrap())
-            .await
-            .unwrap();
+        // A directory at the atomic-write staging path makes persistence fail
+        // without depending on process privileges or filesystem permissions.
+        let staging = dir.path().join("sessions/s/metadata.tmp");
+        std::fs::create_dir(&staging).unwrap();
         assert!(suspend(&storage, "s").await.is_err());
         assert!(storage.get_session("s".into()).unwrap().is_open());
+        assert!(storage
+            .engine
+            .get_session("s".into())
+            .await
+            .unwrap()
+            .is_open());
+        std::fs::remove_dir(staging).unwrap();
+        assert!(suspend(&storage, "s").await.unwrap().is_suspending());
     }
 
     #[tokio::test]

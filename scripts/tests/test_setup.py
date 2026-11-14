@@ -35,11 +35,24 @@ class SetupTests(ScriptCase):
 
         self.assertEqual(self.installed(), {"flame-session-manager", *TOOLS})
         self.assertTrue((self.prefix / "conf/flame-cluster.yaml").is_file())
-        self.assertTrue((self.prefix / "migrations/sqlite/001.sql").is_file())
+        self.assertFalse((self.prefix / "migrations").exists())
         self.assertTrue((self.prefix / "conf/applications/flmexec.yaml").is_file())
         self.assertEqual(list((self.prefix / "lib").iterdir()), [])
         self.assertFalse((self.prefix / "sbin/flmenv.sh").exists())
         self.assertEqual((self.prefix / "data").stat().st_mode & 0o777, 0o700)
+
+    def test_upgrade_preserves_existing_migrations_and_session_data(self):
+        self.ok(self.setup())
+        migration = self.prefix / "migrations/sqlite/001.sql"
+        migration.parent.mkdir(parents=True)
+        migration.write_text("old migration")
+        database = self.prefix / "data/flame.db"
+        database.write_bytes(b"existing session data")
+
+        self.ok(self.setup("--force"))
+
+        self.assertEqual(migration.read_text(), "old migration")
+        self.assertEqual(database.read_bytes(), b"existing session data")
 
     def test_head_writes_a_unit_and_starts_it(self):
         self.ok(self.setup())
@@ -194,7 +207,7 @@ class SetupTests(ScriptCase):
         self.assertFalse((self.prefix / "bin/flame-session-manager").exists())
         for tool in TOOLS:
             self.assertTrue((self.prefix / "bin" / tool).stat().st_mode & 0o111)
-        self.assertFalse((self.prefix / "migrations/sqlite/001.sql").exists())
+        self.assertFalse((self.prefix / "migrations").exists())
         self.assertTrue((self.prefix / "conf/flame-cluster.yaml").is_file())
 
     def test_join_takes_no_address_and_the_interface_option_is_gone(self):
@@ -329,7 +342,7 @@ class SetupTests(ScriptCase):
         self.assertNotIn("[y/N]", result.stderr)
 
     def test_any_existing_target_is_refused(self):
-        for relative in ("bin/flame-session-manager", "conf/applications/flmexec.yaml", "migrations/sqlite/001.sql", *(f"bin/{tool}" for tool in TOOLS)):
+        for relative in ("bin/flame-session-manager", "conf/applications/flmexec.yaml", *(f"bin/{tool}" for tool in TOOLS)):
             with self.subTest(relative=relative):
                 shutil.rmtree(self.prefix, ignore_errors=True)
                 (self.prefix / relative).parent.mkdir(parents=True)

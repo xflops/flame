@@ -25,7 +25,7 @@ mod tests {
     use chrono::Utc;
 
     use crate::apis::Executor;
-    use crate::storage::engine::SqliteEngine;
+    use crate::storage::engine::connect;
 
     /// Detailed reports must survive the engine/cache boundary without new persistence columns.
     #[tokio::test]
@@ -35,7 +35,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for url in [
             "none".to_string(),
-            format!("sqlite://{}", dir.path().join("inventory.db").display()),
             format!("fs://{}", dir.path().join("inventory-fs").display()),
         ] {
             let config = FlameClusterContext {
@@ -83,7 +82,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for url in [
             "none".to_string(),
-            format!("sqlite://{}", dir.path().join("nodes.db").display()),
             format!("fs://{}", dir.path().join("fs").display()),
         ] {
             let config = FlameClusterContext {
@@ -171,23 +169,18 @@ mod tests {
         }
     }
 
-    async fn sqlite_node_storage() -> (
-        tempfile::TempDir,
-        crate::storage::StoragePtr,
-        sqlx::SqlitePool,
-    ) {
+    #[tokio::test]
+    async fn failed_node_deletion_preserves_cached_node_and_allows_retry() {
         use crate::ctx::{FlameCluster, FlameClusterContext};
-
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite://{}", dir.path().join("release.db").display());
-        let config = FlameClusterContext {
+        let context = FlameClusterContext {
             cluster: FlameCluster {
-                storage: url.clone(),
+                storage: format!("fs://{}", dir.path().display()),
                 ..Default::default()
             },
             ..Default::default()
         };
-        let storage = crate::storage::new_ptr(&config).await.unwrap();
+        let storage = crate::storage::new_ptr(&context).await.unwrap();
         storage
             .register_node(&Node {
                 name: "worker".into(),
@@ -196,56 +189,30 @@ mod tests {
             })
             .await
             .unwrap();
-        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
-        (dir, storage, pool)
-    }
-
-    #[tokio::test]
-    async fn failed_node_deletion_preserves_cached_node_and_allows_retry() {
-        let (_dir, storage, pool) = sqlite_node_storage().await;
         let original = storage.get_node_ptr("worker").unwrap();
-        sqlx::query(
-            "CREATE TRIGGER reject_node_delete BEFORE DELETE ON nodes BEGIN SELECT RAISE(ABORT, 'test node deletion failure'); END",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let error = storage.release_node("worker").await.unwrap_err();
-        assert!(
-            error.to_string().contains("test node deletion failure"),
-            "{error}"
-        );
+        let path = dir.path().join("nodes/worker");
+        let backup = dir.path().join("worker-backup");
+        // Replacing the directory with a file makes remove_dir_all fail while
+        // retaining the actual persisted node for a successful retry.
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::write(&path, b"blocked").unwrap();
+        assert!(storage.release_node("worker").await.is_err());
         let cached = storage.get_node_ptr("worker").unwrap();
         assert!(std::sync::Arc::ptr_eq(&cached, &original));
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM nodes WHERE name='worker'")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            1
-        );
-
-        sqlx::query("DROP TRIGGER reject_node_delete")
-            .execute(&pool)
-            .await
-            .unwrap();
+        assert!(backup.join("metadata").is_file());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
         storage.release_node("worker").await.unwrap();
         assert!(storage.get_node("worker").unwrap().is_none());
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM nodes WHERE name='worker'")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            0
-        );
+        assert!(!path.exists());
     }
 
     /// Test node CRUD operations.
     #[test]
     fn test_node_crud() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_node_crud");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("fs://{}", dir.path().display());
+        let storage = tokio_test::block_on(connect(&url))?;
 
         // Create a node
         let node = Node {
@@ -324,10 +291,11 @@ mod tests {
     /// Test executor CRUD operations.
     #[test]
     fn test_executor_crud() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_executor_crud");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("fs://{}", dir.path().display());
+        let storage = tokio_test::block_on(connect(&url))?;
 
-        // First create a node (required for foreign key)
+        // First create a node (required for executor ownership)
         let node = Node {
             name: "test-node-exec".to_string(),
             state: NodeState::Ready,
@@ -411,8 +379,9 @@ mod tests {
     /// Test that deleting a node cascades to executors.
     #[test]
     fn test_node_delete_cascades_to_executors() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_node_cascade");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("fs://{}", dir.path().display());
+        let storage = tokio_test::block_on(connect(&url))?;
 
         // Create a node
         let node = Node {
@@ -477,8 +446,9 @@ mod tests {
     /// Test executor state transitions.
     #[test]
     fn test_executor_state_transitions() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_executor_states");
-        let storage = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("fs://{}", dir.path().display());
+        let storage = tokio_test::block_on(connect(&url))?;
 
         // Create a node
         let node = Node {

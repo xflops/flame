@@ -1311,10 +1311,9 @@ mod event_lifecycle_tests {
         storage
     }
 
-    fn test_urls(dir: &std::path::Path) -> [String; 3] {
+    fn test_urls(dir: &std::path::Path) -> [String; 2] {
         [
             "none".to_string(),
-            format!("sqlite://{}", dir.join("events.db").display()),
             format!("fs://{}", dir.join("filesystem").display()),
         ]
     }
@@ -1734,19 +1733,25 @@ mod event_lifecycle_tests {
             .await
             .unwrap();
         let task = storage.create_task(id.clone(), None, None).await.unwrap();
-        storage.engine.close_session(id.clone()).await.unwrap();
-        // Older engines allowed late task writers to publish Running after
-        // Closed. Recovery preserves that history without retrying its task.
-        let connection = sqlx::SqlitePool::connect(&url).await.unwrap();
-        sqlx::query("UPDATE tasks SET state=?, version=version+1 WHERE ssn_id=? AND id=?")
-            .bind(TaskState::Running as i32)
-            .bind(&id)
-            .bind(task.id)
-            .execute(&connection)
+        storage
+            .engine
+            .update_task_state(task.clone(), TaskState::Running, None)
             .await
             .unwrap();
+        // Model a legacy late writer by persisting Closed while the task record
+        // remains Running, then restart the filesystem engine from those files.
+        let path = engine_dir
+            .path()
+            .join("filesystem/sessions")
+            .join(&id)
+            .join("metadata");
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        metadata["state"] = serde_json::json!(SessionState::Closed as i32);
+        std::fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
         let persisted = storage.engine.get_task(task.gid()).await.unwrap();
         let recovered = Storage {
+            engine: engine::connect(&url).await.unwrap(),
             sessions: stdng::new_ptr(HashMap::new()),
             ..storage.clone()
         };

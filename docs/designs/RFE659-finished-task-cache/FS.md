@@ -536,7 +536,7 @@ to mutate the task.
   `load_data`, task reads/writes, and `close_session`.
 - [Engine interface](../../../common/src/storage/engine/mod.rs),
   [filesystem](../../../common/src/storage/engine/filesystem/mod.rs),
-  [SQLite](../../../common/src/storage/engine/sqlite.rs), and
+  [SQLite](https://github.com/xflops/flame/blob/65cff555/common/src/storage/engine/sqlite.rs), and
   [none](../../../common/src/storage/engine/none.rs).
 - [Session cache updates](../../../common/src/apis/session.rs),
   [API types](../../../common/src/apis/types.rs), and

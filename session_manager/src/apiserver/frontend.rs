@@ -779,7 +779,7 @@ mod tests {
         crate::controller::ControllerPtr,
         apis::SessionID,
     ) {
-        task_test_controller("sqlite::memory:".to_string()).await
+        task_test_controller("none".to_string()).await
     }
 
     async fn task_test_controller(
@@ -847,11 +847,10 @@ mod tests {
     async fn list_tasks_streams_all_active_tasks_then_finished_history() {
         use common::apis::{TaskResult, TaskState};
 
-        for backend in ["none", "sqlite", "fs"] {
+        for backend in ["none", "fs"] {
             let dir = tempfile::tempdir().unwrap();
             let url = match backend {
                 "none" => "none".to_string(),
-                "sqlite" => format!("sqlite://{}", dir.path().join("tasks.db").display()),
                 _ => format!("fs://{}", dir.path().join("data").display()),
             };
             let (storage, controller, ssn_id) = task_test_controller(url).await;
@@ -1013,11 +1012,10 @@ mod tests {
     async fn late_watch_reads_evicted_terminal_result_and_events() {
         use common::apis::{TaskResult, TaskState};
 
-        for backend in ["none", "sqlite", "fs"] {
+        for backend in ["none", "fs"] {
             let dir = tempfile::tempdir().unwrap();
             let url = match backend {
                 "none" => "none".to_string(),
-                "sqlite" => format!("sqlite://{}", dir.path().join("tasks.db").display()),
                 _ => format!("fs://{}", dir.path().join("data").display()),
             };
             let (storage, controller, ssn_id) = task_test_controller(url).await;
