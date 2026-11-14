@@ -6,6 +6,7 @@ isort>=9.0.2
 mypy>=2.4.1
 
 # Runtime dependencies (for development)
+cryptography>=50.0.2
 grpcio>=1.85.1
 grpcio-tools>=1.85.1
 protobuf>=7.36.2

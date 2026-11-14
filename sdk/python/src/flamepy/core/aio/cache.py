@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 # Explicit close() is required before the owning loop exits. A channel can
 # retain its loop, so weak loop keys would not make forgotten channels safe.
-_clients: dict[asyncio.AbstractEventLoop, dict[tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]], tuple[grpc.aio.Channel, Any]]] = {}
+_clients: dict[asyncio.AbstractEventLoop, dict[tuple[str, Optional[str], Optional[str]], tuple[grpc.aio.Channel, Any]]] = {}
 _clients_lock = threading.Lock()
 
 
@@ -59,20 +59,9 @@ def _create_client(location: str, tls_config: Optional[FlameClientTls], target: 
         common._validate_proxy_endpoint(location)
     options = list(common.GRPC_OPTIONS)
     if parsed.scheme in ("grpcs", "grpc+tls", "grpcs-proxy"):
-        if tls_config is not None:
-            tls_config.validate_identity()
-        roots = None
-        if tls_config and tls_config.ca_file:
-            with open(tls_config.ca_file, "rb") as source:
-                roots = source.read()
-        private_key = certificate_chain = None
-        if tls_config and tls_config.cert_file:
-            with open(tls_config.key_file, "rb") as source:
-                private_key = source.read()
-            with open(tls_config.cert_file, "rb") as source:
-                certificate_chain = source.read()
-        credentials = grpc.ssl_channel_credentials(root_certificates=roots, private_key=private_key, certificate_chain=certificate_chain)
-        channel = grpc.aio.secure_channel(parsed.netloc, credentials, options=options)
+        from flamepy.core.tls import channel_credentials
+
+        channel = grpc.aio.secure_channel(parsed.netloc, channel_credentials(tls_config), options=options)
     else:
         channel = grpc.aio.insecure_channel(parsed.netloc, options=options)
     stub = cache_pb2_grpc.ObjectCacheServiceStub(channel)
@@ -101,7 +90,7 @@ class _RoutedCacheStub:
 
 def _get_client(endpoint: str, tls_config: Optional[FlameClientTls] = None):
     location, target = common._resolve_cache_endpoint(endpoint)
-    key = (location, target, tls_config.ca_file if tls_config else None, tls_config.cert_file if tls_config else None, tls_config.key_file if tls_config else None)
+    key = (location, target, tls_config.fingerprint() if tls_config is not None else None)
     with _clients_lock:
         pool = _clients.setdefault(asyncio.get_running_loop(), {})
         if key not in pool:

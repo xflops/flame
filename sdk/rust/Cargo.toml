@@ -36,6 +36,8 @@ serde = { workspace = true }
 serde_yaml = { workspace = true }
 serde_derive = { workspace = true }
 bson = { workspace = true }
+base64 = "0.23.1"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 
 [build-dependencies]
 tonic-build = { workspace = true }
@@ -43,6 +45,7 @@ tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
 comfy-table = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
 default = []

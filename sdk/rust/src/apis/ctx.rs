@@ -11,6 +11,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use base64::{engine::general_purpose::STANDARD, Engine};
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use serde_derive::{Deserialize, Serialize};
 use std::env;
 use std::fmt::{Display, Formatter};
@@ -31,7 +33,7 @@ const FLAME_KEY_FILE: &str = "FLAME_KEY_FILE";
 ///
 /// Note: To disable TLS for development, use http:// instead of https://
 /// in the endpoint URL.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct FlameClientTls {
     /// Path to CA certificate for server verification
     #[serde(default)]
@@ -42,40 +44,87 @@ pub struct FlameClientTls {
     /// Path to the PEM private key for cert_file.
     #[serde(default)]
     pub key_file: Option<String>,
+    /// Standard-base64-encoded PEM CA certificates for server verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_data: Option<String>,
+    /// Standard-base64-encoded PEM client certificate chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_data: Option<String>,
+    /// Standard-base64-encoded PEM private key matching the client certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_data: Option<String>,
+}
+
+impl std::fmt::Debug for FlameClientTls {
+    /// Keep inline credentials out of configuration diagnostics and logs.
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlameClientTls")
+            .field("ca_file", &self.ca_file)
+            .field("cert_file", &self.cert_file)
+            .field("key_file", &self.key_file)
+            .field("ca_data", &self.ca_data.as_ref().map(|_| "<redacted>"))
+            .field("cert_data", &self.cert_data.as_ref().map(|_| "<redacted>"))
+            .field("key_data", &self.key_data.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl FlameClientTls {
     /// Load client TLS config for tonic.
     ///
-    /// If ca_file is specified, use it; otherwise use system CA bundle.
+    /// Credentials may come from files or standard-base64-encoded PEM data.
+    /// Each credential accepts only one source; client authentication requires
+    /// both a certificate and its matching private key. Inline data stays in memory.
     /// The domain parameter is used for server name verification.
     pub fn client_tls_config(&self, domain: &str) -> Result<ClientTlsConfig, FlameError> {
         stdng::tls::install_crypto_provider();
-        if self.cert_file.is_some() != self.key_file.is_some() {
+        for (name, file, data) in [
+            ("ca", &self.ca_file, &self.ca_data),
+            ("cert", &self.cert_file, &self.cert_data),
+            ("key", &self.key_file, &self.key_data),
+        ] {
+            validate_source(name, file.as_deref(), data.as_deref())?;
+        }
+        let has_cert = self.cert_file.is_some() || self.cert_data.is_some();
+        let has_key = self.key_file.is_some() || self.key_data.is_some();
+        if has_cert != has_key {
             return Err(FlameError::InvalidConfig(
-                "client TLS requires both cert_file and key_file".to_string(),
+                "client TLS requires both a certificate (cert_file or cert_data) and a private key (key_file or key_data)".to_string(),
             ));
         }
         let mut config = ClientTlsConfig::new()
             .domain_name(domain)
             .with_native_roots();
 
-        if let Some(ref ca_file) = self.ca_file {
-            let ca = fs::read_to_string(ca_file).map_err(|e| {
-                FlameError::InvalidConfig(format!("failed to read ca_file <{}>: {}", ca_file, e))
-            })?;
+        if let Some(ca) = load_credential("ca", self.ca_file.as_deref(), self.ca_data.as_deref())? {
+            validate_certificates(&ca, "ca_file or ca_data")?;
             config = config.ca_certificate(Certificate::from_pem(ca));
         }
 
-        if let (Some(cert_file), Some(key_file)) = (&self.cert_file, &self.key_file) {
-            let cert = fs::read(cert_file).map_err(|e| {
-                FlameError::InvalidConfig(format!(
-                    "failed to read cert_file <{}>: {}",
-                    cert_file, e
-                ))
-            })?;
-            let key = fs::read(key_file).map_err(|e| {
-                FlameError::InvalidConfig(format!("failed to read key_file <{}>: {}", key_file, e))
+        if let (Some(cert), Some(key)) = (
+            load_credential("cert", self.cert_file.as_deref(), self.cert_data.as_deref())?,
+            load_credential("key", self.key_file.as_deref(), self.key_data.as_deref())?,
+        ) {
+            let certs = validate_certificates(&cert, "cert_file or cert_data")?;
+            std::str::from_utf8(&key).map_err(|_| invalid_key())?;
+            let keys = PrivateKeyDer::pem_slice_iter(&key)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| invalid_key())?;
+            let mut keys = keys.into_iter();
+            let private_key = keys.next().ok_or_else(invalid_key)?;
+            if keys.next().is_some() {
+                return Err(invalid_key());
+            }
+            rustls::sign::CertifiedKey::from_der(
+                certs,
+                private_key,
+                &rustls::crypto::ring::default_provider(),
+            )
+            .map_err(|_| {
+                FlameError::InvalidConfig(
+                    "client TLS certificate and private key must form a valid matching identity"
+                        .to_string(),
+                )
             })?;
             config = config.identity(Identity::from_pem(cert, key));
         }
@@ -84,16 +133,89 @@ impl FlameClientTls {
     }
 }
 
+/// Reject ambiguous and empty credential sources without displaying their values.
+fn validate_source(name: &str, file: Option<&str>, data: Option<&str>) -> Result<(), FlameError> {
+    if file.is_some() && data.is_some() {
+        return Err(FlameError::InvalidConfig(format!(
+            "{name}_file and {name}_data cannot both be configured"
+        )));
+    }
+    if file == Some("") || data == Some("") {
+        return Err(FlameError::InvalidConfig(format!(
+            "{name}_file and {name}_data must not be empty when configured"
+        )));
+    }
+    Ok(())
+}
+
+/// Read or decode one credential; errors name the source field, never its contents.
+fn load_credential(
+    name: &str,
+    file: Option<&str>,
+    data: Option<&str>,
+) -> Result<Option<Vec<u8>>, FlameError> {
+    if let Some(data) = data {
+        let invalid = || {
+            FlameError::InvalidConfig(format!(
+                "{name}_data must contain canonical standard base64-encoded PEM"
+            ))
+        };
+        let decoded = STANDARD.decode(data).map_err(|_| invalid())?;
+        if STANDARD.encode(&decoded) != data {
+            return Err(invalid());
+        }
+        return Ok(Some(decoded));
+    }
+    file.map(|path| {
+        fs::read(path).map_err(|error| {
+            FlameError::InvalidConfig(format!("failed to read {name}_file: {error}"))
+        })
+    })
+    .transpose()
+}
+
+/// Parse and validate every X.509 certificate in a PEM certificate bundle.
+fn validate_certificates(
+    pem: &[u8],
+    field: &str,
+) -> Result<Vec<CertificateDer<'static>>, FlameError> {
+    let invalid =
+        || FlameError::InvalidConfig(format!("{field} must contain valid PEM certificates"));
+    std::str::from_utf8(pem).map_err(|_| invalid())?;
+    let certificates = CertificateDer::pem_slice_iter(pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| invalid())?;
+    if certificates.is_empty() {
+        return Err(invalid());
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in &certificates {
+        roots.add(cert.clone()).map_err(|_| invalid())?;
+    }
+    Ok(certificates)
+}
+
+/// Keep private-key parser details out of user-visible errors.
+fn invalid_key() -> FlameError {
+    FlameError::InvalidConfig(
+        "key_file or key_data must contain exactly one valid, unencrypted PEM private key"
+            .to_string(),
+    )
+}
+
 fn merge_tls(target: &mut Option<FlameClientTls>, source: &FlameClientTls) {
     let tls = target.get_or_insert_with(FlameClientTls::default);
-    if tls.ca_file.is_none() {
+    if tls.ca_file.is_none() && tls.ca_data.is_none() {
         tls.ca_file.clone_from(&source.ca_file);
+        tls.ca_data.clone_from(&source.ca_data);
     }
-    if tls.cert_file.is_none() {
+    if tls.cert_file.is_none() && tls.cert_data.is_none() {
         tls.cert_file.clone_from(&source.cert_file);
+        tls.cert_data.clone_from(&source.cert_data);
     }
-    if tls.key_file.is_none() {
+    if tls.key_file.is_none() && tls.key_data.is_none() {
         tls.key_file.clone_from(&source.key_file);
+        tls.key_data.clone_from(&source.key_data);
     }
 }
 
@@ -215,6 +337,7 @@ impl FlameContext {
                 ca_file,
                 cert_file,
                 key_file,
+                ..Default::default()
             })
         } else {
             None
@@ -267,7 +390,8 @@ impl FlameContext {
 
     /// Apply environment variable overrides to the current context; use it as `from_file(fp)?.with_env()`.
     ///
-    /// Environment variables take precedence over the file:
+    /// Endpoint variables override the file. TLS file variables fill credentials
+    /// only when neither a file nor inline data is configured:
     /// - FLAME_ENDPOINT: Overrides cluster endpoint
     /// - FLAME_CACHE_ENDPOINT: Overrides cache endpoint
     /// - FLAME_CA_FILE: Sets CA file if not already configured
@@ -287,6 +411,7 @@ impl FlameContext {
                 ca_file,
                 cert_file,
                 key_file,
+                ..Default::default()
             };
             if env_tls.ca_file.is_some()
                 || env_tls.cert_file.is_some()
@@ -335,8 +460,17 @@ impl FlameContext {
 
         let contents =
             fs::read_to_string(fp.clone()).map_err(|e| FlameError::Internal(e.to_string()))?;
-        let ctx: FlameContext = serde_yaml::from_str(&contents).map_err(|e| {
-            FlameError::InvalidConfig(format!("<{fp}> is not a valid Flame configuration: {e}"))
+        let ctx: FlameContext = serde_yaml::from_str(&contents).map_err(|error| {
+            // Serde errors can quote an invalid input value, including a secret.
+            let location = error
+                .location()
+                .map(|location| {
+                    format!(" at line {}, column {}", location.line(), location.column())
+                })
+                .unwrap_or_default();
+            FlameError::InvalidConfig(format!(
+                "<{fp}> is not a valid Flame configuration{location}"
+            ))
         })?;
 
         tracing::debug!("Load FlameContext from <{fp}>: {ctx}");
@@ -366,75 +500,4 @@ impl Display for FlameContext {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_missing_file_is_an_error_that_says_how_to_configure() {
-        let error =
-            FlameContext::from_file(Some("/nonexistent/flame.yaml".to_string())).unwrap_err();
-
-        let message = error.to_string();
-        assert!(message.contains("no Flame cluster configured"));
-        assert!(message.contains("/nonexistent/flame.yaml"));
-        assert!(message.contains("endpoint: \"http://<head>:8080\""));
-        // the file is the only user-facing configuration, so the hint names only the file
-        assert!(!message.contains("FLAME_ENDPOINT"));
-    }
-
-    #[test]
-    fn an_invalid_file_names_itself() {
-        let path = std::env::temp_dir().join(format!("flame-invalid-{}.yaml", std::process::id()));
-        std::fs::write(&path, "current-context: [").unwrap();
-
-        let error = FlameContext::from_file(Some(path.to_string_lossy().into_owned())).unwrap_err();
-        let _ = std::fs::remove_file(&path);
-
-        assert!(matches!(error, FlameError::InvalidConfig(_)));
-        assert!(error
-            .to_string()
-            .contains("is not a valid Flame configuration"));
-        assert!(error
-            .to_string()
-            .contains(&path.to_string_lossy().into_owned()));
-    }
-
-    #[test]
-    fn client_identity_requires_both_files() {
-        for tls in [
-            FlameClientTls {
-                cert_file: Some("client.crt".into()),
-                ..Default::default()
-            },
-            FlameClientTls {
-                key_file: Some("client.key".into()),
-                ..Default::default()
-            },
-        ] {
-            let error = tls.client_tls_config("gateway.example.com").unwrap_err();
-            assert!(matches!(error, FlameError::InvalidConfig(_)));
-            assert!(error.to_string().contains("both cert_file and key_file"));
-        }
-    }
-
-    #[test]
-    fn client_identity_loads_pem_files() {
-        let cert_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ci/docker/certs");
-        let tls = FlameClientTls {
-            ca_file: Some(cert_dir.join("ca.crt").to_string_lossy().into_owned()),
-            cert_file: Some(cert_dir.join("server.crt").to_string_lossy().into_owned()),
-            key_file: Some(cert_dir.join("server.key").to_string_lossy().into_owned()),
-        };
-        tls.client_tls_config("gateway.example.com").unwrap();
-    }
-
-    #[test]
-    fn client_identity_yaml_fields_round_trip() {
-        let tls: FlameClientTls =
-            serde_yaml::from_str("ca_file: ca.crt\ncert_file: client.crt\nkey_file: client.key\n")
-                .unwrap();
-        assert_eq!(tls.ca_file.as_deref(), Some("ca.crt"));
-        assert_eq!(tls.cert_file.as_deref(), Some("client.crt"));
-        assert_eq!(tls.key_file.as_deref(), Some("client.key"));
-    }
-}
+mod tests;
