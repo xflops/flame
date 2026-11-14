@@ -207,7 +207,7 @@ Flame's SQLite implementation performs per-session `MAX(id) + 1` inside the
 `INSERT`, in a transaction, and commits before returning the task. It does not
 use `AUTOINCREMENT` for these task IDs. SQLite serializes writes; allocation is
 protected by the same write transaction as row insertion. See
-[Flame's allocator](../../../common/src/storage/engine/sqlite.rs) and
+[Flame's allocator](https://github.com/xflops/flame/blob/65cff555/common/src/storage/engine/sqlite.rs) and
 [SQLite isolation](https://www.sqlite.org/isolation.html).
 
 Use the same logical boundary for filesystem creation:

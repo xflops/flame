@@ -423,7 +423,7 @@ runners (so the binaries run on the oldest glibc we support), these assets for `
 with a `.sha256` file, and uploads them to the GitHub release with `gh release upload --clobber`, so the
 release must exist first and a rerun replaces the assets:
 
-- `flame-<tag>-linux-<arch>.tar.gz`: every binary, `uv`, the Python SDK wheel, the migrations, the
+- `flame-<tag>-linux-<arch>.tar.gz`: every binary, `uv`, the Python SDK wheel, the
   application manifests, the examples (what git tracks under `examples/`), and `sbin/setup.sh` and
   `sbin/sdk.sh` that install it, and
 - `flmctl-<tag>-linux-<arch>`, `flmping-<tag>-linux-<arch>`, `flmexec-<tag>-linux-<arch>` and

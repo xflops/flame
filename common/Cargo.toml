@@ -19,7 +19,6 @@ tracing-appender = { workspace = true }
 gethostname = { workspace = true }
 postcard = { workspace = true }
 async-trait = { workspace = true }
-sqlx = { workspace = true }
 uuid = { workspace = true }
 crc32fast = "1.5.5"
 

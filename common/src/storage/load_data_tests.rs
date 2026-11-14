@@ -25,7 +25,7 @@ mod tests {
     use stdng::lock_ptr;
 
     use crate::apis::Executor;
-    use crate::storage::engine::SqliteEngine;
+    use crate::storage::engine::connect;
 
     fn create_test_context(db_url: &str) -> FlameClusterContext {
         FlameClusterContext {
@@ -53,9 +53,10 @@ mod tests {
 
     #[test]
     fn test_load_data_resets_binding_executor_to_idle() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_load_data_binding_recovery");
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("fs://{}", dir.path().display());
 
-        let engine = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
+        let engine = tokio_test::block_on(connect(&url))?;
 
         let node = Node {
             name: "recovery-node".to_string(),
@@ -136,7 +137,9 @@ mod tests {
         assert!(idle_exec.attributes.is_empty());
         assert!(idle_exec.latest_updated_timestamp > stale_timestamp);
 
-        let db_executor = tokio_test::block_on(engine.get_executor(&"binding-exec".to_string()))?;
+        let persisted = tokio_test::block_on(connect(&url))?;
+        let db_executor =
+            tokio_test::block_on(persisted.get_executor(&"binding-exec".to_string()))?;
         assert!(db_executor.is_some());
         let db_executor = db_executor.unwrap();
         assert_eq!(db_executor.state, ExecutorState::Idle);
@@ -148,9 +151,10 @@ mod tests {
 
     #[test]
     fn test_load_data_preserves_other_executor_states() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_load_data_preserves_states");
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("fs://{}", dir.path().display());
 
-        let engine = tokio_test::block_on(SqliteEngine::new_ptr(&url))?;
+        let engine = tokio_test::block_on(connect(&url))?;
 
         let node = Node {
             name: "state-node".to_string(),
@@ -222,32 +226,34 @@ mod tests {
 
     #[tokio::test]
     async fn load_data_restores_pending_task_affinity() -> Result<(), FlameError> {
-        let url = crate::temp_sqlite_url("flame_test_load_data_affinity");
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("fs://{}", dir.path().display());
         let ctx = create_test_context(&url);
-        let storage = crate::storage::new_ptr(&ctx).await?;
-        storage
-            .register_application("affinity-app".to_string(), ApplicationAttributes::default())
-            .await?;
-        storage
-            .create_session(SessionAttributes {
-                id: "affinity-session".to_string(),
-                application: "affinity-app".to_string(),
-                ..Default::default()
-            })
-            .await?;
         let shared = bytes::Bytes::from_static(b"shared");
-        for _ in 0..2 {
+        {
+            let storage = crate::storage::new_ptr(&ctx).await?;
             storage
-                .create_task(
-                    "affinity-session".to_string(),
-                    None,
-                    Some(TaskOptions {
-                        affinity: [shared.clone()].into_iter().collect(),
-                    }),
-                )
+                .register_application("affinity-app".to_string(), ApplicationAttributes::default())
                 .await?;
+            storage
+                .create_session(SessionAttributes {
+                    id: "affinity-session".to_string(),
+                    application: "affinity-app".to_string(),
+                    ..Default::default()
+                })
+                .await?;
+            for _ in 0..2 {
+                storage
+                    .create_task(
+                        "affinity-session".to_string(),
+                        None,
+                        Some(TaskOptions {
+                            affinity: [shared.clone()].into_iter().collect(),
+                        }),
+                    )
+                    .await?;
+            }
         }
-        drop(storage);
 
         let recovered = crate::storage::new_ptr(&ctx).await?;
         recovered.load_data().await?;

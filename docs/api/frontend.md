@@ -263,7 +263,7 @@ task = session.create_task(b"input data")
 Retrieves task details.
 
 Finished tasks remain readable from the selected storage engine after they
-leave the session manager's active task cache. Filesystem and SQLite retain
+leave the session manager's active task cache. Filesystem retains
 records on disk; `none` retains all task records and results in memory for the
 life of its engine instance. Closing a session or evicting it from the scheduling
 cache does not delete engine task history. Explicit session deletion removes

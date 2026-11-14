@@ -24,7 +24,6 @@ mod delete;
 mod deploy;
 mod helper;
 mod list;
-mod migrate;
 mod register;
 mod resume;
 mod suspend;
@@ -134,15 +133,6 @@ enum Commands {
         #[arg(short, long)]
         resreq: Option<String>,
     },
-    /// Migrate Flame metadata
-    Migrate {
-        /// The url of Flame database
-        #[arg(short, long)]
-        url: String,
-        /// The target SQL schema of Flame database
-        #[arg(short, long)]
-        sql: String,
-    },
     /// Register an application
     Register {
         /// The yaml file of the application
@@ -208,7 +198,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             node,
             output_format,
         }) => view::run(&ctx, output_format, application, session, task, node).await?,
-        Some(Commands::Migrate { url, sql }) => migrate::run(&ctx, url, sql).await?,
         Some(Commands::Register { file }) => register::run(&ctx, file).await?,
         Some(Commands::Deploy(options)) => deploy::run(&ctx, options).await?,
         Some(Commands::Unregister { application }) => unregister::run(&ctx, application).await?,

@@ -27,11 +27,9 @@ use crate::FlameError;
 
 mod filesystem;
 mod none;
-mod sqlite;
-pub mod types;
 
 #[cfg(test)]
-pub use sqlite::SqliteEngine;
+mod lifecycle_tests;
 
 pub type EnginePtr = Arc<dyn Engine>;
 
@@ -137,7 +135,6 @@ pub trait Engine: Send + Sync + 'static {
 /// Connect to a storage engine based on the URL scheme.
 ///
 /// Supported URL schemes:
-/// - `sqlite://` or `sqlite:` - SQLite database (default)
 /// - `filesystem://`, `file://`, `fs://` - Filesystem-based storage
 /// - `none` - In-memory only, no persistence (for non-recoverable workloads)
 ///
@@ -148,9 +145,6 @@ pub trait Engine: Send + Sync + 'static {
 /// # Examples
 ///
 /// ```ignore
-/// // SQLite storage
-/// let engine = connect("sqlite:///var/lib/flame/sessions.db").await?;
-///
 /// // Filesystem storage (absolute path)
 /// let engine = connect("fs:///var/lib/flame").await?;
 ///
@@ -170,8 +164,9 @@ pub async fn connect(url: &str) -> Result<EnginePtr, FlameError> {
         tracing::info!("Using filesystem storage engine: {}", url);
         filesystem::FilesystemEngine::new_ptr(url).await
     } else {
-        tracing::info!("Using SQLite storage engine: {}", url);
-        sqlite::SqliteEngine::new_ptr(url).await
+        Err(FlameError::InvalidConfig(format!(
+            "Unsupported storage URL <{url}>; use fs://, file://, filesystem:// or none"
+        )))
     }
 }
 
@@ -193,10 +188,8 @@ mod task_history_tests {
         let dir = tempfile::tempdir().unwrap();
         let url = if kind == "none" {
             "none".to_string()
-        } else if kind == "fs" {
-            format!("fs://{}", dir.path().display())
         } else {
-            format!("sqlite://{}", dir.path().join("tasks.db").display())
+            format!("fs://{}", dir.path().display())
         };
         let engine = connect(&url).await.unwrap();
         engine
@@ -216,7 +209,7 @@ mod task_history_tests {
 
     #[tokio::test]
     async fn finished_reads_return_all_terminal_tasks_and_recovery_reads_all_tasks() {
-        for kind in ["fs", "sqlite", "none"] {
+        for kind in ["fs", "none"] {
             let (engine, _dir) = engine(kind).await;
             for state in [TaskState::Succeed, TaskState::Failed, TaskState::Cancelled] {
                 let task = engine
@@ -311,44 +304,6 @@ mod task_history_tests {
                 Err(FlameError::NotFound(_))
             ));
         }
-    }
-
-    #[tokio::test]
-    async fn sqlite_history_and_recovery_propagate_invalid_task_data() {
-        let (engine, dir) = engine("sqlite").await;
-        let task = engine
-            .create_task("history".into(), None, None)
-            .await
-            .unwrap();
-        engine
-            .update_task_state(task.clone(), TaskState::Succeed, None)
-            .await
-            .unwrap();
-        let pool = sqlx::SqlitePool::connect(&format!(
-            "sqlite://{}",
-            dir.path().join("tasks.db").display()
-        ))
-        .await
-        .unwrap();
-        sqlx::query("UPDATE tasks SET affinity='invalid' WHERE ssn_id=? AND id=?")
-            .bind("history")
-            .bind(task.id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert!(matches!(
-            engine.find_tasks(&TaskFilter::by_session("history")).await,
-            Err(FlameError::Storage(_))
-        ));
-        assert!(matches!(
-            engine.find_tasks(&TaskFilter::terminal("history")).await,
-            Err(FlameError::Storage(_))
-        ));
-        let closed = engine.close_session("history".into()).await.unwrap();
-        assert_eq!(closed.task_counts.succeed, 1);
-        let repeated = engine.close_session("history".into()).await.unwrap();
-        assert_eq!(repeated.task_counts, closed.task_counts);
-        pool.close().await;
     }
 
     #[tokio::test]
@@ -469,7 +424,7 @@ mod task_history_tests {
 
     #[tokio::test]
     async fn updates_use_engine_records_instead_of_cached_fields() {
-        for kind in ["fs", "sqlite", "none"] {
+        for kind in ["fs", "none"] {
             let (engine, _dir) = engine(kind).await;
             let created = engine
                 .create_task(
@@ -517,7 +472,7 @@ mod task_history_tests {
 
     #[tokio::test]
     async fn close_returns_final_counts_and_repeated_close_keeps_them() {
-        for kind in ["fs", "sqlite", "none"] {
+        for kind in ["fs", "none"] {
             let (engine, _dir) = engine(kind).await;
             let mut running = None;
             for state in [
@@ -589,7 +544,7 @@ mod task_history_tests {
 
     #[tokio::test]
     async fn close_and_running_transition_are_serialized() {
-        for kind in ["fs", "sqlite", "none"] {
+        for kind in ["fs", "none"] {
             let (engine, _dir) = engine(kind).await;
             let task = engine
                 .create_task("history".into(), None, None)
@@ -615,6 +570,38 @@ mod task_history_tests {
                     .unwrap()
                     .is_closed());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    #[tokio::test]
+    async fn unsupported_storage_urls_are_rejected() {
+        for url in [
+            "sqlite:///tmp/flame.db",
+            "sqlite:flame.db",
+            "postgres://localhost/flame",
+            "unknown",
+            "",
+        ] {
+            assert!(
+                matches!(connect(url).await, Err(FlameError::InvalidConfig(_))),
+                "{url}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn filesystem_aliases_and_none_are_supported() {
+        assert!(connect("none").await.is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        for scheme in ["fs", "file", "filesystem"] {
+            assert!(
+                connect(&format!("{scheme}://{}", dir.path().join(scheme).display()))
+                    .await
+                    .is_ok()
+            );
         }
     }
 }

@@ -139,9 +139,6 @@ target_files() {
         for manifest in "$pkg"/config/applications/*.yaml "$pkg"/config/applications/*.yml; do
             [ -f "$manifest" ] && printf '%s\n' "$prefix/conf/applications/$(basename "$manifest")"
         done
-        for migration in "$pkg"/config/migrations/sqlite/*; do
-            [ -f "$migration" ] && printf '%s\n' "$prefix/migrations/sqlite/$(basename "$migration")"
-        done
         [ "$systemd" -eq 1 ] && printf '%s\n' "$(unit_file "$SERVICE_SESSION_MANAGER")"
     else
         for binary in flame-executor-manager flame-object-cache flmping-service flmexec-service flmbox uv; do
@@ -183,7 +180,7 @@ check_existing() {
 
 make_dirs() {
     mkdir -p "$prefix" 2>/dev/null || die "cannot create $prefix: run as root (sudo) or pass --prefix"
-    for dir in bin sbin lib conf logs work wheels migrations/sqlite data/cache; do
+    for dir in bin sbin lib conf logs work wheels data/cache; do
         mkdir -p "$prefix/$dir"
     done
     chmod 0700 "$prefix/data"
@@ -276,14 +273,12 @@ YAML
     log "  wrote $conf"
 }
 
-install_manifests_and_migrations() {
+install_manifests() {
     mkdir -p "$prefix/conf/applications"
     for manifest in "$pkg"/config/applications/*.yaml "$pkg"/config/applications/*.yml; do
         [ -f "$manifest" ] || continue
         cp "$manifest" "$prefix/conf/applications/$(basename "$manifest")"
     done
-    # the session manager reads migrations/sqlite relative to its working directory, the prefix
-    cp "$pkg"/config/migrations/sqlite/* "$prefix/migrations/sqlite/"
 }
 
 # --- systemd -----------------------------------------------------------------------------------
@@ -391,7 +386,7 @@ install_node() {
     done
     if [ "$join" -eq 0 ]; then
         install_bin flame-session-manager
-        install_manifests_and_migrations
+        install_manifests
         # the head runs no Python application, but flmenv.sh and the unit need a version to name
         installed_versions=""
     else

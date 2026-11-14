@@ -135,7 +135,7 @@ mod tests {
     }
 
     struct TestEnv {
-        url: String,
+        _directory: tempfile::TempDir,
         pub controller: ControllerPtr,
     }
 
@@ -148,7 +148,6 @@ mod tests {
             let filter = tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("h2=error".parse()?)
                 .add_directive("hyper_util=error".parse()?)
-                .add_directive("sqlx=error".parse()?)
                 .add_directive("tower=error".parse()?);
 
             let _ = tracing_subscriber::fmt()
@@ -158,10 +157,11 @@ mod tests {
                 .with_ansi(false)
                 .try_init();
 
-            let url = common::temp_db_path("flame_test_env");
+            let directory =
+                tempfile::tempdir().map_err(|error| FlameError::Storage(error.to_string()))?;
             let config = FlameClusterContext {
                 cluster: FlameCluster {
-                    storage: format!("sqlite:///{url}"),
+                    storage: format!("fs://{}", directory.path().display()),
                     recovery: FlameRecovery {
                         session: FlameSessionRecovery { retry_limits },
                     },
@@ -173,14 +173,10 @@ mod tests {
             let storage = tokio_test::block_on(storage::new_ptr(&config))?;
             let controller = controller::new_ptr(storage.clone());
 
-            Ok(Self { url, controller })
-        }
-    }
-
-    impl Drop for TestEnv {
-        fn drop(&mut self) {
-            // Best-effort cleanup - ignore errors (e.g., file in use on Windows)
-            let _ = std::fs::remove_file(&self.url);
+            Ok(Self {
+                _directory: directory,
+                controller,
+            })
         }
     }
 

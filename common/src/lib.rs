@@ -161,45 +161,10 @@ pub fn temp_dir() -> std::path::PathBuf {
     std::env::temp_dir()
 }
 
-/// Creates a SQLite URL pointing to a temporary database file.
-/// The path is cross-platform compatible.
-///
-/// # Example
-/// ```
-/// let url = common::temp_sqlite_url("flame_test_my_feature");
-/// // On Unix: "sqlite:///tmp/flame_test_my_feature_1234567890.db"
-/// // On Windows: "sqlite://C:/Users/.../AppData/Local/Temp/flame_test_my_feature_1234567890.db"
-/// ```
-pub fn temp_sqlite_url(prefix: &str) -> String {
-    let timestamp = chrono::Utc::now().timestamp();
-    let temp_path = temp_dir().join(format!("{}_{}.db", prefix, timestamp));
-    format!("sqlite://{}", temp_path.display())
-}
-
-/// Creates a temporary database file path (without the sqlite:// prefix).
-/// Returns the path as a String for use with storage config and cleanup.
-///
-/// # Example
-/// ```
-/// let path = common::temp_db_path("flame_test_my_feature");
-/// let url = format!("sqlite:///{}", path);
-/// // Later: std::fs::remove_file(&path).ok();
-/// ```
-pub fn temp_db_path(prefix: &str) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let timestamp = chrono::Utc::now().timestamp_micros();
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temp_path = temp_dir().join(format!("{}_{}_{}.db", prefix, timestamp, counter));
-    temp_path.to_string_lossy().to_string()
-}
-
 pub fn init_logger(component: Option<&str>) -> Result<Option<WorkerGuard>, FlameError> {
     let filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive("h2=error".parse()?)
         .add_directive("hyper_util=error".parse()?)
-        .add_directive("sqlx=warn".parse()?)
         .add_directive("tower=error".parse()?);
 
     let time_format = LocalTime::new(format_description!(

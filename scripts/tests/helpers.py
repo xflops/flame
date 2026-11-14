@@ -81,8 +81,6 @@ def make_package(directory, version="v1.2.3", fmt="1"):
     write_executable(directory / "bin/uv", FAKE_UV)
     (directory / "wheels").mkdir(parents=True, exist_ok=True)
     (directory / "wheels/flamepy-0.7.0-py3-none-any.whl").write_text("wheel")
-    (directory / "config/migrations/sqlite").mkdir(parents=True, exist_ok=True)
-    (directory / "config/migrations/sqlite/001.sql").write_text("create table t(x);")
     (directory / "config/applications").mkdir(parents=True, exist_ok=True)
     (directory / "config/applications/flmexec.yaml").write_text("metadata:\n  name: flmexec\n")
     (directory / "examples/pi").mkdir(parents=True, exist_ok=True)

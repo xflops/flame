@@ -28,6 +28,18 @@ All services and messages are defined in the `flame.v1` package.
 package flame.v1;
 ```
 
+## Metadata storage
+
+The session manager supports filesystem storage and `none` (in memory).
+Filesystem is the default: `cluster.storage: "fs://data"`. Relative filesystem
+paths resolve beneath `FLAME_HOME`; use `fs:///absolute/path` for an absolute
+path. The `file://` and `filesystem://` aliases are also supported.
+
+`none` retains records only for the current process and starts empty after a
+restart. SQLite storage URLs and the `flmctl migrate` command are no longer
+supported. Existing SQLite databases are not converted or deleted; configure
+filesystem storage for a new durable store.
+
 ## Authentication
 
 Flame supports TLS for secure communication. Configure TLS certificates in your client configuration:

@@ -31,7 +31,7 @@ const DEFAULT_FLAME_ENDPOINT: &str = "http://127.0.0.1:8080";
 /// Available configurable policies: "priority", "drf", "das"
 /// Note: "shim" plugin is always enabled (required for executor matching)
 pub const DEFAULT_POLICIES: &[&str] = &["priority", "drf", "das"];
-const DEFAULT_STORAGE: &str = "sqlite://flame.db";
+const DEFAULT_STORAGE: &str = "fs://data";
 const DEFAULT_MAX_EXECUTORS_PER_NODE: u32 = 128;
 pub const DEFAULT_SESSION_RETRY_LIMITS: u32 = 5;
 const DEFAULT_SCHEDULE_INTERVAL: u64 = 100;
@@ -984,6 +984,14 @@ mod tests {
     }
 
     #[test]
+    fn cluster_storage_defaults_to_filesystem() {
+        assert_eq!(FlameCluster::default().storage, "fs://data");
+        let yaml: FlameClusterYaml =
+            serde_yaml::from_str("name: flame\nendpoint: http://127.0.0.1:8080\n").unwrap();
+        assert_eq!(FlameCluster::try_from(yaml).unwrap().storage, "fs://data");
+    }
+
+    #[test]
     fn test_flame_context_from_file() -> Result<(), FlameError> {
         // Executor limits explicitly identify their scope.
         let context_string = r#"---
@@ -994,7 +1002,7 @@ cluster:
   policies:
     - priority
     - drf
-  storage: sqlite://flame.db
+  storage: fs://data
   executors:
     shims: [host]
   limits:
@@ -1016,7 +1024,7 @@ cluster:
             Some(ResourceRequirement::from("cpu=1,mem=1g"))
         );
         assert_eq!(ctx.cluster.policies, vec!["priority", "drf"]);
-        assert_eq!(ctx.cluster.storage, "sqlite://flame.db");
+        assert_eq!(ctx.cluster.storage, "fs://data");
         assert_eq!(ctx.cluster.executors.shims, [Shim::Host]);
         assert_eq!(ctx.cluster.limits.node.max_executors, 10);
 
