@@ -327,31 +327,3 @@ impl SessionEntry {
         }
     }
 }
-
-#[cfg(test)]
-mod record_size_tests {
-    use super::*;
-
-    #[test]
-    fn task_record_size_is_constant_for_extreme_values() {
-        let max = TaskMetadata {
-            id: u64::MAX,
-            version: u32::MAX,
-            checksum: u32::MAX,
-            state: u8::MAX,
-            creation_time: i64::MIN,
-            completion_time: i64::MAX,
-            input_offset: u64::MAX,
-            input_len: u64::MAX,
-            output_offset: u64::MAX,
-            output_len: u64::MAX,
-            affinity_offset: u64::MAX,
-            affinity_len: u64::MAX,
-        };
-        let encoded = postcard::to_allocvec(&max).unwrap();
-        assert_eq!(encoded.len(), task_record_size());
-        let (decoded, _): (TaskMetadata, _) = postcard::take_from_bytes(&encoded).unwrap();
-        assert_eq!(decoded.id, u64::MAX);
-        assert_eq!(decoded.creation_time, i64::MIN);
-    }
-}

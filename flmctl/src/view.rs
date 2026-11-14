@@ -349,35 +349,4 @@ fn get_type(schema: Option<String>) -> Result<String, FlameError> {
 }
 
 #[cfg(test)]
-#[path = "view_node_tests.rs"]
-mod node_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::TimeZone;
-    use flame_rs::client::Event;
-
-    #[test]
-    fn format_events_includes_session_event_details() {
-        let event = Event {
-            code: 1001,
-            message: Some("bind failed".to_string()),
-            creation_time: chrono::Utc.with_ymd_and_hms(2026, 5, 8, 10, 1, 2).unwrap(),
-        };
-
-        let formatted = format_events(&[event]);
-
-        assert!(formatted.contains("10:01:02.000"));
-        assert!(formatted.contains("bind failed"));
-        assert!(formatted.contains("(1001)"));
-    }
-
-    #[test]
-    fn format_task_summary_includes_all_states() {
-        let summary = format_task_summary(3, 1, 2, 1);
-
-        assert_eq!(summary, "3 pending, 1 running, 2 succeed, 1 failed");
-        assert!(!summary.contains("4 failed"));
-    }
-}
+mod tests;
