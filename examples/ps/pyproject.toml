@@ -5,15 +5,15 @@ description = "Parameter server with flamepy.app"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "torch",
-    "torchvision",
-    "numpy",
-    "filelock",
+    "torch>=2.15.0",
+    "torchvision>=0.29.2",
+    "numpy>=2.5.4",
+    "filelock>=4.2.10",
     "flamepy",
 ]
 
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=84.2.1", "wheel>=0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

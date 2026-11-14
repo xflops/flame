@@ -10,7 +10,7 @@ rpc = { path = "../rpc"}
 stdng = { path = "../stdng" }
 
 tokio = { workspace = true }
-parking_lot = { version = "0.13", features = ["arc_lock"] }
+parking_lot = { version = "0.13.0", features = ["arc_lock"] }
 tonic = { workspace = true }
 prost = { workspace = true }
 tracing = { workspace = true }
@@ -21,7 +21,7 @@ postcard = { workspace = true }
 async-trait = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
-crc32fast = "1.5"
+crc32fast = "1.5.5"
 
 time = { workspace = true }
 bytes = { workspace = true }
@@ -29,15 +29,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_derive = { workspace = true }
 thiserror = { workspace = true }
-strum = { workspace = true }
 strum_macros = { workspace = true }
 chrono = { workspace = true }
 serde_yaml = { workspace = true }
 humantime = { workspace = true }
-rustix = { version = "1.1" , features = ["system"] }
-bytesize = "2.7"
-network-interface = "2"
-regex = "1"
+rustix = { version = "1.1.6" , features = ["system"] }
+bytesize = "2.7.0"
+network-interface = "2.0.5"
+regex = "1.13.1"
 
 axum = { workspace = true }
 pprof = { workspace = true }
@@ -45,5 +44,5 @@ pprof = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio-test = "*"
+tokio-test = "0.4.6"
 rand = { workspace = true }

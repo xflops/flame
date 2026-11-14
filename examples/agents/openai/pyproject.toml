@@ -5,8 +5,8 @@ description = "Flame OpenAI Agent Example"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "openai",
-  "openai-agents",
+  "openai>=3.50.0",
+  "openai-agents>=0.24.0",
   "flamepy",
 ]
 

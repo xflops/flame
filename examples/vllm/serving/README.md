@@ -25,7 +25,7 @@ the package, and registers the worker. FEM installs its pinned vLLM dependencies
 The console client needs only the Flame SDK; run it with `python3` to avoid
 installing CUDA dependencies on the console.
 
-The example pins vLLM 0.32.0, which accepts FEM-assigned GPU UUIDs. It uses
+The example pins vLLM 0.33.0, which accepts FEM-assigned GPU UUIDs. It uses
 Triton attention and disables FlashInfer sampling by default so the worker does
 not need `nvcc`. Engine sockets default to `/tmp` to avoid Unix socket path limits
 under executor work directories. Explicit `VLLM_RPC_BASE_PATH` and
@@ -47,7 +47,7 @@ short connection deadline separate from model setup; no additional setup or
 teardown deadline is imposed in this version.
 Heavy vLLM imports and model construction run inside setup, so model loading
 does not delay the listening marker. The teardown uses the pinned version's
-[engine-core shutdown API](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core_client.py).
+[engine-core shutdown API](https://github.com/vllm-project/vllm/blob/v0.33.0/vllm/v1/engine/core_client.py).
 
 ## Run
 

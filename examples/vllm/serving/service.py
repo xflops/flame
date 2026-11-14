@@ -35,7 +35,7 @@ def create_engine():
 def destroy_engine():
     global llm
     if llm is not None:
-        # vLLM 0.32.0 exposes shutdown on the engine-core client, not LLM.
+        # vLLM 0.33.0 exposes shutdown on the engine-core client, not LLM.
         llm.llm_engine.engine_core.shutdown()
         llm = None
 

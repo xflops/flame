@@ -45,7 +45,7 @@ jobs:
           path: source
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v10.3.3
 
       - name: Validate release metadata
         id: metadata
@@ -74,7 +74,7 @@ jobs:
           python-version: "3.12"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v10.3.3
 
       - name: Validate PyPI credentials
         env:
@@ -120,7 +120,7 @@ jobs:
           path: source
 
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
 
@@ -163,7 +163,7 @@ jobs:
           path: source
 
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
           cache-workspaces: source
@@ -172,9 +172,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v10.3.3
         with:
-          version: 0.9.26
+          version: 0.13.8
 
       - name: Build the release assets
         working-directory: source

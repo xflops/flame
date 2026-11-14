@@ -4,10 +4,10 @@ version = "0.1.0"
 description = "Search-R1 style RL training on Flame: driver, rollout and trainer services"
 requires-python = ">=3.12"
 # Installed on the executors that run the services.
-dependencies = ["vllm==0.32.0", "bm25s>=0.2", "datasets>=3", "safetensors"]
+dependencies = ["vllm==0.33.0", "bm25s>=0.3.16", "datasets>=5.2.0", "safetensors>=0.8.0"]
 
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=84.2.1", "wheel>=0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

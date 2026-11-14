@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = []
-wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
+wasm = ["dep:anyhow", "dep:wasmtime", "dep:wasmtime-wasi"]
 
 [dependencies]
 rpc = { path = "../rpc" }
@@ -25,35 +25,34 @@ hyper-util = { workspace = true }
 chrono = { workspace = true }
 nix = { workspace = true }
 url = { workspace = true }
-actix-rt = { workspace = true }
-futures = { workspace = true }
 uuid = { workspace = true }
-rustix = { version = "1.1", features = ["system"] }
-num_cpus = "1.17"
+rustix = { version = "1.1.6", features = ["system"] }
+num_cpus = "1.17.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_derive = { workspace = true }
-sha2 = "0.11"
-toml = "1.1"
+sha2 = "0.11.1"
+toml = "1.2.1"
 
 bytes = { workspace = true }
-flate2 = "1"
-zstd = "0.14"
-tar = "0.4"
-zip = "9"
-reqwest = { version = "0.13", features = ["rustls", "stream"], default-features = false }
-futures-util = "0.3"
-wasmtime = { version = "50", optional = true }
-wasmtime-wasi = { version = "50", optional = true }
-anyhow = "1"
+flate2 = "1.1.11"
+zstd = "0.14.4"
+tar = "0.4.46"
+zip = "9.5.1"
+reqwest = { version = "0.13.5", features = ["rustls", "stream"], default-features = false }
+futures-util = "0.3.34"
+wasmtime = { version = "50.0.1", optional = true }
+wasmtime-wasi = { version = "50.0.1", optional = true }
+anyhow = { version = "1.0.104", optional = true }
 tokio-stream = { workspace = true }
-shellexpand = "3.1"
-nvml-wrapper = "0.13"
-notify = "8"
+shellexpand = "3.1.2"
+nvml-wrapper = "0.13.0"
+notify = "8.2.2"
 
 [lints.rust]
 unused = "allow"
 unsafe_code = "forbid"
 
 [dev-dependencies]
-tempfile = "3"
+futures = { workspace = true }
+tempfile = "3.27.0"
