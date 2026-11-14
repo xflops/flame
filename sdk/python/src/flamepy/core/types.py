@@ -11,6 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import hashlib
 import os
 import random
 import string
@@ -327,8 +328,12 @@ class FlameClientTls:
                  For self-signed certificates, this must point to the CA
                  certificate that signed the server certificate.
         cert_file: Path to the client certificate chain (PEM).
-        key_file: Path to the matching private key (PEM). Both identity files
-                  must be set together.
+        key_file: Path to the matching private key (PEM).
+        ca_data: Standard base64-encoded PEM CA certificates, instead of ca_file.
+        cert_data: Standard base64-encoded PEM client chain, instead of cert_file.
+        key_data: Standard base64-encoded PEM private key, instead of key_file.
+                  A client identity needs both a certificate and matching key,
+                  with either a file or inline source for each credential.
 
     Note:
         To disable TLS for development, use http:// instead of https://
@@ -338,12 +343,42 @@ class FlameClientTls:
     ca_file: Optional[str] = None
     cert_file: Optional[str] = None
     key_file: Optional[str] = None
+    ca_data: Optional[str] = field(default=None, repr=False)
+    cert_data: Optional[str] = field(default=None, repr=False)
+    key_data: Optional[str] = field(default=None, repr=False)
 
     def validate_identity(self) -> None:
-        if self.cert_file == "" or self.key_file == "":
-            raise ValueError("TLS cert_file and key_file must not be empty")
-        if bool(self.cert_file) != bool(self.key_file):
-            raise ValueError("TLS cert_file and key_file must be configured together")
+        """Validate sources and identity completeness without opening credential files."""
+        for name in ("ca", "cert", "key"):
+            file = getattr(self, f"{name}_file")
+            data = getattr(self, f"{name}_data")
+            for suffix, value in (("file", file), ("data", data)):
+                if value is not None and not isinstance(value, str):
+                    raise ValueError(f"TLS {name}_{suffix} must be a string")
+                if value == "":
+                    raise ValueError(f"TLS {name}_{suffix} must not be empty")
+            if file is not None and data is not None:
+                raise ValueError(f"TLS {name}_file and {name}_data must not be configured together")
+        certificate = self.cert_file is not None or self.cert_data is not None
+        key = self.key_file is not None or self.key_data is not None
+        if certificate != key:
+            raise ValueError("TLS client certificate (cert_file or cert_data) and private key (key_file or key_data) must be configured together")
+
+    def fingerprint(self) -> str:
+        """Identify credential sources without exposing inline secrets in pool keys."""
+        digest = hashlib.sha256()
+        for name in ("ca_file", "cert_file", "key_file", "ca_data", "cert_data", "key_data"):
+            value = getattr(self, name)
+            if value is None:
+                digest.update(b"\x00")
+            elif isinstance(value, str):
+                encoded = value.encode("utf-8", "surrogatepass")
+                digest.update(b"\x01" + len(encoded).to_bytes(8, "big") + encoded)
+            else:
+                # Plaintext endpoints ignore TLS settings. Secure endpoints
+                # reject invalid field types in validate_identity before use.
+                digest.update(b"\x02")
+        return digest.hexdigest()
 
 
 @dataclass
@@ -418,7 +453,14 @@ class FlameContext:
         config_file = home / ".flame" / DEFAULT_FLAME_CONF
         if config_file.exists():
             with open(config_file, "r") as f:
-                config = yaml.safe_load(f)
+                try:
+                    config = yaml.safe_load(f)
+                except yaml.YAMLError as error:
+                    mark = getattr(error, "problem_mark", None)
+                    location = f" at line {mark.line + 1}, column {mark.column + 1}" if mark is not None else ""
+                    raise FlameError(FlameErrorCode.INVALID_CONFIG, f"invalid YAML in {config_file}{location}") from None
+                if not isinstance(config, dict):
+                    raise FlameError(FlameErrorCode.INVALID_CONFIG, "Flame configuration must be a mapping")
                 current_context = config.get("current-context")
                 if current_context is None:
                     raise FlameError(FlameErrorCode.INVALID_CONFIG, "current-context is not set")
@@ -432,10 +474,15 @@ class FlameContext:
                         # Parse cluster TLS configuration
                         cluster_tls = cluster_config.get("tls")
                         if cluster_tls is not None:
+                            if not isinstance(cluster_tls, dict):
+                                raise FlameError(FlameErrorCode.INVALID_CONFIG, "cluster TLS configuration must be a mapping")
                             self._cluster_tls = FlameClientTls(
                                 ca_file=cluster_tls.get("ca_file"),
                                 cert_file=cluster_tls.get("cert_file"),
                                 key_file=cluster_tls.get("key_file"),
+                                ca_data=cluster_tls.get("ca_data"),
+                                cert_data=cluster_tls.get("cert_data"),
+                                key_data=cluster_tls.get("key_data"),
                             )
 
                         # Parse cache configuration
@@ -443,10 +490,15 @@ class FlameContext:
                         if cache_config is not None:
                             cache_tls = cache_config.get("tls")
                             if cache_tls is not None:
+                                if not isinstance(cache_tls, dict):
+                                    raise FlameError(FlameErrorCode.INVALID_CONFIG, "cache TLS configuration must be a mapping")
                                 self._cache_tls = FlameClientTls(
                                     ca_file=cache_tls.get("ca_file"),
                                     cert_file=cache_tls.get("cert_file"),
                                     key_file=cache_tls.get("key_file"),
+                                    ca_data=cache_tls.get("ca_data"),
+                                    cert_data=cache_tls.get("cert_data"),
+                                    key_data=cache_tls.get("key_data"),
                                 )
                             self._cache = FlameClientCache(
                                 endpoint=cache_config.get("endpoint"),
@@ -467,15 +519,15 @@ class FlameContext:
                 else:
                     raise FlameError(FlameErrorCode.INVALID_CONFIG, f"context <{current_context}> not found")
 
-        # Apply environment variable overrides (these take precedence over config file)
-        # This also allows building context entirely from env vars when no config file exists
+        # Endpoint settings override YAML; TLS file settings fill missing sources.
+        # This also supports contexts configured entirely through the environment.
         self._apply_env_overrides()
 
     def _apply_env_overrides(self):
-        """Apply environment variable overrides to the context.
+        """Override endpoints and fill missing TLS credentials from the environment.
 
         This method handles:
-        1. Overriding config file values with env vars
+        1. Overriding endpoints and filling credentials with neither source configured
         2. Building context entirely from env vars when no config file exists
 
         Environment variables:
@@ -492,12 +544,12 @@ class FlameContext:
             # Set CA file for cluster TLS
             if self._cluster_tls is None:
                 self._cluster_tls = FlameClientTls(ca_file=ca_file)
-            elif self._cluster_tls.ca_file is None:
+            elif self._cluster_tls.ca_file is None and self._cluster_tls.ca_data is None:
                 self._cluster_tls.ca_file = ca_file
             # Set CA file for cache TLS
             if self._cache_tls is None:
                 self._cache_tls = FlameClientTls(ca_file=ca_file)
-            elif self._cache_tls.ca_file is None:
+            elif self._cache_tls.ca_file is None and self._cache_tls.ca_data is None:
                 self._cache_tls.ca_file = ca_file
 
         cert_file = os.getenv("FLAME_CERT_FILE")
@@ -508,14 +560,14 @@ class FlameContext:
             if self._cache_tls is None:
                 self._cache_tls = FlameClientTls()
             if cert_file is not None:
-                if self._cluster_tls.cert_file is None:
+                if self._cluster_tls.cert_file is None and self._cluster_tls.cert_data is None:
                     self._cluster_tls.cert_file = cert_file
-                if self._cache_tls.cert_file is None:
+                if self._cache_tls.cert_file is None and self._cache_tls.cert_data is None:
                     self._cache_tls.cert_file = cert_file
             if key_file is not None:
-                if self._cluster_tls.key_file is None:
+                if self._cluster_tls.key_file is None and self._cluster_tls.key_data is None:
                     self._cluster_tls.key_file = key_file
-                if self._cache_tls.key_file is None:
+                if self._cache_tls.key_file is None and self._cache_tls.key_data is None:
                     self._cache_tls.key_file = key_file
 
         # Override/set endpoint

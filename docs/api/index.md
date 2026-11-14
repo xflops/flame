@@ -50,6 +50,12 @@ contexts:
         key_file: "/etc/flame/certs/client.key"
 ```
 
+Client TLS also supports `ca_data`, `cert_data`, and `key_data` containing
+base64-encoded PEM, allowing a self-contained configuration. Each credential
+can use a file or embedded data; conflicting sources and incomplete identities
+are rejected. See [Portable TLS Configuration](../sdk/index.md#portable-tls-configuration)
+for a shared `flmctl`/Rust/Flamepy example and encoding instructions.
+
 ## Error Handling
 
 gRPC status codes are used for error reporting:

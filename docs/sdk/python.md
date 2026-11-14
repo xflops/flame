@@ -37,7 +37,8 @@ contexts:
       endpoint: "grpc://127.0.0.1:9090"
 ```
 
-Environment variables set endpoints and fill TLS fields absent from the file:
+Environment variables set endpoints and fill TLS credentials with neither a
+file nor embedded value configured:
 
 - `FLAME_ENDPOINT`
 - `FLAME_CACHE_ENDPOINT`
@@ -47,8 +48,11 @@ Environment variables set endpoints and fill TLS fields absent from the file:
 - `FLAME_KEY_FILE`
 
 Use `https://` for the session-manager endpoint when TLS is enabled. Use `grpcs://` for the object-cache endpoint when cache TLS is enabled.
-For a client certificate, set both `cert_file` and `key_file` under the
-relevant `cluster.tls` or `cache.tls` section. An external cache proxy uses
+For a client certificate, supply its matching private key under the
+relevant `cluster.tls` or `cache.tls` section. Both accept PEM file paths or
+base64-encoded PEM through `ca_data`, `cert_data`, and `key_data`; see
+[Portable TLS Configuration](index.md#portable-tls-configuration).
+An external cache proxy uses
 `grpc-proxy://host:port` for plaintext HTTP/2 or `grpcs-proxy://host:port`
 for TLS. Both require an explicit port and send the owning cache address in
 `x-flame-object-cache` metadata for reference requests. Gateways route these

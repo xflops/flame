@@ -1868,6 +1868,7 @@ dependencies = [
 name = "flame-rs"
 version = "0.8.0"
 dependencies = [
+ "base64 0.23.1",
  "bson",
  "bytes",
  "chrono",
@@ -1876,12 +1877,14 @@ dependencies = [
  "futures",
  "postcard",
  "prost 0.14.6",
+ "rustls",
  "serde",
  "serde_derive",
  "serde_json",
  "serde_yaml",
  "stdng",
  "strum_macros 0.28.0",
+ "tempfile",
  "thiserror 2.0.21",
  "time",
  "tokio",

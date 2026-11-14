@@ -17,12 +17,31 @@ contexts:
       endpoint: "grpc://127.0.0.1:9090"
 ```
 
-Environment variables override the file:
+Environment variables override endpoint settings and fill TLS credentials with
+neither a file nor embedded value configured:
 
 - `FLAME_ENDPOINT`
 - `FLAME_CACHE_ENDPOINT`
 - `FLAME_CACHE_STORAGE`
 - `FLAME_CA_FILE`
+- `FLAME_CERT_FILE`
+- `FLAME_KEY_FILE`
+
+### Client TLS
+
+`cluster.tls` and `cache.tls` accept the fields of
+`flamepy.core.types.FlameClientTls`:
+
+- `ca_file`, `cert_file`, `key_file`: paths to PEM credentials.
+- `ca_data`, `cert_data`, `key_data`: single-line standard base64-encoded PEM.
+
+Each credential accepts one source. A client identity requires both its
+certificate and matching private key; CA-only TLS omits both. File and inline
+sources can be mixed across credentials. Embedded credentials are decoded and
+validated in memory, with server certificate and hostname verification enabled.
+The same configuration works with synchronous and asynchronous clients.
+See [Portable TLS Configuration](../../../docs/sdk/index.md#portable-tls-configuration)
+for a complete YAML example and encoding instructions.
 
 ## Client API
 

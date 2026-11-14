@@ -27,7 +27,8 @@ flame-rs = { path = "../../../sdk/rust", features = ["macros"] }
 
 The top-level helpers read `~/.flame/flame.yaml` and apply `FLAME_ENDPOINT`,
 `FLAME_CACHE_ENDPOINT`, `FLAME_CA_FILE`, `FLAME_CERT_FILE`, and `FLAME_KEY_FILE`
-settings. Endpoint values override the file; TLS values fill unset fields:
+settings. Endpoint values override the file; TLS file variables fill credentials
+with neither a file nor embedded value configured:
 
 ```yaml
 current-context: flame
@@ -40,8 +41,11 @@ contexts:
 ```
 
 Use `flame_rs::connect_with_config(Some(path))` or `flame_rs::connect_with_context(context)` when a process needs an explicit config source.
-For a client certificate, set both `cert_file` and `key_file` under the
-relevant `cluster.tls` or `cache.tls` section. An external cache proxy uses
+For a client certificate, supply its matching private key under the
+relevant `cluster.tls` or `cache.tls` section. Both accept PEM file paths or
+base64-encoded PEM through `ca_data`, `cert_data`, and `key_data`; see
+[Portable TLS Configuration](index.md#portable-tls-configuration).
+An external cache proxy uses
 `grpc-proxy://host:port` for plaintext HTTP/2 or `grpcs-proxy://host:port`
 for TLS. Both require an explicit port and send the owning cache address in
 `x-flame-object-cache` metadata for reference requests. Gateways route these

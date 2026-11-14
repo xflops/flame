@@ -46,3 +46,11 @@ def sample_application():
     from flamepy.core.types import Application, ApplicationState
 
     return Application(id="app-1", name="test-app", state=ApplicationState.ENABLED, creation_time=datetime.now(timezone.utc))
+
+
+@pytest.fixture(scope="session")
+def tls_material():
+    """Keep synthetic CA/client/server PEM material out of the user's filesystem."""
+    from tests.tls_helpers import make_tls_material
+
+    return make_tls_material()

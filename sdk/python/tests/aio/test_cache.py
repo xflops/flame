@@ -67,13 +67,13 @@ class TestAioCache:
         asyncio.run(run())
         assert not any(key == "grpc.default_authority" for key, _ in calls[0][1])
 
-    def test_proxy_client_identity_and_owner_metadata(self, monkeypatch, tmp_path):
+    def test_proxy_client_identity_and_owner_metadata(self, monkeypatch, tmp_path, tls_material):
         ca = tmp_path / "ca.pem"
         cert = tmp_path / "client.pem"
         key = tmp_path / "client-key.pem"
-        ca.write_bytes(b"ca")
-        cert.write_bytes(b"certificate")
-        key.write_bytes(b"private key")
+        ca.write_bytes(tls_material["ca"])
+        cert.write_bytes(tls_material["client"])
+        key.write_bytes(tls_material["client_key"])
         credentials = []
         channels = []
         monkeypatch.setattr(aio_cache.grpc, "ssl_channel_credentials", lambda **kwargs: credentials.append(kwargs) or object())
@@ -92,14 +92,14 @@ class TestAioCache:
 
         asyncio.run(run())
         assert channels == [("gateway.example:443", cache_module.GRPC_OPTIONS)]
-        assert credentials == [{"root_certificates": b"ca", "private_key": b"private key", "certificate_chain": b"certificate"}]
+        assert credentials == [{"root_certificates": tls_material["ca"], "private_key": tls_material["client_key"], "certificate_chain": tls_material["client"]}]
 
     def test_incomplete_client_identity_rejected(self):
-        with pytest.raises(ValueError, match="cert_file and key_file"):
+        with pytest.raises(ValueError, match="certificate.*private key"):
             FlameClientTls(cert_file="client.pem").validate_identity()
         with pytest.raises(ValueError, match="must not be empty"):
             FlameClientTls(cert_file="", key_file="").validate_identity()
-        with pytest.raises(ValueError, match="cert_file and key_file"):
+        with pytest.raises(ValueError, match="certificate.*private key"):
             aio_cache._create_client("grpcs-proxy://gateway.example:443", FlameClientTls(key_file="key.pem"), None)
 
     @pytest.mark.parametrize("scheme", ["grpc", "grpc-proxy"])
