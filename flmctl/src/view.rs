@@ -91,7 +91,7 @@ async fn view_session(
     }
 }
 
-fn format_task_summary(pending: i32, running: i32, succeed: i32, failed: i32) -> String {
+pub(crate) fn format_task_summary(pending: i32, running: i32, succeed: i32, failed: i32) -> String {
     format!("{pending} pending, {running} running, {succeed} succeed, {failed} failed")
 }
 
@@ -125,7 +125,7 @@ fn view_session_table(session: &client::Session) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn format_events(events: &[client::Event]) -> String {
+pub(crate) fn format_events(events: &[client::Event]) -> String {
     events
         .iter()
         .map(|event| {
@@ -248,7 +248,7 @@ async fn view_node(
 }
 
 /// Render reported node inventory, using a dash for unavailable information.
-fn format_node(node: &client::Node) -> String {
+pub(crate) fn format_node(node: &client::Node) -> String {
     let status = match node.state {
         NodeState::Ready => "Ready",
         NodeState::NotReady => "NotReady",
@@ -345,39 +345,5 @@ fn get_type(schema: Option<String>) -> Result<String, FlameError> {
             Ok(schema_type.to_string().trim_matches('\"').to_string())
         }
         None => Ok("-".to_string()),
-    }
-}
-
-#[cfg(test)]
-#[path = "view_node_tests.rs"]
-mod node_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::TimeZone;
-    use flame_rs::client::Event;
-
-    #[test]
-    fn format_events_includes_session_event_details() {
-        let event = Event {
-            code: 1001,
-            message: Some("bind failed".to_string()),
-            creation_time: chrono::Utc.with_ymd_and_hms(2026, 5, 8, 10, 1, 2).unwrap(),
-        };
-
-        let formatted = format_events(&[event]);
-
-        assert!(formatted.contains("10:01:02.000"));
-        assert!(formatted.contains("bind failed"));
-        assert!(formatted.contains("(1001)"));
-    }
-
-    #[test]
-    fn format_task_summary_includes_all_states() {
-        let summary = format_task_summary(3, 1, 2, 1);
-
-        assert_eq!(summary, "3 pending, 1 running, 2 succeed, 1 failed");
-        assert!(!summary.contains("4 failed"));
     }
 }
