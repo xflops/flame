@@ -47,7 +47,7 @@ pub async fn run(
     }
 }
 
-fn format_json<T: Serialize>(items: &[T]) -> Result<String, serde_json::Error> {
+pub(crate) fn format_json<T: Serialize>(items: &[T]) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(items)
 }
 
@@ -144,7 +144,7 @@ async fn list_executors(conn: Connection, output_format: &str) -> Result<(), Box
     Ok(())
 }
 
-fn executor_table(executors: &[Executor]) -> Table {
+pub(crate) fn executor_table(executors: &[Executor]) -> Table {
     let mut table = Table::new();
     table
         .load_style(NOTHING)
@@ -195,43 +195,4 @@ async fn list_nodes(conn: Connection, output_format: &str) -> Result<(), Box<dyn
     println!("{table}");
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use flame_rs::apis::ExecutorState;
-
-    use super::*;
-
-    #[test]
-    fn executor_table_shows_application() {
-        let table = executor_table(&[Executor {
-            id: "executor-1".to_string(),
-            application: "app-1".to_string(),
-            state: ExecutorState::Idle,
-            session_id: None,
-            node: "node-1".to_string(),
-        }])
-        .to_string();
-
-        assert!(table.contains("App"));
-        assert!(table.contains("app-1"));
-    }
-
-    #[test]
-    fn executor_json_is_an_array_with_state() {
-        let json = format_json(&[Executor {
-            id: "executor-1".to_string(),
-            application: "app-1".to_string(),
-            state: ExecutorState::Idle,
-            session_id: None,
-            node: "node-1".to_string(),
-        }])
-        .unwrap();
-
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value[0]["id"], "executor-1");
-        assert_eq!(value[0]["state"], "Idle");
-        assert_eq!(value[0]["application"], "app-1");
-    }
 }

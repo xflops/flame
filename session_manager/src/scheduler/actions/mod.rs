@@ -32,3 +32,6 @@ pub type ActionPtr = Arc<dyn Action>;
 pub trait Action: Send + Sync + 'static {
     async fn execute(&self, ctx: &mut Context) -> Result<(), FlameError>;
 }
+
+#[cfg(test)]
+mod tests;
