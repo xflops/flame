@@ -232,6 +232,7 @@ fn test_node_crud() -> Result<(), FlameError> {
             ..Default::default()
         },
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
 
     let created = tokio_test::block_on(storage.create_node(&node))?;
@@ -266,6 +267,7 @@ fn test_node_crud() -> Result<(), FlameError> {
             ..Default::default()
         },
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
 
     let updated = tokio_test::block_on(storage.update_node(&updated_node))?;
@@ -313,6 +315,7 @@ fn test_executor_crud() -> Result<(), FlameError> {
             ..Default::default()
         },
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
     tokio_test::block_on(storage.create_node(&node))?;
 
@@ -401,6 +404,7 @@ fn test_node_delete_cascades_to_executors() -> Result<(), FlameError> {
             ..Default::default()
         },
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
     tokio_test::block_on(storage.create_node(&node))?;
 
@@ -464,6 +468,7 @@ fn test_executor_state_transitions() -> Result<(), FlameError> {
         },
         info: NodeInfo::default(),
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
     tokio_test::block_on(storage.create_node(&node))?;
 

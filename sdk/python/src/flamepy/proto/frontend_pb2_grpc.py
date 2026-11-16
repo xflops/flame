@@ -6,7 +6,7 @@ import warnings
 import flamepy.proto.frontend_pb2 as frontend__pb2
 import flamepy.proto.types_pb2 as types__pb2
 
-GRPC_GENERATED_VERSION = '1.85.0'
+GRPC_GENERATED_VERSION = '1.85.1'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -138,10 +138,10 @@ class FrontendStub:
                 request_serializer=frontend__pb2.WatchTaskRequest.SerializeToString,
                 response_deserializer=types__pb2.Task.FromString,
                 _registered_method=True)
-        self.ListTasks = channel.unary_stream(
+        self.ListTasks = channel.unary_unary(
                 '/flame.v1.Frontend/ListTasks',
                 request_serializer=frontend__pb2.ListTasksRequest.SerializeToString,
-                response_deserializer=types__pb2.Task.FromString,
+                response_deserializer=types__pb2.TaskList.FromString,
                 _registered_method=True)
 
 
@@ -381,10 +381,10 @@ def add_FrontendServicer_to_server(servicer, server):
                     request_deserializer=frontend__pb2.WatchTaskRequest.FromString,
                     response_serializer=types__pb2.Task.SerializeToString,
             ),
-            'ListTasks': grpc.unary_stream_rpc_method_handler(
+            'ListTasks': grpc.unary_unary_rpc_method_handler(
                     servicer.ListTasks,
                     request_deserializer=frontend__pb2.ListTasksRequest.FromString,
-                    response_serializer=types__pb2.Task.SerializeToString,
+                    response_serializer=types__pb2.TaskList.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -951,12 +951,12 @@ class Frontend:
             wait_for_ready=None,
             timeout=None,
             metadata=None):
-        return grpc.experimental.unary_stream(
+        return grpc.experimental.unary_unary(
             request,
             target,
             '/flame.v1.Frontend/ListTasks',
             frontend__pb2.ListTasksRequest.SerializeToString,
-            types__pb2.Task.FromString,
+            types__pb2.TaskList.FromString,
             options,
             channel_credentials,
             insecure,

@@ -17,6 +17,7 @@ use crate::apis::TaskCounts;
 mod connection;
 mod history;
 mod lifecycle;
+mod metadata;
 mod none;
 
 pub(super) fn task_snapshot(gid: TaskGID) -> Task {

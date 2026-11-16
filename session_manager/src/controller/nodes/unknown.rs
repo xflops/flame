@@ -75,7 +75,8 @@ impl NodeStates for UnknownState {
         // Clean up all executors on this node
         let executors = self
             .storage
-            .list_executors(Some(&ExecutorFilter::by_node(&node_name)))?;
+            .list_executors(Some(&ExecutorFilter::by_node(&node_name)))
+            .await?;
 
         if !executors.is_empty() {
             tracing::info!(

@@ -20,8 +20,8 @@ def test_aio_frontend_api_parity(frontend_server):
             assert len(await connection.list_applications()) == 1
             assert (await connection.get_application("app")).name == "app"
             assert await connection.get_application("missing") is None
-            assert await connection.list_executors() == []
-            assert await connection.list_nodes() == []
+            assert not (await connection.list_executors())
+            assert not (await connection.list_nodes())
             session = await connection.create_session(SessionAttributes(application="app"))
             assert session.common_data() == b""
             assert (await connection.open_session(session.id)).id == session.id
@@ -29,7 +29,6 @@ def test_aio_frontend_api_parity(frontend_server):
             assert len(await connection.list_sessions()) == 1
             assert (await session.create_task(b"input")).id == "task-1"
             assert (await session.get_task("task-1")).output == b"done"
-            assert [task.id async for task in session.list_tasks()] == ["task-1"]
             updates = session.watch_task("task-1")
             assert (await updates.__anext__()).state == TaskState.SUCCEED
             updates.close()

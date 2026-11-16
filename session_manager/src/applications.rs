@@ -77,7 +77,7 @@ impl ApplicationManager {
         }
         let closed_filter =
             SessionFilter::by_application_state(application.name.clone(), SessionState::Closed);
-        for session in self.storage.list_sessions(Some(&closed_filter))? {
+        for session in self.storage.list_sessions(Some(&closed_filter)).await? {
             match self.controller.delete_session(session.id).await {
                 Ok(_) | Err(FlameError::NotFound(_)) => {}
                 Err(error) => return Err(error),
@@ -88,7 +88,8 @@ impl ApplicationManager {
         let live_filter = SessionFilter::by_application(application.name.clone());
         let has_live_sessions = self
             .storage
-            .list_sessions(Some(&live_filter))?
+            .list_sessions(Some(&live_filter))
+            .await?
             .iter()
             .any(|session| !session.is_closed());
         if has_live_sessions {
@@ -97,7 +98,8 @@ impl ApplicationManager {
 
         let idle_executors = self
             .storage
-            .list_executors(Some(&ExecutorFilter::by_state(ExecutorState::Idle)))?
+            .list_executors(Some(&ExecutorFilter::by_state(ExecutorState::Idle)))
+            .await?
             .into_iter()
             .filter(|executor| executor.application == application.name)
             .map(|executor| executor.id)

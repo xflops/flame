@@ -20,6 +20,7 @@ mod to_rpc;
 mod types;
 
 pub use executor::{Executor, ExecutorPtr};
+pub(crate) use filters::paginate;
 pub use filters::*;
 pub use types::*;
 

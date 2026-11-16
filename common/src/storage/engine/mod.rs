@@ -75,7 +75,10 @@ pub trait Engine: Send + Sync + 'static {
         state: SessionState,
     ) -> Result<Session, FlameError>;
     async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError>;
-    async fn find_sessions(&self) -> Result<Vec<Session>, FlameError>;
+
+    /// Load session headers without retaining credentials or payloads. Closed
+    /// sessions include their final task counters reconstructed from headers.
+    async fn find_session_metadata(&self) -> Result<Vec<Session>, FlameError>;
 
     // Task operations
     async fn create_task(
@@ -105,7 +108,12 @@ pub trait Engine: Send + Sync + 'static {
         task_result: TaskResult,
     ) -> Result<Task, FlameError>;
 
-    async fn find_tasks(&self, filter: &TaskFilter) -> Result<Vec<Task>, FlameError>;
+    /// Capture matching task headers, ordered by creation time descending and
+    /// numeric ID ascending. Recovery hydrates selected records through `get_task`.
+    async fn find_task_metadata(
+        &self,
+        filter: &TaskFilter,
+    ) -> Result<crate::apis::Page<Task>, FlameError>;
 
     // Node operations
     async fn create_node(&self, node: &Node) -> Result<Node, FlameError>;

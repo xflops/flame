@@ -10,17 +10,24 @@ import grpc
 from flamepy.core.types import (
     Application,
     ApplicationAttributes,
+    ApplicationFilter,
     ApplicationSchema,
     ApplicationState,
     Event,
+    ExecutorFilter,
     FlameClientTls,
     FlameError,
     FlameErrorCode,
+    NodeFilter,
+    Page,
+    Paging,
     SessionAttributes,
+    SessionFilter,
     SessionID,
     SessionState,
     Shim,
     Task,
+    TaskFilter,
     TaskID,
     TaskOptions,
     TaskState,
@@ -57,8 +64,25 @@ from flamepy.proto.types_pb2 import (
     TaskSpec,
 )
 from flamepy.proto.types_pb2 import (
+    Paging as PagingProto,
+)
+from flamepy.proto.types_pb2 import (
     ResourceRequirement as ResourceRequirementProto,
 )
+
+
+def _page(response: Any, items: List[Any]) -> Page[Any]:
+    if not response.HasField("paging"):
+        raise FlameError(FlameErrorCode.INTERNAL, "list response is missing paging")
+    wire = response.paging
+    paging = Paging(limit=wire.limit, number=wire.number, total=wire.total if wire.HasField("total") else None)
+    if paging.total is None or not 1 <= paging.limit <= 1000 or paging.number < 1:
+        raise FlameError(FlameErrorCode.INTERNAL, "invalid list response paging or missing total")
+    return Page(items=items, paging=paging)
+
+
+def _wire_paging(paging: Optional[Paging]) -> Optional[PagingProto]:
+    return None if paging is None else PagingProto(limit=paging.limit, number=paging.number, total=paging.total)
 
 
 def _optional_field(message: Any, field: str) -> Any:
@@ -136,14 +160,18 @@ def _raise_for_result(response, operation: str) -> None:
 
 
 def _grpc_error(error: grpc.RpcError, operation: str) -> FlameError:
-    code = error.code()
+    return _grpc_status_error(error.code(), error.details(), operation)
+
+
+def _grpc_status_error(code: grpc.StatusCode, details: str, operation: str) -> FlameError:
+    """Preserve server errors even when a streamed page has no initial metadata."""
     mapping = {
         grpc.StatusCode.NOT_FOUND: FlameErrorCode.NOT_FOUND,
         grpc.StatusCode.ALREADY_EXISTS: FlameErrorCode.ALREADY_EXISTS,
         grpc.StatusCode.INVALID_ARGUMENT: FlameErrorCode.INVALID_ARGUMENT,
         grpc.StatusCode.FAILED_PRECONDITION: FlameErrorCode.INVALID_STATE,
     }
-    return FlameError(mapping.get(code, FlameErrorCode.INTERNAL), f"{operation}: {error.details() or ''}")
+    return FlameError(mapping.get(code, FlameErrorCode.INTERNAL), f"{operation}: {details or ''}")
 
 
 def _session_spec(attrs: SessionAttributes) -> SessionSpec:
@@ -279,9 +307,11 @@ class Connection:
         response = await self._rpc("UnregisterApplication", UnregisterApplicationRequest(name=name), "failed to unregister application")
         _raise_for_result(response, "unregister application")
 
-    async def list_applications(self) -> List[Application]:
-        response = await self._rpc("ListApplications", ListApplicationsRequest(), "failed to list applications")
-        return [_application_from_proto(app) for app in response.applications]
+    async def list_applications(self, filter: Optional[ApplicationFilter] = None) -> Page[Application]:
+        """List application metadata using reusable exact filters and paging."""
+        filter = filter or ApplicationFilter()
+        response = await self._rpc("ListApplications", ListApplicationsRequest(names=list(filter.names), state=int(filter.state) if filter.state is not None else None, paging=_wire_paging(filter.paging)), "failed to list applications")
+        return _page(response, [_application_from_proto(app) for app in response.applications])
 
     async def get_application(self, name: str) -> Optional[Application]:
         try:
@@ -292,36 +322,36 @@ class Connection:
             raise
         return _application_from_proto(response)
 
-    async def list_executors(self) -> List[Any]:
-        response = await self._rpc("ListExecutors", ListExecutorsRequest(), "failed to list executors")
-        return list(response.executors)
+    async def list_executors(self, filter: Optional[ExecutorFilter] = None) -> Page[Any]:
+        """List executor metadata using reusable assignment filters and paging."""
+        filter = filter or ExecutorFilter()
+        response = await self._rpc("ListExecutors", ListExecutorsRequest(ids=list(filter.ids), node=filter.node, application=filter.application, session_id=filter.session_id, state=int(filter.state) if filter.state is not None else None, paging=_wire_paging(filter.paging)), "failed to list executors")
+        return _page(response, list(response.executors))
 
-    async def list_nodes(self) -> List[Any]:
-        response = await self._rpc("ListNodes", ListNodesRequest(), "failed to list nodes")
-        return list(response.nodes)
+    async def list_nodes(self, filter: Optional[NodeFilter] = None) -> Page[Any]:
+        """List node metadata using reusable exact filters and paging."""
+        filter = filter or NodeFilter()
+        response = await self._rpc("ListNodes", ListNodesRequest(names=list(filter.names), state=int(filter.state) if filter.state is not None else None, paging=_wire_paging(filter.paging)), "failed to list nodes")
+        return _page(response, list(response.nodes))
+
+    async def list_tasks(self, session_id: SessionID, filter: Optional[TaskFilter] = None) -> Page[Task]:
+        """Read task metadata directly without an authoritative session read."""
+        filter = filter or TaskFilter()
+        response = await self._rpc("ListTasks", ListTasksRequest(session_id=session_id, ids=list(filter.ids), states=[int(state) for state in filter.states], paging=_wire_paging(filter.paging)), "failed to list tasks")
+        return _page(response, [_task_from_proto(task, session_id) for task in response.tasks])
 
     async def create_session(self, attrs: SessionAttributes) -> "Session":
         response = await self._rpc("CreateSession", CreateSessionRequest(session_id=attrs.id or short_name(attrs.application), session=_session_spec(attrs)), "failed to create session")
         return _session_from_proto(self, response)
 
-    async def list_sessions(
-        self,
-        *,
-        state: Optional[SessionState] = None,
-        ids: Optional[Iterable[SessionID]] = None,
-        application: Optional[str] = None,
-    ) -> List["Session"]:
-        """List sessions; the server applies the filters, so only matches are returned.
-
-        ``ids`` limits the result to those sessions (an empty ``ids`` means no filter on ids).
-        """
+    async def list_sessions(self, filter: Optional[SessionFilter] = None, *, state: Optional[SessionState] = None, ids: Optional[Iterable[SessionID]] = None, application: Optional[str] = None) -> Page["Session"]:
+        """List session metadata. Existing exact-filter keywords override the filter."""
+        filter = filter or SessionFilter()
         request = ListSessionsRequest(
-            application=application,
-            state=int(state) if state is not None else None,
-            ids=list(ids) if ids is not None else [],
+            state=int(state if state is not None else filter.state) if state is not None or filter.state is not None else None, ids=list(ids) if ids is not None else list(filter.ids), application=application if application is not None else filter.application, paging=_wire_paging(filter.paging)
         )
         response = await self._rpc("ListSessions", request, "failed to list sessions")
-        return [_session_from_proto(self, item) for item in response.sessions]
+        return _page(response, [_session_from_proto(self, item) for item in response.sessions])
 
     async def open_session(self, session_id: SessionID, spec: Optional[SessionAttributes] = None) -> "Session":
         response = await self._rpc("OpenSession", OpenSessionRequest(session_id=session_id, session=_session_spec(spec) if spec is not None else None), "failed to open session")
@@ -403,10 +433,9 @@ class Session:
         response = await self.connection._rpc("GetTask", GetTaskRequest(task_id=task_id, session_id=self.id), "failed to get task")
         return _task_from_proto(response, self.id)
 
-    def list_tasks(self) -> "TaskIterator":
-        self.connection._check_loop()
-        stream = self.connection._frontend.ListTasks(ListTasksRequest(session_id=self.id))
-        return TaskIterator(stream, self.id)
+    async def list_tasks(self, filter: Optional[TaskFilter] = None) -> Page[Task]:
+        """List task metadata; detailed getters and watches retain payload access."""
+        return await self.connection.list_tasks(self.id, filter)
 
     def watch_task(self, task_id: TaskID, timeout: Optional[float] = None) -> "TaskWatcher":
         return self.connection._watch_task(self.id, task_id, timeout)
@@ -655,29 +684,3 @@ class TaskWatcher(AsyncIterator[Task]):
         if not self._closed:
             self._closed = True
             self._session_watch.unregister(self)
-
-
-class TaskIterator(AsyncIterator[Task]):
-    """Lazy async iterator for a session's tasks."""
-
-    def __init__(self, stream, session_id: str):
-        self._stream = stream
-        self._responses = stream.__aiter__()
-        self._session_id = session_id
-        self._loop = asyncio.get_running_loop()
-
-    def __aiter__(self) -> "TaskIterator":
-        return self
-
-    async def __anext__(self) -> Task:
-        if asyncio.get_running_loop() is not self._loop:
-            raise RuntimeError("aio task iterator used from another event loop")
-        try:
-            return _task_from_proto(await self._responses.__anext__(), self._session_id)
-        except grpc.RpcError as error:
-            raise _grpc_error(error, "failed to list tasks") from error
-
-    def close(self) -> None:
-        if asyncio.get_running_loop() is not self._loop:
-            raise RuntimeError("aio task iterator used from another event loop")
-        self._stream.cancel()

@@ -17,6 +17,26 @@ use super::types::*;
 use crate::FlameError;
 
 impl Session {
+    /// Project list metadata without copying task maps, payloads, credentials or events.
+    pub fn metadata(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            application: self.application.clone(),
+            version: self.version,
+            task_counts: self.task_counts,
+            creation_time: self.creation_time,
+            completion_time: self.completion_time,
+            status: self.status.clone(),
+            min_instances: self.min_instances,
+            max_instances: self.max_instances,
+            batch_size: self.batch_size,
+            priority: self.priority,
+            resreq: self.resreq.clone(),
+            retry_count: self.retry_count,
+            ..Default::default()
+        }
+    }
+
     pub fn is_closed(&self) -> bool {
         self.status.state == SessionState::Closed
     }

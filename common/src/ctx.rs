@@ -202,7 +202,7 @@ pub struct FlameExecutors {
 
 #[derive(Debug, Clone, Default)]
 pub struct FlameLimits {
-    /// Maximum number of sessions across the entire cluster.
+    /// Maximum number of Open sessions; other states remain cached without consuming a slot.
     pub max_sessions: Option<usize>,
     pub application: FlameApplicationLimits,
     pub session: FlameSessionLimits,

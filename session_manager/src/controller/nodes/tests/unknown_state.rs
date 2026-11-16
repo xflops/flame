@@ -90,6 +90,7 @@ async fn test_update_node_fails_in_unknown_state() {
         },
         info: NodeInfo::default(),
         shims: vec![common::apis::Shim::Host],
+        creation_time: Default::default(),
     };
 
     let result = state.update_node(&updated_node).await;

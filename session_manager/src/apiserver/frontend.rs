@@ -17,6 +17,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use common::apis::{ApplicationAttributes, SessionAttributes, Signal};
 use futures::Stream;
+use prost::Message;
 use serde_json::Value;
 use stdng::trace_fn;
 use tokio::sync::mpsc;
@@ -30,7 +31,7 @@ use self::rpc::{
     GetNodeResponse, GetSessionRequest, GetTaskRequest, ListApplicationsRequest,
     ListExecutorsRequest, ListNodesRequest, ListSessionsRequest, ListTasksRequest, NodeList,
     OpenSessionRequest, RegisterApplicationRequest, ResumeSessionRequest, Session, SessionList,
-    SuspendSessionRequest, Task, UnregisterApplicationRequest, UpdateApplicationRequest,
+    SuspendSessionRequest, Task, TaskList, UnregisterApplicationRequest, UpdateApplicationRequest,
     WatchTaskRequest,
 };
 
@@ -40,6 +41,42 @@ use common::apis::ResourceRequirement;
 use common::{apis, FlameError};
 
 use crate::apiserver::Flame;
+
+/// Project list metadata without exposing credentials or execution payloads.
+fn application_metadata(app: &apis::Application) -> rpc::Application {
+    let mut value = rpc::Application::from(app);
+    if let Some(spec) = value.spec.as_mut() {
+        spec.environments.clear();
+    }
+    value
+}
+
+/// Strip session execution data and events from list responses.
+fn session_metadata(session: &apis::Session) -> rpc::Session {
+    let mut value = rpc::Session::from(session);
+    if let Some(spec) = value.spec.as_mut() {
+        spec.common_data = None;
+        spec.tokens.clear();
+    }
+    if let Some(status) = value.status.as_mut() {
+        status.events.clear();
+    }
+    value
+}
+
+/// Keep task metadata on list responses while Get/Watch retain their payloads.
+fn task_metadata(task: &apis::Task) -> rpc::Task {
+    let mut value = rpc::Task::from(task);
+    if let Some(spec) = value.spec.as_mut() {
+        spec.input = None;
+        spec.output = None;
+        spec.affinity.clear();
+    }
+    if let Some(status) = value.status.as_mut() {
+        status.events.clear();
+    }
+    value
+}
 
 /// Hardcoded safety-net default `resreq` applied when a session spec supplies
 /// no explicit `resreq` AND `cluster.resreq` is unset.
@@ -129,7 +166,6 @@ impl Flame {
 #[async_trait]
 impl Frontend for Flame {
     type WatchTasksStream = Pin<Box<dyn Stream<Item = Result<Task, Status>> + Send>>;
-    type ListTasksStream = Pin<Box<dyn Stream<Item = Result<Task, Status>> + Send>>;
 
     async fn watch_tasks(
         &self,
@@ -209,37 +245,6 @@ impl Frontend for Flame {
             }
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
-    }
-
-    async fn list_tasks(
-        &self,
-        req: Request<ListTasksRequest>,
-    ) -> Result<Response<Self::ListTasksStream>, Status> {
-        trace_fn!("Frontend::list_tasks");
-        let req = req.into_inner();
-        let ssn_id = req
-            .session_id
-            .parse::<apis::SessionID>()
-            .map_err(|_| Status::invalid_argument("invalid session id"))?;
-        let task_list = self
-            .controller
-            .list_tasks(ssn_id)
-            .await
-            .map_err(Status::from)?;
-        let (tx, rx) = mpsc::channel(128);
-
-        tokio::spawn(async move {
-            for task in task_list {
-                if tx.send(Ok(Task::from(&task))).await.is_err() {
-                    return;
-                }
-            }
-        });
-
-        let output_stream = ReceiverStream::new(rx);
-        Ok(Response::new(
-            Box::pin(output_stream) as Self::ListTasksStream
-        ))
     }
 
     async fn register_application(
@@ -389,37 +394,78 @@ impl Frontend for Flame {
         request: Request<ListApplicationsRequest>,
     ) -> Result<Response<ApplicationList>, Status> {
         trace_fn!("Frontend::list_applications");
-        let filter = crate::model::ApplicationFilter::try_from(request.into_inner())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let app_list = self
+        let request = request.into_inner();
+        let filter = crate::model::ApplicationFilter::try_from(request).map_err(Status::from)?;
+        let page = self
             .controller
             .list_applications(Some(&filter))
             .await
             .map_err(Status::from)?;
-
-        let applications = app_list.iter().map(rpc::Application::from).collect();
-
-        Ok(Response::new(ApplicationList { applications }))
+        let applications = page.iter().map(application_metadata).collect();
+        Ok(Response::new(ApplicationList {
+            applications,
+            paging: Some(rpc::Paging::from(page.paging)),
+        }))
     }
 
     async fn list_executors(
         &self,
-        _: tonic::Request<ListExecutorsRequest>,
+        request: Request<ListExecutorsRequest>,
     ) -> Result<Response<ExecutorList>, Status> {
-        trace_fn!("Frontend::list_executors");
-        let executor_list = self.controller.list_executors().map_err(Status::from)?;
-        let executors = executor_list.iter().map(rpc::Executor::from).collect();
-        Ok(Response::new(ExecutorList { executors }))
+        let request = request.into_inner();
+        let filter = apis::ExecutorFilter {
+            ids: (!request.ids.is_empty()).then_some(request.ids),
+            node: request.node,
+            application: request.application,
+            session_id: request.session_id,
+            state: request
+                .state
+                .map(|state| {
+                    rpc::ExecutorState::try_from(state)
+                        .map(|value| apis::ExecutorState::from(value as i32))
+                        .map_err(|_| Status::invalid_argument("invalid executor state"))
+                })
+                .transpose()?,
+            paging: Some(apis::Paging::try_from(request.paging).map_err(Status::from)?),
+        };
+        let executors = self
+            .controller
+            .list_executors(Some(&filter))
+            .await
+            .map_err(Status::from)?;
+        let paging = rpc::Paging::from(executors.paging);
+        Ok(Response::new(ExecutorList {
+            executors: executors.iter().map(rpc::Executor::from).collect(),
+            paging: Some(paging),
+        }))
     }
 
     async fn list_nodes(
         &self,
-        _: tonic::Request<ListNodesRequest>,
+        request: Request<ListNodesRequest>,
     ) -> Result<Response<NodeList>, Status> {
-        trace_fn!("Frontend::list_nodes");
-        let node_list = self.controller.list_nodes().map_err(Status::from)?;
-        let nodes = node_list.iter().map(rpc::Node::from).collect();
-        Ok(Response::new(NodeList { nodes }))
+        let request = request.into_inner();
+        let filter = apis::NodeFilter {
+            names: (!request.names.is_empty()).then_some(request.names),
+            state: request
+                .state
+                .map(|state| {
+                    rpc::NodeState::try_from(state)
+                        .map(|value| apis::NodeState::from(value as i32))
+                        .map_err(|_| Status::invalid_argument("invalid node state"))
+                })
+                .transpose()?,
+            paging: Some(apis::Paging::try_from(request.paging).map_err(Status::from)?),
+        };
+        let nodes = self
+            .controller
+            .list_nodes(Some(&filter))
+            .map_err(Status::from)?;
+        let paging = rpc::Paging::from(nodes.paging);
+        Ok(Response::new(NodeList {
+            nodes: nodes.iter().map(rpc::Node::from).collect(),
+            paging: Some(paging),
+        }))
     }
 
     async fn get_node(
@@ -650,16 +696,61 @@ impl Frontend for Flame {
         request: Request<ListSessionsRequest>,
     ) -> Result<Response<SessionList>, Status> {
         trace_fn!("Frontend::list_sessions");
-        let filter = crate::model::SessionFilter::try_from(request.into_inner())
+        let request = request.into_inner();
+        let filter = crate::model::SessionFilter::try_from(request)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let ssn_list = self
             .controller
             .list_sessions(Some(&filter))
+            .await
             .map_err(Status::from)?;
 
-        let sessions = ssn_list.iter().map(Session::from).collect();
+        let sessions = ssn_list.iter().map(session_metadata).collect();
 
-        Ok(Response::new(SessionList { sessions }))
+        Ok(Response::new(SessionList {
+            sessions,
+            paging: Some(rpc::Paging::from(ssn_list.paging)),
+        }))
+    }
+
+    async fn list_tasks(
+        &self,
+        request: Request<ListTasksRequest>,
+    ) -> Result<Response<TaskList>, Status> {
+        trace_fn!("Frontend::list_tasks");
+        let request = request.into_inner();
+        let session_id = request
+            .session_id
+            .parse::<apis::SessionID>()
+            .map_err(|_| Status::invalid_argument("invalid session id"))?;
+        if request.ids.iter().any(|id| *id <= 0) {
+            return Err(Status::invalid_argument("task ids must be positive"));
+        }
+        let mut filter = crate::model::TaskFilter::by_session(session_id)
+            .with_paging(apis::Paging::try_from(request.paging).map_err(Status::from)?);
+        filter.ids = (!request.ids.is_empty()).then_some(request.ids);
+        filter.states = if request.states.is_empty() {
+            None
+        } else {
+            Some(
+                request
+                    .states
+                    .into_iter()
+                    .map(apis::TaskState::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(Status::from)?,
+            )
+        };
+        let tasks = self
+            .controller
+            .list_tasks(&filter)
+            .await
+            .map_err(Status::from)?;
+        let paging = rpc::Paging::from(tasks.paging);
+        Ok(Response::new(TaskList {
+            tasks: tasks.iter().map(task_metadata).collect(),
+            paging: Some(paging),
+        }))
     }
 
     async fn create_task(&self, req: Request<CreateTaskRequest>) -> Result<Response<Task>, Status> {

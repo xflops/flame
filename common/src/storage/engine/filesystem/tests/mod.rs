@@ -15,5 +15,6 @@ use super::*;
 use crate::storage::engine::tests::task_snapshot;
 
 mod filesystem;
+mod metadata;
 mod payload;
 mod record_size;

@@ -44,6 +44,7 @@ fn test_node_status_construction() {
             ..Default::default()
         },
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
 
     // Verify all fields are properly set
@@ -82,6 +83,7 @@ fn test_node_status_merge_preserves_existing_info() {
             ..Default::default()
         },
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
 
     // Simulate a heartbeat status update with updated allocatable but no info
@@ -101,6 +103,7 @@ fn test_node_status_merge_preserves_existing_info() {
         allocatable: updated_allocatable,
         info: existing_node.info.clone(),
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
 
     // Verify the merge preserved existing info
@@ -142,6 +145,7 @@ fn test_node_status_update_without_existing_node() {
             ..Default::default()
         },
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
 
     // Verify the new node was created correctly
@@ -178,6 +182,7 @@ fn test_node_status_partial_update() {
             ..Default::default()
         },
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
 
     // Partial update: only state and allocatable changed
@@ -193,6 +198,7 @@ fn test_node_status_partial_update() {
         },
         info: existing_node.info.clone(),
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
 
     // Verify partial update worked correctly

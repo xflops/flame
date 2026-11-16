@@ -85,6 +85,7 @@ fn create_test_node(name: &str) -> Node {
             ..Default::default()
         },
         shims: vec![common::apis::Shim::Host],
+        creation_time: Default::default(),
     }
 }
 

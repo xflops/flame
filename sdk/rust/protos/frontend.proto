@@ -40,7 +40,7 @@ service Frontend {
 
   rpc GetTask (GetTaskRequest) returns (Task) {}
   rpc WatchTasks (stream WatchTaskRequest) returns (stream Task) {}
-  rpc ListTasks (ListTasksRequest) returns (stream Task) {}
+  rpc ListTasks (ListTasksRequest) returns (TaskList) {}
 }
 
 message RegisterApplicationRequest {
@@ -63,15 +63,24 @@ message GetApplicationRequest {
 
 message ListApplicationsRequest {
   optional ApplicationState state = 1;
+  Paging paging = 2;
+  repeated string names = 3;
 }
 
 message ListExecutorsRequest {
-  
+  Paging paging = 1;
+  repeated string ids = 2;
+  optional string node = 3;
+  optional string application = 4;
+  optional string session_id = 5;
+  optional ExecutorState state = 6;
 }
 
-// ListNodesRequest is the request for listing all registered nodes.
+// ListNodesRequest lists registered nodes.
 message ListNodesRequest {
-  // No pagination for now.
+  Paging paging = 1;
+  repeated string names = 2;
+  optional NodeState state = 3;
 }
 
 // GetNodeRequest is the request for getting a specific node by name.
@@ -124,6 +133,7 @@ message ListSessionsRequest {
   optional SessionState state = 2;
   // Only these sessions; an empty list means no filter on ids.
   repeated string ids = 3;
+  Paging paging = 4;
 }
 
 message CreateTaskRequest {
@@ -142,4 +152,7 @@ message WatchTaskRequest {
 
 message ListTasksRequest {
   string session_id = 1;
+  Paging paging = 2;
+  repeated int64 ids = 3;
+  repeated TaskState states = 4;
 }

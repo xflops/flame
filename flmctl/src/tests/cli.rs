@@ -38,7 +38,7 @@ fn close_requires_a_session() {
 fn delete_selection(args: &[&str]) -> (Option<Vec<String>>, Option<Vec<String>>) {
     let cli = Cli::try_parse_from(std::iter::once("flmctl").chain(args.iter().copied())).unwrap();
     match cli.command {
-        Some(Commands::Delete { session, node }) => (session, node),
+        Some(Commands::Delete { session, node, .. }) => (session, node),
         _ => panic!("not a delete command"),
     }
 }
@@ -85,5 +85,15 @@ fn delete_accepts_session_and_node_ids_with_the_same_syntax() {
                 assert_eq!((sessions, nodes), (None, expected.clone()));
             }
         }
+    }
+}
+
+#[test]
+fn delete_selects_one_numbered_page() {
+    let cli =
+        Cli::try_parse_from(["flmctl", "delete", "-s", "--limit", "20", "--number", "3"]).unwrap();
+    match cli.command {
+        Some(Commands::Delete { limit, number, .. }) => assert_eq!((limit, number), (20, 3)),
+        _ => panic!("expected delete"),
     }
 }

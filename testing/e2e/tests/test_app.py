@@ -1023,25 +1023,23 @@ class TestGetData:
 
     def test_get_data_task_input_positional_args(self, check_package_config, check_flmrun_app):
         """TC-GD-001: Test get_data retrieves task input with positional arguments."""
+        from flamepy.app import context
         from flamepy.core import get_session
 
         with initialized_app("test-get-data-input-pos"):
 
             @app.service()
             def sum_service(left, right):
-                return left + right
+                return left + right, context().task_id
 
             sum_service = app.remote(sum_service)
 
             result = sum_service(5, 3)
-            value = result.get()
+            value, task_id = result.get()
             assert value == 8, f"Expected 8, got {value}"
 
             session = get_session(sum_service._session.id)
-            tasks = list(session.list_tasks())
-            assert len(tasks) >= 1, "Expected at least one task"
-
-            task = tasks[0]
+            task = session.get_task(task_id)
             assert task.input is not None, "Task input should not be None"
 
             input_data = get_data(task.input)
@@ -1052,31 +1050,29 @@ class TestGetData:
 
     def test_get_data_task_output(self, check_package_config, check_flmrun_app):
         """TC-GD-002: Test get_data retrieves task output correctly."""
+        from flamepy.app import context
         from flamepy.core import get_session
 
         with initialized_app("test-get-data-output"):
 
             @app.service()
             def multiply_service(left, right):
-                return left * right
+                return left * right, context().task_id
 
             multiply_service = app.remote(multiply_service)
 
             result = multiply_service(4, 7)
-            value = result.get()
+            value, task_id = result.get()
             assert value == 28, f"Expected 28, got {value}"
 
             session = get_session(multiply_service._session.id)
-            tasks = list(session.list_tasks())
-            assert len(tasks) >= 1, "Expected at least one task"
-
-            task = tasks[0]
+            task = session.get_task(task_id)
             assert task.output is not None, "Task output should not be None"
 
             output_data = get_data(task.output)
 
             assert output_data["type"] == "output", f"Expected type 'output', got {output_data['type']}"
-            assert output_data["result"] == 28, f"Expected result 28, got {output_data['result']}"
+            assert output_data["result"] == (28, task_id), f"Expected result {(28, task_id)}, got {output_data['result']}"
 
     def test_get_data_invalid_data_format(self, check_package_config, check_flmrun_app):
         """TC-GD-007: Test get_data handles invalid data format gracefully."""
@@ -1099,6 +1095,7 @@ class TestGetData:
 
     def test_get_data_class_method_input(self, check_package_config, check_flmrun_app):
         """TC-GD-006: Test get_data retrieves class method invocation input."""
+        from flamepy.app import context
         from flamepy.core import get_session
 
         with initialized_app("test-get-data-method"):
@@ -1106,7 +1103,7 @@ class TestGetData:
             @app.service()
             class CalculatorService:
                 def add(self, a, b):
-                    return a + b
+                    return a + b, context().task_id
 
                 def multiply(self, a, b):
                     return a * b
@@ -1117,14 +1114,11 @@ class TestGetData:
             calc_service = CalculatorService.remote()
 
             result = calc_service.add(15, 25)
-            value = result.get()
+            value, task_id = result.get()
             assert value == 40, f"Expected 40, got {value}"
 
             session = get_session(calc_service._session.id)
-            tasks = list(session.list_tasks())
-            assert len(tasks) >= 1, "Expected at least one task"
-
-            task = tasks[0]
+            task = session.get_task(task_id)
             assert task.input is not None, "Task input should not be None"
 
             input_data = get_data(task.input)

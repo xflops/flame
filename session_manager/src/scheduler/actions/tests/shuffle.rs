@@ -92,7 +92,7 @@ async fn shuffle_trims_surplus_without_recipient_and_preserves_minimum() {
     for _ in 0..3 {
         let mut context = shuffle_context(controller.clone());
         ShuffleAction {}.execute(&mut context).await.unwrap();
-        let executors = controller.list_executors().unwrap();
+        let executors = controller.list_executors(None).await.unwrap();
         assert_eq!(executors.len(), ids.len());
         assert_eq!(
             executors
@@ -295,7 +295,7 @@ async fn shuffle_completes_a_suspend_after_node_loss() {
     assert_eq!(state_of(&controller), SessionState::Suspending);
 
     // What the node shutdown does: delete the node's executors.
-    let executors = controller.list_executors().unwrap();
+    let executors = controller.list_executors(None).await.unwrap();
     controller
         .storage()
         .delete_executors(&executors)

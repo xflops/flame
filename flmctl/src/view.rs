@@ -79,14 +79,10 @@ async fn view_session(
     output_format: &Option<String>,
     ssn_id: &String,
 ) -> Result<(), Box<dyn Error>> {
-    let mut session = conn.get_session(ssn_id).await?;
+    let session = conn.get_session(ssn_id).await?;
 
     match output_format {
-        Some(format) if format.as_str() == "json" => {
-            let tasks = session.list_tasks().await?;
-            session.tasks = Some(tasks);
-            view_session_json(&session)
-        }
+        Some(format) if format.as_str() == "json" => view_session_json(&session),
         _ => view_session_table(&session),
     }
 }

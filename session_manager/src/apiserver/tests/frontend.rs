@@ -14,8 +14,9 @@ limitations under the License.
 use std::collections::HashSet;
 
 use ::rpc::flame::v1::{
-    self as rpc, frontend_server::Frontend, DeleteNodeRequest, GetNodeRequest, ListNodesRequest,
-    ListTasksRequest, ResumeSessionRequest, SuspendSessionRequest, Task, WatchTaskRequest,
+    self as rpc, frontend_server::Frontend, DeleteNodeRequest, GetNodeRequest,
+    ListApplicationsRequest, ListExecutorsRequest, ListNodesRequest, ListSessionsRequest,
+    ResumeSessionRequest, SuspendSessionRequest, Task, WatchTaskRequest,
 };
 use common::apis::{self, ApplicationAttributes, ResourceRequirement, SessionAttributes};
 use futures::{Stream, StreamExt};
@@ -161,116 +162,50 @@ fn rr(cpu: u64, memory: u64, gpu: i32) -> ResourceRequirement {
 }
 
 #[tokio::test]
-async fn list_tasks_streams_all_active_tasks_then_finished_history() {
-    use common::apis::{TaskResult, TaskState};
-
-    for backend in ["none", "fs"] {
-        let dir = tempfile::tempdir().unwrap();
-        let url = match backend {
-            "none" => "none".to_string(),
-            _ => format!("fs://{}", dir.path().join("data").display()),
-        };
-        let (storage, controller, ssn_id) = task_test_controller(url).await;
-        for index in 0..2003 {
-            let task = controller
-                .create_task(ssn_id.clone(), None, None)
-                .await
-                .unwrap();
-            if index % 2 == 0 {
-                let task_ptr = storage.get_task_ptr(task.gid()).unwrap();
-                storage
-                    .update_task_result(
-                        storage.get_session_ptr(ssn_id.clone()).unwrap(),
-                        task_ptr,
-                        TaskResult {
-                            state: TaskState::Succeed,
-                            output: Some(bytes::Bytes::from_static(b"stored result")),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .unwrap();
-                assert!(storage.get_task_ptr(task.gid()).is_err());
-            }
-        }
-        let flame = Flame {
-            controller: controller.clone(),
-            cluster_default_resreq: None,
-        };
-        let mut stream = Frontend::list_tasks(
-            &flame,
-            Request::new(ListTasksRequest {
-                session_id: ssn_id.clone(),
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        let mut ids = Vec::new();
-        while let Some(task) = stream.next().await {
-            let task = task.unwrap();
-            let id = task.metadata.as_ref().unwrap().id.parse::<i64>().unwrap();
-            if id % 2 == 1 {
-                assert_eq!(
-                    task.spec.as_ref().unwrap().output.as_deref(),
-                    Some(b"stored result".as_slice())
-                );
-            }
-            ids.push(id);
-        }
-        let active_ids = ids
-            .iter()
-            .take(1001)
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        assert_eq!(active_ids, (2..=2002).step_by(2).collect(), "{backend}");
-        let unique_ids = ids
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        assert_eq!(ids.len(), unique_ids.len(), "duplicate tasks for {backend}");
-        assert_eq!(ids.len(), 2003, "{backend}");
-        let finished_ids = ids
-            .iter()
-            .skip(1001)
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        assert_eq!(finished_ids, (1..=2003).step_by(2).collect(), "{backend}");
-    }
-}
-
-#[tokio::test]
-async fn none_listing_includes_dequeued_pending_tasks() {
-    let (storage, controller, ssn_id) = task_test_controller("none".to_string()).await;
-    let task = controller
-        .create_task(ssn_id.clone(), None, None)
-        .await
-        .unwrap();
-    {
-        let session = storage.get_session_ptr(ssn_id.clone()).unwrap();
-        let mut session = stdng::lock_ptr!(session).unwrap();
-        assert!(session.pop_pending_task().is_some());
-    }
+async fn unary_lists_return_the_default_limited_collection() {
+    let (_, controller, _) = task_test_controller("none".into()).await;
     let flame = Flame {
         controller,
         cluster_default_resreq: None,
     };
-    let mut stream = Frontend::list_tasks(
+    let sessions = Frontend::list_sessions(&flame, Request::new(ListSessionsRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(sessions.sessions.len(), 1);
+    let nodes = Frontend::list_nodes(&flame, Request::new(ListNodesRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    let executors = Frontend::list_executors(&flame, Request::new(ListExecutorsRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(nodes.nodes.is_empty());
+    assert!(executors.executors.is_empty());
+    let apps = Frontend::list_applications(
         &flame,
-        Request::new(ListTasksRequest { session_id: ssn_id }),
+        Request::new(ListApplicationsRequest {
+            state: None,
+            paging: None,
+            ..Default::default()
+        }),
     )
     .await
     .unwrap()
     .into_inner();
+    assert_eq!(apps.applications.len(), 1);
     assert_eq!(
-        stream.next().await.unwrap().unwrap().metadata.unwrap().id,
-        task.id.to_string()
+        apps.applications[0]
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.name.as_str()),
+        Some("test-app")
     );
-    assert!(stream.next().await.is_none());
 }
 
 #[tokio::test]
-async fn none_finished_task_remains_readable_from_get_watch_and_list() {
+async fn none_finished_task_remains_readable_from_get_and_watch() {
     let (storage, controller, ssn_id) = task_test_controller("none".to_string()).await;
     let task = controller
         .create_task(ssn_id.clone(), None, None)
@@ -296,10 +231,6 @@ async fn none_finished_task_remains_readable_from_get_watch_and_list() {
         Some(bytes::Bytes::from_static(b"retained result"))
     );
     assert!(!history.events.is_empty());
-    let listed = controller.list_tasks(ssn_id.clone()).await.unwrap();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].gid(), task.gid());
-    assert_eq!(listed[0].output, history.output);
     let session = controller.get_session(ssn_id.clone()).unwrap();
     assert_eq!(session.task_counts.succeed, 1);
     assert!(session.tasks.is_empty());
@@ -520,7 +451,7 @@ async fn delete_node_rpc_removes_stale_nodes_and_reports_rejections() {
     .unwrap()
     .into_inner();
     assert_eq!(result.return_code, 0);
-    let listed = Frontend::list_nodes(&flame, Request::new(ListNodesRequest {}))
+    let listed = Frontend::list_nodes(&flame, Request::new(ListNodesRequest::default()))
         .await
         .unwrap()
         .into_inner();
@@ -797,4 +728,241 @@ fn hardcoded_fallback_when_no_cluster_default() {
         res, DEFAULT_FALLBACK_RESREQ,
         "should yield the hardcoded fallback (cpu=1, mem=1GiB, gpu=0)"
     );
+}
+
+/// Record-count pages never aggregate task execution payloads onto the wire.
+#[tokio::test]
+async fn task_pages_return_metadata_while_get_keeps_large_inputs() {
+    use prost::Message;
+    let (_, controller, id) = task_test_controller("none".into()).await;
+    let mut tasks = Vec::new();
+    for _ in 0..5 {
+        tasks.push(
+            controller
+                .create_task(id.clone(), Some(bytes::Bytes::from(vec![7; 900_000])), None)
+                .await
+                .unwrap(),
+        );
+    }
+    let flame = test_flame(controller);
+    let page = Frontend::list_tasks(
+        &flame,
+        Request::new(rpc::ListTasksRequest {
+            session_id: id.clone(),
+            paging: Some(rpc::Paging {
+                limit: 5,
+                number: 1,
+                total: Some(999),
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(page.paging.unwrap().total, Some(5));
+    assert_eq!(page.tasks.len(), 5);
+    assert!(page.encoded_len() < 10_000);
+    for task in page.tasks {
+        let spec = task.spec.unwrap();
+        assert!(spec.input.is_none() && spec.output.is_none() && spec.affinity.is_empty());
+        assert!(task.status.unwrap().events.is_empty());
+    }
+    let second_page = Frontend::list_tasks(
+        &flame,
+        Request::new(rpc::ListTasksRequest {
+            session_id: id.clone(),
+            paging: Some(rpc::Paging {
+                limit: 2,
+                number: 2,
+                total: None,
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(second_page.paging.unwrap().total, Some(5));
+    assert_eq!(
+        second_page
+            .tasks
+            .iter()
+            .map(|task| task.metadata.as_ref().unwrap().id.as_str())
+            .collect::<Vec<_>>(),
+        ["3", "2"]
+    );
+    let full = Frontend::get_task(
+        &flame,
+        Request::new(rpc::GetTaskRequest {
+            session_id: id,
+            task_id: tasks[0].id.to_string(),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(full.spec.unwrap().input.unwrap().len(), 900_000);
+}
+
+/// Exact filters apply before paging, totals remain exact, and bad enums fail.
+#[tokio::test]
+async fn application_pages_filter_before_slicing_and_hide_credentials() {
+    let (_, controller, _) = task_test_controller("none".into()).await;
+    for number in 0..105 {
+        controller
+            .register_application(
+                format!("paged-{number:03}"),
+                ApplicationAttributes {
+                    environments: [("SECRET".into(), "private".into())].into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let flame = test_flame(controller);
+    let page = Frontend::list_applications(
+        &flame,
+        Request::new(ListApplicationsRequest {
+            names: vec!["paged-001".into(), "paged-002".into(), "paged-003".into()],
+            paging: Some(rpc::Paging {
+                limit: 2,
+                number: 2,
+                total: None,
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(page.paging.unwrap().total, Some(3));
+    assert_eq!(page.applications.len(), 1);
+    let app = &page.applications[0];
+    assert!(app.spec.as_ref().unwrap().environments.is_empty());
+    let invalid = Frontend::list_nodes(
+        &flame,
+        Request::new(ListNodesRequest {
+            state: Some(i32::MAX),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+}
+
+/// Invalid task identities fail validation before querying a missing owner.
+#[tokio::test]
+async fn task_lists_reject_nonpositive_ids_before_storage_lookup() {
+    let (_, controller, _) = task_test_controller("none".into()).await;
+    let flame = test_flame(controller);
+    for ids in [vec![-1], vec![0], vec![1, -1], vec![i64::MIN]] {
+        let error = Frontend::list_tasks(
+            &flame,
+            Request::new(rpc::ListTasksRequest {
+                session_id: "absent-session".into(),
+                ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("task ids must be positive"));
+    }
+}
+
+/// Every list endpoint rejects invalid paging rather than silently truncating it.
+#[tokio::test]
+async fn list_endpoints_reject_invalid_paging() {
+    let (_, controller, id) = task_test_controller("none".into()).await;
+    let flame = test_flame(controller);
+    for (limit, number) in [(-1, 1), (1001, 1), (1, -1), (1000, i64::MAX)] {
+        let paging = Some(rpc::Paging {
+            limit,
+            number,
+            total: None,
+        });
+        let errors = [
+            Frontend::list_applications(
+                &flame,
+                Request::new(ListApplicationsRequest {
+                    paging,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err(),
+            Frontend::list_sessions(
+                &flame,
+                Request::new(ListSessionsRequest {
+                    paging,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err(),
+            Frontend::list_nodes(
+                &flame,
+                Request::new(ListNodesRequest {
+                    paging,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err(),
+            Frontend::list_executors(
+                &flame,
+                Request::new(ListExecutorsRequest {
+                    paging,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err(),
+            Frontend::list_tasks(
+                &flame,
+                Request::new(rpc::ListTasksRequest {
+                    session_id: id.clone(),
+                    paging,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(error.code(), tonic::Code::InvalidArgument, "{error}");
+        }
+    }
+}
+
+/// Opening a missing session preserves a descriptive NOT_FOUND error for SDK callers.
+#[tokio::test]
+async fn open_missing_session_without_spec_reports_not_found() {
+    let directory = tempfile::tempdir().unwrap();
+    for url in [
+        "none".to_string(),
+        format!("fs://{}", directory.path().display()),
+    ] {
+        let (_, controller, _) = task_test_controller(url).await;
+        let flame = test_flame(controller);
+        let error = Frontend::open_session(
+            &flame,
+            Request::new(rpc::OpenSessionRequest {
+                session_id: "missing-session".into(),
+                session: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::NotFound);
+        assert!(
+            error.message().to_lowercase().contains("not found"),
+            "{error}"
+        );
+        assert!(error.message().contains("missing-session"));
+    }
 }

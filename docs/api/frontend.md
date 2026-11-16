@@ -2,6 +2,13 @@
 
 The Frontend service is the client-facing API for Flame. It handles session management, task operations, and application registration.
 
+`ListApplications`, `ListSessions`, `ListNodes`, `ListExecutors`, and `ListTasks`
+return one page of object metadata with `Paging { limit, number, total }`.
+Paging belongs to the resource filter. Applications, nodes, executors and
+sessions are listed from memory; Closed sessions remain cached without tasks.
+Task pages read metadata from storage, task ID descending regardless of
+state. See [pagination](pagination.md) for defaults, ordering and CLI behavior.
+
 ## Service Definition
 
 ```protobuf
@@ -35,7 +42,7 @@ service Frontend {
   rpc CreateTask(CreateTaskRequest) returns (Task) {}
   rpc GetTask(GetTaskRequest) returns (Task) {}
   rpc WatchTasks(stream WatchTaskRequest) returns (stream Task) {}
-  rpc ListTasks(ListTasksRequest) returns (stream Task) {}
+  rpc ListTasks(ListTasksRequest) returns (TaskList) {}
 }
 ```
 
@@ -236,6 +243,7 @@ Lists sessions, optionally filtered by application and state.
 |-------|------|-------------|
 | `application` | optional string | Application name filter |
 | `state` | optional [SessionState](types.md#sessionstate) | Session state filter |
+| `ids` | repeated string | Exact session IDs; empty selects all |
 
 **Response:** [SessionList](types.md#sessionlist)
 
@@ -308,31 +316,16 @@ for update in session.watch_task(task.id):
         break
 ```
 
-### ListTasks
-
-Streams all active tasks copied from the session cache, followed by all
-finished tasks read from the storage engine, with no limit or pagination.
-Task input/output is preserved. A task that finishes between the cache snapshot
-and storage read appears once, using the active snapshot already selected.
-These reads are not a transactional snapshot: concurrent creation and state
-changes can affect which tasks and states are returned. No task-ID ordering is
-promised. This includes completed history retained in memory by `none` storage.
-
-**Request:** `ListTasksRequest`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `session_id` | string | Session ID |
-
-**Response:** `stream` [Task](types.md#task)
-
 ## Node Operations
 
 ### ListNodes
 
 Lists all registered nodes in the cluster.
 
-**Request:** `ListNodesRequest` (empty)
+**Request:** `ListNodesRequest`
+
+| Field | Type | Description |
+| --- | --- | --- |
 
 **Response:** [NodeList](types.md#nodelist)
 
@@ -400,6 +393,9 @@ flmctl delete -s session-a,session-b
 
 Lists all executors in the cluster.
 
-**Request:** `ListExecutorsRequest` (empty)
+**Request:** `ListExecutorsRequest`
+
+| Field | Type | Description |
+| --- | --- | --- |
 
 **Response:** [ExecutorList](types.md#executorlist)

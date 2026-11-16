@@ -20,7 +20,8 @@ pub mod service;
 pub const FLAME_PYTHON_VERSION_ENV: &str = "FLAME_PYTHON_VERSION";
 
 pub use client::{
-    Connection, Session, SessionOptions, TaskFuture, TaskHandle, TaskOption, TaskOptions,
+    ApplicationFilter, Connection, ExecutorFilter, NodeFilter, Page, Paging, Session,
+    SessionFilter, SessionOptions, TaskFilter, TaskFuture, TaskHandle, TaskOption, TaskOptions,
     TaskResult,
 };
 #[cfg(feature = "macros")]

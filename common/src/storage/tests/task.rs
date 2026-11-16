@@ -218,56 +218,6 @@ mod get_task {
     }
 }
 
-mod list_tasks {
-    use super::*;
-
-    #[tokio::test]
-    async fn returns_empty_list_for_session_with_no_tasks() {
-        let ctx = test_context();
-        let storage = storage::new_ptr(&ctx).await.unwrap();
-
-        let attr = create_session_attr("empty-task-ssn");
-        storage.create_session(attr).await.unwrap();
-
-        let tasks = storage
-            .list_tasks("empty-task-ssn".to_string())
-            .await
-            .unwrap();
-        assert!(tasks.is_empty());
-    }
-
-    #[tokio::test]
-    async fn returns_all_tasks_in_session() {
-        let ctx = test_context();
-        let storage = storage::new_ptr(&ctx).await.unwrap();
-
-        let attr = create_session_attr("list-task-ssn");
-        storage.create_session(attr).await.unwrap();
-
-        for _ in 0..5 {
-            storage
-                .create_task("list-task-ssn".to_string(), None, None)
-                .await
-                .unwrap();
-        }
-
-        let tasks = storage
-            .list_tasks("list-task-ssn".to_string())
-            .await
-            .unwrap();
-        assert_eq!(tasks.len(), 5);
-    }
-
-    #[tokio::test]
-    async fn returns_error_for_nonexistent_session() {
-        let ctx = test_context();
-        let storage = storage::new_ptr(&ctx).await.unwrap();
-
-        let result = storage.list_tasks("nonexistent-ssn".to_string()).await;
-        assert!(result.is_err());
-    }
-}
-
 mod update_task_state {
     use super::*;
 

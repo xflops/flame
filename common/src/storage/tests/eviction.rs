@@ -11,7 +11,7 @@ limitations under the License.
 */
 
 use super::*;
-use crate::apis::TaskCounts;
+use crate::apis::{TaskCounts, TaskFilter};
 use crate::events::EventManager;
 use bytes::Bytes;
 
@@ -300,7 +300,15 @@ async fn recovery_keeps_only_active_tasks_and_rebuilds_counts() {
                 ..Default::default()
             }
         );
-        assert_eq!(recovered.list_tasks("s".into()).await.unwrap().len(), 7);
+        assert_eq!(
+            recovered
+                .engine
+                .find_task_metadata(&TaskFilter::by_session("s"))
+                .await
+                .unwrap()
+                .len(),
+            7
+        );
         assert_eq!(
             recovered
                 .get_task_metadata("s".into(), 1)
@@ -323,9 +331,13 @@ async fn none_listing_keeps_dequeued_tasks_and_counts() {
     let task = lock_ptr!(ssn).unwrap().pop_pending_task().unwrap();
     assert_eq!(lock_ptr!(ssn).unwrap().task_counts.pending, 1);
     storage.create_task("s".into(), None, None).await.unwrap();
-    let listed = storage.list_tasks("s".into()).await.unwrap();
+    let listed = storage
+        .engine
+        .find_task_metadata(&TaskFilter::by_session("s"))
+        .await
+        .unwrap();
     assert_eq!(listed.len(), 2);
-    assert_eq!(listed[0].id, created.id);
+    assert!(listed.iter().any(|task| task.id == created.id));
     // Preserve a stale external Arc across Running publication: NoneEngine must
     // derive the completion version from its retained authoritative cache.
     storage
@@ -368,10 +380,18 @@ async fn none_listing_keeps_dequeued_tasks_and_counts() {
         storage.get_task_ptr(created.gid()),
         Err(FlameError::NotFound(_))
     ));
-    let remaining = storage.list_tasks("s".into()).await.unwrap();
+    let remaining = storage
+        .engine
+        .find_task_metadata(&TaskFilter::by_session("s"))
+        .await
+        .unwrap();
     assert_eq!(remaining.len(), 2);
-    assert_eq!(remaining[0].state, TaskState::Pending);
-    assert_eq!(remaining[1].state, TaskState::Succeed);
+    assert!(remaining
+        .iter()
+        .any(|task| task.state == TaskState::Pending));
+    assert!(remaining
+        .iter()
+        .any(|task| task.state == TaskState::Succeed));
     assert_eq!(
         storage.get_session("s".into()).unwrap().task_counts.succeed,
         1
@@ -464,7 +484,7 @@ async fn final_failure_event_is_appended_before_terminal_cache_publication() {
 }
 
 #[tokio::test]
-async fn none_history_survives_session_cache_eviction_until_explicit_deletion() {
+async fn none_history_survives_closed_handoff_until_explicit_deletion() {
     let mut storage = storage("none").await;
     storage.max_sessions = Some(1);
     let ssn = session(&storage).await;
@@ -482,10 +502,7 @@ async fn none_history_survives_session_cache_eviction_until_explicit_deletion() 
         .await
         .unwrap();
     storage.close_session("s".into()).await.unwrap();
-    assert!(matches!(
-        storage.get_session_ptr("s".into()),
-        Err(FlameError::NotFound(_))
-    ));
+    assert!(storage.get_session_ptr("s".into()).is_ok());
     assert_eq!(
         storage
             .get_task("s".into(), created.id)
@@ -494,7 +511,15 @@ async fn none_history_survives_session_cache_eviction_until_explicit_deletion() 
             .output,
         Some(Bytes::from_static(b"memory result"))
     );
-    assert_eq!(storage.list_tasks("s".into()).await.unwrap().len(), 1);
+    assert_eq!(
+        storage
+            .engine
+            .find_task_metadata(&TaskFilter::by_session("s"))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     storage.delete_session("s".into()).await.unwrap();
     assert!(matches!(
         storage.get_task("s".into(), created.id).await,
@@ -573,5 +598,13 @@ async fn none_retains_history_after_cache_eviction_and_skips_duplicate_updates()
             ..Default::default()
         }
     );
-    assert_eq!(storage.list_tasks("s".into()).await.unwrap().len(), 3);
+    assert_eq!(
+        storage
+            .engine
+            .find_task_metadata(&TaskFilter::by_session("s"))
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
 }

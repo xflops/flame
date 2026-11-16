@@ -49,16 +49,22 @@ fn named_ids_are_trimmed_and_node_duplicates_are_deleted_once() {
 async fn selection_errors_are_reported_before_connecting() {
     let ctx = FlameContext::default();
     for (sessions, nodes) in [(None, None), (Some([].as_slice()), Some([].as_slice()))] {
-        let error = run(&ctx, sessions, nodes).await.unwrap_err().to_string();
+        let error = run(&ctx, sessions, nodes, Default::default())
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("--session"), "{error}");
     }
     for values in [args(&[""]), args(&["id-1", " "])] {
-        let error = delete_sessions(&ctx, &values)
+        let error = delete_sessions(&ctx, &values, Default::default())
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("session ids"), "{error}");
-        let error = delete_nodes(&ctx, &values).await.unwrap_err().to_string();
+        let error = delete_nodes(&ctx, &values, Default::default())
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("node names"), "{error}");
     }
 }

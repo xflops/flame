@@ -16,7 +16,7 @@ use std::error::Error;
 
 use flame_rs as flame;
 use flame_rs::apis::{FlameContext, SessionState};
-use flame_rs::client::{NodeState, SessionFilter};
+use flame_rs::client::{NodeFilter, NodeState, Paging, SessionFilter};
 
 use crate::utils::trim_ids;
 
@@ -65,19 +65,26 @@ async fn connect(ctx: &FlameContext) -> Result<flame::Connection, Box<dyn Error>
 pub(crate) async fn delete_nodes(
     ctx: &FlameContext,
     nodes: &[String],
+    paging: Paging,
 ) -> Result<(), Box<dyn Error>> {
     let selection = NodeSelection::parse(nodes)?;
     let conn = connect(ctx).await?;
-    let names: Vec<String> = match selection {
-        NodeSelection::AllNotReady => conn
-            .list_nodes()
-            .await?
-            .into_iter()
-            .filter(|node| node.state == NodeState::NotReady)
-            .map(|node| node.name)
-            .collect(),
-        NodeSelection::Ids(ids) => ids.into_iter().map(str::to_string).collect(),
+    let filter = NodeFilter {
+        names: match selection {
+            NodeSelection::AllNotReady => Vec::new(),
+            NodeSelection::Ids(ids) => ids.into_iter().map(str::to_owned).collect(),
+        },
+        paging: Some(paging),
+        ..Default::default()
     };
+    let names = conn
+        .list_nodes(Some(&filter))
+        .await?
+        .items
+        .into_iter()
+        .filter(|node| node.state == NodeState::NotReady)
+        .map(|node| node.name)
+        .collect::<Vec<_>>();
     let mut deleted = 0;
     let mut failed = 0;
     for name in names {
@@ -100,6 +107,7 @@ pub(crate) async fn delete_nodes(
 pub(crate) async fn delete_sessions(
     ctx: &FlameContext,
     sessions: &[String],
+    paging: Paging,
 ) -> Result<(), Box<dyn Error>> {
     let selection = SessionSelection::parse(sessions)?;
     let conn = connect(ctx).await?;
@@ -108,20 +116,19 @@ pub(crate) async fn delete_sessions(
         SessionSelection::Ids(ids) => ids.iter().map(|id| id.to_string()).collect(),
     };
 
-    // Only closed sessions can be deleted, so ask the server for closed ones
-    // only (and for just the named ids), and no other session crosses the wire.
     let filter = SessionFilter {
-        state: Some(SessionState::Closed),
         ids,
+        paging: Some(paging),
         ..Default::default()
     };
-    // The server returns each matching session once.
-    let closed: Vec<String> = conn
-        .list_sessions_with(&filter)
+    let closed = conn
+        .list_sessions(Some(&filter))
         .await?
+        .items
         .into_iter()
-        .map(|ssn| ssn.id)
-        .collect();
+        .filter(|session| session.state == SessionState::Closed)
+        .map(|session| session.id)
+        .collect::<Vec<_>>();
 
     let mut deleted = 0;
     let mut failed = 0;
@@ -131,7 +138,7 @@ pub(crate) async fn delete_sessions(
         for id in ids.iter().filter(|id| !closed.iter().any(|c| c == **id)) {
             failed += 1;
             eprintln!(
-                "Failed to delete session <{}>: not found or not closed (close it first)",
+                "Failed to delete session <{}>: not a Closed session on the selected page",
                 id
             );
         }
@@ -160,13 +167,14 @@ pub async fn run(
     ctx: &FlameContext,
     sessions: Option<&[String]>,
     nodes: Option<&[String]>,
+    paging: Paging,
 ) -> Result<(), Box<dyn Error>> {
     match (sessions, nodes) {
-        (Some(sessions), None) => delete_sessions(ctx, sessions).await,
-        (None, Some(nodes)) => delete_nodes(ctx, nodes).await,
+        (Some(sessions), None) => delete_sessions(ctx, sessions, paging).await,
+        (None, Some(nodes)) => delete_nodes(ctx, nodes, paging).await,
         (Some(_), Some(_)) => Err("--session and --node cannot be combined".into()),
         (None, None) => Err(
-            "--session or --node is required; use `-s` for all closed sessions or `-n` for all NotReady nodes".into(),
+            "--session or --node is required; use `-s` for Closed sessions or `-n` for NotReady nodes on the selected page".into(),
         ),
     }
 }

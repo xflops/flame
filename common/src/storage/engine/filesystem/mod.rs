@@ -37,11 +37,13 @@ limitations under the License.
 //! - **No file locks**: Relies on in-memory locks in the Session Manager
 //! - **CRC32 checksums**: Detects corruption on read
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
+use std::time::SystemTime;
 use stdng::{async_rw_ptr, ensure, read_async, write_async, AsyncRWPtr};
 use tokio::sync::OwnedRwLockWriteGuard;
 
@@ -214,7 +216,10 @@ impl FilesystemEngine {
     fn load_entities(&self) -> Result<(), FlameError> {
         for id in Self::child_names(&self.base_path.join("sessions")) {
             match self.read_session_metadata(&id) {
-                Ok(metadata) => {
+                Ok(mut metadata) => {
+                    if metadata.state == SessionState::Closed as i32 {
+                        metadata.tokens.clear();
+                    }
                     let entry = SessionEntry::new(metadata, self.session_path(&id));
                     self.sessions
                         .write()
@@ -261,6 +266,27 @@ impl FilesystemEngine {
             }
         }
         Ok(())
+    }
+
+    /// Directory names, newest creation time first. The stat is enough to order
+    /// them; the record body is read only for names the caller keeps.
+    fn sort_subdir(dir: &Path) -> Vec<String> {
+        let mut rows = Vec::new();
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        for entry in entries.flatten() {
+            let created = entry
+                .metadata()
+                .and_then(|metadata| metadata.created())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            rows.push((
+                Reverse(created),
+                entry.file_name().to_string_lossy().to_string(),
+            ));
+        }
+        rows.sort();
+        rows.into_iter().map(|(_, name)| name).collect()
     }
 
     fn child_names(dir: &std::path::Path) -> Vec<String> {
@@ -354,9 +380,6 @@ impl FilesystemEngine {
         &self,
         filter: Option<&SessionFilter>,
     ) -> Result<Vec<(SessionID, SessionMetadata)>, FlameError> {
-        if filter.and_then(|filter| filter.limit) == Some(0) {
-            return Ok(Vec::new());
-        }
         let sessions_dir = self.base_path.join("sessions");
         let entries = match fs::read_dir(&sessions_dir) {
             Ok(entries) => entries,
@@ -390,12 +413,6 @@ impl FilesystemEngine {
             });
             if matches {
                 sessions.push((session_id, metadata));
-                if filter
-                    .and_then(|filter| filter.limit)
-                    .is_some_and(|limit| sessions.len() >= limit)
-                {
-                    break;
-                }
             }
         }
         Ok(sessions)
@@ -434,6 +451,9 @@ impl FilesystemEngine {
     ) -> Result<(), FlameError> {
         self.write_session_metadata(&metadata.id, &metadata)?;
         entry.metadata = metadata;
+        if entry.is_closed() {
+            entry.metadata.tokens.clear();
+        }
         Ok(())
     }
 
@@ -822,9 +842,41 @@ impl FilesystemEngine {
         })
     }
 
+    /// Read execution-only session data for lifecycle and detailed getters.
     fn session_from_metadata(&self, meta: &SessionMetadata) -> Result<Session, FlameError> {
+        let mut session = Self::session_header(meta)?;
+        session.common_data = self.read_common_data(&meta.id, meta.common_data_len)?;
+        session.tokens = if session.is_closed() {
+            // Closed entries do not retain credentials. Explicit detailed reads
+            // hydrate them from the persisted record only for this response.
+            self.read_session_metadata(&meta.id)?.tokens
+        } else {
+            meta.tokens.clone()
+        };
+        Ok(session)
+    }
+
+    /// Reconstruct Closed counters from fixed task headers only.
+    async fn session_metadata(&self, entry: &SessionEntry) -> Result<Session, FlameError> {
+        let mut session = Self::session_header(&entry.metadata)?;
+        if session.is_closed() {
+            let count = {
+                let _commit = entry.commit.lock().await;
+                self._count_task(entry, &TaskFilter::by_session(&entry.metadata.id))?
+            };
+            for task_id in 1..=count {
+                let header = self.read_task_metadata(entry, task_id as TaskID)?;
+                session
+                    .task_counts
+                    .increment(TaskState::try_from(header.state as i32)?);
+            }
+        }
+        Ok(session)
+    }
+
+    /// Decode a session header without opening payload files or copying tokens.
+    fn session_header(meta: &SessionMetadata) -> Result<Session, FlameError> {
         let state = SessionState::try_from(meta.state)?;
-        let common_data = self.read_common_data(&meta.id, meta.common_data_len)?;
         let completion_time = meta
             .completion_time
             .and_then(|t| DateTime::from_timestamp(t, 0));
@@ -838,8 +890,8 @@ impl FilesystemEngine {
             id: meta.id.clone(),
             application: meta.application.clone(),
             version: meta.version,
-            common_data,
-            tokens: meta.tokens.clone(),
+            common_data: None,
+            tokens: Default::default(),
             tasks: Default::default(),
             task_counts: Default::default(),
             tasks_index: std::collections::HashMap::new(),
@@ -891,6 +943,7 @@ impl FilesystemEngine {
     fn node_from_metadata(meta: &NodeMetadata) -> Node {
         Node {
             name: meta.name.clone(),
+            creation_time: DateTime::from_timestamp(meta.creation_time, 0).unwrap_or_default(),
             state: NodeState::from(meta.state),
             capacity: ResourceRequirement {
                 cpu: meta.capacity_cpu,
@@ -1158,13 +1211,19 @@ impl Engine for FilesystemEngine {
         &self,
         filter: Option<&ApplicationFilter>,
     ) -> Result<Vec<Application>, FlameError> {
-        let names = self
+        let known = self
             .applications
             .read()
             .map_err(poisoned)?
             .keys()
             .cloned()
             .collect::<Vec<_>>();
+        let mut names = Self::sort_subdir(&self.base_path.join("applications"));
+        for name in &known {
+            if !names.iter().any(|listed| listed == name) {
+                names.push(name.clone());
+            }
+        }
         let mut apps = Vec::new();
         for name in names {
             if let Ok(app) = self.get_application(name).await {
@@ -1374,7 +1433,7 @@ impl Engine for FilesystemEngine {
         Ok(session)
     }
 
-    async fn find_sessions(&self) -> Result<Vec<Session>, FlameError> {
+    async fn find_session_metadata(&self) -> Result<Vec<Session>, FlameError> {
         let entries = self
             .sessions
             .read()
@@ -1382,13 +1441,15 @@ impl Engine for FilesystemEngine {
             .iter()
             .map(|(id, entry)| (id.clone(), entry.clone()))
             .collect::<Vec<_>>();
-        let mut sessions = Vec::new();
+        let mut sessions = Vec::with_capacity(entries.len());
         for (id, shared) in entries {
             let entry = read_async!(shared);
-            // A session deleted while we waited is simply no longer listed.
-            if validate_entry(&self.sessions, &id, &shared).is_ok() {
-                sessions.push(self.session_from_metadata(&entry.metadata)?);
+            match validate_entry(&self.sessions, &id, &shared) {
+                Ok(()) => {}
+                Err(FlameError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
             }
+            sessions.push(self.session_metadata(&entry).await?);
         }
         Ok(sessions)
     }
@@ -1537,28 +1598,94 @@ impl Engine for FilesystemEngine {
         self.task_from_metadata(&entry, &meta)
     }
 
-    async fn find_tasks(&self, filter: &TaskFilter) -> Result<Vec<Task>, FlameError> {
+    async fn find_task_metadata(
+        &self,
+        filter: &TaskFilter,
+    ) -> Result<crate::apis::Page<Task>, FlameError> {
         lock_ssn!(self, &filter.session, entry);
-        if filter.states.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(Vec::new());
-        }
-        let task_count = {
+        let count = {
             let _commit = entry.commit.lock().await;
             self._count_task(&entry, &TaskFilter::by_session(&filter.session))?
         };
+        let offset = filter.paging.map_or(0, |paging| paging.offset());
+        let limit = filter.paging.map_or(usize::MAX, |paging| paging.limit());
+        let states = filter
+            .states
+            .as_ref()
+            .map(|states| states.iter().copied().collect::<HashSet<_>>());
+        let (candidates, candidate_count): (Box<dyn Iterator<Item = TaskID> + Send>, u64) =
+            if let Some(ids) = &filter.ids {
+                let mut ids = ids
+                    .iter()
+                    .copied()
+                    .filter(|id| *id > 0 && (*id as u64) <= count)
+                    .collect::<Vec<_>>();
+                ids.sort_unstable_by(|a, b| b.cmp(a));
+                ids.dedup();
+                let count = ids.len() as u64;
+                let (skip, take) = if states.is_none() {
+                    (offset, limit)
+                } else {
+                    (0, usize::MAX)
+                };
+                (Box::new(ids.into_iter().skip(skip).take(take)), count)
+            } else {
+                // Dense task IDs permit a direct seek to the last ID on this page.
+                let first = if states.is_none() {
+                    count.saturating_sub(offset as u64)
+                } else {
+                    count
+                };
+                let end = if states.is_none() {
+                    first.saturating_sub(limit as u64)
+                } else {
+                    0
+                };
+                (
+                    Box::new((end..first).rev().map(|id| (id + 1) as TaskID)),
+                    count,
+                )
+            };
         let mut tasks = Vec::new();
-        for task_id in 1..=task_count {
-            let meta = self.read_task_metadata(&entry, task_id as TaskID)?;
-            let state = TaskState::try_from(meta.state as i32)?;
-            if filter
-                .states
+        let mut matched = 0usize;
+        for task_id in candidates {
+            let header = self.read_task_metadata(&entry, task_id)?;
+            if header.id != task_id as u64 {
+                return Err(FlameError::Storage(format!(
+                    "Task {task_id} metadata has mismatched identity"
+                )));
+            }
+            let state = TaskState::try_from(header.state as i32)?;
+            if states
                 .as_ref()
-                .is_none_or(|states| states.contains(&state))
+                .is_some_and(|states| !states.contains(&state))
             {
-                tasks.push(self.task_from_metadata(&entry, &meta)?);
+                continue;
+            }
+            let selected = states.is_none() || (matched >= offset && matched - offset < limit);
+            matched += 1;
+            if selected {
+                tasks.push(Self::task_with_data(
+                    &filter.session,
+                    &header,
+                    None,
+                    None,
+                    Default::default(),
+                )?);
             }
         }
-        Ok(tasks)
+        let total = if states.is_some() {
+            matched as u64
+        } else {
+            candidate_count
+        };
+        Ok(crate::apis::Page {
+            items: tasks,
+            paging: filter.paging.map_or_else(
+                || crate::apis::Paging::all(total),
+                |paging| paging.with_total(total),
+            ),
+        })
     }
 
     async fn create_node(&self, node: &Node) -> Result<Node, FlameError> {
@@ -1580,7 +1707,10 @@ impl Engine for FilesystemEngine {
             return Err(error);
         }
         entry.metadata = metadata;
-        Ok(node.clone())
+        let mut result = node.clone();
+        result.creation_time =
+            DateTime::from_timestamp(entry.metadata.creation_time, 0).unwrap_or_default();
+        Ok(result)
     }
 
     async fn get_node(&self, name: &str) -> Result<Option<Node>, FlameError> {
@@ -1601,7 +1731,10 @@ impl Engine for FilesystemEngine {
         let metadata = NodeMetadata::from_node(node, entry.metadata.creation_time);
         self.write_node_metadata(&node.name, &metadata)?;
         entry.metadata = metadata;
-        Ok(node.clone())
+        let mut result = node.clone();
+        result.creation_time =
+            DateTime::from_timestamp(entry.metadata.creation_time, 0).unwrap_or_default();
+        Ok(result)
     }
 
     async fn delete_node(&self, name: &str) -> Result<(), FlameError> {
@@ -1653,8 +1786,11 @@ impl Engine for FilesystemEngine {
             .collect::<Vec<_>>();
         let mut nodes = Vec::new();
         for name in names {
-            if let Some(node) = self.get_node(&name).await? {
-                nodes.push(node);
+            match self.get_node(&name).await {
+                Ok(Some(node)) => nodes.push(node),
+                // Deletion can win while get_node waits for the captured entry.
+                Ok(None) | Err(FlameError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
             }
         }
         Ok(nodes)
@@ -1793,19 +1929,33 @@ impl Engine for FilesystemEngine {
     }
 
     async fn find_executors(&self, node: Option<&str>) -> Result<Vec<Executor>, FlameError> {
-        let ids = self
-            .executors
-            .read()
-            .map_err(poisoned)?
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        let shared = {
+            let executors = self.executors.read().map_err(poisoned)?;
+            executors
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut rows = Vec::with_capacity(shared.len());
+        for (id, entry) in &shared {
+            let node_name = read_async!(entry).metadata.node.clone();
+            let created = fs::metadata(self.executor_path(&node_name, id))
+                .and_then(|metadata| metadata.created())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            rows.push((Reverse(created), id.clone()));
+        }
+        rows.sort();
         let mut executors = Vec::new();
-        for id in ids {
-            if let Some(executor) = self.get_executor(&id).await? {
-                if node.is_none_or(|name| executor.node == name) {
-                    executors.push(executor);
+        for (_, id) in rows {
+            match self.get_executor(&id).await {
+                Ok(Some(executor)) => {
+                    if node.is_none_or(|name| executor.node == name) {
+                        executors.push(executor);
+                    }
                 }
+                // Executor or parent-node deletion can win after IDs are captured.
+                Ok(None) | Err(FlameError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
             }
         }
         Ok(executors)

@@ -49,7 +49,7 @@ async fn deletion_is_persistent_and_keeps_other_nodes() {
     }
     let recovered = crate::storage::new_ptr(&config).await.unwrap();
     recovered.load_data().await.unwrap();
-    let nodes = recovered.list_nodes().unwrap();
+    let nodes = recovered.list_nodes(None).unwrap();
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes[0].name, "current");
     controller

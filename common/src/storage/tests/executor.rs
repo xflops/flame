@@ -286,11 +286,11 @@ mod delete_executor {
             .await
             .unwrap();
 
-        assert_eq!(storage.list_executors(None).unwrap().len(), 1);
+        assert_eq!(storage.list_executors(None).await.unwrap().len(), 1);
 
         storage.delete_executor(executor.id).await.unwrap();
 
-        assert_eq!(storage.list_executors(None).unwrap().len(), 0);
+        assert_eq!(storage.list_executors(None).await.unwrap().len(), 0);
     }
 }
 
@@ -321,7 +321,7 @@ mod delete_executors {
         let deleted_ids = storage.delete_executors(&to_delete).await.unwrap();
 
         assert_eq!(deleted_ids.len(), 2);
-        assert_eq!(storage.list_executors(None).unwrap().len(), 0);
+        assert_eq!(storage.list_executors(None).await.unwrap().len(), 0);
     }
 }
 
@@ -333,7 +333,7 @@ mod list_executors {
         let ctx = test_context();
         let storage = storage::new_ptr(&ctx).await.unwrap();
 
-        let executors = storage.list_executors(None).unwrap();
+        let executors = storage.list_executors(None).await.unwrap();
         assert!(executors.is_empty());
     }
 
@@ -355,7 +355,7 @@ mod list_executors {
                 .unwrap();
         }
 
-        let executors = storage.list_executors(None).unwrap();
+        let executors = storage.list_executors(None).await.unwrap();
         assert_eq!(executors.len(), 3);
     }
 
@@ -389,11 +389,14 @@ mod list_executors {
             .unwrap();
 
         let filter = ExecutorFilter {
+            application: None,
+            session_id: None,
             state: Some(ExecutorState::Idle),
             node: None,
             ids: None,
+            paging: None,
         };
-        let filtered = storage.list_executors(Some(&filter)).unwrap();
+        let filtered = storage.list_executors(Some(&filter)).await.unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].state, ExecutorState::Idle);
     }
@@ -425,11 +428,14 @@ mod list_executors {
             .unwrap();
 
         let filter = ExecutorFilter {
+            application: None,
+            session_id: None,
             state: None,
             node: Some("node-1".to_string()),
             ids: None,
+            paging: None,
         };
-        let filtered = storage.list_executors(Some(&filter)).unwrap();
+        let filtered = storage.list_executors(Some(&filter)).await.unwrap();
         assert_eq!(filtered.len(), 2);
         assert!(filtered.iter().all(|e| e.node == "node-1"));
     }
@@ -459,11 +465,14 @@ mod list_executors {
             .unwrap();
 
         let filter = ExecutorFilter {
+            application: None,
+            session_id: None,
             state: None,
             node: None,
             ids: Some(vec![exec1.id.clone(), exec2.id.clone()]),
+            paging: None,
         };
-        let filtered = storage.list_executors(Some(&filter)).unwrap();
+        let filtered = storage.list_executors(Some(&filter)).await.unwrap();
         assert_eq!(filtered.len(), 2);
 
         let ids: Vec<_> = filtered.iter().map(|e| e.id.as_str()).collect();
@@ -506,11 +515,14 @@ mod list_executors {
         storage.update_executor(&exec3).await.unwrap();
 
         let filter = ExecutorFilter {
+            application: None,
+            session_id: None,
             state: Some(ExecutorState::Idle),
             node: Some("mf-node-1".to_string()),
             ids: None,
+            paging: None,
         };
-        let filtered = storage.list_executors(Some(&filter)).unwrap();
+        let filtered = storage.list_executors(Some(&filter)).await.unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].node, "mf-node-1");
         assert_eq!(filtered[0].state, ExecutorState::Idle);

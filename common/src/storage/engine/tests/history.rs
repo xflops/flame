@@ -71,23 +71,23 @@ async fn finished_reads_return_all_terminal_tasks_and_recovery_reads_all_tasks()
             .await
             .unwrap();
         let all = engine
-            .find_tasks(&TaskFilter::by_session("history"))
+            .find_task_metadata(&TaskFilter::by_session("history"))
             .await
             .unwrap();
         assert_eq!(all.len(), 5, "{kind}");
         let finished = engine
-            .find_tasks(&TaskFilter::terminal("history"))
+            .find_task_metadata(&TaskFilter::terminal("history"))
             .await
             .unwrap();
         assert_eq!(finished.len(), 3, "{kind}");
         let active = engine
-            .find_tasks(&TaskFilter::non_terminal("history"))
+            .find_task_metadata(&TaskFilter::non_terminal("history"))
             .await
             .unwrap();
         assert_eq!(active.len(), 2, "{kind}");
         assert!(active.iter().all(|task| !task.state.is_terminal()));
         let mixed = engine
-            .find_tasks(&TaskFilter::by_session_states(
+            .find_task_metadata(&TaskFilter::by_session_states(
                 "history",
                 vec![TaskState::Pending, TaskState::Failed],
             ))
@@ -99,32 +99,38 @@ async fn finished_reads_return_all_terminal_tasks_and_recovery_reads_all_tasks()
             .all(|task| matches!(task.state, TaskState::Pending | TaskState::Failed)));
         let empty = TaskFilter::by_session_states("history", Vec::<TaskState>::new());
         assert!(
-            engine.find_tasks(&empty).await.unwrap().is_empty(),
+            engine.find_task_metadata(&empty).await.unwrap().is_empty(),
             "{kind}"
         );
         let repeated =
             TaskFilter::by_session_states("history", vec![TaskState::Pending, TaskState::Pending]);
         assert_eq!(
-            engine.find_tasks(&repeated).await.unwrap().len(),
+            engine.find_task_metadata(&repeated).await.unwrap().len(),
             1,
             "{kind}"
         );
-        for task in finished {
+        for metadata in finished {
+            assert!(metadata.input.is_none() && metadata.output.is_none());
+            let task = engine.get_task(metadata.gid()).await.unwrap();
             assert!(task.state.is_terminal());
             assert_eq!(task.input, Some(Bytes::from("input")));
             assert_eq!(task.output, Some(Bytes::from("output")));
         }
         assert!(matches!(
-            engine.find_tasks(&TaskFilter::by_session("missing")).await,
-            Err(FlameError::NotFound(_))
-        ));
-        assert!(matches!(
-            engine.find_tasks(&TaskFilter::terminal("missing")).await,
+            engine
+                .find_task_metadata(&TaskFilter::by_session("missing"))
+                .await,
             Err(FlameError::NotFound(_))
         ));
         assert!(matches!(
             engine
-                .find_tasks(&TaskFilter::by_session_states(
+                .find_task_metadata(&TaskFilter::terminal("missing"))
+                .await,
+            Err(FlameError::NotFound(_))
+        ));
+        assert!(matches!(
+            engine
+                .find_task_metadata(&TaskFilter::by_session_states(
                     "missing",
                     Vec::<TaskState>::new()
                 ))
@@ -195,7 +201,7 @@ async fn none_retains_task_records_and_payloads_after_completion() {
     assert_eq!(stored.affinity, created.affinity);
     assert_eq!(
         engine
-            .find_tasks(&TaskFilter::terminal("history"))
+            .find_task_metadata(&TaskFilter::terminal("history"))
             .await
             .unwrap()
             .len(),

@@ -250,7 +250,7 @@ mod application_lifecycle {
         let ssn_attr = create_session_attr("cleanup-ssn", "cleanup-app");
         storage.create_session(ssn_attr).await.unwrap();
 
-        assert_eq!(storage.list_sessions(None).unwrap().len(), 1);
+        assert_eq!(storage.list_sessions(None).await.unwrap().len(), 1);
 
         storage
             .update_application_state("cleanup-app".to_string(), ApplicationState::Disabled)
@@ -259,7 +259,7 @@ mod application_lifecycle {
 
         let open_sessions =
             crate::apis::SessionFilter::by_application_state("cleanup-app", SessionState::Open);
-        assert_eq!(storage.count_session(&open_sessions).unwrap(), 1);
+        assert_eq!(storage.count_session(&open_sessions).await.unwrap(), 1);
         let result = storage.delete_application("cleanup-app".to_string()).await;
         assert!(matches!(result, Err(crate::FlameError::InvalidState(_))));
 
@@ -269,7 +269,7 @@ mod application_lifecycle {
             .unwrap();
         let result = storage.delete_application("cleanup-app".to_string()).await;
         assert!(matches!(result, Err(crate::FlameError::InvalidState(_))));
-        assert_eq!(storage.list_sessions(None).unwrap().len(), 1);
+        assert_eq!(storage.list_sessions(None).await.unwrap().len(), 1);
 
         storage
             .delete_session("cleanup-ssn".to_string())
@@ -280,7 +280,7 @@ mod application_lifecycle {
             .await
             .unwrap();
 
-        assert_eq!(storage.list_sessions(None).unwrap().len(), 0);
+        assert_eq!(storage.list_sessions(None).await.unwrap().len(), 0);
     }
 
     #[tokio::test]

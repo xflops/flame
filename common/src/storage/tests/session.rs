@@ -91,7 +91,7 @@ mod create_session {
             storage.create_session(attr).await.unwrap();
         }
 
-        let sessions = storage.list_sessions(None).unwrap();
+        let sessions = storage.list_sessions(None).await.unwrap();
         assert_eq!(sessions.len(), 5);
     }
 }
@@ -338,14 +338,14 @@ mod delete_session {
         let attr = create_session_attr("list-delete-ssn");
         storage.create_session(attr).await.unwrap();
 
-        assert_eq!(storage.list_sessions(None).unwrap().len(), 1);
+        assert_eq!(storage.list_sessions(None).await.unwrap().len(), 1);
 
         storage
             .delete_session("list-delete-ssn".to_string())
             .await
             .unwrap();
 
-        assert_eq!(storage.list_sessions(None).unwrap().len(), 0);
+        assert_eq!(storage.list_sessions(None).await.unwrap().len(), 0);
     }
 }
 
@@ -357,7 +357,7 @@ mod list_sessions {
         let ctx = test_context();
         let storage = storage::new_ptr(&ctx).await.unwrap();
 
-        let sessions = storage.list_sessions(None).unwrap();
+        let sessions = storage.list_sessions(None).await.unwrap();
         assert!(sessions.is_empty());
     }
 
@@ -371,7 +371,7 @@ mod list_sessions {
             storage.create_session(attr).await.unwrap();
         }
 
-        let sessions = storage.list_sessions(None).unwrap();
+        let sessions = storage.list_sessions(None).await.unwrap();
         assert_eq!(sessions.len(), 3);
 
         let ids: Vec<_> = sessions.iter().map(|s| s.id.as_str()).collect();
@@ -395,7 +395,7 @@ mod list_sessions {
             .await
             .unwrap();
 
-        let sessions = storage.list_sessions(None).unwrap();
+        let sessions = storage.list_sessions(None).await.unwrap();
         assert_eq!(sessions.len(), 2);
 
         let open_count = sessions
@@ -412,7 +412,7 @@ mod list_sessions {
     }
 
     #[tokio::test]
-    async fn includes_session_events() {
+    async fn omits_session_events() {
         let ctx = test_context();
         let storage = storage::new_ptr(&ctx).await.unwrap();
 
@@ -430,17 +430,12 @@ mod list_sessions {
             .await
             .unwrap();
 
-        let sessions = storage.list_sessions(None).unwrap();
+        let sessions = storage.list_sessions(None).await.unwrap();
         let session = sessions
             .iter()
             .find(|session| session.id == "list-event-ssn")
             .expect("session should be listed");
 
-        assert_eq!(session.events.len(), 1);
-        assert_eq!(session.events[0].code, 1002);
-        assert_eq!(
-            session.events[0].message.as_deref(),
-            Some("retry limit reached")
-        );
+        assert!(session.events.is_empty());
     }
 }

@@ -105,7 +105,10 @@ impl FrontendLivenessProvider {
 impl LivenessProvider for FrontendLivenessProvider {
     /// Fetch unfiltered application and session lists, failing closed if either RPC or validation fails.
     async fn snapshot(&mut self) -> Result<LivenessSnapshot, FlameError> {
-        let mut request = Request::new(ListApplicationsRequest { state: None });
+        let mut request = Request::new(ListApplicationsRequest {
+            state: None,
+            ..Default::default()
+        });
         request.set_timeout(LIST_TIMEOUT);
         let applications = validate_applications(
             self.client
@@ -125,6 +128,14 @@ impl LivenessProvider for FrontendLivenessProvider {
                 .into_inner()
                 .sessions,
         )?;
+        if applications.len() >= common::apis::DEFAULT_LIST_LIMITATION
+            || sessions.len() >= common::apis::DEFAULT_LIST_LIMITATION
+        {
+            return Err(FlameError::Internal(
+                "list reached DEFAULT_LIST_LIMITATION; refusing an incomplete liveness snapshot"
+                    .into(),
+            ));
+        }
         Ok(LivenessSnapshot {
             applications,
             sessions,

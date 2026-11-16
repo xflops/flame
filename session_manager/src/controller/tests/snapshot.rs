@@ -343,15 +343,23 @@ fn slots_rr(n: u32) -> ResourceRequirement {
 fn application_filter_maps_rpc_state() {
     let filter = ApplicationFilter::try_from(rpc::ListApplicationsRequest {
         state: Some(rpc::ApplicationState::Disabled as i32),
+        paging: None,
+        ..Default::default()
     })
     .unwrap();
 
     assert_eq!(filter.state, Some(ApplicationState::Disabled));
+    assert_eq!(filter.paging, Some(common::apis::Paging::default()));
 }
 
 #[test]
 fn application_filter_rejects_unknown_rpc_state() {
-    assert!(ApplicationFilter::try_from(rpc::ListApplicationsRequest { state: Some(99) }).is_err());
+    assert!(ApplicationFilter::try_from(rpc::ListApplicationsRequest {
+        state: Some(99),
+        paging: None,
+        ..Default::default()
+    })
+    .is_err());
 }
 
 #[test]
@@ -360,12 +368,14 @@ fn session_filter_maps_rpc_fields() {
         application: Some("test-app".to_string()),
         state: Some(rpc::SessionState::Open as i32),
         ids: vec![],
+        paging: None,
     })
     .unwrap();
 
     assert_eq!(filter.application.as_deref(), Some("test-app"));
     assert_eq!(filter.state, Some(SessionState::Open));
     assert_eq!(filter.ids, None);
+    assert_eq!(filter.paging, Some(common::apis::Paging::default()));
 }
 
 #[test]
@@ -374,6 +384,7 @@ fn session_filter_maps_rpc_ids() {
         application: None,
         state: None,
         ids: vec!["ssn-1".to_string(), "ssn-2".to_string()],
+        paging: None,
     })
     .unwrap();
 
@@ -381,6 +392,7 @@ fn session_filter_maps_rpc_ids() {
         filter.ids,
         Some(vec!["ssn-1".to_string(), "ssn-2".to_string()])
     );
+    assert_eq!(filter.paging, Some(common::apis::Paging::default()));
 }
 
 #[test]
@@ -389,6 +401,7 @@ fn session_filter_rejects_unknown_rpc_state() {
         application: None,
         state: Some(99),
         ids: vec![],
+        paging: None,
     })
     .is_err());
 }
@@ -706,6 +719,9 @@ fn test_snapshot_empty_filters() {
             state: Some(ExecutorState::Releasing),
             ids: None,
             node: None,
+            paging: None,
+            application: None,
+            session_id: None,
         }))
         .unwrap();
     assert_eq!(releasing_execs.len(), 0);
@@ -716,6 +732,9 @@ fn test_snapshot_empty_filters() {
             state: None,
             ids: Some(vec!["nonexistent".to_string()]),
             node: None,
+            paging: None,
+            application: None,
+            session_id: None,
         }))
         .unwrap();
     assert_eq!(nonexistent.len(), 0);
@@ -757,6 +776,9 @@ fn interrupted_executors_remain_visible_in_actual_state_indexes() {
                         state: Some(indexed_state),
                         ids: None,
                         node: None,
+                        paging: None,
+                        application: None,
+                        session_id: None,
                     }))
                     .unwrap();
                 assert_eq!(indexed.len(), usize::from(indexed_state == state));

@@ -85,8 +85,9 @@ fn test_get_task_with_events() -> Result<(), FlameError> {
 
     let task_1_1 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
     assert_eq!(task_1_1.id, 1);
-    let tasks =
-        tokio_test::block_on(storage.find_tasks(&TaskFilter::by_session(ssn_1.id.clone())))?;
+    let tasks = tokio_test::block_on(
+        storage.find_task_metadata(&TaskFilter::by_session(ssn_1.id.clone())),
+    )?;
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].id, 1);
     assert_eq!(tasks[0].ssn_id, ssn_1.id.clone());
@@ -100,8 +101,9 @@ fn test_get_task_with_events() -> Result<(), FlameError> {
         Some("Task succeeded".to_string()),
     ))?;
     assert_eq!(task_1_1.state, TaskState::Succeed);
-    let tasks =
-        tokio_test::block_on(storage.find_tasks(&TaskFilter::by_session(ssn_1.id.clone())))?;
+    let tasks = tokio_test::block_on(
+        storage.find_task_metadata(&TaskFilter::by_session(ssn_1.id.clone())),
+    )?;
 
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].id, 1);
@@ -265,7 +267,7 @@ fn test_unregister_application() -> Result<(), FlameError> {
     let res = tokio_test::block_on(storage.delete_application("flmexec".to_string()));
     assert!(matches!(res, Err(FlameError::InvalidState(_))));
 
-    let list_ssn = tokio_test::block_on(storage.find_sessions())?;
+    let list_ssn = tokio_test::block_on(storage.find_session_metadata())?;
     assert_eq!(list_ssn.len(), 1);
     assert_eq!(list_ssn[0].id, ssn_1_id);
 
@@ -275,7 +277,7 @@ fn test_unregister_application() -> Result<(), FlameError> {
     let app_1 = tokio_test::block_on(storage.get_application("flmexec".to_string()));
     assert!(app_1.is_err());
 
-    let list_ssn = tokio_test::block_on(storage.find_sessions())?;
+    let list_ssn = tokio_test::block_on(storage.find_session_metadata())?;
     assert_eq!(list_ssn.len(), 0);
 
     Ok(())
@@ -595,7 +597,8 @@ fn test_single_session() -> Result<(), FlameError> {
     let task_1_2 = tokio_test::block_on(storage.create_task(ssn_1.id.clone(), None, None))?;
     assert_eq!(task_1_2.id, 2);
 
-    let task_list = tokio_test::block_on(storage.find_tasks(&TaskFilter::by_session(ssn_1.id)))?;
+    let task_list =
+        tokio_test::block_on(storage.find_task_metadata(&TaskFilter::by_session(ssn_1.id)))?;
     assert_eq!(task_list.len(), 2);
 
     let task_1_1 = tokio_test::block_on(storage.update_task_state(
@@ -701,7 +704,7 @@ fn test_multiple_session() -> Result<(), FlameError> {
     ))?;
     assert_eq!(task_2_2.state, TaskState::Succeed);
 
-    let ssn_list = tokio_test::block_on(storage.find_sessions())?;
+    let ssn_list = tokio_test::block_on(storage.find_session_metadata())?;
     assert_eq!(ssn_list.len(), 2);
 
     let ssn_1 = tokio_test::block_on(storage.close_session(ssn_1_id.clone()))?;

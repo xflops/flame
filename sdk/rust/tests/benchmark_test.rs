@@ -226,7 +226,7 @@ async fn wait_for_executors_to_settle(conn: &flame::client::Connection) -> Resul
     let deadline = Instant::now() + EXECUTOR_SETTLE_TIMEOUT;
     loop {
         let settled = conn
-            .list_executors()
+            .list_executors(None)
             .await?
             .into_iter()
             .filter(|executor| executor.application == FLAME_APP)
@@ -255,7 +255,7 @@ async fn wait_for_retained_executor_count(
     let deadline = Instant::now() + EXECUTOR_SETTLE_TIMEOUT;
     loop {
         let idle = conn
-            .list_executors()
+            .list_executors(None)
             .await?
             .into_iter()
             .filter(|executor| {
