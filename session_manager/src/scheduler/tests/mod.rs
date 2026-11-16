@@ -73,6 +73,7 @@ fn new_test_node(name: String) -> Node {
         },
         state: NodeState::Ready,
         shims: vec![common::apis::Shim::Host],
+        creation_time: Default::default(),
     }
 }
 
@@ -176,7 +177,7 @@ fn assert_dispatch_reuses_idle_executors(task_counts: &[usize]) -> Result<(), Fl
     let allocate = AllocateAction::new_ptr();
     tokio_test::block_on(allocate.execute(&mut ctx))?;
 
-    let executors = controller.list_executors()?;
+    let executors = tokio_test::block_on(controller.list_executors(None))?;
     assert_eq!(executors.len(), executor_count);
     assert!(executors.iter().all(|executor| {
         executor.state == common::apis::ExecutorState::Binding
@@ -361,8 +362,7 @@ fn gang_dispatch(batch_size: u32, idle: usize) -> Result<usize, FlameError> {
     let mut ctx = Context::new(controller.clone(), &PluginsOptions::default())?;
     tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
 
-    Ok(controller
-        .list_executors()?
+    Ok(tokio_test::block_on(controller.list_executors(None))?
         .iter()
         .filter(|executor| executor.ssn_id.as_ref() == Some(&session.id))
         .count())
@@ -406,14 +406,14 @@ fn gang_cycles(batch_size: u32, idle: usize, cycles: usize) -> Result<(usize, us
         let mut ctx = Context::new(controller.clone(), &PluginsOptions::default())?;
         tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
         tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
-        for executor in controller.list_executors()? {
+        for executor in tokio_test::block_on(controller.list_executors(None))? {
             if executor.state == common::apis::ExecutorState::Void {
                 tokio_test::block_on(controller.register_executor(&executor))?;
             }
         }
     }
 
-    let executors = controller.list_executors()?;
+    let executors = tokio_test::block_on(controller.list_executors(None))?;
     let bound = executors
         .iter()
         .filter(|executor| executor.ssn_id.as_ref() == Some(&session.id))
@@ -461,7 +461,7 @@ fn competing_gangs(policies: &[&str], size: u32, cycles: usize) -> Result<Vec<us
         let mut ctx = Context::new(controller.clone(), &options)?;
         tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
         tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
-        for executor in controller.list_executors()? {
+        for executor in tokio_test::block_on(controller.list_executors(None))? {
             if executor.state == common::apis::ExecutorState::Void {
                 tokio_test::block_on(controller.register_executor(&executor))?;
             }
@@ -470,7 +470,7 @@ fn competing_gangs(policies: &[&str], size: u32, cycles: usize) -> Result<Vec<us
     sessions
         .iter()
         .map(|session| {
-            controller.list_executors().map(|all| {
+            tokio_test::block_on(controller.list_executors(None)).map(|all| {
                 all.iter()
                     .filter(|e| e.ssn_id.as_ref() == Some(&session.id))
                     .count()
@@ -526,8 +526,7 @@ fn executors_held(
     for _ in 0..cycles {
         cycle(&controller, &options)?;
     }
-    Ok(controller
-        .list_executors()?
+    Ok(tokio_test::block_on(controller.list_executors(None))?
         .iter()
         .filter(|e| e.ssn_id.as_deref() == Some(session.id.as_str()))
         .count())
@@ -543,7 +542,7 @@ fn cycle(controller: &ControllerPtr, options: &PluginsOptions) -> Result<(), Fla
     let mut ctx = Context::new(controller.clone(), options)?;
     tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
     tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
-    for executor in controller.list_executors()? {
+    for executor in tokio_test::block_on(controller.list_executors(None))? {
         if executor.state == common::apis::ExecutorState::Void {
             tokio_test::block_on(controller.register_executor(&executor))?;
         }
@@ -638,8 +637,7 @@ fn assert_dispatch_limit_preserves_das(
         let mut ctx = Context::new(controller.clone(), &options)?;
         tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
         assert_eq!(
-            controller
-                .list_executors()?
+            tokio_test::block_on(controller.list_executors(None))?
                 .iter()
                 .filter(|exec| exec.ssn_id.as_ref() == Some(&session_id))
                 .count(),
@@ -648,7 +646,7 @@ fn assert_dispatch_limit_preserves_das(
         );
         tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
 
-        let executors = controller.list_executors()?;
+        let executors = tokio_test::block_on(controller.list_executors(None))?;
         assert_eq!(
             executors.len(),
             2,
@@ -692,7 +690,7 @@ fn assert_application_limit_spans_sessions(
         let mut ctx = Context::new(controller.clone(), &options)?;
         tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
         tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
-        let executors = controller.list_executors()?;
+        let executors = tokio_test::block_on(controller.list_executors(None))?;
         assert_eq!(
             executors.len(),
             1,

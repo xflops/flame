@@ -300,7 +300,14 @@ impl tonic::server::UnaryService<rpc::ListNodesRequest> for ListNodes {
     type Future = std::future::Ready<Result<tonic::Response<Self::Response>, tonic::Status>>;
 
     fn call(&mut self, _: tonic::Request<rpc::ListNodesRequest>) -> Self::Future {
-        std::future::ready(Ok(tonic::Response::new(rpc::NodeList::default())))
+        std::future::ready(Ok(tonic::Response::new(rpc::NodeList {
+            nodes: Vec::new(),
+            paging: Some(rpc::Paging {
+                limit: 100,
+                number: 1,
+                total: Some(0),
+            }),
+        })))
     }
 }
 
@@ -448,7 +455,7 @@ async fn exercise_clients(port: u16, tls: FlameClientTls) {
         .await
         .unwrap()
         .unwrap();
-        assert!(connection.list_nodes().await.unwrap().is_empty());
+        assert!(connection.list_nodes(None).await.unwrap().is_empty());
         let reference = tokio::time::timeout(
             Duration::from_secs(5),
             crate::upload_package(&loaded, "test", "package.whl", &package),
@@ -464,7 +471,7 @@ async fn exercise_clients(port: u16, tls: FlameClientTls) {
 async fn rejects_cluster(endpoint: &str, tls: Option<&FlameClientTls>) {
     let rejected = tokio::time::timeout(Duration::from_secs(5), async {
         match crate::client::connect_with_tls(endpoint, tls).await {
-            Ok(connection) => connection.list_nodes().await.is_err(),
+            Ok(connection) => connection.list_nodes(None).await.is_err(),
             Err(_) => true,
         }
     })

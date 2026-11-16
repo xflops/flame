@@ -47,13 +47,54 @@ impl HealthSummary {
 }
 
 async fn sample(connection: &Connection) -> Result<(usize, usize, usize), FlameError> {
-    let nodes = connection.list_nodes().await?;
-    let executors = connection.list_executors().await?;
-    let ready = nodes
-        .iter()
-        .filter(|node| node.state == NodeState::Ready)
-        .count();
-    Ok((ready, nodes.len(), executors.len()))
+    let mut nodes = 0;
+    let mut ready = 0;
+    let mut filter = flame_rs::client::NodeFilter::default();
+    loop {
+        let page = connection.list_nodes(Some(&filter)).await?;
+        nodes += page.len();
+        ready += page
+            .iter()
+            .filter(|node| node.state == NodeState::Ready)
+            .count();
+        let total = page
+            .paging
+            .total
+            .ok_or_else(|| FlameError::InvalidConfig("missing page total".into()))?;
+        if (page.paging.number as u64).saturating_mul(page.paging.limit as u64) >= total {
+            break;
+        }
+        filter.paging = Some(flame_rs::client::Paging {
+            number: page
+                .paging
+                .number
+                .checked_add(1)
+                .ok_or_else(|| FlameError::InvalidConfig("page number overflow".into()))?,
+            ..page.paging
+        });
+    }
+    let mut executors = 0;
+    let mut filter = flame_rs::client::ExecutorFilter::default();
+    loop {
+        let page = connection.list_executors(Some(&filter)).await?;
+        executors += page.len();
+        let total = page
+            .paging
+            .total
+            .ok_or_else(|| FlameError::InvalidConfig("missing page total".into()))?;
+        if (page.paging.number as u64).saturating_mul(page.paging.limit as u64) >= total {
+            break;
+        }
+        filter.paging = Some(flame_rs::client::Paging {
+            number: page
+                .paging
+                .number
+                .checked_add(1)
+                .ok_or_else(|| FlameError::InvalidConfig("page number overflow".into()))?,
+            ..page.paging
+        });
+    }
+    Ok((ready, nodes, executors))
 }
 
 /// Polls node and executor state in the background until [`finish`](Self::finish).

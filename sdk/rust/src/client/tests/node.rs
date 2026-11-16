@@ -146,7 +146,14 @@ impl tonic::server::UnaryService<rpc::ListNodesRequest> for ListNodes {
             ..Default::default()
         })
         .collect();
-        std::future::ready(Ok(tonic::Response::new(rpc::NodeList { nodes })))
+        std::future::ready(Ok(tonic::Response::new(rpc::NodeList {
+            nodes,
+            paging: Some(rpc::Paging {
+                limit: 100,
+                number: 1,
+                total: Some(3),
+            }),
+        })))
     }
 }
 
@@ -232,10 +239,13 @@ async fn start_server(
 async fn list_nodes_decodes_every_node_state() {
     let stub = FrontendStub::default();
     let (connection, shutdown, server) = start_server(stub.clone()).await;
-    let nodes = tokio::time::timeout(std::time::Duration::from_secs(5), connection.list_nodes())
-        .await
-        .unwrap()
-        .unwrap();
+    let nodes = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        connection.list_nodes(None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         nodes
             .iter()

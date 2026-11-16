@@ -5,22 +5,28 @@ import logging
 import os
 import threading
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
-from typing import Any, Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, Iterable, Optional, Union
 
 from flamepy.core._bridge import LoopThread
 from flamepy.core.aio import client as aio_client
 from flamepy.core.types import (
     Application,
     ApplicationAttributes,
+    ApplicationFilter,
+    ExecutorFilter,
     FlameClientTls,
     FlameContext,
     FlameError,
     FlameErrorCode,
+    NodeFilter,
+    Page,
     ResourceRequirement,
     SessionAttributes,
+    SessionFilter,
     SessionID,
     SessionState,
     Task,
+    TaskFilter,
     TaskID,
     TaskOptions,
 )
@@ -59,29 +65,24 @@ def unregister_application(name: str) -> None:
     ConnectionInstance.instance().unregister_application(name)
 
 
-def list_applications() -> List[Application]:
-    return ConnectionInstance.instance().list_applications()
+def list_applications(filter: Optional[ApplicationFilter] = None) -> Page[Application]:
+    return ConnectionInstance.instance().list_applications(filter)
 
 
 def get_application(name: str) -> Optional[Application]:
     return ConnectionInstance.instance().get_application(name)
 
 
-def list_executors() -> List[Any]:
-    return ConnectionInstance.instance().list_executors()
+def list_executors(filter: Optional[ExecutorFilter] = None) -> Page[Any]:
+    return ConnectionInstance.instance().list_executors(filter)
 
 
-def list_nodes() -> List[Any]:
-    return ConnectionInstance.instance().list_nodes()
+def list_nodes(filter: Optional[NodeFilter] = None) -> Page[Any]:
+    return ConnectionInstance.instance().list_nodes(filter)
 
 
-def list_sessions(
-    *,
-    state: Optional[SessionState] = None,
-    ids: Optional[Iterable[SessionID]] = None,
-    application: Optional[str] = None,
-) -> List["Session"]:
-    return ConnectionInstance.instance().list_sessions(state=state, ids=ids, application=application)
+def list_sessions(filter: Optional[SessionFilter] = None, *, state: Optional[SessionState] = None, ids: Optional[Iterable[SessionID]] = None, application: Optional[str] = None) -> Page["Session"]:
+    return ConnectionInstance.instance().list_sessions(filter, state=state, ids=ids, application=application)
 
 
 def get_session(session_id: SessionID) -> "Session":
@@ -242,17 +243,20 @@ class Connection:
     def unregister_application(self, name: str) -> None:
         return self._call(self._aio.unregister_application(name))
 
-    def list_applications(self) -> List[Application]:
-        return self._call(self._aio.list_applications())
+    def list_applications(self, filter: Optional[ApplicationFilter] = None) -> Page[Application]:
+        return self._call(self._aio.list_applications(filter))
 
     def get_application(self, name: str) -> Optional[Application]:
         return self._call(self._aio.get_application(name))
 
-    def list_executors(self) -> List[Any]:
-        return self._call(self._aio.list_executors())
+    def list_executors(self, filter: Optional[ExecutorFilter] = None) -> Page[Any]:
+        return self._call(self._aio.list_executors(filter))
 
-    def list_nodes(self) -> List[Any]:
-        return self._call(self._aio.list_nodes())
+    def list_nodes(self, filter: Optional[NodeFilter] = None) -> Page[Any]:
+        return self._call(self._aio.list_nodes(filter))
+
+    def list_tasks(self, session_id: SessionID, filter: Optional[TaskFilter] = None) -> Page[Task]:
+        return self._call(self._aio.list_tasks(session_id, filter))
 
     def _session(self, aio_session: aio_client.Session) -> "Session":
         return Session(self, aio_session)
@@ -260,14 +264,9 @@ class Connection:
     def create_session(self, attrs: SessionAttributes) -> "Session":
         return self._session(self._call(self._aio.create_session(attrs)))
 
-    def list_sessions(
-        self,
-        *,
-        state: Optional[SessionState] = None,
-        ids: Optional[Iterable[SessionID]] = None,
-        application: Optional[str] = None,
-    ) -> List["Session"]:
-        return [self._session(session) for session in self._call(self._aio.list_sessions(state=state, ids=ids, application=application))]
+    def list_sessions(self, filter: Optional[SessionFilter] = None, *, state: Optional[SessionState] = None, ids: Optional[Iterable[SessionID]] = None, application: Optional[str] = None) -> Page["Session"]:
+        page = self._call(self._aio.list_sessions(filter, state=state, ids=ids, application=application))
+        return Page(items=[self._session(session) for session in page.items], paging=page.paging)
 
     def open_session(self, session_id: SessionID, spec: Optional[SessionAttributes] = None) -> "Session":
         return self._session(self._call(self._aio.open_session(session_id, spec)))
@@ -307,11 +306,8 @@ class Session:
     def get_task(self, task_id: TaskID) -> Task:
         return self.connection._call(self._aio.get_task(task_id))
 
-    def list_tasks(self) -> "TaskIterator":
-        async def start():
-            return self._aio.list_tasks()
-
-        return TaskIterator(self.connection._bridge, self.connection._call(start()))
+    def list_tasks(self, filter: Optional[TaskFilter] = None) -> Page[Task]:
+        return self.connection._call(self._aio.list_tasks(filter))
 
     def watch_task(self, task_id: TaskID, timeout: Optional[float] = None) -> "TaskWatcher":
         async def start():
@@ -460,10 +456,6 @@ class _AsyncIteratorFacade:
 
 class TaskWatcher(_AsyncIteratorFacade):
     """Blocking iterator for task status updates."""
-
-
-class TaskIterator(_AsyncIteratorFacade):
-    """Blocking iterator for a session's tasks."""
 
 
 class TaskFuture(Future):

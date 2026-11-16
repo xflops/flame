@@ -525,7 +525,7 @@ async fn warmup_without_pending_tasks_works_with_each_demand_policy() {
                     .execute(&mut context)
                     .await
                     .unwrap();
-                let executors = controller.list_executors().unwrap();
+                let executors = controller.list_executors(None).await.unwrap();
                 assert!(
                     executors.len() <= expected,
                     "cycle {cycle}, policies {policies:?}"
@@ -536,13 +536,17 @@ async fn warmup_without_pending_tasks_works_with_each_demand_policy() {
                     }
                 }
             }
-            let executors = controller.list_executors().unwrap();
+            let executors = controller.list_executors(None).await.unwrap();
             assert_eq!(executors.len(), expected, "policies {policies:?}");
             assert!(executors
                 .iter()
                 .all(|executor| executor.state == ExecutorState::Binding
                     && executor.ssn_id.as_ref() == Some(&session.id)));
-            assert!(controller.list_tasks(session.id).await.unwrap().is_empty());
+            assert!(controller
+                .get_session(session.id.clone())
+                .unwrap()
+                .tasks
+                .is_empty());
         }
     }
 }

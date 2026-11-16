@@ -59,9 +59,15 @@ fn locked_session_does_not_block_other_session_history_or_mutations() {
                             },
                         )
                         .await?;
-                    let tasks = engine.find_tasks(&TaskFilter::terminal("free")).await?;
+                    let tasks = engine
+                        .find_task_metadata(&TaskFilter::terminal("free"))
+                        .await?;
                     assert_eq!(tasks.len(), 1);
-                    assert_eq!(tasks[0].output, finished.output);
+                    assert!(tasks[0].output.is_none());
+                    assert_eq!(
+                        engine.get_task(tasks[0].gid()).await?.output,
+                        finished.output
+                    );
                     let closed = engine.close_session("free".into()).await?;
                     assert_eq!(closed.task_counts.succeed, 1);
                     Ok::<_, FlameError>(())
@@ -169,7 +175,7 @@ async fn test_none_engine_get_session_returns_not_found() {
 async fn test_none_engine_find_sessions_returns_empty() {
     let engine = NoneEngine::new_ptr("none").await.unwrap();
 
-    let sessions = engine.find_sessions().await.unwrap();
+    let sessions = engine.find_session_metadata().await.unwrap();
     assert!(sessions.is_empty());
 }
 
@@ -208,7 +214,7 @@ async fn session_metadata_and_retry_keep_history_until_delete_or_restart() {
         engine.get_task(created.gid()).await.unwrap().version,
         retried.version
     );
-    let metadata = engine.find_sessions().await.unwrap();
+    let metadata = engine.find_session_metadata().await.unwrap();
     assert_eq!(metadata.len(), 1);
     assert_eq!(metadata[0].task_counts.pending, 1);
     assert_eq!(metadata[0].task_counts.running, 0);
@@ -258,7 +264,7 @@ async fn session_metadata_and_retry_keep_history_until_delete_or_restart() {
         Err(FlameError::InvalidState(_))
     ));
     let fresh = NoneEngine::new_ptr("none").await.unwrap();
-    assert!(fresh.find_sessions().await.unwrap().is_empty());
+    assert!(fresh.find_session_metadata().await.unwrap().is_empty());
     assert!(matches!(
         fresh.get_task(created.gid()).await,
         Err(FlameError::NotFound(_))
@@ -381,7 +387,7 @@ async fn test_none_engine_delete_session_cleans_counter() {
     ));
     assert!(matches!(
         engine
-            .find_tasks(&TaskFilter::by_session("test-session"))
+            .find_task_metadata(&TaskFilter::by_session("test-session"))
             .await,
         Err(FlameError::NotFound(_))
     ));

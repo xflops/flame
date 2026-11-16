@@ -100,6 +100,7 @@ impl From<rpc::Node> for Node {
         let spec = node.spec.unwrap_or_default();
         Self {
             name: metadata.name,
+            creation_time: Default::default(),
             capacity: status.capacity.unwrap_or_default().into(),
             allocatable: status.allocatable.unwrap_or_default().into(),
             info: status.info.unwrap_or_default().into(),
@@ -455,5 +456,27 @@ impl TryFrom<TaskResult> for rpc::TaskResult {
             output: result.output.map(TaskOutput::into),
             message: result.message,
         })
+    }
+}
+
+impl TryFrom<rpc::Paging> for Paging {
+    type Error = FlameError;
+    fn try_from(info: rpc::Paging) -> Result<Self, Self::Error> {
+        let paging = Self::new()
+            .with_limit(info.limit)?
+            .with_number(info.number)?;
+        Ok(match info.total {
+            Some(total) => paging.with_total(total),
+            None => paging,
+        })
+    }
+}
+
+impl TryFrom<Option<rpc::Paging>> for Paging {
+    type Error = FlameError;
+    fn try_from(info: Option<rpc::Paging>) -> Result<Self, Self::Error> {
+        info.map(Self::try_from)
+            .transpose()
+            .map(Option::unwrap_or_default)
     }
 }

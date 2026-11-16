@@ -24,6 +24,7 @@ fn create_test_node(name: &str, state: NodeState) -> NodePtr {
         allocatable: ResourceRequirement::default(),
         info: NodeInfo::default(),
         shims: vec![common::apis::Shim::Host],
+        creation_time: Default::default(),
     })
 }
 

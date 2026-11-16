@@ -20,6 +20,95 @@ use chrono::{DateTime, Duration, Utc};
 use rustix::system;
 use stdng::MutexPtr;
 
+/// Default number of metadata objects returned by a list RPC.
+pub const DEFAULT_LIST_LIMITATION: usize = 100;
+
+/// Shared validated request and response paging. Request totals are ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Paging {
+    limit: usize,
+    number: i64,
+    total: Option<u64>,
+}
+
+impl Default for Paging {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Paging {
+    pub const fn new() -> Self {
+        Self {
+            limit: DEFAULT_LIST_LIMITATION,
+            number: 1,
+            total: None,
+        }
+    }
+
+    pub fn with_limit(mut self, limit: i32) -> Result<Self, crate::FlameError> {
+        if !(0..=1000).contains(&limit) {
+            return Err(crate::FlameError::InvalidConfig(
+                "limit must be between 0 and 1000".into(),
+            ));
+        }
+        self.limit = if limit == 0 {
+            DEFAULT_LIST_LIMITATION
+        } else {
+            limit as usize
+        };
+        self.checked_offset()?;
+        Ok(self)
+    }
+
+    pub fn with_number(mut self, number: i64) -> Result<Self, crate::FlameError> {
+        if number < 0 {
+            return Err(crate::FlameError::InvalidConfig(
+                "number must be nonnegative".into(),
+            ));
+        }
+        self.number = number.max(1);
+        self.checked_offset()?;
+        Ok(self)
+    }
+
+    pub const fn with_total(mut self, total: u64) -> Self {
+        self.total = Some(total);
+        self
+    }
+
+    /// Internal full-result envelopes do not use the public request size bound.
+    pub(crate) fn all(total: u64) -> Self {
+        Self {
+            limit: total.min(i32::MAX as u64) as usize,
+            number: 1,
+            total: Some(total),
+        }
+    }
+
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+    pub const fn number(&self) -> i64 {
+        self.number
+    }
+    pub const fn total(&self) -> Option<u64> {
+        self.total
+    }
+
+    /// Construction guarantees that this multiplication fits usize.
+    pub fn offset(&self) -> usize {
+        ((self.number as u64 - 1) * self.limit as u64) as usize
+    }
+
+    fn checked_offset(&self) -> Result<usize, crate::FlameError> {
+        (self.number as u64 - 1)
+            .checked_mul(self.limit as u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| crate::FlameError::InvalidConfig("paging offset is too large".into()))
+    }
+}
+
 pub const DEFAULT_MAX_INSTANCES: u32 = 1_000_000;
 pub const DEFAULT_DELAY_RELEASE: Duration = Duration::seconds(60);
 pub const SESSION_EVENT_TASK_ID: i64 = 0;
@@ -387,6 +476,19 @@ impl Default for Task {
 }
 
 impl Task {
+    /// Project list metadata without copying payloads, affinity or events.
+    pub fn metadata(&self) -> Self {
+        Self {
+            id: self.id,
+            ssn_id: self.ssn_id.clone(),
+            version: self.version,
+            creation_time: self.creation_time,
+            completion_time: self.completion_time,
+            state: self.state,
+            ..Default::default()
+        }
+    }
+
     pub fn is_completed(&self) -> bool {
         self.state.is_terminal()
     }
@@ -513,6 +615,8 @@ pub struct ResourceRequirement {
 #[derive(Clone, Debug, Default)]
 pub struct Node {
     pub name: String,
+    /// First registration time, preserved by the session manager.
+    pub creation_time: DateTime<Utc>,
     pub capacity: ResourceRequirement,
     pub allocatable: ResourceRequirement,
     pub info: NodeInfo,

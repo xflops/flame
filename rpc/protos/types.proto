@@ -9,6 +9,14 @@ message Metadata {
   string name = 2;
 }
 
+// One independent list page. Zero limit selects 100; zero number selects 1.
+// Requests ignore total. Responses always populate the filtered total.
+message Paging {
+  int32 limit = 1;
+  int64 number = 2;
+  optional uint64 total = 3;
+}
+
 enum SessionState {
   Open = 0;
   Closed = 1;
@@ -183,14 +191,17 @@ message Executor {
 
 message ExecutorList {
   repeated Executor executors = 1;
+  Paging paging = 2;
 }
 
 message SessionList {
   repeated Session sessions = 1;
+  Paging paging = 2;
 }
 
 message ApplicationList {
   repeated Application applications = 1;
+  Paging paging = 2;
 }
 
 message ResourceRequirement {
@@ -268,6 +279,12 @@ message Node {
 // NodeList contains a list of nodes.
 message NodeList {
   repeated Node nodes = 1;
+  Paging paging = 2;
+}
+
+message TaskList {
+  repeated Task tasks = 1;
+  Paging paging = 2;
 }
 
 message Result {

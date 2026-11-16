@@ -355,17 +355,11 @@ class TestTaskStateTransitions:
         )
 
         try:
-            request = TestRequest(input="event_test")
+            request = TestRequest(input="event_test", request_task_context=True)
             response = invoke_task(session, request)
             assert response.output == "event_test"
 
-            # Get tasks and check events
-            tasks = list(session.list_tasks())
-            assert len(tasks) >= 1
-
-            # At least one task should have events
-            task_with_events = tasks[0]
-            refreshed_task = session.get_task(task_with_events.id)
+            refreshed_task = session.get_task(response.task_context.task_id)
             # Events are recorded during state transitions
             assert refreshed_task.events is not None
 

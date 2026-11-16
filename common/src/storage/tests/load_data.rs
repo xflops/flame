@@ -71,6 +71,7 @@ fn test_load_data_resets_binding_executor_to_idle() -> Result<(), FlameError> {
         },
         info: NodeInfo::default(),
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
     tokio_test::block_on(engine.create_node(&node))?;
 
@@ -119,7 +120,7 @@ fn test_load_data_resets_binding_executor_to_idle() -> Result<(), FlameError> {
     let storage = tokio_test::block_on(crate::storage::new_ptr(&ctx))?;
     tokio_test::block_on(storage.load_data())?;
 
-    let executors = storage.list_executors(None)?;
+    let executors = tokio_test::block_on(storage.list_executors(None))?;
     assert_eq!(executors.len(), 2);
 
     let binding_exec = executors.iter().find(|e| e.id == "binding-exec").unwrap();
@@ -168,6 +169,7 @@ fn test_load_data_preserves_other_executor_states() -> Result<(), FlameError> {
         },
         info: NodeInfo::default(),
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
     tokio_test::block_on(engine.create_node(&node))?;
 
@@ -205,7 +207,7 @@ fn test_load_data_preserves_other_executor_states() -> Result<(), FlameError> {
     let storage = tokio_test::block_on(crate::storage::new_ptr(&ctx))?;
     tokio_test::block_on(storage.load_data())?;
 
-    let executors = storage.list_executors(None)?;
+    let executors = tokio_test::block_on(storage.list_executors(None))?;
     assert_eq!(executors.len(), states_to_test.len());
 
     for (id, expected_state) in &states_to_test {

@@ -17,7 +17,7 @@ limitations under the License.
 //! or the session-manager process exits. The scheduling cache can evict finished
 //! tasks while this engine retains their history without disk I/O.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -34,7 +34,6 @@ use crate::apis::{ApplicationFilter, Executor, TaskFilter};
 use crate::FlameError;
 
 use super::{Engine, EnginePtr};
-
 /// Session metadata and task history share one lock for atomic lifecycle changes.
 pub(crate) struct SessionEntry {
     metadata: Session,
@@ -412,19 +411,16 @@ impl Engine for NoneEngine {
         Ok(metadata)
     }
 
-    async fn find_sessions(&self) -> Result<Vec<Session>, FlameError> {
-        let entries = {
-            let directory = lock_ptr!(self.sessions)?;
-            directory
-                .iter()
-                .map(|(id, entry)| (id.clone(), entry.clone()))
-                .collect::<Vec<_>>()
-        };
+    async fn find_session_metadata(&self) -> Result<Vec<Session>, FlameError> {
+        let entries = lock_ptr!(self.sessions)?
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.clone()))
+            .collect::<Vec<_>>();
         let mut sessions = Vec::with_capacity(entries.len());
         for (id, shared) in entries {
             let entry = lock_ptr!(shared)?;
             match self.validate_session(&id, &shared) {
-                Ok(()) => sessions.push(entry.metadata.clone()),
+                Ok(()) => sessions.push(entry.metadata.metadata()),
                 Err(FlameError::NotFound(_)) => continue,
                 Err(error) => return Err(error),
             }
@@ -500,23 +496,46 @@ impl Engine for NoneEngine {
         )
     }
 
-    async fn find_tasks(&self, filter: &TaskFilter) -> Result<Vec<Task>, FlameError> {
+    async fn find_task_metadata(
+        &self,
+        filter: &TaskFilter,
+    ) -> Result<crate::apis::Page<Task>, FlameError> {
+        let ids = filter
+            .ids
+            .as_ref()
+            .map(|ids| ids.iter().copied().collect::<HashSet<_>>());
+        let states = filter
+            .states
+            .as_ref()
+            .map(|states| states.iter().copied().collect::<HashSet<_>>());
         self.with_session(&filter.session, |entry| {
-            Ok(entry
-                .tasks
-                .values()
-                .filter(|task| {
-                    filter
-                        .states
+            let matches = |task: &&Task| {
+                ids.as_ref().is_none_or(|ids| ids.contains(&task.id))
+                    && states
                         .as_ref()
                         .is_none_or(|states| states.contains(&task.state))
-                })
-                .cloned()
-                .collect())
+            };
+            let total = entry.tasks.values().filter(matches).count() as u64;
+            let offset = filter.paging.map_or(0, |paging| paging.offset());
+            let limit = filter.paging.map_or(usize::MAX, |paging| paging.limit());
+            let items = entry
+                .tasks
+                .values()
+                .rev()
+                .filter(matches)
+                .skip(offset)
+                .take(limit)
+                .map(Task::metadata)
+                .collect();
+            Ok(crate::apis::Page {
+                items,
+                paging: filter.paging.map_or_else(
+                    || crate::apis::Paging::all(total),
+                    |paging| paging.with_total(total),
+                ),
+            })
         })
     }
-
-    // ========== Node operations ==========
 
     async fn create_node(&self, node: &Node) -> Result<Node, FlameError> {
         Ok(node.clone())

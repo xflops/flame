@@ -78,7 +78,7 @@ fn test_allocate_executors() -> Result<(), FlameError> {
         assert_eq!(node_list.len(), 1);
         assert_eq!(node_list.values().next().unwrap().name, "node_1");
 
-        let exec_list = controller.list_executors()?;
+        let exec_list = tokio_test::block_on(controller.list_executors(None))?;
         // The test does not run an executor manager, so a created executor
         // remains Void. Allocate pipelines that existing Void executor on
         // later cycles instead of creating duplicates before it becomes
@@ -129,7 +129,7 @@ fn test_allocate_respects_max_executors() -> Result<(), FlameError> {
     let mut ctx = Context::new(controller.clone(), &options)?;
     tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
 
-    let executors = controller.list_executors()?;
+    let executors = tokio_test::block_on(controller.list_executors(None))?;
     assert_eq!(executors.len(), 1);
     assert_eq!(executors[0].node, "node_1");
     Ok(())
@@ -322,8 +322,7 @@ fn test_dispatch_two_gangs_with_supply_for_one() -> Result<(), FlameError> {
     tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
 
     let bound = |id: &String| {
-        controller
-            .list_executors()
+        tokio_test::block_on(controller.list_executors(None))
             .unwrap()
             .iter()
             .filter(|executor| executor.ssn_id.as_ref() == Some(id))
@@ -512,7 +511,7 @@ fn test_drf_rebalances_a_session_holding_the_whole_cluster() -> Result<(), Flame
         for action in ctx.actions.clone() {
             tokio_test::block_on(action.execute(&mut ctx))?;
         }
-        for executor in controller.list_executors()? {
+        for executor in tokio_test::block_on(controller.list_executors(None))? {
             match executor.state {
                 common::apis::ExecutorState::Void => {
                     tokio_test::block_on(controller.register_executor(&executor))?
@@ -532,8 +531,7 @@ fn test_drf_rebalances_a_session_holding_the_whole_cluster() -> Result<(), Flame
         cycle(&controller)?;
     }
     let held = |ssn: &str| -> Result<usize, FlameError> {
-        Ok(controller
-            .list_executors()?
+        Ok(tokio_test::block_on(controller.list_executors(None))?
             .iter()
             .filter(|e| e.ssn_id.as_deref() == Some(ssn))
             .count())
@@ -545,8 +543,7 @@ fn test_drf_rebalances_a_session_holding_the_whole_cluster() -> Result<(), Flame
     for _ in 0..3 {
         cycle(&controller)?;
     }
-    let interrupted = controller
-        .list_executors()?
+    let interrupted = tokio_test::block_on(controller.list_executors(None))?
         .iter()
         .filter(|e| e.signal == Some(common::apis::Signal::Interrupt))
         .count();
@@ -575,7 +572,7 @@ fn test_no_executor_is_allocated_on_a_node_that_is_not_ready() -> Result<(), Fla
         cycle(&controller, &options)?;
     }
     assert!(
-        controller.list_executors()?.is_empty(),
+        tokio_test::block_on(controller.list_executors(None))?.is_empty(),
         "an executor was created on a node that is not ready"
     );
 
@@ -588,7 +585,7 @@ fn test_no_executor_is_allocated_on_a_node_that_is_not_ready() -> Result<(), Fla
     for _ in 0..5 {
         cycle(&controller, &options)?;
     }
-    let executors = controller.list_executors()?;
+    let executors = tokio_test::block_on(controller.list_executors(None))?;
     assert_eq!(executors.len(), 1);
     assert_eq!(executors[0].node, "node_dead");
     Ok(())
@@ -614,7 +611,7 @@ fn test_no_executor_is_allocated_on_a_node_that_does_not_run_the_shim() -> Resul
         cycle(&controller, &options)?;
     }
     assert!(
-        controller.list_executors()?.is_empty(),
+        tokio_test::block_on(controller.list_executors(None))?.is_empty(),
         "an executor was created on a node that does not run the application's shim"
     );
 
@@ -625,7 +622,7 @@ fn test_no_executor_is_allocated_on_a_node_that_does_not_run_the_shim() -> Resul
     for _ in 0..5 {
         cycle(&controller, &options)?;
     }
-    let executors = controller.list_executors()?;
+    let executors = tokio_test::block_on(controller.list_executors(None))?;
     assert_eq!(executors.len(), 1);
     assert_eq!(executors[0].node, "node_both");
     assert_eq!(executors[0].shim, common::apis::Shim::Host);
@@ -655,8 +652,7 @@ fn test_void_executor_on_a_node_that_is_not_ready_is_not_reused() -> Result<(), 
     for _ in 0..8 {
         cycle(&controller, &options)?;
     }
-    let on_ok = controller
-        .list_executors()?
+    let on_ok = tokio_test::block_on(controller.list_executors(None))?
         .into_iter()
         .filter(|e| e.node == "node_ok" && e.ssn_id.as_ref() == Some(&session.id))
         .count();
@@ -664,8 +660,7 @@ fn test_void_executor_on_a_node_that_is_not_ready_is_not_reused() -> Result<(), 
         on_ok, 1,
         "the session did not get an executor on the ready node"
     );
-    let stranded = controller
-        .list_executors()?
+    let stranded = tokio_test::block_on(controller.list_executors(None))?
         .into_iter()
         .find(|e| e.id == stranded.id)
         .unwrap();
@@ -700,7 +695,7 @@ fn test_allocation_without_drf_stops_at_node_capacity() -> Result<(), FlameError
             let mut context = Context::new(env.controller.clone(), &options)?;
             tokio_test::block_on(DispatchAction::new_ptr().execute(&mut context))?;
             tokio_test::block_on(AllocateAction::new_ptr().execute(&mut context))?;
-            let executors = env.controller.list_executors()?;
+            let executors = tokio_test::block_on(env.controller.list_executors(None))?;
             assert!(executors.len() <= 2, "cycle {cycle}");
             for executor in executors {
                 if executor.state == common::apis::ExecutorState::Void {
@@ -708,7 +703,10 @@ fn test_allocation_without_drf_stops_at_node_capacity() -> Result<(), FlameError
                 }
             }
         }
-        assert_eq!(env.controller.list_executors()?.len(), 2);
+        assert_eq!(
+            tokio_test::block_on(env.controller.list_executors(None))?.len(),
+            2
+        );
     }
     Ok(())
 }
@@ -735,7 +733,7 @@ fn test_drf_gpu_allocation_stops_at_task_demand_while_binding() -> Result<(), Fl
     // First reproduce one pending task with no configured instance cap,
     // then ensure additional task demand still grows the executor pool.
     for demand in [1, 3] {
-        let existing_tasks = tokio_test::block_on(controller.list_tasks(session_id.clone()))?.len();
+        let existing_tasks = controller.get_session(session_id.clone())?.tasks.len();
         for _ in existing_tasks..demand {
             tokio_test::block_on(controller.create_task(session_id.clone(), None, None))?;
         }
@@ -743,7 +741,7 @@ fn test_drf_gpu_allocation_stops_at_task_demand_while_binding() -> Result<(), Fl
             let mut ctx = Context::new(controller.clone(), &options)?;
             tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
             tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
-            let executors = controller.list_executors()?;
+            let executors = tokio_test::block_on(controller.list_executors(None))?;
             assert!(
                 executors.len() <= demand,
                 "cycle {cycle}: {demand} pending tasks must not consume every GPU while binding"
@@ -756,7 +754,7 @@ fn test_drf_gpu_allocation_stops_at_task_demand_while_binding() -> Result<(), Fl
                 }
             }
         }
-        let executors = controller.list_executors()?;
+        let executors = tokio_test::block_on(controller.list_executors(None))?;
         assert_eq!(executors.len(), demand);
         assert!(executors.iter().all(|executor| {
             executor.state == common::apis::ExecutorState::Binding
@@ -793,7 +791,7 @@ fn test_dispatch_session_limit_allows_multiple_instances() -> Result<(), FlameEr
         let mut ctx = Context::new(controller.clone(), &options)?;
         tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
         tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
-        let executors = controller.list_executors()?;
+        let executors = tokio_test::block_on(controller.list_executors(None))?;
         assert_eq!(executors.len(), 3);
         assert_eq!(
             executors
@@ -822,7 +820,7 @@ fn test_allocate_session_limit_counts_inflight_executor() -> Result<(), FlameErr
         let mut ctx = Context::new(controller.clone(), &options)?;
         tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
         tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
-        let executors = controller.list_executors()?;
+        let executors = tokio_test::block_on(controller.list_executors(None))?;
         assert_eq!(
             executors.len(),
             1,
@@ -860,7 +858,7 @@ fn test_dispatch_zero_session_limit_keeps_retained_executor_idle() -> Result<(),
     let mut ctx = Context::new(controller.clone(), &options)?;
     tokio_test::block_on(DispatchAction::new_ptr().execute(&mut ctx))?;
     tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
-    let executors = controller.list_executors()?;
+    let executors = tokio_test::block_on(controller.list_executors(None))?;
     assert_eq!(executors.len(), 1);
     assert_eq!(executors[0].state, common::apis::ExecutorState::Idle);
     assert_eq!(executors[0].ssn_id, None);
@@ -873,7 +871,7 @@ fn test_allocate_zero_application_limit_creates_no_executor() -> Result<(), Flam
     tokio_test::block_on(env.controller.create_task(session_id, None, None))?;
     let mut ctx = Context::new(env.controller.clone(), &options)?;
     tokio_test::block_on(AllocateAction::new_ptr().execute(&mut ctx))?;
-    assert!(env.controller.list_executors()?.is_empty());
+    assert!(tokio_test::block_on(env.controller.list_executors(None))?.is_empty());
     Ok(())
 }
 
@@ -928,7 +926,7 @@ fn test_scheduler_skips_not_ready_session() -> Result<(), FlameError> {
     let alloc = AllocateAction::new_ptr();
     tokio_test::block_on(alloc.execute(&mut ctx))?;
 
-    let executors = controller.list_executors()?;
+    let executors = tokio_test::block_on(controller.list_executors(None))?;
     assert_eq!(executors.len(), 1);
     assert_eq!(executors[0].state, common::apis::ExecutorState::Idle);
     assert_eq!(executors[0].ssn_id, None);

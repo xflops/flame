@@ -135,7 +135,8 @@ cluster:
       maxExecutors: 128
 ```
 
-`maxSessions` limits the total session count. Optional application and session
+`maxSessions` limits Open sessions; Closed sessions remain cached without tasks.
+Optional application and session
 `maxExecutors` values are hard ceilings: the scheduler applies the lower of the
 cluster ceiling and the application's or session's requested `max_instances`.
 A `null` ceiling leaves the requested limit in effect. Node `maxExecutors`

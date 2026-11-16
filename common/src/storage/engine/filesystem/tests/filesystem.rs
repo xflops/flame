@@ -55,11 +55,11 @@ async fn history_and_recovery_reads_reject_corrupt_metadata() {
     bytes[0] ^= 0xff;
     fs::write(path, bytes).unwrap();
     assert!(engine
-        .find_tasks(&TaskFilter::by_session("corrupt"))
+        .find_task_metadata(&TaskFilter::by_session("corrupt"))
         .await
         .is_err());
     assert!(engine
-        .find_tasks(&TaskFilter::terminal("corrupt"))
+        .find_task_metadata(&TaskFilter::terminal("corrupt"))
         .await
         .is_err());
 }
@@ -101,24 +101,57 @@ async fn finished_reads_skip_active_payloads_and_release_task_gates() {
     fs::write(engine.session_path("scan").join("inputs.bin"), []).unwrap();
     assert_eq!(
         engine
-            .find_tasks(&TaskFilter::terminal("scan"))
+            .find_task_metadata(&TaskFilter::terminal("scan"))
+            .await
+            .unwrap()
+            .len(),
+        16
+    );
+    assert_eq!(
+        engine
+            .find_task_metadata(&TaskFilter::by_session("scan"))
+            .await
+            .unwrap()
+            .len(),
+        17
+    );
+    assert!(engine
+        .get_task(TaskGID {
+            ssn_id: "scan".into(),
+            task_id: 17
+        })
+        .await
+        .is_err());
+    // Corrupt payloads fail detailed reads while metadata lists remain readable.
+    fs::write(engine.session_path("scan").join("outputs.bin"), []).unwrap();
+    assert_eq!(
+        engine
+            .find_task_metadata(&TaskFilter::terminal("scan"))
             .await
             .unwrap()
             .len(),
         16
     );
     assert!(engine
-        .find_tasks(&TaskFilter::by_session("scan"))
+        .get_task(TaskGID {
+            ssn_id: "scan".into(),
+            task_id: 1
+        })
         .await
         .is_err());
-    // Corrupt finished payloads must fail both recovery and history reads.
-    fs::write(engine.session_path("scan").join("outputs.bin"), []).unwrap();
+    assert_eq!(
+        engine
+            .find_task_metadata(&TaskFilter::by_session("scan"))
+            .await
+            .unwrap()
+            .len(),
+        17
+    );
     assert!(engine
-        .find_tasks(&TaskFilter::terminal("scan"))
-        .await
-        .is_err());
-    assert!(engine
-        .find_tasks(&TaskFilter::by_session("scan"))
+        .get_task(TaskGID {
+            ssn_id: "scan".into(),
+            task_id: 17
+        })
         .await
         .is_err());
     // Closing counts metadata without loading corrupted task payloads.
@@ -458,7 +491,7 @@ async fn test_session_lifecycle() {
     );
 
     // Find sessions
-    let sessions = engine.find_sessions().await.unwrap();
+    let sessions = engine.find_session_metadata().await.unwrap();
     assert_eq!(sessions.len(), 1);
 
     // Close session (should work since no tasks)
@@ -555,7 +588,7 @@ async fn test_task_lifecycle() {
 
     // Find tasks
     let tasks = engine
-        .find_tasks(&TaskFilter::by_session("test-session"))
+        .find_task_metadata(&TaskFilter::by_session("test-session"))
         .await
         .unwrap();
     assert_eq!(tasks.len(), 1);
@@ -805,6 +838,7 @@ async fn test_node_crud() {
             ..Default::default()
         },
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
 
     let created = engine.create_node(&node).await.unwrap();
@@ -852,6 +886,7 @@ async fn test_executor_crud() {
             ..Default::default()
         },
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
     engine.create_node(&node).await.unwrap();
 
@@ -927,6 +962,7 @@ async fn test_node_delete_cascades_to_executors() {
             ..Default::default()
         },
         shims: Vec::new(),
+        creation_time: Default::default(),
     };
     engine.create_node(&node).await.unwrap();
 
@@ -1017,6 +1053,7 @@ fn test_node_named(name: &str) -> Node {
             ..Default::default()
         },
         shims: Vec::new(),
+        creation_time: Default::default(),
     }
 }
 
@@ -1257,7 +1294,7 @@ async fn test_restart_loads_entities_once() {
             .len(),
         1
     );
-    assert_eq!(engine.find_sessions().await.unwrap().len(), 1);
+    assert_eq!(engine.find_session_metadata().await.unwrap().len(), 1);
     assert!(engine.get_session("restart-ssn".to_string()).await.is_ok());
     assert!(matches!(
         engine.get_session("missing".to_string()).await,
@@ -1300,7 +1337,7 @@ async fn test_concurrent_creates_get_dense_ids_and_distinct_payloads() {
 
     let url = format!("filesystem://{}", dir.path().display());
     let reopened = FilesystemEngine::new_ptr(&url).await.unwrap();
-    reopened.find_sessions().await.unwrap();
+    reopened.find_session_metadata().await.unwrap();
     for task in &tasks {
         let stored = reopened.get_task(gid("dense", task.id)).await.unwrap();
         assert_eq!(stored.input, task.input, "task {} payload", task.id);
@@ -1556,7 +1593,7 @@ async fn test_session_entry_json_and_runtime_recovery() {
     let reopened = FilesystemEngine::new_ptr(&format!("filesystem://{}", dir.path().display()))
         .await
         .unwrap();
-    reopened.find_sessions().await.unwrap();
+    reopened.find_session_metadata().await.unwrap();
     let task = reopened
         .create_task("entry-json".into(), Some(Bytes::from("recovered")), None)
         .await
@@ -1573,7 +1610,7 @@ async fn test_session_entry_json_and_runtime_recovery() {
     let closed = FilesystemEngine::new_ptr(&format!("filesystem://{}", dir.path().display()))
         .await
         .unwrap();
-    closed.find_sessions().await.unwrap();
+    closed.find_session_metadata().await.unwrap();
     assert!(matches!(
         closed.retry_task(gid("entry-json", task.id)).await,
         Err(FlameError::InvalidState(_))
@@ -1636,4 +1673,167 @@ async fn test_waiting_reader_rejects_deleted_entry_after_session_id_reuse() {
         engine.get_task(gid("reuse", 1)).await.unwrap().state,
         TaskState::Pending
     );
+}
+
+/// Advance a future exactly once to prove it has captured an entry and is waiting.
+async fn assert_waiting<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
+    let polled = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(future.as_mut(), cx))
+    })
+    .await;
+    assert!(polled.is_pending());
+}
+
+#[tokio::test]
+async fn executor_lists_skip_entries_deleted_after_ids_are_captured() {
+    for filter in [None, Some("node")] {
+        let (engine, _dir) = create_test_engine().await;
+        engine.create_node(&test_node_named("node")).await.unwrap();
+        for id in ["deleted", "retained"] {
+            engine
+                .create_executor(&test_executor_on(id, "node"))
+                .await
+                .unwrap();
+        }
+        let id = "deleted".to_string();
+        let shared = engine.executor_entry(&id).unwrap();
+        let parent = engine.node_entry("node").unwrap();
+        let mut deleting = Box::pin(engine.delete_executor(&id));
+        let mut listing = Box::pin(engine.find_executors(filter));
+        {
+            let _held = {
+                let _parent = write_async!(parent);
+                // Deletion captures the executor, then waits for its parent.
+                assert_waiting(deleting.as_mut()).await;
+                write_async!(shared)
+            };
+            // Queue deletion's write before listing's read of the captured entry.
+            assert_waiting(deleting.as_mut()).await;
+            assert_waiting(listing.as_mut()).await;
+        }
+        deleting.await.unwrap();
+        let executors = listing.await.unwrap();
+        assert_eq!(executors.len(), 1);
+        assert_eq!(executors[0].id, "retained");
+        assert!(engine.get_executor(&id).await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn node_lists_skip_entries_deleted_after_names_are_captured() {
+    let (engine, _dir) = create_test_engine().await;
+    for name in ["deleted", "retained"] {
+        engine.create_node(&test_node_named(name)).await.unwrap();
+    }
+    let shared = engine.node_entry("deleted").unwrap();
+    let mut deleting = Box::pin(engine.delete_node("deleted"));
+    let mut listing = Box::pin(engine.find_nodes());
+    {
+        let _held = write_async!(shared);
+        assert_waiting(deleting.as_mut()).await;
+        assert_waiting(listing.as_mut()).await;
+    }
+    deleting.await.unwrap();
+    let nodes = listing.await.unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].name, "retained");
+}
+
+#[tokio::test]
+async fn session_lists_skip_entries_deleted_after_the_snapshot() {
+    let (engine, _dir) = engine_with_session("deleted").await;
+    engine
+        .create_session(SessionAttributes {
+            id: "retained".into(),
+            application: "test-app".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine.close_session("deleted".into()).await.unwrap();
+    let shared = engine.session_entry("deleted").unwrap();
+    let mut deleting = Box::pin(engine.delete_session("deleted".into()));
+    let mut listing = Box::pin(engine.find_session_metadata());
+    {
+        let _held = write_async!(shared);
+        assert_waiting(deleting.as_mut()).await;
+        assert_waiting(listing.as_mut()).await;
+    }
+    deleting.await.unwrap();
+    let sessions = listing.await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "retained");
+}
+
+#[tokio::test]
+async fn session_lists_propagate_validation_errors_other_than_deletion() {
+    let (engine, _dir) = engine_with_session("poisoned").await;
+    let shared = engine.session_entry("poisoned").unwrap();
+    let mut listing = Box::pin(engine.find_session_metadata());
+    {
+        let _held = write_async!(shared);
+        assert_waiting(listing.as_mut()).await;
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _registry = engine.sessions.write().unwrap();
+            panic!("poison the session registry after the listing snapshot");
+        }));
+        assert!(poisoned.is_err());
+    }
+    assert!(matches!(listing.await, Err(FlameError::Storage(_))));
+}
+
+#[tokio::test]
+async fn session_metadata_loads_all_persisted_headers() {
+    let (engine, _dir) = create_test_engine().await;
+    engine
+        .register_application("order".into(), ApplicationAttributes::default())
+        .await
+        .unwrap();
+    for id in ["older", "newer"] {
+        engine
+            .create_session(SessionAttributes {
+                id: id.into(),
+                application: "order".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let mut ids = engine
+        .find_session_metadata()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|session| session.id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, ["newer", "older"]);
+}
+
+#[tokio::test]
+async fn task_metadata_filters_exact_ids() {
+    let (engine, _dir) = create_test_engine().await;
+    engine
+        .register_application("tasks".into(), ApplicationAttributes::default())
+        .await
+        .unwrap();
+    engine
+        .create_session(SessionAttributes {
+            id: "tasks".into(),
+            application: "tasks".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        engine
+            .create_task("tasks".into(), None, None)
+            .await
+            .unwrap();
+    }
+    let mut filter = TaskFilter::by_session("tasks");
+    filter.ids = Some(vec![2]);
+    let tasks = engine.find_task_metadata(&filter).await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].id, 2);
 }

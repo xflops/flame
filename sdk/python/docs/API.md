@@ -68,7 +68,7 @@ Public helpers:
 - `unregister_application(name) -> None`
 - `list_applications() -> list[Application]`
 - `get_application(name) -> Application | None`
-- `list_sessions() -> list[Session]`
+- `list_sessions() -> Page[Session]`
 - `get_session(session_id) -> Session`
 - `close_session(session_id) -> Session`
 
@@ -80,7 +80,6 @@ Methods:
 
 - `create_task(input_data: bytes) -> Task`
 - `get_task(task_id) -> Task`
-- `list_tasks() -> Iterator[Task]`
 - `watch_task(task_id, timeout=None) -> TaskWatcher`
 - `run(input_data) -> bytes`
 - `submit(input_data) -> TaskFuture`
@@ -365,4 +364,44 @@ try:
     flamepy.connect("invalid://address")
 except flamepy.FlameError as exc:
     print(exc.code, exc.message)
+```
+
+## Resource lists
+
+`list_applications`, `list_sessions`, `list_nodes`, `list_executors`, and
+`Session.list_tasks` return `Page[Resource]`: `items` contains resource metadata
+and `paging` contains the effective `limit`, `number`, and filtered `total`.
+Pages support iteration, indexing, and `len(page)` over their items.
+
+Paging belongs to reusable `ApplicationFilter`, `SessionFilter`, `NodeFilter`,
+`ExecutorFilter`, and `TaskFilter` objects. `Paging(limit=0)` selects 100; explicit limits are 1 through 1000. `number=0` selects
+page 1. Negative values and overflowing offsets are rejected. Each request
+reads current metadata; changes between requests can shift pages.
+
+| List | Exact filters | Order |
+| --- | --- | --- |
+| Applications | `names`, `state` | Enabled first, creation descending, name ascending |
+| Sessions | `ids`, `application`, `state` | Open first, creation descending, ID ascending |
+| Nodes | `names`, `state` | Ready first, creation descending, name ascending |
+| Executors | `ids`, `node`, `application`, `session_id`, `state` | Node, numeric state, ID ascending |
+| Tasks | session ID, numeric `ids`, `states` | Numeric task ID descending |
+
+Different filters use AND; repeated values use OR, with empty repeated filters
+unrestricted. Lists omit task payload/affinity, session common data/tokens,
+credential environments and events. Detailed getters and watches retain their
+existing behavior. `Connection.list_tasks(session_id, ...)` lists task metadata
+without a separate session read.
+
+Callers select each page by setting `filter.paging`; each list call fetches
+only that page. Use the response's effective bounds and total to decide whether
+to request another page. The sync and async clients use the same filters.
+
+```python
+filter = SessionFilter(state=SessionState.CLOSED, paging=Paging(limit=20, number=1))
+page = connection.list_sessions(filter)
+print(page.paging.total)
+filter.paging = Paging(limit=page.paging.limit, number=2)
+second_page = connection.list_sessions(filter)
+for session in second_page:
+    print(session.id)
 ```

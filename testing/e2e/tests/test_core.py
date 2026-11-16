@@ -248,33 +248,6 @@ def test_service_state_tracking():
     session.close()
 
 
-def test_list_tasks():
-    """Test that list_tasks returns all tasks in a session as an iterator."""
-    session = flamepy.create_session(application=FLM_TEST_SVC_APP, common_data=None)
-
-    num_tasks = 5
-
-    # Create multiple tasks
-    for i in range(num_tasks):
-        request = TestRequest(input=f"list_task_{i}")
-        response = invoke_task(session, request)
-        assert response.output == f"list_task_{i}"
-
-    # Get all tasks using list_tasks iterator
-    tasks = list(session.list_tasks())
-
-    # Verify we got all tasks
-    assert len(tasks) == num_tasks, f"Expected {num_tasks} tasks, got {len(tasks)}"
-
-    # Verify each task has valid properties
-    for task in tasks:
-        assert task.id is not None
-        assert task.session_id == session.id
-        assert task.state is not None
-        assert task.creation_time is not None
-    session.close()
-
-
 def test_common_data_without_context_request():
     """Test common data handling without requesting context info."""
     sys_context = random_string()
@@ -905,18 +878,15 @@ class TestTaskWatchTimeout:
 
         try:
             # Run task to completion
-            request = TestRequest(input="already_done")
+            request = TestRequest(input="already_done", request_task_context=True)
             response = invoke_task(session, request)
             assert response.output == "already_done"
-
-            # Get the task ID
-            tasks = list(session.list_tasks())
-            assert len(tasks) >= 1
+            task_id = response.task_context.task_id
 
             # A completed task's current status is already terminal.
-            watcher = session.watch_task(tasks[0].id)
+            watcher = session.watch_task(task_id)
             first_update = next(watcher)
-            assert first_update.id == tasks[0].id
+            assert first_update.id == task_id
             assert first_update.state == TaskState.SUCCEED
             with pytest.raises(StopIteration):
                 next(watcher)

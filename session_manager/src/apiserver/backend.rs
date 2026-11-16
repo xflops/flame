@@ -103,6 +103,7 @@ fn build_node_from_heartbeat(
                 info: status.info.map(|i| i.into()).unwrap_or(existing.info),
                 // Reported at registration, not in a heartbeat.
                 shims: existing.shims,
+                creation_time: existing.creation_time,
             }
         }
         None => {
@@ -116,6 +117,7 @@ fn build_node_from_heartbeat(
                 allocatable: status.allocatable.map(|r| r.into()).unwrap_or_default(),
                 info: status.info.map(|i| i.into()).unwrap_or_default(),
                 shims: Vec::new(),
+                creation_time: chrono::Utc::now(),
             }
         }
     }
@@ -557,15 +559,18 @@ mod tests {
 
     #[test]
     fn heartbeat_keeps_the_shims_the_node_registered_with() {
+        let created = chrono::DateTime::from_timestamp(1234, 0).unwrap();
         let existing = Node {
             name: "node-1".to_string(),
             shims: vec![Shim::Cri, Shim::Host],
+            creation_time: created,
             ..Default::default()
         };
 
         let node = build_node_from_heartbeat(Some(existing), "node-1", heartbeat_status());
 
         assert_eq!(node.shims, [Shim::Cri, Shim::Host]);
+        assert_eq!(node.creation_time, created);
         // The heartbeat updates what it carries.
         assert_eq!(node.capacity.cpu, 8);
         assert_eq!(node.capacity.gpu, 1);

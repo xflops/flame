@@ -470,3 +470,13 @@ impl From<TaskGID> for EventOwner {
         Self::from(&gid)
     }
 }
+
+impl From<Paging> for rpc::Paging {
+    fn from(info: Paging) -> Self {
+        Self {
+            limit: info.limit() as i32,
+            number: info.number(),
+            total: info.total(),
+        }
+    }
+}

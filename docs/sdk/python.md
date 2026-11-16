@@ -99,9 +99,8 @@ tasks can be submitted concurrently; submission and execution errors surface
 through `future.result()`. `run()` blocks until task completion and returns its
 output, raising submission or execution errors directly.
 
-Use `session.create_task()`, `session.get_task()`, `session.list_tasks()`, and
-`session.watch_task()` when callers need explicit task objects or streamed task
-updates. `watch_task()` first yields the latest available status, which may
+Use `session.create_task()`, `session.get_task()`, and `session.watch_task()`
+when callers need explicit task objects or streamed task updates. `watch_task()` first yields the latest available status, which may
 already be terminal, then yields updates until the task reaches a terminal
 state. Intermediate updates may be coalesced when the iterator is not read.
 

@@ -42,6 +42,17 @@ class FrontendFixture(FrontendServicer):
             status=pb.TaskStatus(state=state, creation_time=1),
         )
 
+    @staticmethod
+    def _paging(request, total):
+        return pb.Paging(limit=request.paging.limit or 100, number=request.paging.number or 1, total=total)
+
+    async def ListTasks(self, request, context):
+        self.requests.append(request)
+        task = self._task("1")
+        task.spec.ClearField("input")
+        task.spec.ClearField("output")
+        return pb.TaskList(tasks=[task], paging=self._paging(request, 1))
+
     async def RegisterApplication(self, request, context):
         self.requests.append(request)
         return pb.Result()
@@ -50,7 +61,8 @@ class FrontendFixture(FrontendServicer):
         return pb.Result()
 
     async def ListApplications(self, request, context):
-        return pb.ApplicationList(applications=[await self.GetApplication(type("Request", (), {"name": "app"})(), context)])
+        self.requests.append(request)
+        return pb.ApplicationList(applications=[await self.GetApplication(type("Request", (), {"name": "app"})(), context)], paging=self._paging(request, 1))
 
     async def GetApplication(self, request, context):
         if request.name == "missing":
@@ -64,10 +76,12 @@ class FrontendFixture(FrontendServicer):
         return app
 
     async def ListExecutors(self, request, context):
-        return pb.ExecutorList()
+        self.requests.append(request)
+        return pb.ExecutorList(paging=self._paging(request, 0))
 
     async def ListNodes(self, request, context):
-        return pb.NodeList()
+        self.requests.append(request)
+        return pb.NodeList(paging=self._paging(request, 0))
 
     async def CreateSession(self, request, context):
         self.requests.append(request)
@@ -81,7 +95,7 @@ class FrontendFixture(FrontendServicer):
 
     async def ListSessions(self, request, context):
         self.requests.append(request)
-        return pb.SessionList(sessions=[self._session()])
+        return pb.SessionList(sessions=[self._session()], paging=self._paging(request, 1))
 
     async def CloseSession(self, request, context):
         if self.reject_close:
@@ -114,9 +128,6 @@ class FrontendFixture(FrontendServicer):
 
     async def GetTask(self, request, context):
         return self._task(request.task_id)
-
-    async def ListTasks(self, request, context):
-        yield self._task()
 
     async def WatchTasks(self, requests, context):
         self.watches += 1

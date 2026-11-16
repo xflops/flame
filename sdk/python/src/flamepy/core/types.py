@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Generic, Iterator, List, Optional, Sequence, Set, TypeVar, Union, overload
 
 import yaml
 
@@ -111,6 +111,93 @@ class FlameError(Exception):
         self.code = code
         self.message = message
         super().__init__(f"{message} (code: {code})")
+
+
+DEFAULT_LIST_LIMITATION = 100
+
+
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class Paging:
+    """Effective list bounds and filtered total; requests ignore total."""
+
+    limit: int = 0
+    number: int = 0
+    total: Optional[int] = None
+
+
+@dataclass
+class ApplicationFilter:
+    """Reusable exact list filters with optional numbered paging."""
+
+    names: List[str] = field(default_factory=list)
+    state: Optional[ApplicationState] = None
+    paging: Optional[Paging] = None
+
+
+@dataclass
+class SessionFilter:
+    """Reusable exact list filters with optional numbered paging."""
+
+    ids: List[SessionID] = field(default_factory=list)
+    application: Optional[str] = None
+    state: Optional[SessionState] = None
+    paging: Optional[Paging] = None
+
+
+@dataclass
+class NodeFilter:
+    """Reusable exact list filters with optional numbered paging."""
+
+    names: List[str] = field(default_factory=list)
+    state: Optional[int] = None
+    paging: Optional[Paging] = None
+
+
+@dataclass
+class ExecutorFilter:
+    """Reusable exact list filters with optional numbered paging."""
+
+    ids: List[str] = field(default_factory=list)
+    node: Optional[str] = None
+    application: Optional[str] = None
+    session_id: Optional[SessionID] = None
+    state: Optional[int] = None
+    paging: Optional[Paging] = None
+
+
+@dataclass
+class TaskFilter:
+    """Reusable exact list filters with optional numbered paging."""
+
+    ids: List[int] = field(default_factory=list)
+    states: List[TaskState] = field(default_factory=list)
+    paging: Optional[Paging] = None
+
+
+@dataclass
+class Page(Sequence[T], Generic[T]):
+    """One list page. Sequence access applies to items; paging retains counts."""
+
+    items: List[T]
+    paging: Paging
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    @overload
+    def __getitem__(self, index: int) -> T: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> List[T]: ...
+
+    def __getitem__(self, index: Union[int, slice]) -> Union[T, List[T]]:
+        return self.items[index]
+
+    def __iter__(self) -> Iterator[T]:
+        return iter(self.items)
 
 
 @dataclass

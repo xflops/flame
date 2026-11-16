@@ -69,7 +69,13 @@ impl BindingState {
             FlameError::InvalidState(format!("Executor <{}> has no bound session", executor.id))
         })?;
         let retry_limit = self.storage.session_retry_limits();
-        let ssn_ptr = self.storage.get_session_ptr(ssn_id.clone())?;
+        let ssn_ptr = match self.storage.get_session_ptr(ssn_id.clone()) {
+            Ok(session) => session,
+            // A deleted session's late worker response must still complete
+            // executor cleanup.
+            Err(FlameError::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let (retry_count, crossed_retry_limit) = {
             let mut ssn = lock_ptr!(ssn_ptr)?;
             let previous_retry_count = ssn.retry_count;

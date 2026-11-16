@@ -267,7 +267,7 @@ async fn create_task_is_accepted_until_the_session_closes() {
         storage.close_session("s".into()).await.unwrap();
         let before = storage
             .engine
-            .find_tasks(&TaskFilter::by_session("s"))
+            .find_task_metadata(&TaskFilter::by_session("s"))
             .await
             .unwrap()
             .len();
@@ -275,7 +275,7 @@ async fn create_task_is_accepted_until_the_session_closes() {
         assert_eq!(
             storage
                 .engine
-                .find_tasks(&TaskFilter::by_session("s"))
+                .find_task_metadata(&TaskFilter::by_session("s"))
                 .await
                 .unwrap()
                 .len(),
@@ -307,7 +307,7 @@ async fn scheduler_snapshot_leaves_out_suspended_sessions_only() {
         ids
     };
     assert_eq!(ids(&storage), ["open", "suspending"]);
-    assert_eq!(storage.list_sessions(None).unwrap().len(), 3);
+    assert_eq!(storage.list_sessions(None).await.unwrap().len(), 3);
 
     resume(&storage, "suspended").await.unwrap();
     assert_eq!(ids(&storage), ["open", "suspended", "suspending"]);
@@ -404,7 +404,8 @@ async fn restart_keeps_suspending_and_suspended_sessions() {
         assert!(ssn.is_suspending(), "{url}");
         assert_eq!(
             restarted
-                .list_tasks("suspending".into())
+                .engine
+                .find_task_metadata(&TaskFilter::by_session("suspending"))
                 .await
                 .unwrap()
                 .len(),

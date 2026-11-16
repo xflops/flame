@@ -30,7 +30,7 @@ fn test_context_with_limit(max_sessions: Option<usize>) -> FlameClusterContext {
 }
 
 #[tokio::test]
-async fn test_no_eviction_when_no_limit() {
+async fn retains_closed_metadata_without_a_limit() {
     let ctx = test_context_with_limit(None);
     let storage = storage::new_ptr(&ctx).await.unwrap();
 
@@ -53,12 +53,12 @@ async fn test_no_eviction_when_no_limit() {
         storage.close_session(format!("ssn-{}", i)).await.unwrap();
     }
 
-    let sessions = storage.list_sessions(None).unwrap();
+    let sessions = storage.list_sessions(None).await.unwrap();
     assert_eq!(sessions.len(), 5);
 }
 
 #[tokio::test]
-async fn test_eviction_when_limit_reached() {
+async fn closed_handoff_preserves_history_at_open_limit() {
     let ctx = test_context_with_limit(Some(3));
     let storage = storage::new_ptr(&ctx).await.unwrap();
 
@@ -77,20 +77,32 @@ async fn test_eviction_when_limit_reached() {
         storage.create_session(attr).await.unwrap();
     }
 
-    let sessions_before = storage.list_sessions(None).unwrap();
+    let sessions_before = storage.list_sessions(None).await.unwrap();
     assert_eq!(sessions_before.len(), 3);
 
     storage.close_session("ssn-0".to_string()).await.unwrap();
 
-    let sessions_after = storage.list_sessions(None).unwrap();
-    assert_eq!(sessions_after.len(), 2);
+    assert!(storage.get_session_ptr("ssn-0".into()).is_ok());
+    for id in ["ssn-1", "ssn-2"] {
+        assert!(storage.get_session_ptr(id.into()).is_ok());
+    }
 
-    let session_ids: Vec<_> = sessions_after.iter().map(|s| s.id.as_str()).collect();
-    assert!(!session_ids.contains(&"ssn-0"));
+    // Closed history remains in the coordinated in-memory metadata directory.
+    let sessions_after = storage.list_sessions(None).await.unwrap();
+    assert_eq!(sessions_after.len(), 3);
+    assert_eq!(
+        sessions_after
+            .iter()
+            .find(|session| session.id == "ssn-0")
+            .unwrap()
+            .status
+            .state,
+        SessionState::Closed
+    );
 }
 
 #[tokio::test]
-async fn test_no_eviction_under_limit() {
+async fn retains_closed_metadata_below_open_limit() {
     let ctx = test_context_with_limit(Some(5));
     let storage = storage::new_ptr(&ctx).await.unwrap();
 
@@ -111,12 +123,12 @@ async fn test_no_eviction_under_limit() {
 
     storage.close_session("ssn-0".to_string()).await.unwrap();
 
-    let sessions = storage.list_sessions(None).unwrap();
+    let sessions = storage.list_sessions(None).await.unwrap();
     assert_eq!(sessions.len(), 3);
 }
 
 #[tokio::test]
-async fn test_eviction_only_removes_closed_sessions() {
+async fn closed_handoff_preserves_live_execution_sessions() {
     let ctx = test_context_with_limit(Some(3));
     let storage = storage::new_ptr(&ctx).await.unwrap();
 
@@ -137,8 +149,20 @@ async fn test_eviction_only_removes_closed_sessions() {
 
     storage.close_session("ssn-1".to_string()).await.unwrap();
 
-    let sessions = storage.list_sessions(None).unwrap();
-    assert_eq!(sessions.len(), 2);
+    assert!(storage.get_session_ptr("ssn-1".into()).is_ok());
+    for id in ["ssn-0", "ssn-2"] {
+        assert!(storage.get_session_ptr(id.into()).is_ok());
+    }
+
+    let sessions = storage.list_sessions(None).await.unwrap();
+    assert_eq!(sessions.len(), 3);
+    assert_eq!(
+        sessions
+            .iter()
+            .filter(|session| session.status.state == SessionState::Closed)
+            .count(),
+        1
+    );
 
     let open_count = sessions
         .iter()

@@ -296,7 +296,8 @@ impl Controller {
         // Get executors from DB for this node
         let db_executors = self
             .storage
-            .list_executors(Some(&ExecutorFilter::by_node(&node.name)))?;
+            .list_executors(Some(&ExecutorFilter::by_node(&node.name)))
+            .await?;
 
         // The node may only report executors this Session Manager knows. An unknown
         // one is capacity nothing counts (a new node, or executors deleted while the
@@ -397,9 +398,12 @@ impl Controller {
         self.storage.get_node(name)
     }
 
-    /// Lists all registered nodes.
-    pub fn list_nodes(&self) -> Result<Vec<Node>, FlameError> {
-        self.storage.list_nodes()
+    /// Lists registered nodes from the controller cache. `None` returns every node.
+    pub fn list_nodes(
+        &self,
+        filter: Option<&common::apis::NodeFilter>,
+    ) -> Result<common::apis::Page<Node>, FlameError> {
+        self.storage.list_nodes(filter)
     }
 
     /// Updates node status from a heartbeat.
@@ -601,11 +605,11 @@ impl Controller {
         Ok(session)
     }
 
-    pub fn list_sessions(
+    pub async fn list_sessions(
         &self,
         filter: Option<&crate::model::SessionFilter>,
-    ) -> Result<Vec<Session>, FlameError> {
-        self.storage.list_sessions(filter)
+    ) -> Result<common::apis::Page<Session>, FlameError> {
+        self.storage.list_sessions(filter).await
     }
 
     pub async fn create_task(
@@ -648,8 +652,11 @@ impl Controller {
         self.storage.get_task_metadata(ssn_id, id).await
     }
 
-    pub async fn list_tasks(&self, ssn_id: SessionID) -> Result<Vec<Task>, FlameError> {
-        self.storage.list_tasks(ssn_id).await
+    pub async fn list_tasks(
+        &self,
+        filter: &crate::model::TaskFilter,
+    ) -> Result<common::apis::Page<Task>, FlameError> {
+        self.storage.list_tasks(filter).await
     }
 
     pub async fn create_executor(
@@ -686,9 +693,12 @@ impl Controller {
         Ok((*exe).clone())
     }
 
-    pub fn list_executors(&self) -> Result<Vec<Executor>, FlameError> {
+    pub async fn list_executors(
+        &self,
+        filter: Option<&ExecutorFilter>,
+    ) -> Result<common::apis::Page<Executor>, FlameError> {
         trace_fn!("Controller::list_executors");
-        self.storage.list_executors(None)
+        self.storage.list_executors(filter).await
     }
 
     /// Prepare lifecycle changes privately; storage publishes them after saving.
@@ -781,7 +791,7 @@ impl Controller {
     pub async fn list_applications(
         &self,
         filter: Option<&crate::model::ApplicationFilter>,
-    ) -> Result<Vec<Application>, FlameError> {
+    ) -> Result<common::apis::Page<Application>, FlameError> {
         trace_fn!("Controller::list_applications");
         self.storage.list_applications(filter).await
     }

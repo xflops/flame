@@ -75,6 +75,7 @@ async fn test_update_node_fails_must_reconnect() {
         allocatable: ResourceRequirement::default(),
         info: NodeInfo::default(),
         shims: vec![common::apis::Shim::Host],
+        creation_time: Default::default(),
     };
 
     let result = state.update_node(&updated_node).await;

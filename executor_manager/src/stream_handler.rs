@@ -450,6 +450,7 @@ mod tests {
                 ..Default::default()
             },
             shims: Vec::new(),
+            creation_time: Default::default(),
         };
 
         // Verify the node can be converted to proto NodeStatus
@@ -489,6 +490,7 @@ mod tests {
                 ..Default::default()
             },
             shims: Vec::new(),
+            creation_time: Default::default(),
         };
 
         // We can't fully test StreamHandler without a real client,
