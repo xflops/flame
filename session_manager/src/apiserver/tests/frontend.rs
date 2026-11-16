@@ -966,3 +966,54 @@ async fn open_missing_session_without_spec_reports_not_found() {
         assert!(error.message().contains("missing-session"));
     }
 }
+
+/// Metadata skipped during recovery is absent from the FSM owner view used by FOC.
+#[tokio::test]
+async fn exact_owner_lists_treat_skipped_metadata_as_absent() {
+    let directory = tempfile::tempdir().unwrap();
+    for path in ["applications/unreadable-app", "sessions/unreadable-session"] {
+        let path = directory.path().join(path);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("metadata"), b"invalid").unwrap();
+    }
+    let (_, controller, id) =
+        task_test_controller(format!("fs://{}", directory.path().display())).await;
+    let flame = test_flame(controller.clone());
+    let applications = Frontend::list_applications(
+        &flame,
+        Request::new(rpc::ListApplicationsRequest {
+            names: vec!["unreadable-app".into()],
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert!(applications.applications.is_empty());
+    assert_eq!(applications.paging.unwrap().total, Some(0));
+    let sessions = Frontend::list_sessions(
+        &flame,
+        Request::new(rpc::ListSessionsRequest {
+            ids: vec!["unreadable-session".into()],
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert!(sessions.sessions.is_empty());
+    assert_eq!(sessions.paging.unwrap().total, Some(0));
+    controller.close_session(id.clone()).await.unwrap();
+    controller.delete_session(id.clone()).await.unwrap();
+    let sessions = Frontend::list_sessions(
+        &flame,
+        Request::new(rpc::ListSessionsRequest {
+            ids: vec![id],
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(sessions.paging.unwrap().total, Some(0));
+}

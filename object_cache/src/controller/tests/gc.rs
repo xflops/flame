@@ -15,8 +15,9 @@ limitations under the License.
 
 use super::*;
 use crate::controller::gc::{
-    classify_stale, validate_applications, validate_sessions, ApplicationState,
-    GarbageCollectableStorage, GarbageCollector, LivenessProvider, LivenessSnapshot, StaleReason,
+    classify_stale, validate_applications, validate_owner_page, validate_sessions,
+    ApplicationState, GarbageCollectableStorage, GarbageCollector, LivenessProvider,
+    LivenessSnapshot, StaleReason,
 };
 use async_trait::async_trait;
 use rpc::flame::v1 as flame_rpc;
@@ -87,11 +88,16 @@ struct MockProvider {
 #[async_trait]
 impl LivenessProvider for MockProvider {
     /// Return one complete scripted snapshot and count freshness checks.
-    async fn snapshot(&mut self) -> Result<LivenessSnapshot, FlameError> {
+    async fn snapshot(&mut self, _key: &ObjectKey) -> Result<LivenessSnapshot, FlameError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.responses
-            .pop_front()
-            .expect("unexpected liveness lookup")
+        if self.responses.len() > 1 {
+            self.responses.pop_front().unwrap()
+        } else {
+            match self.responses.front().expect("unexpected liveness lookup") {
+                Ok(snapshot) => Ok(snapshot.clone()),
+                Err(error) => Err(FlameError::Network(error.to_string())),
+            }
+        }
     }
 }
 struct MockStorage {
@@ -111,13 +117,13 @@ impl GarbageCollectableStorage for MockStorage {
             .collect())
     }
     /// Record exact internal deletion, or return its injected storage error.
-    async fn delete(&self, key: &ObjectKey) -> Result<(), FlameError> {
-        let key = key.to_key().unwrap();
+    async fn delete(&self, metadata: &ObjectMetadata) -> Result<bool, FlameError> {
+        let key = metadata.key.clone();
         if self.failures.contains(&key) {
             return Err(FlameError::Storage("injected deletion failure".into()));
         }
         self.deleted.lock().unwrap().push(key);
-        Ok(())
+        Ok(true)
     }
 }
 /// Build observable storage without deletion failures.
@@ -290,7 +296,7 @@ async fn live_session_objects_are_not_candidates() {
     let (mut collector, calls) = collector(storage.clone(), vec![Ok(live)]);
     let stats = collector.reconcile(100_000).await.unwrap();
     assert_eq!((stats.candidates, stats.deleted), (0, 0));
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(storage.deleted.lock().unwrap().is_empty());
 }
 
@@ -310,7 +316,7 @@ async fn absent_sessions_delete_old_exact_objects_after_grace() {
     );
     let stats = collector.reconcile(20_000).await.unwrap();
     assert_eq!((stats.candidates, stats.deleted, stats.failures), (1, 1, 0));
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
     assert_eq!(&*storage.deleted.lock().unwrap(), &["app/gone/old"]);
 }
 
@@ -331,8 +337,8 @@ async fn fresh_snapshot_recovery_prevents_deletion() {
         vec![Ok(LivenessSnapshot::default()), Ok(recovered)],
     );
     let stats = collector.reconcile(20_000).await.unwrap();
-    assert_eq!((stats.candidates, stats.deleted), (3, 0));
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!((stats.candidates, stats.deleted), (1, 0));
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     assert!(storage.deleted.lock().unwrap().is_empty());
 }
 
@@ -357,7 +363,7 @@ async fn unavailable_or_malformed_liveness_deletes_nothing() {
     ] {
         let storage = storage(vec![object("app/session/object", 1)]);
         let (mut collector, _) = collector(storage.clone(), responses);
-        assert!(collector.reconcile(20_000).await.is_err());
+        assert_eq!(collector.reconcile(20_000).await.unwrap().failures, 1);
         assert!(storage.deleted.lock().unwrap().is_empty());
     }
 }
@@ -475,3 +481,61 @@ async fn gone_session_cleanup_does_not_wait_for_existing_reader() {
     );
     assert!(futures::StreamExt::next(&mut reader).await.is_none());
 }
+
+/// Missing totals, malformed metadata and unrelated identities cannot authorize deletion.
+#[test]
+fn exact_owner_response_requires_complete_identity_and_total() {
+    let absent = flame_rpc::Paging {
+        limit: 1,
+        number: 1,
+        total: Some(0),
+    };
+    assert!(validate_owner_page(Some(&absent), "id", []).is_ok());
+    let present = flame_rpc::Paging {
+        total: Some(1),
+        ..absent
+    };
+    assert!(validate_owner_page(Some(&present), "id", ["id"]).is_ok());
+    assert!(validate_owner_page(Some(&present), "id", ["other"]).is_err());
+    assert!(validate_owner_page(Some(&present), "id", []).is_err());
+    assert!(validate_owner_page(None, "id", []).is_err());
+    for bad in [
+        flame_rpc::Paging {
+            total: None,
+            ..absent
+        },
+        flame_rpc::Paging {
+            total: Some(101),
+            ..absent
+        },
+        flame_rpc::Paging {
+            limit: 100,
+            ..absent
+        },
+        flame_rpc::Paging {
+            number: 2,
+            ..absent
+        },
+    ] {
+        assert!(validate_owner_page(Some(&bad), "id", []).is_err());
+    }
+}
+
+/// A failed owner lookup defers that object without blocking unrelated cleanup.
+#[tokio::test]
+async fn failed_owner_does_not_starve_later_candidates() {
+    let storage = storage(vec![object("app/broken/a", 1), object("app/gone/b", 1)]);
+    let (mut collector, _) = collector(
+        storage.clone(),
+        vec![
+            Err(FlameError::Network("unreadable owner".into())),
+            Ok(LivenessSnapshot::default()),
+        ],
+    );
+    let stats = collector.reconcile(20_000).await.unwrap();
+    assert_eq!((stats.failures, stats.deleted), (1, 1));
+    assert_eq!(&*storage.deleted.lock().unwrap(), &["app/gone/b"]);
+}
+
+#[path = "gc_owner_rpc.rs"]
+mod owner_rpc;

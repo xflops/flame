@@ -43,6 +43,7 @@ fn create_test_context(db_url: &str) -> FlameClusterContext {
                 ..Default::default()
             },
             recovery: Default::default(),
+            history: Default::default(),
             pprof: None,
         },
         cache: None,

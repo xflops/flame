@@ -164,6 +164,12 @@ async fn main() -> Result<(), FlameError> {
         handlers.push(handler);
     }
 
+    // History cleanup is supervised and runs its blocking I/O outside task runtimes.
+    {
+        let controller = controller.clone();
+        handlers.push(tokio::spawn(async move { controller.run_gc().await }));
+    }
+
     // Start provider task.
     #[allow(clippy::let_underscore_future)]
     {

@@ -192,8 +192,8 @@ belongs to its application instead. Failed or malformed frontend responses canno
 authorize collection. Collection proceeds regardless of active readers or
 writers. Appending to an object whose session is gone does not retain it.
 
-There is no delete RPC or SDK helper, and no `delete_if_unchanged` API. Package
-uploads never delete or replace an existing name. Filesystem metadata is retired
+Deletion is internal; no delete RPC or SDK helper is exposed. Package uploads
+never delete or replace an existing name. Filesystem metadata is retired
 on internal deletion, with no memory payload cache to invalidate.
 
 ## Validation

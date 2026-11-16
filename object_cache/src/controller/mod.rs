@@ -151,7 +151,22 @@ impl Controller {
         .await
     }
 
-    /// Own GC filesystem deletion through completion even if its waiting caller is canceled.
+    /// Finish a conditional GC unlink even if the waiting collector is cancelled.
+    pub(super) async fn delete_if_unchanged(
+        &self,
+        metadata: &ObjectMetadata,
+    ) -> Result<bool, FlameError> {
+        let storage = Arc::clone(&self.storage);
+        let metadata = metadata.clone();
+        tokio::spawn(async move { storage.delete_if_unchanged(&metadata).await })
+            .await
+            .map_err(|error| {
+                FlameError::Internal(format!("object deletion task failed: {error}"))
+            })?
+    }
+
+    #[cfg(test)]
+    /// Own fixture filesystem deletion through completion even if its waiting caller is canceled.
     pub(super) async fn delete(&self, key: &ObjectKey) -> Result<(), FlameError> {
         let storage = Arc::clone(&self.storage);
         let key = key.clone();

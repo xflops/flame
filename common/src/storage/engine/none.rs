@@ -396,6 +396,10 @@ impl Engine for NoneEngine {
         let shared = self.session_entry(&id)?;
         let metadata = {
             let entry = lock_ptr!(shared)?;
+            ensure!(
+                entry.metadata.is_closed(),
+                FlameError::InvalidState(format!("session <{id}> is not closed"))
+            )?;
             {
                 let mut directory = lock_ptr!(self.sessions)?;
                 ensure!(
@@ -409,6 +413,11 @@ impl Engine for NoneEngine {
             entry.metadata.clone()
         };
         Ok(metadata)
+    }
+
+    async fn stale_session(&self, id: SessionID) -> Result<(), FlameError> {
+        self.delete_session(id).await?;
+        Ok(())
     }
 
     async fn find_session_metadata(&self) -> Result<Vec<Session>, FlameError> {

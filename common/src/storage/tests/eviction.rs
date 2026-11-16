@@ -520,7 +520,10 @@ async fn none_history_survives_closed_handoff_until_explicit_deletion() {
             .len(),
         1
     );
-    storage.delete_session("s".into()).await.unwrap();
+    storage
+        .delete_session(&storage.get_session_ptr("s".into()).unwrap())
+        .await
+        .unwrap();
     assert!(matches!(
         storage.get_task("s".into(), created.id).await,
         Err(FlameError::NotFound(_))

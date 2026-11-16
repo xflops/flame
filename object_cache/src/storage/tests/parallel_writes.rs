@@ -599,3 +599,40 @@ async fn create_if_missing_is_shared_by_object_and_patch_writes() {
     assert!(object.key.starts_with("parallel/session/"));
     assert_eq!(object.version, 1);
 }
+
+/// GC must not unlink a newer committed prefix selected after its metadata scan.
+#[tokio::test]
+async fn conditional_gc_preserves_appended_objects() {
+    let directory = tempdir().unwrap();
+    let storage = FsStorage::new(directory.path().into()).unwrap();
+    let key = key();
+    let observed = create(&storage, &key, b"old").await;
+    let mut writer = storage.patch_writer(&key, "raw", 3).await.unwrap();
+    writer
+        .write_chunk(Bytes::from_static(b"new"))
+        .await
+        .unwrap();
+    let updated = storage.commit_test_writer(writer).await.unwrap();
+    assert!(!storage.delete_if_unchanged(&observed).await.unwrap());
+    assert_eq!(latest(&storage).await.version, updated.version);
+    assert!(storage.delete_if_unchanged(&updated).await.unwrap());
+    assert!(!storage.delete_if_unchanged(&updated).await.unwrap());
+}
+
+/// Reusing the same key and version cannot let an old GC candidate remove a new UUID.
+#[tokio::test]
+async fn conditional_gc_preserves_recreated_objects() {
+    let directory = tempdir().unwrap();
+    let storage = FsStorage::new(directory.path().into()).unwrap();
+    let key = key();
+    let observed = create(&storage, &key, b"old").await;
+    storage.delete_objects(&key).await.unwrap();
+    let recreated = create(&storage, &key, b"new").await;
+    assert_eq!(observed.version, recreated.version);
+    assert_ne!(observed.uuid, recreated.uuid);
+    assert!(!storage.delete_if_unchanged(&observed).await.unwrap());
+    assert_eq!(
+        contents(&storage, &recreated).await,
+        vec![(0, b"new".to_vec())]
+    );
+}

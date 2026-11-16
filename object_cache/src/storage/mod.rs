@@ -66,6 +66,9 @@ pub(crate) trait StorageEngine: Send + Sync + 'static {
     ) -> Result<ObjectMetadata, FlameError>;
     /// List matching metadata, optionally restricted to a committed part prefix.
     async fn list(&self, filter: &ObjectFilter) -> Result<Vec<ObjectMetadata>, FlameError>;
+    /// Unlink only the observed object incarnation and committed version.
+    async fn delete_if_unchanged(&self, metadata: &ObjectMetadata) -> Result<bool, FlameError>;
+    #[cfg(test)]
     /// Delete the exact object or all objects selected by an application/session key.
     async fn delete_objects(&self, key: &ObjectKey) -> Result<(), FlameError>;
 }
@@ -343,6 +346,52 @@ fn validate_uuid(dir: &Path, expected: &str) -> Result<(), FlameError> {
 }
 
 impl FsStorage {
+    /// Compare and unlink under the publication lock on a blocking worker.
+    async fn delete_if_unchanged(&self, metadata: &ObjectMetadata) -> Result<bool, FlameError> {
+        let storage = self.clone();
+        let metadata = metadata.clone();
+        joined(
+            tokio::task::spawn_blocking(move || {
+                let key = ObjectKey::try_from(metadata.key.as_str())?;
+                let Some(key) = key.to_key() else {
+                    return Err(FlameError::InvalidConfig(
+                        "complete object key required".into(),
+                    ));
+                };
+                let path = storage.storage_path.join(&key);
+                {
+                    let mut published = storage.catalog.lock().map_err(|_| catalog_error())?;
+                    let Some(object) = published.get(&key) else {
+                        return Ok(false);
+                    };
+                    if metadata.uuid.is_empty()
+                        || object.metadata.uuid != metadata.uuid
+                        || object.version() != metadata.version
+                    {
+                        return Ok(false);
+                    }
+                    match fs::remove_dir_all(&path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    published.remove(&key);
+                    storage.part_cache.remove_object(&metadata.uuid);
+                }
+                if let Some(session) = path.parent() {
+                    remove_empty_dir(&session.join(STAGING_DIR));
+                    remove_empty_dir(session);
+                    if let Some(app) = session.parent() {
+                        remove_empty_dir(app);
+                    }
+                }
+                Ok(true)
+            })
+            .await,
+        )?
+    }
+
+    #[cfg(test)]
     /// Unlink committed objects directly; captured descriptors remain readable and GC never waits for active I/O.
     fn delete_committed(&self, key: &ObjectKey) -> Result<(), FlameError> {
         let keys: Vec<_> = if let Some(key) = key.to_key() {
@@ -892,6 +941,11 @@ impl StorageEngine for FsStorage {
         }
         Ok(items)
     }
+    async fn delete_if_unchanged(&self, metadata: &ObjectMetadata) -> Result<bool, FlameError> {
+        FsStorage::delete_if_unchanged(self, metadata).await
+    }
+
+    #[cfg(test)]
     /// Unlink expired-session data on a blocking worker without waiting for readers or writers.
     async fn delete_objects(&self, key: &ObjectKey) -> Result<(), FlameError> {
         let storage = self.clone();

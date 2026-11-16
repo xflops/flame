@@ -104,8 +104,10 @@ Detailed getters and list metadata projections use the retained session.
 With `none`, the storage engine continues to retain authoritative session/task
 history in memory independently of the session manager's active-task cache.
 
-History retention and removal/archive of stale sessions are tracked separately
-in [#719](https://github.com/xflops/flame/issues/719).
+Always-on history collection removes expired Closed sessions according to
+`cluster.history.retention`, defaulting to 30 days, on a fixed four-hour interval.
+See the [history collection design](../RFE719-session-history-gc/FS.md) for
+eligibility, lifecycle coordination and retry behavior.
 
 ### Response metadata and clients
 

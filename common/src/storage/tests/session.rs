@@ -310,9 +310,17 @@ mod delete_session {
 
         let attr = create_session_attr("delete-test-ssn");
         storage.create_session(attr).await.unwrap();
+        storage
+            .close_session("delete-test-ssn".into())
+            .await
+            .unwrap();
 
         let deleted = storage
-            .delete_session("delete-test-ssn".to_string())
+            .delete_session(
+                &storage
+                    .get_session_ptr("delete-test-ssn".to_string())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(deleted.id, "delete-test-ssn");
@@ -322,12 +330,18 @@ mod delete_session {
     }
 
     #[tokio::test]
-    async fn delete_returns_error_for_nonexistent() {
+    async fn delete_returns_error_for_removed_pointer() {
         let ctx = test_context();
         let storage = storage::new_ptr(&ctx).await.unwrap();
 
-        let result = storage.delete_session("nonexistent".to_string()).await;
-        assert!(result.is_err());
+        storage
+            .create_session(create_session_attr("removed"))
+            .await
+            .unwrap();
+        storage.close_session("removed".into()).await.unwrap();
+        let pointer = storage.get_session_ptr("removed".into()).unwrap();
+        storage.delete_session(&pointer).await.unwrap();
+        assert!(storage.delete_session(&pointer).await.is_err());
     }
 
     #[tokio::test]
@@ -337,11 +351,19 @@ mod delete_session {
 
         let attr = create_session_attr("list-delete-ssn");
         storage.create_session(attr).await.unwrap();
+        storage
+            .close_session("list-delete-ssn".into())
+            .await
+            .unwrap();
 
         assert_eq!(storage.list_sessions(None).await.unwrap().len(), 1);
 
         storage
-            .delete_session("list-delete-ssn".to_string())
+            .delete_session(
+                &storage
+                    .get_session_ptr("list-delete-ssn".to_string())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 

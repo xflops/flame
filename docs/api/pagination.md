@@ -26,7 +26,9 @@ Executors sort by node, numeric state, then ID. Tasks sort by numeric ID
 descending, independently of state and timestamps.
 
 Application, node, executor and session lists project in-memory metadata. All
-sessions remain in the existing cache regardless of state or age. Closed sessions
+retained sessions remain in the existing cache regardless of state or age.
+History collection removes expired Closed sessions according to
+`cluster.history.retention` (30 days by default), every four hours. Closed sessions
 retain the same Session object with final counters and empty task maps/indexes;
 terminal task history is read from storage. `max_sessions` limits Open sessions and does not evict history. Task pages
 read storage metadata without loading input, output or affinity payloads.

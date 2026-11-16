@@ -272,7 +272,7 @@ mod application_lifecycle {
         assert_eq!(storage.list_sessions(None).await.unwrap().len(), 1);
 
         storage
-            .delete_session("cleanup-ssn".to_string())
+            .delete_session(&storage.get_session_ptr("cleanup-ssn".to_string()).unwrap())
             .await
             .unwrap();
         storage

@@ -101,6 +101,7 @@ fn stale_session_handles_are_rejected_after_delete_and_recreate() {
         None,
     ))
     .unwrap();
+    tokio_test::block_on(engine.close_session("same".into())).unwrap();
     tokio_test::block_on(engine.delete_session("same".into())).unwrap();
     {
         let _old_entry = lock_ptr!(stale).unwrap();
@@ -379,6 +380,7 @@ async fn test_none_engine_delete_session_cleans_counter() {
         .unwrap();
     assert_eq!(task1.id, 1);
 
+    engine.close_session("test-session".into()).await.unwrap();
     let result = engine.delete_session("test-session".to_string()).await;
     assert_eq!(result.unwrap().id, "test-session");
     assert!(matches!(

@@ -119,6 +119,10 @@ fn derive_events_path(_storage_url: &str) -> String {
 }
 
 impl Storage {
+    pub fn context(&self) -> &FlameClusterContext {
+        &self.context
+    }
+
     pub fn session_retry_limits(&self) -> u32 {
         self.context.cluster.recovery.session.retry_limits
     }
@@ -541,6 +545,12 @@ impl Storage {
                 .cloned()
                 .ok_or_else(|| FlameError::NotFound(format!("session <{id}>")))?
         };
+        {
+            let session = lock_ptr!(shared)?;
+            if session.is_closed() {
+                return Ok(session.clone());
+            }
+        }
         let persisted = match self.engine.close_session(id.clone()).await {
             Ok(session) => session,
             Err(error) => {
@@ -766,29 +776,62 @@ impl Storage {
         Ok(task_ptr.clone())
     }
 
-    pub async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError> {
+    pub async fn delete_session(&self, shared: &SessionPtr) -> Result<Session, FlameError> {
         let _admission = self.session_admission.lock().await;
-        let previous = self.get_session(id.clone()).ok();
-        let removed = match self.engine.delete_session(id.clone()).await {
+        let previous = self.session_for_removal(shared)?;
+        self.event_manager.remove_events(previous.id.clone())?;
+        let removed = match self.engine.delete_session(previous.id.clone()).await {
             Ok(session) => session,
-            Err(FlameError::NotFound(_)) if previous.is_some() => previous.unwrap(),
+            Err(FlameError::NotFound(_)) => previous,
             Err(error) => return Err(error),
         };
-        let shared = {
-            let mut directory = lock_ptr!(self.sessions)?;
-            directory.remove(&id)
-        };
-        if let Some(shared) = shared {
+        self.remove_cached_session(shared, &removed.id)?;
+        Ok(removed.metadata())
+    }
+
+    pub async fn stale_session(&self, shared: &SessionPtr) -> Result<(), FlameError> {
+        let _admission = self.session_admission.lock().await;
+        let previous = self.session_for_removal(shared)?;
+        self.event_manager.remove_events(previous.id.clone())?;
+        match self.engine.stale_session(previous.id.clone()).await {
+            Ok(()) | Err(FlameError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        self.remove_cached_session(shared, &previous.id)
+    }
+
+    /// Call while holding session_admission, which excludes removal and same-ID creation.
+    fn session_for_removal(&self, shared: &SessionPtr) -> Result<Session, FlameError> {
+        let session = { lock_ptr!(shared)?.metadata() };
+        let current = self.get_session_ptr(session.id.clone())?;
+        ensure!(
+            Arc::ptr_eq(&current, shared),
+            FlameError::NotFound(format!("Session <{}> was removed or replaced", session.id))
+        )?;
+        ensure!(
+            session.is_closed(),
+            FlameError::InvalidState(format!("session <{}> is not closed", session.id))
+        )?;
+        Ok(session)
+    }
+
+    fn remove_cached_session(&self, shared: &SessionPtr, id: &SessionID) -> Result<(), FlameError> {
+        {
             let mut session = lock_ptr!(shared)?;
-            session.status.state = SessionState::Closed;
             session.tasks.clear();
             session.tasks_index.clear();
             session.tokens.clear();
             session.common_data = None;
             session.events.clear();
         }
-        event_result(self.event_manager.remove_events(id.clone()), "remove", &id);
-        Ok(removed.metadata())
+        let mut sessions = lock_ptr!(self.sessions)?;
+        if sessions
+            .get(id)
+            .is_some_and(|current| Arc::ptr_eq(current, shared))
+        {
+            sessions.remove(id);
+        }
+        Ok(())
     }
 
     /// Project metadata from all cached sessions without copying task maps or payloads.

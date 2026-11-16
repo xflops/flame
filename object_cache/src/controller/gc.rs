@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use common::ctx::FlameCluster;
 use common::{FlameError, PACKAGE_SESSION, SHARED_SESSION};
 use rpc::flame::v1::frontend_client::FrontendClient;
-use rpc::flame::v1::{self as flame_rpc, ListApplicationsRequest, ListSessionsRequest};
+use rpc::flame::v1::{self as flame_rpc, ListApplicationsRequest, ListSessionsRequest, Paging};
 use tokio::time::{interval, MissedTickBehavior};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::Request;
@@ -55,11 +55,6 @@ pub(super) enum StaleReason {
     PreviousApplication,
     MissingApplication,
 }
-struct Candidate {
-    key: ObjectKey,
-    metadata: ObjectMetadata,
-    reason: StaleReason,
-}
 #[derive(Default)]
 pub(super) struct ReconcileStats {
     pub(super) candidates: usize,
@@ -70,14 +65,14 @@ pub(super) struct ReconcileStats {
 #[async_trait]
 pub(super) trait LivenessProvider: Send {
     /// Return validated application and session identities, including every session state.
-    async fn snapshot(&mut self) -> Result<LivenessSnapshot, FlameError>;
+    async fn snapshot(&mut self, key: &ObjectKey) -> Result<LivenessSnapshot, FlameError>;
 }
-struct FrontendLivenessProvider {
+pub(super) struct FrontendLivenessProvider {
     client: FrontendClient<Channel>,
 }
 impl FrontendLivenessProvider {
     /// Build one lazy frontend client for application and session liveness queries.
-    fn new(cluster: &FlameCluster) -> Result<Self, FlameError> {
+    pub(super) fn new(cluster: &FlameCluster) -> Result<Self, FlameError> {
         let mut endpoint = Endpoint::from_shared(cluster.endpoint.clone()).map_err(|error| {
             FlameError::InvalidConfig(format!(
                 "invalid FSM frontend endpoint <{}>: {}",
@@ -103,43 +98,55 @@ impl FrontendLivenessProvider {
 }
 #[async_trait]
 impl LivenessProvider for FrontendLivenessProvider {
-    /// Fetch unfiltered application and session lists, failing closed if either RPC or validation fails.
-    async fn snapshot(&mut self) -> Result<LivenessSnapshot, FlameError> {
-        let mut request = Request::new(ListApplicationsRequest {
-            state: None,
-            ..Default::default()
+    /// Exact owner filters make absence independent of global list size and ordering.
+    async fn snapshot(&mut self, key: &ObjectKey) -> Result<LivenessSnapshot, FlameError> {
+        let paging = Some(Paging {
+            limit: 1,
+            number: 1,
+            total: None,
         });
-        request.set_timeout(LIST_TIMEOUT);
-        let applications = validate_applications(
-            self.client
+        let mut snapshot = LivenessSnapshot::default();
+        if matches!(key.session_id.as_str(), PACKAGE_SESSION | SHARED_SESSION) {
+            let mut request = Request::new(ListApplicationsRequest {
+                names: vec![key.app_name.clone()],
+                state: None,
+                paging,
+            });
+            request.set_timeout(LIST_TIMEOUT);
+            let response = self
+                .client
                 .list_applications(request)
                 .await
                 .map_err(|error| FlameError::Network(error.to_string()))?
-                .into_inner()
-                .applications,
-        )?;
-        let mut request = Request::new(ListSessionsRequest::default());
-        request.set_timeout(LIST_TIMEOUT);
-        let sessions = validate_sessions(
-            self.client
+                .into_inner();
+            snapshot.applications = validate_applications(response.applications)?;
+            validate_owner_page(
+                response.paging.as_ref(),
+                &key.app_name,
+                snapshot.applications.keys().map(String::as_str),
+            )?;
+        } else {
+            let mut request = Request::new(ListSessionsRequest {
+                ids: vec![key.session_id.clone()],
+                application: None,
+                state: None,
+                paging,
+            });
+            request.set_timeout(LIST_TIMEOUT);
+            let response = self
+                .client
                 .list_sessions(request)
                 .await
                 .map_err(|error| FlameError::Network(error.to_string()))?
-                .into_inner()
-                .sessions,
-        )?;
-        if applications.len() >= common::apis::DEFAULT_LIST_LIMITATION
-            || sessions.len() >= common::apis::DEFAULT_LIST_LIMITATION
-        {
-            return Err(FlameError::Internal(
-                "list reached DEFAULT_LIST_LIMITATION; refusing an incomplete liveness snapshot"
-                    .into(),
-            ));
+                .into_inner();
+            snapshot.sessions = validate_sessions(response.sessions)?;
+            validate_owner_page(
+                response.paging.as_ref(),
+                &key.session_id,
+                snapshot.sessions.keys().map(String::as_str),
+            )?;
         }
-        Ok(LivenessSnapshot {
-            applications,
-            sessions,
-        })
+        Ok(snapshot)
     }
 }
 
@@ -148,7 +155,7 @@ pub(super) trait GarbageCollectableStorage: Send + Sync {
     /// List the filesystem object metadata eligible for garbage-collection classification.
     async fn list(&self, filter: &ObjectFilter) -> Result<Vec<ObjectMetadata>, FlameError>;
     /// Delete one exact stale object without waiting for readers or accepted writes.
-    async fn delete(&self, key: &ObjectKey) -> Result<(), FlameError>;
+    async fn delete(&self, metadata: &ObjectMetadata) -> Result<bool, FlameError>;
 }
 #[async_trait]
 impl GarbageCollectableStorage for Controller {
@@ -157,8 +164,8 @@ impl GarbageCollectableStorage for Controller {
         Controller::list(self, filter).await
     }
     /// Remove stale session data internally without exposing a public delete RPC.
-    async fn delete(&self, key: &ObjectKey) -> Result<(), FlameError> {
-        Controller::delete(self, key).await
+    async fn delete(&self, metadata: &ObjectMetadata) -> Result<bool, FlameError> {
+        Controller::delete_if_unchanged(self, metadata).await
     }
 }
 
@@ -201,60 +208,40 @@ impl GarbageCollector {
             }
         }
     }
-    /// Recheck a complete validated liveness snapshot before deleting confirmed absent-session or stale-package data.
+    /// Recheck each exact owner before conditionally deleting its observed object.
     pub(super) async fn reconcile(&mut self, now: i64) -> Result<ReconcileStats, FlameError> {
         let objects = self.storage.list(&ObjectFilter::AllObject).await?;
-        if objects.is_empty() {
-            return Ok(ReconcileStats::default());
-        }
-        let snapshot = self.liveness.snapshot().await?;
-        let mut candidates = Vec::new();
+        let mut stats = ReconcileStats::default();
         for metadata in objects {
             let key = match ObjectKey::try_from(metadata.key.as_str()) {
                 Ok(key) => key,
                 Err(error) => {
-                    tracing::warn!(key = %metadata.key, error = %error, "ignoring invalid object key during garbage collection");
+                    tracing::warn!(key = %metadata.key, %error, "ignoring invalid object key during garbage collection");
                     continue;
                 }
             };
-            if let Some(reason) = classify_stale(&snapshot, &key, metadata.creation_time, now) {
-                candidates.push(Candidate {
-                    key,
-                    metadata,
-                    reason,
-                });
+            let result = async {
+                let snapshot = self.liveness.snapshot(&key).await?;
+                if classify_stale(&snapshot, &key, metadata.creation_time, now).is_none() {
+                    return Ok(false);
+                }
+                stats.candidates += 1;
+                let current = self.liveness.snapshot(&key).await?;
+                if classify_stale(&current, &key, metadata.creation_time, now).is_none() {
+                    return Ok(false);
+                }
+                self.storage.delete(&metadata).await
             }
-        }
-        let mut stats = ReconcileStats {
-            candidates: candidates.len(),
-            ..Default::default()
-        };
-        if !candidates.is_empty() {
-            // Neither RPC list is atomic with deletion. A fresh validated pair is required before any destructive work.
-            let current = self.liveness.snapshot().await?;
-            candidates.retain_mut(|candidate| {
-                if let Some(reason) = classify_stale(
-                    &current,
-                    &candidate.key,
-                    candidate.metadata.creation_time,
-                    now,
-                ) {
-                    candidate.reason = reason;
-                    true
-                } else {
-                    false
-                }
-            });
-        }
-        for candidate in candidates {
-            match self.storage.delete(&candidate.key).await {
-                Ok(()) => {
+            .await;
+            match result {
+                Ok(true) => {
                     stats.deleted += 1;
-                    tracing::debug!(key = %candidate.metadata.key, reason = ?candidate.reason, "deleted stale object");
+                    tracing::debug!(key = %metadata.key, "deleted stale object");
                 }
+                Ok(false) => {}
                 Err(error) => {
                     stats.failures += 1;
-                    tracing::warn!(key = %candidate.metadata.key, error = %error, "failed to delete stale object");
+                    tracing::warn!(key = %metadata.key, %error, "deferred object garbage collection");
                 }
             }
         }
@@ -392,6 +379,24 @@ pub(super) fn classify_stale(
         None
     }
 }
+/// Only an exact, complete identity/count pair can establish owner absence.
+pub(super) fn validate_owner_page<'a>(
+    paging: Option<&Paging>,
+    expected: &str,
+    identities: impl IntoIterator<Item = &'a str>,
+) -> Result<(), FlameError> {
+    let paging = paging.ok_or_else(|| invalid("owner lookup missing paging"))?;
+    if paging.limit != 1 || paging.number != 1 {
+        return Err(invalid("owner lookup has inconsistent paging"));
+    }
+    let identities = identities.into_iter().collect::<Vec<_>>();
+    match (paging.total, identities.as_slice()) {
+        (Some(0), []) => Ok(()),
+        (Some(1), [identity]) if *identity == expected => Ok(()),
+        _ => Err(invalid("owner lookup identity or count mismatch")),
+    }
+}
+
 /// Describe an invalid liveness response without authorizing any deletion.
 fn invalid(message: &str) -> FlameError {
     FlameError::InvalidState(message.into())

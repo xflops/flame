@@ -371,12 +371,11 @@ async fn delete_drops_events_from_writers_with_a_retained_cache_pointer() {
             .record_event(EventOwner::session(id.clone()), event("before"))
             .await
             .unwrap();
-        if url != "none" {
-            // Persistent engines require Closed before deletion. Keep the
-            // retained cache pointer Open to model a delayed cache writer.
-            storage.engine.close_session(id.clone()).await.unwrap();
-        }
-        storage.delete_session(id.clone()).await.unwrap();
+        storage.close_session(id.clone()).await.unwrap();
+        storage
+            .delete_session(&storage.get_session_ptr(id.clone()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(
             lock_ptr!(retained).unwrap().status.state,
             SessionState::Closed

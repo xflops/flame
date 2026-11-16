@@ -13,6 +13,13 @@ limitations under the License.
 
 use super::*;
 
+fn history_directories(directory: &Path) -> Vec<PathBuf> {
+    fs::read_dir(directory.join(".history"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect()
+}
+
 async fn engine() -> (FilesystemEngine, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
     let storage = FilesystemEngine {
@@ -234,4 +241,166 @@ async fn closed_registry_drops_tokens_and_details_read_them_on_demand() {
             .tokens["service"],
         "secret"
     );
+}
+
+#[test]
+fn malformed_session_timestamps_are_errors_not_fallbacks() {
+    let mut metadata = SessionMetadata {
+        state: SessionState::Closed as i32,
+        ..Default::default()
+    };
+    metadata.creation_time = i64::MAX;
+    assert!(FilesystemEngine::session_header(&metadata).is_err());
+    metadata.creation_time = 0;
+    metadata.completion_time = Some(i64::MAX);
+    assert!(FilesystemEngine::session_header(&metadata).is_err());
+    metadata.completion_time = None;
+    assert!(FilesystemEngine::session_header(&metadata)
+        .unwrap()
+        .completion_time
+        .is_none());
+}
+
+#[tokio::test]
+async fn deleting_closed_session_does_not_read_common_data_payload() {
+    let (engine, directory) = engine().await;
+    engine
+        .create_session(SessionAttributes {
+            id: "payload-history".into(),
+            application: "app".into(),
+            common_data: Some(Bytes::from_static(b"payload")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine
+        .close_session("payload-history".into())
+        .await
+        .unwrap();
+    fs::remove_file(
+        directory
+            .path()
+            .join("sessions/payload-history/common_data.bin"),
+    )
+    .unwrap();
+    assert!(engine
+        .get_session("payload-history".into())
+        .await
+        .unwrap()
+        .common_data
+        .is_none());
+    engine
+        .delete_session("payload-history".into())
+        .await
+        .unwrap();
+    assert!(!directory.path().join("sessions/payload-history").exists());
+    assert!(!directory.path().join(".history").exists());
+    engine
+        .create_session(SessionAttributes {
+            id: "payload-history".into(),
+            application: "app".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stale_session_moves_data_and_preserves_reused_ids_after_restart() {
+    let (engine, directory) = engine().await;
+    assert!(engine.stale_session("session".into()).await.is_err());
+    engine.close_session("session".into()).await.unwrap();
+    use std::os::unix::fs::MetadataExt;
+    let original = fs::metadata(directory.path().join("sessions/session")).unwrap();
+    engine.stale_session("session".into()).await.unwrap();
+    let first = history_directories(directory.path()).pop().unwrap();
+    assert_eq!(
+        first.parent(),
+        Some(directory.path().join(".history").as_path())
+    );
+    let moved = fs::metadata(&first).unwrap();
+    assert_eq!((original.dev(), original.ino()), (moved.dev(), moved.ino()));
+    assert!(first.join("metadata").exists());
+    assert!(!directory.path().join("sessions/session").exists());
+    engine
+        .create_session(SessionAttributes {
+            id: "session".into(),
+            application: "app".into(),
+            common_data: Some(Bytes::from_static(b"replacement")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine.close_session("session".into()).await.unwrap();
+    engine.stale_session("session".into()).await.unwrap();
+    let second = history_directories(directory.path())
+        .into_iter()
+        .find(|path| path != &first)
+        .unwrap();
+    assert_ne!(first, second);
+    engine
+        .create_session(SessionAttributes {
+            id: "session".into(),
+            application: "app".into(),
+            common_data: Some(Bytes::from_static(b"live")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let restarted = FilesystemEngine::new_ptr(&format!("fs://{}", directory.path().display()))
+        .await
+        .unwrap();
+    fs::remove_dir_all(&first).unwrap();
+    assert!(second.join("metadata").exists());
+    fs::remove_dir_all(&second).unwrap();
+    assert_eq!(
+        restarted
+            .get_session("session".into())
+            .await
+            .unwrap()
+            .common_data
+            .as_deref(),
+        Some(b"live".as_slice())
+    );
+}
+
+/// Closed state is sufficient for removal; damaged historical task records
+/// must not require repair before either deletion or staging can proceed.
+#[tokio::test]
+async fn closed_removal_does_not_read_task_records() {
+    for stale in [false, true] {
+        for corruption in ["missing", "truncated", "corrupt"] {
+            let (engine, directory) = engine().await;
+            engine
+                .create_task("session".into(), None, None)
+                .await
+                .unwrap();
+            engine.close_session("session".into()).await.unwrap();
+            let records = directory.path().join("sessions/session/tasks.bin");
+            match corruption {
+                "missing" => fs::remove_file(&records).unwrap(),
+                "truncated" => fs::write(&records, [0]).unwrap(),
+                "corrupt" => fs::write(&records, vec![0; engine.record_size]).unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(engine
+                .find_task_metadata(&TaskFilter::by_session("session"))
+                .await
+                .is_err());
+            if stale {
+                engine.stale_session("session".into()).await.unwrap();
+                let staged = history_directories(directory.path()).pop().unwrap();
+                assert!(staged.join("metadata").exists());
+                fs::remove_dir_all(staged).unwrap();
+            } else {
+                assert!(engine
+                    .delete_session("session".into())
+                    .await
+                    .unwrap()
+                    .is_closed());
+            }
+            assert!(!directory.path().join("sessions/session").exists());
+            assert!(engine.get_session("session".into()).await.is_err());
+        }
+    }
 }
