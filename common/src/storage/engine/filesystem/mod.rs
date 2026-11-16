@@ -879,7 +879,11 @@ impl FilesystemEngine {
         let state = SessionState::try_from(meta.state)?;
         let completion_time = meta
             .completion_time
-            .and_then(|t| DateTime::from_timestamp(t, 0));
+            .map(|t| {
+                DateTime::from_timestamp(t, 0)
+                    .ok_or_else(|| FlameError::Storage("Invalid completion time".into()))
+            })
+            .transpose()?;
 
         let resreq = match (meta.resreq_cpu, meta.resreq_memory, meta.resreq_gpu) {
             (Some(cpu), Some(memory), Some(gpu)) => Some(ResourceRequirement { cpu, memory, gpu }),
@@ -1420,17 +1424,48 @@ impl Engine for FilesystemEngine {
                 "Cannot delete open session".to_string(),
             ));
         }
-        if self._count_task(&entry, &TaskFilter::non_terminal(&id))? > 0 {
-            return Err(FlameError::Storage(
-                "Cannot delete session with non-terminal tasks".to_string(),
-            ));
-        }
-        let session = self.session_from_metadata(&entry.metadata)?;
+        let session = Self::session_header(&entry.metadata)?;
         fs::remove_dir_all(&entry.dir)
-            .map_err(|e| FlameError::Storage(format!("Failed to delete session: {e}")))?;
+            .map_err(|error| FlameError::Storage(format!("Failed to delete session: {error}")))?;
         entry.release_files();
         self.sessions.write().map_err(poisoned)?.remove(&id);
         Ok(session)
+    }
+
+    async fn stale_session(&self, id: SessionID) -> Result<(), FlameError> {
+        let shared = self.session_entry(&id)?;
+        let entry = write_async!(shared);
+        validate_entry(&self.sessions, &id, &shared)?;
+        if !entry.is_closed() {
+            return Err(FlameError::Storage(
+                "Cannot delete open session".to_string(),
+            ));
+        }
+        let history = self.base_path.join(".history");
+        fs::create_dir_all(&history).map_err(|error| {
+            FlameError::Storage(format!("Failed to create history directory: {error}"))
+        })?;
+        ensure!(
+            fs::symlink_metadata(&history)
+                .map_err(|error| FlameError::Storage(format!(
+                    "Cannot inspect history directory: {error}"
+                )))?
+                .file_type()
+                .is_dir(),
+            FlameError::Storage("History path is not a directory".into())
+        )?;
+        let detached = history.join(uuid::Uuid::new_v4().to_string());
+        fs::rename(&entry.dir, &detached).map_err(|error| {
+            FlameError::Storage(format!("Failed to move session to history: {error}"))
+        })?;
+        // Rename committed removal from the live namespace. Publish absence
+        // synchronously even if a registry lock was previously poisoned.
+        entry.release_files();
+        self.sessions
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&id);
+        Ok(())
     }
 
     async fn find_session_metadata(&self) -> Result<Vec<Session>, FlameError> {

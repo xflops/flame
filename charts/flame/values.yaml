@@ -17,13 +17,16 @@ cluster:
     - das
   scheduleInterval: 100
   storage: "fs:///var/lib/flame/session"
+  history:
+    # Closed-session history retention; collection always runs every four hours.
+    retention: "30days"
   executors:
     # Shims the executor manager runs; Kubernetes executor managers run the host shim.
     shims: [host]
     # Optional device managers loaded by FEM; CPU and memory are always loaded.
     devices: [gpu]
   limits:
-    # Maximum number of sessions in the cluster.
+    # Maximum number of Open sessions in the cluster.
     maxSessions: 1000
     application:
       # Optional hard ceiling per application, including idle executors.

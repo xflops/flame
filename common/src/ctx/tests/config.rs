@@ -689,3 +689,60 @@ cluster:
     let result = FlameClusterContext::from_file(Some(tmp_file.to_string_lossy().to_string()));
     assert!(result.is_err());
 }
+
+fn history_context(yaml: &str) -> Result<FlameClusterContext, FlameError> {
+    let context = format!("cluster:\n  name: flame\n  endpoint: http://127.0.0.1:8080\n{yaml}");
+    let parsed = serde_yaml::from_str::<FlameClusterContextYaml>(&context)
+        .map_err(|error| FlameError::InvalidConfig(error.to_string()))?;
+    FlameClusterContext::try_from(parsed)
+}
+
+#[test]
+fn history_retention_defaults_to_thirty_days() {
+    for yaml in ["", "  history: {}\n"] {
+        let ctx = history_context(yaml).unwrap();
+        assert_eq!(
+            ctx.cluster.history.retention,
+            std::time::Duration::from_secs(30 * 24 * 60 * 60)
+        );
+    }
+    assert_eq!(
+        FlameCluster::default().history.retention,
+        FlameHistory::default().retention
+    );
+}
+
+#[test]
+fn history_retention_parses_positive_human_durations() {
+    for (value, expected) in [("30days", 30 * 24 * 60 * 60), ("12h", 12 * 60 * 60)] {
+        let ctx = history_context(&format!("  history:\n    retention: {value}\n")).unwrap();
+        assert_eq!(
+            ctx.cluster.history.retention,
+            std::time::Duration::from_secs(expected)
+        );
+    }
+}
+
+#[test]
+fn history_retention_rejects_invalid_and_overflowing_durations() {
+    for value in [
+        "''",
+        "invalid",
+        "0s",
+        "-1day",
+        "18446744073709551615s",
+        "10000000000000s",
+    ] {
+        assert!(
+            history_context(&format!("  history:\n    retention: {value}\n")).is_err(),
+            "history.retention={value} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn history_accepts_only_retention_configuration() {
+    for key in ["enabled", "interval", "batch_size"] {
+        assert!(history_context(&format!("  history:\n    {key}: 1\n")).is_err());
+    }
+}

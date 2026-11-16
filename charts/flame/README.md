@@ -22,6 +22,46 @@ Eviction releases memory without deleting persistent parts. Active GET requests
 share one data-file descriptor per request; writes and metadata operations need
 additional file-descriptor headroom.
 
+## Session history retention
+
+The session manager removes eligible Closed sessions older than
+`cluster.history.retention`, defaulting to `"30days"`. Collection is always
+enabled and runs every four hours. Active and suspended sessions remain
+retained; `cluster.limits.maxSessions` limits Open sessions independently.
+
+```yaml
+cluster:
+  history:
+    retention: "30days"
+```
+
+Use a positive human-readable duration such as `"12h"` or `"7days"`.
+Invalid, zero and overflowing durations fail startup. Restart the session
+manager after changing retention. Expiration uses completion time, falling
+back to creation time for legacy records without completion time. The Controller
+lists Closed sessions in pages of 100 and checks their age in the GC loop.
+Retirement trusts the Closed state established by the close path and leaves
+executors and their retained services unchanged. The filesystem engine
+moves each selected session directory into `.history/<uuid>` on the same
+filesystem, without copying its payloads. Each pass traverses all Closed-session
+pages, then recursively removes every child directory in `.history`, preserving
+the root itself. Files and symlinks are skipped; a symlink history root is
+rejected. Failed cleanup is retried on a later pass. Session admission is
+released before this recursive removal begins.
+
+Explicit session deletion removes its files immediately through the ordinary
+delete operation. Age-based collection detaches history for cleanup during the
+GC pass. Creating, opening, closing or resuming sessions may wait while a backend
+delete or move is in progress; task creation in existing sessions can continue
+while that backend operation is pending.
+
+After restart, the next GC pass also removes history detached by an earlier
+session-manager process. Detached
+directories stay outside the live session namespace. Relative filesystem storage
+paths resolve under `FLAME_HOME` (default `/usr/local/flame`). Object-cache
+replicas reclaim orphaned session data through their own lifecycle. Increasing
+retention cannot restore removed history.
+
 ## Host workers
 
 Select a dedicated worker pool using node labels and, when needed, taints and

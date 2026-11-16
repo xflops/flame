@@ -57,6 +57,7 @@ async fn create_test_storage_with_retry_limits(retry_limits: u32) -> StoragePtr 
                 session: FlameSessionRecovery { retry_limits },
             },
             pprof: None,
+            history: Default::default(),
         },
         cache: None,
     };
@@ -214,6 +215,7 @@ mod bind_session_failed;
 mod controller;
 mod delete_node;
 mod drain_node;
+mod gc;
 mod register_node;
 mod snapshot;
 mod suspend;

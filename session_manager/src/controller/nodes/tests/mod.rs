@@ -62,6 +62,7 @@ async fn create_mock_storage() -> StoragePtr {
                 ..Default::default()
             },
             recovery: Default::default(),
+            history: Default::default(),
             pprof: None,
         },
         cache: None,

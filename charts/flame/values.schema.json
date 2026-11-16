@@ -15,6 +15,14 @@
       "type": "object",
       "properties": {
         "advertise": { "type": "string" },
+        "history": {
+          "type": "object",
+          "properties": {
+            "retention": { "type": "string", "minLength": 1 }
+          },
+          "required": ["retention"],
+          "additionalProperties": false
+        },
         "executors": {
           "type": "object",
           "properties": {

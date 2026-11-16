@@ -98,8 +98,19 @@ impl<K: Eq + Hash + Clone, V: Clone> Notifier<K, V> {
     }
 
     pub fn remove(&self, key: &K) -> Result<(), FlameError> {
+        self.remove_if(key, || Ok(true))
+    }
+
+    /// Check ownership and retire its channel without allowing a new subscription between them.
+    pub fn remove_if(
+        &self,
+        key: &K,
+        predicate: impl FnOnce() -> Result<bool, FlameError>,
+    ) -> Result<(), FlameError> {
         let mut channels = lock_ptr!(self.channels)?;
-        channels.remove(key);
+        if predicate()? {
+            channels.remove(key);
+        }
         Ok(())
     }
 }
@@ -226,6 +237,53 @@ mod tests {
                 updates.recv().await,
                 Err(broadcast::error::RecvError::Closed)
             ));
+        }
+
+        #[test]
+        fn conditional_removal_preserves_recreated_owner_and_retires_current_owner() {
+            let notifier = TaskNotifier::new();
+            let session = "session-1".to_string();
+            let previous_owner = Arc::new(());
+            let current_owner = Arc::new(());
+            let mut updates = notifier.subscribe(&session).unwrap();
+
+            // A delayed old-owner cleanup cannot retire the replacement's channel.
+            notifier
+                .remove_if(&session, || {
+                    Ok(Arc::ptr_eq(&previous_owner, &current_owner))
+                })
+                .unwrap();
+            notifier.notify(&session, 42).unwrap();
+            assert_eq!(updates.try_recv().unwrap(), 42);
+
+            notifier
+                .remove_if(&session, || {
+                    // Subscriptions use this same lock, so none can enter after
+                    // the owner check and before the channel is unlinked.
+                    assert!(notifier.channels.try_lock().is_none());
+                    Ok(Arc::ptr_eq(&current_owner, &current_owner))
+                })
+                .unwrap();
+            assert!(matches!(
+                updates.try_recv(),
+                Err(broadcast::error::TryRecvError::Closed)
+            ));
+            let mut replacement_updates = notifier.subscribe(&session).unwrap();
+            notifier.notify(&session, 43).unwrap();
+            assert_eq!(replacement_updates.try_recv().unwrap(), 43);
+        }
+
+        #[test]
+        fn conditional_removal_preserves_channel_when_owner_check_fails() {
+            let notifier = TaskNotifier::new();
+            let session = "session-1".to_string();
+            let mut updates = notifier.subscribe(&session).unwrap();
+            let result = notifier.remove_if(&session, || {
+                Err(FlameError::InvalidState("owner check failed".into()))
+            });
+            assert!(matches!(result, Err(FlameError::InvalidState(_))));
+            notifier.notify(&session, 42).unwrap();
+            assert_eq!(updates.try_recv().unwrap(), 42);
         }
 
         #[tokio::test]

@@ -37,6 +37,7 @@ pub const DEFAULT_SESSION_RETRY_LIMITS: u32 = 5;
 const DEFAULT_SCHEDULE_INTERVAL: u64 = 100;
 const DEFAULT_SHIM: &str = "host";
 const DEFAULT_FLAME_CACHE_ENDPOINT: &str = "http://127.0.0.1:9090";
+const DEFAULT_HISTORY_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 
 // ============================================================
 // YAML deserialization structs (serde layer)
@@ -72,6 +73,13 @@ struct FlameClusterYaml {
     pub pprof: Option<FlamePprofYaml>,
     /// Recovery configuration
     pub recovery: Option<FlameRecoveryYaml>,
+    pub history: Option<FlameHistoryYaml>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlameHistoryYaml {
+    pub retention: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,7 +192,22 @@ pub struct FlameCluster {
     pub tls: Option<FlameTls>,
     pub limits: FlameLimits,
     pub recovery: FlameRecovery,
+    pub history: FlameHistory,
     pub pprof: Option<FlamePprof>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlameHistory {
+    /// Age after which eligible Closed sessions are removed by history collection.
+    pub retention: std::time::Duration,
+}
+
+impl Default for FlameHistory {
+    fn default() -> Self {
+        Self {
+            retention: std::time::Duration::from_secs(DEFAULT_HISTORY_RETENTION_SECS),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -547,6 +570,11 @@ impl TryFrom<FlameClusterYaml> for FlameCluster {
             tls,
             limits,
             recovery,
+            history: cluster
+                .history
+                .map(FlameHistory::try_from)
+                .transpose()?
+                .unwrap_or_default(),
             pprof,
         })
     }
@@ -727,6 +755,7 @@ impl Default for FlameCluster {
             tls: None,
             limits: FlameLimits::default(),
             recovery: FlameRecovery::default(),
+            history: FlameHistory::default(),
             pprof: None,
         }
     }
@@ -819,6 +848,35 @@ impl TryFrom<FlameCacheGcYaml> for FlameCacheGc {
         }
 
         Ok(Self { interval })
+    }
+}
+
+impl TryFrom<FlameHistoryYaml> for FlameHistory {
+    type Error = FlameError;
+
+    fn try_from(history: FlameHistoryYaml) -> Result<Self, Self::Error> {
+        let Some(value) = history.retention else {
+            return Ok(Self::default());
+        };
+        let retention = humantime::parse_duration(&value).map_err(|error| {
+            FlameError::InvalidConfig(format!(
+                "invalid cluster.history.retention <{value}>: {error}"
+            ))
+        })?;
+        if retention.is_zero() {
+            return Err(FlameError::InvalidConfig(
+                "cluster.history.retention must be greater than zero".to_string(),
+            ));
+        }
+        let duration = chrono::Duration::from_std(retention).map_err(|_| {
+            FlameError::InvalidConfig("cluster.history.retention is too large".to_string())
+        })?;
+        if chrono::Utc::now().checked_sub_signed(duration).is_none() {
+            return Err(FlameError::InvalidConfig(
+                "cluster.history.retention overflows the history cutoff timestamp".to_string(),
+            ));
+        }
+        Ok(Self { retention })
     }
 }
 

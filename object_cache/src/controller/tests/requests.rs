@@ -339,6 +339,10 @@ impl StorageEngine for TrackedStorage {
         }
         Ok(metadata)
     }
+    async fn delete_if_unchanged(&self, metadata: &ObjectMetadata) -> Result<bool, FlameError> {
+        self.inner.delete_if_unchanged(metadata).await
+    }
+
     /// Pause after backend deletion returns, when its storage-owned operation has already ended.
     async fn delete_objects(&self, key: &ObjectKey) -> Result<(), FlameError> {
         self.inner.delete_objects(key).await?;

@@ -87,7 +87,10 @@ async fn close_retains_the_same_session_pointer_without_task_indexes() {
         .unwrap()
         .tasks_index
         .is_empty());
-    storage.delete_session("s".into()).await.unwrap();
+    storage
+        .delete_session(&storage.get_session_ptr("s".into()).unwrap())
+        .await
+        .unwrap();
     assert!(storage.list_sessions(None).await.unwrap().is_empty());
 }
 

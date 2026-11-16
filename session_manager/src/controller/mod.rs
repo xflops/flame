@@ -41,6 +41,7 @@ use crate::storage::StoragePtr;
 
 mod connections;
 mod executors;
+mod gc;
 mod nodes;
 
 pub use connections::ConnectionManager;
@@ -151,6 +152,7 @@ pub struct Controller {
     storage: StoragePtr,
     connection_manager: ConnectionManager<NodeCallbacks>,
     notifier: NotifyManagerPtr,
+    gc: gc::State,
 }
 
 pub type ControllerPtr = Arc<Controller>;
@@ -159,14 +161,27 @@ pub fn new_ptr(storage: StoragePtr) -> ControllerPtr {
     let callbacks = NodeCallbacks {
         storage: storage.clone(),
     };
+    let gc = gc::State::new(storage.context());
     Arc::new(Controller {
         storage,
         connection_manager: ConnectionManager::new(callbacks),
         notifier: NotifyManager::new_ptr(),
+        gc,
     })
 }
 
 impl Controller {
+    fn remove_session_notifier(&self, expected: &SessionPtr) -> Result<(), FlameError> {
+        let id = { lock_ptr!(expected)?.id.clone() };
+        self.notifier
+            .tasks
+            .remove_if(&id, || match self.storage.get_session_ptr(id.clone()) {
+                Ok(current) => Ok(Arc::ptr_eq(&current, expected)),
+                Err(FlameError::NotFound(_)) => Ok(true),
+                Err(error) => Err(error),
+            })
+    }
+
     const MAX_EXECUTOR_ATTRIBUTES: usize = 1_024;
     const MAX_EXECUTOR_ATTRIBUTE_BYTES: usize = 256;
     const MAX_EXECUTOR_ATTRIBUTES_BYTES: usize = 64 * 1_024;
@@ -502,10 +517,11 @@ impl Controller {
 
     pub async fn close_session(&self, id: SessionID) -> Result<Session, FlameError> {
         trace_fn!("Controller::close_session");
+        let expected = self.storage.get_session_ptr(id.clone())?;
         let session = self.storage.close_session(id.clone()).await?;
         // Dropping the session's broadcast sender lets subscribers drain queued
         // task updates, then receive RecvError::Closed.
-        self.notifier.tasks.remove(&id)?;
+        self.remove_session_notifier(&expected)?;
         Ok(session)
     }
 
@@ -527,6 +543,7 @@ impl Controller {
                 "Session <{id}> cannot be signalled with {signal:?}"
             ))
         )?;
+        let expected = self.storage.get_session_ptr(id.clone())?;
         let current = self.storage.get_session(id.clone())?;
         ensure!(
             current.is_open(),
@@ -538,7 +555,7 @@ impl Controller {
             .await?;
 
         // Wake the executors waiting for tasks so they notice the session left `Open`.
-        self.notifier.tasks.remove(&id)?;
+        self.remove_session_notifier(&expected)?;
         Ok(session)
     }
 
@@ -599,10 +616,35 @@ impl Controller {
         Ok(is_open)
     }
 
+    async fn stale_session(&self, expected: &SessionPtr) -> Result<bool, FlameError> {
+        let id = {
+            let Some(session) = expected.try_lock() else {
+                return Ok(false);
+            };
+            if !session.is_closed() {
+                return Ok(false);
+            }
+            session.id.clone()
+        };
+        let current = match self.storage.get_session_ptr(id.clone()) {
+            Ok(current) => current,
+            Err(FlameError::NotFound(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !Arc::ptr_eq(&current, expected) {
+            return Ok(false);
+        }
+        self.storage.stale_session(expected).await?;
+        Ok(true)
+    }
+
     pub async fn delete_session(&self, id: SessionID) -> Result<Session, FlameError> {
-        let session = self.storage.delete_session(id.clone()).await?;
-        self.notifier.tasks.remove(&id)?;
-        Ok(session)
+        let expected = self.storage.get_session_ptr(id.clone())?;
+        ensure!(
+            lock_ptr!(expected)?.is_closed(),
+            FlameError::InvalidState(format!("session <{id}> is not closed"))
+        )?;
+        self.storage.delete_session(&expected).await
     }
 
     pub async fn list_sessions(

@@ -33,6 +33,9 @@ pub type EnginePtr = Arc<dyn Engine>;
 
 #[async_trait]
 pub trait Engine: Send + Sync + 'static {
+    /// Retire a session from the live namespace.
+    async fn stale_session(&self, id: SessionID) -> Result<(), FlameError>;
+
     // Application operations
     async fn register_application(
         &self,

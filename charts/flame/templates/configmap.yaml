@@ -21,6 +21,8 @@ data:
         {{- end }}
       storage: {{ .Values.cluster.storage | quote }}
       schedule_interval: {{ .Values.cluster.scheduleInterval }}
+      history:
+        retention: {{ .Values.cluster.history.retention | quote }}
       executors:
         shims: {{ .Values.cluster.executors.shims | toJson }}
         devices: {{ .Values.cluster.executors.devices | toJson }}
