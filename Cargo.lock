@@ -1981,7 +1981,6 @@ version = "0.8.0"
 dependencies = [
  "byte-unit",
  "clap",
- "comfy-table",
  "flame-rs",
  "futures",
  "gethostname",

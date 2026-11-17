@@ -14,18 +14,21 @@ limitations under the License.
 mod apis;
 
 use std::error::Error;
+use std::future::Future;
+use std::io::{self, Write};
 use std::time::Instant;
 
 use byte_unit::Byte;
 use clap::Parser;
-use comfy_table::presets::NOTHING;
-use comfy_table::Table;
 use futures::future::try_join_all;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use indicatif::HumanCount;
 use serde_derive::{Deserialize, Serialize};
 
 use crate::apis::{PingRequest, PingResponse};
 
+use flame::apis::FlameError;
 use flame::client::{Session, SessionOptions, TaskResult};
 use flame_rs::{self as flame};
 
@@ -139,8 +142,11 @@ async fn run_output_mode(
     duration: Option<u64>,
     memory: Option<u64>,
 ) -> Result<(), Box<dyn Error>> {
-    let (duration_ms, tasks) = run_tasks(ssn, task_num, duration, memory).await?;
-    print_outputs(tasks)?;
+    let input = PingRequest { duration, memory };
+    let start = Instant::now();
+    let tasks = (0..task_num).map(|_| async { ssn.run::<_, PingResponse>(&input).await?.await });
+    print_outputs(tasks, &ssn.id, task_num, &mut io::stdout()).await?;
+    let duration_ms = start.elapsed().as_millis();
 
     println!(
         "\n\n<{}> tasks was completed in <{} ms>.\n",
@@ -151,29 +157,43 @@ async fn run_output_mode(
     Ok(())
 }
 
-fn print_outputs(tasks: Vec<TaskResult<PingResponse>>) -> Result<(), Box<dyn Error>> {
-    let mut table = Table::new();
+async fn print_outputs<F>(
+    tasks: impl IntoIterator<Item = F>,
+    session_id: &str,
+    task_num: i32,
+    writer: &mut impl Write,
+) -> Result<(), Box<dyn Error>>
+where
+    F: Future<Output = Result<TaskResult<PingResponse>, FlameError>>,
+{
+    let session_width = session_id.len().max("Session".len());
+    let task_width = task_num.max(0).to_string().len().max("Task".len());
+    let state_width = "Cancelled".len();
+    writeln!(
+        writer,
+        " {:<session_width$} {:<task_width$} {:<state_width$} Output",
+        "Session", "Task", "State"
+    )?;
+    writer.flush()?;
 
-    table
-        .load_style(NOTHING)
-        .set_header(vec!["Session", "Task", "State", "Output"]);
-
-    for task in tasks {
+    let mut pending: FuturesUnordered<_> = tasks.into_iter().collect();
+    while let Some(task) = pending.next().await {
+        let task = task?;
         let output = if task.is_succeed() {
             task.output.map(|output| output.message).unwrap_or_default()
         } else {
             format_task_error(&task)
         };
-
-        table.add_row(vec![
+        writeln!(
+            writer,
+            " {:<session_width$} {:<task_width$} {:<state_width$} {}",
             task.session_id,
             task.task_id,
             task.state.to_string(),
-            output,
-        ]);
+            output
+        )?;
+        writer.flush()?;
     }
-
-    println!("{table}");
     Ok(())
 }
 
@@ -203,3 +223,6 @@ fn print_perf_summary(succeeded: u32, task_num: i32, duration_ms: u128) {
     println!("Throughput:      {:.2} tasks/sec", throughput);
     println!("{}\n", "=".repeat(60));
 }
+
+#[cfg(test)]
+mod tests;
