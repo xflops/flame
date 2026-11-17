@@ -855,3 +855,55 @@ def test_flame_context_reads_client_identity(tmp_path, monkeypatch):
     ctx = FlameContext()
     assert (ctx.tls.cert_file, ctx.tls.key_file) == ("cluster-cert", "cluster-key")
     assert (ctx.cache.tls.cert_file, ctx.cache.tls.key_file) == ("cache-cert", "cache-key")
+
+
+def test_close_wakes_pending_synchronous_watch_read(frontend_server):
+    endpoint, _, _ = frontend_server
+    connection = client.connect(endpoint)
+    pool = ThreadPoolExecutor(max_workers=1)
+    watcher = None
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        watcher = session.watch_task("hold")
+        assert next(watcher).state == TaskState.PENDING
+        read_started = threading.Event()
+
+        async def observe_read():
+            original = watcher._iterator.__anext__
+
+            async def read():
+                read_started.set()
+                return await original()
+
+            watcher._iterator.__anext__ = read
+
+        connection._call(observe_read())
+        waiting = pool.submit(next, watcher)
+        assert read_started.wait(1)
+        watcher.close()
+        with pytest.raises(StopIteration):
+            waiting.result(timeout=1)
+    finally:
+        if watcher is not None:
+            watcher.close()
+        connection.close()
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def test_synchronous_submit_reports_remote_task_cancellation(frontend_server, monkeypatch):
+    endpoint, frontend, _ = frontend_server
+    original = frontend._task
+
+    def cancelled_task(task_id="task-1", state=TaskState.SUCCEED):
+        task = original(task_id, TaskState.CANCELLED)
+        task.spec.ClearField("output")
+        return task
+
+    monkeypatch.setattr(frontend, "_task", cancelled_task)
+    connection = client.connect(endpoint)
+    try:
+        session = connection.create_session(SessionAttributes(application="app"))
+        with pytest.raises(FlameError, match="Task was cancelled"):
+            session.submit(b"input").result(timeout=1)
+    finally:
+        connection.close()

@@ -272,6 +272,22 @@ def test_close_idempotent_and_blocks_use(core):
     assert exc.value.code == FlameErrorCode.INVALID_STATE
 
 
+def test_close_can_retry_after_rpc_failure(core):
+    box = Sandbox.create()
+    error = FlameError(FlameErrorCode.INTERNAL, "response lost")
+    with patch.object(core.session, "close", side_effect=[error, None]) as core_close:
+        with pytest.raises(FlameError) as exc:
+            box.close()
+        assert exc.value is error
+        assert box._session is core.session
+        box.close()
+        box.close()
+    assert core_close.call_count == 2
+    with pytest.raises(FlameError) as exc:
+        box.run("ls")
+    assert exc.value.code == FlameErrorCode.INVALID_STATE
+
+
 def test_context_manager_closes(core):
     with Sandbox.create() as box:
         assert box.id == "sandbox-1"

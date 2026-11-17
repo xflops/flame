@@ -1,4 +1,9 @@
 import asyncio
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -303,3 +308,86 @@ class TestObjectKey:
         assert not all_sessions.matches_key("myapp/session/obj1/extra")
         assert not session.matches_key("myapp/session")
         assert not session.matches_key("myapp/session/obj1/extra")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        np.array([1, 2], dtype=np.dtype("i4").newbyteorder("S")),
+        np.array([True, False]),
+        np.array(["alpha", "beta"]),
+        np.array([{"nested": 1}], dtype=object),
+        np.ma.array([1, 2], mask=[False, True]),
+        np.array([1, 2], dtype=np.dtype("i4", metadata={"unit": "meters"})),
+    ],
+    ids=["non-native-endian", "boolean", "strings", "objects", "masked-subclass", "dtype-metadata"],
+)
+def test_numpy_fallback_preserves_values_types_and_metadata(value):
+    wire_type, payload = cache_module._encode_object_data(value)
+    data_type, compression = cache_module._type_and_compression(wire_type)
+    restored = _deserialize_object_data(data_type, cache_module._decompress_data(payload, compression))
+    assert data_type == _TYPE_CLOUDPICKLE
+    assert type(restored) is type(value)
+    assert restored.dtype == value.dtype
+    assert restored.dtype.metadata == value.dtype.metadata
+    np.testing.assert_array_equal(restored, value)
+    if isinstance(value, np.ma.MaskedArray):
+        np.testing.assert_array_equal(restored.mask, value.mask)
+
+
+def _run_isolated_cache_probe(code):
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    script = f"import sys\nsys.path.insert(0, {src!r})\n" + textwrap.dedent(code)
+    return subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True, check=True, timeout=15)
+
+
+def test_nested_sync_deserializers_do_not_occupy_the_transport_executor():
+    _run_isolated_cache_probe("""
+        import asyncio
+        import concurrent.futures
+        import threading
+        from flamepy.core import cache
+        from flamepy.core.aio import cache as aio
+        async def unchanged(*args): return None
+        aio._fetch_object_data = unchanged
+        bridge = cache._get_aio_bridge()
+        async def capacity():
+            await asyncio.to_thread(lambda: None)
+            return asyncio.get_running_loop()._default_executor._max_workers
+        count = bridge.call(capacity())
+        refs = [cache.ObjectRef('grpc://cache:1', 'app/session/' + name, 1) for name in ('outer', 'inner')]
+        for ref in refs:
+            cache._cache_append_parts((ref.endpoint, ref.key), cache.FetchResult(1, ['value'], uuid='object'))
+        ready = threading.Barrier(count)
+        def deserialize(parts):
+            ready.wait(timeout=5)
+            return cache.get_object(refs[1])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=count) as callers:
+            futures = [callers.submit(cache.get_object, refs[0], deserialize) for _ in range(count)]
+            assert [future.result(timeout=5) for future in futures] == ['value'] * count
+        cache._close_aio_bridge()
+    """)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is unavailable")
+def test_fork_resets_all_cache_locks_and_inherited_state():
+    _run_isolated_cache_probe("""
+        import os
+        import signal
+        from flamepy.core import cache
+        cache._cache_append_parts(('endpoint', 'key'), cache.FetchResult(1, ['value'], uuid='object'))
+        cache._context_cache = object()
+        with cache._cache_lock, cache._context_cache_lock, cache._aio_bridge_lock:
+            child = os.fork()
+            if child == 0:
+                signal.alarm(3)
+                assert cache._cache_get(('endpoint', 'key')) is None
+                assert not cache._cache_tokens
+                assert cache._context_cache is None
+                assert cache._context_cache_lock.acquire(blocking=False)
+                assert cache._aio_bridge_lock.acquire(blocking=False)
+                os._exit(0)
+            _, status = os.waitpid(child, 0)
+        assert status == 0, status
+        assert cache._cache_get(('endpoint', 'key')).data == ['value']
+    """)

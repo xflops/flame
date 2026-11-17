@@ -138,7 +138,7 @@ def test_runtime_reuses_existing_application_with_noop_owner(monkeypatch):
     monkeypatch.setattr("flamepy.app.client.FlameContext", lambda: context)
     monkeypatch.setattr(
         "flamepy.app.client.core_client.get_application",
-        MagicMock(return_value=SimpleNamespace(state=ApplicationState.ENABLED, labels=["external"], url=None)),
+        MagicMock(return_value=SimpleNamespace(state=ApplicationState.ENABLED, labels=["external"], url=None, environments={"FLAME_PYTHON_VERSION": f"{sys.version_info.major}.{sys.version_info.minor}"})),
     )
     monkeypatch.setattr(
         "flamepy.app.client.core_client.register_application",
@@ -210,11 +210,11 @@ def test_registration_race_cleans_only_attempt_package(monkeypatch, tmp_path):
     monkeypatch.setattr("flamepy.app.client.FlameContext", lambda: context)
     monkeypatch.setattr(
         "flamepy.app.client.core_client.get_application",
-        MagicMock(side_effect=[None, template]),
+        MagicMock(side_effect=[None, template, SimpleNamespace(url="file://winner.tar.gz")]),
     )
     monkeypatch.setattr(
         "flamepy.app.client.core_client.register_application",
-        MagicMock(side_effect=FlameError(FlameErrorCode.INTERNAL, "application already exists")),
+        MagicMock(side_effect=FlameError(FlameErrorCode.ALREADY_EXISTS, "application already exists")),
     )
     monkeypatch.setattr("flamepy.app.client.create_storage_backend", lambda *args, **kwargs: storage)
     monkeypatch.setattr(Runtime, "_create_package", lambda self: str(losing_package))
@@ -2745,6 +2745,8 @@ def test_unregister_failure_preserves_cache_and_package_artifacts(monkeypatch):
     """Artifacts remain available while the application is still registered."""
     runtime = object.__new__(Runtime)
     runtime._name = "unregister-failure-app"
+    runtime._package_url = "grpc://cache/package"
+    monkeypatch.setattr(app_client.core_client, "get_application", lambda _: SimpleNamespace(url=runtime._package_url, state=ApplicationState.ENABLED))
     runtime._cleanup_package_artifacts = MagicMock()
     monkeypatch.setattr(
         "flamepy.app.client.core_client.unregister_application",
@@ -2761,6 +2763,9 @@ def test_unregister_leaves_registered_package_cleanup_to_object_cache(monkeypatc
     """Successful teardown does not delete the remotely registered package."""
     runtime = object.__new__(Runtime)
     runtime._name = "draining-app"
+    runtime._package_url = "grpc://cache/package"
+    runtime._storage_backend = CacheStorage("grpc://cache:9090", app_name="draining-app")
+    monkeypatch.setattr(app_client.core_client, "get_application", lambda _: SimpleNamespace(url=runtime._package_url, state=ApplicationState.ENABLED))
     runtime._cleanup_local_package = MagicMock()
     runtime._cleanup_storage = MagicMock()
     unregister = MagicMock()
@@ -2846,8 +2851,10 @@ def test_executor_environments_default_to_the_client_python_version():
 
     assert _executor_environments(None, None) == {"FLAME_PYTHON_VERSION": client}
     assert _executor_environments({"A": "1"}, None) == {"A": "1", "FLAME_PYTHON_VERSION": client}
-    assert _executor_environments({"FLAME_PYTHON_VERSION": "3.12"}, None) == {"FLAME_PYTHON_VERSION": "3.12"}
-    assert _executor_environments({"FLAME_PYTHON_VERSION": "3.12"}, "3.13") == {"FLAME_PYTHON_VERSION": "3.13"}
+    other = "3.11" if client != "3.11" else "3.12"
+    with pytest.raises(FlameError, match="same Python minor"):
+        _executor_environments({"FLAME_PYTHON_VERSION": other}, None)
+    assert _executor_environments({"FLAME_PYTHON_VERSION": other}, client) == {"FLAME_PYTHON_VERSION": client}
 
 
 def test_cache_storage_cleanup_does_not_delete_remote_packages():

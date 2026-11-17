@@ -78,6 +78,7 @@ class FlameInstanceServicer(InstanceServicer):
         self._binding_lock = asyncio.Lock()
         self._active_tasks = 0
         self._hook_calls: set[asyncio.Task] = set()
+        self._task_calls: set[asyncio.Task] = set()
 
     async def close(self):
         if self._hook_calls:
@@ -123,7 +124,14 @@ class FlameInstanceServicer(InstanceServicer):
     async def _binding_hook(self, name, *args):
         # Once a hook starts, RPC cancellation cannot interrupt it safely: a
         # worker thread (or user coroutine) may still mutate the binding.
-        work = asyncio.create_task(self._hook(name, *args))
+        async def drain_and_call():
+            # The caller owns _binding_lock, so no new invocation can enter
+            # while old hooks drain or the retained service changes bindings.
+            if self._task_calls:
+                await asyncio.gather(*(asyncio.shield(work) for work in tuple(self._task_calls)), return_exceptions=True)
+            return await self._hook(name, *args)
+
+        work = asyncio.create_task(drain_and_call())
         self._hook_calls.add(work)
         work.add_done_callback(self._hook_calls.discard)
         try:
@@ -134,6 +142,8 @@ class FlameInstanceServicer(InstanceServicer):
                     await asyncio.shield(work)
                 except asyncio.CancelledError:
                     pass
+                except Exception:
+                    break
             if not work.cancelled():
                 work.exception()  # Consume a hook failure after the caller has gone.
             raise
@@ -186,18 +196,21 @@ class FlameInstanceServicer(InstanceServicer):
             session_id=request.session_id,
             input=request.input if request.HasField("input") else None,
         )
-        if self._active_tasks >= self._max_inflight:
-            return OnTaskInvokeResponse(task_result=TaskResultProto(return_code=-1, message="too many concurrent task invocations"))
-        self._active_tasks += 1
-        coroutine = self._invoke_task(task_context)
-        try:
-            work = asyncio.create_task(coroutine)
-        except Exception:
-            coroutine.close()
-            self._active_tasks -= 1
-            raise
-        self._hook_calls.add(work)
-        work.add_done_callback(self._hook_calls.discard)
+        async with self._binding_lock:
+            if self._active_tasks >= self._max_inflight:
+                return OnTaskInvokeResponse(task_result=TaskResultProto(return_code=-1, message="too many concurrent task invocations"))
+            self._active_tasks += 1
+            coroutine = self._invoke_task(task_context)
+            try:
+                work = asyncio.create_task(coroutine)
+            except Exception:
+                coroutine.close()
+                self._active_tasks -= 1
+                raise
+            self._task_calls.add(work)
+            work.add_done_callback(self._task_calls.discard)
+            self._hook_calls.add(work)
+            work.add_done_callback(self._hook_calls.discard)
         return await asyncio.shield(work)
 
     async def _invoke_task(self, task_context: TaskContext):

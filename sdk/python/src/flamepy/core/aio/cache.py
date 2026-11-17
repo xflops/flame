@@ -258,6 +258,12 @@ async def get_object(ref: Ref, deserializer: Optional[Deserializer] = None) -> A
         return ref.value if deserializer is None else await asyncio.to_thread(deserializer, [ref.value])
     if not isinstance(ref, ObjectRef):
         raise TypeError(f"Expected ValueRef or ObjectRef, got {type(ref).__name__}")
+    obj = await _get_cached_object(ref)
+    return await asyncio.to_thread(common._materialize_object, obj, deserializer)
+
+
+async def _get_cached_object(ref: ObjectRef) -> common.Object:
+    """Fetch verified parts separately from executing user deserializers."""
     ObjectKey.from_key(ref.key)
     cache_key = (ref.endpoint, ref.key)
     if ref.version == 0:
@@ -283,10 +289,10 @@ async def get_object(ref: Ref, deserializer: Optional[Deserializer] = None) -> A
                 raise ValueError(f"Object not found: {ref.key}")
             if not common._cache_snapshot_matches(cache_key, cached, token):
                 continue
-            return await asyncio.to_thread(common._materialize_object, cached, deserializer)
+            return cached
         published = common._cache_append_parts(cache_key, result, cached_version, expected=cached, token=token)
         if published is not None:
-            return await asyncio.to_thread(common._materialize_object, published, deserializer)
+            return published
 
 
 async def patch_object(ref: ObjectRef, data: Any) -> ObjectRef:
@@ -327,10 +333,11 @@ async def _upload_file(key: str, file_path: str, endpoint: Optional[str], source
 
 async def _download_file(ref: ObjectRef, dest_path: str) -> None:
     ObjectKey.from_key(ref.key)
+    dest_path = os.path.abspath(dest_path)
     client = _get_client(ref.endpoint, common._get_cache_tls_config())
     dest_dir = os.path.dirname(dest_path)
-    if dest_dir:
-        await asyncio.to_thread(os.makedirs, dest_dir, exist_ok=True)
+    await asyncio.to_thread(os.makedirs, dest_dir, exist_ok=True)
+    temporary_path = None
     try:
         responses = client.Get(cache_pb2.CacheGetRequest(key=ref.key, mode=cache_pb2.OBJECT)).__aiter__()
         try:
@@ -341,39 +348,51 @@ async def _download_file(ref: ObjectRef, dest_path: str) -> None:
             raise ValueError("Cache Get must start with a header")
         if not first.header.HasField("metadata") or first.header.metadata.version != 1 or not first.header.metadata.uuid:
             raise ValueError("expected raw data of the first version only")
-        data_type, compression = common._type_and_compression(first.header.metadata.data_type)
+        metadata = first.header.metadata
+        if metadata.key != ref.key:
+            raise ValueError("Cache Get returned metadata for a different key")
+        data_type, compression = common._type_and_compression(metadata.data_type)
+        if data_type != common._TYPE_RAW:
+            raise ValueError("expected raw data of the first version only")
         saw_base = False
-        with open(dest_path, "wb") as output:
-            if compression == common._COMPRESSION_NONE:
+        received = 0
+        with tempfile.NamedTemporaryFile(mode="wb", dir=dest_dir, prefix=".flame-download-", delete=False) as output:
+            temporary_path = output.name
+            with contextlib.ExitStack() as stack:
+                encoded = output if compression == common._COMPRESSION_NONE else stack.enter_context(tempfile.TemporaryFile())
                 async for response in responses:
-                    if response.WhichOneof("payload") != "chunk" or response.chunk.part != 0 or data_type != common._TYPE_RAW:
+                    if response.WhichOneof("payload") != "chunk" or response.chunk.part != 0:
                         raise ValueError("expected raw data of the first version only")
                     saw_base = True
-                    await asyncio.to_thread(output.write, response.chunk.data)
-            else:
-                with tempfile.TemporaryFile() as compressed:
-                    async for response in responses:
-                        if response.WhichOneof("payload") != "chunk" or response.chunk.part != 0 or data_type != common._TYPE_RAW:
-                            raise ValueError("expected raw data of the first version only")
-                        saw_base = True
-                        await asyncio.to_thread(compressed.write, response.chunk.data)
+                    received += len(response.chunk.data)
+                    if received > metadata.size:
+                        raise ValueError("Cache Get payload exceeds its declared size")
+                    await asyncio.to_thread(encoded.write, response.chunk.data)
+                if not saw_base:
+                    raise ValueError("Cache Get response omitted the object data")
+                if received != metadata.size:
+                    raise ValueError("Cache Get payload does not match its declared size")
+                if compression != common._COMPRESSION_NONE:
 
                     def decompress_file():
                         pa = common._pyarrow()
-                        compressed.seek(0)
-                        with pa.CompressedInputStream(pa.input_stream(compressed), common._COMPRESSION_ZSTD) as stream:
+                        encoded.seek(0)
+                        with pa.CompressedInputStream(pa.input_stream(encoded), common._COMPRESSION_ZSTD) as stream:
                             while data := stream.read(common._UPLOAD_CHUNK_SIZE):
                                 output.write(data)
 
                     await asyncio.to_thread(decompress_file)
-        if not saw_base:
-            raise ValueError("Cache Get response omitted the object data")
-    except BaseException as exc:
-        if os.path.exists(dest_path):
-            await asyncio.to_thread(os.remove, dest_path)
-        if not isinstance(exc, Exception):
-            raise
+        # No await between publication and completion: cancellation cannot leave
+        # a background rename replacing the destination after the call failed.
+        os.replace(temporary_path, dest_path)
+    except Exception as exc:
         raise ValueError(f"Failed to download file from cache server: {exc}") from exc
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
 
 
 def _package_key(app_name: str, filename: str) -> str:

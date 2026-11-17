@@ -124,7 +124,8 @@ class FileStorage(StorageBackend):
                 os.remove(dest_path)
                 logger.debug(f"Removed package from storage: {dest_path}")
             except Exception as e:
-                logger.error(f"Error removing package from storage: {e}", exc_info=True)
+                if not isinstance(e, FileNotFoundError):
+                    raise FlameError(FlameErrorCode.INTERNAL, f"Failed to remove package from storage: {e}") from e
 
     def download(self, filename: str, local_path: str) -> None:
         """Download a package file from local filesystem storage.
@@ -223,9 +224,9 @@ class HttpStorage(StorageBackend):
             if response.status_code in (200, 204, 404):
                 logger.debug(f"Removed package from storage: {delete_url}")
             else:
-                logger.warning(f"Failed to delete package from {delete_url}: HTTP {response.status_code}")
+                raise FlameError(FlameErrorCode.INTERNAL, f"Failed to delete package from {delete_url}: HTTP {response.status_code}")
         except requests.exceptions.RequestException as e:
-            logger.warning(f"Error deleting package from HTTP storage: {e}")
+            raise FlameError(FlameErrorCode.INTERNAL, f"Failed to delete package from HTTP storage: {e}") from e
 
     def download(self, filename: str, local_path: str) -> None:
         """Download a package file from HTTP storage.
@@ -304,7 +305,8 @@ class CacheStorage(StorageBackend):
             self._host = parsed.hostname or "localhost"
             self._port = parsed.port or 9090
 
-        self._endpoint = f"{self._scheme}://{self._host}:{self._port}"
+        host = f"[{self._host}]" if ":" in self._host else self._host
+        self._endpoint = f"{self._scheme}://{host}:{self._port}"
 
     def upload(self, local_path: str, filename: str) -> str:
         from flamepy.core.cache import upload_package
