@@ -286,19 +286,22 @@ def test_open_restores_options():
     assert agent_session.attr.min_instances == 1
 
 
-def test_open_by_id_passes_creation_options_as_spec():
-    spec = {}
+def test_open_missing_id_passes_creation_options_only_after_not_found():
+    calls = []
 
     def fake_open(session_id, attrs=None):
-        spec["id"], spec["attrs"] = session_id, attrs
+        calls.append((session_id, attrs))
+        if attrs is None:
+            raise FlameError(FlameErrorCode.NOT_FOUND, "session not found")
         return FakeSession(session_id=session_id, common_data=attrs.common_data)
 
     resreq = ResourceRequirement(cpu=1)
     with patch("flamepy.agent.session._open_core_session", fake_open):
         agent_session = open_session(ssn_id="named", image="img", min_instances=1, max_instances=2, resreq=resreq)
 
-    attrs = spec["attrs"]
-    assert spec["id"] == "named"
+    assert calls[0] == ("named", None)
+    session_id, attrs = calls[1]
+    assert session_id == "named"
     assert attrs.id == "named"
     assert attrs.application == "flmbox"
     assert attrs.min_instances == 1
@@ -310,12 +313,24 @@ def test_open_by_id_passes_creation_options_as_spec():
 
 
 def test_open_existing_session_keeps_its_own_options():
-    existing = FakeSession(common_data=_encode_options(_SessionOptions(image="img")))
+    options = _SessionOptions(image="img", min_instances=2, max_instances=3, resreq=ResourceRequirement(cpu=4))
+    existing = FakeSession(common_data=_encode_options(options))
 
-    with patch("flamepy.agent.session._open_core_session", return_value=existing):
+    with patch("flamepy.agent.session._open_core_session", return_value=existing) as core_open:
         agent_session = open_session(ssn_id="ssn-1", image="ignored")
 
-    assert agent_session.attr.image == "img"
+    core_open.assert_called_once_with("ssn-1")
+    assert agent_session.attr == options
+
+
+@pytest.mark.parametrize("code", [FlameErrorCode.INTERNAL, FlameErrorCode.INVALID_STATE, FlameErrorCode.INVALID_CONFIG])
+def test_open_does_not_try_creation_after_other_errors(code):
+    error = FlameError(code, "cannot open session")
+    with patch("flamepy.agent.session._open_core_session", side_effect=error) as core_open:
+        with pytest.raises(FlameError) as exc:
+            open_session(ssn_id="named")
+    assert exc.value is error
+    core_open.assert_called_once_with("named")
 
 
 def test_open_rejects_non_flmbox_session():
@@ -353,6 +368,23 @@ def test_close_destroys_session_and_is_idempotent():
     assert core_session.closed is True
     with pytest.raises(FlameError) as exc:
         agent_session.run_code("print(1)")
+    assert exc.value.code == FlameErrorCode.INVALID_STATE
+
+
+def test_close_can_retry_after_rpc_failure():
+    core_session = FakeSession()
+    agent_session = Session(core_session, _SessionOptions())
+    error = FlameError(FlameErrorCode.INTERNAL, "response lost")
+    with patch.object(core_session, "close", side_effect=[error, None]) as core_close:
+        with pytest.raises(FlameError) as exc:
+            agent_session.close()
+        assert exc.value is error
+        assert agent_session.id == core_session.id
+        agent_session.close()
+        agent_session.close()
+    assert core_close.call_count == 2
+    with pytest.raises(FlameError) as exc:
+        agent_session.run_code("echo done")
     assert exc.value.code == FlameErrorCode.INVALID_STATE
 
 

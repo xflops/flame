@@ -186,10 +186,12 @@ def test_task_limit_keeps_session_control_available():
             assert "too many concurrent" in excess.task_result.message
             leave = asyncio.create_task(servicer.OnSessionLeave(types_pb2.EmptyRequest(), None))
             await asyncio.sleep(0)
-            assert (await leave).return_code == 0
+            assert not leave.done()
             release.set()
             assert (await first).task_result.output == b"done"
+            assert (await leave).return_code == 0
         finally:
+            release.set()
             await servicer.close()
 
     asyncio.run(exercise())
@@ -462,5 +464,177 @@ def test_aio_app_worker_isolates_invocation_attributes(monkeypatch):
             return set(service._take_attributes().publish)
 
         assert await asyncio.gather(invoke(1), invoke(2)) == [{b"1"}, {b"2"}]
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("threaded", [False, True])
+@pytest.mark.parametrize("transition", ["leave", "cancelled_leave", "enter", "destroy"])
+def test_binding_changes_drain_cancelled_invocations(threaded, transition):
+    async def exercise():
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        async_release = asyncio.Event()
+        thread_release = threading.Event()
+        observations = []
+
+        class SyncService(aio_service.SyncFlameService):
+            def on_instance_create(self):
+                observations.append("create")
+
+            def on_session_enter(self, context):
+                self.binding = context.session_id
+                observations.append(f"enter:{self.binding}")
+
+            def on_task_invoke(self, context):
+                loop.call_soon_threadsafe(started.set)
+                if not thread_release.wait(3):
+                    raise TimeoutError("test invocation was not released")
+                observations.append(f"task:{self.binding}")
+                return b"done"
+
+            def on_session_leave(self):
+                observations.append("leave")
+                self.binding = None
+
+            def on_instance_destroy(self):
+                observations.append("destroy")
+                self.binding = None
+
+        class AsyncService(aio_service.FlameService):
+            async def on_instance_create(self):
+                observations.append("create")
+
+            async def on_session_enter(self, context):
+                self.binding = context.session_id
+                observations.append(f"enter:{self.binding}")
+
+            async def on_task_invoke(self, context):
+                started.set()
+                await async_release.wait()
+                observations.append(f"task:{self.binding}")
+                return b"done"
+
+            async def on_session_leave(self):
+                observations.append("leave")
+                self.binding = None
+
+            async def on_instance_destroy(self):
+                observations.append("destroy")
+                self.binding = None
+
+        service = SyncService() if threaded else AsyncService()
+        servicer = aio_service.FlameInstanceServicer(service)
+
+        def enter(session_id):
+            return servicer.OnSessionEnter(shim_pb2.SessionContext(session_id=session_id, application=shim_pb2.ApplicationContext(name="app")), None)
+
+        try:
+            await servicer.OnInstanceCreate(types_pb2.EmptyRequest(), None)
+            await enter("first")
+            invoking = asyncio.create_task(servicer.OnTaskInvoke(shim_pb2.TaskContext(task_id="task", session_id="first"), None))
+            await asyncio.wait_for(started.wait(), 1)
+            invoking.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await invoking
+            if transition in ("leave", "cancelled_leave"):
+                changing = asyncio.create_task(servicer.OnSessionLeave(types_pb2.EmptyRequest(), None))
+            elif transition == "enter":
+                changing = asyncio.create_task(enter("second"))
+            else:
+                changing = asyncio.create_task(servicer.OnInstanceDestroy(types_pb2.EmptyRequest(), None))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert not changing.done()
+            assert observations == ["create", "enter:first"]
+            if transition == "cancelled_leave":
+                changing.cancel()
+                await asyncio.sleep(0)
+                assert not changing.done()
+                rebound = asyncio.create_task(enter("second"))
+                await asyncio.sleep(0)
+                assert not rebound.done()
+            async_release.set()
+            thread_release.set()
+            if transition == "cancelled_leave":
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(changing, 1)
+                assert (await asyncio.wait_for(rebound, 1)).result.return_code == 0
+                assert observations == ["create", "enter:first", "task:first", "leave", "enter:second"]
+            else:
+                response = await asyncio.wait_for(changing, 1)
+                assert (response.result if transition == "enter" else response).return_code == 0
+                expected = {"leave": "leave", "enter": "enter:second", "destroy": "destroy"}[transition]
+                assert observations == ["create", "enter:first", "task:first", expected]
+            assert servicer._service is service
+            assert observations.count("create") == 1
+        finally:
+            async_release.set()
+            thread_release.set()
+            await servicer.close()
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_binding_preserves_cancellation_when_hook_fails():
+    async def exercise():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class Service(aio_service.FlameService):
+            async def on_session_enter(self, context):
+                started.set()
+                await release.wait()
+                raise ValueError("binding failed after caller cancelled")
+
+        servicer = aio_service.FlameInstanceServicer(Service())
+        try:
+            enter = asyncio.create_task(servicer.OnSessionEnter(shim_pb2.SessionContext(session_id="session", application=shim_pb2.ApplicationContext(name="app")), None))
+            await started.wait()
+            enter.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(enter, 1)
+        finally:
+            release.set()
+            await servicer.close()
+
+    asyncio.run(exercise())
+
+
+def test_task_admission_waits_for_cancelled_session_enter_to_finish():
+    async def exercise():
+        started = asyncio.Event()
+        release = asyncio.Event()
+        invoked = asyncio.Event()
+
+        class Service(aio_service.FlameService):
+            async def on_session_enter(self, context):
+                started.set()
+                await release.wait()
+                self.binding = context.session_id
+
+            async def on_task_invoke(self, context):
+                invoked.set()
+                assert self.binding == context.session_id
+                return b"done"
+
+        servicer = aio_service.FlameInstanceServicer(Service())
+        try:
+            enter = asyncio.create_task(servicer.OnSessionEnter(shim_pb2.SessionContext(session_id="session", application=shim_pb2.ApplicationContext(name="app")), None))
+            await started.wait()
+            enter.cancel()
+            invoke = asyncio.create_task(servicer.OnTaskInvoke(shim_pb2.TaskContext(task_id="task", session_id="session"), None))
+            await asyncio.sleep(0)
+            assert not invoked.is_set()
+            assert not enter.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(enter, 1)
+            assert (await asyncio.wait_for(invoke, 1)).task_result.output == b"done"
+        finally:
+            release.set()
+            await servicer.close()
 
     asyncio.run(exercise())

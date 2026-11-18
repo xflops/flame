@@ -441,9 +441,14 @@ runtime handle. Calling it again with the same name returns that handle. Set
 disabled existing application is never reused and always produces an error.
 `dependencies` is used only to generate a `pyproject.toml` when the packaged
 project has no Python package metadata; otherwise, declare dependencies in the
-project's existing metadata. `python_version` selects the executor Python
-version; when omitted, the template's `FLAME_PYTHON_VERSION` applies, else the executor runs the
-client's Python version, which a pickled task payload needs. `app.service()` is the canonical
+project's existing metadata. PEP 508 dependency markers are supported in generated
+metadata. `python_version` selects the executor Python minor version; when
+omitted, the template's `FLAME_PYTHON_VERSION` applies, or the client's version
+when the template does not specify one. App code requires matching client and
+executor Python minor versions. An incompatible selection is rejected; run the
+client with the selected interpreter or explicitly select the client's version.
+Reused registrations must declare a matching `FLAME_PYTHON_VERSION`; initialization
+verifies that setting without changing a borrowed application. `app.service()` is the canonical
 decorator and must run after initialization. Decorated functions and classes
 run locally when called directly. `fn.remote(*args, **kwargs)` submits a remote
 function call on a shared session and returns an `ObjectFuture`. Use
@@ -523,6 +528,21 @@ module-level state naturally follows Python module lifetime. Service affinity
 keys may therefore identify data held directly by the retained object. This
 executor-local state is volatile: it is not persisted or migrated and is
 discarded when the executor process exits.
+
+`app.destroy()` closes owned sessions and unregisters an application created by
+that runtime. Borrowed registrations are preserved. Object-cache packages are
+reclaimed by the cache collector. For external `file://` or HTTP package storage,
+shutdown waits up to 30 seconds for the owned registration to disappear before
+deleting its archive. An unavailable control plane, delayed retirement, or failed
+external deletion leaves shutdown retryable; call `destroy()` or the runtime's
+`close()` again. Before unregistering on retry, the SDK checks that the registration still
+references its package URL; an observed replacement registration is preserved.
+
+If registration returns an uncertain result, the SDK recovers a matching committed
+registration when possible. It preserves the uploaded archive when the original
+request might still commit, including after an empty lookup. An unresolved attempt
+can therefore leave an archive for operator reconciliation; it is never deleted
+while its registration outcome remains uncertain.
 
 To verify a configured cluster end to end with App, run:
 

@@ -238,11 +238,10 @@ class Sandbox:
     def close(self) -> None:
         if self._closed:
             return
+        if self._session is not None:
+            self._session.close()
         self._closed = True
-        session = self._session
         self._session = None
-        if session is not None:
-            session.close()
 
     def _wait_for(self, target: SessionState, timeout: float) -> None:
         deadline = time.monotonic() + timeout

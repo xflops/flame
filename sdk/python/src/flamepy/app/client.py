@@ -14,11 +14,13 @@ limitations under the License.
 import asyncio
 import inspect
 import io
+import json
 import logging
 import os
 import sys
 import tarfile
 import threading
+import time
 import uuid
 import weakref
 from concurrent.futures import Future, as_completed
@@ -57,6 +59,8 @@ logger = logging.getLogger(__name__)
 
 _cloudpickle_registry_lock = threading.Lock()
 _MAX_CONCURRENT_RESULT_FETCHES = 16
+_APPLICATION_RETIREMENT_TIMEOUT = 30.0
+_APPLICATION_RETIREMENT_POLL = 0.1
 
 
 async def _await_task_result(source: Future) -> Any:
@@ -118,17 +122,22 @@ def _validate_service_class(execution_class: type) -> None:
         raise TypeError(f"service class methods conflict with ServiceInstance API: {names}")
 
 
-def _executor_environments(template_environments, python_version: Optional[str]) -> dict:
-    """Environment of the registered application.
+def _validate_python_version(version: Optional[str]) -> str:
+    client = f"{sys.version_info.major}.{sys.version_info.minor}"
+    selected = client if version is None else version
+    if selected != client:
+        raise FlameError(
+            FlameErrorCode.INVALID_CONFIG,
+            f"App code requires the same Python minor version on client and executor: client={client}, executor={selected!r}. Run the client with Python {selected} or select {client} for the executor.",
+        )
+    return client
 
-    A task payload pickled by this client only loads under the same Python minor version, so the
-    executor runs the client's version unless the caller or the application template names one.
-    """
+
+def _executor_environments(template_environments, python_version: Optional[str]) -> dict:
+    """Select and validate the interpreter before sending cloudpickled code."""
     environments = dict(template_environments) if template_environments else {}
-    if python_version:
-        environments["FLAME_PYTHON_VERSION"] = python_version
-    else:
-        environments.setdefault("FLAME_PYTHON_VERSION", f"{sys.version_info.major}.{sys.version_info.minor}")
+    selected = python_version if python_version is not None else environments.get("FLAME_PYTHON_VERSION")
+    environments["FLAME_PYTHON_VERSION"] = _validate_python_version(selected)
     return environments
 
 
@@ -790,6 +799,8 @@ class _Runtime:
         self._fail_if_exists = fail_if_exists
         self._dependencies = dependencies
         self._python_version = python_version
+        _validate_python_version(python_version)
+        self._package_url: Optional[str] = None
 
         logger.debug(f"Initialized app runtime '{name}' (fail_if_exists={fail_if_exists}, dependencies={dependencies}, python_version={python_version})")
 
@@ -832,6 +843,11 @@ class _Runtime:
                         FlameErrorCode.ALREADY_EXISTS,
                         f"Application '{self._name}' already exists. Set fail_if_exists=False to skip registration.",
                     )
+                environments = getattr(application, "environments", None) or {}
+                selected = environments.get("FLAME_PYTHON_VERSION")
+                if not selected:
+                    raise FlameError(FlameErrorCode.INVALID_CONFIG, f"Cannot verify Python version of existing application '{self._name}'; configure FLAME_PYTHON_VERSION on its registration")
+                _validate_python_version(selected)
                 logger.debug(f"Application '{self._name}' already exists, reusing registration")
                 self._application_owner = _NoopApplicationOwner()
             else:
@@ -856,6 +872,7 @@ class _Runtime:
 
         # Step 2: Upload the package to storage
         storage_url = self._upload_package()
+        self._package_url = storage_url
         logger.debug(f"Uploaded package to: {storage_url}")
 
         # Step 3: Retrieve the application template
@@ -870,6 +887,7 @@ class _Runtime:
             raise FlameError(FlameErrorCode.INTERNAL, f"Failed to get application template '{template_name}': {str(e)}")
 
         # Register the new application
+        registration_attempted = False
         try:
             working_directory = None
             if template_app.working_directory is not None and template_app.working_directory != "":
@@ -895,14 +913,41 @@ class _Runtime:
                 installer=template_app.installer,
             )
 
+            registration_attempted = True
             core_client.register_application(self._name, app_attrs)
             logger.debug(f"Registered application '{self._name}' with working directory: {working_directory}")
-        except FlameError:
-            self._cleanup_package_artifacts()
-            raise
-        except Exception as e:
-            self._cleanup_package_artifacts()
-            raise FlameError(FlameErrorCode.INTERNAL, f"Failed to register application: {str(e)}")
+        except Exception as error:
+            if not registration_attempted:
+                self._cleanup_package_artifacts()
+                if isinstance(error, FlameError):
+                    raise
+                raise FlameError(FlameErrorCode.INTERNAL, f"Failed to register application: {error}") from error
+            # A failed response does not establish whether registration committed.
+            # A negative lookup cannot exclude a request that is still committing.
+            definite_rejection = isinstance(error, FlameError) and error.code in {
+                FlameErrorCode.ALREADY_EXISTS,
+                FlameErrorCode.INVALID_ARGUMENT,
+            }
+            try:
+                current = core_client.get_application(self._name)
+            except Exception:
+                logger.warning("Registration outcome is uncertain; preserving uploaded package %s", storage_url)
+                self._cleanup_local_package()
+            else:
+                if current is not None and current.url == storage_url:
+                    if current.state == ApplicationState.ENABLED:
+                        logger.info("Recovered committed registration for '%s'", self._name)
+                        return
+                    logger.warning("Registration still references package %s; preserving it", storage_url)
+                    self._cleanup_local_package()
+                elif definite_rejection:
+                    self._cleanup_package_artifacts()
+                else:
+                    logger.warning("Registration may still commit; preserving uploaded package %s", storage_url)
+                    self._cleanup_local_package()
+            if isinstance(error, FlameError):
+                raise
+            raise FlameError(FlameErrorCode.INTERNAL, f"Failed to register application: {error}") from error
 
     def __enter__(self) -> "_Runtime":
         """Enter the context manager and set up the application environment.
@@ -970,11 +1015,29 @@ class _Runtime:
             self._state = _RuntimeState.INACTIVE
 
     def _unregister_application(self) -> None:
-        """Release the registration owned by this runtime."""
-        logger.debug(f"Closing app runtime '{self._name}'")
+        """Retire only our registration, then reclaim supported external packages."""
+        current = core_client.get_application(self._name)
+        owned_url = self._package_url
+        owns_registration = current is not None and current.url == owned_url
+        if owns_registration and current.state != ApplicationState.DISABLED:
+            try:
+                core_client.unregister_application(self._name)
+            except FlameError as error:
+                if error.code != FlameErrorCode.NOT_FOUND:
+                    raise
 
-        core_client.unregister_application(self._name)
-        logger.debug(f"Unregistered application '{self._name}'")
+        # FOC owns its package GC. External URLs have no server-side collector;
+        # wait until the old registration is actually gone before unlinking them.
+        if callable(getattr(self._storage_backend, "delete", None)):
+            deadline = time.monotonic() + _APPLICATION_RETIREMENT_TIMEOUT
+            while current is not None and current.url == owned_url:
+                current = core_client.get_application(self._name)
+                if current is None or current.url != owned_url:
+                    break
+                if time.monotonic() >= deadline:
+                    raise FlameError(FlameErrorCode.INVALID_STATE, f"Application '{self._name}' is still retiring; package preserved. Retry close() or destroy() after its sessions and executors finish.")
+                time.sleep(_APPLICATION_RETIREMENT_POLL)
+            self._cleanup_storage(strict=True)
         self._cleanup_local_package()
 
     def service(
@@ -1262,23 +1325,23 @@ class _Runtime:
 
         deps = sorted(self._dependencies or [])
         if deps:
-            deps_block = "dependencies = [\n    " + ",\n    ".join(f'"{dep}"' for dep in deps) + ",\n]"
+            deps_block = "dependencies = [\n    " + ",\n    ".join(json.dumps(dep, ensure_ascii=False) for dep in deps) + ",\n]"
         else:
             deps_block = "dependencies = []"
 
-        content = f'''[build-system]
+        content = f"""[build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "{self._name}"
+name = {json.dumps(self._name, ensure_ascii=False)}
 version = "0.1.0"
 requires-python = ">=3.9"
 {deps_block}
 
 [tool.setuptools]
 py-modules = []
-'''
+"""
 
         logger.info(f"Generated package pyproject.toml with dependencies: {deps}")
         return content
@@ -1322,7 +1385,7 @@ py-modules = []
             except Exception as e:
                 logger.error(f"Error removing local package: {e}", exc_info=True)
 
-    def _cleanup_storage(self) -> None:
+    def _cleanup_storage(self, *, strict: bool = False) -> None:
         """Clean supported external storage; object-service packages are collected by GC."""
         if not self._package_filename or not self._storage_backend:
             return
@@ -1333,6 +1396,8 @@ py-modules = []
         try:
             delete(self._package_filename)
         except Exception as e:
+            if strict:
+                raise
             logger.error(f"Error cleaning up storage: {e}", exc_info=True)
 
 
@@ -1358,6 +1423,7 @@ def init(
     """
     global _runtime
 
+    _validate_python_version(python_version)
     with _runtime_lock:
         if _runtime is not None:
             if _runtime._name == name:

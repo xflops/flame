@@ -168,11 +168,10 @@ class Session:
     def close(self) -> None:
         if self._closed:
             return
+        if self._session is not None:
+            self._session.close()
         self._closed = True
-        session = self._session
         self._session = None
-        if session is not None:
-            session.close()
 
     def _ensure_open(self) -> None:
         if self._closed or self._session is None:
@@ -220,17 +219,22 @@ def open_session(
             resreq=normalized_options.resreq,
         )
     else:
-        core_session = _open_core_session(
-            ssn_id,
-            SessionAttributes(
-                application=_FLMBOX_APP,
-                id=ssn_id,
-                common_data=common_data,
-                min_instances=normalized_options.min_instances,
-                max_instances=normalized_options.max_instances,
-                resreq=normalized_options.resreq,
-            ),
-        )
+        try:
+            core_session = _open_core_session(ssn_id)
+        except FlameError as exc:
+            if exc.code != FlameErrorCode.NOT_FOUND:
+                raise
+            core_session = _open_core_session(
+                ssn_id,
+                SessionAttributes(
+                    application=_FLMBOX_APP,
+                    id=ssn_id,
+                    common_data=common_data,
+                    min_instances=normalized_options.min_instances,
+                    max_instances=normalized_options.max_instances,
+                    resreq=normalized_options.resreq,
+                ),
+            )
 
     if core_session.application != _FLMBOX_APP:
         raise FlameError(

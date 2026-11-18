@@ -204,3 +204,41 @@ def test_asyncio_wrap_future_on_sync_core_result(frontend_server):
         assert asyncio.run(wait_for_result()) == b"done"
     finally:
         connection.close()
+
+
+def test_close_wakes_pending_async_watch_read(frontend_server):
+    endpoint, _, _ = frontend_server
+
+    async def exercise():
+        async with await aio.connect(endpoint) as connection:
+            session = await connection.create_session(SessionAttributes(application="app"))
+            watcher = session.watch_task("hold")
+            assert (await watcher.__anext__()).state == TaskState.PENDING
+            waiting = asyncio.create_task(watcher.__anext__())
+            await asyncio.sleep(0)
+            watcher.close()
+            with pytest.raises(StopAsyncIteration):
+                await asyncio.wait_for(waiting, 1)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("submit", [False, True])
+def test_remote_cancelled_task_raises_instead_of_returning_output(frontend_server, monkeypatch, submit):
+    endpoint, frontend, _ = frontend_server
+    original = frontend._task
+
+    def cancelled_task(task_id="task-1", state=TaskState.SUCCEED):
+        task = original(task_id, TaskState.CANCELLED)
+        task.spec.ClearField("output")
+        return task
+
+    monkeypatch.setattr(frontend, "_task", cancelled_task)
+
+    async def exercise():
+        async with await aio.connect(endpoint) as connection:
+            session = await connection.create_session(SessionAttributes(application="app"))
+            with pytest.raises(FlameError, match="Task was cancelled"):
+                await (session.submit(b"input") if submit else session.run(b"input"))
+
+    asyncio.run(exercise())

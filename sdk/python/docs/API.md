@@ -91,6 +91,10 @@ returns its output. `submit()` returns immediately with a `TaskFuture`, a
 `concurrent.futures.Future` subclass that resolves with the task output and
 dispatches user completion callbacks away from the shared aio loop.
 
+Both `run()` and `submit()` report a remotely cancelled task as a `FlameError`.
+Closing a task watcher ends a pending iterator read, including a read blocked
+in another thread through the synchronous API.
+
 ## Data Classes
 
 `SessionAttributes`:
@@ -142,6 +146,8 @@ until server garbage collection removes data whose owning session is gone.
 Packages use `<app>/pkg/<filename>` and remain tied to application lifetime;
 uploading the same filename again appends another part. Package downloads
 require one part, so choose a new filename for each package.
+Downloads validate the returned key and encoded size before atomically replacing
+the destination. A failed or cancelled download preserves an existing file.
 
 PUT and PATCH declare the exact encoded byte count in their write header. The
 SDK derives this after serialization and compression, or from the opened file
@@ -157,6 +163,10 @@ Object references are versioned:
 - Without a deserializer, `get_object()` returns the newest data part of the object.
 - With a deserializer, `get_object(ref, deserializer)` calls `deserializer(parts)` with all the data parts in the order they were written.
 
+Synchronous deserializers run on the caller's thread and may call `get_object()`
+again. NumPy arrays use Arrow only when it preserves their representation;
+other dtypes and array subclasses use cloudpickle.
+
 The cache protocol has three GET modes: `METADATA` returns only object metadata;
 `OBJECT` returns the prefix before the requested part count (zero selects the
 latest object); and `PATCHES` returns parts after that count. Metadata reads do
@@ -165,7 +175,11 @@ chooses `OBJECT` for an initial read and `PATCHES` for subsequent reads.
 
 ## Service API
 
-Host-shim Python services subclass `flamepy.FlameService` and run with `flamepy.run()`:
+Host-shim Python services subclass `flamepy.FlameService` and run with `flamepy.run()`.
+
+The service instance is retained across session bindings. Binding changes wait
+for outstanding task hooks to finish, even when their invocation RPC was
+cancelled, before entering or leaving a session or destroying the instance.
 
 ```python
 import flamepy
@@ -254,7 +268,13 @@ Key classes and helpers:
   Repeating it for the same name returns the same handle. `dependencies`
   populates an auto-generated `pyproject.toml` only when the project has no
   existing Python package metadata. `python_version` selects the executor
-  Python version through the application template.
+  Python version through the application template. Its minor version must match
+  the client. Reused registrations must explicitly declare a compatible
+  `FLAME_PYTHON_VERSION`; the SDK never changes a borrowed registration.
+  External file/HTTP package cleanup waits up to 30 seconds for authoritative
+  application retirement. If retirement or deletion fails, retry `destroy()` or
+  runtime `close()`. Uncertain registration outcomes preserve uploaded code
+  until a committed registration can be recovered or an operator reconciles it.
 - `app.service(autoscale=None, warmup=0, resreq=None, batch_size=1)` is the canonical service
   decorator. Functions become `ServiceInstance` proxies. Decorating a class
   declares a service class without creating a session. Calling
@@ -319,6 +339,8 @@ Key classes and methods:
 
 Creation options apply only when the session is created: an existing session keeps its own, so they are ignored when `ssn_id` names one that exists. `ssn.attr` is a read-only view of the effective creation settings; its type is intentionally not exported. `image` is create-time only. `close()` destroys the session. Reopen works only while the session is still open. `ResourceRequirement` and `FlameError` are imported from `flamepy`.
 
+If `close()` fails, the handle retains the session so you can retry `close()`. After a successful close, further calls to `close()` do nothing.
+
 ## Sandbox API
 
 `flamepy.agent.Sandbox` runs commands and scripts inside a container sandbox served by the built-in `flmbox` application.
@@ -339,7 +361,7 @@ with Sandbox.create(image="ubuntu:26.04") as box:
 - `box.run_code(code, *, language="python", cwd=None, envs=None, input=None, timeout=None) -> CommandResult` and `box.submit_code(...)`; `language` is `"python"` or `"shell"`, `input` is bytes for stdin.
 - `box.suspend(*, timeout=60.0)` requests suspension and polls until the state is `suspended`. The signal is asynchronous; `INTERNAL` is raised on timeout.
 - `box.resume()` returns when the sandbox is `open` again. Phase 1 does NOT preserve process or filesystem state: a resumed sandbox starts fresh.
-- `box.close()` is idempotent; the context manager closes on exit.
+- `box.close()` is idempotent after success; a failed close retains the session handle for retry. The context manager closes on exit.
 - A command is sent without asking the server for the state first. The server queues a command for a suspending or suspended sandbox and runs it after the resume, so `run` blocks (and `submit` stays pending) until then; check `box.state` first if that matters.
 - `CommandResult.exit_code`, `.stdout`, `.stderr` (bytes), `.stdout_text()`, `.stderr_text()`, `.ok`. A nonzero exit code is a normal result, not an error.
 

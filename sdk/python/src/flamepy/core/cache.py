@@ -474,8 +474,12 @@ def _serialize_object_data(obj: Any) -> tuple[str, bytes]:
     """Encode a value and return its type tag separately from its payload."""
     # A value of a library's type means the library is already imported.
     np = sys.modules.get("numpy")
-    if np is not None and isinstance(obj, np.ndarray):
-        if obj.flags.c_contiguous or obj.flags.f_contiguous:
+    if np is not None and type(obj) is np.ndarray:
+        # Arrow tensors do not retain byte order, ndarray subclass state or
+        # arbitrary NumPy dtypes. Use pickle whenever that would change a value.
+        dtype = obj.dtype
+        numeric = dtype.kind in "iu" and dtype.itemsize in (1, 2, 4, 8) or dtype.kind == "f" and dtype.itemsize in (2, 4, 8)
+        if numeric and dtype.isnative and dtype.metadata is None and (obj.flags.c_contiguous or obj.flags.f_contiguous):
             return _TYPE_NUMPY, _serialize_numpy(obj)
     pd = sys.modules.get("pandas")
     if pd is not None and isinstance(obj, pd.DataFrame):
@@ -655,10 +659,17 @@ _aio_bridge_lock = threading.Lock()
 
 
 def _reset_aio_bridge_after_fork() -> None:
-    global _aio_bridge, _aio_bridge_pid, _aio_bridge_lock
+    global _aio_bridge, _aio_bridge_pid, _aio_bridge_lock, _cache_lock, _object_cache, _cache_tokens, _context_cache, _context_cache_lock
     _aio_bridge = None
     _aio_bridge_pid = None
     _aio_bridge_lock = threading.Lock()
+    # A parent thread may have held a lock or been publishing an entry at fork.
+    # Do not reuse inherited snapshots or synchronization in the child.
+    _cache_lock = threading.Lock()
+    _object_cache = OrderedDict()
+    _cache_tokens = weakref.WeakValueDictionary()
+    _context_cache = None
+    _context_cache_lock = threading.Lock()
 
 
 if hasattr(os, "register_at_fork"):
@@ -710,7 +721,10 @@ def get_object(ref: Ref, deserializer: Optional[Deserializer] = None) -> Any:
         return ref.value if deserializer is None else deserializer([ref.value])
     if not isinstance(ref, ObjectRef):
         raise TypeError(f"Expected ValueRef or ObjectRef, got {type(ref).__name__}")
-    return _call_aio_cache("get_object", ref, deserializer)
+    # User code runs on the synchronous caller's thread. A deserializer may
+    # call this API again without occupying the bridge's transport executor.
+    obj = _call_aio_cache("_get_cached_object", ref)
+    return _materialize_object(obj, deserializer)
 
 
 def patch_object(ref: ObjectRef, data: Any) -> ObjectRef:

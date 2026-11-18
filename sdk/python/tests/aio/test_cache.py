@@ -448,7 +448,7 @@ class TestAioCache:
 
             def Get(self, request):  # noqa: N802 - gRPC method
                 async def responses():
-                    yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(metadata=cache_pb2.CacheObjectMetadata(key=request.key, uuid="object-uuid", data_type=stored["type"], version=1)))
+                    yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(metadata=cache_pb2.CacheObjectMetadata(key=request.key, uuid="object-uuid", data_type=stored["type"], version=1, size=len(stored["payload"]))))
                     yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(part=0, data=stored["payload"][:7]))
                     yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(part=0, data=stored["payload"][7:]))
 
@@ -890,6 +890,7 @@ def test_package_repeated_name_appends_and_requires_a_new_name_for_single_part_d
                             uuid="package-object",
                             version=len(values),
                             data_type="raw",
+                            size=sum(map(len, values)),
                         )
                     )
                 )
@@ -986,3 +987,85 @@ def test_empty_file_upload_declares_zero_and_sends_no_payload_chunks(monkeypatch
     monkeypatch.setattr(aio_cache, "_get_client", lambda endpoint, tls=None: Client())
     asyncio.run(aio_cache.upload_package("audit", str(source), endpoint="grpc://cache:1"))
     assert headers[0].size == 0
+
+
+@pytest.mark.parametrize("failure", ["before-header", "mid-stream", "wrong-key", "truncated", "oversized", "bad-compression"])
+def test_failed_package_download_preserves_existing_destination(monkeypatch, tmp_path, failure):
+    original = b"previous working package"
+    payload = b"new package bytes"
+    destination = tmp_path / "package.tar.gz"
+    destination.write_bytes(original)
+    ref = ObjectRef("grpc://cache:1", "app/pkg/package.tar.gz", 1)
+
+    class Client:
+        async def Get(self, request):  # noqa: N802
+            if failure == "before-header":
+                raise ConnectionError("server is unavailable")
+            metadata = cache_pb2.CacheObjectMetadata(key=request.key, uuid="object", version=1, data_type="raw", size=len(payload))
+            if failure == "wrong-key":
+                metadata.key = "another/pkg/package.tar.gz"
+            elif failure == "truncated":
+                metadata.size += 1
+            elif failure == "oversized":
+                metadata.size -= 1
+            elif failure == "bad-compression":
+                metadata.data_type = "raw.zstd"
+            yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(metadata=metadata))
+            yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(part=0, data=payload))
+            if failure == "mid-stream":
+                raise ConnectionError("stream interrupted")
+
+    monkeypatch.setattr(aio_cache, "_get_client", lambda *args: Client())
+    monkeypatch.setattr(cache_module, "_get_cache_tls_config", lambda: None)
+
+    async def run():
+        with pytest.raises(ValueError):
+            await aio_cache._download_file(ref, str(destination))
+
+    asyncio.run(run())
+    assert destination.read_bytes() == original
+    assert sorted(path.name for path in tmp_path.iterdir()) == [destination.name]
+
+
+def test_cancelled_package_download_preserves_existing_destination(monkeypatch, tmp_path):
+    destination = tmp_path / "package.tar.gz"
+    destination.write_bytes(b"working package")
+
+    async def run():
+        waiting = asyncio.Event()
+
+        class Client:
+            async def Get(self, request):  # noqa: N802
+                metadata = cache_pb2.CacheObjectMetadata(key=request.key, uuid="object", version=1, data_type="raw", size=100)
+                yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(metadata=metadata))
+                yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(part=0, data=b"partial"))
+                waiting.set()
+                await asyncio.Event().wait()
+
+        monkeypatch.setattr(aio_cache, "_get_client", lambda *args: Client())
+        monkeypatch.setattr(cache_module, "_get_cache_tls_config", lambda: None)
+        task = asyncio.create_task(aio_cache._download_file(ObjectRef("grpc://cache:1", "app/pkg/package.tar.gz"), str(destination)))
+        await asyncio.wait_for(waiting.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert destination.read_bytes() == b"working package"
+    assert sorted(path.name for path in tmp_path.iterdir()) == [destination.name]
+
+
+def test_empty_package_download_atomically_replaces_destination(monkeypatch, tmp_path):
+    destination = tmp_path / "package.tar.gz"
+    destination.write_bytes(b"old")
+
+    class Client:
+        async def Get(self, request):  # noqa: N802
+            yield cache_pb2.CacheGetResponse(header=cache_pb2.CacheGetHeader(metadata=cache_pb2.CacheObjectMetadata(key=request.key, uuid="object", version=1, data_type="raw", size=0)))
+            yield cache_pb2.CacheGetResponse(chunk=cache_pb2.CacheGetChunk(part=0, data=b""))
+
+    monkeypatch.setattr(aio_cache, "_get_client", lambda *args: Client())
+    monkeypatch.setattr(cache_module, "_get_cache_tls_config", lambda: None)
+    asyncio.run(aio_cache._download_file(ObjectRef("grpc://cache:1", "app/pkg/package.tar.gz"), str(destination)))
+    assert destination.read_bytes() == b""
+    assert sorted(path.name for path in tmp_path.iterdir()) == [destination.name]

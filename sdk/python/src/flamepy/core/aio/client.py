@@ -498,6 +498,9 @@ class Session:
                     await asyncio.sleep(0)
                     active_watcher = self.watch_task(task_id)
                 async for update in active_watcher:
+                    if update.is_cancelled():
+                        await finish(error=FlameError(FlameErrorCode.INTERNAL, "Task was cancelled"))
+                        return
                     if update.is_failed():
                         message = next((event.message for event in update.events or [] if event.code == TaskState.FAILED), "Task failed without error message")
                         await finish(error=FlameError(FlameErrorCode.INTERNAL, message))
@@ -633,13 +636,13 @@ class TaskWatcher(AsyncIterator[Task]):
     def __init__(self, session_watch: _SessionWatch, task_id: TaskID, timeout: Optional[float] = None):
         self._session_watch = session_watch
         self._task_id = task_id
-        self._updates: asyncio.Queue[Union[Task, FlameError]] = asyncio.Queue(maxsize=1)
+        self._updates: asyncio.Queue[Union[Task, FlameError, None]] = asyncio.Queue(maxsize=1)
         self._loop = asyncio.get_running_loop()
         self._timeout = timeout
         self._deadline = asyncio.get_running_loop().time() + timeout if timeout is not None else None
         self._closed = False
 
-    def _put(self, update: Union[Task, FlameError]) -> None:
+    def _put(self, update: Union[Task, FlameError, None]) -> None:
         if self._closed:
             return
         if self._updates.full():
@@ -668,6 +671,8 @@ class TaskWatcher(AsyncIterator[Task]):
                 update = await asyncio.wait_for(self._updates.get(), remaining)
             else:
                 update = await self._updates.get()
+            if update is None:
+                raise StopAsyncIteration
             if isinstance(update, FlameError):
                 self.close()
                 raise update
@@ -682,5 +687,8 @@ class TaskWatcher(AsyncIterator[Task]):
         if asyncio.get_running_loop() is not self._loop:
             raise RuntimeError("aio task watch used from another event loop")
         if not self._closed:
+            # Wake a reader already waiting in Queue.get(), including the
+            # synchronous facade's blocked next() call.
+            self._put(None)
             self._closed = True
             self._session_watch.unregister(self)
