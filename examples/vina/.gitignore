@@ -1,0 +1,5 @@
+results/
+data/screening/
+.venv*/
+__pycache__/
+dist/

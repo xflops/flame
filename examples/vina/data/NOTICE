@@ -1,0 +1,39 @@
+The PDBQT files in this directory are the PDB 1IEP (c-Abl / imatinib) example
+distributed with AutoDock Vina under the Apache License, Version 2.0:
+
+https://github.com/forlilab/AutoDock-Vina/tree/develop/example/python_scripting
+
+Generated DUD-E ABL1 screening inputs (not bundled in this repository)
+------------------------------------------------------------------
+The prepare.py script downloads the source-prepared 3D actives and decoys from:
+https://dude.docking.org/targets/abl1/actives_final.sdf.gz
+https://dude.docking.org/targets/abl1/decoys_final.sdf.gz
+
+DUD-E is provided by the Irwin and Shoichet Laboratories at UCSF. Its website
+states that it is "free to use" and requests this citation:
+Mysinger MM, Carchia M, Irwin JJ, Shoichet BK. Directory of Useful Decoys,
+Enhanced (DUD-E): Better Ligands and Decoys for Better Benchmarking.
+J. Med. Chem. 2012, 55, 6582-6594. https://doi.org/10.1021/jm300687e
+Source terms/copyright: https://dude.docking.org/targets/abl1/
+Copyright 2009-2024 The Irwin Lab and the UC Regents, as stated on that page.
+No named open-data redistribution license is identified there. The repository's
+Apache license does not relicense DUD-E. Archives and generated screening data
+remain local runtime artifacts; no DUD-E structures are embedded in this repo.
+
+The 100-compound library is a deterministic demonstration subset (20 labelled
+actives and 80 property-matched decoys), not an unbiased prospective screen.
+DUD-E source protonation/tautomer states and 3D coordinates are retained for
+Meeko preparation. Deduplication uses the neutral parent canonical-tautomer
+standard InChIKey connectivity block, so protonation, tautomer and stereochemical
+variants do not inflate the count. Normalization is used for identity only,
+not to change the source molecule used in docking. Imatinib is excluded from
+the library and the bundled 1IEP ligand is added separately as a reference.
+Imatinib identity: PubChem CID 5291 / ChEMBL941,
+https://pubchem.ncbi.nlm.nih.gov/compound/Imatinib
+
+Preparation software references:
+https://github.com/rdkit/rdkit/releases/tag/Release_2025_09_3
+https://github.com/forlilab/Meeko/releases/tag/v0.6.1
+https://apidocmeeko.readthedocs.io/en/latest/lig_overview.html
+The manifest records pinned tool versions, source SHA-256 hashes, selected
+record identities, prepared file hashes and duplicate/preparation failures.
