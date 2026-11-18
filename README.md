@@ -99,7 +99,9 @@ For more details, see the [install scripts README](scripts/README.md).
 
 ### Verify the Installation
 
-After starting Flame (via either option), verify the installation with `flmping`:
+After starting Flame (via either option), verify the installation with `flmping`.
+Normal mode prints each task result as it completes, so rows can appear out of
+submission order. Use `--perf` for a final benchmark summary without per-task output.
 
 ```shell
 $ flmping
