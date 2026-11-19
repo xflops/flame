@@ -76,7 +76,7 @@ impl Sandboxes {
 
     fn rootfs(&self, id: &str) -> PathBuf {
         let spec: Value =
-            serde_json::from_slice(&fs::read(self.bundle(id).join("config.json")).unwrap())
+            serde_json::from_slice(&fs::read(self.bundle(id).join("bundle/config.json")).unwrap())
                 .unwrap();
         assert_eq!(spec["root"]["readonly"], false);
         PathBuf::from(spec["root"]["path"].as_str().unwrap())
