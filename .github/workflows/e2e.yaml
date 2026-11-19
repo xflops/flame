@@ -563,6 +563,13 @@ jobs:
           # The services run as root under systemd; make the flmbox state directories exist.
           sudo install -d -m 0755 /var/lib/flmbox "$INSTALL_PREFIX/data/flmbox"
 
+      - name: Verify flmbox root filesystem isolation
+        timeout-minutes: 10
+        env:
+          # Compile as the runner user; only the test executable needs root for runsc.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo
+        run: cargo test -p flmbox --test rootfs -- --ignored --nocapture
+
       - name: Run Python E2E tests
         timeout-minutes: 20
         run: |
