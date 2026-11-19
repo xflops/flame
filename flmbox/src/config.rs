@@ -284,7 +284,7 @@ impl FlameSandbox {
                 overlay: get(ENV_OVERLAY)
                     .map(str::to_string)
                     .or(filled(runtime.overlay))
-                    .unwrap_or_else(|| DEFAULT_OVERLAY.to_string()),
+                    .map_or_else(|| Ok(DEFAULT_OVERLAY.to_string()), private_overlay)?,
             }),
             other => {
                 return Err(invalid(format!(
@@ -317,6 +317,18 @@ impl FlameSandbox {
             images: FlameImages { max_bytes },
         })
     }
+}
+
+/// A writable OCI root must never expose the shared image cache directly.
+/// Leave the rest of runsc's overlay grammar to runsc itself.
+fn private_overlay(value: String) -> Result<String, FlameError> {
+    let mode = value.split(',').next().unwrap_or_default().trim();
+    if matches!(mode, "none" | "root:none" | "all:none") {
+        return Err(invalid(format!(
+            "sandbox.runtime.overlay / {ENV_OVERLAY}: '{value}' disables the private root overlay; use root:memory, root:self or root:dir=/absolute/path"
+        )));
+    }
+    Ok(value)
 }
 
 fn parse_yaml(text: &str) -> Result<FlameSandboxYaml, String> {
@@ -447,6 +459,61 @@ sandbox:
             assert_eq!(runsc(&c).path, "runsc");
             assert_eq!(c.images.max_bytes, 4 << 30);
         }
+    }
+
+    #[test]
+    fn overlays_that_disable_root_isolation_are_rejected() {
+        for overlay in [
+            "none",
+            "root:none",
+            "all:none",
+            "none,size=1g",
+            "root:none,size=1g",
+            "all:none,size=1g",
+        ] {
+            let err = FlameSandbox::from_yaml(
+                &format!("sandbox:\n  runtime:\n    overlay: {overlay}\n"),
+                &HashMap::new(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, FlameError::InvalidConfig(_)),
+                "{overlay}: {err}"
+            );
+            assert!(err.to_string().contains("private root overlay"), "{err}");
+
+            let err = FlameSandbox::from_yaml(FULL, &map(&[(ENV_OVERLAY, overlay)])).unwrap_err();
+            assert!(
+                matches!(err, FlameError::InvalidConfig(_)),
+                "{overlay}: {err}"
+            );
+            assert!(err.to_string().contains(ENV_OVERLAY), "{err}");
+        }
+    }
+
+    #[test]
+    fn private_overlay_modes_are_forwarded_to_runsc() {
+        for overlay in [
+            "root:memory",
+            "root:self",
+            "root:dir=/var/tmp",
+            "all:memory",
+            "all:self",
+            "all:dir=/var/tmp",
+            "root:memory,size=1g",
+            "all:dir=/var/tmp,size=1g",
+        ] {
+            let c = FlameSandbox::from_map(&map(&[(ENV_OVERLAY, overlay)])).unwrap();
+            assert_eq!(runsc(&c).overlay, overlay);
+        }
+        // Validation applies after precedence: a safe environment wins over
+        // an unsafe file setting, just as for the other runtime properties.
+        let c = FlameSandbox::from_yaml(
+            "sandbox:\n  runtime:\n    overlay: none\n",
+            &map(&[(ENV_OVERLAY, "root:memory")]),
+        )
+        .unwrap();
+        assert_eq!(runsc(&c).overlay, "root:memory");
     }
 
     #[test]

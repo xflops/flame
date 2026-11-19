@@ -458,6 +458,43 @@ class TestSandboxCommands:
 class TestSandboxFilesystem:
     """The filesystem belongs to one sandbox."""
 
+    def test_rootfs_writes_are_private_and_removed_on_close(self, make_sandbox):
+        """Root writes and image-file edits stay private, including after close."""
+        first = make_sandbox()
+        second = make_sandbox()
+        marker = f"flm-e2e-rootfs-{random_string(8)}"
+        original = _run(first, "cat /etc/os-release")
+        assert original.exit_code == 0, original.stderr_text()
+        baseline = _run(second, "cat /etc/os-release")
+        assert baseline.exit_code == 0, baseline.stderr_text()
+        assert baseline.stdout == original.stdout
+
+        # These paths exercise the image root, rather than a separate /tmp mount.
+        # Appending to an existing image file also exercises overlay copy-up.
+        write = _run(
+            first,
+            f'set -eu; for dir in / /root /usr/local /var /etc; do printf "%s\\n" "{marker}" > "$dir/{marker}"; done; mkdir -p /workspace/project; printf "%s\\n" "{marker}" > /workspace/project/{marker}; printf "\\n# %s\\n" "{marker}" >> /etc/os-release',
+        )
+        assert write.exit_code == 0, write.stderr_text()
+        verify = _run(
+            first,
+            f'set -eu; for dir in / /root /usr/local /var /etc /workspace/project; do test "$(cat "$dir/{marker}")" = "{marker}"; done; cat /etc/os-release',
+        )
+        assert verify.exit_code == 0, verify.stderr_text()
+        assert verify.stdout == original.stdout + f"\n# {marker}\n".encode()
+
+        def assert_pristine(sandbox):
+            result = _run(
+                sandbox,
+                f'set -eu; for dir in / /root /usr/local /var /etc /workspace/project; do test ! -e "$dir/{marker}"; done; cat /etc/os-release',
+            )
+            assert result.exit_code == 0, result.stderr_text()
+            assert result.stdout == original.stdout
+
+        assert_pristine(second)
+        first.close()
+        assert_pristine(make_sandbox())
+
     def test_file_persists_between_runs_of_one_sandbox(self, sandbox):
         assert _run(sandbox, "echo data > /tmp/flm-e2e-file").exit_code == 0
         result = _run(sandbox, "cat /tmp/flm-e2e-file")

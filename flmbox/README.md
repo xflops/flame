@@ -114,6 +114,16 @@ Images are pulled with `oci-client` (anonymous access; the `linux/<host arch>` m
 digest. They are unpacked once into a flattened, read-only root filesystem, and `runsc --overlay2` provides each
 sandbox's writable layer. The unpacker rejects path traversal, escaping symlinks and oversized layers.
 
+The sandbox root is writable subject to the image user's normal permissions. With the default
+`root:memory` overlay, root can create `/workspace/project`, write under `/root`, `/usr/local`, `/var` and `/etc`,
+and modify existing image files. These changes belong to that sandbox; they do not modify cached image contents
+or appear in another sandbox using the same image. Killing the sandbox discards its writable layer. Preserving
+changes across suspend/resume is tracked in #657. Explicit read-only mounts, including `/etc/hosts` and the
+host resolver configuration when mounted, remain read-only.
+
+Disabling the private overlay (`none`, `root:none` or `all:none`) is rejected because sandboxes share the cached
+image root. Memory and file-backed private overlays remain configurable through `sandbox.runtime.overlay`.
+
 ```
 <state_dir>/
   images/sha256/<manifest-digest>/{rootfs/,image.json}   the cache; pulls go through images/.tmp-*
@@ -141,3 +151,12 @@ cargo clippy -p flmbox --all-targets -- -D warnings
 ```
 
 Real `runsc` runs are covered by the CI end-to-end jobs (`testing/e2e/tests/test_sandbox.py`).
+The filesystem regression covers root writes, existing-file copy-up and isolation after sandbox deletion.
+For a direct CLI check against one shared image cache, run the following as root on Linux with `runsc` installed:
+
+```bash
+cargo test -p flmbox --test rootfs -- --ignored --nocapture
+```
+
+This test creates isolated temporary state and removes its sandboxes afterwards. It uses `ubuntu:26.04` by default;
+`FLMBOX_TEST_IMAGE` can select another root-user image containing `/bin/sh`, standard file utilities and `/etc/os-release`.

@@ -62,7 +62,9 @@ const CAPABILITIES: [Capability; 14] = [
 ];
 
 /// Writes `<dir>/config.json` (OCI runtime spec 1.0.2) for a sandbox whose
-/// root filesystem is `rootfs`, mounted read-only. With [`FlameNetwork::None`]
+/// root filesystem is `rootfs`, with writes isolated by runsc's private overlay.
+/// The OCI root must be writable for the overlay to accept writes; the cached
+/// image remains the unchanged lower layer. With [`FlameNetwork::None`]
 /// the sandbox has its own, empty network namespace; with [`FlameNetwork::Host`]
 /// the spec names no network namespace, so the sandbox uses the network of the
 /// process that runs `runsc`, and the host's `/etc/resolv.conf` is bind-mounted
@@ -198,7 +200,7 @@ fn minimal_spec(
 
     let root = RootBuilder::default()
         .path(rootfs)
-        .readonly(true)
+        .readonly(false)
         .build()
         .map_err(build_err)?;
 
@@ -340,7 +342,7 @@ mod tests {
         assert_eq!(v["process"]["user"], json!({"uid": 0, "gid": 0}));
         assert_eq!(
             v["root"],
-            json!({"path": "/images/rootfs", "readonly": true})
+            json!({"path": "/images/rootfs", "readonly": false})
         );
         assert!(v.get("annotations").is_none());
     }
