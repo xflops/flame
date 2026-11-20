@@ -1,0 +1,19 @@
+name: Analyze with CodeQL
+description: Initialize and analyze one language without a separate build.
+inputs:
+  language:
+    description: The CodeQL language to analyze.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v4
+      with:
+        languages: ${{ inputs.language }}
+        build-mode: none
+
+    - name: Analyze
+      uses: github/codeql-action/analyze@v4
+      with:
+        category: "/language:${{ inputs.language }}"
