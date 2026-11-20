@@ -87,15 +87,49 @@ gh workflow run release-publish.yaml --ref main \
   -f release_tag="${RELEASE_TAG}"
 ```
 
-Main and release image publishing use the shared `build-images.yaml` workflow.
-It builds amd64 on `ubuntu-26.04` and arm64 on `ubuntu-26.04-arm`, without QEMU.
-Each runner builds all five images with `ci/release/image-bake.hcl`, sharing the
-common Rust compilation stage. Build caches are scoped by image and architecture.
-Native binary and Python SDK smoke checks must pass before the image digests are
-uploaded. A separate job merges the verified digests into multiarchitecture tags
-and checks both platforms. Main promotes its `sha-<commit>` tags to `latest` only
-after the whole image set succeeds; releases publish the requested version tag.
-Architecture tags such as `sha-<commit>-arm64` are intermediate build references.
+Versioned releases use `build-images.yaml` to build and publish native amd64 and
+arm64 images. Main follows the artifact flow below instead.
+
+## Main publication
+
+`Flame CI` (`e2e.yaml`) is the single entry point for main pushes, PRs and manual runs.
+It first completes the code, script, publication-rule and CodeQL verification jobs.
+Image and package builds depend only on those verification jobs. CodeQL also
+retains its independent weekly schedule without starting builds.
+
+Architecture and scheduling-policy variants are explicit parallel jobs. YAML
+step anchors share identical commands, and a composite action shares the CodeQL
+implementation. There are no matrix or reusable-workflow job wrappers in main CI;
+the dashboard shows the actual jobs and their direct dependencies.
+
+The build stage creates all eight image variants on native amd64 and arm64
+runners, runs their
+binary and SDK smoke checks, and saves the images with their source commit,
+architecture, image IDs and archive checksum. Packages are built once with the
+`latest` tag on Ubuntu 24.04 for both architectures, preserving the glibc
+baseline. The build stage verifies checksums and smoke-tests package installation.
+
+The E2E, system and benchmark jobs consume those build outputs. Full E2E coverage
+runs on amd64; arm64 receives native build and smoke coverage. Both publication
+jobs depend only on the two terminal benchmarks, whose dependencies cover every
+verification, build, E2E and system job. Each stage names only its immediate
+predecessors. A failed, cancelled or skipped dependency prevents publication.
+Pull requests never publish.
+
+After success, the image and package publication jobs download artifacts from
+that same run and do not rebuild
+images, server binaries or SDK wheels. Image publication validates the source
+commit, architecture, checksum and image IDs before pushing, then merges the two
+native manifests. Both image transfers, manifest creation and promotion run as
+steps of one publication job; no native architecture matrix is needed to upload
+already-built images. Package publication verifies the complete asset set and its
+checksums before changing the release. Mutable `latest` outputs are updated only
+while the run's commit is still the head of main.
+
+To retry, rerun the failed jobs of the original CI run while its artifacts remain
+available. To start a new run, dispatch `e2e.yaml` against main; this runs the full
+validation graph before publication. Publication cannot be dispatched independently.
+Versioned release publication remains separate.
 
 ## Source Readiness
 
