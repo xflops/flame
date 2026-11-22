@@ -822,7 +822,7 @@ impl FilesystemEngine {
     ) -> Result<Task, FlameError> {
         let state = TaskState::try_from(meta.state as i32)?;
         let completion_time = if meta.completion_time > 0 {
-            DateTime::from_timestamp(meta.completion_time, 0)
+            DateTime::from_timestamp_millis(meta.completion_time)
         } else {
             None
         };
@@ -834,7 +834,7 @@ impl FilesystemEngine {
             input,
             output,
             affinity,
-            creation_time: DateTime::from_timestamp(meta.creation_time, 0)
+            creation_time: DateTime::from_timestamp_millis(meta.creation_time)
                 .ok_or_else(|| FlameError::Storage("Invalid creation time".to_string()))?,
             completion_time,
             events: Vec::new(), // Events are handled by EventManager
@@ -1036,10 +1036,7 @@ impl FilesystemEngine {
         task_state: TaskState,
     ) -> Result<TaskMetadata, FlameError> {
         self.update_task(entry, task_id, |meta| {
-            meta.state = task_state as u8;
-            if task_state.is_terminal() {
-                meta.completion_time = Utc::now().timestamp();
-            }
+            meta.set_state(task_state);
         })
     }
 }
@@ -1530,7 +1527,7 @@ impl Engine for FilesystemEngine {
             version: 1,
             checksum: 0,
             state: TaskState::Pending as u8,
-            creation_time: Utc::now().timestamp(),
+            creation_time: Utc::now().timestamp_millis(),
             completion_time: 0,
             input_offset,
             input_len,
@@ -1568,7 +1565,7 @@ impl Engine for FilesystemEngine {
 
         let meta = entry.with_task(gid.task_id, || {
             self.update_task(&entry, gid.task_id, |meta| {
-                meta.state = TaskState::Pending as u8;
+                meta.set_state(TaskState::Pending);
             })
         })?;
         self.task_from_metadata(&entry, &meta)
@@ -1624,10 +1621,7 @@ impl Engine for FilesystemEngine {
                     meta.output_offset = offset;
                     meta.output_len = len;
                 }
-                meta.state = task_result.state as u8;
-                if task_result.state.is_terminal() {
-                    meta.completion_time = Utc::now().timestamp();
-                }
+                meta.set_state(task_result.state);
             })
         })?;
         self.task_from_metadata(&entry, &meta)

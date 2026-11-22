@@ -13,7 +13,7 @@ limitations under the License.
 
 use super::payload::{Part, PayloadFile};
 use super::poisoned;
-use crate::apis::{Executor, Node, SessionState, TaskID};
+use crate::apis::{Executor, Node, SessionState, TaskID, TaskState};
 use crate::FlameError;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -38,12 +38,12 @@ pub(super) struct TaskMetadata {
     /// CRC32 checksum of the record (excluding this field)
     #[serde(with = "postcard::fixint::le")]
     pub(super) checksum: u32,
-    /// Task state (TaskState enum as u8)
+    /// Task state (TaskState enum as u8).
     pub(super) state: u8,
-    /// Unix timestamp of creation
+    /// Creation time as Unix epoch milliseconds.
     #[serde(with = "postcard::fixint::le")]
     pub(super) creation_time: i64,
-    /// Unix timestamp of completion (0 if not completed)
+    /// Completion time as Unix epoch milliseconds (0 if not completed).
     #[serde(with = "postcard::fixint::le")]
     pub(super) completion_time: i64,
     /// Offset in inputs.bin where input data starts
@@ -64,6 +64,17 @@ pub(super) struct TaskMetadata {
     /// Length of the encoded affinity vector in bytes
     #[serde(with = "postcard::fixint::le")]
     pub(super) affinity_len: u64,
+}
+
+impl TaskMetadata {
+    pub(super) fn set_state(&mut self, state: TaskState) {
+        self.state = state as u8;
+        self.completion_time = if state.is_terminal() {
+            Utc::now().timestamp_millis()
+        } else {
+            0
+        };
+    }
 }
 
 /// Application metadata stored as JSON.
