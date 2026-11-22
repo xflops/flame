@@ -130,7 +130,16 @@ flowchart TB
 
 **Task Metadata (Fixed-Size Binary):**
 
-We use `serde` + `bincode` for serialization. We rely on `bincode`'s predictable sizing for fixed-width types to ensure O(1) random access. The struct uses `u64` for IDs and offsets to support large datasets.
+Task creation and completion times are stored as Unix epoch milliseconds (issue #729), matching
+the existing RPC fields and units. Completion is `0` (absent in the API) for unfinished tasks,
+including tasks returned to Pending by retry. Terminal transitions write the current time in
+milliseconds; nonterminal transitions clear completion. Task state remains an ordinary `TaskState`
+value, and the optimistic-lock `version` retains its existing meaning.
+
+The fixed 81-byte postcard record layout and CRC coverage are unchanged. Legacy seconds-based
+task timestamps are not decoded or migrated.
+
+We use `serde` + `postcard` for serialization, with `postcard::fixint::le` on integer fields (attributes omitted below) to ensure fixed-size records and O(1) random access. The struct uses `u64` for IDs and offsets to support large datasets.
 
 ```rust
 use serde::{Serialize, Deserialize};
@@ -141,8 +150,8 @@ pub struct TaskMetadata {
     pub version: u32,               // 4 bytes - Optimistic locking
     pub checksum: u32,              // 4 bytes - CRC32 of the record (calculated via crc32fast)
     pub state: u8,                  // 1 byte - TaskState enum
-    pub creation_time: i64,         // 8 bytes - Unix timestamp
-    pub completion_time: i64,       // 8 bytes - Unix timestamp
+    pub creation_time: i64,         // 8 bytes - Unix milliseconds
+    pub completion_time: i64,       // 8 bytes - Same units; 0 means unfinished
     
     // Input Location (in inputs.bin)
     pub input_offset: u64,          // 8 bytes
@@ -151,15 +160,19 @@ pub struct TaskMetadata {
     // Output Location (in outputs.bin)
     pub output_offset: u64,         // 8 bytes
     pub output_len: u64,            // 8 bytes
+
+    // Affinity Location (in affinity.bin)
+    pub affinity_offset: u64,       // 8 bytes
+    pub affinity_len: u64,          // 8 bytes
 }
-// Total size: Sum of fields (approx 61 bytes, depending on bincode overhead/padding)
+// Total serialized size: 81 bytes with postcard::fixint::le on integer fields.
 // Note: We verify the serialized size at runtime to ensure it is constant.
 ```
 
 **Serialization Strategy:**
-- **Library:** `bincode` with `fixint` encoding to ensure fixed-size integers.
+- **Library:** `postcard` with `postcard::fixint::le` encoding to ensure fixed-size integers.
 - **Checksum:** `crc32fast` crate used to calculate CRC32 checksums for data integrity.
-- **Alignment:** `bincode` handles endianness and alignment automatically. We do not manually pad the struct, but we assert that `bincode::serialized_size` is constant for any instance.
+- **Alignment:** Little-endian fixed-width integer encoding needs no manual struct padding. Tests assert that the length returned by `postcard::to_allocvec` is constant for all field values.
 
 **Session Metadata (JSON):**
 Standard JSON format (unchanged).
@@ -173,7 +186,7 @@ Standard JSON format (unchanged).
 *   **Step 2**: Append input data to `inputs.bin`. Record `input_offset` (file end before write) and `input_len`.
 *   **Step 3**: Construct `TaskMetadata` with the new ID, input location.
 *   **Step 4**: Calculate `checksum` using `crc32fast::Hasher`.
-*   **Step 5**: Serialize `TaskMetadata` using `bincode::serialize`.
+*   **Step 5**: Serialize `TaskMetadata` using `postcard::to_allocvec`.
 *   **Step 6**: Append serialized bytes to `tasks.bin`.
 *   **Step 7**: Flush/Sync (optional based on durability config).
 
@@ -191,7 +204,7 @@ Standard JSON format (unchanged).
 
 **3. Task Retrieval (Random Read):**
 *   **Step 1**: Read `RECORD_SIZE` bytes from `tasks.bin` at `offset = task_id * RECORD_SIZE`.
-*   **Step 2**: Deserialize using `bincode::deserialize`.
+*   **Step 2**: Deserialize using `postcard::from_bytes`.
 *   **Step 3**: Validate `checksum`. If mismatch, return `Corrupted` error.
 *   **Step 4**: If input needed, read from `inputs.bin` using `input_offset` and `input_len`.
 *   **Step 5**: If output needed, read from `outputs.bin` using `output_offset` and `output_len`.
@@ -279,9 +292,9 @@ fn reconstruct_task(session_id, task_id, storage_engine, event_manager) -> Resul
 
 **Resource Usage:**
 - **Memory**: Minimal; only file handles and small buffers. No in-memory caching of task data.
-- **CPU**: Low; serialization/deserialization is fast with `bincode`. CRC32 calculation is hardware-accelerated on modern CPUs.
+- **CPU**: Low; serialization/deserialization is fast with `postcard`. CRC32 calculation is hardware-accelerated on modern CPUs.
 - **Disk**: 
-  - Fixed overhead: ~61 bytes per task in `tasks.bin`.
+  - Fixed overhead: 81 bytes per task in `tasks.bin`.
   - Variable: Input/output sizes depend on workload.
   - No WAL or journal overhead (unlike SQLite).
 - **Network**: None; local filesystem only.
@@ -323,7 +336,7 @@ fn reconstruct_task(session_id, task_id, storage_engine, event_manager) -> Resul
 | Crate | Version | Purpose |
 |-------|---------|---------|
 | `serde` | ^1.0 | Serialization framework |
-| `bincode` | ^1.3 | Binary serialization with fixed-size encoding |
+| `postcard` | ^1.1 | Binary serialization with fixed-size encoding |
 | `crc32fast` | ^1.3 | Hardware-accelerated CRC32 checksums |
 
 **Internal Dependencies:**
@@ -438,7 +451,7 @@ This section details how the `storage::Engine` trait methods map to the filesyst
 | **Cross-File Inconsistency** | Validate offsets against file sizes on startup. Mark invalid tasks as corrupted. |
 | **Large Files** | `u64` offsets support exabytes. Filesystem limits apply (usually 16TB+). |
 | **Concurrency Bugs** | Strictly enforce "Session Manager must lock session before calling Engine". Single-process only. |
-| **Alignment Issues** | Mitigated by using `serde` + `bincode` instead of `packed` structs. |
+| **Alignment Issues** | Mitigated by using `serde` + `postcard` instead of `packed` structs. |
 
 ## 7. References
 
@@ -448,7 +461,7 @@ This section details how the `storage::Engine` trait methods map to the filesyst
 - `storage::Engine` trait definition in `session-manager/src/storage/mod.rs`
 
 **External References:**
-- [bincode documentation](https://docs.rs/bincode/latest/bincode/)
+- [postcard documentation](https://docs.rs/postcard/latest/postcard/)
 - [crc32fast documentation](https://docs.rs/crc32fast/latest/crc32fast/)
 - [serde documentation](https://serde.rs/)
 
