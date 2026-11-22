@@ -140,6 +140,16 @@ async fn records_retry_limit_once_and_allows_count_to_exceed_limit() {
 
     let session = controller.get_session(ssn_id).unwrap();
     assert_eq!(session.retry_count, 3);
+    assert!(session
+        .events
+        .iter()
+        .filter(|event| event.code == SESSION_BIND_FAILED)
+        .all(|event| event
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("on_session_enter failed: boom")));
+
     assert_eq!(
         session
             .events

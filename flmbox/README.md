@@ -89,6 +89,69 @@ file overrides the defaults:
 | `FLMBOX_NETWORK` | `sandbox.network` (the `--network` option overrides both) |
 | `FLMBOX_MAX_IMAGE_BYTES` | `sandbox.images.max_size` |
 
+## Registry mirrors
+
+Registry routing is configured on the executor node in the same sandbox configuration file used by
+`flmbox pull` and `flmbox -d`. Clients continue to use canonical references such as
+`docker.io/library/python:3.12-slim` or `docker.io/library/python@sha256:...`.
+These settings belong to flmbox's OCI client; containerd and Docker Engine registry settings are independent.
+
+```yaml
+sandbox:
+  images:
+    registries:
+      docker.io:
+        mirrors:
+          - endpoint: https://192.168.3.150:5000/dockerhub
+            ca_file: /etc/flame/registry-ca.pem
+          - endpoint: https://dockerproxy.net
+      registry.example.com:
+        mirrors:
+          - endpoint: https://registry.internal.example.com
+            username_env: REGISTRY_USERNAME
+            password_env: REGISTRY_PASSWORD
+```
+
+Mirrors are tried in order. An endpoint's optional path is a repository prefix: the first mirror above
+serves `library/python` at `/v2/dockerhub/library/python/...`. It is not an arbitrary HTTP API path;
+do not append `/v2` unless it is actually part of the repository namespace.
+The original upstream registry is always tried after all configured mirrors fail. A registry without
+mirrors retains the normal direct HTTPS behavior. Mirror settings are evaluated when an image is pulled.
+An unusable endpoint, CA file or credential setting is recorded and skipped, as is a failed pull.
+Each attempt retries the complete pull. If every mirror and the upstream fail, the final error includes
+the attempted endpoints and their underlying errors. Digest checks, image size limits and safe unpacking
+apply to every attempt.
+
+HTTPS verifies the server certificate and hostname normally. `ca_file` adds a PEM CA certificate for
+that endpoint only. When using an IP address, the registry certificate must include that IP in its
+Subject Alternative Name. An internal HTTPS registry requires no authentication fields if it permits
+anonymous pulls. `http://` endpoints explicitly select unencrypted transport; use HTTPS for credentials.
+To authenticate, provide both environment variable names and set their values in the CLI process or
+executor service environment. No credentials belong in endpoint URLs. To configure authentication or
+private trust for the original registry itself, list its HTTPS URL as a mirror endpoint.
+
+Routing changes do not change cache identity: aliases use the original reference, and unpacked roots
+use the verified platform-manifest digest. OCI index selection still chooses Linux and the node's
+architecture; manifest and blob digests are verified through mirrors. A mirror cannot substitute a
+different image for a digest-pinned reference. Tag references still trust the configured registry to
+resolve the tag. The existing pull policy applies before network access: `ifnotpresent` reuses cached
+tag aliases, `always` re-resolves tags, and cached digest references remain immutable. Changing a mirror
+does not itself invalidate cached images.
+
+`HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` (and their lowercase equivalents) control the OCI client's
+outbound HTTP transport, including requests to mirrors. They do not map image repositories or select a
+registry mirror. Use an HTTP proxy URL such as `http://proxy.example.com:3128` for an HTTPS CONNECT proxy,
+and include internal registry IPs/hostnames in `NO_PROXY` when they should be reached directly.
+Sandbox network mode controls sandboxed commands, independently of these node-side image pulls.
+
+During session bootstrap, image-pull failures appear in session binding events with the attempted endpoint
+and underlying transport error. Each failed bind records its own event, including failures after the
+retry limit is reached. Python
+`watch_task(..., timeout=...)` appends available session event messages and their codes to its timeout
+error in the order returned by the server. Clients that enforce their own bootstrap deadline should read the session's
+events when reporting that timeout. Retry exhaustion pauses new executor assignments; queued tasks
+and any existing executors retain their normal lifecycle.
+
 ## Network
 
 `sandbox.network` selects the network of every sandbox:
@@ -110,7 +173,8 @@ only: a client cannot request it for its own sandbox. A per-sandbox network with
 
 ## Images and state
 
-Images are pulled with `oci-client` (anonymous access; the `linux/<host arch>` manifest of an index) and verified by
+Images are pulled with `oci-client` (anonymous by default, or configured endpoint credentials; the
+`linux/<host arch>` manifest of an index) and verified by
 digest. They are unpacked once into a flattened, read-only root filesystem, and `runsc --overlay2` provides each
 sandbox's writable layer. The unpacker rejects path traversal, escaping symlinks and oversized layers.
 

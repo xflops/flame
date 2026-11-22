@@ -28,18 +28,19 @@ use std::time::{Duration, Instant};
 
 use flame_rs::apis::FlameError;
 use nix::fcntl::{Flock, FlockArg};
-use oci_client::client::{Client, ClientConfig, ClientProtocol};
+use oci_client::client::{Client, ClientProtocol};
 use oci_client::config::ConfigFile;
 use oci_client::config::{Architecture, Os};
 use oci_client::manifest::{ImageIndexEntry, OciDescriptor, OciImageManifest};
-use oci_client::secrets::RegistryAuth;
 use oci_client::Reference;
 use serde_derive::{Deserialize, Serialize};
 use tokio::io::AsyncWrite;
 
 use super::progress::{PullEvent, PullPrinter};
+use super::registry::{client_config, PullSource};
 use super::unpack::unpack_layers;
-use crate::config::FlameSandbox;
+use crate::config::{FlameRegistry, FlameSandbox};
+use std::collections::HashMap;
 
 const IMAGE_JSON: &str = "image.json";
 const ROOTFS_DIR: &str = "rootfs";
@@ -147,7 +148,7 @@ fn sha256_hex(digest: &str) -> Result<&str, FlameError> {
 }
 
 /// The `linux/<host arch>` entry of an image index.
-fn linux_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
+pub(super) fn linux_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
     manifests
         .iter()
         .find(|entry| {
@@ -248,6 +249,7 @@ pub struct ImageStore {
     images_dir: PathBuf,
     max_bytes: u64,
     client: Client,
+    registries: HashMap<String, FlameRegistry>,
     progress: Option<PullPrinter>,
 }
 
@@ -267,17 +269,12 @@ impl ImageStore {
         // is the one the workspace uses; `aws-lc-rs` must stay out of the build,
         // since rustls cannot choose when both are enabled. Already installed is fine.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = Client::new(ClientConfig {
-            protocol,
-            platform_resolver: Some(Box::new(linux_resolver)),
-            connect_timeout: Some(Duration::from_secs(30)),
-            read_timeout: Some(Duration::from_secs(120)),
-            ..ClientConfig::default()
-        });
+        let client = Client::new(client_config(protocol));
         Self {
             images_dir,
             max_bytes: config.images.max_bytes,
             client,
+            registries: config.images.registries.clone(),
             progress: None,
         }
     }
@@ -319,21 +316,62 @@ impl ImageStore {
             }
         }
 
-        let (manifest, digest) = self
-            .client
-            .pull_image_manifest(&reference, &RegistryAuth::Anonymous)
-            .await
-            .map_err(|e| registry_error(&format!("pull {reference}"), &e))?;
-        sha256_hex(&digest)?;
-        // A tag, or the digest of an index: the digest of the platform manifest keys the cache.
-        if reference.digest() != Some(digest.as_str()) {
-            self.record_alias(&reference, &digest);
+        let mirrors = self
+            .registries
+            .get(reference.registry())
+            .into_iter()
+            .flat_map(|registry| &registry.mirrors);
+        let attempts = mirrors.map(Some).chain(std::iter::once(None));
+        let mut errors = Vec::new();
+        let mut last_error = None;
+        for mirror in attempts {
+            let source = match mirror {
+                Some(mirror) => PullSource::mirror(&reference, mirror),
+                None => Ok(PullSource::upstream(&reference, &self.client)),
+            };
+            let source = match source {
+                Ok(source) => source,
+                Err(error) => {
+                    errors.push(error.to_string());
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            match self.pull_from(&source).await {
+                Ok(root) => {
+                    // Publish the canonical alias only after the entire image was verified.
+                    if reference.digest() != Some(root.digest.as_str()) {
+                        self.record_alias(&reference, &root.digest);
+                    }
+                    return Ok(root);
+                }
+                Err(error) => {
+                    let message = source.error(&error);
+                    tracing::warn!("image pull {reference} via {message}");
+                    errors.push(message);
+                    last_error = Some(error);
+                }
+            }
         }
+        let message = format!("pull {reference} failed; attempted {}", errors.join("; "));
+        Err(match last_error {
+            Some(FlameError::InvalidConfig(_)) => FlameError::InvalidConfig(message),
+            Some(FlameError::Internal(_)) => internal(message),
+            _ => FlameError::Network(message),
+        })
+    }
 
+    async fn pull_from(&self, source: &PullSource) -> Result<ImageRoot, FlameError> {
+        let (manifest, digest) = source
+            .client
+            .pull_image_manifest(&source.remote, &source.auth)
+            .await
+            .map_err(|e| registry_error(&format!("resolve {}", source.remote), &e))?;
+        sha256_hex(&digest)?;
         // Held until the end of the pull: other executors of the node wait here.
         let _lock = self.lock(&digest).await?;
         if let Some(root) = self.cached(&digest)? {
-            self.record_reference(&digest, &reference);
+            self.record_reference(&digest, &source.reference);
             self.emit(PullEvent::Cached { digest });
             return Ok(root);
         }
@@ -361,7 +399,7 @@ impl ImageStore {
                 self.max_bytes
             )));
         }
-        self.pull(&reference, digest, manifest, total).await
+        self.pull(source, digest, manifest, total).await
     }
 
     /// The cache is keyed by the digest of the platform manifest, which is not what a tag or the
@@ -511,7 +549,7 @@ impl ImageStore {
 
     async fn pull(
         &self,
-        reference: &Reference,
+        source: &PullSource,
         digest: String,
         manifest: OciImageManifest,
         total: u64,
@@ -537,7 +575,7 @@ impl ImageStore {
         }
 
         let config_path = blobs.join("config");
-        self.download_blob(reference, &manifest.config, &config_path, None)
+        self.download_blob(source, &manifest.config, &config_path, None)
             .await?;
         let config_json = fs::read_to_string(&config_path)
             .map_err(|e| internal(format!("read image config: {e}")))?;
@@ -547,7 +585,7 @@ impl ImageStore {
         for (i, layer) in layers.iter().enumerate() {
             let path = blobs.join(format!("layer-{i}"));
             let name = format!("layer {}/{}", i + 1, layers.len());
-            self.download_blob(reference, layer, &path, Some(&name))
+            self.download_blob(source, layer, &path, Some(&name))
                 .await?;
             layer_files.push(path);
         }
@@ -561,7 +599,7 @@ impl ImageStore {
         let meta = ImageMeta {
             digest: digest.clone(),
             config,
-            reference: Some(reference.to_string()),
+            reference: Some(source.reference.to_string()),
             created: unix_secs(std::time::SystemTime::now()),
         };
         let json = serde_json::to_vec_pretty(&meta).map_err(|e| internal(e.to_string()))?;
@@ -597,7 +635,7 @@ impl ImageStore {
     /// blob reports its progress.
     async fn download_blob(
         &self,
-        reference: &Reference,
+        source: &PullSource,
         layer: &OciDescriptor,
         dest: &Path,
         name: Option<&str>,
@@ -625,8 +663,9 @@ impl ImageStore {
             last: Instant::now(),
             report: |done| report(done, false, live_name.as_deref()),
         };
-        self.client
-            .pull_blob(reference, layer, writer)
+        source
+            .client
+            .pull_blob(&source.remote, layer, writer)
             .await
             .map_err(|e| registry_error(&format!("download {}", layer.digest), &e))?;
         let written = fs::metadata(dest)
@@ -680,867 +719,5 @@ fn chain(err: &dyn std::error::Error) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use oci_client::manifest::{ImageIndexEntry, Platform};
-
-    use super::*;
-    use std::collections::HashMap;
-    use std::net::SocketAddr;
-    use std::os::unix::fs::MetadataExt;
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    use flame_rs::apis::FlameError;
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use sha2::{Digest, Sha256};
-    use tar::{EntryType, Header};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-
-    fn entry(os: Os, arch: Architecture, digest: &str) -> ImageIndexEntry {
-        ImageIndexEntry {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
-            digest: digest.to_string(),
-            size: 1,
-            platform: Some(Platform {
-                architecture: arch,
-                os,
-                os_version: None,
-                os_features: None,
-                variant: None,
-                features: None,
-            }),
-            annotations: None,
-            artifact_type: None,
-        }
-    }
-
-    #[test]
-    fn picks_the_linux_manifest_of_the_host_arch() {
-        let host = Architecture::default();
-        let other = if host == Architecture::Amd64 {
-            Architecture::ARM64
-        } else {
-            Architecture::Amd64
-        };
-        let list = [
-            entry(Os::Windows, host.clone(), "sha256:win"),
-            entry(Os::Linux, other, "sha256:other"),
-            entry(Os::Linux, host, "sha256:want"),
-        ];
-        assert_eq!(linux_resolver(&list).as_deref(), Some("sha256:want"));
-        assert_eq!(linux_resolver(&list[..2]), None);
-    }
-
-    #[test]
-    fn docker_and_oci_image_configs_parse() {
-        let json = r#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},
-            "config":{"Env":["A=1"],"Cmd":["sh"],"Entrypoint":null,"WorkingDir":"","User":"1000:1000"}}"#;
-        let cfg = parse_image_config(json).unwrap();
-        assert_eq!(cfg.env, ["A=1"]);
-        assert_eq!(cfg.cmd, ["sh"]);
-        assert!(cfg.entrypoint.is_empty());
-        assert_eq!(cfg.working_dir, None);
-        assert_eq!(cfg.user.as_deref(), Some("1000:1000"));
-        assert!(parse_image_config("nope").is_err());
-    }
-
-    #[test]
-    fn references_are_normalized_and_validated() {
-        let r = parse_reference("ubuntu:26.04").unwrap();
-        assert_eq!(r.repository(), "library/ubuntu");
-        assert_eq!(r.tag(), Some("26.04"));
-        let digest = format!("name@sha256:{}", "a".repeat(64));
-        assert!(parse_reference(&digest).unwrap().digest().is_some());
-        for bad in ["", "not a ref!", "a@sha256:short"] {
-            assert!(
-                matches!(parse_reference(bad), Err(FlameError::InvalidConfig(_))),
-                "{bad}"
-            );
-        }
-    }
-
-    #[test]
-    fn digest_format_is_strict() {
-        assert!(sha256_hex(&format!("sha256:{}", "a".repeat(64))).is_ok());
-        assert!(sha256_hex("sha256:../../etc").is_err());
-        assert!(sha256_hex(&format!("sha512:{}", "a".repeat(64))).is_err());
-    }
-
-    #[test]
-    fn sweeps_stale_tmp_dirs_only() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join(".tmp-a/rootfs")).unwrap();
-        fs::create_dir_all(dir.path().join("sha256")).unwrap();
-        sweep_tmp(dir.path(), Duration::from_secs(3600));
-        assert!(dir.path().join(".tmp-a").exists());
-        sweep_tmp(dir.path(), Duration::ZERO);
-        assert!(!dir.path().join(".tmp-a").exists());
-        assert!(dir.path().join("sha256").exists());
-    }
-
-    const REPO: &str = "test/img";
-    const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
-    const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
-
-    // ---- mock registry -------------------------------------------------------
-
-    struct State {
-        routes: Mutex<HashMap<String, (String, Vec<u8>)>>,
-        log: Mutex<Vec<String>>,
-        delay: Duration,
-    }
-
-    struct Mock {
-        addr: SocketAddr,
-        state: Arc<State>,
-    }
-
-    impl Mock {
-        async fn start(delay: Duration) -> Mock {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let state = Arc::new(State {
-                routes: Mutex::new(HashMap::new()),
-                log: Mutex::new(Vec::new()),
-                delay,
-            });
-            let st = state.clone();
-            tokio::spawn(async move {
-                loop {
-                    let Ok((stream, _)) = listener.accept().await else {
-                        return;
-                    };
-                    tokio::spawn(handle(stream, st.clone()));
-                }
-            });
-            Mock { addr, state }
-        }
-
-        fn put(&self, path: &str, content_type: &str, body: Vec<u8>) {
-            self.state
-                .routes
-                .lock()
-                .unwrap()
-                .insert(path.to_string(), (content_type.to_string(), body));
-        }
-
-        fn requests(&self, needle: &str) -> usize {
-            self.state
-                .log
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|p| p.contains(needle))
-                .count()
-        }
-
-        fn total(&self) -> usize {
-            self.state.log.lock().unwrap().len()
-        }
-
-        fn reference(&self, suffix: &str) -> String {
-            format!("{}/{REPO}{suffix}", self.addr)
-        }
-    }
-
-    async fn handle(mut stream: TcpStream, st: Arc<State>) {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 4096];
-        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            match stream.read(&mut chunk).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            }
-        }
-        let text = String::from_utf8_lossy(&buf).to_string();
-        let path = text
-            .lines()
-            .next()
-            .and_then(|l| l.split(' ').nth(1))
-            .unwrap_or("/")
-            .to_string();
-        st.log.lock().unwrap().push(path.clone());
-
-        let (status, headers, body): (&str, String, Vec<u8>) = {
-            let route = st.routes.lock().unwrap().get(&path).cloned();
-            match route {
-                Some((ct, body)) => {
-                    if path.contains("/blobs/") && !st.delay.is_zero() {
-                        tokio::time::sleep(st.delay).await;
-                    }
-                    ("200 OK", format!("Content-Type: {ct}\r\n"), body)
-                }
-                None => ("404 Not Found", String::new(), Vec::new()),
-            }
-        };
-        let head = format!(
-            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        let _ = stream.write_all(head.as_bytes()).await;
-        let _ = stream.write_all(&body).await;
-        let _ = stream.shutdown().await;
-    }
-
-    // ---- image building ------------------------------------------------------
-
-    enum Ent<'a> {
-        File(&'a str, &'a [u8], u32),
-        Dir(&'a str, u32),
-        Symlink(&'a str, &'a str),
-        Hardlink(&'a str, &'a str),
-    }
-
-    /// Builds a gzip layer; names are written raw so unsafe paths can be tested.
-    fn layer(entries: &[Ent]) -> Vec<u8> {
-        let mut builder = tar::Builder::new(Vec::new());
-        for ent in entries {
-            let (name, kind, mode, link, data): (&str, EntryType, u32, Option<&str>, &[u8]) =
-                match ent {
-                    Ent::File(n, d, m) => (n, EntryType::Regular, *m, None, d),
-                    Ent::Dir(n, m) => (n, EntryType::Directory, *m, None, &[]),
-                    Ent::Symlink(n, t) => (n, EntryType::Symlink, 0o777, Some(t), &[]),
-                    Ent::Hardlink(n, t) => (n, EntryType::Link, 0o644, Some(t), &[]),
-                };
-            let mut h = Header::new_gnu();
-            h.set_entry_type(kind);
-            h.set_mode(mode);
-            h.set_uid(0);
-            h.set_gid(0);
-            h.set_size(data.len() as u64);
-            h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
-            if let Some(l) = link {
-                h.as_old_mut().linkname[..l.len()].copy_from_slice(l.as_bytes());
-            }
-            h.set_cksum();
-            builder.append(&h, data).unwrap();
-        }
-        let tar = builder.into_inner().unwrap();
-        let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
-        std::io::Write::write_all(&mut gz, &tar).unwrap();
-        gz.finish().unwrap()
-    }
-
-    fn digest(bytes: &[u8]) -> String {
-        let digest: String = Sha256::digest(bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        format!("sha256:{digest}")
-    }
-
-    fn config_json() -> Vec<u8> {
-        br#"{"architecture":"amd64","os":"linux","config":{"Env":["PATH=/usr/bin","A=b"],"Cmd":["/bin/sh"],"Entrypoint":null,"WorkingDir":"/work","User":"1000"},"rootfs":{"type":"layers","diff_ids":[]}}"#.to_vec()
-    }
-
-    /// Registers config, layers and the manifest; returns the manifest digest.
-    fn add_image(mock: &Mock, layers: &[Vec<u8>]) -> String {
-        let config = config_json();
-        let config_digest = digest(&config);
-        mock.put(
-            &format!("/v2/{REPO}/blobs/{config_digest}"),
-            "application/octet-stream",
-            config.clone(),
-        );
-        let mut descs = Vec::new();
-        for l in layers {
-            let d = digest(l);
-            mock.put(
-                &format!("/v2/{REPO}/blobs/{d}"),
-                "application/octet-stream",
-                l.clone(),
-            );
-            descs.push(format!(
-                r#"{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{d}","size":{}}}"#,
-                l.len()
-            ));
-        }
-        let manifest = format!(
-            r#"{{"schemaVersion":2,"mediaType":"{OCI_MANIFEST}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[{}]}}"#,
-            config.len(),
-            descs.join(",")
-        )
-        .into_bytes();
-        let d = digest(&manifest);
-        mock.put(&format!("/v2/{REPO}/manifests/{d}"), OCI_MANIFEST, manifest);
-        d
-    }
-
-    /// Registers an index under `tag` and under its digest, which it returns, that selects
-    /// `manifest` for the host arch.
-    fn add_index(mock: &Mock, tag: &str, manifest: &str) -> String {
-        let host = match std::env::consts::ARCH {
-            "x86_64" => "amd64",
-            "aarch64" => "arm64",
-            other => other,
-        };
-        let other = if host == "amd64" { "arm64" } else { "amd64" };
-        let missing = format!("sha256:{}", "e".repeat(64));
-        let index = format!(
-            r#"{{"schemaVersion":2,"mediaType":"{OCI_INDEX}","manifests":[
-            {{"mediaType":"{OCI_MANIFEST}","digest":"{missing}","size":1,"platform":{{"architecture":"{other}","os":"linux"}}}},
-            {{"mediaType":"{OCI_MANIFEST}","digest":"{missing}","size":1,"platform":{{"architecture":"{host}","os":"windows"}}}},
-            {{"mediaType":"{OCI_MANIFEST}","digest":"{manifest}","size":1,"platform":{{"architecture":"{host}","os":"linux"}}}}]}}"#
-        );
-        let index = index.into_bytes();
-        let index_digest = digest(&index);
-        mock.put(
-            &format!("/v2/{REPO}/manifests/{index_digest}"),
-            OCI_INDEX,
-            index.clone(),
-        );
-        mock.put(&format!("/v2/{REPO}/manifests/{tag}"), OCI_INDEX, index);
-        index_digest
-    }
-
-    fn base_layers() -> Vec<Vec<u8>> {
-        let l1 = layer(&[
-            Ent::Dir("etc/", 0o755),
-            Ent::File("etc/os-release", b"ID=v1\n", 0o644),
-            Ent::Dir("bin/", 0o755),
-            Ent::File("bin/tool", b"#!tool\n", 0o755),
-            Ent::File("bin/su", b"su", 0o4755),
-            Ent::Symlink("bin/sh", "tool"),
-            Ent::Symlink("abs", "/etc"),
-            Ent::Dir("data/", 0o755),
-            Ent::File("data/old.txt", b"old", 0o644),
-            Ent::File("data/keep.txt", b"keep", 0o644),
-            Ent::Dir("opt/", 0o755),
-            Ent::File("opt/a", b"a", 0o644),
-            Ent::File("opt/b", b"b", 0o644),
-            Ent::Dir("ro/", 0o555),
-            Ent::File("ro/f", b"f", 0o444),
-        ]);
-        let l2 = layer(&[
-            Ent::File("./etc/os-release", b"ID=v2\n", 0o644),
-            Ent::File("data/.wh.old.txt", b"", 0o644),
-            // The new file precedes the opaque marker and must survive it.
-            Ent::File("opt/c", b"c", 0o644),
-            Ent::File("opt/.wh..wh..opq", b"", 0o644),
-            // Through an absolute symlink: lands inside the root's /etc.
-            Ent::File("abs/extra.conf", b"x", 0o600),
-            Ent::Hardlink("bin/tool2", "bin/tool"),
-        ]);
-        vec![l1, l2]
-    }
-
-    /// An [`ImageStore`] that reaches the mock registry over `http://127.0.0.1`.
-    fn store(state: &Path, max: Option<&str>) -> ImageStore {
-        let mut vars = HashMap::new();
-        vars.insert("FLMBOX_STATE_DIR".to_string(), state.display().to_string());
-        if let Some(max) = max {
-            vars.insert("FLMBOX_MAX_IMAGE_BYTES".to_string(), max.to_string());
-        }
-        ImageStore::with_protocol(
-            &FlameSandbox::from_map(&vars).unwrap(),
-            ClientProtocol::Http,
-        )
-    }
-
-    fn assert_clean(state: &Path) {
-        let images = state.join("images");
-        if let Ok(rd) = std::fs::read_dir(&images) {
-            for e in rd.flatten() {
-                assert!(
-                    !e.file_name().to_string_lossy().starts_with(".tmp-"),
-                    "left {:?}",
-                    e.path()
-                );
-            }
-        }
-        let published = std::fs::read_dir(images.join("sha256"))
-            .map(|rd| rd.count())
-            .unwrap_or(0);
-        assert_eq!(published, 0, "nothing should be published");
-    }
-
-    fn mode(path: impl AsRef<Path>) -> u32 {
-        std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
-    }
-
-    // ---- tests ---------------------------------------------------------------
-
-    #[tokio::test]
-    async fn flattens_layers() {
-        let mock = Mock::start(Duration::ZERO).await;
-        let manifest = add_image(&mock, &base_layers());
-        add_index(&mock, "v1", &manifest);
-        let state = tempfile::tempdir().unwrap();
-        let store = store(state.path(), None);
-
-        let root = store
-            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
-            .await
-            .unwrap();
-        let fs = &root.rootfs;
-
-        assert_eq!(root.digest, manifest);
-        assert_eq!(
-            fs.parent().unwrap(),
-            state
-                .path()
-                .join("images/sha256")
-                .join(manifest.trim_start_matches("sha256:"))
-        );
-        assert_eq!(
-            std::fs::read(fs.join("etc/os-release")).unwrap(),
-            b"ID=v2\n"
-        );
-        assert_eq!(std::fs::read(fs.join("etc/extra.conf")).unwrap(), b"x");
-        assert_eq!(std::fs::read(fs.join("data/keep.txt")).unwrap(), b"keep");
-        assert!(!fs.join("data/old.txt").exists());
-        assert!(!fs.join("data/.wh.old.txt").exists());
-        assert!(!fs.join("opt/a").exists() && !fs.join("opt/b").exists());
-        assert_eq!(std::fs::read(fs.join("opt/c")).unwrap(), b"c");
-        assert!(!fs.join("opt/.wh..wh..opq").exists());
-        assert_eq!(
-            std::fs::read_link(fs.join("bin/sh")).unwrap().to_str(),
-            Some("tool")
-        );
-        assert_eq!(mode(fs.join("bin/tool")), 0o755);
-        assert_eq!(mode(fs.join("bin/su")), 0o4755);
-        assert_eq!(mode(fs.join("etc/extra.conf")), 0o600);
-        assert_eq!(mode(fs.join("ro")), 0o555);
-        assert_eq!(mode(fs.join("ro/f")), 0o444);
-        assert_eq!(
-            std::fs::metadata(fs.join("bin/tool")).unwrap().ino(),
-            std::fs::metadata(fs.join("bin/tool2")).unwrap().ino()
-        );
-
-        assert_eq!(root.config.env, ["PATH=/usr/bin", "A=b"]);
-        assert_eq!(root.config.cmd, ["/bin/sh"]);
-        assert!(root.config.entrypoint.is_empty());
-        assert_eq!(root.config.working_dir.as_deref(), Some("/work"));
-        assert_eq!(root.config.user.as_deref(), Some("1000"));
-        assert!(state
-            .path()
-            .join("images/sha256")
-            .join(manifest.trim_start_matches("sha256:"))
-            .join("image.json")
-            .exists());
-        let leftovers = std::fs::read_dir(state.path().join("images"))
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp-"))
-            .count();
-        assert_eq!(leftovers, 0);
-
-        // Make the read-only directories removable for the tempdir cleanup.
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(fs.join("ro"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    #[tokio::test]
-    async fn second_call_hits_the_cache() {
-        let mock = Mock::start(Duration::ZERO).await;
-        let manifest = add_image(&mock, &base_layers());
-        add_index(&mock, "v1", &manifest);
-        let state = tempfile::tempdir().unwrap();
-        let store = store(state.path(), None);
-
-        let first = store
-            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
-            .await
-            .unwrap();
-        let blobs = mock.requests("/blobs/");
-        assert_eq!(blobs, 3);
-        let manifests = mock.requests("/manifests/");
-
-        // A cached tag costs no registry request, and `Always` the manifest requests (index
-        // and platform manifest) only, never a blob.
-        let second = store
-            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
-            .await
-            .unwrap();
-        assert_eq!(first, second);
-        assert_eq!(mock.requests("/manifests/"), manifests);
-        let always = store
-            .pull_image(&mock.reference(":v1"), PullPolicy::Always)
-            .await
-            .unwrap();
-        assert_eq!(first, always);
-        assert_eq!(mock.requests("/blobs/"), blobs);
-        assert_eq!(mock.requests("/manifests/"), manifests + 2);
-
-        // The reference is recorded for `list`, also on an image cached without one.
-        let images = store.list().unwrap();
-        assert_eq!(images.len(), 1);
-        assert!(images[0].reference.as_deref().unwrap().contains(":v1"));
-
-        // A cached digest costs nothing.
-        let before = mock.total();
-        let third = store
-            .pull_image(
-                &format!("{}@{manifest}", mock.reference("")),
-                PullPolicy::IfNotPresent,
-            )
-            .await
-            .unwrap();
-        assert_eq!(first, third);
-        assert_eq!(mock.total(), before);
-    }
-
-    /// A cached image pulled by the digest of a multi-platform index costs no registry request,
-    /// though the cache is keyed by the digest of the platform manifest.
-    #[tokio::test]
-    async fn an_index_digest_costs_no_registry_request_once_cached() {
-        let mock = Mock::start(Duration::ZERO).await;
-        let manifest = add_image(&mock, &base_layers());
-        let by_index = format!(
-            "{}@{}",
-            mock.reference(""),
-            add_index(&mock, "v1", &manifest)
-        );
-        let state = tempfile::tempdir().unwrap();
-        let (first_store, other_store) = (store(state.path(), None), store(state.path(), None));
-
-        let first = first_store
-            .pull_image(&by_index, PullPolicy::IfNotPresent)
-            .await
-            .unwrap();
-
-        let before = mock.total();
-        assert_eq!(
-            first_store
-                .pull_image(&by_index, PullPolicy::IfNotPresent)
-                .await
-                .unwrap(),
-            first
-        );
-        // The alias is on disk: another store (another process) does not ask either.
-        assert_eq!(
-            other_store
-                .pull_image(&by_index, PullPolicy::IfNotPresent)
-                .await
-                .unwrap(),
-            first
-        );
-        assert_eq!(mock.total(), before);
-    }
-
-    /// An alias is a hint: a wrong or damaged one falls back to the registry, which corrects it.
-    #[tokio::test]
-    async fn a_bad_alias_falls_back_to_the_registry_and_is_corrected() {
-        let mock = Mock::start(Duration::ZERO).await;
-        let manifest = add_image(&mock, &base_layers());
-        let index = add_index(&mock, "v1", &manifest);
-        let by_index = format!("{}@{index}", mock.reference(""));
-        let state = tempfile::tempdir().unwrap();
-        let store = store(state.path(), None);
-        let first = store
-            .pull_image(&by_index, PullPolicy::IfNotPresent)
-            .await
-            .unwrap();
-        let blobs = mock.requests("/blobs/");
-
-        let not_cached = format!("sha256:{}", "d".repeat(64));
-        for bad in [not_cached.as_str(), "../../etc"] {
-            fs::write(
-                store
-                    .alias_path(&parse_reference(&by_index).unwrap())
-                    .unwrap(),
-                bad,
-            )
-            .unwrap();
-            let before = mock.total();
-            assert_eq!(
-                store
-                    .pull_image(&by_index, PullPolicy::IfNotPresent)
-                    .await
-                    .unwrap(),
-                first
-            );
-            assert!(mock.total() > before, "{bad}: it did not ask the registry");
-            assert_eq!(
-                mock.requests("/blobs/"),
-                blobs,
-                "{bad}: the image was pulled again"
-            );
-        }
-
-        let before = mock.total();
-        assert_eq!(
-            store
-                .pull_image(&by_index, PullPolicy::IfNotPresent)
-                .await
-                .unwrap(),
-            first
-        );
-        assert_eq!(mock.total(), before, "the alias was not corrected");
-    }
-
-    /// With `IfNotPresent` a cached tag is used as it is; `Always` follows a tag that moved.
-    #[tokio::test]
-    async fn a_moved_tag_is_followed_by_the_always_policy_only() {
-        let mock = Mock::start(Duration::ZERO).await;
-        let old = add_image(&mock, &base_layers());
-        add_index(&mock, "v1", &old);
-        let state = tempfile::tempdir().unwrap();
-        let store = store(state.path(), None);
-        let first = store
-            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
-            .await
-            .unwrap();
-
-        let new = add_image(
-            &mock,
-            &[layer(&[Ent::File("etc/os-release", b"ID=v2\n", 0o644)])],
-        );
-        assert_ne!(old, new);
-        add_index(&mock, "v1", &new);
-
-        let before = mock.total();
-        assert_eq!(
-            store
-                .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
-                .await
-                .unwrap(),
-            first
-        );
-        assert_eq!(mock.total(), before, "a cached tag asked the registry");
-
-        let moved = store
-            .pull_image(&mock.reference(":v1"), PullPolicy::Always)
-            .await
-            .unwrap();
-        assert_ne!(moved, first);
-        // The tag is what it resolved to now.
-        assert_eq!(
-            store
-                .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
-                .await
-                .unwrap(),
-            moved
-        );
-
-        // Another tag of the same repository has its own alias, and a digest is not resolved again.
-        add_index(&mock, "v2", &old);
-        assert_eq!(
-            store
-                .pull_image(&mock.reference(":v2"), PullPolicy::IfNotPresent)
-                .await
-                .unwrap(),
-            first
-        );
-        let by_digest = format!("{}@{old}", mock.reference(""));
-        let before = mock.total();
-        assert_eq!(
-            store
-                .pull_image(&by_digest, PullPolicy::Always)
-                .await
-                .unwrap(),
-            first
-        );
-        assert_eq!(mock.total(), before);
-    }
-
-    /// Aliases are nested by image, and a tag never clashes with a repository below it.
-    #[test]
-    fn aliases_are_nested_by_image() {
-        let state = tempfile::tempdir().unwrap();
-        let store = store(state.path(), None);
-        let (one, two) = (
-            parse_reference("example.com/a/b:c").unwrap(),
-            parse_reference("example.com/a/b/c:d").unwrap(),
-        );
-        let digest = |c: char| format!("sha256:{}", c.to_string().repeat(64));
-        store.record_alias(&one, &digest('1'));
-        store.record_alias(&two, &digest('2'));
-
-        assert_eq!(store.alias(&one), Some(digest('1')));
-        assert_eq!(store.alias(&two), Some(digest('2')));
-        let refs = state.path().join("images/refs/example.com/a/b");
-        assert!(refs.join(":c").is_file());
-        assert!(refs.join("c/:d").is_file());
-
-        let by_digest = parse_reference(&format!("example.com/a/b@{}", digest('3'))).unwrap();
-        store.record_alias(&by_digest, &digest('4'));
-        assert!(refs.join(format!("@sha256-{}", "3".repeat(64))).is_file());
-        assert_eq!(store.alias(&by_digest), Some(digest('4')));
-    }
-
-    #[tokio::test]
-    async fn concurrent_calls_pull_once() {
-        let mock = Mock::start(Duration::from_millis(50)).await;
-        let manifest = add_image(&mock, &base_layers());
-        add_index(&mock, "v1", &manifest);
-        let state = tempfile::tempdir().unwrap();
-        let store = store(state.path(), None);
-        let r = mock.reference(":v1");
-
-        let (a, b, c, d) = tokio::join!(
-            store.pull_image(&r, PullPolicy::IfNotPresent),
-            store.pull_image(&r, PullPolicy::IfNotPresent),
-            store.pull_image(&r, PullPolicy::IfNotPresent),
-            store.pull_image(&r, PullPolicy::IfNotPresent)
-        );
-        for result in [a, b, c, d] {
-            assert_eq!(result.unwrap().digest, manifest);
-        }
-        assert_eq!(mock.requests("/blobs/"), 3);
-    }
-
-    #[tokio::test]
-    async fn stores_sharing_a_state_dir_pull_once() {
-        // Each executor of a node has its own process and so its own store;
-        // two stores stand in for them (flock conflicts between open files too).
-        let mock = Mock::start(Duration::from_millis(50)).await;
-        let manifest = add_image(&mock, &base_layers());
-        add_index(&mock, "v1", &manifest);
-        let state = tempfile::tempdir().unwrap();
-        let (a, b) = (store(state.path(), None), store(state.path(), None));
-        let r = mock.reference(":v1");
-
-        let (x, y) = tokio::join!(
-            a.pull_image(&r, PullPolicy::IfNotPresent),
-            b.pull_image(&r, PullPolicy::IfNotPresent)
-        );
-        assert_eq!(x.unwrap(), y.unwrap());
-        assert_eq!(mock.requests("/blobs/"), 3);
-        assert_eq!(a.list().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn size_cap_is_enforced_before_download() {
-        let mock = Mock::start(Duration::ZERO).await;
-        let manifest = add_image(&mock, &base_layers());
-        add_index(&mock, "v1", &manifest);
-        let state = tempfile::tempdir().unwrap();
-        let store = store(state.path(), Some("100"));
-
-        let err = store
-            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, FlameError::InvalidConfig(_)), "{err}");
-        assert_eq!(mock.requests("/blobs/"), 0);
-        assert_clean(state.path());
-    }
-
-    #[tokio::test]
-    async fn unpacked_size_cap_is_enforced() {
-        let mock = Mock::start(Duration::ZERO).await;
-        // Compresses to almost nothing but expands past the cap.
-        let big = vec![0u8; 64 * 1024];
-        let manifest = add_image(&mock, &[layer(&[Ent::File("big", &big, 0o644)])]);
-        add_index(&mock, "v1", &manifest);
-        let state = tempfile::tempdir().unwrap();
-        let store = store(state.path(), Some("16K"));
-
-        let err = store
-            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("limit"), "{err}");
-        assert_clean(state.path());
-    }
-
-    #[tokio::test]
-    async fn unsafe_layers_are_rejected() {
-        let cases: Vec<(&str, Vec<Vec<u8>>)> = vec![
-            (
-                "dotdot",
-                vec![layer(&[Ent::File("a/../../escape", b"x", 0o644)])],
-            ),
-            (
-                "absolute",
-                vec![layer(&[Ent::File("/abs-escape", b"x", 0o644)])],
-            ),
-            (
-                "symlink escape",
-                vec![
-                    layer(&[Ent::Symlink("link", "../../../tmp")]),
-                    layer(&[Ent::File("link/escape", b"x", 0o644)]),
-                ],
-            ),
-            (
-                "hardlink escape via dotdot",
-                vec![layer(&[Ent::Hardlink("h", "../../etc/passwd")])],
-            ),
-            (
-                "hardlink absolute",
-                vec![layer(&[Ent::Hardlink("h", "/etc/passwd")])],
-            ),
-            (
-                "hardlink through escaping symlink",
-                vec![layer(&[
-                    Ent::Symlink("link", "../../.."),
-                    Ent::Hardlink("h", "link/etc/passwd"),
-                ])],
-            ),
-        ];
-        for (name, layers) in cases {
-            let mock = Mock::start(Duration::ZERO).await;
-            let manifest = add_image(&mock, &layers);
-            add_index(&mock, "v1", &manifest);
-            let state = tempfile::tempdir().unwrap();
-            let store = store(state.path(), None);
-
-            let result = store
-                .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
-                .await;
-            assert!(result.is_err(), "{name} must be rejected");
-            assert_clean(state.path());
-            assert!(!state.path().join("escape").exists(), "{name}");
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_pull_leaves_nothing() {
-        let mock = Mock::start(Duration::ZERO).await;
-        let layers = base_layers();
-        let manifest = add_image(&mock, &layers);
-        add_index(&mock, "v1", &manifest);
-        mock.state
-            .routes
-            .lock()
-            .unwrap()
-            .remove(&format!("/v2/{REPO}/blobs/{}", digest(&layers[1])));
-        let state = tempfile::tempdir().unwrap();
-        let store = store(state.path(), None);
-
-        let err = store
-            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, FlameError::Network(_)), "{err}");
-        assert!(err.to_string().contains("404"), "{err}");
-        assert_clean(state.path());
-    }
-
-    #[tokio::test]
-    async fn zstd_and_plain_layers_are_detected() {
-        let mock = Mock::start(Duration::ZERO).await;
-        let gz = layer(&[Ent::File("one", b"1", 0o644)]);
-        let tar = {
-            let mut d = flate2::read::GzDecoder::new(&gz[..]);
-            let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut d, &mut out).unwrap();
-            out
-        };
-        let zst = zstd::encode_all(&tar[..], 1).unwrap();
-        let plain = {
-            let mut b = tar::Builder::new(Vec::new());
-            let mut h = Header::new_gnu();
-            h.set_size(1);
-            h.set_mode(0o644);
-            h.set_path("two").unwrap();
-            h.set_cksum();
-            b.append(&h, &b"2"[..]).unwrap();
-            b.into_inner().unwrap()
-        };
-        let manifest = add_image(&mock, &[zst, plain]);
-        add_index(&mock, "v1", &manifest);
-        let state = tempfile::tempdir().unwrap();
-        let store = store(state.path(), None);
-
-        let root = store
-            .pull_image(&mock.reference(":v1"), PullPolicy::IfNotPresent)
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(root.rootfs.join("one")).unwrap(), b"1");
-        assert_eq!(std::fs::read(root.rootfs.join("two")).unwrap(), b"2");
-    }
-}
+#[path = "tests/store.rs"]
+mod tests;

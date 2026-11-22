@@ -1,13 +1,15 @@
 """AsyncIO frontend client integration tests."""
 
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from flamepy.core import aio
 from flamepy.core import client as sync_client
 from flamepy.core._bridge import LoopThread
-from flamepy.core.types import ApplicationAttributes, FlameError, SessionAttributes, SessionState, TaskState
+from flamepy.core.types import ApplicationAttributes, Event, FlameError, SessionAttributes, SessionState, TaskState
 
 
 def test_aio_frontend_api_parity(frontend_server):
@@ -240,5 +242,68 @@ def test_remote_cancelled_task_raises_instead_of_returning_output(frontend_serve
             session = await connection.create_session(SessionAttributes(application="app"))
             with pytest.raises(FlameError, match="Task was cancelled"):
                 await (session.submit(b"input") if submit else session.run(b"input"))
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("events", "details"),
+    [
+        (
+            [Event(42, "Waiting for resources"), Event(73, "Executor unavailable"), Event(9999)],
+            "[42] Waiting for resources; [73] Executor unavailable",
+        ),
+        (
+            [Event(1001, "Image pull TLS failure"), Event(1002, "Session retry limit reached"), Event(74, "Releasing executor")],
+            "[1001] Image pull TLS failure; [1002] Session retry limit reached; [74] Releasing executor",
+        ),
+    ],
+)
+def test_aio_watch_timeout_includes_session_events(frontend_server, monkeypatch, events, details):
+    endpoint, _, _ = frontend_server
+
+    async def exercise():
+        async with await aio.connect(endpoint) as connection:
+            session = await connection.create_session(SessionAttributes(application="app"))
+            diagnostics = AsyncMock(return_value=SimpleNamespace(id=session.id, events=events))
+            monkeypatch.setattr(connection, "get_session", diagnostics)
+            watcher = session.watch_task("hold", timeout=0.03)
+            assert (await watcher.__anext__()).state == TaskState.PENDING
+            diagnostics.assert_not_called()
+            with pytest.raises(TimeoutError) as caught:
+                await watcher.__anext__()
+            assert str(caught.value) == f"watch_task timed out after 0.03 seconds; session {session.id!r} events: {details}"
+            diagnostics.assert_awaited_once_with(session.id)
+            # A diagnostic timeout does not close the shared watch or settle
+            # queued tasks: another subscriber can still receive its result.
+            completed = session.watch_task("task-1")
+            assert (await completed.__anext__()).state == TaskState.SUCCEED
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("diagnostic", ["failure", "hang", "no_events", "empty_messages"])
+def test_aio_watch_timeout_preserves_error_when_diagnostics_unavailable(frontend_server, monkeypatch, diagnostic):
+    from flamepy.core.aio import client as aio_client
+
+    endpoint, _, _ = frontend_server
+
+    async def exercise():
+        async with await aio.connect(endpoint) as connection:
+            session = await connection.create_session(SessionAttributes(application="app"))
+
+            async def diagnostics(_):
+                if diagnostic == "failure":
+                    raise RuntimeError("manager unavailable")
+                if diagnostic == "hang":
+                    await asyncio.Event().wait()
+                return SimpleNamespace(id=session.id, events=[Event(42), Event(73, "")] if diagnostic == "empty_messages" else [])
+
+            monkeypatch.setattr(connection, "get_session", diagnostics)
+            monkeypatch.setattr(aio_client, "_SESSION_DIAGNOSTIC_TIMEOUT", 0.01)
+            watcher = session.watch_task("hold", timeout=0.03)
+            assert (await watcher.__anext__()).state == TaskState.PENDING
+            with pytest.raises(TimeoutError, match="^watch_task timed out after 0.03 seconds$"):
+                await asyncio.wait_for(watcher.__anext__(), 1)
 
     asyncio.run(exercise())
