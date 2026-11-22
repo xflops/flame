@@ -630,6 +630,9 @@ class _SessionWatch:
             self._reader.cancel()
 
 
+_SESSION_DIAGNOSTIC_TIMEOUT = 1.0
+
+
 class TaskWatcher(AsyncIterator[Task]):
     """A task's latest status followed by updates from its session stream."""
 
@@ -681,7 +684,20 @@ class TaskWatcher(AsyncIterator[Task]):
             return update
         except asyncio.TimeoutError as error:
             self.close()
-            raise TimeoutError(f"watch_task timed out after {self._timeout} seconds") from error
+            message = f"watch_task timed out after {self._timeout} seconds"
+            # Fetch diagnostics only on failure. A bounded best-effort read must
+            # not hide the original timeout if the manager is unreachable.
+            try:
+                session = await asyncio.wait_for(
+                    self._session_watch._connection.get_session(self._session_watch._session_id),
+                    _SESSION_DIAGNOSTIC_TIMEOUT,
+                )
+                events = "; ".join(f"[{event.code}] {event.message}" for event in session.events if event.message)
+                if events:
+                    message += f"; session {session.id!r} events: {events}"
+            except Exception:
+                pass
+            raise TimeoutError(message) from error
 
     def close(self) -> None:
         if asyncio.get_running_loop() is not self._loop:

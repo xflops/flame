@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use flame_rs::apis::FlameError;
 
 mod progress;
+mod registry;
 mod store;
 mod unpack;
 
